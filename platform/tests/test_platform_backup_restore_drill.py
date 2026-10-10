@@ -26,6 +26,19 @@ SPEC.loader.exec_module(backup_drill)
 
 
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
+    def _assert_latest_verification_preflight_rejects(
+        self,
+        output_dir: pathlib.Path,
+        env_file: pathlib.Path,
+        message: str,
+    ) -> None:
+        with mock.patch.object(backup_drill, "require_commands") as require_commands:
+            with self.assertRaisesRegex((RuntimeError, OSError), message):
+                backup_drill.verify_latest_existing_backup(
+                    output_dir, env_file, max_age_hours=24
+                )
+        require_commands.assert_not_called()
+
     def test_parse_database_url_accepts_platformdb_and_decodes_credentials(self) -> None:
         target = backup_drill.parse_database_url(
             "postgresql+asyncpg://platform%5Fuser:p%40ss@127.0.0.1:5433/platformdb"
@@ -314,26 +327,356 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
+            env_file = output_dir / ".env.platform"
+            env_file.write_text(
+                "PLATFORM_DATABASE_URL=postgresql://platform_user:synthetic@127.0.0.1/platformdb\n",
+                encoding="utf-8",
+            )
             dump_path = output_dir / "platformdb-20260714T120000Z.dump"
             dump_path.write_bytes(b"custom-format-backup")
+            dump_path.chmod(0o600)
             metadata_path = dump_path.with_suffix(".json")
+            original_created_at = dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
             metadata_path.write_text(
                 json.dumps(
                     {
+                        "format_version": 2,
+                        "database": "platformdb",
+                        "schemas": ["platform", "public"],
+                        "required_extensions": ["pg_trgm"],
                         "dump_file": dump_path.name,
+                        "size_bytes": dump_path.stat().st_size,
                         "sha256": hashlib.sha256(dump_path.read_bytes()).hexdigest(),
-                        "completed_at_utc": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
-                        "restore_verified": True,
+                        "completed_at_utc": original_created_at,
+                        "restore_verified": False,
+                        "alembic_revision_verified": False,
                         "restored_table_count": 31,
+                        "restore_error": "historical closed diagnostic",
                     }
                 ),
                 encoding="utf-8",
             )
+            metadata_path.chmod(0o600)
 
-            result = backup_drill.check_latest_backup(output_dir, max_age_hours=24)
+            original_dump_stat = dump_path.stat()
+            with mock.patch.dict(
+                backup_drill.os.environ,
+                {"PLATFORM_DATABASE_URL": "postgresql://platform_user:synthetic@127.0.0.1/platformdb"},
+            ), mock.patch.object(backup_drill, "require_commands"), mock.patch.object(
+                backup_drill,
+                "run_command",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as run_command, mock.patch.object(
+                backup_drill, "perform_restore_drill", return_value=31
+            ) as perform_restore:
+                result = backup_drill.verify_latest_existing_backup(
+                    output_dir, env_file, max_age_hours=24
+                )
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["restored_table_count"], 31)
+            self.assertEqual(run_command.call_args.args[0][:2], ["pg_restore", "--list"])
+            perform_restore.assert_called_once()
+            updated = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated["completed_at_utc"], original_created_at)
+            self.assertEqual(updated["restore_error"], "historical closed diagnostic")
+            self.assertIs(updated["restore_verified"], True)
+            self.assertIs(updated["alembic_revision_verified"], True)
+            self.assertIsInstance(updated["restore_verified_at_utc"], str)
+            self.assertEqual(
+                backup_drill.check_latest_backup(output_dir, max_age_hours=24)["sha256"],
+                hashlib.sha256(b"custom-format-backup").hexdigest(),
+            )
+            self.assertEqual(dump_path.read_bytes(), b"custom-format-backup")
+            self.assertEqual(
+                (dump_path.stat().st_ino, dump_path.stat().st_mtime_ns),
+                (original_dump_stat.st_ino, original_dump_stat.st_mtime_ns),
+            )
+
+            updated_sidecar_bytes = metadata_path.read_bytes()
+            with mock.patch.dict(
+                backup_drill.os.environ,
+                {"PLATFORM_DATABASE_URL": "postgresql://platform_user:synthetic@127.0.0.1/platformdb"},
+            ), mock.patch.object(backup_drill, "require_commands"), mock.patch.object(
+                backup_drill,
+                "run_command",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ), mock.patch.object(
+                backup_drill,
+                "perform_restore_drill",
+                side_effect=backup_drill.RestoreGuardStop("command_failed"),
+            ):
+                with self.assertRaises(backup_drill.RestoreGuardStop):
+                    backup_drill.verify_latest_existing_backup(
+                        output_dir, env_file, max_age_hours=24
+                    )
+            self.assertEqual(metadata_path.read_bytes(), updated_sidecar_bytes)
+            self.assertEqual(dump_path.read_bytes(), b"custom-format-backup")
+
+            command_results = [
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "CREATE EXTENSION\n", ""),
+                subprocess.CompletedProcess([], 0, "CREATE SCHEMA\n", ""),
+                subprocess.CompletedProcess([], 0, "31\n", ""),
+                subprocess.CompletedProcess([], 0, "1\n", ""),
+                subprocess.CompletedProcess([], 0, "20260801_0036\n", ""),
+                subprocess.CompletedProcess([], 0, "1\n", ""),
+                subprocess.CalledProcessError(1, ["dropdb"]),
+            ]
+            with mock.patch.dict(
+                backup_drill.os.environ,
+                {"PLATFORM_DATABASE_URL": "postgresql://platform_user:synthetic@127.0.0.1/platformdb"},
+            ), mock.patch.object(backup_drill, "require_commands"), mock.patch.object(
+                backup_drill, "run_command", side_effect=command_results
+            ), mock.patch.object(backup_drill, "run_restore_command"), mock.patch.object(
+                backup_drill, "require_restore_headroom"
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    backup_drill.verify_latest_existing_backup(
+                        output_dir, env_file, max_age_hours=24
+                    )
+            self.assertEqual(metadata_path.read_bytes(), updated_sidecar_bytes)
+            self.assertEqual(dump_path.read_bytes(), b"custom-format-backup")
+
+            crossing = dict(updated)
+            start_now = dt.datetime.now(dt.UTC)
+            crossing["completed_at_utc"] = (
+                start_now - dt.timedelta(hours=23, minutes=59)
+            ).isoformat().replace("+00:00", "Z")
+            metadata_path.write_text(json.dumps(crossing), encoding="utf-8")
+            metadata_path.chmod(0o600)
+            crossing_bytes = metadata_path.read_bytes()
+            with mock.patch.dict(
+                backup_drill.os.environ,
+                {"PLATFORM_DATABASE_URL": "postgresql://platform_user:synthetic@127.0.0.1/platformdb"},
+            ), mock.patch.object(backup_drill, "require_commands"), mock.patch.object(
+                backup_drill,
+                "run_command",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ), mock.patch.object(
+                backup_drill, "perform_restore_drill", return_value=31
+            ), mock.patch.object(
+                backup_drill,
+                "utc_now",
+                side_effect=[start_now, start_now, start_now + dt.timedelta(hours=2)],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "creation-age window"):
+                    backup_drill.verify_latest_existing_backup(
+                        output_dir, env_file, max_age_hours=24
+                    )
+            self.assertEqual(metadata_path.read_bytes(), crossing_bytes)
+            self.assertEqual(dump_path.read_bytes(), b"custom-format-backup")
+
+            # A directory-fsync failure after rename must restore the exact old sidecar.
+            stable_bytes = metadata_path.read_bytes()
+            with mock.patch.dict(
+                backup_drill.os.environ,
+                {"PLATFORM_DATABASE_URL": "postgresql://platform_user:synthetic@127.0.0.1/platformdb"},
+            ), mock.patch.object(backup_drill, "require_commands"), mock.patch.object(
+                backup_drill,
+                "run_command",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ), mock.patch.object(
+                backup_drill, "perform_restore_drill", return_value=31
+            ), mock.patch.object(
+                backup_drill.os,
+                "fsync",
+                side_effect=[None, OSError("synthetic directory fsync failure"), None, None],
+            ):
+                with self.assertRaisesRegex(OSError, "synthetic directory fsync failure"):
+                    backup_drill.verify_latest_existing_backup(
+                        output_dir, env_file, max_age_hours=24
+                    )
+            self.assertEqual(metadata_path.read_bytes(), stable_bytes)
+            self.assertEqual(dump_path.read_bytes(), b"custom-format-backup")
+
+            def write_metadata(value: dict[str, object]) -> None:
+                metadata_path.write_text(json.dumps(value), encoding="utf-8")
+                metadata_path.chmod(0o600)
+
+            def restore_hook(callback):
+                with mock.patch.dict(
+                    backup_drill.os.environ,
+                    {
+                        "PLATFORM_DATABASE_URL": (
+                            "postgresql://platform_user:synthetic@127.0.0.1/platformdb"
+                        )
+                    },
+                ), mock.patch.object(backup_drill, "require_commands"), mock.patch.object(
+                    backup_drill,
+                    "run_command",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ), mock.patch.object(
+                    backup_drill, "perform_restore_drill", side_effect=callback
+                ):
+                    return backup_drill.verify_latest_existing_backup(
+                        output_dir, env_file, max_age_hours=24
+                    )
+
+            baseline = dict(updated)
+            baseline["completed_at_utc"] = original_created_at
+            write_metadata(baseline)
+            malformed = b'{"dump_file":"one","dump_file":"two"}'
+            metadata_path.write_bytes(malformed)
+            metadata_path.chmod(0o600)
+            self._assert_latest_verification_preflight_rejects(
+                output_dir, env_file, "malformed"
+            )
+
+            metadata_path.write_bytes(b" " * (1_048_577))
+            metadata_path.chmod(0o600)
+            self._assert_latest_verification_preflight_rejects(
+                output_dir, env_file, "unsafe file metadata"
+            )
+
+            wrong_schema = dict(baseline)
+            wrong_schema["schemas"] = ["platform", "sparkydb"]
+            write_metadata(wrong_schema)
+            self._assert_latest_verification_preflight_rejects(
+                output_dir, env_file, "unsupported schema set"
+            )
+
+            naive_timestamp = dict(baseline)
+            naive_timestamp["completed_at_utc"] = dt.datetime.now(dt.UTC).replace(
+                tzinfo=None
+            ).isoformat()
+            write_metadata(naive_timestamp)
+            self._assert_latest_verification_preflight_rejects(
+                output_dir, env_file, "creation timestamp is invalid"
+            )
+
+            write_metadata(baseline)
+            saved_metadata = output_dir / ".platformdb-metadata.saved"
+            metadata_path.rename(saved_metadata)
+            metadata_path.symlink_to(saved_metadata.name)
+            self._assert_latest_verification_preflight_rejects(
+                output_dir, env_file, "Too many levels|unsafe file metadata"
+            )
+            metadata_path.unlink()
+            saved_metadata.rename(metadata_path)
+
+            hardlink_path = output_dir / ".platformdb-metadata.hardlink"
+            os.link(metadata_path, hardlink_path)
+            self._assert_latest_verification_preflight_rejects(
+                output_dir, env_file, "unsafe file metadata"
+            )
+            hardlink_path.unlink()
+
+            dump_hardlink = output_dir / ".platformdb-dump.hardlink"
+            os.link(dump_path, dump_hardlink)
+            self._assert_latest_verification_preflight_rejects(
+                output_dir, env_file, "unsafe file metadata"
+            )
+            dump_hardlink.unlink()
+
+            metadata_path.chmod(0o640)
+            self._assert_latest_verification_preflight_rejects(
+                output_dir, env_file, "unsafe file metadata"
+            )
+            metadata_path.chmod(0o600)
+
+            if os.geteuid() == 0:
+                os.chown(metadata_path, 65534, metadata_path.stat().st_gid)
+                self._assert_latest_verification_preflight_rejects(
+                    output_dir, env_file, "unsafe file metadata"
+                )
+                os.chown(metadata_path, 0, 0)
+                metadata_path.chmod(0o600)
+                os.chown(metadata_path, 0, 65534)
+                self._assert_latest_verification_preflight_rejects(
+                    output_dir, env_file, "unsafe file metadata"
+                )
+                os.chown(metadata_path, 0, 0)
+
+            original_archive_bytes = dump_path.read_bytes()
+            original_archive_stat = dump_path.stat()
+
+            def mutate_archive_during_restore(*_args, **_kwargs):
+                dump_path.write_bytes(b"mutated same inode")
+                os.utime(
+                    dump_path,
+                    ns=(original_archive_stat.st_atime_ns, original_archive_stat.st_mtime_ns),
+                )
+                return 31
+
+            original_sidecar_bytes = metadata_path.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "checksum does not match"):
+                restore_hook(mutate_archive_during_restore)
+            self.assertEqual(metadata_path.read_bytes(), original_sidecar_bytes)
+            self.assertEqual(dump_path.stat().st_ino, original_archive_stat.st_ino)
+            dump_path.write_bytes(original_archive_bytes)
+            dump_path.chmod(0o600)
+
+            def replace_metadata_during_restore(*_args, **_kwargs):
+                replacement = dict(baseline)
+                replacement["restore_error"] = "external metadata replacement"
+                replacement.pop("restore_verified_at_utc", None)
+                replacement_path = output_dir / ".replacement.json"
+                replacement_path.write_text(json.dumps(replacement), encoding="utf-8")
+                replacement_path.chmod(0o600)
+                os.replace(replacement_path, metadata_path)
+                return 31
+
+            with self.assertRaisesRegex(RuntimeError, "metadata changed during restore"):
+                restore_hook(replace_metadata_during_restore)
+            replacement_after = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(replacement_after["restore_error"], "external metadata replacement")
+            self.assertNotIn("restore_verified_at_utc", replacement_after)
+
+            write_metadata(baseline)
+
+            def add_newer_pair_during_restore(*_args, **_kwargs):
+                newer_dump = output_dir / "platformdb-newer.dump"
+                newer_dump.write_bytes(b"newer archive")
+                newer_dump.chmod(0o600)
+                newer_metadata = newer_dump.with_suffix(".json")
+                newer_metadata.write_text(
+                    json.dumps(
+                        {
+                            "dump_file": newer_dump.name,
+                            "sha256": hashlib.sha256(newer_dump.read_bytes()).hexdigest(),
+                            "size_bytes": newer_dump.stat().st_size,
+                            "format_version": 2,
+                            "database": "platformdb",
+                            "schemas": ["platform", "public"],
+                            "required_extensions": ["pg_trgm"],
+                            "completed_at_utc": original_created_at,
+                            "restore_verified": False,
+                            "alembic_revision_verified": False,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                newer_metadata.chmod(0o600)
+                future_ns = metadata_path.stat().st_mtime_ns + 10_000_000
+                os.utime(newer_metadata, ns=(future_ns, future_ns))
+                return 31
+
+            original_sidecar_bytes = metadata_path.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "metadata changed during restore"):
+                restore_hook(add_newer_pair_during_restore)
+            self.assertEqual(metadata_path.read_bytes(), original_sidecar_bytes)
+
+            too_old = dict(updated)
+            too_old["completed_at_utc"] = (
+                dt.datetime.now(dt.UTC) - dt.timedelta(hours=25)
+            ).isoformat().replace("+00:00", "Z")
+            metadata_path.write_text(json.dumps(too_old), encoding="utf-8")
+            metadata_path.chmod(0o600)
+            rewritten_stat = metadata_path.stat()
+            os.utime(
+                metadata_path,
+                ns=(rewritten_stat.st_atime_ns, rewritten_stat.st_mtime_ns + 1_000_000_000),
+            )
+            expired_bytes = metadata_path.read_bytes()
+            with mock.patch.object(backup_drill, "require_commands") as require_commands:
+                with self.assertRaisesRegex(RuntimeError, "creation-age window"):
+                    backup_drill.verify_latest_existing_backup(
+                        output_dir, env_file, max_age_hours=24
+                    )
+            require_commands.assert_not_called()
+            self.assertEqual(metadata_path.read_bytes(), expired_bytes)
 
     def test_check_latest_cli_rejects_unverified_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

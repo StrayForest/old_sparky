@@ -2,9 +2,37 @@ name: Platform production backup
 
 on:
   workflow_dispatch:
+    inputs:
+      operation:
+        description: "Create a new backup or restore-verify only the latest existing pair"
+        required: true
+        type: choice
+        options:
+          - create
+          - verify-existing
+        default: create
+      security_run_id:
+        description: "Exact successful Platform security and build run ID for verify-existing"
+        required: false
+        type: string
+      security_run_attempt:
+        description: "Exact attempt for that security run"
+        required: false
+        type: string
+      source_sha:
+        description: "Exact successful dev source SHA for the helper bundle"
+        required: false
+        type: string
+      evict_build_node_cache:
+        description: "Explicitly remove the pinned disposable build-Node cache before verifying the newest backup"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: read
+  attestations: read
 
 concurrency:
   group: platform-production-deploy
@@ -23,6 +51,302 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production backup must run from the reviewed dev ref" >&2; exit 1; }
+
+      - name: Download and verify exact-source backup helper bundle
+        if: ${{ inputs.operation == 'verify-existing' }}
+        id: backup-helper
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SECURITY_RUN_ID: ${{ inputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$REPOSITORY" = "StrayForest/old_sparky" ]]
+          [[ "$SECURITY_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$SECURITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_SHA" = "$DISPATCH_SHA" ]]
+          artifact_dir="$RUNNER_TEMP/platform-backup-verifier-input"
+          install -d -m 700 "$artifact_dir"
+          test "$(stat -c '%F:%a:%h' "$artifact_dir")" = "directory:700:2"
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/runs/$SECURITY_RUN_ID" --output "$artifact_dir/run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$artifact_dir/jobs.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/runs/$SECURITY_RUN_ID/artifacts?per_page=100&page=1" --output "$artifact_dir/artifacts.json"
+          /usr/bin/python3 -I -B - "$artifact_dir" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path(sys.argv[1])
+          output = Path(sys.argv[2])
+          run_id = os.environ["SECURITY_RUN_ID"]
+          attempt = int(os.environ["SECURITY_RUN_ATTEMPT"])
+          source_sha = os.environ["SOURCE_SHA"]
+          dispatch_sha = os.environ["DISPATCH_SHA"]
+          if source_sha != dispatch_sha:
+              raise SystemExit("backup helper source must equal the reviewed dispatch SHA")
+          run = json.loads((root / "run.json").read_text(encoding="utf-8"))
+          if (
+              not isinstance(run, dict)
+              or run.get("id") != int(run_id)
+              or run.get("run_attempt") != attempt
+              or run.get("path") != ".github/workflows/platform-security.yml"
+              or run.get("event") != "push"
+              or run.get("head_branch") != "dev"
+              or run.get("head_sha") != source_sha
+              or run.get("status") != "completed"
+              or run.get("conclusion") != "success"
+          ):
+              raise SystemExit("security source run identity is not exact and successful")
+          jobs_payload = json.loads((root / "jobs.json").read_text(encoding="utf-8"))
+          jobs = jobs_payload.get("jobs") if isinstance(jobs_payload, dict) else None
+          if (
+              not isinstance(jobs, list)
+              or type(jobs_payload.get("total_count")) is not int
+              or jobs_payload["total_count"] != len(jobs)
+              or not 0 < len(jobs) <= 100
+          ):
+              raise SystemExit("security jobs response is incomplete")
+          producer_jobs = [
+              row for row in jobs
+              if isinstance(row, dict)
+              and row.get("name") == "Verification contract"
+              and row.get("run_id") == int(run_id)
+              and row.get("run_attempt") == attempt
+              and row.get("head_sha") == source_sha
+              and row.get("status") == "completed"
+              and row.get("conclusion") == "success"
+              and type(row.get("id")) is int
+              and row["id"] > 0
+          ]
+          if len(producer_jobs) != 1:
+              raise SystemExit("exact successful verification-contract job is missing")
+          artifact_name = f"platform-backup-verifier-{run_id}-{attempt}"
+          artifact_payload = json.loads((root / "artifacts.json").read_text(encoding="utf-8"))
+          artifacts = artifact_payload.get("artifacts") if isinstance(artifact_payload, dict) else None
+          if (
+              not isinstance(artifacts, list)
+              or type(artifact_payload.get("total_count")) is not int
+              or artifact_payload["total_count"] != len(artifacts)
+              or not 0 <= len(artifacts) <= 100
+          ):
+              raise SystemExit("security artifacts response is incomplete")
+          matches = [
+              row for row in artifacts
+              if isinstance(row, dict)
+              and row.get("name") == artifact_name
+              and row.get("expired") is False
+              and type(row.get("id")) is int
+              and row["id"] > 0
+              and type(row.get("size_in_bytes")) is int
+              and 0 < row["size_in_bytes"] <= 10 * 1024 * 1024
+              and isinstance(row.get("workflow_run"), dict)
+              and row["workflow_run"].get("id") == int(run_id)
+              and row["workflow_run"].get("head_sha") == source_sha
+              and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == attempt)
+              and re.fullmatch(r"sha256:[0-9a-f]{64}", str(row.get("digest", ""))) is not None
+          ]
+          if len(matches) != 1:
+              raise SystemExit("exact backup helper artifact is missing or ambiguous")
+          with output.open("a", encoding="ascii") as stream:
+              stream.write(f"artifact_id={matches[0]['id']}\n")
+              stream.write(f"artifact_digest={matches[0]['digest'].removeprefix('sha256:')}\n")
+              stream.write(f"artifact_size={matches[0]['size_in_bytes']}\n")
+              stream.write(f"artifact_name={artifact_name}\n")
+              stream.write(f"producer_job_id={producer_jobs[0]['id']}\n")
+          PY
+          artifact_id="$(awk -F= '$1 == "artifact_id" {print $2}' "$GITHUB_OUTPUT")"
+          artifact_digest="$(awk -F= '$1 == "artifact_digest" {print $2}' "$GITHUB_OUTPUT")"
+          artifact_size="$(awk -F= '$1 == "artifact_size" {print $2}' "$GITHUB_OUTPUT")"
+          [[ "$artifact_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$artifact_size" =~ ^[1-9][0-9]{0,8}$ ]]
+          curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            --max-filesize 10485760 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/artifacts/$artifact_id/zip" --output "$artifact_dir/outer.zip"
+          test "$(sha256sum "$artifact_dir/outer.zip" | awk '{print $1}')" = "$artifact_digest"
+          test "$(stat -c '%s' "$artifact_dir/outer.zip")" = "$artifact_size"
+          /usr/bin/python3 -I -B - "$artifact_dir" "$SOURCE_SHA" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          import zipfile
+
+          root = Path(sys.argv[1])
+          source_sha = sys.argv[2]
+          output = Path(sys.argv[3])
+          outer = root / "outer.zip"
+          with zipfile.ZipFile(outer) as archive:
+              infos = archive.infolist()
+              if len(infos) != 1:
+                  raise SystemExit("backup verifier artifact is not a closed single-file archive")
+              info = infos[0]
+              mode = (info.external_attr >> 16) & 0o177777
+              if (
+                  info.filename != "platform-backup-verifier.zip"
+                  or info.create_system != 3
+                  or info.is_dir()
+                  or not stat.S_ISREG(mode)
+                  or stat.S_IMODE(mode) & 0o022
+                  or info.flag_bits & 0x1
+                  or info.file_size > 10 * 1024 * 1024
+                  or info.compress_size > 10 * 1024 * 1024
+              ):
+                  raise SystemExit("backup verifier artifact member is unsafe")
+              data = archive.read(info)
+              if len(data) != info.file_size:
+                  raise SystemExit("backup verifier artifact size mismatch")
+          target = root / "platform-backup-verifier.zip"
+          descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "wb") as handle:
+              handle.write(data)
+              handle.flush()
+              os.fsync(handle.fileno())
+              opened = os.fstat(handle.fileno())
+              if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid() or opened.st_nlink != 1 or stat.S_IMODE(opened.st_mode) != 0o600 or opened.st_size != len(data):
+                  raise SystemExit("backup verifier bundle staging metadata is invalid")
+          digest = hashlib.sha256(data).hexdigest()
+          attestation_path = root / "attestation.json"
+          with output.open("a", encoding="ascii") as stream:
+              stream.write(f"bundle_path={target}\n")
+              stream.write(f"bundle_sha256={digest}\n")
+              stream.write(f"attestation_path={attestation_path}\n")
+          PY
+          bundle_path="$artifact_dir/platform-backup-verifier.zip"
+          before="$(stat -c '%d:%i:%h:%s:%u:%g:%a' "$bundle_path")"
+          bundle_sha="$(sha256sum "$bundle_path" | awk '{print $1}')"
+          test "$bundle_sha" = "$(awk -F= '$1 == "bundle_sha256" {print $2}' "$GITHUB_OUTPUT")"
+          gh attestation verify "$bundle_path" \
+            --repo "$REPOSITORY" \
+            --signer-workflow StrayForest/old_sparky/.github/workflows/platform-security.yml \
+            --source-ref refs/heads/dev \
+            --source-digest "$SOURCE_SHA" \
+            --format json > "$artifact_dir/attestation.json"
+          after="$(stat -c '%d:%i:%h:%s:%u:%g:%a' "$bundle_path")"
+          test "$before" = "$after"
+          test "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$bundle_sha"
+          /usr/bin/python3 -I -B - "$artifact_dir/attestation.json" "$bundle_sha" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" "$SOURCE_SHA" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          attestation_path = Path(sys.argv[1])
+          if attestation_path.stat().st_size > 2 * 1024 * 1024:
+              raise SystemExit("attestation output exceeds its fixed bound")
+          values = json.loads(attestation_path.read_text(encoding="utf-8"))
+          digest, run_id, attempt, source_sha = sys.argv[2:]
+          expected_build = "https://github.com/StrayForest/old_sparky/.github/workflows/platform-security.yml@refs/heads/dev"
+          expected_repo = "https://github.com/StrayForest/old_sparky"
+          expected_runner = f"https://github.com/StrayForest/old_sparky/actions/runs/{run_id}/attempts/{attempt}"
+          if not isinstance(values, list) or not values:
+              raise SystemExit("attestation output is empty")
+          for item in values:
+              result = item.get("verificationResult") if isinstance(item, dict) else None
+              signature = result.get("signature") if isinstance(result, dict) else None
+              certificate = signature.get("certificate") if isinstance(signature, dict) else None
+              statement = result.get("statement") if isinstance(result, dict) else None
+              subjects = statement.get("subject") if isinstance(statement, dict) else None
+              if (
+                  isinstance(certificate, dict)
+                  and certificate.get("issuer") == "https://token.actions.githubusercontent.com"
+                  and certificate.get("sourceRepositoryURI") == expected_repo
+                  and certificate.get("sourceRepositoryRef") == "refs/heads/dev"
+                  and certificate.get("sourceRepositoryDigest") == source_sha
+                  and certificate.get("buildConfigURI") == expected_build
+                  and certificate.get("buildSignerURI") == expected_build
+                  and certificate.get("runInvocationURI") == expected_runner
+                  and isinstance(subjects, list)
+                  and len(subjects) == 1
+                  and isinstance(subjects[0], dict)
+                  and isinstance(subjects[0].get("digest"), dict)
+                  and subjects[0]["digest"].get("sha256") == digest
+              ):
+                  break
+          else:
+              raise SystemExit("backup verifier attestation policy failed")
+          PY
+          /usr/bin/python3 -I -B - "$bundle_path" "$SOURCE_SHA" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+          import zipfile
+
+          bundle_path = Path(sys.argv[1])
+          source_sha = sys.argv[2]
+          expected_names = (
+              "platform_backup_restore_drill.py",
+              "platform_disk_policy.py",
+              "platform_live_qa_guard.py",
+              "platform_release_retention.py",
+              "platform_build_node_cache.py",
+              "platform_storage_maintenance.py",
+          )
+          with zipfile.ZipFile(bundle_path) as archive:
+              infos = archive.infolist()
+              expected_paths = {f"platform-backup-verifier/{name}" for name in expected_names}
+              expected_paths.add("platform-backup-verifier/manifest.json")
+              if len(infos) != len(expected_paths) or {item.filename for item in infos} != expected_paths:
+                  raise SystemExit("backup verifier bundle inventory is not closed")
+              by_name = {item.filename: item for item in infos}
+              manifest_info = by_name["platform-backup-verifier/manifest.json"]
+              manifest_mode = (manifest_info.external_attr >> 16) & 0o177777
+              if not stat.S_ISREG(manifest_mode) or stat.S_IMODE(manifest_mode) != 0o444 or manifest_info.file_size > 65536:
+                  raise SystemExit("backup verifier manifest metadata is invalid")
+              manifest = json.loads(archive.read(manifest_info).decode("ascii"))
+              if set(manifest) != {"schema", "repository", "source_sha", "files"} or manifest.get("schema") != 1 or manifest.get("repository") != "StrayForest/old_sparky" or manifest.get("source_sha") != source_sha:
+                  raise SystemExit("backup verifier manifest binding is invalid")
+              rows = manifest.get("files")
+              if not isinstance(rows, list) or len(rows) != len(expected_names):
+                  raise SystemExit("backup verifier manifest rows are invalid")
+              seen = set()
+              for row in rows:
+                  if not isinstance(row, dict) or set(row) != {"path", "source_mode", "size", "sha256"}:
+                      raise SystemExit("backup verifier manifest row is not closed")
+                  path = row.get("path")
+                  name = path.removeprefix("platform/tools/") if isinstance(path, str) else ""
+                  if name not in expected_names or name in seen or row.get("source_mode") != 0o644 or type(row.get("size")) is not int or row["size"] <= 0 or re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256", ""))) is None:
+                      raise SystemExit("backup verifier manifest row binding is invalid")
+                  seen.add(name)
+                  item = by_name[f"platform-backup-verifier/{name}"]
+                  mode = (item.external_attr >> 16) & 0o177777
+                  data = archive.read(item)
+                  if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o444 or len(data) != row["size"] or hashlib.sha256(data).hexdigest() != row["sha256"]:
+                      raise SystemExit("backup verifier member bytes or mode differ from manifest")
+          if seen != set(expected_names):
+              raise SystemExit("backup verifier member set differs from manifest")
+          PY
 
       - name: Validate production SSH inputs
         shell: bash
@@ -67,14 +391,178 @@ jobs:
             printf '%s\n' "SSH_DIR=$ssh_dir"
           } >> "$GITHUB_ENV"
 
+      - name: Stage the verified helper bundle on the production host
+        if: ${{ inputs.operation == 'verify-existing' }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          BUNDLE_PATH: ${{ steps.backup-helper.outputs.bundle_path }}
+          BUNDLE_SHA256: ${{ steps.backup-helper.outputs.bundle_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ "$BUNDLE_PATH" = "$RUNNER_TEMP/platform-backup-verifier-input/platform-backup-verifier.zip" ]]
+          [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(stat -c '%F:%a:%h' "$BUNDLE_PATH")" = "regular file:600:1"
+          test "$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')" = "$BUNDLE_SHA256"
+          stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          stage_identity=""
+          cleanup_failed_transfer() {
+            exit_code=$?
+            trap - EXIT
+            if (( exit_code != 0 )) && [[ "$stage_identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+              ssh \
+                -F /dev/null \
+                -o BatchMode=yes \
+                -o IdentitiesOnly=yes \
+                -o StrictHostKeyChecking=yes \
+                -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+                -o ConnectTimeout=10 \
+                -i "$SSH_DIR/id_ed25519" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST" \
+                "bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $stage_identity" <<'REMOTE' >/dev/null 2>&1 || true
+          set -Eeuo pipefail
+          run_id="${1:-}"
+          run_attempt="${2:-}"
+          expected_identity="${3:-}"
+          [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]]
+          test "$(id -u)" -eq 0
+          stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
+          /usr/bin/python3 -I -B - "$stage" "$expected_identity" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          path = Path(sys.argv[1])
+          expected = tuple(int(item) for item in sys.argv[2].split(":"))
+          try:
+              before = path.lstat()
+          except FileNotFoundError:
+              raise SystemExit(0)
+          if not stat.S_ISDIR(before.st_mode) or (before.st_dev, before.st_ino) != expected or before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) != 0o700 or before.st_nlink != 2:
+              raise SystemExit(1)
+          entries = list(path.iterdir())
+          if len(entries) > 1 or any(entry.name != "bundle.zip" for entry in entries):
+              raise SystemExit(1)
+          if entries:
+              bundle = entries[0]
+              item = bundle.lstat()
+              if not stat.S_ISREG(item.st_mode) or item.st_uid != 0 or item.st_gid != 0 or item.st_nlink != 1 or stat.S_IMODE(item.st_mode) != 0o600:
+                  raise SystemExit(1)
+              bundle.unlink()
+          current = path.lstat()
+          if (current.st_dev, current.st_ino) != expected or list(path.iterdir()):
+              raise SystemExit(1)
+          path.rmdir()
+          directory_fd = os.open("/tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+          try:
+              os.fsync(directory_fd)
+          finally:
+              os.close(directory_fd)
+          PY
+          REMOTE
+            fi
+            exit "$exit_code"
+          }
+          trap cleanup_failed_transfer EXIT
+          stage_identity="$(ssh \
+            -F /dev/null \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT" <<'REMOTE'
+          set -Eeuo pipefail
+          run_id="${1:-}"
+          run_attempt="${2:-}"
+          [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
+          test "$(id -u)" -eq 0
+          stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
+          [[ ! -e "$stage" && ! -L "$stage" ]]
+          mkdir -m 700 -- "$stage"
+          test "$(stat -c '%F:%u:%g:%a:%h' "$stage")" = "directory:0:0:700:2"
+          stat -c '%d:%i' "$stage"
+          REMOTE
+          )"
+          [[ "$stage_identity" =~ ^[0-9]+:[0-9]+$ ]]
+          scp \
+            -F /dev/null \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$BUNDLE_PATH" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST:$stage/bundle.zip"
+          ssh \
+            -F /dev/null \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BUNDLE_SHA256 $stage_identity" <<'REMOTE'
+          set -Eeuo pipefail
+          run_id="${1:-}"
+          run_attempt="${2:-}"
+          bundle_sha="${3:-}"
+          expected_identity="${4:-}"
+          [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ "$bundle_sha" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]]
+          stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
+          test "$(id -u)" -eq 0
+          test "$(stat -c '%F:%u:%g:%a:%h' "$stage")" = "directory:0:0:700:2"
+          test "$(stat -c '%d:%i' "$stage")" = "$expected_identity"
+          test "$(stat -c '%F:%u:%g:%a:%h' "$stage/bundle.zip")" = "regular file:0:0:600:1"
+          test "$(sha256sum "$stage/bundle.zip" | awk '{print $1}')" = "$bundle_sha"
+          printf 'Verified backup helper bundle staged for run %s attempt %s\n' "$run_id" "$run_attempt"
+          REMOTE
+          trap - EXIT
+
       - name: Create and verify the production backup
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          BACKUP_OPERATION: ${{ inputs.operation }}
+          EVICT_BUILD_NODE_CACHE: ${{ inputs.evict_build_node_cache }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          BUNDLE_SHA256: ${{ steps.backup-helper.outputs.bundle_sha256 }}
         run: |
           set -euo pipefail
           umask 077
+          [[ "$BACKUP_OPERATION" = create || "$BACKUP_OPERATION" = verify-existing ]]
+          [[ "$EVICT_BUILD_NODE_CACHE" = true || "$EVICT_BUILD_NODE_CACHE" = false ]]
+          if [[ "$BACKUP_OPERATION" = verify-existing ]]; then
+            [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            bundle_stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BACKUP_OPERATION $SOURCE_SHA $BUNDLE_SHA256 $EVICT_BUILD_NODE_CACHE"
+          else
+            [[ "$EVICT_BUILD_NODE_CACHE" = false ]]
+            bundle_stage=none
+            remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT create none none false"
+          fi
           remote_report="$RUNNER_TEMP/platform-production-backup-report.log"
           remote_error="$RUNNER_TEMP/platform-production-backup-ssh-error.log"
           [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
@@ -93,18 +581,118 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT" >"$remote_report" 2>"$remote_error" <<'REMOTE'
+            "bash -s -- $remote_arguments" >"$remote_report" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
 
+          [[ "$#" = 6 ]]
           run_id="${1:-}"
           run_attempt="${2:-}"
+          operation="${3:-}"
+          source_sha="${4:-}"
+          bundle_sha="${5:-}"
+          evict_build_node_cache="${6:-false}"
           [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ "$operation" = create || "$operation" = verify-existing ]]
+          if [[ "$operation" = verify-existing ]]; then
+            [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$bundle_sha" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$evict_build_node_cache" = true || "$evict_build_node_cache" = false ]]
+          else
+            [[ "$source_sha" = none && "$bundle_sha" = none && "$evict_build_node_cache" = false ]]
+          fi
           failure_stage=preflight
           backup_report_file=""
+          helper_stage=""
+          helper_stage_identity=""
           backup_failure_marker() {
             exit_code=$?
             trap - EXIT
+            if [[ "$operation" = verify-existing && -n "$helper_stage" && -n "$helper_stage_identity" ]]; then
+              if /usr/bin/python3 -I -B - "$helper_stage" "$helper_stage_identity" "$bundle_sha" "$source_sha" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          import zipfile
+
+          root = Path(sys.argv[1])
+          expected_identity = tuple(int(value) for value in sys.argv[2].split(":"))
+          expected_bundle_sha, source_sha = sys.argv[3:]
+          names = (
+              "platform_backup_restore_drill.py",
+              "platform_disk_policy.py",
+              "platform_live_qa_guard.py",
+              "platform_release_retention.py",
+              "platform_build_node_cache.py",
+              "platform_storage_maintenance.py",
+          )
+          try:
+              root_st = root.lstat()
+          except FileNotFoundError:
+              raise SystemExit(0)
+          if (
+              not stat.S_ISDIR(root_st.st_mode)
+              or (root_st.st_dev, root_st.st_ino) != expected_identity
+              or root_st.st_uid != 0
+              or root_st.st_gid != 0
+              or stat.S_IMODE(root_st.st_mode) != 0o700
+              or root_st.st_nlink not in {2, 3}
+          ):
+              raise SystemExit(1)
+          entries = {entry.name for entry in root.iterdir()}
+          if entries not in ({"bundle.zip"}, {"bundle.zip", "tools"}):
+              raise SystemExit(1)
+          bundle = root / "bundle.zip"
+          bundle_st = bundle.lstat()
+          if not stat.S_ISREG(bundle_st.st_mode) or bundle_st.st_uid != 0 or bundle_st.st_gid != 0 or bundle_st.st_nlink != 1 or stat.S_IMODE(bundle_st.st_mode) != 0o600 or hashlib.sha256(bundle.read_bytes()).hexdigest() != expected_bundle_sha:
+              raise SystemExit(1)
+          if "tools" in entries:
+              tools = root / "tools"
+              tools_st = tools.lstat()
+              if not stat.S_ISDIR(tools_st.st_mode) or tools_st.st_uid != 0 or tools_st.st_gid != 0 or tools_st.st_nlink != 2 or stat.S_IMODE(tools_st.st_mode) != 0o555 or {entry.name for entry in tools.iterdir()} != set(names):
+                  raise SystemExit(1)
+              with zipfile.ZipFile(bundle) as archive:
+                  manifest = json.loads(archive.read("platform-backup-verifier/manifest.json").decode("ascii"))
+              if manifest.get("source_sha") != source_sha or len(manifest.get("files", [])) != len(names):
+                  raise SystemExit(1)
+              rows = {row.get("path", "").removeprefix("platform/tools/"): row for row in manifest["files"] if isinstance(row, dict)}
+              if set(rows) != set(names):
+                  raise SystemExit(1)
+              for name in names:
+                  path = tools / name
+                  current = path.lstat()
+                  row = rows[name]
+                  if not stat.S_ISREG(current.st_mode) or current.st_uid != 0 or current.st_gid != 0 or current.st_nlink != 1 or stat.S_IMODE(current.st_mode) != 0o444 or current.st_size != row.get("size") or hashlib.sha256(path.read_bytes()).hexdigest() != row.get("sha256"):
+                      raise SystemExit(1)
+              tools.chmod(0o700)
+              for name in names:
+                  (tools / name).unlink()
+              tools.rmdir()
+          if (root / "bundle.zip").exists():
+              current = bundle.lstat()
+              if (current.st_dev, current.st_ino) != (bundle_st.st_dev, bundle_st.st_ino):
+                  raise SystemExit(1)
+              bundle.unlink()
+          current_root = root.lstat()
+          if (current_root.st_dev, current_root.st_ino) != expected_identity or {entry.name for entry in root.iterdir()}:
+              raise SystemExit(1)
+          root.rmdir()
+          directory_fd = os.open("/tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+          try:
+              os.fsync(directory_fd)
+          finally:
+              os.close(directory_fd)
+          PY
+              then
+                :
+              elif (( exit_code == 0 )); then
+                exit_code=1
+                failure_stage=helper_cleanup
+              fi
+            fi
             if [[ -n "$backup_report_file" ]]; then
               if rm -f -- "$backup_report_file"; then
                 :
@@ -129,6 +717,101 @@ jobs:
           python_bin="$runtime/shared/venv/bin/python"
           maintenance_tool="$current/tools/platform_storage_maintenance.py"
           summary_tool="$current/tools/platform_storage_evidence_summary.py"
+          helper_stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
+          if [[ "$operation" = verify-existing ]]; then
+            failure_stage=helper_bundle_validation
+            test "$(stat -c '%F:%u:%g:%a:%h' "$helper_stage")" = "directory:0:0:700:2"
+            helper_stage_identity="$(stat -c '%d:%i' "$helper_stage")"
+            test "$(stat -c '%F:%u:%g:%a:%h' "$helper_stage/bundle.zip")" = "regular file:0:0:600:1"
+            test "$(sha256sum "$helper_stage/bundle.zip" | awk '{print $1}')" = "$bundle_sha"
+            helper_dir="$helper_stage/tools"
+            /usr/bin/python3 -I -B - "$helper_stage/bundle.zip" "$bundle_sha" "$source_sha" "$helper_dir" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+          import zipfile
+
+          archive_path = Path(sys.argv[1])
+          expected_archive_sha, source_sha, destination = sys.argv[2:]
+          destination = Path(destination)
+          names = (
+              "platform_backup_restore_drill.py",
+              "platform_disk_policy.py",
+              "platform_live_qa_guard.py",
+              "platform_release_retention.py",
+              "platform_build_node_cache.py",
+              "platform_storage_maintenance.py",
+          )
+          raw = archive_path.read_bytes()
+          if hashlib.sha256(raw).hexdigest() != expected_archive_sha:
+              raise SystemExit("backup helper archive digest mismatch")
+          destination.mkdir(mode=0o700)
+          with zipfile.ZipFile(archive_path) as archive:
+              infos = archive.infolist()
+              expected = {f"platform-backup-verifier/{name}" for name in names}
+              expected.add("platform-backup-verifier/manifest.json")
+              if len(infos) != len(expected) or {item.filename for item in infos} != expected:
+                  raise SystemExit("backup helper archive inventory is not closed")
+              by_name = {item.filename: item for item in infos}
+              manifest_info = by_name["platform-backup-verifier/manifest.json"]
+              manifest_mode = (manifest_info.external_attr >> 16) & 0o177777
+              if not stat.S_ISREG(manifest_mode) or stat.S_IMODE(manifest_mode) != 0o444 or manifest_info.file_size > 65536:
+                  raise SystemExit("backup helper manifest metadata is invalid")
+              manifest = json.loads(archive.read(manifest_info).decode("ascii"))
+              if set(manifest) != {"schema", "repository", "source_sha", "files"} or manifest.get("schema") != 1 or manifest.get("repository") != "StrayForest/old_sparky" or manifest.get("source_sha") != source_sha:
+                  raise SystemExit("backup helper manifest binding is invalid")
+              rows = manifest.get("files")
+              if not isinstance(rows, list) or len(rows) != len(names):
+                  raise SystemExit("backup helper manifest rows are invalid")
+              seen = set()
+              for row in rows:
+                  if not isinstance(row, dict) or set(row) != {"path", "source_mode", "size", "sha256"}:
+                      raise SystemExit("backup helper manifest row is not closed")
+                  path = row.get("path")
+                  name = path.removeprefix("platform/tools/") if isinstance(path, str) else ""
+                  if name not in names or name in seen or row.get("source_mode") != 0o644 or type(row.get("size")) is not int or not 0 < row["size"] <= 2 * 1024 * 1024 or re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256", ""))) is None:
+                      raise SystemExit("backup helper manifest row binding is invalid")
+                  seen.add(name)
+                  info = by_name[f"platform-backup-verifier/{name}"]
+                  mode = (info.external_attr >> 16) & 0o177777
+                  data = archive.read(info)
+                  if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o444 or len(data) != row["size"] or hashlib.sha256(data).hexdigest() != row["sha256"]:
+                      raise SystemExit("backup helper member bytes or mode differ from manifest")
+                  target = destination / name
+                  descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+                  with os.fdopen(descriptor, "wb") as handle:
+                      handle.write(data)
+                      handle.flush()
+                      os.fsync(handle.fileno())
+                      os.fchmod(handle.fileno(), 0o444)
+              if seen != set(names):
+                  raise SystemExit("backup helper member set differs from manifest")
+          directory = destination.lstat()
+          if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != 0 or directory.st_gid != 0 or stat.S_IMODE(directory.st_mode) != 0o700 or directory.st_nlink != 2:
+              raise SystemExit("backup helper extraction directory metadata is invalid")
+          for name in names:
+              info = (destination / name).lstat()
+              if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o444:
+                  raise SystemExit("backup helper extracted file metadata is invalid")
+          os.chmod(destination, 0o555)
+          directory = destination.lstat()
+          if stat.S_IMODE(directory.st_mode) != 0o555 or directory.st_nlink != 2:
+              raise SystemExit("backup helper extraction directory changed")
+          directory_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+          try:
+              os.fsync(directory_fd)
+          finally:
+              os.close(directory_fd)
+          PY
+            maintenance_tool="$helper_dir/platform_storage_maintenance.py"
+          else
+            failure_stage=preflight
+          fi
+          failure_stage=preflight
           umask 077
           backup_report_file="$(mktemp /tmp/oldsparky-production-backup-report.XXXXXX)"
           chmod 600 "$backup_report_file"
@@ -142,9 +825,13 @@ jobs:
           test -f "$summary_tool" && test ! -L "$summary_tool" \
             || { echo "Storage evidence summary helper is missing or unsafe" >&2; exit 1; }
 
-          failure_stage=backup_create
+          if [[ "$operation" = verify-existing ]]; then
+            failure_stage=backup_verify_existing
+          else
+            failure_stage=backup_create
+          fi
           /usr/bin/python3 -I - "$python_bin" "$maintenance_tool" \
-            "$runtime" "$run_id" "$run_attempt" "$backup_report_file" <<'PY'
+            "$runtime" "$run_id" "$run_attempt" "$backup_report_file" "$operation" <<'PY'
           import os
           from pathlib import Path
           import re
@@ -153,7 +840,7 @@ jobs:
           import subprocess
           import sys
 
-          python_bin, maintenance_tool, runtime, run_id, run_attempt, report_path = sys.argv[1:]
+          python_bin, maintenance_tool, runtime, run_id, run_attempt, report_path, operation = sys.argv[1:]
           if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id):
               raise SystemExit(125)
           if not re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt):
@@ -188,11 +875,27 @@ jobs:
               raise SystemExit(125)
           command = [
               python_bin,
+              "-I",
+              "-B",
               maintenance_tool,
               "--app-dir", runtime,
               "--backup-max-age-hours", "24",
-              "--backup-only", "--private-backup-diagnostics", "--apply", "--json",
+              "--private-backup-diagnostics", "--apply", "--json",
           ]
+          if operation == "create":
+              command.insert(-3, "--backup-only")
+          elif operation == "verify-existing":
+              command.insert(-3, "--verify-existing-backup-only")
+              if evict_build_node_cache == "true":
+                  command.extend((
+                      "--evict-pinned-build-node-cache",
+                      "--eviction-run-id", run_id,
+                      "--eviction-run-attempt", run_attempt,
+                      "--eviction-source-sha", source_sha,
+                      "--eviction-bundle-sha256", bundle_sha,
+                  ))
+          else:
+              raise SystemExit(125)
           def stop_child_group(process):
               try:
                   os.killpg(process.pid, signal.SIGTERM)
@@ -259,38 +962,83 @@ jobs:
             echo "Production backup summary failed" >&2
             exit 1
           }
-          /usr/bin/python3 -I - "$backup_report_file" <<'PY'
+          /usr/bin/python3 -I - "$backup_report_file" "$operation" "$evict_build_node_cache" "$run_id" "$run_attempt" "$source_sha" "$bundle_sha" <<'PY'
           import json
           from pathlib import Path
           import re
           import sys
 
           report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if report.get("mode") != "backup-only" or report.get("ok") is not True:
-              raise SystemExit("lock-aware backup report is not successful")
+          operation = sys.argv[2]
+          evict_cache = sys.argv[3]
+          expected_run_id, expected_attempt, expected_source, expected_bundle = sys.argv[4:]
+          if evict_cache not in {"true", "false"}:
+              raise SystemExit("cache eviction selection is invalid")
+          expected_mode = "backup-only" if operation == "create" else "verify-existing-backup-only"
+          if operation not in {"create", "verify-existing"} or report.get("mode") != expected_mode or report.get("ok") is not True:
+              raise SystemExit("lock-aware backup report mode or health is invalid")
           backup = report.get("backup") or {}
           if (
               backup.get("status") != "completed"
               or backup.get("restore_verified") is not True
               or backup.get("alembic_revision_verified") is not True
-              or backup.get("checksum_present") is not True
               or backup.get("rotation_mode") != "preserve-existing"
-              or backup.get("preexisting_archives_preserved") is not True
               or backup.get("removed_count") != 0
-              or not isinstance(backup.get("preexisting_archive_count"), int)
-              or isinstance(backup.get("preexisting_archive_count"), bool)
-              or backup.get("preexisting_archive_count", -1) < 0
-              or not isinstance(backup.get("preexisting_sidecar_count"), int)
-              or isinstance(backup.get("preexisting_sidecar_count"), bool)
-              or backup.get("preexisting_sidecar_count", -1) < 0
-              or not re.fullmatch(
-                  r"[0-9a-f]{64}",
-                  str(backup.get("preexisting_archive_inventory_sha256") or ""),
-              )
-              or backup.get("preexisting_archive_inventory_sha256")
-              != backup.get("postexisting_archive_inventory_sha256")
+              or not isinstance(backup.get("restored_table_count"), int)
+              or isinstance(backup.get("restored_table_count"), bool)
+              or backup.get("restored_table_count", 0) < 1
           ):
-              raise SystemExit("lock-aware backup verification or preservation failed")
+              raise SystemExit("lock-aware backup verification flags are invalid")
+          if operation == "create":
+              if (
+                  backup.get("checksum_present") is not True
+                  or backup.get("preexisting_archives_preserved") is not True
+                  or backup.get("created") is not True
+                  or not isinstance(backup.get("preexisting_archive_count"), int)
+                  or isinstance(backup.get("preexisting_archive_count"), bool)
+                  or backup.get("preexisting_archive_count", -1) < 0
+                  or not isinstance(backup.get("preexisting_sidecar_count"), int)
+                  or isinstance(backup.get("preexisting_sidecar_count"), bool)
+                  or backup.get("preexisting_sidecar_count", -1) < 0
+                  or not re.fullmatch(r"[0-9a-f]{64}", str(backup.get("preexisting_archive_inventory_sha256") or ""))
+                  or backup.get("preexisting_archive_inventory_sha256") != backup.get("postexisting_archive_inventory_sha256")
+              ):
+                  raise SystemExit("new backup creation or preservation failed")
+          elif (
+              backup.get("verified_existing") is not True
+              or backup.get("created") is not False
+              or re.fullmatch(r"[0-9a-f]{64}", str(backup.get("sha256") or "")) is None
+              or not isinstance(backup.get("age_hours"), (int, float))
+              or isinstance(backup.get("age_hours"), bool)
+              or not 0 <= backup.get("age_hours", -1) <= 24
+              or not isinstance(backup.get("restore_verified_at_utc"), str)
+              or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z", backup["restore_verified_at_utc"]) is None
+          ):
+              raise SystemExit("existing backup verification result is invalid")
+          cache = backup.get("build_node_cache")
+          if operation == "verify-existing" and evict_cache == "true":
+              if (
+                  not isinstance(cache, dict)
+                  or cache.get("status") not in {"removed", "already-absent"}
+                  or cache.get("node_version") != "26.3.1"
+                  or cache.get("run_id") != expected_run_id
+                  or cache.get("run_attempt") != expected_attempt
+                  or cache.get("source_sha") != expected_source
+                  or cache.get("bundle_sha256") != expected_bundle
+                  or type(cache.get("reclaimed_bytes")) is not int
+                  or cache["reclaimed_bytes"] < 0
+                  or cache.get("intent_receipt") != f"build-node-cache-eviction-{expected_run_id}-{expected_attempt}.intent.json"
+                  or cache.get("completion_receipt") != f"build-node-cache-eviction-{expected_run_id}-{expected_attempt}.completion.json"
+                  or (cache.get("status") == "removed" and (re.fullmatch(r"[0-9a-f]{64}", str(cache.get("manifest_tree_sha256", ""))) is None or cache.get("regeneration") != "pinned_archive_required"))
+                  or (cache.get("status") == "already-absent" and (cache["reclaimed_bytes"] != 0 or "manifest_tree_sha256" in cache))
+              ):
+                  raise SystemExit("build Node cache eviction result is invalid")
+          elif operation == "verify-existing" and (
+              not isinstance(cache, dict) or cache.get("status") != "not-requested"
+          ):
+              raise SystemExit("unexpected build Node cache operation")
+          elif operation == "create" and (evict_cache != "false" or cache is not None):
+              raise SystemExit("unexpected build Node cache operation")
           for section_name in (
               "production_releases",
               "source_release_artifacts",
@@ -317,14 +1065,35 @@ jobs:
           PY
           failure_stage=public_summary
           public_report="$({
-            /usr/bin/python3 -I - "$public_report" <<'PY'
+            /usr/bin/python3 -I - "$public_report" "$operation" "$backup_report_file" "$EVICT_BUILD_NODE_CACHE" <<'PY'
           import json
+          from pathlib import Path
           import sys
 
           public = json.loads(sys.argv[1])
           if not isinstance(public, dict) or public.get("mode") != "unknown":
               raise SystemExit("unexpected retention summary mode")
-          public["mode"] = "backup-only"
+          public["mode"] = "backup-only" if sys.argv[2] == "create" else "verify-existing-backup-only"
+          if sys.argv[4] == "true":
+              report = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+              cache = report["backup"]["build_node_cache"]
+              projected = {
+                  "status": cache["status"],
+                  "node_version": cache["node_version"],
+                  "reclaimed_bytes": cache["reclaimed_bytes"],
+                  "intent_receipt": cache["intent_receipt"],
+                  "completion_receipt": cache["completion_receipt"],
+                  "run_id": cache["run_id"],
+                  "run_attempt": cache["run_attempt"],
+                  "source_sha": cache["source_sha"],
+                  "bundle_sha256": cache["bundle_sha256"],
+              }
+              if cache["status"] == "removed":
+                  projected["manifest_tree_sha256"] = cache["manifest_tree_sha256"]
+                  projected["regeneration"] = cache["regeneration"]
+              public["build_node_cache"] = projected
+          elif sys.argv[4] != "false":
+              raise SystemExit("cache eviction selection is invalid")
           print(json.dumps(public, sort_keys=True, separators=(",", ":")))
           PY
           } 2>/dev/null)" || {
@@ -385,7 +1154,7 @@ jobs:
           with open(sys.argv[1], encoding="utf-8") as handle:
               raw = handle.read(4097)
           match = re.fullmatch(
-              r"BACKUP_FAILURE schema=1 stage=(preflight|backup_create|summary_validation|public_summary|private_capture_cleanup|report_cleanup|complete) exit_code=([0-9]{1,3})\n",
+              r"BACKUP_FAILURE schema=1 stage=(preflight|helper_bundle_validation|backup_create|backup_verify_existing|summary_validation|public_summary|private_capture_cleanup|helper_cleanup|report_cleanup|complete) exit_code=([0-9]{1,3})\n",
               raw,
           )
           if match is not None:

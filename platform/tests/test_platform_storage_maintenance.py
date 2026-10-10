@@ -3,11 +3,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,6 +19,7 @@ from types import SimpleNamespace
 import textwrap
 import unittest
 from unittest import mock
+import zipfile
 
 import yaml
 
@@ -109,6 +113,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             skip_backup=True,
             apply=True,
             backup_only=False,
+            verify_existing_backup_only=False,
+            evict_pinned_build_node_cache=False,
+            eviction_run_id=None,
+            eviction_run_attempt=None,
+            eviction_source_sha=None,
+            eviction_bundle_sha256=None,
+            private_backup_diagnostics=False,
         )
 
     def test_artifact_plan_keeps_five_and_protects_rollback(self) -> None:
@@ -236,6 +247,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(args.maximum_used_percent, 85.0)
         self.assertEqual(args.backup_max_age_hours, 24.0)
         self.assertFalse(args.backup_only)
+        self.assertFalse(args.evict_pinned_build_node_cache)
+        self.assertIsNone(args.eviction_run_id)
 
     def test_backup_only_cli_is_apply_only_and_cannot_skip_backup(self) -> None:
         with mock.patch.object(
@@ -245,6 +258,39 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 maintenance.parse_args()
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--evict-pinned-build-node-cache",
+                "--backup-only",
+                "--apply",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                maintenance.parse_args()
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--verify-existing-backup-only",
+                "--evict-pinned-build-node-cache",
+                "--eviction-run-id",
+                "12345",
+                "--eviction-run-attempt",
+                "2",
+                "--eviction-source-sha",
+                "c" * 40,
+                "--eviction-bundle-sha256",
+                "d" * 64,
+                "--apply",
+            ],
+        ):
+            args = maintenance.parse_args()
+            self.assertTrue(args.evict_pinned_build_node_cache)
+            self.assertEqual(args.eviction_run_id, "12345")
         with mock.patch.object(
             maintenance.sys,
             "argv",
@@ -595,10 +641,183 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(report["production_releases"]["deleted_count"], 0)
         self.assertEqual(report["source_release_artifacts"]["deleted_count"], 0)
         self.assertEqual(report["live_qa_runtime_caches"]["deleted_count"], 0)
+
         self.assertEqual(report["limits"]["backup_keep"], 14)
         self.assertEqual(report["transient"]["failed_builds"]["count"], 0)
         self.assertEqual(report["transient"]["browser_test_artifacts"]["count"], 0)
         self.assertEqual(report["transient"]["preprod_screenshots"]["count"], 0)
+
+        args.backup_only = False
+        args.verify_existing_backup_only = True
+        result = {
+            "ok": True,
+            "status": "verified-existing",
+            "verified_existing": True,
+            "created": False,
+            "rotation_mode": "preserve-existing",
+            "removed_count": 0,
+            "metadata_file": "platformdb-latest.json",
+            "dump_file": "platformdb-latest.dump",
+            "age_hours": 20.8,
+            "restore_verified": True,
+            "alembic_revision_verified": True,
+            "restored_table_count": 321,
+            "sha256": "a" * 64,
+            "restore_verified_at_utc": "2026-10-10T12:00:00Z",
+        }
+        events.clear()
+        with (
+            mock.patch.object(maintenance, "maintenance_lock_scope", tracked_scope),
+            mock.patch.object(maintenance, "_plan_and_maybe_apply") as retention_plan,
+            mock.patch.object(
+                maintenance, "verify_existing_backup", return_value=result
+            ) as verify_backup,
+            mock.patch.object(
+                maintenance.live_qa_guard,
+                "prune_runtime_cache_release_lock_held",
+            ) as live_qa_prune,
+        ):
+            report = run_maintenance(args)
+
+        self.assertEqual(report["mode"], "verify-existing-backup-only")
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["backup"]["verified_existing"])
+        self.assertFalse(report["backup"]["created"])
+        self.assertEqual(report["backup"]["rotation_mode"], "preserve-existing")
+        self.assertEqual(report["backup"]["removed_count"], 0)
+        self.assertEqual(events, ["locks-enter", "locks-exit"])
+        verify_backup.assert_called_once_with(
+            app_dir,
+            max_age_hours=24.0,
+            private_failure_diagnostics=False,
+        )
+        live_qa_prune.assert_not_called()
+        retention_plan.assert_not_called()
+        self.assertTrue(candidate.exists())
+        self.assertEqual(report["production_releases"]["deleted_count"], 0)
+        self.assertEqual(report["source_release_artifacts"]["deleted_count"], 0)
+        self.assertEqual(report["live_qa_runtime_caches"]["deleted_count"], 0)
+
+        args.evict_pinned_build_node_cache = True
+        args.eviction_run_id = "12345"
+        args.eviction_run_attempt = "2"
+        args.eviction_source_sha = "c" * 40
+        args.eviction_bundle_sha256 = "d" * 64
+        events.clear()
+
+        @maintenance.contextmanager
+        def tracked_live_qa_lock():
+            events.append("live-qa-enter")
+            try:
+                yield
+            finally:
+                events.append("live-qa-exit")
+
+        cache_identity = {
+            "schema": 1,
+            "event": "build_node_cache_eviction",
+            "node_version": "26.3.1",
+            "cache_dev": 27,
+            "cache_ino": 123456,
+            "manifest_tree_sha256": "b" * 64,
+            "total_bytes": 234_000_000,
+        }
+
+        def evict_cache(*, write_intent, write_completion) -> dict[str, object]:
+            events.append("cache-evict")
+            write_intent({**cache_identity, "status": "intent"})
+            write_completion(
+                {
+                    **cache_identity,
+                    "status": "removed",
+                    "reclaimed_bytes": 234_000_000,
+                    "regeneration": "pinned_archive_required",
+                }
+            )
+            return {
+                "status": "removed",
+                "node_version": "26.3.1",
+                "manifest_tree_sha256": "b" * 64,
+                "reclaimed_bytes": 234_000_000,
+                "regeneration": "pinned_archive_required",
+            }
+
+        receipt_writer = maintenance.write_build_node_cache_receipt
+
+        def write_receipt(app_path: Path, *, phase: str, **kwargs: object) -> str:
+            events.append(f"receipt-{phase}")
+            return receipt_writer(app_path, phase=phase, **kwargs)
+
+        def verify_latest(*_args: object, **_kwargs: object) -> dict[str, object]:
+            events.append("verify-latest")
+            return result
+
+        with (
+            mock.patch.object(maintenance, "DEFAULT_APP_DIR", app_dir),
+            mock.patch.object(
+                maintenance, "DEFAULT_SOURCE_RELEASE_DIR", self.release_dir
+            ),
+            mock.patch.object(maintenance, "maintenance_lock_scope", tracked_scope),
+            mock.patch.object(maintenance, "live_qa_machine_lock", tracked_live_qa_lock),
+            mock.patch.object(
+                maintenance.platform_build_node_cache,
+                "evict_pinned_build_node_cache",
+                side_effect=evict_cache,
+            ) as evict,
+            mock.patch.object(
+                maintenance,
+                "write_build_node_cache_receipt",
+                side_effect=write_receipt,
+            ) as write_receipt_mock,
+            mock.patch.object(
+                maintenance, "verify_existing_backup", side_effect=verify_latest
+            ) as verify_backup,
+            mock.patch.object(maintenance, "_plan_and_maybe_apply") as retention_plan,
+            mock.patch.object(
+                maintenance.live_qa_guard,
+                "prune_runtime_cache_release_lock_held",
+            ) as live_qa_prune,
+        ):
+            report = run_maintenance(args)
+
+        self.assertEqual(
+            events,
+            [
+                "locks-enter",
+                "live-qa-enter",
+                "cache-evict",
+                "receipt-intent",
+                "receipt-completion",
+                "verify-latest",
+                "live-qa-exit",
+                "locks-exit",
+            ],
+        )
+        evict.assert_called_once()
+        self.assertEqual(write_receipt_mock.call_count, 2)
+        verify_backup.assert_called_once_with(
+            app_dir,
+            max_age_hours=24.0,
+            private_failure_diagnostics=False,
+        )
+        self.assertEqual(report["backup"]["build_node_cache"]["status"], "removed")
+        self.assertEqual(
+            report["backup"]["build_node_cache"]["reclaimed_bytes"], 234_000_000
+        )
+        for phase in ("intent", "completion"):
+            receipt = app_dir / "shared" / (
+                f"build-node-cache-eviction-12345-2.{phase}.json"
+            )
+            receipt_stat = receipt.lstat()
+            self.assertEqual(stat.S_IMODE(receipt_stat.st_mode), 0o600)
+            self.assertEqual((receipt_stat.st_uid, receipt_stat.st_gid), (0, 0))
+            self.assertEqual(receipt_stat.st_nlink, 1)
+            payload = json.loads(receipt.read_text(encoding="ascii"))
+            self.assertEqual(payload["source_sha"], "c" * 40)
+            self.assertEqual(payload["bundle_sha256"], "d" * 64)
+            self.assertEqual(payload["phase"], phase)
+        live_qa_prune.assert_not_called()
+        retention_plan.assert_not_called()
 
     def test_backup_only_failure_does_not_prune_or_check_live_qa(self) -> None:
         app_dir = self.root / "runtime" / "platform"
@@ -774,15 +993,23 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_manual_backup_uses_lock_aware_backup_only_workflow(self) -> None:
         workflow_path = REPO_ROOT / ".github/workflows/platform-production-backup.yml"
-        workflow = workflow_path.read_text()
+        workflow = workflow_path.read_text(encoding="utf-8")
         self.assertIn("platform_storage_maintenance.py", workflow)
         self.assertIn("--backup-only", workflow)
         self.assertIn('"--backup-max-age-hours", "24"', workflow)
         self.assertNotIn("--backup-keep 14", workflow)
         self.assertIn("--apply", workflow)
-        self.assertNotIn("platform_backup_restore_drill.py", workflow)
+        self.assertIn('"platform_backup_restore_drill.py"', workflow)
+        self.assertNotIn('"--verify-latest-existing"', workflow)
+        self.assertIn("--verify-existing-backup-only", workflow)
+        self.assertIn("gh attestation verify", workflow)
+        self.assertIn("/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}", workflow)
         self.assertNotIn("--check-latest", workflow)
-        self.assertIn('report.get("mode") != "backup-only"', workflow)
+        self.assertIn("evict_build_node_cache", workflow)
+        self.assertIn('"--evict-pinned-build-node-cache"', workflow)
+        self.assertIn('"platform_build_node_cache.py"', workflow)
+        self.assertIn('"--eviction-bundle-sha256"', workflow)
+        self.assertIn('report.get("mode") != expected_mode', workflow)
         self.assertIn('backup.get("rotation_mode") != "preserve-existing"', workflow)
         self.assertIn('backup.get("preexisting_archives_preserved") is not True', workflow)
         self.assertIn('backup.get("removed_count") != 0', workflow)
@@ -813,9 +1040,246 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             workflow.index("failure_stage=private_capture_cleanup"),
             workflow.index('printf \'%s\\n\' "$public_report"'),
         )
+
+        def workflow_python(marker: str) -> str:
+            marker_start = workflow.index(marker)
+            body_start = workflow.index("\n", marker_start) + 1
+            body_end = workflow.index("\n          PY", body_start)
+            return textwrap.dedent(workflow[body_start:body_end])
+
+        attestation_script = workflow_python(
+            '/usr/bin/python3 -I -B - "$artifact_dir/attestation.json"'
+        )
+        bundle_validation_script = workflow_python(
+            '/usr/bin/python3 -I -B - "$bundle_path" "$SOURCE_SHA"'
+        )
+        extraction_script = workflow_python(
+            '/usr/bin/python3 -I -B - "$helper_stage/bundle.zip" "$bundle_sha"'
+        )
+        self.assertLess(
+            workflow.index('test "$bundle_sha" = "$(awk -F='),
+            workflow.index("gh attestation verify \"$bundle_path\""),
+        )
+        self.assertLess(
+            workflow.index("gh attestation verify \"$bundle_path\""),
+            workflow.index(
+                "- name: Stage the verified helper bundle on the production host"
+            ),
+        )
+        self.assertLess(
+            workflow.index("backup verifier attestation policy failed"),
+            workflow.index(
+                "- name: Stage the verified helper bundle on the production host"
+            ),
+        )
+
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as fixture_root_name:
+            fixture_root = Path(fixture_root_name)
+            bundle_path = fixture_root / "bundle.zip"
+            source_sha = "a" * 40
+            names = (
+                "platform_backup_restore_drill.py",
+                "platform_disk_policy.py",
+                "platform_live_qa_guard.py",
+                "platform_release_retention.py",
+                "platform_build_node_cache.py",
+                "platform_storage_maintenance.py",
+            )
+            payloads = {
+                name: f"bounded fixture {name}\n".encode("ascii")
+                for name in names
+            }
+            manifest_rows = [
+                {
+                    "path": f"platform/tools/{name}",
+                    "source_mode": 0o644,
+                    "size": len(payloads[name]),
+                    "sha256": hashlib.sha256(payloads[name]).hexdigest(),
+                }
+                for name in names
+            ]
+            valid_manifest = {
+                "schema": 1,
+                "repository": "StrayForest/old_sparky",
+                "source_sha": source_sha,
+                "files": manifest_rows,
+            }
+
+            def write_bundle(
+                *,
+                manifest: dict[str, object] | None = None,
+                member_mode: int = stat.S_IFREG | 0o444,
+                duplicate_member: bool = False,
+            ) -> None:
+                selected_manifest = manifest or valid_manifest
+                with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for name in names:
+                        info = zipfile.ZipInfo(f"platform-backup-verifier/{name}")
+                        mode = member_mode if name == names[0] else stat.S_IFREG | 0o444
+                        info.external_attr = mode << 16
+                        archive.writestr(info, payloads[name])
+                    manifest_info = zipfile.ZipInfo(
+                        "platform-backup-verifier/manifest.json"
+                    )
+                    manifest_info.external_attr = (stat.S_IFREG | 0o444) << 16
+                    archive.writestr(
+                        manifest_info,
+                        json.dumps(selected_manifest, separators=(",", ":")),
+                    )
+                    if duplicate_member:
+                        duplicate = zipfile.ZipInfo(
+                            f"platform-backup-verifier/{names[0]}"
+                        )
+                        duplicate.external_attr = (stat.S_IFREG | 0o444) << 16
+                        archive.writestr(duplicate, payloads[names[0]])
+
+            def run_inline(
+                script: str, *arguments: str
+            ) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-I", "-B", "-", *arguments],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+
+            write_bundle()
+            bundle_sha = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+            attestation_path = fixture_root / "attestation.json"
+            expected_workflow = (
+                "https://github.com/StrayForest/old_sparky/.github/workflows/"
+                "platform-security.yml@refs/heads/dev"
+            )
+            valid_attestation = [
+                {
+                    "verificationResult": {
+                        "signature": {
+                            "certificate": {
+                                "issuer": "https://token.actions.githubusercontent.com",
+                                "sourceRepositoryURI": (
+                                    "https://github.com/StrayForest/old_sparky"
+                                ),
+                                "sourceRepositoryRef": "refs/heads/dev",
+                                "sourceRepositoryDigest": source_sha,
+                                "buildConfigURI": expected_workflow,
+                                "buildSignerURI": expected_workflow,
+                                "runInvocationURI": (
+                                    "https://github.com/StrayForest/old_sparky/"
+                                    "actions/runs/123456/attempts/2"
+                                ),
+                            }
+                        },
+                        "statement": {
+                            "subject": [{"digest": {"sha256": bundle_sha}}]
+                        },
+                    }
+                }
+            ]
+
+            def attestations_pass(values: object) -> bool:
+                attestation_path.write_text(json.dumps(values), encoding="utf-8")
+                result = run_inline(
+                    attestation_script,
+                    str(attestation_path),
+                    bundle_sha,
+                    "123456",
+                    "2",
+                    source_sha,
+                )
+                return result.returncode == 0
+
+            self.assertTrue(attestations_pass(valid_attestation))
+            for field, wrong in (
+                ("sourceRepositoryDigest", "b" * 40),
+                (
+                    "runInvocationURI",
+                    "https://github.com/StrayForest/old_sparky/"
+                    "actions/runs/123457/attempts/2",
+                ),
+            ):
+                broken = json.loads(json.dumps(valid_attestation))
+                broken[0]["verificationResult"]["signature"]["certificate"][
+                    field
+                ] = wrong
+                self.assertFalse(attestations_pass(broken), field)
+            broken_subject = json.loads(json.dumps(valid_attestation))
+            broken_subject[0]["verificationResult"]["statement"]["subject"][0][
+                "digest"
+            ]["sha256"] = "c" * 64
+            self.assertFalse(attestations_pass(broken_subject), "subject digest")
+            broken_subject[0]["verificationResult"]["statement"]["subject"][0][
+                "digest"
+            ]["sha256"] = bundle_sha
+            broken_subject[0]["verificationResult"]["statement"]["subject"].append(
+                {"digest": {"sha256": bundle_sha}}
+            )
+            self.assertFalse(attestations_pass(broken_subject), "multiple subjects")
+
+            valid_zip = run_inline(
+                bundle_validation_script, str(bundle_path), source_sha
+            )
+            self.assertEqual(valid_zip.returncode, 0, valid_zip.stderr)
+            for kwargs, reason in (
+                (
+                    {"manifest": {**valid_manifest, "source_sha": "d" * 40}},
+                    "source binding",
+                ),
+                (
+                    {
+                        "manifest": {
+                            **valid_manifest,
+                            "files": [
+                                {**manifest_rows[0], "sha256": "e" * 64},
+                                *manifest_rows[1:],
+                            ],
+                        }
+                    },
+                    "inner member digest",
+                ),
+                ({"duplicate_member": True}, "duplicate ZIP member"),
+                ({"member_mode": stat.S_IFLNK | 0o777}, "symlink ZIP member"),
+            ):
+                write_bundle(**kwargs)
+                rejected = run_inline(
+                    bundle_validation_script, str(bundle_path), source_sha
+                )
+                self.assertNotEqual(rejected.returncode, 0, reason)
+
+            write_bundle()
+            archive_sha = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+            output_dir = fixture_root / "extracted"
+            wrong_outer_sha = run_inline(
+                extraction_script,
+                str(bundle_path),
+                "e" * 64,
+                source_sha,
+                str(output_dir),
+            )
+            self.assertNotEqual(wrong_outer_sha.returncode, 0)
+            self.assertFalse(output_dir.exists())
+            extracted = run_inline(
+                extraction_script,
+                str(bundle_path),
+                archive_sha,
+                source_sha,
+                str(output_dir),
+            )
+            self.assertEqual(extracted.returncode, 0, extracted.stderr)
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()}, set(names)
+            )
+            self.assertTrue(
+                all(
+                    stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) == 0o444
+                    and path.stat(follow_symlinks=False).st_nlink == 1
+                    for path in output_dir.iterdir()
+                )
+            )
         self.assertIn('backup.get("restore_verified") is not True', workflow)
         self.assertIn('backup.get("checksum_present") is not True', workflow)
-        self.assertIn('public["mode"] = "backup-only"', workflow)
+        self.assertIn('public["mode"] = "backup-only" if sys.argv[2] == "create" else "verify-existing-backup-only"', workflow)
         self.assertIn(
             '"production_releases",\n              "source_release_artifacts",\n              "live_qa_runtime_caches"',
             workflow,
@@ -848,7 +1312,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 f'backup_report_file="$(mktemp {report_path}.XXXXXX)"',
             )
             completed = subprocess.run(
-                ["bash", "-s", "--", "123456", "1"],
+                ["bash", "-s", "--", "123456", "1", "create", "none", "none", "false"],
                 input=remote_script,
                 text=True,
                 capture_output=True,
@@ -870,7 +1334,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             if step.get("name") == "Create and verify the production backup"
         )
         remote_script = run_script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
-        wrapper_script = remote_script.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        wrapper_script = next(
+            block
+            for block in re.findall(r"<<'PY'\n(.*?)\n[ \t]*PY(?=\n)", remote_script, re.S)
+            if "def stop_child_group(process):" in block
+        )
         function_start = wrapper_script.index("def stop_child_group(process):")
         function_end = wrapper_script.index("signal.signal(signal.SIGTERM", function_start)
         function_source = wrapper_script[function_start:function_end].replace(
@@ -962,7 +1430,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             if step.get("name") == "Create and verify the production backup"
         )
         remote_script = run_script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
-        wrapper_script = remote_script.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        wrapper_script = next(
+            block
+            for block in re.findall(r"<<'PY'\n(.*?)\n[ \t]*PY(?=\n)", remote_script, re.S)
+            if "def stop_child_group(process):" in block
+        )
         wrapper_script = wrapper_script.replace(
             'capture_path = Path(f"/tmp/oldsparky-production-backup-{run_id}-{run_attempt}.stderr")',
             'capture_path = Path("/tmp/placeholder.stderr")',
@@ -1003,6 +1475,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "123456",
                     "1",
                     str(report_path),
+                    "create",
                 ],
                 input=wrapper_script,
                 text=True,
@@ -1372,9 +1845,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             events.append("release-exit")
 
         @maintenance.contextmanager
-        def tracked_source_lock(path: Path):
+        def tracked_source_lock(
+            path: Path, *, initialize_if_missing: bool = False
+        ):
             events.append("source-enter")
-            with original_source_lock(path) as resolved:
+            with original_source_lock(
+                path, initialize_if_missing=initialize_if_missing
+            ) as resolved:
                 yield resolved
             events.append("source-exit")
 
@@ -1432,6 +1909,111 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "reclaimed_tombstone_count": 0,
             },
         )
+
+        # The cache-only opt-in may initialize only the canonical build-lock
+        # directory. Exercise its no-follow creation and inode-race guards
+        # without changing the normal missing-lock behavior above.
+        with tempfile.TemporaryDirectory(dir="/root") as source_root_name:
+            source_root = Path(source_root_name) / "platform"
+            source_root.mkdir(mode=0o755)
+            source_lock_path = source_root / "dist" / "releases"
+
+            # Reject a noncanonical app before the opt-in lock scope can
+            # initialize the otherwise-canonical source lock directory.
+            canonical_app = Path(source_root_name) / "canonical-app"
+            canonical_app.mkdir()
+            noncanonical_app = Path(source_root_name) / "other-app"
+            noncanonical_app.mkdir()
+            noncanonical_args = self.maintenance_args(noncanonical_app)
+            noncanonical_args.verify_existing_backup_only = True
+            noncanonical_args.evict_pinned_build_node_cache = True
+            noncanonical_args.source_release_dir = source_lock_path
+            with (
+                mock.patch.object(maintenance, "DEFAULT_APP_DIR", canonical_app),
+                mock.patch.object(
+                    maintenance, "DEFAULT_SOURCE_RELEASE_DIR", source_lock_path
+                ),
+                mock.patch.object(
+                    maintenance,
+                    "maintenance_lock_scope",
+                    side_effect=AssertionError("lock scope ran before path rejection"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "canonical app/build lock roots"):
+                    maintenance.run_maintenance(noncanonical_args)
+            self.assertFalse(source_root.joinpath("dist").exists())
+
+            with (
+                mock.patch.object(
+                    maintenance, "DEFAULT_PLATFORM_SOURCE_ROOT", source_root
+                ),
+                mock.patch.object(
+                    maintenance, "DEFAULT_SOURCE_RELEASE_DIR", source_lock_path
+                ),
+            ):
+                previous_umask = os.umask(0o077)
+                try:
+                    with maintenance.source_release_lock(
+                        source_lock_path, initialize_if_missing=True
+                    ) as locked_path:
+                        self.assertEqual(locked_path, source_lock_path)
+                        lock_stat = source_lock_path.stat(follow_symlinks=False)
+                        dist_stat = source_lock_path.parent.stat(
+                            follow_symlinks=False
+                        )
+                        self.assertEqual(stat.S_IMODE(lock_stat.st_mode), 0o755)
+                        self.assertEqual(stat.S_IMODE(dist_stat.st_mode), 0o755)
+                        self.assertEqual((lock_stat.st_uid, lock_stat.st_gid), (0, 0))
+                finally:
+                    os.umask(previous_umask)
+
+                unsafe_root = Path(source_root_name) / "unsafe-platform"
+                unsafe_root.mkdir(mode=0o755)
+                outside = Path(source_root_name) / "outside"
+                outside.mkdir(mode=0o755)
+                (unsafe_root / "dist").symlink_to(outside, target_is_directory=True)
+                unsafe_lock_path = unsafe_root / "dist" / "releases"
+                with mock.patch.object(
+                    maintenance, "DEFAULT_PLATFORM_SOURCE_ROOT", unsafe_root
+                ), mock.patch.object(
+                    maintenance, "DEFAULT_SOURCE_RELEASE_DIR", unsafe_lock_path
+                ):
+                    with self.assertRaises(OSError):
+                        maintenance._ensure_canonical_source_release_lock_directory(
+                            unsafe_lock_path
+                        )
+                self.assertFalse((outside / "releases").exists())
+
+                race_root = Path(source_root_name) / "race-platform"
+                race_root.mkdir(mode=0o755)
+                race_lock_path = race_root / "dist" / "releases"
+                with (
+                    mock.patch.object(
+                        maintenance, "DEFAULT_PLATFORM_SOURCE_ROOT", race_root
+                    ),
+                    mock.patch.object(
+                        maintenance, "DEFAULT_SOURCE_RELEASE_DIR", race_lock_path
+                    ),
+                ):
+                    @maintenance.contextmanager
+                    def replace_lock_directory(path: Path, *, label: str):
+                        moved = path.with_name("releases.original")
+                        path.rename(moved)
+                        path.mkdir(mode=0o755)
+                        yield path
+
+                    with mock.patch.object(
+                        maintenance,
+                        "exclusive_directory_lock",
+                        replace_lock_directory,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                            with maintenance.source_release_lock(
+                                race_lock_path, initialize_if_missing=True
+                            ):
+                                self.fail("replaced source lock directory was accepted")
+                    self.assertTrue(race_lock_path.is_dir())
+                    self.assertTrue(race_lock_path.with_name("releases.original").is_dir())
 
     def test_removed_legacy_backup_template_is_not_a_runtime_dependency(self) -> None:
         legacy_template = (

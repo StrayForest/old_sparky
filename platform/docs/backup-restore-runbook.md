@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-08
+- Last reviewed: 2026-10-10
 
 ## Local verified backup
 
@@ -64,6 +64,50 @@ failure diagnostics stay in a root-private file and are not copied to the
 public artifact. No backup-only branch rotates or removes existing archives.
 Full storage maintenance owns the separate archive-rotation path and applies
 its configured keep count only after a successful restore drill.
+
+### Re-verify the newest existing backup
+
+When the newest archive is present but its restore verification is missing or
+failed, use the workflow's `verify-existing` operation. It selects only the
+newest sidecar, validates that exact archive and metadata, and runs the same
+temporary-database restore/Alembic/table checks. It never falls back to an
+older pair, creates a dump, rotates pairs, or changes archive bytes. On success
+it updates only the selected sidecar's restore-verification fields; the
+original completion time remains the age reference. Failure leaves that pair
+unchanged. The restore monitor samples free space during each restore and
+terminates its owned child at the configured floor plus lead margin; the lead
+is not a hard bound on a single write burst.
+
+The workflow offers an explicit `evict_build_node_cache` opt-in for the case
+where the validated disposable builder cache is the remaining storage
+constraint. It is available only with `verify-existing`. While holding the
+release, retained-load, build-output and live-QA locks, the helper validates
+the pinned cache manifest and complete tree, checks for process references,
+records a durable intent, and removes only the exact pinned build-Node cache.
+It then records a durable completion receipt before starting the restore
+drill. The cache is regenerable from its pinned archive. A failure after the
+intent or during removal stops the workflow for operator review; it does not
+start the restore or alter a backup pair. This operation does not evict the
+separate live-QA runtime cache.
+
+For this opt-in only, if the canonical local build-output lock path
+`/root/old_sparky/platform/dist/releases` is absent, maintenance initializes
+the fixed `dist` and `releases` directories as root-owned mode `0755`
+directories. It validates the existing path chain without following symlinks,
+requires the same filesystem device, fsyncs each parent after creation, and
+then locks the exact `releases` directory inode used by the release builder.
+Existing unsafe, replaced, or unexpected paths stop the operation. Ordinary
+backup verification does not create these directories and retains its
+existing lock behavior.
+
+Dispatch `Platform production backup` from reviewed `dev` with
+`operation=verify-existing`, the exact successful security-run ID/attempt and
+source SHA, and `evict_build_node_cache=true`. The workflow fetches and
+attestation-checks the exact source-bound helper bundle before staging it.
+The bounded public result reports only cache status, Node version, allocated
+bytes, tree digest and receipt names; it does not publish backup metadata or
+private restore diagnostics. Leave the option false when cache eviction is
+not required.
 
 Check freshness without restoring production:
 
