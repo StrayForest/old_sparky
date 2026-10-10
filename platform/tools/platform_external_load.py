@@ -1152,11 +1152,21 @@ def _manifest_source_binding(payload: Mapping[str, Any]) -> tuple[str, str, dict
 
 def load_manifest(path: Path) -> tuple[dict[str, Any], list[VirtualUser]]:
     try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ExternalLoadError("external load manifest is not valid JSON") from exc
+    return load_manifest_bytes(raw)
+
+
+def load_manifest_bytes(raw: bytes) -> tuple[dict[str, Any], list[VirtualUser]]:
+    """Parse a previously bounded manifest snapshot without reopening its path."""
+
+    try:
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            raw.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_json_keys,
         )
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ExternalLoadError("external load manifest is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise ExternalLoadError("external load manifest must be an object")
@@ -1631,6 +1641,7 @@ def _page_request(
     csrf_cookie_name: str,
     diagnostic_id: str | None = None,
     transport: str = DEFAULT_CLIENT_TRANSPORT,
+    diagnostic_trace_run_id: str | None = None,
     budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     """Measure the real Next.js HTML response, including server TTFB."""
@@ -1644,11 +1655,17 @@ def _page_request(
             session_cookie_name=session_cookie_name,
             csrf_cookie_name=csrf_cookie_name,
             diagnostic_id=diagnostic_id,
+            diagnostic_trace_run_id=diagnostic_trace_run_id,
             budget=budget,
         )
     if transport != DEFAULT_CLIENT_TRANSPORT:
         raise ExternalLoadError(f"unsupported page-load transport: {transport}")
 
+    extra_headers = {"Accept": "text/html"}
+    if diagnostic_trace_run_id is not None:
+        if re.fullmatch(r"[0-9a-f]{32}", diagnostic_trace_run_id) is None:
+            raise ExternalLoadError("diagnostic trace run id is invalid")
+        extra_headers["x-platform-ssr-trace"] = diagnostic_trace_run_id
     return _request(
         origin,
         user,
@@ -1659,7 +1676,7 @@ def _page_request(
         session_cookie_name=session_cookie_name,
         csrf_cookie_name=csrf_cookie_name,
         expected_statuses=frozenset({200}),
-        extra_headers={"Accept": "text/html"},
+        extra_headers=extra_headers,
         url_prefix="",
         diagnostic_id=diagnostic_id,
         budget=budget,
@@ -1693,6 +1710,7 @@ def _page_request_http11_keepalive(
     session_cookie_name: str,
     csrf_cookie_name: str,
     diagnostic_id: str | None = None,
+    diagnostic_trace_run_id: str | None = None,
     budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     """Measure a page request over explicit HTTP/1.1 per-thread keep-alive."""
@@ -1709,6 +1727,10 @@ def _page_request_http11_keepalive(
         "X-CSRF-Token": user.csrf_token,
         "X-Platform-QA-Phase": phase,
     }
+    if diagnostic_trace_run_id is not None:
+        if re.fullmatch(r"[0-9a-f]{32}", diagnostic_trace_run_id) is None:
+            raise ExternalLoadError("diagnostic trace run id is invalid")
+        request_headers["x-platform-ssr-trace"] = diagnostic_trace_run_id
     if budget is not None:
         timeout = budget.bound_timeout(timeout, phase, operation="http_io")
     client = _http11_keepalive_client(origin, timeout)

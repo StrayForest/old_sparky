@@ -192,7 +192,9 @@ if (( TRUSTED_MODE == 1 )); then
 fi
 
 browser_status=0
-if /usr/bin/systemd-run \
+browser_diagnostic=""
+if browser_diagnostic="$("${GUARD[@]}" capture-qa-browser-child -- \
+  /usr/bin/systemd-run \
   --no-ask-password \
   --quiet \
   --wait \
@@ -233,10 +235,15 @@ if /usr/bin/systemd-run \
       test \
       --config="$RUNTIME_SUITE/web/playwright.live.config.ts" \
       "$RUNTIME_SUITE/web/tests/smoke/live-launch.spec.ts"
-then
+)"; then
   browser_status=0
 else
   browser_status=$?
+fi
+if [[ "$browser_diagnostic" =~ ^LIVE_QA_CHILD_DIAGNOSTIC\ schema=1\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=[0-9]{1,3}$ ]]; then
+  printf '%s\n' "$browser_diagnostic"
+else
+  browser_status=2
 fi
 
 count_status=0

@@ -426,6 +426,49 @@ class MediaRepository:
     async def descriptor(self, asset_id: str) -> AssetDescriptor | None:
         return (await self.descriptors((asset_id,))).get(asset_id)
 
+    async def descriptor_for_preloaded_asset(
+        self,
+        asset: MediaAsset,
+    ) -> AssetDescriptor:
+        """Build a descriptor from an asset already loaded in this session.
+
+        The single-account read model joins its avatar asset while loading the
+        account fields. Re-selecting that same ORM entity does not refresh it
+        in SQLAlchemy's identity map, so this narrow path keeps those values
+        and fetches only the ordered variants. General multi-asset callers
+        should continue to use :meth:`descriptors`.
+        """
+
+        variants = tuple(
+            await self.db_session.scalars(
+                select(MediaVariant)
+                .where(MediaVariant.asset_id == asset.id)
+                .order_by(
+                    MediaVariant.asset_id,
+                    MediaVariant.width,
+                    MediaVariant.variant_name,
+                )
+            )
+        )
+        return AssetDescriptor(
+            asset_id=asset.id,
+            purpose=asset.purpose,
+            status=asset.status,
+            error_code=asset.error_code,
+            variants=tuple(
+                VariantRecord(
+                    variant_name=variant.variant_name,
+                    object_key=variant.object_key,
+                    mime_type=variant.mime_type,
+                    width=variant.width,
+                    height=variant.height,
+                    byte_size=variant.byte_size,
+                    sha256=variant.sha256,
+                )
+                for variant in variants
+            ),
+        )
+
     async def descriptors(
         self, asset_ids: tuple[str, ...]
     ) -> dict[str, AssetDescriptor]:

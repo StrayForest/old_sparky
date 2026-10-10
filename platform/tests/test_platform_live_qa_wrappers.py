@@ -108,6 +108,18 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertIn("LIVE_BROWSER_COUNTS schema=1 run_status=failed", line)
                 self.assertIn("logical_expected_fail=1", line)
                 self.assertTrue(line.endswith(f"marker_sha256={marker_sha}\n"))
+                gate.rename(root / "live-user-qa.Abc123")
+                gate = root / "live-user-qa.Abc123"
+                count_path = gate / "test-results" / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE
+                self.assertEqual(
+                    platform_live_qa_guard.public_browser_counts_line(
+                        gate,
+                        source_sha=source_sha,
+                        app_sha=app_sha,
+                        marker_sha256=marker_sha,
+                    ),
+                    line,
+                )
                 with self.assertRaisesRegex(platform_live_qa_guard.GuardError, "binding"):
                     platform_live_qa_guard.public_browser_counts_line(
                         gate,
@@ -463,6 +475,161 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertEqual(stderr.getvalue(), "workflow input is invalid\n")
                 self.assertNotIn("private@example.invalid", stderr.getvalue())
 
+    def test_cpu_diagnostic_dispatch_uses_closed_canonical_stdin(self) -> None:
+        prepare = {
+            "schema": 1,
+            "operation": "prepare",
+            "run_id": "a" * 32,
+            "source_sha": "b" * 40,
+            "workload": "authenticated_workspace_read_pair_v1",
+            "off_start_ms": 60_000,
+            "off_end_ms": 80_000,
+            "on_start_ms": 85_000,
+            "on_end_ms": 105_000,
+        }
+        cleanup = {"schema": 1, "operation": "cleanup", "run_id": "a" * 32}
+        for payload in (prepare, cleanup):
+            raw = json.dumps(
+                payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            ) + "\n"
+            stdout = StringIO()
+            stderr = StringIO()
+            with (
+                patch.object(
+                    platform_workflow_remote_dispatch.sys,
+                    "stdin",
+                    TextIOWrapper(BytesIO(raw.encode("ascii")), encoding="ascii"),
+                ),
+                patch.object(
+                    platform_workflow_remote_dispatch,
+                    "_run_cpu_diagnostic_plan",
+                    return_value=0,
+                ) as invoke,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                self.assertEqual(
+                    platform_workflow_remote_dispatch.main(["cpu-diagnostic-plan"]), 0
+                )
+            self.assertEqual(invoke.call_count, 1)
+            self.assertEqual(invoke.call_args.args[0], payload)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "")
+
+        for malformed in (
+            b'{"schema":1,"schema":1,"operation":"cleanup","run_id":"' + b"a" * 32 + b'"}\n',
+            b'{"schema":1,"operation":"cleanup","run_id":"' + b"a" * 32 + b'","extra":true}\n',
+            b'{"schema":1,"operation":"prepare","run_id":"' + b"a" * 32 + b'","source_sha":"' + b"b" * 40 + b'","workload":"authenticated_workspace_read_pair_v1","off_start_ms":60000,"off_end_ms":80000,"on_start_ms":85000,"on_end_ms":105000,"release_slug":"caller"}\n',
+        ):
+            stdout = StringIO()
+            stderr = StringIO()
+            with (
+                patch.object(
+                    platform_workflow_remote_dispatch.sys,
+                    "stdin",
+                    TextIOWrapper(BytesIO(malformed), encoding="ascii"),
+                ),
+                patch.object(
+                    platform_workflow_remote_dispatch, "_run_cpu_diagnostic_plan"
+                ) as invoke,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                self.assertEqual(
+                    platform_workflow_remote_dispatch.main(["cpu-diagnostic-plan"]), 2
+                )
+            invoke.assert_not_called()
+            self.assertEqual(stderr.getvalue(), "remote workflow input is invalid\n")
+
+        rows = []
+        for service, phase, targets, cpu_ns in (
+            ("api", "off", 2, 4_000_000_000),
+            ("api", "on", 2, 4_200_000_000),
+            ("web", "off", 1, 1_000_000_000),
+            ("web", "on", 1, 1_100_000_000),
+        ):
+            rows.append({
+                "service": service, "phase": phase, "expected_targets": targets,
+                "observed_targets": targets, "event_count": targets, "cpu_ns": cpu_ns,
+                "window_ms_min": 20_000, "window_ms_max": 20_000,
+                "start_lag_ms_min": 0, "start_lag_ms_max": 0,
+                "end_lag_ms_min": 0, "end_lag_ms_max": 0,
+                "duplicate_count": 0, "timing_complete": True,
+            })
+        helper_result = {
+            "status": "expired_plans_removed", "service_count": 2,
+            "usage_status": "complete", "usage_reason": "none", "usage_rows": rows,
+            "profile_status": "complete", "profile_reason": "none",
+            "profile_rows": [
+                {
+                    "service": "api", "expected_targets": 2, "observed_targets": 2,
+                    "event_count": 2, "timer": "thread_cpu", "observation_unit": "calls",
+                    "total_cpu_us": 2_000_000, "sample_count": None,
+                    "start_lag_ms_min": 0, "start_lag_ms_max": 0,
+                    "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
+                    "end_lag_ms_min": 0, "end_lag_ms_max": 0,
+                    "categories": [{
+                        "category": "repo.get_current_user", "cpu_us": 50_000,
+                        "observations": 100,
+                    }],
+                },
+                {
+                    "service": "web", "expected_targets": 1, "observed_targets": 1,
+                    "event_count": 1, "timer": "v8_cpu", "observation_unit": "samples",
+                    "total_cpu_us": 1_000_000, "sample_count": 100,
+                    "start_lag_ms_min": 0, "start_lag_ms_max": 0,
+                    "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
+                    "end_lag_ms_min": 0, "end_lag_ms_max": 0,
+                    "categories": [{"category": "other", "cpu_us": 1_000_000, "observations": 100}],
+                },
+            ],
+        }
+        real_popen = subprocess.Popen
+
+        def invoke_with_helper_result(result: dict[str, object]) -> tuple[int, str]:
+            helper_json = (
+                "CPU_DIAGNOSTIC_PLAN "
+                + json.dumps(result, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            )
+
+            def fake_popen(_command, **kwargs):
+                return real_popen(
+                    [sys.executable, "-c", "import sys; sys.stdin.buffer.read(); sys.stdout.write(" + repr(helper_json) + ")"],
+                    **kwargs,
+                )
+
+            stdout = StringIO()
+            with (
+                patch.object(platform_workflow_remote_dispatch, "_trusted_helper", return_value=True),
+                patch.object(platform_workflow_remote_dispatch.subprocess, "Popen", side_effect=fake_popen),
+                redirect_stdout(stdout),
+            ):
+                status = platform_workflow_remote_dispatch._run_cpu_diagnostic_plan(cleanup)
+            return status, stdout.getvalue()
+
+        dispatch_status, dispatch_output = invoke_with_helper_result(helper_result)
+        self.assertEqual(dispatch_status, 0)
+        self.assertTrue(dispatch_output.startswith("CPU_DIAGNOSTIC_PLAN "))
+        projected = json.loads(dispatch_output.removeprefix("CPU_DIAGNOSTIC_PLAN "))
+        self.assertEqual(projected["usage_rows"], rows)
+        duplicate_result = dict(helper_result)
+        duplicate_rows = [dict(row) for row in rows]
+        duplicate_rows[0]["duplicate_count"] = 1
+        duplicate_result["usage_rows"] = duplicate_rows
+        bad_status, bad_output = invoke_with_helper_result(duplicate_result)
+        self.assertEqual(bad_status, 2)
+        self.assertEqual(bad_output, "")
+        private_label = dict(helper_result)
+        private_profiles = [dict(row) for row in helper_result["profile_rows"]]
+        private_profiles[0]["categories"] = [{
+            "category": "raw_function_name", "cpu_us": 1, "observations": 1,
+        }]
+        private_label["profile_rows"] = private_profiles
+        bad_status, bad_output = invoke_with_helper_result(private_label)
+        self.assertEqual(bad_status, 2)
+        self.assertEqual(bad_output, "")
+
     def test_external_fixture_forwards_control_identity_only_on_stdin(self) -> None:
         class CapturedInput:
             def __init__(self) -> None:
@@ -612,9 +779,21 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         source = (REPO_ROOT / ".github/workflows/platform-live-launch.yml").read_text(
             encoding="utf-8"
         )
+        browser_spec = (
+            REPO_ROOT / "platform/apps/platform_web/tests/smoke/live-launch.spec.ts"
+        ).read_text(encoding="utf-8")
+        browser_config = (
+            REPO_ROOT / "platform/apps/platform_web/playwright.live.config.ts"
+        ).read_text(encoding="utf-8")
         supervisor = (
             TOOLS_ROOT / "platform_live_launch_supervisor.sh"
         ).read_text(encoding="utf-8")
+        route_cases = re.findall(r'^  \{ path: "[^"]+", text:', browser_spec, re.MULTILINE)
+        explicit_tests = re.findall(r"^test\(", browser_spec, re.MULTILINE)
+        browser_projects = re.findall(r'^      name: "live-[a-z-]+",$', browser_config, re.MULTILINE)
+        self.assertEqual((len(route_cases) + len(explicit_tests), len(browser_projects)), (18, 3))
+        self.assertEqual((len(route_cases) + len(explicit_tests)) * len(browser_projects), 54)
+        self.assertEqual(browser_spec.count('type: "public-live-qa-expected-skip"'), 6)
         self.assertIn("PROD_SSH_HOST", source)
         self.assertIn("ssh " + "\\", source)
         self.assertIn(
@@ -1258,17 +1437,17 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
         count_fields = {
             "run_status": "passed",
-            "logical_total": 2,
-            "logical_pass": 1,
+            "logical_total": 54,
+            "logical_pass": 44,
             "logical_fail": 0,
-            "logical_expected_fail": 1,
+            "logical_expected_fail": 0,
             "logical_flaky": 0,
-            "logical_skip": 0,
+            "logical_skip": 10,
             "logical_interrupted": 0,
-            "attempt_total": 2,
-            "attempt_pass": 1,
-            "attempt_fail": 1,
-            "attempt_skip": 0,
+            "attempt_total": 54,
+            "attempt_pass": 44,
+            "attempt_fail": 0,
+            "attempt_skip": 10,
             "attempt_interrupted": 0,
             "attempt_timedout": 0,
             "source_sha": status_sha,
@@ -1293,23 +1472,58 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             (counts_line + good_status + "\n").encode(), 0
         )
         self.assertEqual(passed_report["status"], "passed")
-        self.assertEqual(passed_report["test_count"], 2)
-        self.assertEqual(passed_report["logical_counts"]["logical_expected_fail"], 1)
-        self.assertEqual(passed_report["attempt_counts"]["attempt_fail"], 1)
+        self.assertTrue(passed_report["success"])
+        self.assertEqual(passed_report["failure_reason"], "none")
+        self.assertEqual(passed_report["test_count"], 44)
+        self.assertEqual(passed_report["logical_counts"]["logical_total"], 54)
+        self.assertEqual(passed_report["logical_counts"]["logical_skip"], 10)
+        self.assertEqual(passed_report["attempt_counts"]["attempt_pass"], 44)
         self.assertEqual(passed_report["tests"], [])
         self.assertEqual(passed_report["stage"], "complete")
         self.assertEqual(passed_report["check_id"], "none")
         self.assertEqual(passed_report["source_git_sha"], status_sha)
         self.assertEqual(passed_report["app_target_sha"], status_sha)
         self.assertIsNone(passed_report["source_binding_sha256"])
+        validator_match = re.search(
+            r'/usr/bin/python3 - "\$RUNNER_TEMP/live-launch-report\.json" \\\s*'
+            r'"\$GITHUB_SHA" <<\'PY\'\n(.*?)\n\s*PY',
+            source,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(validator_match)
+        assert validator_match is not None
+        validator_script = textwrap.dedent(validator_match.group(1))
+        with tempfile.TemporaryDirectory(prefix="live-launch-validator-") as directory:
+            report_path = Path(directory) / "report.json"
+            report_path.write_text(json.dumps(passed_report), encoding="utf-8")
+            valid_summary = subprocess.run(
+                [sys.executable, "-", str(report_path), status_sha],
+                input=validator_script,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(valid_summary.returncode, 0, valid_summary.stderr)
+            inconsistent_status = {**passed_report, "status": "failed"}
+            report_path.write_text(json.dumps(inconsistent_status), encoding="utf-8")
+            rejected_summary = subprocess.run(
+                [sys.executable, "-", str(report_path), status_sha],
+                input=validator_script,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected_summary.returncode, 0)
+            self.assertIn("status is not passed", rejected_summary.stderr)
         no_pass_fields = {
             **count_fields,
             "logical_pass": 0,
             "logical_expected_fail": 1,
-            "logical_skip": 1,
-            "attempt_total": 1,
+            "logical_skip": 53,
+            "attempt_total": 54,
             "attempt_pass": 0,
             "attempt_fail": 1,
+            "attempt_skip": 53,
         }
         no_pass_counts_line = (
             "LIVE_BROWSER_COUNTS schema=1 "
@@ -1332,12 +1546,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertFalse(no_pass_report["success"])
         self.assertEqual(no_pass_report["logical_counts"]["logical_pass"], 0)
         self.assertEqual(no_pass_report["logical_counts"]["logical_expected_fail"], 1)
-        self.assertEqual(no_pass_report["logical_counts"]["logical_skip"], 1)
-        self.assertEqual(no_pass_report["test_count"], 2)
+        self.assertEqual(no_pass_report["logical_counts"]["logical_skip"], 53)
+        self.assertEqual(no_pass_report["test_count"], 1)
+        self.assertEqual(no_pass_report["failure_reason"], "coverage_incomplete")
         failed_report = sanitize_status((failed_status + "\n").encode(), 1)
         self.assertEqual(failed_report["status"], "failed")
         self.assertIsNone(failed_report["test_count"])
         self.assertEqual(failed_report["stage"], "identity")
+        self.assertEqual(failed_report["failure_reason"], "child_failed")
         checked_failure_status = (
             "LIVE_LAUNCH_STATUS schema=2 status=failed stage=validation "
             "check=provision_marker child_exit=1 "
@@ -1346,14 +1562,33 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         checked_failure = sanitize_status(checked_failure_status.encode(), 1)
         self.assertEqual(checked_failure["status"], "failed")
         self.assertEqual(checked_failure["check_id"], "provision_marker")
-        for malformed in (
-            (counts_line.replace(status_sha, "b" * 40) + good_status + "\n").encode(),
-            (good_status + "\nPRIVATE_OUTPUT\n").encode(),
-            b"x" * 300,
+        for malformed, reason, error_classes in (
+            (
+                (counts_line.replace(status_sha, "b" * 40) + good_status + "\n").encode(),
+                "counts_unavailable",
+                {"other": 1},
+            ),
+            (
+                (good_status + "\nPRIVATE_OUTPUT\n").encode(),
+                "marker_unavailable",
+                {"unclassified_child_or_dispatch_failure": 1},
+            ),
+            (
+                b"x" * 300,
+                "marker_unavailable",
+                {"unclassified_child_or_dispatch_failure": 1},
+            ),
+            (
+                b"",
+                "marker_unavailable",
+                {"unclassified_child_or_dispatch_failure": 1},
+            ),
         ):
             report = sanitize_status(malformed, 0)
             self.assertEqual(report["status"], "unavailable")
             self.assertIsNone(report["test_count"])
+            self.assertEqual(report["failure_reason"], reason)
+            self.assertEqual(report["error_class_counts"], error_classes)
             self.assertNotIn("PRIVATE_OUTPUT", json.dumps(report))
 
         # The local handoff is an atomic private file, not a shell fragment or
@@ -2120,6 +2355,105 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             )
         )
 
+    def test_qa_child_capture_drains_both_streams_and_retains_only_safe_summary(self) -> None:
+        secret = b"private-token-sentinel"
+        late_error = b"\nError: browserType.launch: private detail"
+        script = (
+            "import os,sys\n"
+            "os.write(1, b'x' * 70000 + " + repr(secret) + ")\n"
+            "os.write(2, b'y' * 70000 + " + repr(late_error) + ")\n"
+            "raise SystemExit(2)\n"
+        )
+        status, marker = platform_live_qa_guard._capture_qa_child(
+            [sys.executable, "-c", script], timeout_seconds=3.0
+        )
+        self.assertEqual(status, 2)
+        match = platform_live_qa_guard.LIVE_QA_CHILD_MARKER_RE.fullmatch(marker)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.group(1), "unclassified")
+        self.assertEqual(int(match.group(2)), 70000 + len(secret))
+        self.assertEqual(int(match.group(3)), 70000 + len(late_error))
+        self.assertEqual(match.group(4), "true")
+        self.assertNotIn(secret.decode("ascii"), marker)
+        wide_count = (
+            "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=unclassified "
+            "stdout_bytes=123456789 stderr_bytes=987654321 "
+            "truncated=true child_exit=2\n"
+        )
+        wide_match = platform_live_qa_guard.LIVE_QA_CHILD_MARKER_RE.fullmatch(wide_count)
+        self.assertIsNotNone(wide_match)
+        assert wide_match is not None
+        self.assertEqual(int(wide_match.group(2)), 123456789)
+        self.assertEqual(int(wide_match.group(3)), 987654321)
+
+    def test_qa_child_capture_timeout_reaps_the_child_group(self) -> None:
+        status, marker = platform_live_qa_guard._capture_qa_child(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout_seconds=0.05,
+        )
+        self.assertEqual(status, 124)
+        self.assertRegex(marker, r"kind=child_timeout .* child_exit=124\n$")
+
+    def test_qa_child_timeout_stops_and_verifies_only_the_fixed_browser_unit(self) -> None:
+        stop = SimpleNamespace(returncode=0, stdout=b"")
+        state = SimpleNamespace(
+            returncode=0,
+            stdout=b"LoadState=loaded\nActiveState=inactive\n",
+        )
+        with (
+            patch.object(platform_live_qa_guard.subprocess, "run", side_effect=(stop, state)) as run,
+            patch.object(platform_live_qa_guard, "_liveqa_cgroup_process_ids", return_value=()),
+        ):
+            self.assertTrue(platform_live_qa_guard._stop_timed_out_qa_browser_unit())
+        self.assertEqual(run.call_args_list[0].args[0], [
+            "/usr/bin/systemctl",
+            "--no-ask-password",
+            "stop",
+            "oldsparky-liveqa-browser.service",
+        ])
+        self.assertEqual(run.call_args_list[1].args[0][-1], "oldsparky-liveqa-browser.service")
+
+        failed = SimpleNamespace(returncode=1, stdout=b"")
+        with patch.object(platform_live_qa_guard.subprocess, "run", return_value=failed):
+            self.assertFalse(platform_live_qa_guard._stop_timed_out_qa_browser_unit())
+
+    def test_qa_child_runner_accepts_only_the_fixed_playwright_scope(self) -> None:
+        runtime = "/var/lib/oldsparky-liveqa/runtime-suite-" + "a" * 40
+        command = [
+            "/usr/bin/systemd-run",
+            "--no-ask-password",
+            "--quiet",
+            "--wait",
+            "--collect",
+            "--pipe",
+            "--service-type=exec",
+            "--expand-environment=no",
+            "--unit=oldsparky-liveqa-browser.service",
+            "--uid=1001",
+            "--gid=1001",
+            f"--working-directory={runtime}/web",
+            "--property=KillMode=control-group",
+            "--property=Restart=no",
+            "--property=RuntimeMaxSec=30min",
+            "--property=SendSIGKILL=yes",
+            "--property=TimeoutStopSec=5s",
+            "--property=UMask=0077",
+            "--",
+            "/usr/bin/env",
+            "-i",
+            "LANG=C.UTF-8",
+            f"{runtime}/node/bin/node",
+            f"{runtime}/web/node_modules/@playwright/test/cli.js",
+            "test",
+            f"--config={runtime}/web/playwright.live.config.ts",
+            f"{runtime}/web/tests/smoke/live-launch.spec.ts",
+        ]
+        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(command))
+        arbitrary = list(command)
+        arbitrary[23] = "/bin/sh"
+        self.assertFalse(platform_live_qa_guard._is_fixed_live_browser_command(arbitrary))
+
     def test_deploy_marker_capture_keeps_bounded_timeout_cleanup(self) -> None:
         expected = ("deploy", "gha-123456-2-aaaaaaaaaaaa", "a" * 40)
         child_code = (
@@ -2600,7 +2934,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", source)
         self.assertIn("RUN-LIVE-USER-QA", source)
         self.assertIn("ssh", source)
-        self.assertIn("live_user_qa_success", source)
+        self.assertIn("LIVE_USER_QA_SUCCESS", source)
+        self.assertIn("LIVE_BROWSER_COUNTS schema=1", source)
         self.assertIn(
             "/root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py",
             source,
@@ -2638,6 +2973,86 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("platform_live_user_qa_trusted.sh", dispatcher)
         self.assertIn("platform_live_qa_mailbox_helper.py", dispatcher)
         self.assertIn("PLATFORM_LIVE_QA_TARGET_SHA", dispatcher)
+
+    def test_live_user_dispatch_forwards_only_one_bound_playwright_count_record(self) -> None:
+        dispatch = platform_workflow_remote_dispatch
+        source_sha = "a" * 40
+        app_sha = "b" * 40
+        count = (
+            "LIVE_BROWSER_COUNTS schema=1 run_status=passed logical_total=1 logical_pass=1 "
+            "logical_fail=0 logical_expected_fail=0 logical_flaky=0 logical_skip=0 "
+            "logical_interrupted=0 attempt_total=1 attempt_pass=1 attempt_fail=0 "
+            "attempt_skip=0 attempt_interrupted=0 attempt_timedout=0 "
+            f"source_sha={source_sha} app_sha={app_sha} marker_sha256={'c' * 64}\n"
+        ).encode("ascii")
+        diagnostic = (
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none stdout_bytes=128 "
+            b"stderr_bytes=0 truncated=false child_exit=0\n"
+        )
+        real_popen = subprocess.Popen
+
+        class Capture:
+            def __init__(self) -> None:
+                self.buffer = BytesIO()
+                self.text = StringIO()
+
+            def write(self, value: str) -> int:
+                return self.text.write(value)
+
+            def flush(self) -> None:
+                self.text.flush()
+
+            def output(self) -> bytes:
+                return self.buffer.getvalue() + self.text.getvalue().encode("ascii")
+
+        def invoke(child_stdout: bytes) -> tuple[int, bytes]:
+            capture = Capture()
+
+            def local_child(_command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+                script = (
+                    "import sys; "
+                    f"sys.stdout.buffer.write({child_stdout!r}); "
+                    "sys.stdout.flush(); sys.stderr.write('secret-sentinel\\n')"
+                )
+                return real_popen(
+                    [sys.executable, "-c", script],
+                    **kwargs,
+                )
+
+            with patch.object(dispatch, "_trusted_helper", return_value=True), \
+                patch.object(dispatch.subprocess, "Popen", side_effect=local_child), \
+                patch.object(dispatch.sys, "stdout", capture):
+                status = dispatch._run_live_user_qa_sudo(
+                    [source_sha], expected_sha=source_sha, expected_app_sha=app_sha
+                )
+            return status, capture.output()
+
+        status, output = invoke(diagnostic + count)
+        self.assertEqual(status, 0, output.decode("ascii", errors="replace"))
+        self.assertIn(count, output)
+        self.assertIn(b"LIVE_USER_QA_SUCCESS\n", output)
+        self.assertNotIn(b"secret-sentinel", output)
+
+        for invalid_output in (
+            diagnostic,
+            diagnostic + count + count,
+            diagnostic + count.replace(source_sha.encode(), b"e" * 40),
+        ):
+            with self.subTest(invalid_output=invalid_output[:40]):
+                invalid_status, invalid_forwarded = invoke(invalid_output)
+                self.assertEqual(invalid_status, 2)
+                self.assertNotIn(b"LIVE_USER_QA_SUCCESS", invalid_forwarded)
+                self.assertNotIn(b"secret-sentinel", invalid_forwarded)
+
+        all_skipped = count.replace(
+            b"logical_total=1 logical_pass=1", b"logical_total=1 logical_pass=0"
+        ).replace(b"logical_skip=0", b"logical_skip=1").replace(
+            b"attempt_pass=1", b"attempt_pass=0"
+        ).replace(b"attempt_skip=0", b"attempt_skip=1")
+        skipped_status, skipped_output = invoke(diagnostic + all_skipped)
+        self.assertEqual(skipped_status, 0)
+        self.assertIn(all_skipped, skipped_output)
+        self.assertNotIn(b"LIVE_USER_QA_SUCCESS", skipped_output)
 
     def test_live_user_inline_handoff_verifier_authenticates_and_fails_closed(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-live-user-qa.yml").read_text(
@@ -2939,11 +3354,23 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         runner_sha = "a" * 40
         app_sha = "b" * 40
         binding_digest = "c" * 64
+        marker_sha = "d" * 64
+        counts = (
+            "LIVE_BROWSER_COUNTS schema=1 run_status=passed logical_total=1 logical_pass=1 "
+            "logical_fail=0 logical_expected_fail=0 logical_flaky=0 logical_skip=0 "
+            "logical_interrupted=0 attempt_total=1 attempt_pass=1 attempt_fail=0 "
+            "attempt_skip=0 attempt_interrupted=0 attempt_timedout=0 "
+            f"source_sha={runner_sha} app_sha={app_sha} marker_sha256={marker_sha}\n"
+        )
+        child = (
+            "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none stdout_bytes=128 "
+            "stderr_bytes=0 truncated=false child_exit=0\n"
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             raw = root / "raw.log"
             report = root / "report.json"
-            raw.write_text("LIVE_USER_QA_SUCCESS\n", encoding="utf-8")
+            raw.write_text(child + counts + "LIVE_USER_QA_SUCCESS\n", encoding="utf-8")
             valid = subprocess.run(
                 [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, app_sha, binding_digest],
                 check=False,
@@ -2955,13 +3382,22 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 json.loads(report.read_text(encoding="utf-8"))["source_binding_sha256"],
                 binding_digest,
             )
+            passed_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(passed_report["status"], "passed")
+            self.assertEqual(passed_report["coverage_status"], "complete")
+            self.assertEqual(passed_report["test_count"], 1)
+            self.assertEqual(passed_report["logical_total"], 1)
+            self.assertEqual(passed_report["logical_skip_count"], 0)
             accepted = subprocess.run(
                 [sys.executable, "-c", validator, str(report), runner_sha, app_sha, binding_digest],
                 check=False,
                 capture_output=True,
                 text=True,
             )
-            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(
+                accepted.returncode, 0,
+                accepted.stderr + json.dumps(passed_report, sort_keys=True),
+            )
 
             missing_binding = subprocess.run(
                 [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, app_sha, ""],
@@ -2971,6 +3407,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             )
             self.assertNotEqual(missing_binding.returncode, 0)
 
+            raw.write_text(
+                child + counts.replace(f"app_sha={app_sha}", f"app_sha={runner_sha}")
+                + "LIVE_USER_QA_SUCCESS\n",
+                encoding="utf-8",
+            )
             same_source = subprocess.run(
                 [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, runner_sha, ""],
                 check=False,
@@ -2985,6 +3426,105 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(same_source_valid.returncode, 0, same_source_valid.stderr)
+
+            raw.write_text(child + "LIVE_USER_QA_SUCCESS\n", encoding="utf-8")
+            marker_only = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, app_sha, binding_digest],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(marker_only.returncode, 0, marker_only.stderr)
+            marker_only_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertFalse(marker_only_report["success"])
+            self.assertEqual(marker_only_report["coverage_status"], "unavailable")
+            self.assertIsNone(marker_only_report["test_count"])
+            rejected_marker_only = subprocess.run(
+                [sys.executable, "-c", validator, str(report), runner_sha, app_sha, binding_digest],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertNotEqual(rejected_marker_only.returncode, 0)
+
+            all_skipped = counts.replace("logical_pass=1", "logical_pass=0").replace(
+                "logical_skip=0", "logical_skip=1"
+            ).replace("attempt_pass=1", "attempt_pass=0").replace(
+                "attempt_skip=0", "attempt_skip=1"
+            )
+            raw.write_text(child + all_skipped + "LIVE_USER_QA_SUCCESS\n", encoding="utf-8")
+            skipped_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, app_sha, binding_digest],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(skipped_run.returncode, 0, skipped_run.stderr)
+            skipped_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertFalse(skipped_report["success"])
+            self.assertEqual(skipped_report["status"], "failed")
+            self.assertEqual(skipped_report["test_count"], 0)
+
+            unexpected_skip = counts.replace("logical_total=1", "logical_total=2").replace(
+                "logical_skip=0", "logical_skip=1"
+            ).replace("attempt_total=1", "attempt_total=2").replace(
+                "attempt_skip=0", "attempt_skip=1"
+            )
+            raw.write_text(child + unexpected_skip + "LIVE_USER_QA_SUCCESS\n", encoding="utf-8")
+            skipped_case = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, app_sha, binding_digest],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(skipped_case.returncode, 0, skipped_case.stderr)
+            skipped_case_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertFalse(skipped_case_report["success"])
+            self.assertEqual(skipped_case_report["test_count"], 1)
+            self.assertEqual(skipped_case_report["logical_skip_count"], 1)
+            self.assertEqual(skipped_case_report["status"], "failed")
+
+            expected_failure = counts.replace("logical_pass=1", "logical_pass=0").replace(
+                "logical_expected_fail=0", "logical_expected_fail=1"
+            ).replace("attempt_pass=1", "attempt_pass=0").replace(
+                "attempt_fail=0", "attempt_fail=1"
+            )
+            raw.write_text(child + expected_failure + "LIVE_USER_QA_SUCCESS\n", encoding="utf-8")
+            expected_failure_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, app_sha, binding_digest],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(expected_failure_run.returncode, 0, expected_failure_run.stderr)
+            expected_failure_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertFalse(expected_failure_report["success"])
+            self.assertEqual(expected_failure_report["logical_expected_fail_count"], 1)
+            self.assertEqual(expected_failure_report["status"], "failed")
+
+            raw.write_text(child + counts + counts + "LIVE_USER_QA_SUCCESS\n", encoding="utf-8")
+            duplicate_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, app_sha, binding_digest],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(duplicate_run.returncode, 0, duplicate_run.stderr)
+            duplicate_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(duplicate_report["coverage_status"], "invalid")
+            self.assertEqual(duplicate_report["status"], "error")
+
+            stale = counts.replace(f"source_sha={runner_sha}", f"source_sha={'e' * 40}")
+            raw.write_text(child + stale + "LIVE_USER_QA_SUCCESS\n", encoding="utf-8")
+            stale_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, app_sha, binding_digest],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(stale_run.returncode, 0, stale_run.stderr)
+            stale_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(stale_report["coverage_status"], "invalid")
+            self.assertFalse(stale_report["success"])
+
+            raw.write_text("", encoding="utf-8")
+            no_cause = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "2", runner_sha, app_sha, binding_digest],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(no_cause.returncode, 0, no_cause.stderr)
+            no_cause_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(no_cause_report["status"], "failed")
+            self.assertEqual(
+                no_cause_report["error_class_counts"],
+                {"unclassified_child_or_dispatch_failure": 1},
+            )
 
     def test_all_wrappers_disable_xtrace_before_any_work(self) -> None:
         for wrapper in WRAPPERS:

@@ -1149,6 +1149,7 @@ jobs:
           grep -Fqx "capability=production_deploy_control" "$inner_root/capabilities.txt"
           grep -Fqx "capability=retained_load_export_cleanup" "$inner_root/capabilities.txt"
           grep -Fqx "capability=retained_load_source_binding" "$inner_root/capabilities.txt"
+          grep -Fqx "capability=cpu_diagnostic_plan_control" "$inner_root/capabilities.txt"
           grep -Fqx "capability=python_isolated" "$inner_root/capabilities.txt"
           grep -Fqx "capability=python_bytecode_disabled" "$inner_root/capabilities.txt"
           grep -Fqx '"schema":1,' "$inner_root/manifest.json" || grep -Fq '"schema":1' "$inner_root/manifest.json"
@@ -1469,7 +1470,7 @@ jobs:
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
           remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
           probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
-          expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 python_isolated=1 python_bytecode_disabled=1"
+          expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1"
           expected_bytes="$(printf '%s\n' "$expected_output" | wc -c | tr -d '[:space:]')"
           expected_sha256="$(printf '%s\n' "$expected_output" | sha256sum | cut -d' ' -f1)"
           # The file-size limit bounds the remote process, while ``head`` caps
@@ -4210,6 +4211,7 @@ jobs:
               "platform_workflow_remote_dispatch.py", "platform_workflow_input_guard.py",
               "platform_prepare_artifact_dir.py", "platform_production_deploy_supervisor.sh",
               "platform_retained_load_export_executor.py",
+              "platform_cpu_diagnostic_plan.py",
               "platform_release_lock.sh", "platform_release_preflight.sh",
               "platform_validate_release_artifact.py", "platform_safe_env_exec.py",
               "platform_render_service_envs.py", "platform_validate_edge_policy.py",

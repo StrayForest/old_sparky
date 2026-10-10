@@ -746,16 +746,22 @@ class NoopSourceBindingTests(unittest.TestCase):
             "load_stdin_payload",
             return_value=payload,
         ), patch.object(
-            platform_workflow_remote_dispatch, "_run_sudo", return_value=0
+            platform_workflow_remote_dispatch,
+            "_run_live_user_qa_sudo",
+            return_value=0,
         ) as user_qa:
             self.assertEqual(
                 platform_workflow_remote_dispatch.main(["live-user-qa"]), 0
             )
-        user_arguments = user_qa.call_args.args[1]
+        user_arguments = user_qa.call_args.args[0]
         self.assertEqual(user_arguments[0], RUNNER_SHA)
         self.assertEqual(user_arguments[-2], "--source-binding-base64")
         self.assertEqual(
             json.loads(base64.b64decode(user_arguments[-1], validate=True)), binding
+        )
+        self.assertEqual(
+            user_qa.call_args.kwargs,
+            {"expected_sha": RUNNER_SHA, "expected_app_sha": APP_SHA},
         )
 
         with patch.object(
@@ -865,6 +871,7 @@ class NoopSourceBindingTests(unittest.TestCase):
         legacy_capabilities = (
             b"capability=release_baseline\n"
             b"capability=retained_load_export_cleanup\n"
+            b"capability=cpu_diagnostic_plan_control\n"
         )
         supported_capabilities = legacy_capabilities + b"capability=retained_load_source_binding\n"
 

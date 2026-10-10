@@ -129,6 +129,14 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
         )
         self.assertTrue(
             decide(
+                visibility="invite_only",
+                organizer_user_id="organizer-1",
+                user_id="viewer-1",
+                participant_status=None,
+            )
+        )
+        self.assertTrue(
+            decide(
                 visibility="public",
                 organizer_user_id="organizer-1",
                 user_id="viewer-1",
@@ -140,10 +148,100 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
         statement = tournament_routes.workspace_conditional_preflight_stmt()
         sql = str(statement.compile())
 
-        self.assertEqual(sql.upper().count("SELECT"), 8)
+        # Count SQL keywords and scalar-subquery forms separately so a column
+        # such as captain_selection_starts_at cannot affect the query shape.
+        self.assertTrue(sql.lstrip().upper().startswith("SELECT "))
+        self.assertEqual(sql.upper().count("(SELECT"), 6)
+        self.assertIn("platform.tournaments.visibility", sql)
+        self.assertIn("platform.tournaments.organizer_user_id", sql)
+        self.assertIn("platform.tournaments.bracket_revision", sql)
+        self.assertNotIn("platform.tournaments.name", sql)
+        self.assertNotIn("platform.tournaments.description", sql)
         self.assertIn("tournament_deadlock_ready_votes", sql)
         self.assertIn("tournament_deadlock_ready_vote_count_shards", sql)
         self.assertNotIn("JOIN platform.users", sql)
+
+    async def test_conditional_detail_membership_read_defers_only_exact_candidate(self) -> None:
+        auth_session = SimpleNamespace(
+            user=SimpleNamespace(id="viewer-1"),
+            role_slugs=frozenset(),
+        )
+
+        def request_for(query: bytes, headers: list[tuple[bytes, bytes]]) -> Request:
+            return Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/api/v1/tournaments/night-cup/workspace",
+                    "headers": headers,
+                    "query_string": query,
+                    "scheme": "https",
+                    "server": ("testserver", 443),
+                    "client": ("testclient", 1),
+                }
+            )
+
+        candidate = request_for(
+            b"workspace_view=detail&participants_limit=0&participants_offset=0&"
+            b"include_current_user=false",
+            [(b"if-none-match", b'"etag"')],
+        )
+        database = AsyncMock()
+        await workspace_access.ensure_workspace_private_membership(
+            candidate,
+            auth_session=auth_session,
+            db_session=database,
+        )
+        self.assertTrue(candidate.state.workspace_membership_preflight_pending)
+        database.execute.assert_not_awaited()
+
+        fallback_requests = (
+            request_for(
+                b"workspace_view=detail&participants_limit=0&participants_limit=0&"
+                b"include_current_user=false",
+                [(b"if-none-match", b'"etag"')],
+            ),
+            request_for(
+                b"workspace_view=detail&participants_limit=-1&include_current_user=false",
+                [(b"if-none-match", b'"etag"')],
+            ),
+            request_for(
+                b"workspace_view=detail&participants_limit=0&include_current_user=false&"
+                b"invite_code=",
+                [(b"if-none-match", b'"etag"')],
+            ),
+            request_for(
+                b"workspace_view=detail&participants_limit=0&include_current_user=false",
+                [(b"if-none-match", b"  ")],
+            ),
+            request_for(
+                b"workspace_view=detail&participants_limit=0&include_current_user=0",
+                [(b"if-none-match", b'"etag"')],
+            ),
+        )
+        for fallback in fallback_requests:
+            with self.subTest(
+                query=fallback.url.query,
+                headers=list(fallback.headers.items()),
+            ):
+                with patch.object(
+                    workspace_access,
+                    "ensure_private_tournament_read_membership_is_active",
+                    new=AsyncMock(),
+                ) as original_check:
+                    await workspace_access.ensure_workspace_private_membership(
+                        fallback,
+                        auth_session=auth_session,
+                        db_session=database,
+                    )
+                original_check.assert_awaited_once()
+                self.assertFalse(
+                    getattr(
+                        fallback.state,
+                        "workspace_membership_preflight_pending",
+                        False,
+                    )
+                )
 
     def test_workspace_base_preflight_statement_includes_viewer_access(self) -> None:
         statement = tournament_routes.workspace_base_preflight_stmt()
@@ -572,15 +670,25 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
         )
         db_session = AsyncMock()
         db_session.execute.return_value = Mock(
-            first=Mock(
-                return_value=(
-                    tournament,
-                    "registered",
-                    500,
-                    11,
-                    0,
-                    0,
-                    None,
+            mappings=Mock(
+                return_value=Mock(
+                    first=Mock(
+                        return_value={
+                            "tournament_id": tournament.id,
+                            "organizer_user_id": tournament.organizer_user_id,
+                            "visibility": tournament.visibility,
+                            "format_slug": tournament.format_slug,
+                            "updated_at": tournament.updated_at,
+                            "created_at": tournament.created_at,
+                            "bracket_revision": tournament.bracket_revision,
+                            "participant_status": "registered",
+                            "participant_count": 500,
+                            "ready_round_id": 11,
+                            "ready_count": 0,
+                            "declined_count": 0,
+                            "current_user_choice": None,
+                        }
+                    )
                 )
             )
         )
@@ -630,7 +738,8 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
                 auth_session=auth_session,
                 db_session=db_session,
             )
-        old_membership_guard.assert_awaited_once()
+        old_membership_guard.assert_not_awaited()
+        self.assertTrue(request.state.workspace_membership_preflight_pending)
 
         with (
             patch.object(

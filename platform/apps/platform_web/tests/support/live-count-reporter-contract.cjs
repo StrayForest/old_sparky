@@ -54,6 +54,134 @@ assert.equal(
   1,
 );
 assert.equal(summarizeRun({ allTests: () => Array(4097).fill(test("expected", ["passed"])) }, "passed"), null);
+
+function publicCase(title, project, outcome, description) {
+  return {
+    title,
+    expectedStatus: outcome === "skipped" ? "skipped" : "passed",
+    parent: { project: () => ({ name: project }) },
+    results: [
+      {
+        status: outcome === "skipped" ? "skipped" : "passed",
+        annotations: description === undefined
+          ? []
+          : [{ type: "public-live-qa-expected-skip", description }],
+      },
+    ],
+    outcome: () => outcome,
+  };
+}
+
+const publicProjects = ["live-desktop", "live-mobile", "live-webkit-mobile"];
+const publicTitles = [
+  ...["/", "/info", "/tournaments", "/tournaments/new", "/profile/me", "/profile/lisalexy"]
+    .map((route) => `live route ${route} renders without horizontal overflow`),
+  "production Chromium live QA keeps its process sandbox enabled",
+  "live CSP nonce is stable on soft navigation and rotates on hard reload",
+  "local enforced CSP blocks negative inline and external probes",
+  "live tournaments hub exposes a valid empty or populated list",
+  "live 1920 catalog stays contained after every card asset loads",
+  "live tournament detail and bracket routes render from the current public data",
+  "live admin route is protected for anonymous users",
+  "live home uses text-only tournament steps without overflow",
+  "live public contact surfaces do not publish the support recipient",
+  "live patch renders separate Urn and Rift objectives with source icons",
+  "live Cloudflare Analytics is conditionally observed without widening CSP",
+  "live image currentSrc inventory stays inside the exact CSP hosts",
+];
+const expectedPublicSkips = new Map([
+  ["production Chromium live QA keeps its process sandbox enabled|live-webkit-mobile", "chromium_only:live-webkit-mobile"],
+  ...publicProjects.map((project) => [
+    `local enforced CSP blocks negative inline and external probes|${project}`,
+    `local_csp_disabled:${project}`,
+  ]),
+  ...["live-mobile", "live-webkit-mobile"].map((project) => [
+    `live 1920 catalog stays contained after every card asset loads|${project}`,
+    `desktop_only:${project}`,
+  ]),
+  ["live 1920 catalog stays contained after every card asset loads|live-desktop", "empty_tournament_list:live-desktop"],
+  ...publicProjects.map((project) => [
+    `live tournament detail and bracket routes render from the current public data|${project}`,
+    `empty_tournament_list:${project}`,
+  ]),
+]);
+const publicTests = publicProjects.flatMap((project) => publicTitles.map((title) => {
+  const skipDescription = expectedPublicSkips.get(`${title}|${project}`);
+  return publicCase(
+    title,
+    project,
+    skipDescription === undefined ? "expected" : "skipped",
+    skipDescription,
+  );
+}));
+const publicSuite = { allTests: () => publicTests };
+assert.equal(summarizeRun(publicSuite, "passed", { publicGate: true }).run_status, "passed");
+const unannotatedSkip = publicCase(
+  "live route / renders without horizontal overflow",
+  "live-desktop",
+  "skipped",
+);
+assert.equal(
+  summarizeRun(
+    { allTests: () => [unannotatedSkip, ...publicTests.slice(1)] },
+    "passed",
+    { publicGate: true },
+  ).run_status,
+  "failed",
+  "an unannotated skipped selected case invalidates the public run",
+);
+const wrongProjectSkip = publicCase(
+  "production Chromium live QA keeps its process sandbox enabled",
+  "live-mobile",
+  "skipped",
+  "chromium_only:live-webkit-mobile",
+);
+const wrongProjectTests = [...publicTests];
+const sandboxWebkitIndex = wrongProjectTests.findIndex((testCase) => (
+  testCase.title === wrongProjectSkip.title
+  && testCase.parent.project().name === "live-webkit-mobile"
+));
+assert.notEqual(sandboxWebkitIndex, -1);
+wrongProjectTests[sandboxWebkitIndex] = wrongProjectSkip;
+assert.equal(
+  summarizeRun(
+    { allTests: () => wrongProjectTests },
+    "passed",
+    { publicGate: true },
+  ).run_status,
+  "failed",
+  "skip annotations are bound to the exact project as well as the test",
+);
+assert.equal(
+  summarizeRun(
+    { allTests: () => publicTests.slice(0, -1) },
+    "passed",
+    { publicGate: true },
+  ).run_status,
+  "failed",
+  "a missing selected case cannot be hidden by expected skips",
+);
+const duplicatePublicTests = [...publicTests];
+duplicatePublicTests[0] = duplicatePublicTests[1];
+assert.equal(
+  summarizeRun(
+    { allTests: () => duplicatePublicTests },
+    "passed",
+    { publicGate: true },
+  ).run_status,
+  "failed",
+  "a duplicate selected test cannot replace a missing planned case",
+);
+const liveUserSummary = summarizeRun(
+  { allTests: () => [test("expected", ["passed"])] },
+  "passed",
+  { publicGate: false },
+);
+assert.deepEqual(liveUserSummary, {
+  run_status: "passed",
+  logical: { total: 1, pass: 1, fail: 0, expected_fail: 0, flaky: 0, skip: 0, interrupted: 0 },
+  attempts: { total: 1, pass: 1, fail: 0, skip: 0, interrupted: 0, timedout: 0 },
+});
 let cappedResultReads = 0;
 const cappedResults = Array.from({ length: 32769 }, () => ({
   get status() {
@@ -221,7 +349,7 @@ try {
         });
       };
     }
-    assert.equal(writeBoundedSummary(userWriteBinding, summary, { gateRoot: temporary }), true);
+    assert.equal(writeBoundedSummary(userWriteBinding, liveUserSummary, { gateRoot: temporary }), true);
     assert.equal(writeBoundedSummary(userWriteBinding, summary, { gateRoot: temporary }), false, "live-user report also rejects replacement");
   } finally {
     fs.lstatSync = nativeLstatSync;
@@ -230,6 +358,11 @@ try {
   assert.equal(userReport.app_sha, bindingEnv.PLATFORM_LIVE_QA_TARGET_SHA);
   assert.equal(userReport.source_sha, bindingEnv.PLATFORM_LIVE_QA_RUNNER_SHA);
   assert.equal(userReport.marker_sha256, bindingEnv.PLATFORM_LIVE_QA_MARKER_SHA256);
+  assert.equal(userReport.logical_total, 1);
+  assert.equal(userReport.logical_pass, 1);
+  assert.equal(userReport.attempt_total, 1);
+  assert.equal(userReport.attempt_pass, 1);
+  assert.equal(userReport.run_status, "passed");
 } finally {
   fs.rmSync(temporary, { recursive: true, force: true });
 }

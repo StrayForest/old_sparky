@@ -214,14 +214,20 @@ for (const route of routes) {
   });
 }
 
-test("production Chromium live QA keeps its process sandbox enabled", async ({ page, browserName }) => {
+test("production Chromium live QA keeps its process sandbox enabled", async ({ page, browserName }, testInfo) => {
   test.skip(
     !/^https:\/\/old-sparky\.com\/?$/u.test(
       process.env.PLAYWRIGHT_LIVE_BASE_URL ?? "",
     ),
     "Production-only process sandbox assertion.",
   );
-  test.skip(browserName !== "chromium", "Chromium-only process sandbox assertion.");
+  if (browserName !== "chromium") {
+    testInfo.annotations.push({
+      type: "public-live-qa-expected-skip",
+      description: `chromium_only:${testInfo.project.name}`,
+    });
+    test.skip(true, "Chromium-only process sandbox assertion.");
+  }
   await assertLiveQaChromiumSandbox(page.context(), browserName);
 });
 
@@ -243,11 +249,20 @@ test("live CSP nonce is stable on soft navigation and rotates on hard reload", a
 });
 
 test("local enforced CSP blocks negative inline and external probes", async ({ page }, testInfo) => {
-  test.skip(
-    process.env.PLATFORM_LOCAL_CSP_NEGATIVE_QA !== "1",
-    "PLATFORM_LOCAL_CSP_NEGATIVE_QA=1 is required.",
-  );
-  test.skip(testInfo.project.name !== "live-desktop", "One Chromium enforcement probe is sufficient.");
+  if (process.env.PLATFORM_LOCAL_CSP_NEGATIVE_QA !== "1") {
+    testInfo.annotations.push({
+      type: "public-live-qa-expected-skip",
+      description: `local_csp_disabled:${testInfo.project.name}`,
+    });
+    test.skip(true, "PLATFORM_LOCAL_CSP_NEGATIVE_QA=1 is required.");
+  }
+  if (testInfo.project.name !== "live-desktop") {
+    testInfo.annotations.push({
+      type: "public-live-qa-expected-skip",
+      description: `desktop_only:${testInfo.project.name}`,
+    });
+    test.skip(true, "One Chromium enforcement probe is sufficient.");
+  }
   const base = new URL(process.env.PLAYWRIGHT_LIVE_BASE_URL ?? "http://127.0.0.1");
   expect(["127.0.0.1", "::1", "localhost"]).toContain(base.hostname);
   testInfo.annotations.push({ type: "expected-csp-violations" });
@@ -336,14 +351,26 @@ test("live tournaments hub exposes a valid empty or populated list", async ({ pa
 });
 
 test("live 1920 catalog stays contained after every card asset loads", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== "live-desktop", "The visual artifact has one canonical desktop viewport.");
+  if (testInfo.project.name !== "live-desktop") {
+    testInfo.annotations.push({
+      type: "public-live-qa-expected-skip",
+      description: `desktop_only:${testInfo.project.name}`,
+    });
+    test.skip(true, "The visual artifact has one canonical desktop viewport.");
+  }
   await page.setViewportSize({ width: 1920, height: 1080 });
   await page.goto("/tournaments");
 
   const cards = page.getByTestId("tournament-card");
   await expect(cards.first().or(page.locator(".tournament-list-state"))).toBeVisible();
   const cardCount = await cards.count();
-  test.skip(cardCount === 0, "The production tournament list is intentionally empty.");
+  if (cardCount === 0) {
+    testInfo.annotations.push({
+      type: "public-live-qa-expected-skip",
+      description: `empty_tournament_list:${testInfo.project.name}`,
+    });
+    test.skip(true, "The production tournament list is intentionally empty.");
+  }
   await waitForTournamentCardAssets(page, true);
   await page.locator(".hero-wrap").scrollIntoViewIfNeeded();
 
@@ -373,11 +400,17 @@ test("live 1920 catalog stays contained after every card asset loads", async ({ 
   });
 });
 
-test("live tournament detail and bracket routes render from the current public data", async ({ page }) => {
+test("live tournament detail and bracket routes render from the current public data", async ({ page }, testInfo) => {
   await page.goto("/tournaments");
   const firstDetailsLink = page.getByTestId("tournament-card").first();
   await expect(firstDetailsLink.or(page.locator(".tournament-list-state"))).toBeVisible();
-  test.skip((await firstDetailsLink.count()) === 0, "The production tournament list is intentionally empty.");
+  if ((await firstDetailsLink.count()) === 0) {
+    testInfo.annotations.push({
+      type: "public-live-qa-expected-skip",
+      description: `empty_tournament_list:${testInfo.project.name}`,
+    });
+    test.skip(true, "The production tournament list is intentionally empty.");
+  }
   const href = await firstDetailsLink.getAttribute("href");
   expect(href).toBeTruthy();
 

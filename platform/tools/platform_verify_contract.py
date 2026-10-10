@@ -591,6 +591,8 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host capability preflight must not execute repository checkout source")
         if 'grep -Fqx "capability=retained_load_source_binding" "$inner_root/capabilities.txt"' not in host_preflight:
             issues.append("host-tools artifact validation must require the retained-load source-binding capability")
+        if 'grep -Fqx "capability=cpu_diagnostic_plan_control" "$inner_root/capabilities.txt"' not in host_preflight:
+            issues.append("host-tools artifact validation must require CPU diagnostic plan control")
         if "scp " in host_preflight or "platform-production-deploy-remote" in host_preflight:
             issues.append("host capability preflight must not upload a bundle or deploy artifact")
         if (
@@ -640,6 +642,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
                 'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA '
                 'dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 '
                 'retained_load_export_cleanup=1 retained_load_source_binding=1 '
+                'cpu_diagnostic_plan_control=1 '
                 'python_isolated=1 python_bytecode_disabled=1"',
                 'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
                 "command_rc=",
@@ -1553,8 +1556,22 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         issues.append("release-runtime-real must have contents: read permissions")
     for marker, message in (
         ("github.event_name == 'push'", "push route condition"),
-        ("github.event_name == 'workflow_dispatch'", "manual route condition"),
+        (
+            "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&",
+            "manual route condition",
+        ),
         ("github.ref == 'refs/heads/dev'", "canonical dev ref condition"),
+        ("github.event_name == 'pull_request'", "same-repository dev PR route condition"),
+        ("github.event.pull_request.base.ref == 'dev'", "same-repository dev PR base ref"),
+        (
+            "github.event.pull_request.base.repo.full_name == github.repository",
+            "same-repository dev PR base repository",
+        ),
+        (
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            "same-repository dev PR head repository",
+        ),
+        ("parents != [target, base_sha, head_sha]", "same-repository dev PR merge-parent binding"),
         ("needs.classifier.outputs.runtime_sensitive == 'true'", "runtime-sensitive condition"),
         ("needs.classifier.outputs.fallback == 'true'", "fallback condition"),
     ):
@@ -1630,7 +1647,22 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         issues.append("canonical release builder must emit machine-readable phases")
     if "secrets." in real or "PROD_SSH_" in real or "SSH_PRIVATE_KEY" in real:
         issues.append("release-runtime-real must not receive production credentials")
-    if "actions/upload-artifact@" in real or "actions/attest-build-provenance@" in real:
+    projection_upload = (
+        "      - name: Upload evidence-only release size projection\n"
+        "        if: ${{ success() }}\n"
+        "        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0\n"
+        "        with:\n"
+        "          name: platform-release-size-${{ github.run_id }}-${{ github.run_attempt }}\n"
+        "          path: ${{ steps.real-runtime-build.outputs.projection_path }}\n"
+        "          if-no-files-found: error\n"
+        "          retention-days: 14\n"
+    )
+    upload_steps = tuple(
+        step.rstrip("\n")
+        for step in _workflow_step_blocks(real)
+        if "actions/upload-artifact@" in step
+    )
+    if upload_steps != (projection_upload.rstrip("\n"),) or "actions/attest-build-provenance@" in real:
         issues.append("release-runtime-real must not publish or attest an artifact")
     if "GITHUB_WORKSPACE/platform/dist/releases" in real or "/root/old_sparky" in real:
         issues.append("release-runtime-real must use task-owned output, not production paths")

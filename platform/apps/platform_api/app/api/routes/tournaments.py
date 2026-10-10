@@ -657,10 +657,23 @@ class WorkspaceReadyRoundSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceConditionalTournamentSnapshot:
+    """Small tournament revision and permission fields for conditional reads."""
+
+    id: str
+    organizer_user_id: str
+    visibility: str
+    format_slug: str
+    updated_at: datetime | None
+    created_at: datetime | None
+    bracket_revision: int
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceConditionalPreflight:
     """One-query authorization and revision snapshot for participant 304s."""
 
-    tournament: Tournament
+    tournament: WorkspaceConditionalTournamentSnapshot
     participant_status: str | None
     participant_count: int
     ready_round_id: int | None
@@ -1388,7 +1401,13 @@ def _build_workspace_conditional_preflight_stmt() -> Select:
     )
     return (
         select(
-            Tournament,
+            Tournament.id.label("tournament_id"),
+            Tournament.organizer_user_id.label("organizer_user_id"),
+            Tournament.visibility.label("visibility"),
+            Tournament.format_slug.label("format_slug"),
+            Tournament.updated_at.label("updated_at"),
+            Tournament.created_at.label("created_at"),
+            Tournament.bracket_revision.label("bracket_revision"),
             participant_status.label("participant_status"),
             func.coalesce(participant_count, 0).label("participant_count"),
             ready_round.id.label("ready_round_id"),
@@ -1424,17 +1443,27 @@ async def workspace_conditional_preflight(
                 "workspace_conditional_slug": slug,
             },
         )
-    ).first()
+    ).mappings().first()
     if row is None:
         return None
     return WorkspaceConditionalPreflight(
-        tournament=row[0],
-        participant_status=row[1],
-        participant_count=int(row[2] or 0),
-        ready_round_id=int(row[3]) if row[3] is not None else None,
-        ready_count=int(row[4] or 0),
-        declined_count=int(row[5] or 0),
-        current_user_choice=row[6],
+        tournament=WorkspaceConditionalTournamentSnapshot(
+            id=str(row["tournament_id"]),
+            organizer_user_id=str(row["organizer_user_id"]),
+            visibility=str(row["visibility"]),
+            format_slug=str(row["format_slug"]),
+            updated_at=row["updated_at"],
+            created_at=row["created_at"],
+            bracket_revision=int(row["bracket_revision"] or 0),
+        ),
+        participant_status=row["participant_status"],
+        participant_count=int(row["participant_count"] or 0),
+        ready_round_id=(
+            int(row["ready_round_id"]) if row["ready_round_id"] is not None else None
+        ),
+        ready_count=int(row["ready_count"] or 0),
+        declined_count=int(row["declined_count"] or 0),
+        current_user_choice=row["current_user_choice"],
     )
 
 
@@ -7476,6 +7505,23 @@ async def get_tournament_workspace(
         if preflight is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
         preflight_tournament = preflight.tournament
+        if (
+            getattr(request.state, "workspace_membership_preflight_pending", False)
+            and auth_session is not None
+            and not private_tournament_read_membership_is_active(
+                visibility=preflight_tournament.visibility,
+                organizer_user_id=preflight_tournament.organizer_user_id,
+                user_id=auth_session.user.id,
+                participant_status=preflight.participant_status,
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Inactive tournament participants cannot access private "
+                    "tournament workspace data."
+                ),
+            )
         ensure_tournament_summary_visible(preflight_tournament, auth_session)
         preflight_is_active_participant = bool(
             preflight.participant_status is not None

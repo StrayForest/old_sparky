@@ -61,17 +61,21 @@ retention, validator agreement and fixed read-only unit aliases; collision,
 identity-bound cleanup and UID paths are covered without a live browser. The
 gate has no production
 network, credentials or deployment authority. A separate `release-runtime-real`
-job runs only for a
-classifier-sensitive or fallback `push` to canonical `dev`, or for
-`workflow_dispatch` whose ref is exactly `dev`. It starts on a fresh runner,
-checks out the exact workflow SHA, creates the production-style clean root venv
-and invokes the full `platform_build_release.sh` builder. It validates the
-archive checksum and `RELEASE.json` provenance read-only, emits only bounded
-status/digest data, and removes its identified temporary output/cache in an
-exit trap. It does not receive production secrets or SSH material, publish an
-artifact, or deploy; `status-final` independently requires the fixture job and
-this real job on the routes where each is required. Non-`dev` manual runs and
-all ordinary/docs routes keep the real job skipped as selected by the
+job runs for classifier-sensitive or fallback pushes to canonical `dev`,
+same-repository PRs targeting `dev` when that route requires the real builder,
+or `workflow_dispatch` whose ref is exactly `dev`. The PR route binds the
+tested merge SHA, ordered base/head parents and exact same-repository refs
+before building. It starts on a fresh runner, checks out the exact tested SHA,
+creates the production-style clean root venv and invokes the full
+`platform_build_release.sh` builder. It validates the archive checksum and
+`RELEASE.json` provenance read-only, emits only bounded status/digest data,
+and removes its identified temporary output/cache in an exit trap. The
+same-repository PR route also uploads one short-lived JSON size projection
+bound to the tested source, run and archive; the release archive, logs and
+build tree are never uploaded. The job receives no production secrets or SSH
+material and does not deploy; `status-final` independently requires the
+fixture job and real job on routes where each is required. Non-`dev` manual
+runs and ordinary/docs routes keep the real job skipped as selected by the
 classifier; there is no schedule trigger.
 The canonical builder keeps its ordinary build output in a private root-owned
 `0600` raw log and emits only allowlisted `RELEASE_BUILD_PHASE` markers to a
@@ -262,15 +266,17 @@ pin-bump lifecycle; it does not silently skip historical ancestry proof.
 Operation-bound legacy LiveQA fixtures in `test_platform_recovery_bootstrap` stay in `backend-privileged`; they cover receipt/pointer/venv identity, service/timer snapshot, bounded readiness retries, fixed child-stage/status diagnostics and receipt-last cleanup.
 `test_platform_release_recovery_boundaries` covers the candidate-deadline-clamped reconcile timeout, retained receipt, and idempotent retry after a simulated partial payload publish. `test_platform_live_qa_runtime_install` covers fixed stage diagnostics for a post-promotion retention failure, pre-validator provider reuse without relaxing new-generation checks, and transaction-bound reconciliation of the exact M8 source-only runtime during rollback recovery. These remain in `backend-privileged` because they exercise release-state transitions and privileged payload ownership.
 `test_platform_live_qa_wrappers` also owns the source-bound fixed-stage status contract for public launch failures before the browser supervisor starts; its failure tests remain in `backend-privileged` and invoke no browser or database work.
-The same wrapper contract owns the optional closed browser-count line: it binds logical-case and attempt partitions to the exact source, app and marker hashes, and is accepted only before the single terminal launch status. Missing or invalid counts remain unavailable; workflow sanitization never invents a browser-test result.
+The same wrapper contract owns the optional closed browser-count line: it binds logical-case and attempt partitions to the exact source, app and marker hashes, and is accepted only before the single terminal launch status. The live-user path projects that same record before cleanup; its configured journey has one logical case and no retries, so success requires exactly one executed, passed case and one passed attempt with no skips or failures. Workflow `test_count` is the number of executed logical outcomes, while total and skipped cases remain separate. A success marker without that bound coverage is not QA evidence. Missing or invalid counts remain unavailable; workflow sanitization never invents a browser-test result. Its QA-only child capture tests also prove concurrent pipe draining, bounded retained prefixes, closed diagnostic enums, timeout process-group cleanup, secret non-disclosure, and the fixed systemd/Playwright command boundary. Generic release/deploy subprocess handling remains outside this adapter.
 `test_liveqa_reconcile_stderr_is_available_only_to_private_candidate_capture`
 checks the helper preserves reconcile stderr. Its companion
 `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` verifies private
 capture and closed stdout/public markers; the executable catalog snapshot tracks these IDs.
 Privileged release tests prove promoted dependencies stay readable, relocation removes only wheel/RECORD-bound generated caches, cleanup is receipt/readiness/cgroup-bound, and runtime summaries stay out of deployment markers.
 Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity; tampering is refused.
-A proof miss uses the existing fresh-venv snapshot path. These root-owned cases remain in `backend-privileged`; bootstrap extraction tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
-The canonical AST snapshot is 1,800 tests (1,728 backend, including 573 privileged) across 165 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 294, tool-contract 425, integration 255, privileged 573, and performance-contract 181.
+A proof miss uses the existing fresh-venv snapshot path. These root-owned cases remain in `backend-privileged`; bootstrap extraction and release-size projection tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
+`test_platform_cpu_profile` also owns the fixed-schema diagnostic-plan, process CPU-window, and bounded CPU-profile contracts in `performance-contract`; they cover exact service/process/phase binding, one-use request selection, released-runtime identity, and fixed-category summaries without exporting raw frames.
+
+The canonical AST snapshot is 1,822 tests (1,750 backend, including 580 privileged) across 165 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 295, tool-contract 425, integration 256, privileged 580, and performance-contract 194.
 Release retention tests own locked candidate-set rechecks and belong to
 `backend-privileged`.
 

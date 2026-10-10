@@ -3,12 +3,12 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_workflow_remote_dispatch.py",
-      "sha256": "1acf34b7ddb1d4412419aebee6379cf066a61545ba344c7a29fefad5b38a7305"
+      "sha256": "339b070a2f7899c70f4b4114586b56acc5a730d9d9b228b22bfa57ced24449fa"
     },
     {
       "mode": 493,
       "path": "platform/tools/platform_workflow_input_guard.py",
-      "sha256": "03cc0efa1417c6cd01314c596c9e377d1e61ac6914aaf5b7310a4b31fc72cbd7"
+      "sha256": "12ddb20e20de2e26f821eb864e2ecb572be8c131fec5b8919d3cf23ad5ad6cc7"
     },
     {
       "mode": 493,
@@ -18,7 +18,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_production_deploy_supervisor.sh",
-      "sha256": "8be376b5858ff0c299286ccc61b9b9a3717695ace001d3812ccc7696e4b84f1b"
+      "sha256": "5297f818e30336696193e377842827cc8e8eb2c352ca2ea8a47839bb19e99bcf"
     },
     {
       "mode": 493,
@@ -69,9 +69,14 @@
       "mode": 420,
       "path": "platform/tools/platform_retained_load_export_executor.py",
       "sha256": "2d499f8cd41939f7664c17119391447595ee6cdd2960a183735b991ee09a75e0"
+    },
+    {
+      "mode": 420,
+      "path": "platform/tools/platform_cpu_diagnostic_plan.py",
+      "sha256": "cb7ef066b5cfc4c2576d8aa1e4ff29538c3f5e8d40c3b7eaa6ba9efd002213d4"
     }
   ],
-  "host_tools_sha": "93f8a8e0f7a2cb32d2444e2d69ae5c09ba669dee",
+  "host_tools_sha": "16eee656fbca10c485728b34b8490917b4de64a2",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }

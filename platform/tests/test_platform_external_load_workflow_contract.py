@@ -149,6 +149,21 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("needs.load-client.result", self.jobs["evaluate-load"])
         self.assertIn("needs.fixture-finalize.result", self.jobs["evaluate-load"])
         self.assertIn("needs.namespace-containment-barrier.outputs.namespace_closed_status", self.jobs["fixture-finalize"])
+        pair = self.jobs["cpu-diagnostic-pair"]
+        self.assertIn("needs.fixture-setup.result == 'success'", pair)
+        self.assertIn("needs.load-client.result", pair)
+        self.assertIn("needs.namespace-containment-barrier.outputs.namespace_closed_status == '0'", pair)
+        dispatch_validation = self.jobs["validate-external-inputs"]
+        self.assertIn(
+            "false:authenticated-page-load-v1:RUN-PRODUCTION-EXTERNAL-LOAD:true",
+            dispatch_validation,
+        )
+        self.assertNotIn(
+            "false:*:RUN-PRODUCTION-EXTERNAL-LOAD:true", dispatch_validation
+        )
+        finalize_job = yaml.safe_load(self.source)["jobs"]["fixture-finalize"]
+        self.assertIn("cpu-diagnostic-pair", finalize_job["needs"])
+        self.assertIn("platform_cpu_diagnostic_pair.py parent", pair)
         self.assertIn("emergency/manual", self.jobs["namespace-containment-manual-barrier"])
         for name in ("Exact cleanup of external fixture", "Remove finalizer SSH material"):
             self.assertIn(f"- name: {name}", self.jobs["fixture-finalize"])
@@ -879,6 +894,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "control_email": "Control%qa@example.invalid",
             "profile_id": "ready-vote-slo-v2",
             "timeout_diagnostics": False,
+            "cpu_diagnostic_pair": False,
         }
         invalid_payloads = (
             json.dumps({"inputs": {**valid_inputs, "unexpected": "value"}}),

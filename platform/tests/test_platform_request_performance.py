@@ -48,10 +48,9 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
             )
 
         log_info.assert_called_once()
-        self.assertEqual(log_info.call_args.args[-8], 320)
-        self.assertEqual(log_info.call_args.args[-7], "-")
-        self.assertEqual(log_info.call_args.args[-6], 0.0)
-        self.assertEqual(log_info.call_args.args[-5:-3], ("-", "-"))
+        rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
+        self.assertIn("response_bytes=320 qa_phase=-", rendered)
+        self.assertIn("pool_wait_ms=0.00 cf_ray=- client=-", rendered)
 
     def test_fast_reads_are_not_logged_by_mutation_rule(self) -> None:
         middleware = performance.RequestPerformanceMiddleware(app=None)
@@ -440,6 +439,33 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         self.assertEqual(
             performance._request_identity_from_scope(scope),
             ("ssr-request", "ssr-ray"),
+        )
+
+    def test_diagnostic_ssr_identity_requires_matching_validated_run(self) -> None:
+        scope = {
+            "headers": [
+                (b"x-request-id", b"proxy-request"),
+                (b"cf-ray", b"proxy-ray"),
+                (b"x-platform-ssr-trace", b"a" * 32),
+                (b"x-platform-ssr-request-id", b"ssr-request"),
+                (b"x-platform-ssr-cf-ray", b"ssr-ray"),
+            ]
+        }
+        self.assertEqual(
+            performance._request_identity_from_scope(scope),
+            ("proxy-request", "proxy-ray"),
+        )
+        self.assertEqual(
+            performance._request_identity_from_scope(
+                scope, diagnostic_run_id="a" * 32
+            ),
+            ("ssr-request", "ssr-ray"),
+        )
+        self.assertEqual(
+            performance._request_identity_from_scope(
+                scope, diagnostic_run_id="b" * 32
+            ),
+            ("proxy-request", "proxy-ray"),
         )
 
     def test_non_sampled_identity_keeps_proxy_headers(self) -> None:

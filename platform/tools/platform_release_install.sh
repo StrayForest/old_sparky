@@ -125,6 +125,190 @@ public_status() {
     "$status" "$class" "$PUBLIC_RELEASE_SLUG"
 }
 
+VENV_INSTALL_POLICY="legacy"
+
+read_venv_install_policy() {
+  local policy
+  if ! policy="$(/usr/bin/python3 -I -B - "$RELEASE_DIR" <<'PY'
+import json
+import os
+import stat
+import sys
+
+release_path = sys.argv[1]
+maximum = 1024
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+release_fd = -1
+deploy_fd = -1
+policy_fd = -1
+
+def identity(value):
+    return (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+        value.st_gid, value.st_nlink, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns,
+    )
+
+try:
+    release_before = os.lstat(release_path)
+    if (not stat.S_ISDIR(release_before.st_mode) or release_before.st_uid != 0
+            or release_before.st_gid != 0 or stat.S_IMODE(release_before.st_mode) & 0o022):
+        raise SystemExit(1)
+    release_fd = os.open(release_path, directory_flags)
+    release_opened = os.fstat(release_fd)
+    if identity(release_opened) != identity(release_before):
+        raise SystemExit(1)
+    try:
+        deploy_fd = os.open("deploy", directory_flags, dir_fd=release_fd)
+    except FileNotFoundError:
+        print("legacy")
+        raise SystemExit(0)
+    deploy_before = os.fstat(deploy_fd)
+    if (not stat.S_ISDIR(deploy_before.st_mode) or deploy_before.st_uid != 0
+            or deploy_before.st_gid != 0 or stat.S_IMODE(deploy_before.st_mode) & 0o022):
+        raise SystemExit(1)
+    try:
+        policy_fd = os.open(
+            "python-venv-policy.json",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=deploy_fd,
+        )
+    except FileNotFoundError:
+        print("legacy")
+        raise SystemExit(0)
+    before = os.fstat(policy_fd)
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+            or stat.S_IMODE(before.st_mode) != 0o644 or before.st_nlink != 1
+            or before.st_size <= 0 or before.st_size > maximum):
+        raise SystemExit(1)
+    raw = bytearray()
+    while len(raw) <= maximum:
+        chunk = os.read(policy_fd, min(4096, maximum + 1 - len(raw)))
+        if not chunk:
+            break
+        raw.extend(chunk)
+    after = os.fstat(policy_fd)
+    policy_path_after = os.stat(
+        "python-venv-policy.json", dir_fd=deploy_fd, follow_symlinks=False
+    )
+    deploy_after = os.fstat(deploy_fd)
+    release_after = os.fstat(release_fd)
+    if (len(raw) != before.st_size or identity(after) != identity(before)
+            or identity(policy_path_after) != identity(before)
+            or identity(deploy_after) != identity(deploy_before)
+            or identity(release_after) != identity(release_opened)):
+        raise SystemExit(1)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    payload = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    if (not isinstance(payload, dict) or set(payload) != {"schema", "transition"}
+            or type(payload.get("schema")) is not int or payload["schema"] != 1
+            or payload.get("transition") != "require_proven_reuse"):
+        raise SystemExit(1)
+except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1) from None
+else:
+    print("require_proven_reuse")
+finally:
+    for descriptor in (policy_fd, deploy_fd, release_fd):
+        if descriptor >= 0:
+            os.close(descriptor)
+PY
+)"; then
+    return 1
+  fi
+  case "$policy" in
+    legacy|require_proven_reuse) VENV_INSTALL_POLICY="$policy" ;;
+    *) return 1 ;;
+  esac
+}
+
+install_space_floor_ok() {
+  local available="$1"
+  local total="$2"
+  [[ "$available" =~ ^[0-9]+$ && "$total" =~ ^[1-9][0-9]*$ ]] || return 1
+  local filesystem_floor=$(((total * 15 + 99) / 100))
+  local hard_floor=$((5 * 1024 * 1024 * 1024))
+  local margin=$((128 * 1024 * 1024))
+  (( filesystem_floor > hard_floor )) || filesystem_floor="$hard_floor"
+  (( available >= filesystem_floor + margin ))
+}
+
+read_install_space() {
+  /usr/bin/python3 -I -B - "$SHARED_DIR" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+try:
+    before = os.lstat(path)
+    if (not stat.S_ISDIR(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+            or stat.S_IMODE(before.st_mode) & 0o022):
+        raise SystemExit(1)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        def identity(value):
+            return (
+                value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                value.st_gid, value.st_nlink,
+            )
+
+        if identity(opened) != identity(before):
+            raise SystemExit(1)
+        info = os.fstatvfs(fd)
+        after = os.fstat(fd)
+        current = os.lstat(path)
+        if identity(after) != identity(opened) or identity(current) != identity(opened):
+            raise SystemExit(1)
+        available = info.f_bavail * info.f_frsize
+        total = info.f_blocks * info.f_frsize
+        if available < 0 or total <= 0:
+            raise SystemExit(1)
+        print(f"{available} {total}")
+    finally:
+        os.close(fd)
+except OSError:
+    raise SystemExit(1) from None
+PY
+}
+
+enforce_required_venv_reuse() {
+  if ! read_venv_install_policy; then
+    return 1
+  fi
+  [[ "$VENV_INSTALL_POLICY" == "require_proven_reuse" ]] || return 0
+  # A caller-supplied skip flag is never accepted for an artifact whose own
+  # closed policy requires the strict verifier below.
+  (( SKIP_PYTHON_DEPS == 0 )) || return 1
+  [[ -n "$PREVIOUS_TARGET" && -x /usr/bin/python3.12 \
+    && -f "$TOOLS_DIR/platform_verify_venv_reuse.py" \
+    && ! -L "$TOOLS_DIR/platform_verify_venv_reuse.py" ]] || return 1
+  /usr/bin/python3 -I -S -B "$TOOLS_DIR/platform_verify_venv_reuse.py" \
+    --app "$APP_DIR" \
+    --current "$PREVIOUS_TARGET" \
+    --candidate "$RELEASE_DIR" \
+    --venv "$SHARED_VENV_DIR" \
+    --python /usr/bin/python3.12 \
+    --transaction-state "$TRANSACTION_STATE" \
+    --quiesce-state "$SHARED_DIR/.release-quiesce.json" \
+    --previous-before "$ORIGINAL_PREVIOUS_TARGET" >/dev/null 2>/dev/null || return 1
+  local space available total
+  space="$(read_install_space)" || return 1
+  read -r available total <<<"$space"
+  install_space_floor_ok "$available" "$total" || return 1
+  SKIP_PYTHON_DEPS=1
+}
+
 LOCK_HELPER="$TOOLS_DIR/platform_release_lock.sh"
 if [[ ! -f "$LOCK_HELPER" || -L "$LOCK_HELPER" ]]; then
   echo "RELEASE_INSTALL status=failed class=lock release_slug=$PUBLIC_RELEASE_SLUG" >&2
@@ -356,6 +540,11 @@ RELEASE_EXTRACTED=1
   --lock "$RELEASE_DIR/requirements-platform.lock.txt" \
   --freeze "$RELEASE_DIR/requirements-platform.freeze.txt" >/dev/null 2>/dev/null
 
+if ! enforce_required_venv_reuse; then
+  public_status failed venv_policy
+  exit 1
+fi
+
 if [[ ! -f "$RELEASE_DIR/apps/platform_web/.next/standalone/server.js" ]]; then
     echo "RELEASE_INSTALL status=failed class=artifact release_slug=$PUBLIC_RELEASE_SLUG" >&2
   exit 1
@@ -391,6 +580,18 @@ fi
 # copies without ever widening this file's permissions.
 chown root:root "$SHARED_ENV_FILE"
 chmod 0600 "$SHARED_ENV_FILE"
+
+if [[ "$VENV_INSTALL_POLICY" == "require_proven_reuse" ]]; then
+  INSTALL_SPACE="$(read_install_space)" || {
+    public_status failed venv_policy
+    exit 1
+  }
+  read -r INSTALL_AVAILABLE INSTALL_TOTAL <<<"$INSTALL_SPACE"
+  if ! install_space_floor_ok "$INSTALL_AVAILABLE" "$INSTALL_TOTAL"; then
+    public_status failed venv_policy
+    exit 1
+  fi
+fi
 
 run_isolated_python() {
   local python_bin="$1"

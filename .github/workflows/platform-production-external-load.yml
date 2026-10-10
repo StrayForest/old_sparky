@@ -33,6 +33,11 @@ on:
         required: false
         default: false
         type: boolean
+      cpu_diagnostic_pair:
+        description: "After the governed authenticated-page-load-v1 run, add a separate zero-credit SSR CPU off/on diagnostic"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -109,7 +114,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -174,8 +179,9 @@ jobs:
           test "$GITHUB_EVENT_NAME" = workflow_dispatch || { echo "External load accepts workflow_dispatch only." >&2; exit 1; }
           test "$GITHUB_REF" = refs/heads/dev || { echo "External production load must run from dev." >&2; exit 1; }
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "External load requires an exact target SHA." >&2; exit 1; }
-          case "$TIMEOUT_DIAGNOSTICS:$PROFILE_ID:$QA_CONFIRMATION" in
-            true:authenticated-page-load-v1:RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS|false:*:RUN-PRODUCTION-EXTERNAL-LOAD) ;;
+          CPU_DIAGNOSTIC_PAIR='${{ inputs.cpu_diagnostic_pair }}'
+          case "$TIMEOUT_DIAGNOSTICS:$PROFILE_ID:$QA_CONFIRMATION:$CPU_DIAGNOSTIC_PAIR" in
+            true:authenticated-page-load-v1:RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS:false|false:*:RUN-PRODUCTION-EXTERNAL-LOAD:false|false:authenticated-page-load-v1:RUN-PRODUCTION-EXTERNAL-LOAD:true) ;;
             *) echo "External load confirmation/profile combination is invalid." >&2; exit 1 ;;
           esac
 
@@ -474,7 +480,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -856,7 +862,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -1287,6 +1293,180 @@ jobs:
           echo 'BLOCKED: namespace_closed is missing/false; do not begin or assume fixture cleanup. Follow the emergency/manual retained-fixture abort runbook.' >&2
           exit 1
 
+  cpu-diagnostic-pair:
+    name: Run isolated zero-credit authenticated SSR CPU pair
+    needs:
+      - validate-external-inputs
+      - resolve-host-tools-pin
+      - fixture-setup
+      - load-client
+      - namespace-containment-barrier
+      - namespace-containment-manual-barrier
+    if: >-
+      always() &&
+      inputs.cpu_diagnostic_pair == true &&
+      needs.validate-external-inputs.result == 'success' &&
+      needs.resolve-host-tools-pin.result == 'success' &&
+      needs.fixture-setup.result == 'success' &&
+      needs.fixture-setup.outputs.setup_status == '0' &&
+      needs.fixture-setup.outputs.manifest_ready == '1' &&
+      needs.namespace-containment-barrier.result == 'success' &&
+      needs.namespace-containment-manual-barrier.result == 'success' &&
+      needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' &&
+      (needs.load-client.result == 'success' || needs.load-client.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
+      INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
+      MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}
+    steps:
+      - name: Checkout exact diagnostic runner source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the exact same-run input and fixture manifest
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cpu-diagnostic-input
+      - name: Download the exact same-run fixture manifest
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cpu-diagnostic-manifest
+
+      - name: Check out the bounded handoff files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test -f "$RUNNER_TEMP/cpu-diagnostic-input/platform-production-external-load-input.json"
+          test ! -L "$RUNNER_TEMP/cpu-diagnostic-input/platform-production-external-load-input.json"
+          test -f "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
+          test ! -L "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
+          chmod 600 \
+            "$RUNNER_TEMP/cpu-diagnostic-input/platform-production-external-load-input.json" \
+            "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
+
+      - name: Configure pinned production SSH for the trusted parent
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/external-ssh"
+          control_path="/tmp/old-sparky-external-load-ssh-cpudiag-$GITHUB_RUN_ID"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"; rm -f -- "$ssh_scan"; ssh_scan_ok=0
+          for ssh_attempt in 1 2; do
+            ssh_scan_attempt="$ssh_scan.$ssh_attempt"; rm -f -- "$ssh_scan_attempt"; install -m 600 /dev/null "$ssh_scan_attempt"
+            if timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" >"$ssh_scan_attempt" 2>/dev/null \
+              && awk -v host="$PROD_SSH_HOST" 'NR == 1 && NF == 3 && $1 == host && $2 == "ssh-ed25519" { valid=1; next } { invalid=1 } END { exit !(NR == 1 && valid == 1 && !invalid) }' "$ssh_scan_attempt" \
+              && test "$(ssh-keygen -lf "$ssh_scan_attempt" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"; then
+              mv -- "$ssh_scan_attempt" "$ssh_scan"; ssh_scan_ok=1; printf 'Production SSH host-key acquisition attempt %s/2 succeeded\n' "$ssh_attempt"; break
+            fi
+            rm -f -- "$ssh_scan_attempt"; printf 'Production SSH host-key acquisition attempt %s/2 failed\n' "$ssh_attempt" >&2; (( ssh_attempt == 2 )) || sleep 0.5
+          done
+          test "$ssh_scan_ok" = 1 || { echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2; exit 1; }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+            printf '%s\n' '  ControlMaster auto' '  ControlPersist 15m'
+            printf '  ControlPath %s\n' "$control_path"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+
+      - name: Run the fixed authenticated workspace CPU pair
+        id: cpu-pair
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/cpu-diagnostic-report"
+          install -d -m 700 "$report_dir"
+          report_path="$report_dir/report.json"
+          set +e
+          /usr/bin/python3 platform/tools/platform_cpu_diagnostic_pair.py parent \
+            --manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" \
+            --input-handoff "$RUNNER_TEMP/cpu-diagnostic-input/platform-production-external-load-input.json" \
+            --report "$report_path" \
+            --source-sha "$TARGET_SHA" \
+            --app-target-sha "$APP_TARGET_SHA" \
+            --external-run-id "$GITHUB_RUN_ID" \
+            --external-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --ssh-config "$RUNNER_TEMP/external-ssh/config" \
+            --ssh-key "$RUNNER_TEMP/external-ssh/id_ed25519"
+          pair_status="$?"
+          set -e
+          echo "pair_status=$pair_status" >> "$GITHUB_OUTPUT"
+          exit "$pair_status"
+
+      - name: Publish only the bounded diagnostic summary
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-cpu-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cpu-diagnostic-report/report.json
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Remove diagnostic SSH material
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set +e
+          ssh_dir="$RUNNER_TEMP/external-ssh"
+          control_path="/tmp/old-sparky-external-load-ssh-cpudiag-$GITHUB_RUN_ID"
+          cleanup_status=0
+          if [[ -L "$control_path" ]]; then
+            cleanup_status=1
+          elif [[ -S "$control_path" ]]; then
+            ssh -F "$ssh_dir/config" -O exit "$PROD_SSH_USER@$PROD_SSH_HOST" >/dev/null 2>&1 \
+              || cleanup_status=$?
+            [[ ! -e "$control_path" && ! -L "$control_path" ]] || cleanup_status=1
+          elif [[ -e "$control_path" ]]; then
+            cleanup_status=1
+          fi
+          if [[ -L "$ssh_dir" ]]; then
+            cleanup_status=1
+          elif [[ -d "$ssh_dir" ]]; then
+            expected_dir_owner="$(id -u):700"
+            observed_dir_owner="$(stat -c '%u:%a' -- "$ssh_dir" 2>/dev/null)" \
+              || cleanup_status=1
+            if [[ "$observed_dir_owner" == "$expected_dir_owner" ]]; then
+              rm -rf -- "$ssh_dir" || cleanup_status=$?
+            else
+              cleanup_status=1
+            fi
+          elif [[ -e "$ssh_dir" ]]; then
+            cleanup_status=1
+          fi
+          test ! -e "$control_path" && test ! -L "$control_path" || cleanup_status=1
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir" || cleanup_status=1
+          if [[ ! -e "$control_path" && ! -L "$control_path" \
+              && ! -e "$ssh_dir" && ! -L "$ssh_dir" && "$cleanup_status" == 0 ]]; then
+            exit 0
+          fi
+          exit 1
+
   fixture-finalize:
     name: Signal fixture completion and collect origin evidence
     needs:
@@ -1296,6 +1476,7 @@ jobs:
       - load-client
       - namespace-containment-barrier
       - namespace-containment-manual-barrier
+      - cpu-diagnostic-pair
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -1374,7 +1555,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None

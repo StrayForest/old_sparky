@@ -22,6 +22,7 @@ from typing import Any, Mapping
 
 
 MAX_INPUT_BYTES = 64 * 1024
+MAX_CPU_DIAGNOSTIC_INPUT_BYTES = 4 * 1024
 MAX_CONTROL_EMAIL_STDIN_BYTES = 1_024
 MAX_EMAIL_LENGTH = 254
 MAX_EMAIL_LOCAL_LENGTH = 64
@@ -94,6 +95,8 @@ HOST_TOOLS_ARTIFACT_NAME_RE = re.compile(
     r"^platform-host-tools-bundle-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$"
 )
 HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+CPU_DIAGNOSTIC_RUN_RE = re.compile(r"^[0-9a-f]{32}$")
+CPU_DIAGNOSTIC_WORKLOAD = "authenticated_workspace_read_pair_v1"
 HOST_TOOLS_SIGNER_WORKFLOW = (
     "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml"
 )
@@ -443,6 +446,53 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     if source_binding is not None:
         result["source_binding"] = source_binding
     return result
+
+
+def validate_cpu_diagnostic_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the one fixed, zero-credit profiler-plan request."""
+
+    payload = _require_mapping(payload)
+    operation = _require_string(payload, "operation")
+    if operation == "cleanup":
+        _require_exact_keys(payload, {"schema", "operation", "run_id"})
+        if type(payload.get("schema")) is not int or payload["schema"] != 1:
+            raise _invalid()
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str) or CPU_DIAGNOSTIC_RUN_RE.fullmatch(run_id) is None:
+            raise _invalid()
+        return {"schema": 1, "operation": "cleanup", "run_id": run_id}
+    if operation != "prepare":
+        raise _invalid()
+    keys = {
+        "schema", "operation", "run_id", "source_sha", "workload",
+        "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms",
+    }
+    _require_exact_keys(payload, keys)
+    if type(payload.get("schema")) is not int or payload["schema"] != 1:
+        raise _invalid()
+    run_id = payload.get("run_id")
+    source_sha = payload.get("source_sha")
+    if not isinstance(run_id, str) or CPU_DIAGNOSTIC_RUN_RE.fullmatch(run_id) is None:
+        raise _invalid()
+    if not isinstance(source_sha, str) or SHA_RE.fullmatch(source_sha) is None:
+        raise _invalid()
+    if payload.get("workload") != CPU_DIAGNOSTIC_WORKLOAD:
+        raise _invalid()
+    times = [payload.get(name) for name in (
+        "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms"
+    )]
+    if any(type(value) is not int or value <= 0 for value in times):
+        raise _invalid()
+    off_start, off_end, on_start, on_end = times
+    if not (
+        off_start < off_end <= on_start < on_end
+        and off_end - off_start == 20_000
+        and on_start - off_end == 5_000
+        and on_end - on_start == 20_000
+        and on_end - off_start == 45_000
+    ):
+        raise _invalid()
+    return dict(payload)
 
 
 def validate_live_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -818,6 +868,23 @@ def load_payload(path: Path, *, mode: str) -> dict[str, Any]:
 
 
 def load_stdin_payload(*, mode: str) -> dict[str, Any]:
+    if mode == "cpu-diagnostic":
+        try:
+            raw = sys.stdin.buffer.read(MAX_CPU_DIAGNOSTIC_INPUT_BYTES + 1)
+        except (AttributeError, OSError) as exc:
+            raise _invalid() from exc
+        if len(raw) > MAX_CPU_DIAGNOSTIC_INPUT_BYTES:
+            raise _invalid()
+        payload = _load_json_bytes(raw)
+        try:
+            canonical = json.dumps(
+                payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+            ).encode("ascii") + b"\n"
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise _invalid() from exc
+        if raw != canonical:
+            raise _invalid()
+        return validate_cpu_diagnostic_payload(payload)
     try:
         raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
     except OSError as exc:

@@ -92,14 +92,14 @@ to `dev`. The chain is:
    `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>` generation. It
    requires the configured SSH identity to be root and checks the generation's
    owner, mode, link count, type, capabilities and every digest with fixed
-   absolute tools. The currently installed C4 generation and pending C5 pin
-   candidate retain the same capability contract:
-   `dispatcher=3`, `supervisor=3`, `release_baseline=1` and
-   `python_bytecode_disabled=1`; every immutable dispatcher call uses
-   `/usr/bin/python3.12 -I -B`. A missing or mismatched generation fails before
-   app build/attestation, pending status or transfer. Host bundle/source bind to
-   `HOST_TOOLS_SHA`; app artifact, provenance, migration and receipt bind to
-   `TARGET_SHA`. API artifact ID/name/run/source/digest and downloaded size
+   absolute tools. The 15-member, four-component candidate adds
+   `cpu_diagnostic_plan_control=1`; its contract is in the [host-tools ADR](adr/production-host-tools-provisioning.md).
+   The closure remains inactive until pinning and deployment; dispatchers use
+   `/usr/bin/python3.12 -I -B`.
+   A missing or mismatched generation fails before app build/attestation,
+   pending status or transfer.
+   Host bundle/source bind to `HOST_TOOLS_SHA`; app artifact, provenance,
+   migration and receipt bind to `TARGET_SHA`. API artifact ID/name/run/source/digest and downloaded size
    are cross-checked by bounded canonical verification. Because a nested
    `workflow_run.run_attempt` may be absent, the secret-free builder resolves
    the exact attempt through GitHub's authoritative attempt endpoint.
@@ -208,28 +208,28 @@ gh run list \
 gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The deploy workflow checks out the exact GitHub commit for the application
-release, builds the immutable release and wheelhouse in CI, publishes and
-attests the artifact, verifies its digest and `TARGET_SHA` provenance, then
-transfers that exact artifact to production. Host control is selected only by
-the reviewed `HOST_TOOLS_SHA` pin and is never copied from or rebuilt from the
-application checkout in a secret-bearing job.
-The VPS performs no source checkout or dependency/build resolution; it only
-revalidates the artifact and invokes the guarded release state machine. Record
-the Actions run URL/ID, target SHA, release slug and final smoke result in the
-handoff. Record both `TARGET_SHA` and `HOST_TOOLS_SHA` in the release receipt.
+The deploy workflow checks out the exact commit, builds and attests the release
+and wheelhouse, verifies digest and `TARGET_SHA`, then transfers it. Host control
+comes only from reviewed `HOST_TOOLS_SHA`, never the secret-bearing app checkout. The VPS validates the
+artifact and invokes the guarded state machine without source checkout or dependency resolution.
+Record run URL/ID, target SHA, release slug, smoke result and host-tools SHA in the handoff and receipt.
+
+Archives may carry `deploy/python-venv-policy.json` (`schema: 1`,
+`transition: require_proven_reuse`). These releases require strict shared-venv
+proof, reject dependency-skip requests, and need free space of at least
+`max(5 GiB, 15% of filesystem) + 128 MiB`. Proof, bypass or space failure
+aborts before replacement-venv/pointer changes. Missing policy stays legacy;
+cold fallback needs artifact-bound size evidence and a capacity guard.
 
 The production Alembic wrapper keeps the exact `upgrade head` allowlist. Its
-candidate-bound read-only revision check runs under quiesced locks before the
-catalog recovery helper, as defined by the [migration guard ADR](adr/candidate-forward-migration-guard.md).
-The helper acts only when `alembic_version` is exactly `20260901_0050`
-and a table matching the historical 0051 schema is present. It validates the
-table and constraints, idempotently backfills the projection, and repairs only
-invalid/unfinished concurrent indexes before stamping 0051. A valid index with
-the wrong definition or table, or any incompatible table/constraint, fails
-closed. Revision `20260913_0053` provides the same validation/repair as a
-forward migration for databases that already recorded 0051/0052; no downgrade
-or automatic migration reversal is performed.
+candidate-bound read-only revision check runs under quiesced locks before
+catalog recovery, per the [migration guard ADR](adr/candidate-forward-migration-guard.md).
+The helper acts only when `alembic_version` is `20260901_0050` and the
+historical 0051 table exists. It validates table/constraints, backfills the
+projection idempotently and repairs only invalid concurrent indexes before
+stamping 0051. Wrong definitions/tables or incompatible schema fail closed.
+Revision `20260913_0053` applies the same repair forward for databases at
+0051/0052; no downgrade or automatic reversal occurs.
 
 The migration wrapper has a bounded 300-second outer operation deadline that
 covers preflight, partial-0051 repair and the final `upgrade head` command. The

@@ -436,6 +436,18 @@ authority.
 
 ## Intentional host-tools bump lifecycle
 
+The performance follow-up candidate extends the previous 14-member host
+closure with the fixed CPU diagnostic plan controller, producing a
+15-member, four-component bundle. The new `cpu_diagnostic_control` component
+contains only `platform_cpu_diagnostic_plan.py`; the installed immutable
+dispatcher may invoke it only as its exact trusted sibling through the closed
+`cpu-diagnostic-plan` stdin action. The capability contract adds
+`cpu_diagnostic_plan_control=1` and advances the dispatcher schema to 4. This
+candidate is not authorized by an earlier pin: the normal C/P sequence must
+record all 15 source paths, modes and digests, pass exact-SHA CI, and provision
+and attest the new generation before the action can be used. The 14-member
+counts below are historical records for their respective prior generations.
+
 Changes to any member of the host-control closure, its closure declaration or
 the bundle helper must be handled as a reviewed **C → P** source sequence,
 never by pinning the commit that carries the pin itself:
@@ -447,6 +459,33 @@ delta is limited to `platform_configure_shared_env.py` and
 changes remain outside that 14-member closure. The pin-bearing **P** records
 the raw SHA-256 digests and Git modes of all 14 files from **C**. This source
 identity alone does not establish installation or deployment.
+
+The follow-on CPU diagnostic controller uses source commit **C**
+`80af72d5fec4c868897baf3cd0172af1c17b3fa6` and pin-only commit **E**
+`4af43c5afd84af29bd40d91e9e3002ab540142c5`. E selects the exact 15-member,
+four-component v4 closure and records its source modes and digests. This pin
+selection does not establish installation: the verified T application
+deployment at source `7e5769ba3f8596cb9950735f3685835013eb1085` still used the
+previous v3 host generation. Exact-SHA CI, approved provisioning and a
+post-provision capability check remain required before the CPU diagnostic
+action is available.
+
+The source-quality correction uses **C2**
+`7c4a4b43434b3d104c060778583f44d0bb22e682`, descended from **E**. It changes
+only the pinned dispatcher and CPU-plan controller bytes; the 15-member v4
+layout and capabilities are unchanged. Pin-only **E2**
+`801e785840adce76528389e47cd22cfa9c6b62d5` names C2 and records its exact
+closure digests. The strict resolver selects C2 from E2, but neither commit
+proves that C2 has been provisioned or installed.
+
+The capability-order compatibility correction uses **C3**
+`16eee656fbca10c485728b34b8490917b4de64a2`, descended from **E2**. It changes
+only the v4 capability tuple order to the exact order accepted by the trusted
+builder; the 15-member closure, capability set and component groups are
+unchanged. Pin-only **E3**
+`dfb291ca0ca31e001aecc58f2c75e4e06eddf26b` names C3 and records its exact
+closure digests. The strict resolver selects C3 from E3, but this selection
+does not prove that C3 has been provisioned or installed.
 
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains

@@ -1354,6 +1354,17 @@ except lock.VerificationLockError as exc:
                 for issue in release_runtime_workflow_issues(missing_dev_route)
             )
         )
+        untrusted_pr_route = workflow_text.replace(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            "github.event.pull_request.head.repo.full_name != github.repository",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "same-repository dev PR head repository" in issue
+                for issue in release_runtime_workflow_issues(untrusted_pr_route)
+            )
+        )
         missing_full_builder = workflow_text.replace(
             "$build_root/platform/tools/platform_build_release.sh",
             "$build_root/platform/tools/platform_build_live_qa_runtime.py",
@@ -1366,15 +1377,95 @@ except lock.VerificationLockError as exc:
             )
         )
         release_publishing = workflow_text.replace(
-            "        run: |\n          set -Eeuo pipefail\n          umask 077",
+            "      - name: Remove exact release size projection temporary directory",
+            "      - name: Unapproved release artifact upload\n"
             "        uses: actions/upload-artifact@" + "a" * 40 + "\n"
-            "        run: |\n          set -Eeuo pipefail\n          umask 077",
+            "      - name: Remove exact release size projection temporary directory",
             1,
         )
         self.assertTrue(
             any(
                 "must not publish" in issue
                 for issue in release_runtime_workflow_issues(release_publishing)
+            )
+        )
+        projection_upload_step = (
+            "      - name: Upload evidence-only release size projection\n"
+            "        if: ${{ success() }}\n"
+            "        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0\n"
+            "        with:\n"
+            "          name: platform-release-size-${{ github.run_id }}-${{ github.run_attempt }}\n"
+            "          path: ${{ steps.real-runtime-build.outputs.projection_path }}\n"
+            "          if-no-files-found: error\n"
+            "          retention-days: 14\n"
+        )
+        self.assertEqual(workflow_text.count(projection_upload_step), 1)
+        for label, replacement in (
+            (
+                "projection path",
+                projection_upload_step.replace(
+                    "path: ${{ steps.real-runtime-build.outputs.projection_path }}",
+                    "path: ${{ github.workspace }}/release.tar.gz",
+                    1,
+                ),
+            ),
+            (
+                "wildcard path",
+                projection_upload_step.replace(
+                    "path: ${{ steps.real-runtime-build.outputs.projection_path }}",
+                    "path: ${{ steps.real-runtime-build.outputs.projection_path }}/**",
+                    1,
+                ),
+            ),
+            (
+                "run-bound name",
+                projection_upload_step.replace(
+                    "platform-release-size-${{ github.run_id }}-${{ github.run_attempt }}",
+                    "platform-release-size-latest",
+                    1,
+                ),
+            ),
+            (
+                "unapproved action ref",
+                projection_upload_step.replace(
+                    "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0",
+                    "actions/upload-artifact@v6.0.0",
+                    1,
+                ),
+            ),
+            (
+                "missing-file policy",
+                projection_upload_step.replace(
+                    "if-no-files-found: error",
+                    "if-no-files-found: warn",
+                    1,
+                ),
+            ),
+            (
+                "retention",
+                projection_upload_step.replace("retention-days: 14", "retention-days: 90", 1),
+            ),
+            ("missing upload", ""),
+        ):
+            altered = workflow_text.replace(projection_upload_step, replacement, 1)
+            with self.subTest(release_projection_upload=label):
+                self.assertTrue(
+                    any(
+                        "must not publish" in issue
+                        for issue in release_runtime_workflow_issues(altered)
+                    )
+                )
+        release_attestation = workflow_text.replace(
+            "      - name: Remove exact release size projection temporary directory",
+            "      - name: Unapproved release attestation\n"
+            "        uses: actions/attest-build-provenance@" + "a" * 40 + "\n"
+            "      - name: Remove exact release size projection temporary directory",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "must not publish" in issue
+                for issue in release_runtime_workflow_issues(release_attestation)
             )
         )
         with tempfile.TemporaryDirectory() as directory:

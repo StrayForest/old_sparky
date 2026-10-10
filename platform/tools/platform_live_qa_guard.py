@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 import pwd
 import re
 import secrets
+import selectors
 import signal
 import shutil
 import stat
@@ -44,6 +45,13 @@ RUNNER_CACHE_ROOT = Path("/var/lib/oldsparky-liveqa")
 BUILD_NODE_ROOT = Path("/var/lib/oldsparky-build")
 RUN_GATE_ROOT = Path("/run/oldsparky-liveqa")
 LIVE_QA_SYSTEMD_UNIT = "oldsparky-liveqa-browser.service"
+LIVE_QA_CHILD_CAPTURE_BYTES = 64 * 1024
+LIVE_QA_CHILD_MARKER_RE = re.compile(
+    r"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(none|playwright_cli_usage|"
+    r"node_module_missing|browser_executable_missing|browser_launch_error|"
+    r"child_timeout|cleanup_failure|unclassified) stdout_bytes=([0-9]{1,16}) "
+    r"stderr_bytes=([0-9]{1,16}) truncated=(true|false) child_exit=([0-9]{1,3})\n"
+)
 LIVE_QA_CGROUP = Path("/sys/fs/cgroup/system.slice") / LIVE_QA_SYSTEMD_UNIT
 APPARMOR_RESTRICT_USERNS = Path(
     "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
@@ -1783,16 +1791,19 @@ def public_browser_counts_line(
     app_sha: str,
     marker_sha256: str,
 ) -> str:
-    """Read one exact, private Playwright count record and project closed fields."""
+    """Read one exact private Playwright count record and project closed fields."""
 
     if (
         gate.parent != RUN_GATE_ROOT
-        or not PUBLIC_GATE_NAME_PATTERN.fullmatch(gate.name)
+        or not (
+            PUBLIC_GATE_NAME_PATTERN.fullmatch(gate.name)
+            or STATE_NAME_PATTERN.fullmatch(gate.name)
+        )
         or SHA1_RE.fullmatch(source_sha) is None
         or SHA1_RE.fullmatch(app_sha) is None
         or SHA256_RE.fullmatch(marker_sha256) is None
     ):
-        raise GuardError("public browser count binding is invalid")
+        raise GuardError("browser count binding is invalid")
     uid, gid = liveqa_identity()
     try:
         root_metadata = RUN_GATE_ROOT.lstat()
@@ -1800,7 +1811,7 @@ def public_browser_counts_line(
         results_path = gate / "test-results"
         results_metadata = results_path.lstat()
     except OSError as exc:
-        raise GuardError("public browser count path is unavailable") from exc
+        raise GuardError("browser count path is unavailable") from exc
     if (
         stat.S_ISLNK(root_metadata.st_mode)
         or not stat.S_ISDIR(root_metadata.st_mode)
@@ -1819,7 +1830,7 @@ def public_browser_counts_line(
         or results_metadata.st_gid != gid
         or stat.S_IMODE(results_metadata.st_mode) != 0o700
     ):
-        raise GuardError("public browser count directory metadata is unsafe")
+        raise GuardError("browser count directory metadata is unsafe")
 
     report_path = results_path / LIVE_BROWSER_COUNTS_FILE
     descriptor: int | None = None
@@ -1843,7 +1854,7 @@ def public_browser_counts_line(
             or _browser_count_fingerprint(path_metadata)
             != _browser_count_fingerprint(opened_metadata)
         ):
-            raise GuardError("public browser count file metadata is unsafe")
+            raise GuardError("browser count file metadata is unsafe")
         raw = os.read(descriptor, LIVE_BROWSER_COUNTS_MAX_BYTES + 1)
         final_metadata = os.fstat(descriptor)
         current_path_metadata = report_path.lstat()
@@ -1855,25 +1866,25 @@ def public_browser_counts_line(
             or _browser_count_fingerprint(current_path_metadata)
             != _browser_count_fingerprint(opened_metadata)
         ):
-            raise GuardError("public browser count file changed while reading")
+            raise GuardError("browser count file changed while reading")
     except OSError as exc:
-        raise GuardError("public browser count file is unavailable") from exc
+        raise GuardError("browser count file is unavailable") from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
 
     if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
-        raise GuardError("public browser count JSON framing is invalid")
+        raise GuardError("browser count JSON framing is invalid")
     try:
         payload = json.loads(
             raw.decode("ascii"),
             object_pairs_hook=_strict_object,
             parse_constant=lambda _value: (_ for _ in ()).throw(
-                GuardError("public browser count JSON is invalid")
+                GuardError("browser count JSON is invalid")
             ),
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise GuardError("public browser count JSON is invalid") from exc
+        raise GuardError("browser count JSON is invalid") from exc
     expected_keys = {
         "schema",
         "source_sha",
@@ -1893,12 +1904,12 @@ def public_browser_counts_line(
         or not isinstance(payload.get("run_status"), str)
         or payload["run_status"] not in LIVE_BROWSER_COUNTS_RUN_STATUSES
     ):
-        raise GuardError("public browser count binding is incomplete")
+        raise GuardError("browser count binding is incomplete")
     counts: dict[str, int] = {}
     for field in LIVE_BROWSER_COUNT_FIELDS:
         value = payload.get(field)
         if type(value) is not int or not 0 <= value <= 32768:
-            raise GuardError("public browser count value is invalid")
+            raise GuardError("browser count value is invalid")
         counts[field] = value
     if (
         sum(
@@ -1926,7 +1937,7 @@ def public_browser_counts_line(
         != counts["attempt_total"]
         or counts["logical_total"] > 4096
     ):
-        raise GuardError("public browser count partitions are incomplete")
+        raise GuardError("browser count partitions are incomplete")
 
     ordered = [
         f"run_status={payload['run_status']}",
@@ -3520,6 +3531,307 @@ def prepare_build_node() -> Path:
     return target
 
 
+def _qa_child_failure_kind(
+    stdout_prefix: bytes, stderr_prefix: bytes, *, child_exit: int
+) -> str:
+    if child_exit == 0:
+        return "none"
+    combined = (stdout_prefix + b"\n" + stderr_prefix).lower()
+    if b"cannot find module" in combined or b"module_not_found" in combined:
+        return "node_module_missing"
+    if b"executable doesn't exist" in combined or b"executable does not exist" in combined:
+        return "browser_executable_missing"
+    if b"unknown option" in combined or b"unknown argument" in combined:
+        return "playwright_cli_usage"
+    if b"browsertype.launch:" in combined or b"browser launch failed" in combined:
+        return "browser_launch_error"
+    if child_exit == 124:
+        return "child_timeout"
+    return "unclassified"
+
+
+def _terminate_qa_child_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=2.0)
+        return
+    except (subprocess.TimeoutExpired, ChildProcessError):
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=2.0)
+    except (subprocess.TimeoutExpired, ChildProcessError):
+        pass
+
+
+def _stop_timed_out_qa_browser_unit() -> bool:
+    """Stop and verify only the fixed browser unit after its client times out."""
+
+    try:
+        stopped = subprocess.run(  # nosec B603
+            ["/usr/bin/systemctl", "--no-ask-password", "stop", LIVE_QA_SYSTEMD_UNIT],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={"LANG": "C", "PATH": SAFE_PATH},
+            close_fds=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if stopped.returncode != 0:
+        return False
+
+    deadline = time.monotonic() + 5.0
+    while _liveqa_cgroup_process_ids() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if _liveqa_cgroup_process_ids():
+        try:
+            _kill_liveqa_cgroup(timeout=2.0)
+        except GuardError:
+            return False
+    if _liveqa_cgroup_process_ids():
+        return False
+
+    try:
+        state = subprocess.run(  # nosec B603
+            [
+                "/usr/bin/systemctl",
+                "show",
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                LIVE_QA_SYSTEMD_UNIT,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={"LANG": "C", "PATH": SAFE_PATH},
+            close_fds=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if len(state.stdout) > 256:
+        return False
+    rows = state.stdout.decode("ascii", errors="ignore").splitlines()
+    if state.returncode == 0 and rows == ["LoadState=loaded", "ActiveState=inactive"]:
+        return True
+    return (
+        state.returncode == 1
+        and rows == ["LoadState=not-found", "ActiveState="]
+        and not _liveqa_cgroup_process_ids()
+    )
+
+
+def _capture_qa_child(
+    command: list[str], *, timeout_seconds: float
+) -> tuple[int, str]:
+    """Drain both QA streams while retaining only bounded classifier prefixes."""
+
+    if (
+        not command
+        or len(command) > 64
+        or any(not arg or len(arg) > 4096 or "\x00" in arg for arg in command)
+        or not 0 < timeout_seconds <= 300
+    ):
+        raise GuardError("QA child command shape is invalid")
+    process = subprocess.Popen(  # nosec B603
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        close_fds=True,
+    )
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    if any(stream is None for stream in streams.values()):
+        _terminate_qa_child_group(process)
+        raise GuardError("QA child streams are unavailable")
+    selector = selectors.DefaultSelector()
+    prefixes = {"stdout": bytearray(), "stderr": bytearray()}
+    observed = {"stdout": 0, "stderr": 0}
+    try:
+        for name, stream in streams.items():
+            assert stream is not None
+            descriptor = stream.fileno()
+            os.set_blocking(descriptor, False)
+            selector.register(descriptor, selectors.EVENT_READ, name)
+        deadline = time.monotonic() + timeout_seconds
+        while selector.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_qa_child_group(process)
+                child_exit = 124
+                break
+            for key, _ in selector.select(min(remaining, 0.1)):
+                try:
+                    chunk = os.read(key.fd, 8192)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                name = key.data
+                observed[name] += len(chunk)
+                prefix = prefixes[name]
+                if len(prefix) < LIVE_QA_CHILD_CAPTURE_BYTES:
+                    prefix.extend(chunk[: LIVE_QA_CHILD_CAPTURE_BYTES - len(prefix)])
+        else:
+            child_exit = process.returncode if process.returncode is not None else 2
+        if process.poll() is not None and child_exit != 124:
+            child_exit = process.returncode if process.returncode is not None else 2
+        truncated = any(
+            observed[name] > len(prefixes[name]) for name in prefixes
+        )
+        reported_exit = child_exit if 0 <= child_exit <= 255 else 2
+        kind = _qa_child_failure_kind(
+            bytes(prefixes["stdout"]), bytes(prefixes["stderr"]), child_exit=reported_exit
+        )
+        return reported_exit, (
+            "LIVE_QA_CHILD_DIAGNOSTIC schema=1 "
+            f"kind={kind} stdout_bytes={observed['stdout']} "
+            f"stderr_bytes={observed['stderr']} truncated={'true' if truncated else 'false'} "
+            f"child_exit={reported_exit}\n"
+        )
+    except BaseException:
+        _terminate_qa_child_group(process)
+        raise
+    finally:
+        selector.close()
+        for stream in streams.values():
+            if stream is not None:
+                stream.close()
+
+
+def _is_fixed_live_browser_command(command: list[str]) -> bool:
+    if not command or command[0] != "/usr/bin/systemd-run":
+        return False
+    if command.count("--") != 1:
+        return False
+    separator = command.index("--")
+    if separator < 1 or command[separator + 1 : separator + 3] != ["/usr/bin/env", "-i"]:
+        return False
+    required = {
+        "--no-ask-password",
+        "--quiet",
+        "--wait",
+        "--collect",
+        "--pipe",
+        "--service-type=exec",
+        "--expand-environment=no",
+        f"--unit={LIVE_QA_SYSTEMD_UNIT}",
+        "--property=KillMode=control-group",
+        "--property=Restart=no",
+        "--property=RuntimeMaxSec=30min",
+        "--property=SendSIGKILL=yes",
+        "--property=TimeoutStopSec=5s",
+        "--property=UMask=0077",
+    }
+    before = command[:separator]
+    if not required.issubset(before):
+        return False
+    if not any(re.fullmatch(r"--uid=[1-9][0-9]{0,8}", item) for item in before):
+        return False
+    if not any(re.fullmatch(r"--gid=[1-9][0-9]{0,8}", item) for item in before):
+        return False
+    if not any(
+        item.startswith((
+            "--working-directory=/var/lib/oldsparky-liveqa/",
+            "--working-directory=/root/.oldsparky/liveqa/releases/",
+        ))
+        for item in before
+    ):
+        return False
+    if any(
+        not (
+            item in required
+            or item.startswith("--uid=")
+            or item.startswith("--gid=")
+            or item.startswith((
+                "--working-directory=/var/lib/oldsparky-liveqa/",
+                "--working-directory=/root/.oldsparky/liveqa/releases/",
+            ))
+            or item.startswith("--property=BindReadOnlyPaths=/")
+        )
+        for item in before[1:]
+    ):
+        return False
+    tail = command[separator + 3 :]
+    if len(tail) < 5:
+        return False
+    env_keys = {
+        "CHROME_DEVEL_SANDBOX",
+        "HOME",
+        "LANG",
+        "NODE_PATH",
+        "PATH",
+        "PLATFORM_LIVE_EXPECTED_ORIGIN",
+        "PLATFORM_LIVE_USER_QA_UID",
+        "PLATFORM_QA_BROWSER_GATE_DIR",
+        "PLATFORM_LIVE_QA_RUNNER_SHA",
+        "PLATFORM_LIVE_QA_TARGET_SHA",
+        "PLATFORM_LIVE_QA_MARKER_SHA256",
+        "PLATFORM_LIVE_USER_QA",
+        "PLATFORM_LIVE_USER_QA_INVENTORY",
+        "PLATFORM_LIVE_USER_QA_MARKER",
+        "PLATFORM_LIVE_USER_QA_SESSIONS",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "PLAYWRIGHT_LIVE_BASE_URL",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+    }
+    env_end = 0
+    while env_end < len(tail) and "=" in tail[env_end]:
+        key, _value = tail[env_end].split("=", 1)
+        if key not in env_keys or not re.fullmatch(r"[A-Z0-9_]+", key):
+            return False
+        env_end += 1
+    if env_end == 0 or env_end + 5 > len(tail):
+        return False
+    def runtime_root_ok(value: str) -> bool:
+        return value.startswith(
+            (
+                "/var/lib/oldsparky-liveqa/",
+                "/opt/oldsparky/platform/shared/",
+                "/root/.oldsparky/liveqa/releases/",
+            )
+        )
+    node, cli, subcommand, config, spec, *extra = tail[env_end:]
+    if (
+        not runtime_root_ok(node)
+        or not node.endswith("/node/bin/node")
+        or not runtime_root_ok(cli)
+        or not cli.endswith("/web/node_modules/@playwright/test/cli.js")
+        or subcommand != "test"
+        or not config.startswith("--config=")
+        or not config.endswith("/web/playwright.live.config.ts")
+        or not runtime_root_ok(spec)
+        or not re.search(r"/web/tests/smoke/live-(?:launch|user-journey)\.spec\.ts$", spec)
+        or extra not in ([], ["--project=live-desktop"])
+    ):
+        return False
+    return True
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Guard production live QA execution.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3592,6 +3904,8 @@ def _parser() -> argparse.ArgumentParser:
     remove_state = commands.add_parser("remove-root-state")
     remove_state.add_argument("--bundle-path", type=Path, required=True)
     remove_state.add_argument("--state-dir", type=Path, required=True)
+    qa_child = commands.add_parser("capture-qa-browser-child")
+    qa_child.add_argument("argv", nargs=argparse.REMAINDER)
     return parser
 
 
@@ -3605,6 +3919,24 @@ def main(argv: Iterable[str] | None = None) -> int:
             if command and command[0] == "--":
                 command = command[1:]
             locked_exec(args.bundle_path, command)
+        if args.command == "capture-qa-browser-child":
+            command = list(args.argv)
+            if command and command[0] == "--":
+                command = command[1:]
+            if not _is_fixed_live_browser_command(command):
+                raise GuardError("QA browser child command is not the fixed systemd scope")
+            child_exit, marker = _capture_qa_child(command, timeout_seconds=300.0)
+            if child_exit == 124 and not _stop_timed_out_qa_browser_unit():
+                matched = LIVE_QA_CHILD_MARKER_RE.fullmatch(marker)
+                if matched is not None:
+                    marker = (
+                        "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=cleanup_failure "
+                        f"stdout_bytes={matched.group(2)} stderr_bytes={matched.group(3)} "
+                        f"truncated={matched.group(4)} child_exit=2\n"
+                    )
+                child_exit = 2
+            print(marker, end="")
+            return child_exit
         if args.command == "recovery-locked-exec":
             command = list(args.argv)
             if command and command[0] == "--":

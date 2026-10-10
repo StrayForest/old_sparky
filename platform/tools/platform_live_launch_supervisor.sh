@@ -285,7 +285,8 @@ fi
 # not receive credentials in its environment or command line.
 launch_stage="browser_qa"
 launch_check="browser_qa"
-env -i \
+browser_diagnostic=""
+if browser_diagnostic="$(env -i \
   HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
   PLATFORM_APP_DIR=/opt/oldsparky/platform \
   PLATFORM_LIVE_CSP_QA_BUNDLE="$BUNDLE" \
@@ -294,4 +295,18 @@ env -i \
   PLATFORM_LIVE_QA_RUNNER_SHA="$runner_sha" \
   PLATFORM_LIVE_QA_MARKER_SHA256="$marker_sha256" \
   PLAYWRIGHT_LIVE_BASE_URL="$base_url" \
-  "$TOOLS_DIR/platform_live_browser_qa.sh" public
+  "$TOOLS_DIR/platform_live_browser_qa.sh" public)"; then
+  browser_status=0
+else
+  browser_status=$?
+fi
+if [[ "$browser_diagnostic" =~ (^|$'\n')LIVE_QA_CHILD_DIAGNOSTIC\ schema=1\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=[0-9]{1,3}($|$'\n') ]]; then
+  child_diagnostic="${BASH_REMATCH[0]}"
+  child_diagnostic="${child_diagnostic//$'\n'/}"
+  printf '%s\n' "$child_diagnostic" >&3 || true
+else
+  browser_status=2
+fi
+if (( browser_status != 0 )); then
+  exit "$browser_status"
+fi

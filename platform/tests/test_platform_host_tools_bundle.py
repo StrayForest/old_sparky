@@ -1199,6 +1199,30 @@ class HostToolsBundleTests(unittest.TestCase):
                 manifest["components"],
                 {key: list(value) for key, value in bundle.COMPONENT_FILES.items()},
             )
+            trusted_v4_capabilities = (
+                "artifact_prepare",
+                "input_guard",
+                "production_dispatcher",
+                "production_supervisor",
+                "production_deploy_control",
+                "release_baseline",
+                "retained_load_export_cleanup",
+                "retained_load_source_binding",
+                "python_isolated",
+                "python_bytecode_disabled",
+                "cpu_diagnostic_plan_control",
+            )
+            self.assertEqual(manifest["capabilities"], list(trusted_v4_capabilities))
+            with zipfile.ZipFile(first) as archive:
+                capability_lines = archive.read("platform-host-tools/capabilities.txt")
+                self.assertEqual(
+                    [
+                        line.removeprefix("capability=")
+                        for line in capability_lines.decode("ascii").splitlines()
+                        if line.startswith("capability=")
+                    ],
+                    list(trusted_v4_capabilities),
+                )
             self.assertNotIn("platform_release_deploy.sh", bundle.HOST_TOOL_FILES)
             self.assertNotIn("platform_run_api.sh", bundle.HOST_TOOL_FILES)
             contract = root / "contract"
@@ -1214,47 +1238,106 @@ class HostToolsBundleTests(unittest.TestCase):
                 len((contract / "files.sha256").read_text().splitlines()),
                 len(bundle.HOST_TOOL_FILES) + 1,
             )
-            extended_source = self._source_fixture(root / "extended")
-            extended_tools = extended_source / "platform" / "tools"
-            controller = extended_tools / "platform_cpu_diagnostic_plan.py"
-            controller.write_text("# inert fixture member; builder treats it as bytes only\n", encoding="ascii")
-            controller.chmod(0o755)
-            helper = extended_tools / "platform_host_tools_bundle.py"
+            self.assertEqual(first_summary["manifest"]["toolset_version"], "production-host-tools-v4")
+            self.assertIn(
+                "platform_cpu_diagnostic_plan.py",
+                [record["path"].removeprefix("platform-host-tools/") for record in manifest["files"]],
+            )
+
+            # The trusted T builder accepts only the fixed v4 capability
+            # order. Reordered or extra capabilities must not be normalized
+            # as an equivalent set.
+            wrong_order_source = self._source_fixture(root / "wrong-order")
+            wrong_order_helper = wrong_order_source / "platform" / "tools" / "platform_host_tools_bundle.py"
+            wrong_order_text = wrong_order_helper.read_text(encoding="utf-8")
+            ordered_capability_block = (
+                '    "python_isolated",\n'
+                '    "python_bytecode_disabled",\n'
+                '    "cpu_diagnostic_plan_control",\n'
+            )
+            self.assertIn(ordered_capability_block, wrong_order_text)
+            wrong_order_helper.write_text(
+                wrong_order_text.replace(
+                    ordered_capability_block,
+                    '    "cpu_diagnostic_plan_control",\n'
+                    '    "python_isolated",\n'
+                    '    "python_bytecode_disabled",\n',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            wrong_order_archive = root / "wrong-order.zip"
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.build_bundle(wrong_order_source, SOURCE_SHA, wrong_order_archive)
+            self.assertFalse(wrong_order_archive.exists())
+
+            extra_capability_source = self._source_fixture(root / "extra-capability")
+            extra_capability_helper = (
+                extra_capability_source / "platform" / "tools" / "platform_host_tools_bundle.py"
+            )
+            extra_capability_text = extra_capability_helper.read_text(encoding="utf-8")
+            self.assertIn(ordered_capability_block, extra_capability_text)
+            extra_capability_helper.write_text(
+                extra_capability_text.replace(
+                    ordered_capability_block,
+                    '    "python_isolated",\n'
+                    '    "python_bytecode_disabled",\n'
+                    '    "cpu_diagnostic_plan_control",\n'
+                    '    "unapproved_capability",\n',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            extra_capability_archive = root / "extra-capability.zip"
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.build_bundle(extra_capability_source, SOURCE_SHA, extra_capability_archive)
+            self.assertFalse(extra_capability_archive.exists())
+
+            # Exercise the immutable v3 compatibility layout as an explicit
+            # legacy declaration. The production v4 active declaration above
+            # is never extended to manufacture its own expected layout.
+            legacy_source = self._source_fixture(root / "legacy")
+            legacy_tools = legacy_source / "platform" / "tools"
+            helper = legacy_tools / "platform_host_tools_bundle.py"
             helper_text = helper.read_text(encoding="utf-8")
             self.assertIn(
                 'CPU_DIAGNOSTIC_CONTROL_FILES = ("platform_cpu_diagnostic_plan.py",)',
                 helper_text,
             )
+            self.assertIn("+ CPU_DIAGNOSTIC_CONTROL_FILES", helper_text)
             helper_text = helper_text.replace(
-                "    + RETAINED_LOAD_ARTIFACT_FILES\n)",
                 "    + RETAINED_LOAD_ARTIFACT_FILES\n    + CPU_DIAGNOSTIC_CONTROL_FILES\n)",
+                "    + RETAINED_LOAD_ARTIFACT_FILES\n)",
+                1,
             )
+            self.assertIn('    "cpu_diagnostic_control": CPU_DIAGNOSTIC_CONTROL_FILES,\n', helper_text)
             helper_text = helper_text.replace(
-                '    "python_bytecode_disabled",\n',
-                '    "python_bytecode_disabled",\n    "cpu_diagnostic_plan_control",\n',
+                '    "cpu_diagnostic_control": CPU_DIAGNOSTIC_CONTROL_FILES,\n', "", 1
             )
+            self.assertIn('    "cpu_diagnostic_plan_control",\n', helper_text)
+            helper_text = helper_text.replace('    "cpu_diagnostic_plan_control",\n', "", 1)
             helper_text = helper_text.replace(
-                '    "retained_load_artifact_cleanup": RETAINED_LOAD_ARTIFACT_FILES,\n',
-                '    "retained_load_artifact_cleanup": RETAINED_LOAD_ARTIFACT_FILES,\n'
-                '    "cpu_diagnostic_control": CPU_DIAGNOSTIC_CONTROL_FILES,\n',
-            )
-            helper_text = helper_text.replace(
-                'TOOLSET_VERSION = "production-host-tools-v3"',
                 'TOOLSET_VERSION = "production-host-tools-v4"',
+                'TOOLSET_VERSION = "production-host-tools-v3"',
+                1,
             )
             helper.write_text(helper_text, encoding="utf-8")
-            extended_archive = root / "extended.zip"
-            extended_summary = bundle.build_bundle(extended_source, SOURCE_SHA, extended_archive)
-            extended_manifest = extended_summary["manifest"]
+            legacy_archive = root / "legacy.zip"
+            legacy_summary = bundle.build_bundle(legacy_source, SOURCE_SHA, legacy_archive)
+            legacy_manifest = legacy_summary["manifest"]
+            self.assertEqual(legacy_manifest["toolset_version"], "production-host-tools-v3")
             self.assertEqual(
-                extended_manifest["components"]["cpu_diagnostic_control"],
-                ["platform_cpu_diagnostic_plan.py"],
+                legacy_manifest["components"],
+                {key: list(value) for key, value in bundle.LEGACY_COMPONENT_FILES.items()},
             )
-            self.assertIn("cpu_diagnostic_plan_control", extended_manifest["capabilities"])
-            self.assertEqual(len(extended_manifest["files"]), len(bundle.CPU_DIAGNOSTIC_HOST_TOOL_FILES) + 1)
+            self.assertNotIn("cpu_diagnostic_plan_control", legacy_manifest["capabilities"])
+            self.assertEqual(len(legacy_manifest["files"]), len(bundle.LEGACY_HOST_TOOL_FILES) + 1)
+            self.assertFalse(
+                any(record["path"].endswith("platform_cpu_diagnostic_plan.py") for record in legacy_manifest["files"])
+            )
             self.assertEqual(
-                tuple(record["path"] for record in bundle.verify_bundle(extended_archive)["manifest"]["files"]),
-                tuple(sorted((*bundle.CPU_DIAGNOSTIC_HOST_TOOL_FILES, "capabilities.txt"))),
+                tuple(record["path"] for record in bundle.verify_bundle(legacy_archive)["manifest"]["files"]),
+                tuple(sorted((*bundle.LEGACY_HOST_TOOL_FILES, "capabilities.txt"))),
             )
             for contract_file in (
                 "manifest.sha256",
@@ -1591,6 +1674,7 @@ raise SystemExit(module.main(["host-capabilities"]))
                 "dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 "
                 "release_baseline=1 retained_load_export_cleanup=1 "
                 "retained_load_source_binding=1 "
+                "cpu_diagnostic_plan_control=1 "
                 "python_isolated=1 python_bytecode_disabled=1\n"
             )
             bounded = limited_run("-I", "-B")
@@ -2529,6 +2613,7 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
             'generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 '
             'input_guard=2 release_baseline=1 retained_load_export_cleanup=1 '
             'retained_load_source_binding=1 '
+            'cpu_diagnostic_plan_control=1 '
             'python_isolated=1 python_bytecode_disabled=1"',
             probe,
         )
@@ -2678,7 +2763,7 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
         expected_line = (
             f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
             "dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 "
-            "retained_load_export_cleanup=1 retained_load_source_binding=1 "
+            "retained_load_export_cleanup=1 retained_load_source_binding=1 cpu_diagnostic_plan_control=1 "
             "python_isolated=1 python_bytecode_disabled=1"
         )
         expected_payload = (expected_line + "\n").encode("ascii")

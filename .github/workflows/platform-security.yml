@@ -1020,8 +1020,18 @@ jobs:
     needs: [classifier, baseline-runtime-guard]
     if: >-
       !cancelled() &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      github.ref == 'refs/heads/dev' &&
+      (
+        (
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          github.ref == 'refs/heads/dev'
+        ) ||
+        (
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.base.ref == 'dev' &&
+          github.event.pull_request.base.repo.full_name == github.repository &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      ) &&
       (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') &&
       (needs.classifier.outputs.runtime_sensitive == 'true' ||
       needs.classifier.outputs.fallback == 'true' ||
@@ -1039,6 +1049,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Recheck exact current dev SHA immediately before runtime build
+        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1060,9 +1071,67 @@ jobs:
           if payload.get("name") != "dev" or not isinstance(payload.get("commit"), dict) or payload["commit"].get("sha") != sys.argv[1]:
               raise SystemExit("target is no longer the exact current dev head")
           PY
+      - name: Bind same-repository PR merge tree before runtime build
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        env:
+          TARGET_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I - "$GITHUB_WORKSPACE" <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          workspace = sys.argv[1]
+          target = os.environ.get("TARGET_SHA", "")
+          repository = os.environ.get("REPOSITORY", "")
+          base_ref = os.environ.get("PR_BASE_REF", "")
+          base_repository = os.environ.get("PR_BASE_REPOSITORY", "")
+          base_sha = os.environ.get("PR_BASE_SHA", "")
+          head_repository = os.environ.get("PR_HEAD_REPOSITORY", "")
+          head_sha = os.environ.get("PR_HEAD_SHA", "")
+          sha = re.compile(r"[0-9a-f]{40}")
+          if (
+              not sha.fullmatch(target)
+              or not sha.fullmatch(base_sha)
+              or not sha.fullmatch(head_sha)
+              or not repository
+              or base_ref != "dev"
+              or base_repository != repository
+              or head_repository != repository
+          ):
+              raise SystemExit("same-repository dev PR binding is invalid")
+          try:
+              checked_out = subprocess.run(
+                  ["git", "-C", workspace, "rev-parse", "--verify", "HEAD"],
+                  check=True, capture_output=True, text=True, timeout=5,
+              ).stdout.strip()
+              parents = subprocess.run(
+                  ["git", "-C", workspace, "rev-list", "--parents", "-n", "1", target],
+                  check=True, capture_output=True, text=True, timeout=5,
+              ).stdout.split()
+          except (OSError, subprocess.SubprocessError):
+              raise SystemExit("same-repository dev PR tree is unavailable") from None
+          if checked_out != target or parents != [target, base_sha, head_sha]:
+              raise SystemExit("same-repository dev PR merge tree does not match the event")
+          PY
       - name: Run canonical immutable release builder on trusted dev
         id: real-runtime-build
         timeout-minutes: 40
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -1077,6 +1146,11 @@ jobs:
           disk_after_bytes=""
           build_log=""
           marker_log=""
+          size_projection_path=""
+          public_projection_dir=""
+          public_projection_dir_id=""
+          public_projection_path=""
+          projection_ready=0
           canonical_builder_rc=""
           builder_started=0
           diagnostic_parser="$GITHUB_WORKSPACE/platform/tools/platform_release_build_diagnostics.py"
@@ -1099,6 +1173,17 @@ jobs:
             local safe_diagnostic=""
             local sanitizer_rc=1
             local builder_run_ready=0
+            local cleanup_stage=none
+            local cleanup_predicate=none
+            mark_cleanup_failure() {
+              local stage="$1"
+              local predicate="$2"
+              cleanup_rc=1
+              if [[ "$cleanup_stage" == "none" ]]; then
+                cleanup_stage="$stage"
+                cleanup_predicate="$predicate"
+              fi
+            }
             trap - EXIT
             set +e
             if (( builder_started == 1 )) && [[ -n "$canonical_rc" ]]; then
@@ -1237,25 +1322,83 @@ jobs:
               safe_diagnostic="RELEASE_RUNTIME_BUILD_DIAGNOSTIC schema=1 canonical_builder_rc=${canonical_rc:-unknown} parser_rc=127 phase=unknown status=failed reason=build_failed cleanup=unknown reject_reason=missing consistency=not-run"
             fi
             printf '%s\n' "$safe_diagnostic"
+            if (( projection_ready == 1 && workflow_rc == 0 && canonical_rc == 0 \
+              && parser_rc == 0 && sanitizer_rc == 0 )); then
+              local runner_uid="$(id -u)"
+              local runner_gid="$(id -g)"
+              local output_metadata=""
+              local output_dir_metadata=""
+              local output_dir_id=""
+              if [[ -z "$size_projection_path" ]]; then
+                mark_cleanup_failure projection_copy source_file
+              elif ! sudo -n /usr/bin/test -f "$size_projection_path" 2>/dev/null \
+                || ! sudo -n /usr/bin/test ! -L "$size_projection_path" 2>/dev/null; then
+                mark_cleanup_failure projection_copy source_file
+              elif [[ "$(sudo -n /usr/bin/stat -c '%u:%g:%a:%h:%F' -- "$size_projection_path" 2>/dev/null)" \
+                != "0:0:600:1:regular file" ]]; then
+                mark_cleanup_failure projection_copy source_metadata
+              elif [[ -z "$public_projection_path" || ! -f "$public_projection_path" \
+                || -L "$public_projection_path" ]]; then
+                mark_cleanup_failure projection_copy destination_file
+              else
+                output_dir_metadata="$(stat -c '%u:%g:%a:%h:%F' -- "$public_projection_dir" 2>/dev/null)"
+                output_dir_id="$(stat -c '%d:%i' -- "$public_projection_dir" 2>/dev/null)"
+                output_metadata="$(stat -c '%u:%g:%a:%h:%F' -- "$public_projection_path" 2>/dev/null)"
+                if [[ ! -d "$public_projection_dir" || -L "$public_projection_dir" ]]; then
+                  mark_cleanup_failure projection_copy directory_type
+                elif [[ "$output_dir_metadata" != "${runner_uid}:${runner_gid}:700:2:directory" ]]; then
+                  mark_cleanup_failure projection_copy directory_metadata
+                elif [[ -z "$public_projection_dir_id" || "$output_dir_id" != "$public_projection_dir_id" ]]; then
+                  mark_cleanup_failure projection_copy directory_identity
+                elif [[ "$output_metadata" != "${runner_uid}:${runner_gid}:600:1:regular file" \
+                  && "$output_metadata" != "${runner_uid}:${runner_gid}:600:1:regular empty file" ]]; then
+                  mark_cleanup_failure projection_copy destination_metadata
+                else
+                  if ! sudo -n /usr/bin/install -o "$runner_uid" -g "$runner_gid" -m 0600 \
+                    -- "$size_projection_path" "$public_projection_path" 2>/dev/null; then
+                    mark_cleanup_failure projection_copy install_failed
+                  fi
+                  copied_bytes="$(stat -c '%s' -- "$public_projection_path" 2>/dev/null)"
+                  if [[ ! "$copied_bytes" =~ ^[0-9]{1,5}$ ]] || (( copied_bytes > 8192 )); then
+                    mark_cleanup_failure projection_copy copied_size
+                  elif ! sudo -n /usr/bin/cmp -s -- "$size_projection_path" "$public_projection_path"; then
+                    mark_cleanup_failure projection_copy content_mismatch
+                  fi
+                fi
+              fi
+            fi
             if [[ -n "$release_root" ]]; then
               if [[ -d "$release_root" && ! -L "$release_root" ]]; then
                 current_id="$(sudo -n /usr/bin/stat -c '%d:%i' -- "$release_root" 2>/dev/null)"
                 if [[ -n "$release_root_id" && "$current_id" == "$release_root_id" ]]; then
-                  sudo -n /bin/rm -rf -- "$release_root" 2>/dev/null || cleanup_rc=1
+                  sudo -n /bin/rm -rf -- "$release_root" 2>/dev/null || mark_cleanup_failure release_root_remove remove_failed
                 else
-                  cleanup_rc=1
+                  mark_cleanup_failure release_root_remove identity_mismatch
                 fi
               elif [[ -e "$release_root" || -L "$release_root" ]]; then
-                cleanup_rc=1
+                mark_cleanup_failure release_root_remove unexpected_entry
               fi
-              [[ ! -e "$release_root" && ! -L "$release_root" ]] || cleanup_rc=1
+              [[ ! -e "$release_root" && ! -L "$release_root" ]] || mark_cleanup_failure release_root_remove residual_entry
             fi
             disk_after_bytes="$(free_bytes 2>/dev/null || true)"
-            if [[ ! "$disk_after_bytes" =~ ^[0-9]+$ ]] || (( disk_after_bytes < min_free_bytes )); then
-              cleanup_rc=1
+            if [[ ! "$disk_after_bytes" =~ ^[0-9]+$ ]]; then
+              mark_cleanup_failure disk_floor free_value_invalid
+            elif (( disk_after_bytes < min_free_bytes )); then
+              mark_cleanup_failure disk_floor minimum_not_met
             fi
             if (( cleanup_rc != 0 )); then
-              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup\n'
+              if [[ "$cleanup_stage" == "disk_floor" ]]; then
+                if [[ "$disk_after_bytes" =~ ^[0-9]{1,20}$ ]]; then
+                  printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=%s predicate=%s disk_after_bytes=%s min_free_bytes=%s\n' \
+                    "$cleanup_stage" "$cleanup_predicate" "$disk_after_bytes" "$min_free_bytes"
+                else
+                  printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=%s predicate=%s disk_after_bytes=unknown min_free_bytes=%s\n' \
+                    "$cleanup_stage" "$cleanup_predicate" "$min_free_bytes"
+                fi
+              else
+                printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=%s predicate=%s\n' \
+                  "$cleanup_stage" "$cleanup_predicate"
+              fi
               exit 1
             fi
             if (( builder_run_ready == 1 && parser_rc != 0 )); then
@@ -1278,6 +1421,12 @@ jobs:
               printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=builder_not_started\n'
               exit 1
             fi
+            if [[ -z "$public_projection_path" || ! -f "$public_projection_path" \
+              || -L "$public_projection_path" ]]; then
+              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=size_projection_missing\n'
+              exit 1
+            fi
+            printf 'projection_path=%s\n' "$public_projection_path" >>"$GITHUB_OUTPUT"
             printf 'RELEASE_RUNTIME_BUILD schema=1 status=passed source_sha=%s artifact_sha256=%s disk_before_bytes=%s disk_after_bytes=%s\n' \
               "$TARGET_SHA" "$artifact_sha256" "$disk_before_bytes" "$disk_after_bytes"
             exit 0
@@ -1291,6 +1440,36 @@ jobs:
           [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || { failure_reason=run_attempt_invalid; exit 1; }
           runner_temp="$(readlink -f -- "$RUNNER_TEMP")" || { failure_reason=temp_unavailable; exit 1; }
           [[ -d "$runner_temp" && ! -L "$RUNNER_TEMP" ]] || { failure_reason=temp_unavailable; exit 1; }
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,31}$ && "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || {
+            failure_reason=size_projection_temp_failed
+            exit 1
+          }
+          public_projection_dir="$runner_temp/platform-release-size-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ ! -e "$public_projection_dir" && ! -L "$public_projection_dir" ]] || {
+            failure_reason=size_projection_temp_failed
+            exit 1
+          }
+          mkdir -m 0700 -- "$public_projection_dir" || { failure_reason=size_projection_temp_failed; exit 1; }
+          public_projection_dir_id="$(stat -c '%d:%i' -- "$public_projection_dir" 2>/dev/null)" || {
+            failure_reason=size_projection_temp_failed
+            exit 1
+          }
+          [[ "$public_projection_dir_id" =~ ^[0-9]+:[0-9]+$ ]] || {
+            failure_reason=size_projection_temp_failed
+            exit 1
+          }
+          [[ "$(stat -c '%u:%g:%a:%h:%F' -- "$public_projection_dir" 2>/dev/null)" == "$(id -u):$(id -g):700:2:directory" ]] || {
+            failure_reason=size_projection_temp_failed
+            exit 1
+          }
+          printf 'projection_dir_id=%s\n' "$public_projection_dir_id" >>"$GITHUB_OUTPUT"
+          public_projection_path="$public_projection_dir/measurement.json"
+          : >"$public_projection_path"
+          chmod 0600 "$public_projection_path" || { failure_reason=size_projection_temp_failed; exit 1; }
+          [[ "$(stat -c '%u:%g:%a:%h:%F' -- "$public_projection_path" 2>/dev/null)" == "$(id -u):$(id -g):600:1:regular empty file" ]] || {
+            failure_reason=size_projection_temp_failed
+            exit 1
+          }
           disk_before_bytes="$(free_bytes)" || { failure_reason=disk_probe_failed; exit 1; }
           (( disk_before_bytes >= min_free_bytes )) || { failure_reason=insufficient_disk; exit 1; }
 
@@ -1465,6 +1644,77 @@ jobs:
           }
           [[ "$artifact_sha256" =~ ^[0-9a-f]{64}$ ]] || { failure_reason=artifact_digest_invalid; exit 1; }
 
+          size_projection_path="$release_root/size-projection.json"
+          sudo -n /usr/bin/install -o root -g root -m 0600 /dev/null "$size_projection_path" 2>/dev/null || {
+            failure_reason=size_projection_prepare_failed
+            exit 1
+          }
+          projection_args=(
+            --measurement-root "$release_root"
+            --release-slug "$actual_slug"
+            --source-sha "$TARGET_SHA"
+            --artifact-sha256 "$artifact_sha256"
+            --event-type "$GITHUB_EVENT_NAME"
+            --tested-sha "$GITHUB_SHA"
+            --run-id "$GITHUB_RUN_ID"
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+            --repository "$GITHUB_REPOSITORY"
+            --output "$size_projection_path"
+          )
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            projection_args+=(
+              --pr-head-sha "$PR_HEAD_SHA"
+              --pr-base-sha "$PR_BASE_SHA"
+              --pr-base-ref "$PR_BASE_REF"
+              --pr-head-repository "$PR_HEAD_REPOSITORY"
+              --pr-base-repository "$PR_BASE_REPOSITORY"
+            )
+          fi
+          sudo -n /usr/bin/python3 -I \
+            "$GITHUB_WORKSPACE/platform/tools/platform_release_artifact_size_projection.py" \
+            "${projection_args[@]}" >/dev/null || {
+            failure_reason=size_projection_failed
+            exit 1
+          }
+          projection_ready=1
+
+      - name: Upload evidence-only release size projection
+        if: ${{ success() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-release-size-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.real-runtime-build.outputs.projection_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove exact release size projection temporary directory
+        if: ${{ always() }}
+        shell: bash
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          PROOF_RUN_ID: ${{ github.run_id }}
+          PROOF_RUN_ATTEMPT: ${{ github.run_attempt }}
+          PROJECTION_DIR_ID: ${{ steps.real-runtime-build.outputs.projection_dir_id }}
+        run: |
+          set -euo pipefail
+          [[ "$PROOF_RUN_ID" =~ ^[1-9][0-9]{0,31}$ && "$PROOF_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          runner_temp="$(readlink -f -- "$RUNNER_TEMP")"
+          [[ -d "$runner_temp" && ! -L "$RUNNER_TEMP" ]]
+          projection_dir="$runner_temp/platform-release-size-${PROOF_RUN_ID}-${PROOF_RUN_ATTEMPT}"
+          if [[ -e "$projection_dir" || -L "$projection_dir" ]]; then
+            [[ -d "$projection_dir" && ! -L "$projection_dir" ]]
+            [[ "$PROJECTION_DIR_ID" =~ ^[0-9]+:[0-9]+$ ]]
+            [[ "$(stat -c '%d:%i' -- "$projection_dir")" == "$PROJECTION_DIR_ID" ]]
+            [[ "$(stat -c '%u:%g:%a:%h:%F' -- "$projection_dir")" == "$(id -u):$(id -g):700:2:directory" ]]
+            projection_file="$projection_dir/measurement.json"
+            [[ -f "$projection_file" && ! -L "$projection_file" ]]
+            projection_file_metadata="$(stat -c '%u:%g:%a:%h:%F' -- "$projection_file")"
+            [[ "$projection_file_metadata" == "$(id -u):$(id -g):600:1:regular file" \
+              || "$projection_file_metadata" == "$(id -u):$(id -g):600:1:regular empty file" ]]
+            rm -- "$projection_file"
+            rmdir -- "$projection_dir"
+          fi
+
   status-final:
     if: ${{ always() }}
     permissions:
@@ -1512,6 +1762,10 @@ jobs:
           RELEASE_RUNTIME_RESULT: ${{ needs['release-runtime'].result }}
           RELEASE_RUNTIME_REAL_RESULT: ${{ needs['release-runtime-real'].result }}
           WORKFLOW_REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           set -euo pipefail
           export SUMMARY_PATH="$GITHUB_WORKSPACE/platform-security-summary.json"
@@ -1600,12 +1854,21 @@ jobs:
           release_runtime_result = os.environ.get("RELEASE_RUNTIME_RESULT", "missing")
           real_runtime_result = os.environ.get("RELEASE_RUNTIME_REAL_RESULT", "skipped")
           requires_release_runtime = baseline_mode or runtime_sensitive or raw_fallback == "true"
+          repository = os.environ.get("REPOSITORY", "")
+          same_repository_dev_pr = (
+              event_name == "pull_request"
+              and os.environ.get("PR_BASE_REF") == "dev"
+              and os.environ.get("PR_BASE_REPOSITORY") == repository
+              and os.environ.get("PR_HEAD_REPOSITORY") == repository
+              and bool(repository)
+          )
           trusted_real_event = (
               (event_name == "push" and os.environ.get("WORKFLOW_REF") == "refs/heads/dev")
               or (
                   event_name == "workflow_dispatch"
                   and os.environ.get("WORKFLOW_REF") == "refs/heads/dev"
               )
+              or same_repository_dev_pr
           )
           requires_real_release_runtime = requires_release_runtime and trusted_real_event
           if requires_release_runtime:
@@ -1617,7 +1880,7 @@ jobs:
               if real_runtime_result != "success":
                   missing_or_failed.append("release-runtime-real")
           elif real_runtime_result not in {"", "skipped"}:
-              route_errors.append("real release-runtime must be skipped outside trusted dev routes")
+              route_errors.append("real release-runtime must be skipped outside trusted dev or same-repository dev PR routes")
           passed = (
               os.environ.get("CLASSIFIER_RESULT") == "success"
               and not route_errors

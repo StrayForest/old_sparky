@@ -177,7 +177,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _install_supervisor_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
+    def _install_supervisor_fixture(
+        root: Path, *, include_cpu_diagnostic_tool: bool = False
+    ) -> tuple[Path, Path, Path, Path]:
         """Install an exact supervisor copy under the production path shape.
 
         The real supervisor derives its trusted generation from ``BASH_SOURCE``
@@ -263,6 +265,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "platform_update_cloudflare_ips.py",
             "platform_storage_evidence_summary.py",
         )
+        if include_cpu_diagnostic_tool:
+            host_tool_files += ("platform_cpu_diagnostic_plan.py",)
         for name in host_tool_files:
             destination = generation_dir / name
             if name == "platform_release_lock.sh":
@@ -707,7 +711,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             )
             validated = subprocess.run(
                 [
-                    "/usr/bin/python3",
+                    sys.executable,
                     "-I",
                     str(VALIDATOR_SCRIPT),
                     "--artifact",
@@ -2575,7 +2579,7 @@ fail 'private lock detail must not cross the public channel'
         with tempfile.TemporaryDirectory() as temporary:
             fixture_root = Path(temporary)
             fixture, release_lock, retained_lock, generation_dir = self._install_supervisor_fixture(
-                fixture_root
+                fixture_root, include_cpu_diagnostic_tool=True
             )
 
             def cleanup_fixture() -> None:
@@ -3695,7 +3699,9 @@ fail 'private lock detail must not cross the public channel'
         with tempfile.TemporaryDirectory(prefix="deploy-artifact-errors-") as tmp:
             fixture_root = Path(tmp)
             supervisor, release_lock, retained_lock, generation_dir = (
-                self._install_supervisor_fixture(fixture_root)
+                self._install_supervisor_fixture(
+                    fixture_root, include_cpu_diagnostic_tool=True
+                )
             )
 
             def cleanup_fixture() -> None:
@@ -3872,7 +3878,9 @@ fail 'private lock detail must not cross the public channel'
         with tempfile.TemporaryDirectory() as temporary:
             fixture_root = Path(temporary)
             supervisor, release_lock, retained_lock, generation_dir = (
-                self._install_supervisor_fixture(fixture_root)
+                self._install_supervisor_fixture(
+                    fixture_root, include_cpu_diagnostic_tool=True
+                )
             )
 
             def cleanup_fixture() -> None:
@@ -4116,6 +4124,46 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn("platform_release_phase_telemetry.py", workflow)
         self.assertIn('PLATFORM_RELEASE_PHASE_LOG=\"$marker_log\"', workflow)
         real = workflow_job(workflow, "release-runtime-real")
+        self.assertIn("name: Trusted dev immutable release runtime", real)
+        self.assertIn("github.event_name == 'push'", real)
+        self.assertIn("github.event_name == 'workflow_dispatch'", real)
+        self.assertIn("github.ref == 'refs/heads/dev'", real)
+        self.assertIn("github.event.pull_request.base.ref == 'dev'", real)
+        self.assertIn(
+            "github.event.pull_request.base.repo.full_name == github.repository",
+            real,
+        )
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            real,
+        )
+        self.assertIn("github.event.pull_request.base.sha", real)
+        self.assertIn("github.event.pull_request.head.sha", real)
+        self.assertIn("parents != [target, base_sha, head_sha]", real)
+        self.assertLess(
+            real.index("Bind same-repository PR merge tree before runtime build"),
+            real.index("Run canonical immutable release builder on trusted dev"),
+        )
+        self.assertIn("permissions:\n      contents: read", real)
+        self.assertNotIn("environment:", real)
+        self.assertNotIn("secrets.", real)
+        finalizer = workflow_job(workflow, "status-final")
+        self.assertIn("same_repository_dev_pr", finalizer)
+        self.assertIn('event_name == "push"', finalizer)
+        self.assertIn('event_name == "workflow_dispatch"', finalizer)
+        self.assertIn('os.environ.get("WORKFLOW_REF") == "refs/heads/dev"', finalizer)
+        self.assertIn('os.environ.get("PR_BASE_REF") == "dev"', finalizer)
+        self.assertIn(
+            'requires_release_runtime = baseline_mode or runtime_sensitive or '
+            'raw_fallback == "true"',
+            finalizer,
+        )
+        self.assertIn("or raw_fallback == \"true\"", finalizer)
+        self.assertIn(
+            "requires_real_release_runtime = requires_release_runtime and trusted_real_event",
+            finalizer,
+        )
+        self.assertIn('real_runtime_result != "success"', finalizer)
         self.assertIn("builder_started=0", real)
         self.assertIn("local builder_run_ready=0", real)
         self.assertIn(
@@ -4134,7 +4182,162 @@ fail 'private lock detail must not cross the public channel'
         self.assertNotIn("tee", real)
         self.assertNotIn('cat "$build_log"', real)
         self.assertNotIn("BASH_COMMAND", real)
-        self.assertNotIn("actions/upload-artifact@", real)
+        self.assertIn("platform_release_artifact_size_projection.py", real)
+        self.assertIn('--repository "$GITHUB_REPOSITORY"', real)
+        size_projection_helper = (
+            REPO_ROOT / "platform/tools/platform_release_artifact_size_projection.py"
+        ).read_text()
+        self.assertIn("--extract-bootstrap-to", size_projection_helper)
+        self.assertIn('public_projection_dir_id="$(stat -c \'%d:%i\' -- "$public_projection_dir" 2>/dev/null)"', real)
+        self.assertIn('"$output_dir_id" != "$public_projection_dir_id"', real)
+        self.assertIn('"${runner_uid}:${runner_gid}:700:2:directory"', real)
+        self.assertIn("Upload evidence-only release size projection", real)
+        self.assertIn("path: ${{ steps.real-runtime-build.outputs.projection_path }}", real)
+        self.assertIn("if: ${{ success() }}", real)
+        self.assertIn("retention-days: 14", real)
+        placeholder_setup = real[
+            real.index('public_projection_path="$public_projection_dir/measurement.json"') :
+            real.index('disk_before_bytes="$(free_bytes)"')
+        ]
+        self.assertIn(
+            '== "$(id -u):$(id -g):600:1:regular empty file"',
+            placeholder_setup,
+        )
+        self.assertIn(
+            '&& "$output_metadata" != "${runner_uid}:${runner_gid}:600:1:regular empty file"',
+            real,
+        )
+        upload_start = real.index("- name: Upload evidence-only release size projection")
+        upload_end = real.index("- name: Remove exact release size projection temporary directory", upload_start)
+        upload_step = real[upload_start:upload_end]
+        self.assertNotIn("release_archive", upload_step)
+        self.assertNotIn("canonical-builder.log", upload_step)
+        self.assertIn("if: ${{ always() }}", real[upload_end:])
+        public_cleanup = real[upload_end:]
+        self.assertIn('PROJECTION_DIR_ID: ${{ steps.real-runtime-build.outputs.projection_dir_id }}', public_cleanup)
+        self.assertIn('"$(stat -c \'%d:%i\' -- "$projection_dir")" == "$PROJECTION_DIR_ID"', public_cleanup)
+        self.assertIn('"$(stat -c \'%u:%g:%a:%h:%F\' -- "$projection_dir")" == "$(id -u):$(id -g):700:2:directory"', public_cleanup)
+        self.assertIn("local cleanup_stage=none", real)
+        self.assertIn("local cleanup_predicate=none", real)
+        self.assertIn('if [[ "$cleanup_stage" == "none" ]]; then', real)
+        self.assertIn('cleanup_predicate="$predicate"', real)
+        for cleanup_predicate in (
+            "source_file",
+            "source_metadata",
+            "destination_file",
+            "directory_type",
+            "directory_metadata",
+            "directory_identity",
+            "destination_metadata",
+            "install_failed",
+            "copied_size",
+            "content_mismatch",
+        ):
+            self.assertIn(f"mark_cleanup_failure projection_copy {cleanup_predicate}", real)
+        for cleanup_predicate in (
+            "remove_failed",
+            "identity_mismatch",
+            "unexpected_entry",
+            "residual_entry",
+        ):
+            self.assertIn(f"mark_cleanup_failure release_root_remove {cleanup_predicate}", real)
+        for cleanup_predicate in ("free_value_invalid", "minimum_not_met"):
+            self.assertIn(f"mark_cleanup_failure disk_floor {cleanup_predicate}", real)
+        self.assertIn("mark_cleanup_failure projection_copy", real)
+        self.assertIn("mark_cleanup_failure release_root_remove", real)
+        self.assertIn("mark_cleanup_failure disk_floor", real)
+        self.assertIn("predicate=%s", real)
+        self.assertIn('sudo -n /usr/bin/test -f "$size_projection_path"', real)
+        self.assertIn('sudo -n /usr/bin/test ! -L "$size_projection_path"', real)
+        self.assertIn('!= "0:0:600:1:regular file"', real)
+        self.assertIn("reason=cleanup stage=%s", real)
+        self.assertIn(
+            "reason=cleanup stage=%s predicate=%s disk_after_bytes=%s min_free_bytes=%s",
+            real,
+        )
+        self.assertIn(
+            "reason=cleanup stage=%s predicate=%s disk_after_bytes=unknown min_free_bytes=%s",
+            real,
+        )
+        cleanup_step = self._workflow_step_run(
+            workflow, "Remove exact release size projection temporary directory"
+        )
+        self.assertIn('== "$(id -u):$(id -g):600:1:regular empty file"', cleanup_step)
+        self.assertIn('== "$(id -u):$(id -g):600:1:regular file"', cleanup_step)
+        self.assertLess(public_cleanup.index('"$PROJECTION_DIR_ID"'), public_cleanup.index('rm -- "$projection_file"'))
+
+        # Exercise the exact setup and always-cleanup shell bodies against both
+        # zero-byte failure placeholders and completed JSON projections.
+        with tempfile.TemporaryDirectory(prefix="release-size-placeholder-") as temporary:
+            temp_root = Path(temporary)
+            temp_root.chmod(0o755)
+            private_source_dir = temp_root / "root-private-source"
+            private_source_dir.mkdir(mode=0o700)
+            private_source = private_source_dir / "size-projection.json"
+            private_source.write_text("{}\n", encoding="ascii")
+            private_source.chmod(0o600)
+            self.assertIsNotNone(shutil.which("runuser"))
+            runner_probe = subprocess.run(
+                [
+                    "runuser",
+                    "-u",
+                    "nobody",
+                    "--",
+                    "/usr/bin/test",
+                    "-f",
+                    str(private_source),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(runner_probe.returncode, 0)
+            projection_dir = temp_root / "setup"
+            projection_dir.mkdir(mode=0o700)
+            setup_result = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + placeholder_setup],
+                env={**os.environ, "public_projection_dir": str(projection_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(setup_result.returncode, 0, setup_result.stderr)
+            placeholder = projection_dir / "measurement.json"
+            self.assertEqual(placeholder.read_bytes(), b"")
+            self.assertEqual(
+                subprocess.check_output(
+                    ["stat", "-c", "%F", "--", str(placeholder)], text=True
+                ).strip(),
+                "regular empty file",
+            )
+
+            cleanup_body = self._workflow_step_run(
+                real, "Remove exact release size projection temporary directory"
+            )
+            for projection_bytes in (b"", b'{"evidence_only":true}\n'):
+                candidate = temp_root / "platform-release-size-123-1"
+                candidate.mkdir(mode=0o700)
+                projection_file = candidate / "measurement.json"
+                projection_file.write_bytes(projection_bytes)
+                projection_file.chmod(0o600)
+                candidate_id = subprocess.check_output(
+                    ["stat", "-c", "%d:%i", "--", str(candidate)], text=True
+                ).strip()
+                cleanup_result = subprocess.run(
+                    ["bash", "-c", cleanup_body],
+                    env={
+                        **os.environ,
+                        "RUNNER_TEMP": str(temp_root),
+                        "PROOF_RUN_ID": "123",
+                        "PROOF_RUN_ATTEMPT": "1",
+                        "PROJECTION_DIR_ID": candidate_id,
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(cleanup_result.returncode, 0, cleanup_result.stderr)
+                self.assertFalse(candidate.exists())
         self.assertLess(
             real.index("diagnostic_parser"),
             real.index('/bin/rm -rf -- "$release_root"'),
@@ -4275,6 +4478,10 @@ marker_log=""
 canonical_builder_rc=""
 builder_started=0
 diagnostic_parser=/no/such/parser
+size_projection_path=""
+public_projection_dir=""
+public_projection_path=""
+projection_ready=0
 {cleanup_script}
 free_bytes() {{ printf '9999999999\\n'; }}
 set +e
@@ -5596,6 +5803,260 @@ cleanup
         )
         self.assertIn("--require-hashes", install)
         self.assertNotIn('"$SHARED_VENV_DIR/bin/pip" install', install)
+
+        self.assertLess(
+            install.index("if ! enforce_required_venv_reuse; then"),
+            install.index('NEW_VENV_DIR="$(mktemp -d'),
+        )
+        self.assertIn("(( SKIP_PYTHON_DEPS == 0 )) || return 1", install)
+
+        policy = (REPO_ROOT / "platform/deploy/python-venv-policy.json").read_text()
+        self.assertEqual(
+            json.loads(policy),
+            {"schema": 1, "transition": "require_proven_reuse"},
+        )
+
+        # Exercise the production parser and reuse guard in isolation. The
+        # verifier is a harmless test executable; the real production guard
+        # still receives the same fixed argument vector and owns the decision.
+        function_start = install.index('VENV_INSTALL_POLICY="legacy"')
+        function_end = install.index("\nLOCK_HELPER=", function_start)
+        production_functions = install[function_start:function_end]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            release = root / "release"
+            deploy = release / "deploy"
+            tools = root / "tools"
+            shared = root / "shared"
+            app = root / "app"
+            for directory in (deploy, tools, shared, app):
+                directory.mkdir(parents=True, mode=0o700)
+
+            policy_archive = root / f"{RELEASE_SLUG}.tar.gz"
+            archive_builder = ReleaseArtifactFixtureBuilder(policy_archive)
+            archive_builder.add_directory(f"{RELEASE_SLUG}/deploy", mode=0o755)
+            archive_builder.add_file(
+                f"{RELEASE_SLUG}/deploy/python-venv-policy.json",
+                b'{"schema":1,"transition":"require_proven_reuse"}\n',
+                mode=0o644,
+            )
+            archive_builder.write()
+            policy_checksum = Path(f"{policy_archive}.sha256")
+            policy_checksum.write_text(
+                f"{hashlib.sha256(policy_archive.read_bytes()).hexdigest()}  "
+                f"{policy_archive.name}\n",
+                encoding="ascii",
+            )
+            extraction_root = root / "extracted-releases"
+            extraction_root.mkdir(mode=0o700)
+            with tarfile.open(policy_archive, "r:gz") as archive:
+                archived_policy = archive.getmember(
+                    f"{RELEASE_SLUG}/deploy/python-venv-policy.json"
+                )
+                self.assertEqual(archived_policy.mode & 0o777, 0o644)
+            extracted = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    str(VALIDATOR_SCRIPT),
+                    "--artifact",
+                    str(policy_archive),
+                    "--checksum",
+                    str(policy_checksum),
+                    "--release-slug",
+                    RELEASE_SLUG,
+                    "--extract-to",
+                    str(extraction_root),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(extracted.returncode, 0, extracted.stderr)
+            release = extraction_root / RELEASE_SLUG
+            deploy = release / "deploy"
+            extracted_policy = deploy / "python-venv-policy.json"
+            extracted_metadata = extracted_policy.stat(follow_symlinks=False)
+            self.assertEqual(stat.S_IMODE(extracted_metadata.st_mode), 0o644)
+            self.assertEqual(extracted_metadata.st_uid, 0)
+            self.assertEqual(extracted_metadata.st_gid, 0)
+            self.assertEqual(extracted_metadata.st_nlink, 1)
+
+            verifier = tools / "platform_verify_venv_reuse.py"
+            verifier.write_text(
+                "import os, sys\n"
+                "with open(os.environ['VERIFIER_MARKER'], 'a', encoding='utf-8') as f:\n"
+                "    f.write('called\\n')\n"
+                "raise SystemExit(int(os.environ['VERIFIER_RC']))\n"
+            )
+            verifier.chmod(0o644)
+
+            # The production disk reader is checked against a real directory;
+            # guard threshold cases below use deterministic capacity tuples.
+            guard_harness = (
+                production_functions
+                + "\nPREVIOUS_TARGET=/previous\n"
+                + "ORIGINAL_PREVIOUS_TARGET=/older\n"
+                + "TRANSACTION_STATE=/state\n"
+                + "SHARED_VENV_DIR=/shared/.venv\n"
+                + "INSTALL_SPACE=$(read_install_space) || exit 91\n"
+                + "read -r real_available real_total <<<\"$INSTALL_SPACE\"\n"
+                + "[[ \"$real_available\" =~ ^[0-9]+$ && \"$real_total\" =~ ^[1-9][0-9]*$ ]] || exit 92\n"
+                + "read_install_space() { printf '%s\\n' \"$TEST_SPACE\"; }\n"
+                + "if enforce_required_venv_reuse; then\n"
+                + "  : >\"$NEW_VENV_SENTINEL\"\n"
+                + "  printf 'accepted:%s\\n' \"$SKIP_PYTHON_DEPS\"\n"
+                + "else\n"
+                + "  printf 'rejected:%s\\n' \"$SKIP_PYTHON_DEPS\"\n"
+                + "fi\n"
+            )
+
+            def run_guard(
+                policy_text: str | None,
+                *,
+                verifier_rc: int = 0,
+                skip: int = 0,
+                space: str = "6576668672 42949672960",
+                policy_shape: str = "regular",
+            ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+                policy_path = deploy / "python-venv-policy.json"
+                external_policy = deploy / "external-policy.json"
+                policy_path.unlink(missing_ok=True)
+                external_policy.unlink(missing_ok=True)
+                if policy_shape == "regular" and policy_text is not None:
+                    policy_path.write_text(policy_text)
+                    policy_path.chmod(0o644)
+                elif policy_shape == "symlink" and policy_text is not None:
+                    external_policy.write_text(policy_text)
+                    external_policy.chmod(0o644)
+                    policy_path.symlink_to(external_policy.name)
+                elif policy_shape == "hardlink" and policy_text is not None:
+                    external_policy.write_text(policy_text)
+                    external_policy.chmod(0o644)
+                    os.link(external_policy, policy_path)
+                elif policy_shape == "wrong_mode" and policy_text is not None:
+                    policy_path.write_text(policy_text)
+                    policy_path.chmod(0o600)
+                elif policy_shape == "dangling":
+                    policy_path.symlink_to("missing-policy-target.json")
+                elif policy_shape == "fifo":
+                    os.mkfifo(policy_path, 0o644)
+                elif policy_shape != "regular" or policy_text is not None:
+                    raise AssertionError("invalid policy test fixture shape")
+                marker = root / "verifier-called"
+                marker.unlink(missing_ok=True)
+                sentinel = root / "new-venv-created"
+                sentinel.unlink(missing_ok=True)
+                result = subprocess.run(
+                    ["/bin/bash", "-c", guard_harness],
+                    env={
+                        **os.environ,
+                        "RELEASE_DIR": str(release),
+                        "TOOLS_DIR": str(tools),
+                        "SHARED_DIR": str(shared),
+                        "APP_DIR": str(app),
+                        "SHARED_VENV_DIR": str(shared / ".venv"),
+                        "VERIFIER_MARKER": str(marker),
+                        "VERIFIER_RC": str(verifier_rc),
+                        "TEST_SPACE": space,
+                        "NEW_VENV_SENTINEL": str(sentinel),
+                        "SKIP_PYTHON_DEPS": str(skip),
+                    },
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                return result, marker, sentinel
+
+            valid_policy = '{"schema":1,"transition":"require_proven_reuse"}\n'
+            accepted, marker, sentinel = run_guard(valid_policy)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(accepted.stdout.strip(), "accepted:1")
+            self.assertTrue(marker.is_file())
+            self.assertTrue(sentinel.is_file())
+
+            missed, marker, sentinel = run_guard(valid_policy, verifier_rc=1)
+            self.assertEqual(missed.returncode, 0, missed.stderr)
+            self.assertEqual(missed.stdout.strip(), "rejected:0")
+            self.assertTrue(marker.is_file())
+            self.assertFalse(sentinel.exists())
+
+            bypass, marker, sentinel = run_guard(valid_policy, skip=1)
+            self.assertEqual(bypass.returncode, 0, bypass.stderr)
+            self.assertEqual(bypass.stdout.strip(), "rejected:1")
+            self.assertFalse(marker.exists())
+            self.assertFalse(sentinel.exists())
+
+            malformed, marker, sentinel = run_guard('{"schema":true,"transition":"require_proven_reuse"}\n')
+            self.assertEqual(malformed.returncode, 0, malformed.stderr)
+            self.assertEqual(malformed.stdout.strip(), "rejected:0")
+            self.assertFalse(marker.exists())
+            self.assertFalse(sentinel.exists())
+
+            for invalid_policy in (
+                '{"schema":1,"transition":"require_proven_reuse","extra":0}\n',
+                '{"schema":1,"transition":"allow_cold_install"}\n',
+                '{"schema":1,"schema":1,"transition":"require_proven_reuse"}\n',
+            ):
+                rejected, marker, sentinel = run_guard(invalid_policy)
+                self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                self.assertEqual(rejected.stdout.strip(), "rejected:0")
+                self.assertFalse(marker.exists())
+                self.assertFalse(sentinel.exists())
+
+            for invalid_shape in (
+                "symlink",
+                "hardlink",
+                "wrong_mode",
+                "dangling",
+                "fifo",
+            ):
+                rejected, marker, sentinel = run_guard(
+                    valid_policy
+                    if invalid_shape not in {"dangling", "fifo"}
+                    else None,
+                    policy_shape=invalid_shape,
+                )
+                self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                self.assertEqual(rejected.stdout.strip(), "rejected:0")
+                self.assertFalse(marker.exists())
+                self.assertFalse(sentinel.exists())
+
+            low_space, marker, sentinel = run_guard(
+                valid_policy, space="6576668671 42949672960"
+            )
+            self.assertEqual(low_space.returncode, 0, low_space.stderr)
+            self.assertEqual(low_space.stdout.strip(), "rejected:0")
+            self.assertTrue(marker.is_file())
+            self.assertFalse(sentinel.exists())
+
+            legacy, marker, sentinel = run_guard(None)
+            self.assertEqual(legacy.returncode, 0, legacy.stderr)
+            self.assertEqual(legacy.stdout.strip(), "accepted:0")
+            self.assertFalse(marker.exists())
+            self.assertTrue(sentinel.is_file())
+
+        floor_function = production_functions + "\ninstall_space_floor_ok \"$1\" \"$2\"\n"
+        threshold_cases = (
+            (5 * 1024**3 + 128 * 1024**2, 10 * 1024**3, True),
+            (5 * 1024**3 + 128 * 1024**2 - 1, 10 * 1024**3, False),
+            (6 * 1024**3 + 128 * 1024**2, 40 * 1024**3, True),
+            (6 * 1024**3 + 128 * 1024**2 - 1, 40 * 1024**3, False),
+        )
+        for available, total, expected in threshold_cases:
+            result = subprocess.run(
+                ["/bin/bash", "-c", floor_function, "bash", str(available), str(total)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode == 0, expected, result.stderr)
 
     def test_build_lock_contention_exits_before_source_or_target_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

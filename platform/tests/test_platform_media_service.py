@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from uuid import uuid4
+from unittest.mock import patch
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, event, select, update
+
+from apps.platform_api.app.services.media import (
+    compatibility_media_url,
+    load_media_descriptors,
+)
+from apps.platform_api.app.services import media as media_service
+from apps.platform_api.app.services.user_account_read_models import (
+    build_user_account_read_model,
+)
 
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.media.errors import MediaStorageError
@@ -23,8 +35,10 @@ from python_packages.platform_infra.media.service import (
 )
 from python_packages.platform_infra.media.source_store import MediaSourceStore
 from python_packages.platform_infra.models import (
+    ExternalIdentity,
     MediaAsset,
     MediaVariant,
+    PasswordCredential,
     PlayerProfile,
     User,
 )
@@ -237,6 +251,116 @@ class MediaServiceIntegrationTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(tuple(descriptors), (accepted.asset_id,))
         self.assertEqual(descriptors[accepted.asset_id].status, "ready")
         self.assertEqual(len(descriptors[accepted.asset_id].variants), 3)
+
+    async def test_account_read_uses_joined_avatar_without_reloading_asset(self) -> None:
+        media_settings = patch.object(
+            media_service,
+            "get_settings",
+            return_value=SimpleNamespace(
+                platform_media_public_base_url="http://127.0.0.1:9000"
+            ),
+        )
+        media_settings.start()
+        self.addCleanup(media_settings.stop)
+        accepted = await self._accept_avatar()
+        await self.service.process_asset(accepted.asset_id)
+        asset = await self.db_session.get(MediaAsset, accepted.asset_id)
+        self.assertIsNotNone(asset)
+        self.assertEqual(asset.status, "ready")
+
+        self.db_session.add(
+            ExternalIdentity(
+                user_id=self.user_id,
+                provider="steam",
+                subject="76561198000000001",
+            )
+        )
+        self.db_session.add(
+            PasswordCredential(
+                user_id=self.user_id,
+                password_hash="test-only-placeholder",
+                password_version="v1",
+            )
+        )
+        await self.db_session.commit()
+        user = await self.db_session.get(User, self.user_id)
+        self.assertIsNotNone(user)
+        await self.db_session.refresh(user)
+        reference = await load_media_descriptors(
+            self.db_session,
+            (accepted.asset_id,),
+        )
+        expected_media = reference[accepted.asset_id].model_dump(mode="json")
+
+        # A second session changes the row after this session has loaded it.
+        # Re-selecting the entity without populate_existing returns the same
+        # unexpired identity-map instance, which is the behavior the account
+        # descriptor path relies on.
+        async with session_factory()() as concurrent_session:
+            await concurrent_session.execute(
+                update(MediaAsset)
+                .where(MediaAsset.id == accepted.asset_id)
+                .values(status="failed")
+            )
+            await concurrent_session.commit()
+
+        statements: list[str] = []
+
+        def record_select(_conn, _cursor, statement, _parameters, _context, _many):
+            if statement.lstrip().lower().startswith("select"):
+                statements.append(statement)
+
+        engine = self.db_session.sync_session.get_bind()
+        event.listen(engine, "before_cursor_execute", record_select)
+        try:
+            revision, account = await build_user_account_read_model(
+                self.db_session,
+                user=user,
+                now=datetime(2026, 10, 9, tzinfo=UTC),
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", record_select)
+
+        profile = await self.db_session.scalar(
+            select(PlayerProfile).where(PlayerProfile.user_id == self.user_id)
+        )
+        identity = await self.db_session.scalar(
+            select(ExternalIdentity).where(ExternalIdentity.user_id == self.user_id)
+        )
+        credential = await self.db_session.scalar(
+            select(PasswordCredential).where(PasswordCredential.user_id == self.user_id)
+        )
+        assert profile is not None and identity is not None and credential is not None
+        expected_revision = max(
+            int(value.timestamp() * 1_000_000)
+            for value in (
+                user.updated_at,
+                profile.updated_at,
+                identity.linked_at,
+                credential.updated_at,
+                asset.updated_at,
+            )
+            if value is not None
+        )
+
+        self.assertIs(await self.db_session.get(MediaAsset, accepted.asset_id), asset)
+        self.assertEqual(asset.status, "ready")
+        self.assertEqual(revision, expected_revision)
+        self.assertEqual(account["avatar_media"], expected_media)
+        self.assertEqual(
+            account["avatar_url"],
+            compatibility_media_url(
+                reference[accepted.asset_id],
+                preferred_variant="avatar-256",
+            ),
+        )
+        self.assertEqual(account["steam_id"], "76561198000000001")
+        self.assertTrue(account["steam_linked"])
+        self.assertTrue(account["has_password"])
+        self.assertFalse(account["can_unlink_steam"])
+        self.assertEqual(len(statements), 3, statements)
+        self.assertNotIn("password_hash", statements[0].lower())
+        self.assertNotIn("player_profiles.contact_email", statements[0].lower())
 
     async def test_partial_storage_failure_keeps_old_active_and_cleans_new_keys(self) -> None:
         old = await self._accept_avatar()

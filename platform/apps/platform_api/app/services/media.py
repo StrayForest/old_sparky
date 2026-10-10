@@ -18,6 +18,7 @@ from python_packages.platform_infra.media.repository import (
     AssetDescriptor,
     MediaRepository,
 )
+from python_packages.platform_infra.models import MediaAsset
 from python_packages.platform_infra.media.service import AcceptedMedia, MediaService
 from python_packages.platform_infra.media.tasks import build_media_service
 
@@ -180,3 +181,13 @@ async def load_media_descriptors(
         if response is not None:
             responses[asset_id] = response
     return responses
+
+
+async def load_media_descriptor_for_preloaded_asset(
+    db_session: AsyncSession,
+    asset: MediaAsset,
+) -> MediaDescriptorResponse | None:
+    """Load ordered variants for one asset already joined in this session."""
+
+    descriptor = await MediaRepository(db_session).descriptor_for_preloaded_asset(asset)
+    return media_descriptor_response(descriptor)

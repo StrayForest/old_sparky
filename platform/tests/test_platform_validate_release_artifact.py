@@ -18,6 +18,7 @@ from tools import platform_live_qa_guard
 from tools import platform_live_qa_runtime_install
 from tools import platform_live_user_qa_dispatch
 from tools import platform_safe_env_exec
+from tools import platform_release_artifact_size_projection as size_projection
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -309,6 +310,269 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
                 f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json"
             )
             return artifact, manifest.size
+
+    def test_size_projection_binds_same_repo_dev_pr_merge_parents(self) -> None:
+        repository = self.root / "source"
+        repository.mkdir()
+        subprocess.run(
+            ["/usr/bin/git", "init", "-b", "dev", str(repository)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        git_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(self.root),
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_AUTHOR_NAME": "Projection Fixture",
+            "GIT_AUTHOR_EMAIL": "projection@example.invalid",
+            "GIT_COMMITTER_NAME": "Projection Fixture",
+            "GIT_COMMITTER_EMAIL": "projection@example.invalid",
+        }
+
+        def git(*arguments: str) -> str:
+            result = subprocess.run(
+                ["/usr/bin/git", "-C", str(repository), *arguments],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="ascii",
+                env=git_env,
+                timeout=10,
+            )
+            return result.stdout.strip()
+
+        (repository / "source.txt").write_text("base\n", encoding="ascii")
+        git("add", "source.txt")
+        git("commit", "-m", "base")
+        base_sha = git("rev-parse", "HEAD")
+        git("switch", "-c", "change")
+        (repository / "source.txt").write_text("head\n", encoding="ascii")
+        git("commit", "-am", "head")
+        head_sha = git("rev-parse", "HEAD")
+        merge_sha = git("commit-tree", "HEAD^{tree}", "-p", base_sha, "-p", head_sha)
+        git("update-ref", "refs/heads/dev", merge_sha)
+        git("checkout", "--detach", merge_sha)
+
+        event = size_projection._event_binding(
+            event_type="pull_request",
+            repository="StrayForest/old_sparky",
+            tested_sha=merge_sha,
+            run_id="123456789",
+            run_attempt="1",
+            pr_head_sha=head_sha,
+            pr_base_sha=base_sha,
+            pr_base_ref="dev",
+            pr_head_repository="StrayForest/old_sparky",
+            pr_base_repository="StrayForest/old_sparky",
+            git_root=self.root,
+        )
+        self.assertEqual(event["tested_sha"], merge_sha)
+        self.assertEqual(event["tested_tree_sha"], git("rev-parse", "HEAD^{tree}"))
+        self.assertEqual(event["pr_base_sha"], base_sha)
+        self.assertEqual(event["pr_head_sha"], head_sha)
+        self.assertIs(event["pr_same_repository"], True)
+        self.assertEqual(event["workflow_run_id"], 123456789)
+        self.assertEqual(event["workflow_run_attempt"], 1)
+
+        push_event = size_projection._event_binding(
+            event_type="push",
+            repository="StrayForest/old_sparky",
+            tested_sha=merge_sha,
+            run_id="123456789",
+            run_attempt="1",
+            pr_head_sha=None,
+            pr_base_sha=None,
+            pr_base_ref=None,
+            pr_head_repository=None,
+            pr_base_repository=None,
+            git_root=self.root,
+        )
+        for field in (
+            "pr_head_sha",
+            "pr_base_sha",
+            "pr_base_ref",
+            "pr_same_repository",
+        ):
+            self.assertIsNone(push_event[field])
+        projection = size_projection._projection_document(
+            source_sha=merge_sha,
+            event=push_event,
+            artifact_sha256="b" * 64,
+            archive_file_bytes=100,
+            archive_allocated_bytes=512,
+            release_usage={"regular_bytes": 300, "allocated_bytes": 1024},
+            bootstrap_usage={"regular_bytes": 80, "allocated_bytes": 512},
+            release_liveqa_usage={"regular_bytes": 20, "allocated_bytes": 128},
+            bootstrap_liveqa_usage={"regular_bytes": 10, "allocated_bytes": 64},
+            free_before=4096,
+            free_after=2048,
+        )
+        self.assertTrue(projection["evidence_only"])
+        self.assertIs(projection["deployable"], False)
+        self.assertEqual(projection["measurement_scope"], "builder_snapshot")
+        self.assertEqual(projection["measurement_coexist_allocated_bytes"], 2048)
+        self.assertIsNone(projection["pr_same_repository"])
+        self.assertFalse(any("path" in key for key in projection))
+
+        # Exercise the complete evidence path: bootstrap extraction is expected
+        # to add the release child, changing directory timestamps while keeping
+        # the original private directory object and security metadata intact.
+        release_output = repository / "platform/dist/releases"
+        release_output.mkdir(parents=True)
+        artifact = release_output / f"{RELEASE_SLUG}.tar.gz"
+        ArchiveBuilder(
+            artifact,
+            release_payload(source_git_commit=merge_sha),
+        ).write()
+        checksum = Path(f"{artifact}.sha256")
+        artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        checksum.write_text(
+            f"{artifact_sha256}  {artifact.name}\n", encoding="ascii"
+        )
+        validator.validate_archive(
+            artifact,
+            release_slug=RELEASE_SLUG,
+            extract_to=release_output,
+            expected_source_commit=merge_sha,
+        )
+        output = self.root / "size-projection.json"
+        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        complete = size_projection.project(
+            measurement_root=self.root,
+            release_slug=RELEASE_SLUG,
+            source_sha=merge_sha,
+            artifact_sha256=artifact_sha256,
+            event_type="pull_request",
+            repository="StrayForest/old_sparky",
+            tested_sha=merge_sha,
+            run_id="123456789",
+            run_attempt="1",
+            pr_head_sha=head_sha,
+            pr_base_sha=base_sha,
+            pr_base_ref="dev",
+            pr_head_repository="StrayForest/old_sparky",
+            pr_base_repository="StrayForest/old_sparky",
+            output=output,
+        )
+        self.assertEqual(complete["artifact_sha256"], artifact_sha256)
+        self.assertIs(complete["evidence_only"], True)
+        self.assertIs(complete["deployable"], False)
+        self.assertGreater(complete["bootstrap_allocated_bytes"], 0)
+        self.assertEqual(json.loads(output.read_text()), complete)
+        bound_root = self.root / "bootstrap-identity-fixture"
+        bound_root.mkdir(mode=0o700)
+        bound_identity = size_projection._stable_directory_identity(
+            bound_root.lstat()
+        )
+        (bound_root / RELEASE_SLUG).mkdir()
+        self.assertEqual(
+            size_projection._stable_directory_identity(bound_root.lstat()),
+            bound_identity,
+        )
+        moved_root = self.root / "bootstrap-identity-original"
+        bound_root.rename(moved_root)
+        bound_root.mkdir(mode=0o700)
+        self.assertNotEqual(
+            size_projection._stable_directory_identity(bound_root.lstat()),
+            bound_identity,
+        )
+        bound_root.chmod(0o755)
+        self.assertNotEqual(
+            size_projection._stable_directory_identity(bound_root.lstat()),
+            bound_identity,
+        )
+        with self.assertRaisesRegex(size_projection.ProjectionError, "projection"):
+            size_projection._projection_document(
+                source_sha=merge_sha,
+                event={**push_event, "untrusted": "field"},
+                artifact_sha256="b" * 64,
+                archive_file_bytes=100,
+                archive_allocated_bytes=512,
+                release_usage={"regular_bytes": 300, "allocated_bytes": 1024},
+                bootstrap_usage={"regular_bytes": 80, "allocated_bytes": 512},
+                release_liveqa_usage={"regular_bytes": 20, "allocated_bytes": 128},
+                bootstrap_liveqa_usage={"regular_bytes": 10, "allocated_bytes": 64},
+                free_before=4096,
+                free_after=2048,
+            )
+
+        with self.assertRaisesRegex(size_projection.ProjectionError, "binding"):
+            size_projection._event_binding(
+                event_type="pull_request",
+                repository="StrayForest/old_sparky",
+                tested_sha=merge_sha,
+                run_id="123456789",
+                run_attempt="1",
+                pr_head_sha=base_sha,
+                pr_base_sha=head_sha,
+                pr_base_ref="dev",
+                pr_head_repository="StrayForest/old_sparky",
+                pr_base_repository="StrayForest/old_sparky",
+                git_root=self.root,
+            )
+        with self.assertRaisesRegex(size_projection.ProjectionError, "binding"):
+            size_projection._event_binding(
+                event_type="pull_request",
+                repository="StrayForest/old_sparky",
+                tested_sha=merge_sha,
+                run_id="123456789",
+                run_attempt="1",
+                pr_head_sha=head_sha,
+                pr_base_sha=base_sha,
+                pr_base_ref="dev",
+                pr_head_repository="attacker/fork",
+                pr_base_repository="attacker/fork",
+                git_root=self.root,
+            )
+        with self.assertRaisesRegex(size_projection.ProjectionError, "binding"):
+            size_projection._event_binding(
+                event_type="push",
+                repository="StrayForest/old_sparky",
+                tested_sha=merge_sha,
+                run_id="123456789",
+                run_attempt="1",
+                pr_head_sha=head_sha,
+                pr_base_sha=base_sha,
+                pr_base_ref="dev",
+                pr_head_repository="StrayForest/old_sparky",
+                pr_base_repository="StrayForest/old_sparky",
+                git_root=self.root,
+            )
+        with self.assertRaisesRegex(size_projection.ProjectionError, "arguments"):
+            size_projection._event_binding(
+                event_type="pull_request",
+                repository="StrayForest/old_sparky",
+                tested_sha=merge_sha,
+                run_id="0123",
+                run_attempt="1",
+                pr_head_sha=head_sha,
+                pr_base_sha=base_sha,
+                pr_base_ref="dev",
+                pr_head_repository="StrayForest/old_sparky",
+                pr_base_repository="StrayForest/old_sparky",
+                git_root=self.root,
+            )
+        git("checkout", "--detach", head_sha)
+        with self.assertRaisesRegex(size_projection.ProjectionError, "binding"):
+            size_projection._event_binding(
+                event_type="pull_request",
+                repository="StrayForest/old_sparky",
+                tested_sha=merge_sha,
+                run_id="123456789",
+                run_attempt="1",
+                pr_head_sha=head_sha,
+                pr_base_sha=base_sha,
+                pr_base_ref="dev",
+                pr_head_repository="StrayForest/old_sparky",
+                pr_base_repository="StrayForest/old_sparky",
+                git_root=self.root,
+            )
 
     def _rewrite_archive(
         self,

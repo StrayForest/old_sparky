@@ -261,7 +261,9 @@ if [[ "$LIVE_QA_UID" == "0" || "$LIVE_QA_GID" == "0" ]]; then
   echo "Dedicated live QA identity must be unprivileged." >&2
   exit 1
 fi
-/usr/bin/systemd-run \
+browser_diagnostic=""
+if browser_diagnostic="$("${GUARD[@]}" capture-qa-browser-child -- \
+  /usr/bin/systemd-run \
   --no-ask-password \
   --quiet \
   --wait \
@@ -305,3 +307,33 @@ fi
       --config="$RUNTIME_CACHE/web/playwright.live.config.ts" \
       "$RUNTIME_CACHE/web/tests/smoke/live-user-journey.spec.ts" \
       --project=live-desktop
+)"; then
+  browser_status=0
+else
+  browser_status=$?
+fi
+if [[ "$browser_diagnostic" =~ ^LIVE_QA_CHILD_DIAGNOSTIC\ schema=1\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=[0-9]{1,3}$ ]]; then
+  printf '%s\n' "$browser_diagnostic"
+else
+  browser_status=2
+fi
+count_status=0
+browser_counts=""
+if browser_counts="$("${GUARD[@]}" emit-public-browser-counts \
+  --gate "$BROWSER_GATE" \
+  --source-sha "$LIVE_QA_RUNNER_SHA" \
+  --app-sha "$LIVE_QA_TARGET_SHA" \
+  --marker-sha256 "$LIVE_QA_MARKER_SHA256")" \
+  && [[ "$browser_counts" =~ ^LIVE_BROWSER_COUNTS\ schema=1\ run_status=(passed|failed|timedout|interrupted)\ logical_total=(0|[1-9][0-9]{0,4})\ logical_pass=(0|[1-9][0-9]{0,4})\ logical_fail=(0|[1-9][0-9]{0,4})\ logical_expected_fail=(0|[1-9][0-9]{0,4})\ logical_flaky=(0|[1-9][0-9]{0,4})\ logical_skip=(0|[1-9][0-9]{0,4})\ logical_interrupted=(0|[1-9][0-9]{0,4})\ attempt_total=(0|[1-9][0-9]{0,4})\ attempt_pass=(0|[1-9][0-9]{0,4})\ attempt_fail=(0|[1-9][0-9]{0,4})\ attempt_skip=(0|[1-9][0-9]{0,4})\ attempt_interrupted=(0|[1-9][0-9]{0,4})\ attempt_timedout=(0|[1-9][0-9]{0,4})\ source_sha=[0-9a-f]{40}\ app_sha=[0-9a-f]{40}\ marker_sha256=[0-9a-f]{64}$ ]]; then
+  printf '%s\n' "$browser_counts"
+else
+  count_status=1
+fi
+if (( browser_status != 0 )); then
+  exit "$browser_status"
+fi
+if (( count_status != 0 )); then
+  echo "Live-user Playwright count record is unavailable or invalid." >&2
+  exit 1
+fi
+exit "$browser_status"
