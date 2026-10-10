@@ -318,9 +318,8 @@ workflow queries that run's workflow identity, event, branch, SHA, completion
 and conclusion, then requires the `platform-security-build` status to point to
 the same run URL; a missing, stale or mixed-attempt pair is rejected.
 
-The recovery workflow does not change the active release, database, Redis,
-Nginx configuration or application data. If the restart fails, its journal
-output is the diagnostic handoff; do not weaken the preflight gate.
+The recovery workflow does not change the active release, database, Redis, Nginx configuration or application data. Failures emit only a closed `RECOVERY_FAILURE` stage and optional fixed class; raw remote stdout/stderr are deleted by the runner.
+Use that bounded marker with the retained transaction receipt and systemd journal; do not retry or weaken preflight until the exact failure stage is verified.
 
 ## Release state, activation and recovery
 

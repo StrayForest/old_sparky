@@ -2218,6 +2218,41 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('generation_name="$bundle_sha"', recover)
         self.assertIn("trusted_generation=\"$runtime/shared/.release-recovery/generations/$generation_name\"", recover)
         self.assertIn("platform_recover_pending.sh", recover)
+        self.assertIn("recovery_stage=input", recover)
+        self.assertIn("trap report_recovery_failure EXIT", recover)
+        self.assertIn(
+            'RECOVERY_STAGE schema=1 status=failed stage=%s\\n',
+            recover,
+        )
+        recovery_failure = recover[
+            recover_wrapper:recover.index(
+                "- name: Remove production SSH material", recover_wrapper
+            )
+        ]
+        for stage in (
+            "input",
+            "bundle_input",
+            "staging",
+            "provenance",
+            "bootstrap_extract",
+            "generation_install",
+            "generation_validate",
+            "install_stage_cleanup",
+            "quiesce_recovery",
+        ):
+            self.assertIn(stage, recovery_failure)
+        self.assertIn("transport_or_unclassified", recovery_failure)
+        self.assertIn(
+            "RECOVERY_FAILURE schema=1 stage=%s class=%s helper=%s ssh_rc=%s",
+            recovery_failure,
+        )
+        self.assertIn(
+            "RECOVERY_BOOTSTRAP schema=1 status=failed capability=abort_retained_only deployable=false",
+            recovery_failure,
+        )
+        self.assertIn("helper_marker=bootstrap_failed", recovery_failure)
+        self.assertIn("rm -f -- \"$remote_log\" \"$remote_error\"", recover)
+        self.assertNotIn('cat "$remote_error"', recovery_failure)
         self.assertIn("cleanup_remote_upload", recover)
         recovery_transfer = recover[
             recover_transfer:recover_install
