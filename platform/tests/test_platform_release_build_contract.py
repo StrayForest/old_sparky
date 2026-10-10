@@ -1069,6 +1069,128 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("sha256sum -c", host_build)
         self.assertNotIn("actions/checkout@", host_preflight)
         self.assertNotIn("platform_host_tools_bundle.py", host_preflight)
+        self.assertIn("HOST_TOOLS_TOOLSET_VERSION", host_preflight)
+        self.assertIn('test "$toolset_version" = "$HOST_TOOLS_TOOLSET_VERSION"', host_preflight)
+        self.assertIn("production-host-tools-v3|production-host-tools-v4", host_preflight)
+        self.assertIn('expected_toolset_version', workflow_job(workflow, "production"))
+        self.assertIn('expected_toolset_version == "production-host-tools-v3"', workflow)
+        self.assertIn('expected_toolset_version == "production-host-tools-v4"', workflow)
+        self.assertIn('"platform_cpu_diagnostic_plan.py"', workflow)
+
+        # Execute the actual embedded pre-SSH bundle validator against both
+        # trusted source layouts and closed negative variants. This keeps the
+        # workflow's duplicate envelope check aligned with the bundle builder.
+        validator_command = '/usr/bin/python3 - "$inner_root/manifest.json"'
+        validator_start = host_preflight.index(validator_command)
+        script_start = host_preflight.index("<<'PY'\n", validator_start) + len("<<'PY'\n")
+        script_end = host_preflight.index("\nPY", script_start)
+        embedded_validator = textwrap.dedent(host_preflight[script_start:script_end])
+        from tools import platform_host_tools_bundle as host_tools_bundle
+
+        source_sha = "a" * 40
+
+        def prepare_contract(root: Path, layout: dict[str, object]) -> tuple[Path, ...]:
+            root.mkdir(parents=True, exist_ok=True)
+            manifest_path = root / "manifest.json"
+            capabilities_path = root / "capabilities.txt"
+            files_path = root / "files.sha256"
+            modes_path = root / "files.modes"
+            version_path = root / "toolset_version"
+            source_path = root / "source_sha"
+            output_path = root / "expected-members"
+            names = layout["files"]
+            assert isinstance(names, tuple)
+            records: list[dict[str, object]] = []
+            file_rows: list[tuple[str, str]] = []
+            mode_rows: list[tuple[str, str]] = []
+            for name in names:
+                payload = (TOOLS_DIR / name).read_bytes()
+                digest = hashlib.sha256(payload).hexdigest()
+                records.append({"path": name, "sha256": digest, "mode": 0o555})
+                file_rows.append((digest, name))
+                mode_rows.append(("555", name))
+            capabilities = host_tools_bundle._capabilities_text(source_sha, layout)
+            capabilities_digest = hashlib.sha256(capabilities).hexdigest()
+            records.append({"path": "capabilities.txt", "sha256": capabilities_digest, "mode": 0o444})
+            records.sort(key=lambda record: str(record["path"]))
+            file_rows.append((capabilities_digest, "capabilities.txt"))
+            mode_rows.append(("444", "capabilities.txt"))
+            manifest = host_tools_bundle._manifest(source_sha, records, layout)
+            manifest_path.write_bytes(host_tools_bundle._canonical_json(manifest))
+            capabilities_path.write_bytes(capabilities)
+            files_path.write_text(
+                "".join(f"{digest}  {name}\n" for digest, name in sorted(file_rows, key=lambda row: row[1])),
+                encoding="ascii",
+            )
+            modes_path.write_text(
+                "".join(f"{mode} {name}\n" for mode, name in sorted(mode_rows, key=lambda row: row[1])),
+                encoding="ascii",
+            )
+            version_path.write_text(str(layout["toolset_version"]) + "\n", encoding="ascii")
+            source_path.write_text(source_sha + "\n", encoding="ascii")
+            return (manifest_path, capabilities_path, files_path, modes_path, version_path, source_path, output_path)
+
+        def run_embedded_validator(
+            paths: tuple[Path, ...], *, trusted_sha: str = source_sha, trusted_version: str | None = None
+        ) -> subprocess.CompletedProcess[str]:
+            version = trusted_version or paths[4].read_text(encoding="ascii").strip()
+            return subprocess.run(
+                [sys.executable, "-c", embedded_validator, *(str(path) for path in paths), trusted_sha, version],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        with tempfile.TemporaryDirectory(prefix="host-tools-deploy-layout-") as temporary:
+            fixture_root = Path(temporary)
+            layouts = host_tools_bundle.SUPPORTED_LAYOUTS
+            v3_layout, v4_layout = layouts
+            v3_paths = prepare_contract(fixture_root / "v3", v3_layout)
+            v4_paths = prepare_contract(fixture_root / "v4", v4_layout)
+            v3_valid = run_embedded_validator(v3_paths)
+            v4_valid = run_embedded_validator(v4_paths)
+            self.assertEqual(v3_valid.returncode, 0, v3_valid.stderr)
+            self.assertEqual(v4_valid.returncode, 0, v4_valid.stderr)
+            self.assertNotIn("platform_cpu_diagnostic_plan.py", v3_paths[-1].read_text(encoding="ascii"))
+            self.assertIn("platform_cpu_diagnostic_plan.py", v4_paths[-1].read_text(encoding="ascii"))
+
+            wrong_source = run_embedded_validator(v4_paths, trusted_sha="b" * 40)
+            wrong_version = run_embedded_validator(v4_paths, trusted_version="production-host-tools-v3")
+            self.assertNotEqual(wrong_source.returncode, 0)
+            self.assertNotEqual(wrong_version.returncode, 0)
+
+            wrong_capabilities_paths = prepare_contract(fixture_root / "v4-capability", v4_layout)
+            capabilities = wrong_capabilities_paths[1].read_text(encoding="ascii")
+            wrong_capabilities_paths[1].write_text(
+                capabilities.replace(
+                    "capability=cpu_diagnostic_plan_control\n",
+                    "capability=cpu_diagnostic_plan_control_disabled\n",
+                ),
+                encoding="ascii",
+            )
+            wrong_capabilities = run_embedded_validator(wrong_capabilities_paths)
+            self.assertNotEqual(wrong_capabilities.returncode, 0)
+
+            manifest = json.loads(v4_paths[0].read_text(encoding="utf-8"))
+            manifest["files"].append(
+                {"path": "platform_unexpected.py", "sha256": "0" * 64, "mode": 0o555}
+            )
+            v4_paths[0].write_bytes(host_tools_bundle._canonical_json(manifest))
+            with v4_paths[2].open("a", encoding="ascii") as contract:
+                contract.write(f"{'0' * 64}  platform_unexpected.py\n")
+            with v4_paths[3].open("a", encoding="ascii") as contract:
+                contract.write("555 platform_unexpected.py\n")
+            wrong_closure = run_embedded_validator(v4_paths)
+            self.assertNotEqual(wrong_closure.returncode, 0)
+
+            v4_paths = prepare_contract(fixture_root / "v4-hash", v4_layout)
+            lines = v4_paths[2].read_text(encoding="ascii").splitlines()
+            digest, name = lines[0].split("  ", 1)
+            lines[0] = f"{'0' * 64 if digest != '0' * 64 else '1' * 64}  {name}"
+            v4_paths[2].write_text("\n".join(lines) + "\n", encoding="ascii")
+            wrong_hash = run_embedded_validator(v4_paths)
+            self.assertNotEqual(wrong_hash.returncode, 0)
+
         host_tool_source = (TOOLS_DIR / "platform_host_tools_bundle.py").read_text()
         self.assertIn("size_in_bytes", host_tool_source)
         self.assertIn("workflow_run.get(\"head_branch\")", host_tool_source)
