@@ -73,7 +73,9 @@ from tools.platform_verification_lock import (
 )
 from tools.platform_verify_contract import (
     ALLOWED_ACTION_OWNERS,
+    PRODUCTION_WORKFLOW,
     SECURITY_WORKFLOW,
+    _production_secret_scope_issues,
     action_pin_issues,
     collect_issues,
     _ci_dependency_issues,
@@ -1489,6 +1491,78 @@ except lock.VerificationLockError as exc:
             self.assertEqual(len(action_issues), 2)
             self.assertTrue(any("40-character commit SHA" in item for item in action_issues))
             self.assertTrue(any("owner 'unapproved'" in item for item in action_issues))
+        production_text = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(_production_secret_scope_issues(production_text), [])
+        capability_audit_issue = "exact v3/v4 capability layout"
+        for marker in (
+            'source_sha != sys.argv[8] or version != sys.argv[9]',
+            'if version == "production-host-tools-v3":',
+            'elif version == "production-host-tools-v4":',
+            'capabilities_path.read_text(encoding="ascii") != expected_capabilities',
+        ):
+            with self.subTest(host_tools_capability_contract=marker):
+                altered = production_text.replace(marker, "", 1)
+                self.assertTrue(
+                    any(
+                        capability_audit_issue in issue
+                        for issue in _production_secret_scope_issues(altered)
+                    )
+                )
+        cpu_append = '              capabilities += ("cpu_diagnostic_plan_control",)\n'
+        moved_cpu_append = production_text.replace(cpu_append, "", 1).replace(
+            '          else:\n              raise SystemExit("host-tools toolset version is unsupported")\n'
+            '          expected_paths = files | {"capabilities.txt"}',
+            '          else:\n              raise SystemExit("host-tools toolset version is unsupported")\n'
+            '          capabilities += ("cpu_diagnostic_plan_control",)\n'
+            '          expected_paths = files | {"capabilities.txt"}',
+            1,
+        )
+        with self.subTest(host_tools_capability_contract="CPU capability moved outside v4"):
+            self.assertNotEqual(moved_cpu_append, production_text)
+            self.assertTrue(
+                any(
+                    "CPU diagnostic capability must be added only in the exact v4 branch" in issue
+                    for issue in _production_secret_scope_issues(moved_cpu_append)
+                )
+            )
+        missing_legacy_source_binding = production_text.replace(
+            '"retained_load_source_binding", ', "", 1
+        )
+        with self.subTest(host_tools_capability_contract="legacy source-binding capability removed"):
+            self.assertTrue(
+                any(
+                    "exact legacy v3 capability tuple" in issue
+                    for issue in _production_secret_scope_issues(missing_legacy_source_binding)
+                )
+            )
+        cpu_in_legacy_capabilities = production_text.replace(
+            '              "retained_load_source_binding", "python_isolated", "python_bytecode_disabled",\n          )',
+            '              "retained_load_source_binding", "python_isolated", "python_bytecode_disabled", "cpu_diagnostic_plan_control",\n          )',
+            1,
+        )
+        with self.subTest(host_tools_capability_contract="CPU capability added to legacy tuple"):
+            self.assertTrue(
+                any(
+                    "exact legacy v3 capability tuple" in issue
+                    for issue in _production_secret_scope_issues(cpu_in_legacy_capabilities)
+                )
+            )
+        version_plumbing_issue = "trusted pinned toolset version"
+        for marker in (
+            "host_tools_toolset_version: ${{ steps.build-host-tools-bundle.outputs.host_tools_toolset_version }}",
+            "printf 'host_tools_toolset_version=%s\\n' \"$host_tools_toolset_version\" >> \"$GITHUB_OUTPUT\"",
+            "host_tools_toolset_version: ${{ needs.build-host-tools.outputs.host_tools_toolset_version }}",
+            "HOST_TOOLS_TOOLSET_VERSION: ${{ needs.build-host-tools.outputs.host_tools_toolset_version }}",
+            "HOST_TOOLS_TOOLSET_VERSION: ${{ needs.host-capability-preflight.outputs.host_tools_toolset_version }}",
+        ):
+            with self.subTest(host_tools_version_plumbing=marker):
+                altered = production_text.replace(marker, "", 1)
+                self.assertTrue(
+                    any(
+                        version_plumbing_issue in issue
+                        for issue in _production_secret_scope_issues(altered)
+                    )
+                )
         self.assertEqual(collect_issues(), [])
         synthetic_setup_job = SECURITY_WORKFLOW.read_text(encoding="utf-8") + """
   synthetic-python:

@@ -558,6 +558,13 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host-tools bundle builder must expose exact artifact outputs")
         if "id: publish-host-tools" not in host_build:
             issues.append("host-tools bundle upload must have a stable output step")
+        if (
+            "host_tools_toolset_version: ${{ steps.build-host-tools-bundle.outputs.host_tools_toolset_version }}"
+            not in host_build
+            or "printf 'host_tools_toolset_version=%s\\n' \"$host_tools_toolset_version\" >> \"$GITHUB_OUTPUT\""
+            not in host_build_step
+        ):
+            issues.append("host-tools bundle builder must export the trusted pinned toolset version")
         if "if: ${{ always() }}" not in host_build or "Remove host-tools build data" not in host_build:
             issues.append("host-tools bundle builder must always clean its temporary data")
         if "inputs.mode == 'deploy' || inputs.mode == 'preflight'" not in host_build:
@@ -589,10 +596,66 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host capability preflight must not execute dynamic or self-installing code")
         if "platform/tools/platform_workflow_remote_dispatch.py" in host_preflight:
             issues.append("host capability preflight must not execute repository checkout source")
-        if 'grep -Fqx "capability=retained_load_source_binding" "$inner_root/capabilities.txt"' not in host_preflight:
-            issues.append("host-tools artifact validation must require the retained-load source-binding capability")
-        if 'grep -Fqx "capability=cpu_diagnostic_plan_control" "$inner_root/capabilities.txt"' not in host_preflight:
-            issues.append("host-tools artifact validation must require CPU diagnostic plan control")
+        capability_contract_markers = (
+            'source_sha != sys.argv[8] or version != sys.argv[9]',
+            'if version == "production-host-tools-v3":',
+            'elif version == "production-host-tools-v4":',
+            'capabilities_path.read_text(encoding="ascii") != expected_capabilities',
+        )
+        if any(marker not in host_preflight for marker in capability_contract_markers):
+            issues.append(
+                "host-tools artifact validation must bind the exact v3/v4 capability layout to the trusted pin"
+            )
+        legacy_capability_tuple = (
+            "artifact_prepare",
+            "input_guard",
+            "production_dispatcher",
+            "production_supervisor",
+            "production_deploy_control",
+            "release_baseline",
+            "retained_load_export_cleanup",
+            "retained_load_source_binding",
+            "python_isolated",
+            "python_bytecode_disabled",
+        )
+        capability_assignment = re.search(
+            r"(?ms)^ {10}capabilities = \(\n(?P<body>.*?)^ {10}\)",
+            host_preflight,
+        )
+        try:
+            declared_legacy_capabilities = (
+                ast.literal_eval("(" + capability_assignment.group("body") + ")")
+                if capability_assignment is not None
+                else None
+            )
+        except (SyntaxError, ValueError):
+            declared_legacy_capabilities = None
+        if declared_legacy_capabilities != legacy_capability_tuple:
+            issues.append("host-tools artifact validation must declare the exact legacy v3 capability tuple")
+        cpu_capability_append = 'capabilities += ("cpu_diagnostic_plan_control",)'
+        v4_branch_start = host_preflight.find('elif version == "production-host-tools-v4":')
+        v4_branch_end = host_preflight.find("\n          else:", v4_branch_start)
+        cpu_capability_position = host_preflight.find(cpu_capability_append)
+        if (
+            v4_branch_start < 0
+            or v4_branch_end < 0
+            or cpu_capability_position < v4_branch_start
+            or cpu_capability_position >= v4_branch_end
+            or host_preflight.count(cpu_capability_append) != 1
+        ):
+            issues.append("host-tools CPU diagnostic capability must be added only in the exact v4 branch")
+        trusted_version_plumbing = (
+            "host_tools_toolset_version: ${{ needs.build-host-tools.outputs.host_tools_toolset_version }}",
+            "HOST_TOOLS_TOOLSET_VERSION: ${{ needs.build-host-tools.outputs.host_tools_toolset_version }}",
+        )
+        if any(marker not in host_preflight for marker in trusted_version_plumbing):
+            issues.append("host capability preflight must consume the trusted pinned toolset version")
+        for job_name, job_block in (("preflight", preflight), ("production", jobs["production"])):
+            if (
+                "HOST_TOOLS_TOOLSET_VERSION: ${{ needs.host-capability-preflight.outputs.host_tools_toolset_version }}"
+                not in job_block
+            ):
+                issues.append(f"production deploy {job_name} must consume the trusted pinned toolset version")
         if "scp " in host_preflight or "platform-production-deploy-remote" in host_preflight:
             issues.append("host capability preflight must not upload a bundle or deploy artifact")
         if (

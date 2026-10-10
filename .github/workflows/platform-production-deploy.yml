@@ -637,6 +637,7 @@ jobs:
       artifact_id: ${{ steps.publish-host-tools.outputs.artifact-id }}
       artifact_digest: ${{ steps.publish-host-tools.outputs.artifact-digest }}
       host_tools_sha: ${{ steps.resolve_host_tools_pin.outputs.host_tools_sha }}
+      host_tools_toolset_version: ${{ steps.build-host-tools-bundle.outputs.host_tools_toolset_version }}
     steps:
       - name: Checkout target source as pin metadata
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -697,6 +698,7 @@ jobs:
           test -z "$(git -C "$host_tools_source" status --porcelain=v1 --untracked-files=all -- platform/tools)"
 
       - name: Build and verify deterministic host-tools bundle
+        id: build-host-tools-bundle
         shell: bash
         env:
           HOST_TOOLS_SHA: ${{ steps.resolve_host_tools_pin.outputs.host_tools_sha }}
@@ -721,6 +723,12 @@ jobs:
             test -f "$RUNNER_TEMP/host-tools-artifact/contract/$contract_file"
             test ! -L "$RUNNER_TEMP/host-tools-artifact/contract/$contract_file"
           done
+          IFS= read -r host_tools_toolset_version < "$RUNNER_TEMP/host-tools-artifact/contract/toolset_version"
+          case "$host_tools_toolset_version" in
+            production-host-tools-v3|production-host-tools-v4) ;;
+            *) echo "host-tools source produced an unsupported layout" >&2; exit 1 ;;
+          esac
+          printf 'host_tools_toolset_version=%s\n' "$host_tools_toolset_version" >> "$GITHUB_OUTPUT"
 
       - name: Publish exact host-tools bundle
         id: publish-host-tools
@@ -835,6 +843,7 @@ jobs:
     environment: production
     outputs:
       host_tools_sha: ${{ needs.build-host-tools.outputs.host_tools_sha }}
+      host_tools_toolset_version: ${{ needs.build-host-tools.outputs.host_tools_toolset_version }}
       host_tools_artifact_id: ${{ steps.host-tools-handoff.outputs.artifact_id }}
       host_tools_artifact_name: ${{ steps.host-tools-handoff.outputs.artifact_name }}
       host_tools_artifact_size: ${{ steps.host-tools-handoff.outputs.artifact_size }}
@@ -860,6 +869,7 @@ jobs:
     env:
       TARGET_SHA: ${{ github.sha }}
       HOST_TOOLS_SHA: ${{ needs.build-host-tools.outputs.host_tools_sha }}
+      HOST_TOOLS_TOOLSET_VERSION: ${{ needs.build-host-tools.outputs.host_tools_toolset_version }}
       HOST_TOOLS_ARTIFACT_ID: ${{ needs.build-host-tools.outputs.artifact_id }}
       HOST_TOOLS_ARTIFACT_DIGEST: ${{ needs.build-host-tools.outputs.artifact_digest }}
       HOST_TOOLS_ARTIFACT_NAME: platform-host-tools-bundle-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1077,7 +1087,11 @@ jobs:
           IFS= read -r source_sha < "$contract_dir/source_sha"
           IFS= read -r toolset_version < "$contract_dir/toolset_version"
           test "$source_sha" = "$HOST_TOOLS_SHA"
-          test "$toolset_version" = "production-host-tools-v3"
+          test "$toolset_version" = "$HOST_TOOLS_TOOLSET_VERSION"
+          case "$toolset_version" in
+            production-host-tools-v3|production-host-tools-v4) ;;
+            *) echo "host-tools toolset version is unsupported" >&2; exit 1 ;;
+          esac
           IFS= read -r manifest_hash < "$contract_dir/manifest.sha256"
           IFS= read -r capabilities_hash < "$contract_dir/capabilities.sha256"
           [[ "$manifest_hash" =~ ^[0-9a-f]{64}$ ]]
@@ -1091,46 +1105,110 @@ jobs:
           inner_root="$inner_dir/platform-host-tools"
           test -d "$inner_root" && test ! -L "$inner_root"
           expected_members_file="$RUNNER_TEMP/platform-host-tools-expected-members"
-          /usr/bin/python3 - "$inner_root/manifest.json" "$contract_dir/files.sha256" "$expected_members_file" <<'PY'
+          /usr/bin/python3 - "$inner_root/manifest.json" "$inner_root/capabilities.txt" "$contract_dir/files.sha256" "$contract_dir/files.modes" "$contract_dir/toolset_version" "$contract_dir/source_sha" "$expected_members_file" "$HOST_TOOLS_SHA" "$HOST_TOOLS_TOOLSET_VERSION" <<'PY'
           import json
           from pathlib import Path
           import re
           import sys
 
-          manifest_path, contract_path, output_path = map(Path, sys.argv[1:])
+          manifest_path, capabilities_path, files_path, modes_path, version_path, source_path, output_path = map(Path, sys.argv[1:8])
           payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-          safe_member = re.compile(r"^platform_[A-Za-z0-9_.-]+\.(?:py|sh)$")
-          records = payload.get("files")
+          version = version_path.read_text(encoding="ascii").strip()
+          source_sha = source_path.read_text(encoding="ascii").strip()
+          if source_sha != sys.argv[8] or version != sys.argv[9]:
+              raise SystemExit("host-tools contract differs from trusted pin")
+          common = (
+              "platform_workflow_remote_dispatch.py", "platform_workflow_input_guard.py",
+              "platform_prepare_artifact_dir.py", "platform_production_deploy_supervisor.sh",
+              "platform_release_lock.sh", "platform_release_preflight.sh",
+              "platform_validate_release_artifact.py", "platform_safe_env_exec.py",
+              "platform_render_service_envs.py", "platform_validate_edge_policy.py",
+              "platform_configure_shared_env.py", "platform_update_cloudflare_ips.py",
+              "platform_storage_evidence_summary.py", "platform_retained_load_export_executor.py",
+          )
+          cpu = "platform_cpu_diagnostic_plan.py"
+          capabilities = (
+              "artifact_prepare", "input_guard", "production_dispatcher", "production_supervisor",
+              "production_deploy_control", "release_baseline", "retained_load_export_cleanup",
+              "retained_load_source_binding", "python_isolated", "python_bytecode_disabled",
+          )
+          components = {
+              "prepare_artifact": ["platform_workflow_remote_dispatch.py", "platform_workflow_input_guard.py", "platform_prepare_artifact_dir.py"],
+              "production_deploy_control": [
+                  "platform_production_deploy_supervisor.sh", "platform_release_lock.sh",
+                  "platform_release_preflight.sh", "platform_validate_release_artifact.py",
+                  "platform_safe_env_exec.py", "platform_render_service_envs.py",
+                  "platform_validate_edge_policy.py", "platform_configure_shared_env.py",
+                  "platform_update_cloudflare_ips.py", "platform_storage_evidence_summary.py",
+              ],
+              "retained_load_artifact_cleanup": ["platform_retained_load_export_executor.py"],
+          }
+          if version == "production-host-tools-v3":
+              files = set(common)
+          elif version == "production-host-tools-v4":
+              files = set(common) | {cpu}
+              capabilities += ("cpu_diagnostic_plan_control",)
+              components["cpu_diagnostic_control"] = [cpu]
+          else:
+              raise SystemExit("host-tools toolset version is unsupported")
+          expected_paths = files | {"capabilities.txt"}
+          expected_manifest = {
+              "schema": 1, "toolset_version": version, "source_sha": source_sha,
+              "generation": source_sha, "capabilities": list(capabilities),
+              "components": components,
+              "limits": {"max_bundle_bytes": 4194304, "max_file_bytes": 524288, "max_file_count": 32},
+          }
           if (
-              type(payload.get("schema")) is not int
-              or payload.get("schema") != 1
-              or not isinstance(records, list)
+              not isinstance(payload, dict)
+              or set(payload) != set(expected_manifest) | {"files"}
+              or type(payload.get("schema")) is not int
+              or any(payload.get(key) != value for key, value in expected_manifest.items())
           ):
-              raise SystemExit("host-tools manifest schema is invalid")
-          manifest_paths = []
+              raise SystemExit("host-tools manifest layout is invalid")
+          expected_capabilities = "\n".join(
+              ["schema=1", f"toolset_version={version}", f"source_sha={source_sha}"]
+              + [f"capability={item}" for item in capabilities]
+              + [f"component={item}" for item in components]
+              + [f"component_file={component}:{name}" for component, names in components.items() for name in names]
+          ) + "\n"
+          if capabilities_path.read_text(encoding="ascii") != expected_capabilities:
+              raise SystemExit("host-tools capabilities layout is invalid")
+          safe_member = re.compile(r"^platform_[A-Za-z0-9_.-]+\.(?:py|sh)$")
+          records = payload["files"]
+          if not isinstance(records, list):
+              raise SystemExit("host-tools manifest files are invalid")
+          record_map = {}
           for record in records:
               if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
                   raise SystemExit("host-tools manifest record is invalid")
               path = record.get("path")
               if path != "capabilities.txt" and (not isinstance(path, str) or safe_member.fullmatch(path) is None):
                   raise SystemExit("host-tools manifest path is unsafe")
-              if path in manifest_paths:
-                  raise SystemExit("host-tools manifest has duplicate paths")
-              manifest_paths.append(path)
-          if "capabilities.txt" not in manifest_paths:
-              raise SystemExit("host-tools capabilities member is missing")
-          contract_paths = []
-          for line in contract_path.read_text(encoding="ascii").splitlines():
+              if path in record_map or type(record.get("mode")) is not int or record.get("mode") != (0o444 if path == "capabilities.txt" else 0o555):
+                  raise SystemExit("host-tools manifest record identity is invalid")
+              if not isinstance(record.get("sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None:
+                  raise SystemExit("host-tools manifest record digest is invalid")
+              record_map[path] = record["sha256"]
+          if set(record_map) != expected_paths:
+              raise SystemExit("host-tools manifest file layout is invalid")
+          contract_records = {}
+          for line in files_path.read_text(encoding="ascii").splitlines():
               digest, path = line.split("  ", 1)
-              if path in contract_paths:
-                  raise SystemExit("host-tools contract has duplicate paths")
-              contract_paths.append(path)
-          if sorted(manifest_paths) != sorted(contract_paths):
-              raise SystemExit("host-tools manifest and contract sets differ")
-          expected = sorted(
-              [f"platform-host-tools/{path}" for path in manifest_paths]
-              + ["platform-host-tools/manifest.json"]
-          )
+              if path in contract_records:
+                  raise SystemExit("host-tools files contract has duplicate paths")
+              contract_records[path] = digest
+          if contract_records != record_map:
+              raise SystemExit("host-tools files contract differs from manifest")
+          expected_modes = {path: (0o444 if path == "capabilities.txt" else 0o555) for path in expected_paths}
+          mode_records = {}
+          for line in modes_path.read_text(encoding="ascii").splitlines():
+              mode, path = line.split()
+              if path in mode_records:
+                  raise SystemExit("host-tools modes contract has duplicate paths")
+              mode_records[path] = int(mode, 8)
+          if mode_records != expected_modes:
+              raise SystemExit("host-tools modes contract differs from layout")
+          expected = sorted([f"platform-host-tools/{path}" for path in expected_paths] + ["platform-host-tools/manifest.json"])
           output_path.write_text("\n".join(expected) + "\n", encoding="ascii")
           PY
           mapfile -t actual_members < <(/usr/bin/zipinfo -Z1 "$bundle_path")
@@ -1143,19 +1221,6 @@ jobs:
           mapfile -t expected_members < "$expected_members_file"
           test "$(/usr/bin/sha256sum "$inner_root/manifest.json" | cut -d' ' -f1)" = "$manifest_hash"
           test "$(/usr/bin/sha256sum "$inner_root/capabilities.txt" | cut -d' ' -f1)" = "$capabilities_hash"
-          grep -Fqx "schema=1" "$inner_root/capabilities.txt"
-          grep -Fqx "toolset_version=production-host-tools-v3" "$inner_root/capabilities.txt"
-          grep -Fqx "source_sha=$HOST_TOOLS_SHA" "$inner_root/capabilities.txt"
-          grep -Fqx "capability=production_deploy_control" "$inner_root/capabilities.txt"
-          grep -Fqx "capability=retained_load_export_cleanup" "$inner_root/capabilities.txt"
-          grep -Fqx "capability=retained_load_source_binding" "$inner_root/capabilities.txt"
-          grep -Fqx "capability=cpu_diagnostic_plan_control" "$inner_root/capabilities.txt"
-          grep -Fqx "capability=python_isolated" "$inner_root/capabilities.txt"
-          grep -Fqx "capability=python_bytecode_disabled" "$inner_root/capabilities.txt"
-          grep -Fqx '"schema":1,' "$inner_root/manifest.json" || grep -Fq '"schema":1' "$inner_root/manifest.json"
-          grep -Fq "\"source_sha\":\"$HOST_TOOLS_SHA\"" "$inner_root/manifest.json"
-          grep -Fq "\"generation\":\"$HOST_TOOLS_SHA\"" "$inner_root/manifest.json"
-          grep -Fq '"toolset_version":"production-host-tools-v3"' "$inner_root/manifest.json"
           expected_count=0
           while read -r expected_hash expected_path; do
             [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]
@@ -1470,7 +1535,15 @@ jobs:
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
           remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
           probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
-          expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1"
+          case "$HOST_TOOLS_TOOLSET_VERSION" in
+            production-host-tools-v3)
+              expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 python_isolated=1 python_bytecode_disabled=1"
+              ;;
+            production-host-tools-v4)
+              expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1"
+              ;;
+            *) echo "host-tools pin selected an unsupported capability layout" >&2; exit 1 ;;
+          esac
           expected_bytes="$(printf '%s\n' "$expected_output" | wc -c | tr -d '[:space:]')"
           expected_sha256="$(printf '%s\n' "$expected_output" | sha256sum | cut -d' ' -f1)"
           # The file-size limit bounds the remote process, while ``head`` caps
@@ -3201,6 +3274,7 @@ jobs:
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
       HOST_TOOLS_SHA: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}
+      HOST_TOOLS_TOOLSET_VERSION: ${{ needs.host-capability-preflight.outputs.host_tools_toolset_version }}
       HOST_TOOLS_DISPATCHER: /opt/oldsparky/platform/shared/host-tools/${{ needs.host-capability-preflight.outputs.host_tools_sha }}/platform_workflow_remote_dispatch.py
     steps:
       - name: Download closed preflight handoff
@@ -3408,6 +3482,7 @@ jobs:
       PUBLISHED_ARTIFACT_ID: ${{ needs.build-release.outputs.artifact_id }}
       PUBLISHED_ARTIFACT_DIGEST: ${{ needs.build-release.outputs.artifact_digest }}
       HOST_TOOLS_SHA: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}
+      HOST_TOOLS_TOOLSET_VERSION: ${{ needs.host-capability-preflight.outputs.host_tools_toolset_version }}
       HOST_TOOLS_GENERATION: /opt/oldsparky/platform/shared/host-tools/${{ needs.host-capability-preflight.outputs.host_tools_sha }}
       HOST_TOOLS_DISPATCHER: /opt/oldsparky/platform/shared/host-tools/${{ needs.host-capability-preflight.outputs.host_tools_sha }}/platform_workflow_remote_dispatch.py
       HOST_TOOLS_ARTIFACT_ID: ${{ needs.host-capability-preflight.outputs.host_tools_artifact_id }}
@@ -4109,7 +4184,7 @@ jobs:
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
             --output "$jobs_path"
-          /usr/bin/python3 - "$input_path" "$handoff_path" "$attestation_path" "$jobs_path" "$bundle_path" "$outer_dir" "$TARGET_SHA" "$HOST_TOOLS_SHA" "$HOST_TOOLS_ARTIFACT_ID" "$HOST_TOOLS_ARTIFACT_NAME" "$HOST_TOOLS_ARTIFACT_SIZE" "$HOST_TOOLS_ARTIFACT_DIGEST" "$HOST_TOOLS_BUNDLE_SHA256" "$HOST_TOOLS_MANIFEST_SHA256" "$HOST_TOOLS_CAPABILITIES_SHA256" "$HOST_TOOLS_FILES_CONTRACT_SHA256" "$HOST_TOOLS_MODES_CONTRACT_SHA256" "$HOST_TOOLS_SIGNER_WORKFLOW" "$HOST_TOOLS_SOURCE_REF" "$HOST_TOOLS_ATTESTATION_RUN_ID" "$HOST_TOOLS_ATTESTATION_RUN_ATTEMPT" "$HOST_TOOLS_ATTESTATION_JOB_ID" <<'PY'
+          /usr/bin/python3 - "$input_path" "$handoff_path" "$attestation_path" "$jobs_path" "$bundle_path" "$outer_dir" "$TARGET_SHA" "$HOST_TOOLS_SHA" "$HOST_TOOLS_ARTIFACT_ID" "$HOST_TOOLS_ARTIFACT_NAME" "$HOST_TOOLS_ARTIFACT_SIZE" "$HOST_TOOLS_ARTIFACT_DIGEST" "$HOST_TOOLS_BUNDLE_SHA256" "$HOST_TOOLS_MANIFEST_SHA256" "$HOST_TOOLS_CAPABILITIES_SHA256" "$HOST_TOOLS_FILES_CONTRACT_SHA256" "$HOST_TOOLS_MODES_CONTRACT_SHA256" "$HOST_TOOLS_SIGNER_WORKFLOW" "$HOST_TOOLS_SOURCE_REF" "$HOST_TOOLS_ATTESTATION_RUN_ID" "$HOST_TOOLS_ATTESTATION_RUN_ATTEMPT" "$HOST_TOOLS_ATTESTATION_JOB_ID" "$HOST_TOOLS_TOOLSET_VERSION" <<'PY'
           import hashlib
           import json
           import os
@@ -4124,6 +4199,7 @@ jobs:
               target_sha, host_tools_sha, artifact_id, artifact_name, artifact_size, artifact_digest,
               bundle_sha, manifest_sha, capabilities_sha, files_contract_sha, modes_contract_sha,
               signer_workflow, source_ref, attestation_run_id, attestation_attempt, attestation_job_id,
+              expected_toolset_version,
           ) = sys.argv[1:]
           handoff = json.loads(Path(handoff_path).read_text(encoding="ascii"))
           expected_handoff = {
@@ -4207,23 +4283,48 @@ jobs:
           if attestation_matches != 1:
               raise SystemExit("host-tools attestation certificate/source/run/subject policy failed")
 
-          expected_files = {
+          common_files = {
               "platform_workflow_remote_dispatch.py", "platform_workflow_input_guard.py",
               "platform_prepare_artifact_dir.py", "platform_production_deploy_supervisor.sh",
-              "platform_retained_load_export_executor.py",
-              "platform_cpu_diagnostic_plan.py",
-              "platform_release_lock.sh", "platform_release_preflight.sh",
-              "platform_validate_release_artifact.py", "platform_safe_env_exec.py",
-              "platform_render_service_envs.py", "platform_validate_edge_policy.py",
-              "platform_update_cloudflare_ips.py", "platform_configure_shared_env.py",
-              "platform_storage_evidence_summary.py", "capabilities.txt",
+              "platform_retained_load_export_executor.py", "platform_release_lock.sh",
+              "platform_release_preflight.sh", "platform_validate_release_artifact.py",
+              "platform_safe_env_exec.py", "platform_render_service_envs.py",
+              "platform_validate_edge_policy.py", "platform_update_cloudflare_ips.py",
+              "platform_configure_shared_env.py", "platform_storage_evidence_summary.py",
           }
+          cpu_file = "platform_cpu_diagnostic_plan.py"
+          legacy_capabilities = [
+              "artifact_prepare", "input_guard", "production_dispatcher", "production_supervisor",
+              "production_deploy_control", "release_baseline", "retained_load_export_cleanup",
+              "retained_load_source_binding", "python_isolated", "python_bytecode_disabled",
+          ]
+          expected_components = {
+              "prepare_artifact": ["platform_workflow_remote_dispatch.py", "platform_workflow_input_guard.py", "platform_prepare_artifact_dir.py"],
+              "production_deploy_control": [
+                  "platform_production_deploy_supervisor.sh", "platform_release_lock.sh",
+                  "platform_release_preflight.sh", "platform_validate_release_artifact.py",
+                  "platform_safe_env_exec.py", "platform_render_service_envs.py",
+                  "platform_validate_edge_policy.py", "platform_configure_shared_env.py",
+                  "platform_update_cloudflare_ips.py", "platform_storage_evidence_summary.py",
+              ],
+              "retained_load_artifact_cleanup": ["platform_retained_load_export_executor.py"],
+          }
+          if expected_toolset_version == "production-host-tools-v3":
+              expected_files = common_files
+              expected_capabilities = legacy_capabilities
+          elif expected_toolset_version == "production-host-tools-v4":
+              expected_files = common_files | {cpu_file}
+              expected_capabilities = legacy_capabilities + ["cpu_diagnostic_plan_control"]
+              expected_components["cpu_diagnostic_control"] = [cpu_file]
+          else:
+              raise SystemExit("host-tools trusted pin selected an unsupported layout")
+          expected_files = expected_files | {"capabilities.txt"}
           outer = Path(outer_dir)
           if hashlib.sha256((outer / "platform-host-tools-bundle.zip").read_bytes()).hexdigest() != bundle_sha:
               raise SystemExit("host-tools inner bundle digest changed")
           if (outer / "contract/source_sha").read_text(encoding="ascii").strip() != host_tools_sha:
               raise SystemExit("host-tools source contract mismatch")
-          if (outer / "contract/toolset_version").read_text(encoding="ascii").strip() != "production-host-tools-v3":
+          if (outer / "contract/toolset_version").read_text(encoding="ascii").strip() != expected_toolset_version:
               raise SystemExit("host-tools toolset contract mismatch")
           manifest_contract = (outer / "contract/manifest.sha256").read_text(encoding="ascii").strip()
           capabilities_contract = (outer / "contract/capabilities.sha256").read_text(encoding="ascii").strip()
@@ -4246,8 +4347,32 @@ jobs:
               raise SystemExit("host-tools inner bundle inventory is invalid")
           manifest = json.loads(members[manifest_member].decode("utf-8"))
           records = manifest.get("files") if isinstance(manifest, dict) else None
-          if manifest.get("schema") != 1 or manifest.get("source_sha") != host_tools_sha or manifest.get("generation") != host_tools_sha or not isinstance(records, list):
+          if (
+              not isinstance(manifest, dict)
+              or set(manifest) != {"schema", "toolset_version", "source_sha", "generation", "capabilities", "components", "limits", "files"}
+              or type(manifest.get("schema")) is not int
+              or manifest.get("schema") != 1
+              or manifest.get("toolset_version") != expected_toolset_version
+              or manifest.get("source_sha") != host_tools_sha
+              or manifest.get("generation") != host_tools_sha
+              or manifest.get("capabilities") != expected_capabilities
+              or manifest.get("components") != expected_components
+              or manifest.get("limits") != {"max_bundle_bytes": 4194304, "max_file_bytes": 524288, "max_file_count": 32}
+              or not isinstance(records, list)
+          ):
               raise SystemExit("host-tools manifest identity is invalid")
+          expected_capabilities_text = "\n".join(
+              ["schema=1", f"toolset_version={expected_toolset_version}", f"source_sha={host_tools_sha}"]
+              + [f"capability={name}" for name in expected_capabilities]
+              + [f"component={name}" for name in expected_components]
+              + [
+                  f"component_file={component}:{name}"
+                  for component, names in expected_components.items()
+                  for name in names
+              ]
+          ) + "\n"
+          if members["platform-host-tools/capabilities.txt"].decode("ascii") != expected_capabilities_text:
+              raise SystemExit("host-tools capabilities layout is invalid")
           by_path = {}
           for record in records:
               if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"} or record.get("path") in by_path:
