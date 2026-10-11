@@ -474,6 +474,19 @@ Source **C4** `6d9f593e2214dacfda55d119b2090e7264ef1ab7` adds external-load clea
 
 The bounded SSR follow-up uses source **C5** `d2afef17db081bf435514fa59b6e1d1b3e41c838`: it bounds server-side read-only workspace/auth requests, adds sampled admission-shed aggregates and their public projection, and restores the SSR workspace-error flag with `authenticated-read-admission-24x8`. Its only host-tools change is the supervisor restore selector; the other 14 pinned helpers, modes, v4 layout and capability contract are unchanged. Pin-only **P5** `a2e8dfaa16962074c59047428d22ed2f823cd521` selects C5 and records that supervisor digest. CI, signed artifact verification, approved provisioning and deployment remain separate required evidence.
 
+The populated-quiesce recovery and bounded task-release retention follow-up uses
+source **C6** `af425b0500d72fd7dbd9a1a48fd35c5d37a59b48` and pin-only **P6**
+`112653973b37e38e06293c8c4cde8ab2854062a4`. The 15-entry v4 host-tools
+closure changes only `platform_workflow_remote_dispatch.py` and
+`platform_production_deploy_supervisor.sh` relative to C5; the remaining 13
+entries, modes, bundle layout and capability contract are unchanged. C6 adds
+separately authorized, signed recovery actions for preserving a populated
+quiesce candidate and pruning only a fully reviewed task-created release set.
+The existing empty-only abort remains unchanged. Exact-SHA CI, signed bundle
+verification, approved recovery/provisioning and post-action checks remain
+required; the source and pin do not establish host installation or app
+deployment.
+
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
    blocked.
