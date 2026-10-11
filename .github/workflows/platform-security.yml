@@ -917,6 +917,7 @@ jobs:
         run: python3 platform/tools/platform_verify.py web-hermetic
         env:
           CI: "true"
+          PLATFORM_WEB_404_DIAGNOSTICS: "1"
 
       - name: Upload Playwright report
         if: ${{ !cancelled() }}

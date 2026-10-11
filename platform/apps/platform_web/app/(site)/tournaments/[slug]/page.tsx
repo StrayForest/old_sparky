@@ -14,7 +14,8 @@ import { run_with_workspace_cpu_diagnostic } from "@/lib/performance-diagnostic-
 import {
   getTournamentWorkspace,
   normalizeTournamentInviteCode,
-  PlatformApiError
+  PlatformApiError,
+  recordServerInternalReadDiagnostic
 } from "@/lib/platform-api";
 import type { TournamentDetail } from "@/lib/types";
 
@@ -71,6 +72,7 @@ export default async function TournamentDetailPage({
         )
         : getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));
       if (!workspace) {
+        recordServerInternalReadDiagnostic("detail", "page_not_found", 404);
         notFound();
       }
       initialTournament = workspace.tournament;

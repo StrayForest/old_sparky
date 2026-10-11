@@ -5,7 +5,12 @@ import { ArrowLeft } from "lucide-react";
 import { BracketBoard } from "@/components/bracket/bracket-board";
 import { Hero } from "@/components/layout/hero";
 import { HistoryBackLink } from "@/components/layout/history-back-link";
-import { getTournamentWorkspace, normalizeTournamentInviteCode, PlatformApiError } from "@/lib/platform-api";
+import {
+  getTournamentWorkspace,
+  normalizeTournamentInviteCode,
+  PlatformApiError,
+  recordServerInternalReadDiagnostic
+} from "@/lib/platform-api";
 
 export const metadata: Metadata = {
   title: "Сетка турнира"
@@ -40,6 +45,7 @@ export default async function TournamentBracketPage({
   }
 
   if (!workspace) {
+    recordServerInternalReadDiagnostic("bracket", "page_not_found", 404);
     notFound();
   }
   const { tournament } = workspace;
