@@ -4,11 +4,100 @@ import { expect, test } from "@playwright/test";
 import { NextRequest } from "next/server";
 import { formatWorkspaceApiErrorDiagnostic } from "../../lib/ssr-error-diagnostic";
 import { hasAuthorizedDiagnosticRunMarker } from "../../lib/performance-diagnostic-marker";
+import {
+  ServerInternalReadQueueError,
+  ServerInternalReadScheduler
+} from "../../lib/server-internal-read-scheduler";
 import { proxy } from "../../proxy";
 
 function source(relativePath: string): string {
   return readFileSync(resolve(process.cwd(), relativePath), "utf8");
 }
+
+function deferred<T = void>() {
+  let resolve!: (value?: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = (value) => resolvePromise(value as T | PromiseLike<T>);
+  });
+  return { promise, resolve };
+}
+
+test("server internal reads share a bounded FIFO permit through body completion", async () => {
+  const scheduler = new ServerInternalReadScheduler({
+    activeLimit: 1,
+    pendingLimit: 2,
+    queueDeadlineMs: 500,
+  });
+  const bodyConsumed = deferred();
+  const firstStarted = deferred();
+  const order: string[] = [];
+  const requestHeaders = ["session-a", "session-b", "session-c"];
+
+  const first = scheduler.run(async () => {
+    firstStarted.resolve();
+    await bodyConsumed.promise;
+    return { status: 200, cookie: requestHeaders[0] };
+  });
+  await firstStarted.promise;
+  const second = scheduler.run(async () => {
+    order.push("second");
+    return { status: 503, cookie: requestHeaders[1] };
+  });
+  const third = scheduler.run(async () => {
+    order.push("third");
+    return { status: 200, cookie: requestHeaders[2] };
+  });
+
+  expect(scheduler.activeCount).toBe(1);
+  expect(scheduler.pendingCount).toBe(2);
+  await expect(scheduler.run(async () => "overflow")).rejects.toMatchObject({
+    name: "ServerInternalReadQueueError",
+    failure: "full",
+  } satisfies Partial<ServerInternalReadQueueError>);
+
+  bodyConsumed.resolve();
+  await expect(first).resolves.toEqual({ status: 200, cookie: "session-a" });
+  await expect(second).resolves.toEqual({ status: 503, cookie: "session-b" });
+  await expect(third).resolves.toEqual({ status: 200, cookie: "session-c" });
+  expect(order).toEqual(["second", "third"]);
+  expect(scheduler.activeCount).toBe(0);
+  expect(scheduler.pendingCount).toBe(0);
+});
+
+test("server internal read waiters are removed on abort/deadline and permits release on error", async () => {
+  const scheduler = new ServerInternalReadScheduler({
+    activeLimit: 1,
+    pendingLimit: 2,
+    queueDeadlineMs: 20,
+  });
+  const hold = deferred();
+  const entered = deferred();
+  const active = scheduler.run(async () => {
+    entered.resolve();
+    await hold.promise;
+  });
+  await entered.promise;
+
+  const controller = new AbortController();
+  const aborted = scheduler.run(async () => undefined, controller.signal);
+  controller.abort(new Error("request cancelled"));
+  await expect(aborted).rejects.toThrow("request cancelled");
+  expect(scheduler.pendingCount).toBe(0);
+
+  const expired = scheduler.run(async () => undefined);
+  await expect(expired).rejects.toMatchObject({
+    name: "ServerInternalReadQueueError",
+    failure: "deadline",
+  });
+  expect(scheduler.pendingCount).toBe(0);
+
+  hold.resolve();
+  await active;
+  await expect(scheduler.run(async () => {
+    throw new Error("upstream failure");
+  })).rejects.toThrow("upstream failure");
+  expect(scheduler.activeCount).toBe(0);
+});
 
 test("public timeout metadata cannot promote SSR trace sampling", () => {
   const priorEnabled = process.env.PLATFORM_SSR_PERF_LOG_ENABLED;
@@ -93,6 +182,9 @@ test("workspace CPU diagnostics require an exact private run marker", () => {
 
 test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
+  const api = source("lib/platform-api.ts");
+  const auth = source("lib/server-auth.ts");
+  const scheduler = source("lib/server-internal-read-scheduler.ts");
   const workspaceCalls = detailPage.match(/\bgetTournamentWorkspace\s*\(/gu) ?? [];
 
   // The true/false branches each contain one source call, but only one branch
@@ -112,6 +204,15 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(detailPage).toContain("const workspace = await (ssrTraceSampled");
   expect(detailPage).toContain("? measureSsrStage(");
   expect(detailPage).toContain(": getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));");
+  expect(api).toContain("typeof window === \"undefined\"");
+  expect(api).toContain("runWithServerInternalRead(loadWorkspace, options.signal)");
+  expect(api).toContain("ServerInternalReadQueueError");
+  expect(api).toContain('{ code: "server_read_capacity" }');
+  expect(auth.match(/runWithServerInternalRead\(/gu)).toHaveLength(2);
+  expect(auth).toContain("await cancelServerAuthBody(response)");
+  expect(scheduler).toContain("activeLimit: 24");
+  expect(scheduler).toContain("pendingLimit: 128");
+  expect(scheduler).toContain("queueDeadlineMs: 5_000");
 });
 
 test("workspace API error diagnostics emit only bounded status and correlation fields", () => {

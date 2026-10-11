@@ -1,6 +1,10 @@
 import { notifyPlatformUnauthorized } from "@/lib/auth-session-signal";
 import { deadlockHeroes } from "@/lib/deadlock";
 import {
+  runWithServerInternalRead,
+  ServerInternalReadQueueError
+} from "@/lib/server-internal-read-scheduler";
+import {
   normalizeVisibility,
   ranks,
   registrationTimerLabel,
@@ -812,50 +816,78 @@ export async function getTournamentWorkspace(
     params.set("invite_code", inviteCode);
   }
 
-  const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/workspace?${params.toString()}`, {
-    headers,
-    credentials: "include",
-    cache: "no-store",
-    signal: options.signal
-  });
-  if (response.status === 404) {
-    return null;
-  }
-  if (!response.ok) {
-    throw new PlatformApiError(response.statusText || "Failed to load tournament.", response.status);
-  }
+  const loadWorkspace = async () => {
+    const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/workspace?${params.toString()}`, {
+      headers,
+      credentials: "include",
+      cache: "no-store",
+      signal: options.signal
+    });
+    if (response.status === 404) {
+      await cancelResponseBody(response);
+      return null;
+    }
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      throw new PlatformApiError(response.statusText || "Failed to load tournament.", response.status);
+    }
 
-  const workspace = await response.json() as ApiTournamentWorkspace;
-  const registrations = workspace.participants_available
-    ? dedupeRegistrations((workspace.participants ?? []).map(mapRegistration))
-    : [];
-  const assignmentState = workspace.auto_assignment ?? null;
-  const activeCommitment = workspace.current_user_active_commitment ?? null;
-  return {
-    tournament: mapTournamentDetail(
-      workspace.tournament,
-      registrations,
-      workspace.bracket ? mapBracket(workspace.bracket) : null,
-      {
-        serverTime: workspace.server_time,
-        readyCheckState: workspace.ready_check ?? null,
-        deadlockAssignment: assignmentState?.published_run ?? assignmentState?.latest_run ?? null,
-        activeCommitment: activeCommitment
-          ? {
-              id: activeCommitment.id,
-              tournamentId: activeCommitment.tournament_id,
-              tournamentSlug: activeCommitment.tournament_slug,
-              tournamentName: activeCommitment.tournament_name,
-              assignmentRunId: activeCommitment.assignment_run_id,
-              teamId: activeCommitment.team_id,
-              teamName: activeCommitment.team_name,
-              activatedAt: activeCommitment.activated_at
-            }
-          : null
-      }
-    ),
-    currentUser: workspace.current_user ?? null
+    const workspace = await response.json() as ApiTournamentWorkspace;
+    const registrations = workspace.participants_available
+      ? dedupeRegistrations((workspace.participants ?? []).map(mapRegistration))
+      : [];
+    const assignmentState = workspace.auto_assignment ?? null;
+    const activeCommitment = workspace.current_user_active_commitment ?? null;
+    return {
+      tournament: mapTournamentDetail(
+        workspace.tournament,
+        registrations,
+        workspace.bracket ? mapBracket(workspace.bracket) : null,
+        {
+          serverTime: workspace.server_time,
+          readyCheckState: workspace.ready_check ?? null,
+          deadlockAssignment: assignmentState?.published_run ?? assignmentState?.latest_run ?? null,
+          activeCommitment: activeCommitment
+            ? {
+                id: activeCommitment.id,
+                tournamentId: activeCommitment.tournament_id,
+                tournamentSlug: activeCommitment.tournament_slug,
+                tournamentName: activeCommitment.tournament_name,
+                assignmentRunId: activeCommitment.assignment_run_id,
+                teamId: activeCommitment.team_id,
+                teamName: activeCommitment.team_name,
+                activatedAt: activeCommitment.activated_at
+              }
+            : null
+        }
+      ),
+      currentUser: workspace.current_user ?? null
+    };
   };
+
+  try {
+    return typeof window === "undefined"
+      ? await runWithServerInternalRead(loadWorkspace, options.signal)
+      : await loadWorkspace();
+  } catch (error) {
+    if (error instanceof ServerInternalReadQueueError) {
+      throw new PlatformApiError(
+        "Server read capacity is temporarily unavailable.",
+        503,
+        null,
+        { code: "server_read_capacity" }
+      );
+    }
+    throw error;
+  }
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Preserve the original upstream status/error while releasing the read slot.
+  }
 }
 
 export async function getPlatformStatsOverview(): Promise<PlatformStatsOverview> {
