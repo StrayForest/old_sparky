@@ -1274,6 +1274,7 @@ class LoadAcceptanceTests(unittest.TestCase):
                 "ready-vote-spike-v1",
                 "ready-vote-stress-15k-v2",
                 "ready-vote-stress-20k-v2",
+                "ready-vote-transport-pair-v1",
             },
         )
         resource_fields = (
@@ -1539,6 +1540,7 @@ class LoadAcceptanceTests(unittest.TestCase):
                 "ready-vote-spike-v1",
                 "ready-vote-stress-15k-v2",
                 "ready-vote-stress-20k-v2",
+                "ready-vote-transport-pair-v1",
             },
         )
 
