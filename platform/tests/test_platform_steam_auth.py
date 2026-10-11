@@ -597,6 +597,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
         settings = self.settings.model_copy(
             update={
                 "platform_email_verification_required": True,
+                "platform_auth_rate_limit_enabled": True,
                 "platform_support_smtp_host": "smtp.example.com",
                 "platform_support_smtp_sender_email": "noreply@old-sparky.com",
             }

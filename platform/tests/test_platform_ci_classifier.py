@@ -642,10 +642,21 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("release-runtime-real", workflow)
         self.assertIn("name: Conditional release runtime fixture", workflow)
         self.assertIn("name: Trusted dev immutable release runtime", workflow)
-        self.assertIn(
-            "needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true'",
-            workflow,
-        )
+        for job in ("release-runtime", "release-runtime-real"):
+            match = re.search(
+                rf"(?ms)^  {re.escape(job)}:\n(?P<block>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                workflow,
+            )
+            self.assertIsNotNone(match)
+            assert match is not None
+            block = match.group("block")
+            for required in (
+                "github.event_name == 'push'",
+                "github.ref == 'refs/heads/dev'",
+                "needs.classifier.outputs.class == 'full'",
+                "needs.classifier.outputs.deployable == 'true'",
+            ):
+                self.assertIn(required, block)
         self.assertNotIn("schedule:", workflow)
 
     def test_cancel_safe_status_finalizer_overwrites_every_terminal_conclusion(self) -> None:
@@ -1942,9 +1953,10 @@ class PlatformCiClassifierTests(unittest.TestCase):
             status_final,
         )
         self.assertIn(
-            'requires_release_runtime = baseline_mode or runtime_sensitive or raw_fallback == "true"',
+            'deployable_full_dev_push = (',
             status_final,
         )
+        self.assertIn("or deployable_full_dev_push", status_final)
         self.assertIn('release_runtime_result != "success"', status_final)
         self.assertIn('release_runtime_result != "skipped"', status_final)
         self.assertIn("RELEASE_RUNTIME_REAL_RESULT", status_final)
@@ -2058,6 +2070,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/dev",
                     "true",
                     "false",
+                    "true",
                     "success",
                     "success",
                     True,
@@ -2069,6 +2082,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/dev",
                     "true",
                     "false",
+                    "true",
                     "success",
                     "skipped",
                     False,
@@ -2080,6 +2094,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/dev",
                     "true",
                     "false",
+                    "true",
                     "success",
                     "failure",
                     False,
@@ -2090,6 +2105,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "workflow_dispatch",
                     "refs/heads/dev",
                     "true",
+                    "false",
                     "false",
                     "success",
                     "success",
@@ -2102,6 +2118,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/dev",
                     "true",
                     "true",
+                    "false",
                     "success",
                     "success",
                     True,
@@ -2111,6 +2128,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "ordinary dev both skipped",
                     "push",
                     "refs/heads/dev",
+                    "false",
                     "false",
                     "false",
                     "skipped",
@@ -2126,16 +2144,54 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/dev",
                     "false",
                     "false",
+                    "false",
                     "skipped",
                     "skipped",
                     True,
                     False,
                 ),
                 (
+                    "deployable dev push both skipped",
+                    "push",
+                    "refs/heads/dev",
+                    "false",
+                    "false",
+                    "true",
+                    "skipped",
+                    "skipped",
+                    False,
+                    True,
+                ),
+                (
+                    "deployable dev push fixture missing",
+                    "push",
+                    "refs/heads/dev",
+                    "false",
+                    "false",
+                    "true",
+                    "missing",
+                    "success",
+                    False,
+                    True,
+                ),
+                (
+                    "deployable dev push both success",
+                    "push",
+                    "refs/heads/dev",
+                    "false",
+                    "false",
+                    "true",
+                    "success",
+                    "success",
+                    True,
+                    True,
+                ),
+                (
                     "non-dev manual fixture only",
                     "workflow_dispatch",
                     "refs/heads/feature",
                     "true",
+                    "false",
                     "false",
                     "success",
                     "skipped",
@@ -2147,6 +2203,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "merge_group",
                     "refs/heads/gh-readonly-queue/main/pr-1-abc",
                     "true",
+                    "false",
                     "false",
                     "success",
                     "skipped",
@@ -2160,6 +2217,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 workflow_ref,
                 raw_runtime_sensitive,
                 raw_fallback,
+                raw_deployable,
                 fixture_result,
                 real_result,
                 expected_passed,
@@ -2175,6 +2233,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                             "WORKFLOW_REF": workflow_ref,
                             "ROUTE_RUNTIME_SENSITIVE": raw_runtime_sensitive,
                             "ROUTE_FALLBACK": raw_fallback,
+                            "ROUTE_DEPLOYABLE": raw_deployable,
                             "RELEASE_RUNTIME_RESULT": fixture_result,
                             "RELEASE_RUNTIME_REAL_RESULT": real_result,
                             "SUMMARY_PATH": str(Path(directory) / f"trusted-{label}.json"),

@@ -50,9 +50,10 @@ web-quality` from `platform/`; the helper requires Node 26.3.1.
 The first eight gates are deterministic and always part of the normal CI
 aggregate. The conditional `release-runtime` gate is deterministic as well,
 but is intentionally excluded from `platform_verify.py ci`: the classifier
-enables it for an exact runtime-sensitive path change or for a fail-closed
-fallback route. The fallback condition ensures an uncertain route receives
-the release-runtime coverage without granting it production authority.
+enables it for an exact runtime-sensitive path change, a fail-closed fallback,
+an exact baseline-runtime proof, or every deployable full push to `dev`. This
+ensures that a later test-only push cannot deploy atop undelivered runtime
+changes without producing exact-target runtime proof.
 On pull requests and `merge_group`, `release-runtime` is fixture-only: it
 builds staged runtime from pinned ZIP fixtures under `python -I`, then checks
 file-map/mode parity, ordered paths, archive validation and install behavior.
@@ -61,9 +62,10 @@ retention, validator agreement and fixed read-only unit aliases; collision,
 identity-bound cleanup and UID paths are covered without a live browser. The
 gate has no production
 network, credentials or deployment authority. A separate `release-runtime-real`
-job runs for classifier-sensitive or fallback pushes to canonical `dev`,
-same-repository PRs targeting `dev` when that route requires the real builder,
-or `workflow_dispatch` whose ref is exactly `dev`. The PR route binds the
+job runs for classifier-sensitive or fallback pushes to canonical `dev`, every
+deployable full push to `dev`, same-repository PRs targeting `dev` when that
+route requires the real builder, or `workflow_dispatch` whose ref is exactly
+`dev`. The PR route binds the
 tested merge SHA, ordered base/head parents and exact same-repository refs
 before building. It starts on a fresh runner, checks out the exact tested SHA,
 creates the production-style clean root venv and invokes the full
@@ -140,9 +142,9 @@ ping. A missing migration or seed is a `LOCAL GATE BLOCKED` refusal with an
 instruction to run the migration gate, so an already-cleaned disposable
 database cannot produce a misleading cascade of HTTP 503 test failures.
 `backend-privileged` requires root and disposable Redis DB 15, but not PostgreSQL. The verifier resolves
-the safe dotenv once, validates the fixed target, and passes that mapping to the child and timeout cleanup;
-CI provisions Redis 7 for both privileged lanes. Teardown flushes only DB 15. On timeout, the parent
-reaps its direct child before reacquiring the privileged lock; cleanup errors do not replace timeout 124.
+the safe dotenv once and passes the validated mapping to the child and timeout cleanup. CI provisions
+Redis 7 for both lanes; teardown flushes only DB 15. On timeout, the parent reaps its direct child
+before reacquiring the privileged lock; cleanup errors do not replace timeout 124.
 `backend-integration` and `backend-privileged` are serial because they share database, Redis or host-identity resources; the aggregate preserves that boundary. Release/install and systemd modules
 remain privileged even with temporary-directory fixtures because production paths enforce root
 ownership, fixed release paths or systemd state. Tests mock subprocess contracts instead of requiring
@@ -314,8 +316,8 @@ trusted `dev` and invoked with `python -I -B`.
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route
 with `fallback=true` and `deployable=false`; these routes also run the
-conditional `release-runtime` fixture gate, and a sensitive/fallback push to
-`dev` runs `release-runtime-real`. Recognized platform paths use
+conditional `release-runtime` fixture gate, and a sensitive/fallback or
+deployable full push to `dev` runs `release-runtime-real`. Recognized platform paths use
 `fallback=false`; full verification alone does not imply production authority.
 The candidate-packaging and exact storage-operations families are separately
 closed, full-coverage, non-deployable routes. The storage family requires
@@ -581,15 +583,11 @@ the exact run ID.
 
 ## Contract self-test
 
-The privileged contour owns immutable recovery-bootstrap tests
-(`tests.test_platform_recovery_bootstrap`); backend-tool-contract owns cumulative-baseline
-provenance tests in `tests.test_platform_workflow_provenance`. The
-verification-contract contour owns failed-report caller tests and the synthetic `unittest.subTest` accounting regression: multiple failures/errors count as one executed parent ID while native failure/error rows remain in the summary. Backend-tool-contract also owns the deferred-origin budget-failure pipeline in `tests.test_external_load_pending_origin_pipeline`.
-Together the contract tests cover closed bundles, exact manifest/provenance schemas, content-addressed installation, receipt identity, migration-uncertainty guards, and secret/SSH ordering. `tests.test_platform_release_systemd_state`
-adds subprocess coverage for operation-ID/path/inode mismatch, helper-manifest
-tampering and rollback-target retry binding; `tests.test_platform_release_recovery_boundaries`
-covers rollback/recovery subprocess faults. Recovery-bootstrap tests retain
-attestation variants and the legacy-v2 no-systemd cleanup bridge; live execution remains an explicit operator recovery action.
+The privileged contour owns immutable recovery-bootstrap tests (`tests.test_platform_recovery_bootstrap`); backend-tool-contract owns cumulative-baseline provenance tests (`tests.test_platform_workflow_provenance`).
+Verification-contract owns failed-report caller tests and the synthetic `unittest.subTest` accounting regression: multiple failures/errors count as one executed parent ID while native failure/error rows remain in the summary. Backend-tool-contract also owns the deferred-origin budget-failure pipeline (`tests.test_external_load_pending_origin_pipeline`).
+Contract tests cover closed bundles, exact manifest/provenance schemas, content-addressed installation, receipt identity, migration-uncertainty guards, and secret/SSH ordering. `tests.test_platform_release_systemd_state` covers operation-ID/path/inode mismatch, helper-manifest tampering and rollback-target retry binding; `tests.test_platform_release_recovery_boundaries` covers rollback/recovery subprocess faults.
+Recovery-bootstrap tests retain attestation variants and the legacy-v2 no-systemd cleanup bridge; live execution remains an explicit operator recovery action.
+Migration diagnostics use a bounded mode-600 local temp report retained on failure; CI does not upload it, and ephemeral runner files disappear after the job.
 
 The `docs` gate checks document shape, repository-local links and project skill
 frontmatter/interface metadata. `verification-contract` checks registry/CI

@@ -1125,7 +1125,28 @@ jobs:
   release-runtime:
     name: Conditional release runtime fixture
     needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: >-
+      !cancelled() &&
+      needs.classifier.result == 'success' &&
+      (
+        needs.classifier.outputs.runtime_sensitive == 'true' ||
+        needs.classifier.outputs.fallback == 'true' ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          inputs.proof_mode == 'baseline-runtime'
+        ) ||
+        (
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/dev' &&
+          needs.classifier.outputs.class == 'full' &&
+          needs.classifier.outputs.deployable == 'true'
+        )
+      ) &&
+      (
+        github.event_name != 'workflow_dispatch' ||
+        inputs.proof_mode != 'baseline-runtime' ||
+        needs.baseline-runtime-guard.result == 'success'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -1191,6 +1212,9 @@ jobs:
       (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') &&
       (needs.classifier.outputs.runtime_sensitive == 'true' ||
       needs.classifier.outputs.fallback == 'true' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev' &&
+      needs.classifier.outputs.class == 'full' &&
+      needs.classifier.outputs.deployable == 'true') ||
       (inputs.proof_mode == 'baseline-runtime' && needs.baseline-runtime-guard.result == 'success'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -2009,7 +2033,18 @@ jobs:
           ] if isinstance(required_expected, list) else ["classifier expected gates are malformed"]
           release_runtime_result = os.environ.get("RELEASE_RUNTIME_RESULT", "missing")
           real_runtime_result = os.environ.get("RELEASE_RUNTIME_REAL_RESULT", "skipped")
-          requires_release_runtime = baseline_mode or runtime_sensitive or raw_fallback == "true"
+          deployable_full_dev_push = (
+              event_name == "push"
+              and os.environ.get("WORKFLOW_REF") == "refs/heads/dev"
+              and os.environ.get("ROUTE_CLASS") == "full"
+              and os.environ.get("ROUTE_DEPLOYABLE") == "true"
+          )
+          requires_release_runtime = (
+              baseline_mode
+              or runtime_sensitive
+              or raw_fallback == "true"
+              or deployable_full_dev_push
+          )
           repository = os.environ.get("REPOSITORY", "")
           same_repository_dev_pr = (
               event_name == "pull_request"

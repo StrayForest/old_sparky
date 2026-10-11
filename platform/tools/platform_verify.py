@@ -14,8 +14,10 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Callable, Sequence
 
@@ -24,6 +26,50 @@ PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_ROOT = PLATFORM_ROOT / "tools"
 WEB_ROOT = PLATFORM_ROOT / "apps" / "platform_web"
 _PROCESS_GROUP_TERM_GRACE_SECONDS = 1.0
+
+
+def _create_private_migration_diagnostic() -> tuple[Path, Path]:
+    """Create a private, task-owned file for incremental migration stages."""
+
+    directory = Path(tempfile.mkdtemp(prefix="platform-migration-progress-", dir="/tmp"))
+    report = directory / "progress.log"
+    descriptor = -1
+    try:
+        directory_stat = os.lstat(directory)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        ):
+            raise OSError("private migration report directory failed validation")
+        descriptor = os.open(
+            report,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        report_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(report_stat.st_mode)
+            or report_stat.st_uid != os.geteuid()
+            or report_stat.st_nlink != 1
+            or stat.S_IMODE(report_stat.st_mode) != 0o600
+        ):
+            raise OSError("private migration report file failed validation")
+        return directory, report
+    except BaseException:
+        try:
+            report.unlink(missing_ok=True)
+            directory.rmdir()
+        except OSError:
+            pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 class _VerifierTermination(BaseException):
@@ -755,14 +801,47 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
         return 0
     if gate_id == "migration":
         try:
-            from tools.platform_migration_support import MIGRATION_SUBPROCESS_TIMEOUT_SECONDS
+            from tools.platform_migration_support import (
+                MIGRATION_DIAGNOSTIC_ENV,
+                MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
+            )
         except ModuleNotFoundError:  # Direct execution from platform/tools.
-            from platform_migration_support import MIGRATION_SUBPROCESS_TIMEOUT_SECONDS
-        return _run(
+            from platform_migration_support import (
+                MIGRATION_DIAGNOSTIC_ENV,
+                MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+        child_env = os.environ.copy()
+        child_env.pop(MIGRATION_DIAGNOSTIC_ENV, None)
+        try:
+            diagnostic_directory, diagnostic_file = _create_private_migration_diagnostic()
+        except OSError:
+            print(
+                "[GATE MIGRATION DIAGNOSTIC UNAVAILABLE] private report setup failed",
+                file=sys.stderr,
+                flush=True,
+            )
+            return _run(
+                gate_id,
+                [_python(), "tools/platform_migration_scenario.py"],
+                env=child_env,
+                timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+        child_env[MIGRATION_DIAGNOSTIC_ENV] = str(diagnostic_file)
+        status = _run(
             gate_id,
             [_python(), "tools/platform_migration_scenario.py"],
+            env=child_env,
             timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
         )
+        if status == 0:
+            diagnostic_file.unlink(missing_ok=True)
+            diagnostic_directory.rmdir()
+        else:
+            print(
+                f"[GATE MIGRATION DIAGNOSTIC] private progress retained at {diagnostic_file}",
+                flush=True,
+            )
+        return status
     if gate_id == "docs":
         return _run(gate_id, [_python(), "tools/platform_docs_check.py"])
     if gate_id == "web-quality":

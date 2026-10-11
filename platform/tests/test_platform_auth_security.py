@@ -1383,6 +1383,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
         settings = PlatformSettings(
             _env_file=None,
             platform_email_verification_required=True,
+            platform_auth_rate_limit_enabled=True,
             platform_support_smtp_host="smtp.example.com",
             platform_support_smtp_sender_email="noreply@old-sparky.com",
             platform_auth_generic_response_min_seconds=0,

@@ -37,7 +37,9 @@ from tools.platform_tournament_list_read_model_recovery import (
 from tools.platform_migration_support import (
     MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
     MigrationCommandError,
+    MigrationCommandTimeout,
     assert_single_head_state,
+    record_migration_progress,
     run_migration_subprocess,
     select_reversible_range,
     source_head,
@@ -134,11 +136,23 @@ def _run_alembic(
         command.append("--check-heads")
     elif revision is not None:
         command.append(revision)
-    result = run_migration_subprocess(
-        command,
-        label=f"alembic {operation}{f' {revision}' if revision else ''}".strip(),
-        timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
-        env=command_env,
+    progress_prefix = f"alembic-{operation}"
+    record_migration_progress(f"{progress_prefix}-started")
+    try:
+        result = run_migration_subprocess(
+            command,
+            label=f"alembic {operation}{f' {revision}' if revision else ''}".strip(),
+            timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
+            env=command_env,
+        )
+    except MigrationCommandTimeout:
+        record_migration_progress(f"{progress_prefix}-timeout")
+        raise
+    except MigrationCommandError:
+        record_migration_progress(f"{progress_prefix}-error")
+        raise
+    record_migration_progress(
+        f"{progress_prefix}-finished", returncode=result.returncode
     )
     if (result.returncode == 0) != expect_success:
         raise MigrationCommandError(
@@ -289,6 +303,7 @@ async def _reset_disposable_schema() -> None:
     production rollback contract.
     """
 
+    record_migration_progress("schema-reset-started")
     settings = get_settings()
     validate_platform_settings(settings)
     validate_disposable_migration_target(
@@ -302,6 +317,7 @@ async def _reset_disposable_schema() -> None:
         await db_session.execute(text("DROP TABLE IF EXISTS public.alembic_version"))
         await db_session.commit()
     await dispose_engine()
+    record_migration_progress("schema-reset-completed")
 
 
 async def _assert_source_and_database_head(expected_revision: str | None = None) -> None:
@@ -887,6 +903,7 @@ async def _migration_body() -> None:
         environment=settings.platform_environment,
         schema=settings.platform_db_schema,
     )
+    record_migration_progress("scenario-target-validated")
 
     # The runner owns a disposable test database. Reset only its application
     # schema so local reruns and CI both exercise the same populated migration
@@ -939,6 +956,7 @@ async def _migration_body() -> None:
         )
     finally:
         await dispose_engine()
+    record_migration_progress("migration-completed")
 
 
 async def _main() -> None:

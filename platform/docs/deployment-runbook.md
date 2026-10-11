@@ -47,7 +47,9 @@ to `dev`. The chain is:
    and full baseline-to-target range. Reconcile is a verified no-op for an
    allowed cumulative no-op; an application release requires a deployable full
    cumulative route with every canonical gate, no fallback, and exact-target
-   runtime proof when sensitive. A storage no-op is allowed only for an
+   runtime proof. Every deployable full push to `dev` runs both exact-target
+   runtime gates, so a later test-only push cannot suppress proof required by
+   runtime changes earlier in the undelivered range. A storage no-op is allowed only for an
    authenticated recovery input and a range wholly in the closed recovery,
    storage and docs sets; it changes no classifier field and authorizes no app
    work. Other ranges need normal release checks. Changes to `platform_production_deploy_supervisor.sh` require a deployable full route and exact-target release, not the recovery-bootstrap no-op. The gate re-reads current `dev` HEAD and refuses a stale successful CI result.
@@ -584,10 +586,8 @@ authority.
 
 After rollback, repeat preflight plus origin/SNI and public smoke against the restored release.
 
-A successful `Platform security and build` run for a push to the current
-`dev` HEAD is expected to continue automatically into production deployment.
-A stale successful run must be ignored, and a failed or missing gate must stop
-the chain before production side effects.
+A successful `Platform security and build` run for a push to the current `dev` HEAD continues automatically into production deployment; ignore stale successes.
+Failed or missing gates stop the chain before production side effects.
 
 ## Special release contours
 

@@ -11,8 +11,11 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 import ipaddress
+import os
 from pathlib import Path
+import stat
 import subprocess
+import time
 from typing import Sequence
 from urllib.parse import urlsplit
 
@@ -23,6 +26,85 @@ ALEMBIC_SCRIPT_LOCATION = PLATFORM_ROOT / "alembic"
 MIGRATION_SCHEMA = "platform"
 DISPOSABLE_DATABASE_NAME = "platformdb_test"
 MIGRATION_SUBPROCESS_TIMEOUT_SECONDS = 180.0
+MIGRATION_DIAGNOSTIC_ENV = "PLATFORM_MIGRATION_DIAGNOSTICS_FILE"
+_MIGRATION_DIAGNOSTIC_MAX_BYTES = 64 * 1024
+_MIGRATION_DIAGNOSTIC_STAGES = frozenset(
+    {
+        "scenario-target-validated",
+        "schema-reset-started",
+        "schema-reset-completed",
+        "alembic-upgrade-started",
+        "alembic-upgrade-finished",
+        "alembic-upgrade-timeout",
+        "alembic-upgrade-error",
+        "alembic-downgrade-started",
+        "alembic-downgrade-finished",
+        "alembic-downgrade-timeout",
+        "alembic-downgrade-error",
+        "alembic-current-started",
+        "alembic-current-finished",
+        "alembic-current-timeout",
+        "alembic-current-error",
+        "alembic-connection-started",
+        "alembic-connection-opened",
+        "alembic-connection-failed",
+        "alembic-migrations-started",
+        "alembic-migrations-completed",
+        "alembic-migrations-error",
+        "alembic-connection-closed",
+        "migration-completed",
+    }
+)
+
+
+def record_migration_progress(stage: str, *, returncode: int | None = None) -> None:
+    """Append one fixed, bounded stage record to the verifier-owned private file."""
+
+    if stage not in _MIGRATION_DIAGNOSTIC_STAGES:
+        return
+    raw_path = os.environ.get(MIGRATION_DIAGNOSTIC_ENV, "")
+    if not raw_path or len(raw_path) > 4096:
+        return
+    if returncode is not None and not 0 <= returncode <= 255:
+        return
+    path = Path(raw_path)
+    if not path.is_absolute():
+        return
+    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = -1
+    try:
+        parent = path.parent.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or stat.S_IMODE(parent.st_mode) != 0o700
+        ):
+            return
+        descriptor = os.open(path, flags)
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.geteuid()
+            or current.st_nlink != 1
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or current.st_size >= _MIGRATION_DIAGNOSTIC_MAX_BYTES
+        ):
+            return
+        suffix = "" if returncode is None else f" returncode={returncode}"
+        monotonic_ns = time.monotonic_ns()
+        record = f"stage={stage} monotonic_ns={monotonic_ns}{suffix}\n".encode("ascii")
+        if len(record) <= 160 and current.st_size + len(record) <= _MIGRATION_DIAGNOSTIC_MAX_BYTES:
+            os.write(descriptor, record)
+    except (OSError, ValueError):
+        # Diagnostics must never change the migration's resource or failure behavior.
+        return
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 class MigrationContractError(RuntimeError):

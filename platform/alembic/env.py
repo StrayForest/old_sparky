@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from python_packages.platform_infra.config import get_settings, validate_platform_settings
 from python_packages.platform_infra.db import Base
 from python_packages.platform_infra import models  # noqa: F401
+from tools.platform_migration_support import record_migration_progress
 
 config = context.config
 if config.config_file_name is not None:
@@ -125,10 +126,24 @@ async def run_async_migrations() -> None:
         connect_args=alembic_asyncpg_connect_args(),
     )
 
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
+    record_migration_progress("alembic-connection-started")
+    try:
+        connection = await connectable.connect()
+    except Exception:
+        record_migration_progress("alembic-connection-failed")
+        raise
+    async with connection:
+        record_migration_progress("alembic-connection-opened")
+        record_migration_progress("alembic-migrations-started")
+        try:
+            await connection.run_sync(do_run_migrations)
+        except Exception:
+            record_migration_progress("alembic-migrations-error")
+            raise
+        record_migration_progress("alembic-migrations-completed")
 
     await connectable.dispose()
+    record_migration_progress("alembic-connection-closed")
 
 
 def run_migrations_online() -> None:

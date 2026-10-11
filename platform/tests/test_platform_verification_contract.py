@@ -38,9 +38,12 @@ from tools.platform_load import (
     validate_profile,
 )
 from tools.platform_migration_support import (
+    MIGRATION_DIAGNOSTIC_ENV,
+    _MIGRATION_DIAGNOSTIC_MAX_BYTES,
     MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
     MigrationCommandError,
     MigrationCommandTimeout,
+    record_migration_progress,
     run_migration_subprocess,
     validate_disposable_migration_target,
 )
@@ -51,6 +54,7 @@ from tools.platform_verify import (
     RELEASE_RUNTIME_TEST_IDS,
     VerificationError,
     _cleanup_timed_out_backend_privileged_resources,
+    _create_private_migration_diagnostic,
     _privileged_runner_python,
     _run,
     _validated_privileged_environment,
@@ -636,6 +640,93 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 timeout_seconds=0.01,
             )
         self.assertEqual(timeout.exception.timeout_seconds, 0.01)
+        diagnostic_directory, diagnostic_file = _create_private_migration_diagnostic()
+        try:
+            directory_stat = diagnostic_directory.stat(follow_symlinks=False)
+            report_stat = diagnostic_file.stat(follow_symlinks=False)
+            self.assertEqual(stat.S_IMODE(directory_stat.st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(report_stat.st_mode), 0o600)
+            self.assertTrue(stat.S_ISREG(report_stat.st_mode))
+            self.assertEqual(report_stat.st_nlink, 1)
+            with patch.dict(
+                os.environ,
+                {MIGRATION_DIAGNOSTIC_ENV: str(diagnostic_file)},
+            ):
+                record_migration_progress("alembic-connection-opened")
+                record_migration_progress("not-an-allowlisted-stage")
+            self.assertRegex(
+                diagnostic_file.read_text(encoding="ascii"),
+                r"^stage=alembic-connection-opened monotonic_ns=\d+\n$",
+            )
+            linked_file = diagnostic_directory / "linked-progress.log"
+            linked_file.symlink_to(diagnostic_file)
+            with patch.dict(
+                os.environ,
+                {MIGRATION_DIAGNOSTIC_ENV: str(linked_file)},
+            ):
+                record_migration_progress("alembic-migrations-started")
+            hard_link = diagnostic_directory / "hard-linked-progress.log"
+            os.link(diagnostic_file, hard_link)
+            with patch.dict(
+                os.environ,
+                {MIGRATION_DIAGNOSTIC_ENV: str(hard_link)},
+            ):
+                record_migration_progress("alembic-migrations-started")
+            self.assertEqual(
+                diagnostic_file.read_text(encoding="ascii").count("stage="),
+                1,
+            )
+            bounded_file = diagnostic_directory / "bounded-progress.log"
+            bounded_descriptor = os.open(
+                bounded_file,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                os.write(bounded_descriptor, b"x" * _MIGRATION_DIAGNOSTIC_MAX_BYTES)
+            finally:
+                os.close(bounded_descriptor)
+            with patch.dict(
+                os.environ,
+                {MIGRATION_DIAGNOSTIC_ENV: str(bounded_file)},
+            ):
+                record_migration_progress("alembic-migrations-started")
+            self.assertEqual(
+                bounded_file.stat().st_size,
+                _MIGRATION_DIAGNOSTIC_MAX_BYTES,
+            )
+        finally:
+            diagnostic_file.unlink(missing_ok=True)
+            (diagnostic_directory / "linked-progress.log").unlink(missing_ok=True)
+            (diagnostic_directory / "hard-linked-progress.log").unlink(missing_ok=True)
+            (diagnostic_directory / "bounded-progress.log").unlink(missing_ok=True)
+            diagnostic_directory.rmdir()
+        captured: dict[str, object] = {}
+
+        def capture_migration_run(
+            label: str,
+            command: list[str],
+            **kwargs: object,
+        ) -> int:
+            captured.update(label=label, command=command, **kwargs)
+            return 124
+
+        with (
+            patch.dict(
+                os.environ,
+                {MIGRATION_DIAGNOSTIC_ENV: "/tmp/untrusted-caller-progress.log"},
+            ),
+            patch(
+                "tools.platform_verify._create_private_migration_diagnostic",
+                side_effect=OSError("synthetic private report setup failure"),
+            ),
+            patch("tools.platform_verify._run", side_effect=capture_migration_run),
+        ):
+            status = dispatch("migration")
+        self.assertEqual(status, 124)
+        self.assertEqual(captured["label"], "migration")
+        self.assertEqual(captured["timeout_seconds"], MIGRATION_SUBPROCESS_TIMEOUT_SECONDS)
+        self.assertNotIn(MIGRATION_DIAGNOSTIC_ENV, captured["env"])
 
     def test_verifier_timeout_reaps_only_its_owned_process_group(self) -> None:
         with tempfile.TemporaryDirectory(prefix="platform-verifier-timeout-") as temp_dir:
@@ -643,6 +734,13 @@ class PlatformVerificationContractTests(unittest.TestCase):
             marker = f"verifier-timeout-{os.getpid()}-{time.monotonic_ns()}"
             child_pid_path = temp_root / "grandchild.pid"
             parent_pid_path = temp_root / "child.pid"
+            progress_report = temp_root / "migration-progress.log"
+            progress_descriptor = os.open(
+                progress_report,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.close(progress_descriptor)
             child_code = (
                 "import signal,sys,time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
@@ -650,7 +748,9 @@ class PlatformVerificationContractTests(unittest.TestCase):
             )
             parent_code = "\n".join(
                 (
-                    "import os,pathlib,subprocess,sys,time",
+                    "import os,pathlib,subprocess,sys,time; "
+                    "from tools.platform_migration_support import record_migration_progress; "
+                    "record_migration_progress('schema-reset-completed')",
                     f"pathlib.Path({str(parent_pid_path)!r}).write_text(str(os.getpid()))",
                     "child=subprocess.Popen([sys.executable, '-c', "
                     f"{child_code!r}, {marker!r}])",
@@ -679,6 +779,54 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 stderr = io.StringIO()
                 cleanup_observations: list[bool] = []
 
+                real_popen = subprocess.Popen
+
+                def wait_for_synthetic_group_ready(
+                    command: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> subprocess.Popen[bytes]:
+                    process = real_popen(command, *args, **kwargs)  # type: ignore[arg-type]
+                    if command != [sys.executable, "-c", parent_code]:
+                        return process
+                    deadline = time.monotonic() + 3.0
+                    try:
+                        while time.monotonic() < deadline:
+                            if parent_pid_path.is_file() and child_pid_path.is_file():
+                                return process
+                            if process.poll() is not None:
+                                break
+                            time.sleep(0.01)
+                    except BaseException:
+                        if kwargs.get("start_new_session"):
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        process.wait()
+                        raise
+
+                    if kwargs.get("start_new_session"):
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=0.1)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait()
+                    else:
+                        process.kill()
+                        process.wait()
+                    self.fail("synthetic timeout process group did not publish both readiness markers")
+
+                self.assertTrue(parent_code)
+
                 def verify_timeout_cleanup_order() -> None:
                     self.assertTrue(parent_pid_path.is_file())
                     owned_process_pid = int(parent_pid_path.read_text(encoding="ascii"))
@@ -690,10 +838,20 @@ class PlatformVerificationContractTests(unittest.TestCase):
                     )
                     cleanup_observations.append(sentinel.poll() is None)
 
-                with redirect_stdout(stdout), redirect_stderr(stderr):
+                with (
+                    patch("tools.platform_verify.subprocess.Popen", side_effect=wait_for_synthetic_group_ready),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
                     status = _run(
                         "timeout process group contract",
                         [sys.executable, "-c", parent_code],
+                        env={
+                            **os.environ,
+                            MIGRATION_DIAGNOSTIC_ENV: str(
+                                temp_root / "migration-progress.log"
+                            ),
+                        },
                         timeout_seconds=0.2,
                         timeout_cleanup=verify_timeout_cleanup_order,
                     )
@@ -708,6 +866,15 @@ class PlatformVerificationContractTests(unittest.TestCase):
                     "[GATE TIMEOUT] timeout process group contract exceeded 0.2s\n",
                 )
                 self.assertEqual(cleanup_observations, [True, True])
+                self.assertTrue(progress_report.is_file())
+                self.assertEqual(
+                    stat.S_IMODE(progress_report.stat().st_mode),
+                    0o600,
+                )
+                self.assertRegex(
+                    progress_report.read_text(encoding="ascii"),
+                    r"^stage=schema-reset-completed monotonic_ns=\d+\n$",
+                )
                 self.assertIsNone(sentinel.poll(), "an unrelated session was signalled")
                 self.assertTrue(child_pid_path.is_file(), "timed-out parent did not start child")
                 child_pid = int(child_pid_path.read_text(encoding="ascii"))
@@ -1093,6 +1260,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.os.geteuid", return_value=0),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run", side_effect=capture_run),
@@ -1135,6 +1303,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             observed.clear()
             with (
                 patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.os.geteuid", return_value=0),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run", side_effect=capture_run),
@@ -1168,6 +1337,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             observed.clear()
             with (
                 patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.os.geteuid", return_value=0),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run", side_effect=capture_run),
@@ -1195,6 +1365,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             pinned_python.chmod(0o600)
             with (
                 patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.os.geteuid", return_value=0),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run") as child_run,
@@ -1206,6 +1377,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.os.geteuid", return_value=0),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run") as child_run,
@@ -1257,6 +1429,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             )
             with (
                 patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.os.geteuid", return_value=0),
                 patch("tools.platform_verify._run") as child_run,
             ):
                 with self.assertRaises(VerificationError):
@@ -1343,6 +1516,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 "tools.platform_test_runner._load_suite",
                 return_value=unittest.TestSuite(),
             ),
+            patch("tools.platform_test_runner._require_root_identity"),
             patch("tools.platform_test_runner._require_redis_db15_ready") as runner_preflight,
             patch("tools.platform_test_runner._teardown_privileged_redis_resource") as runner_cleanup,
             patch("builtins.print"),
@@ -2087,13 +2261,30 @@ except lock.VerificationLockError as exc:
             )
         )
         real_job_start = workflow_text.index("  release-runtime-real:\n")
-        missing_dev_route = workflow_text[:real_job_start] + workflow_text[
-            real_job_start:
-        ].replace(
+        next_job = re.search(
+            r"^  [A-Za-z0-9_-]+:\n",
+            workflow_text[real_job_start + len("  release-runtime-real:\n"):],
+            re.MULTILINE,
+        )
+        real_job_end = (
+            real_job_start + len("  release-runtime-real:\n") + next_job.start()
+            if next_job is not None
+            else len(workflow_text)
+        )
+        real_job_block = workflow_text[real_job_start:real_job_end]
+        self.assertIn("github.ref == 'refs/heads/dev'", real_job_block)
+        missing_dev_route = (
+            workflow_text[:real_job_start]
+            + real_job_block.replace(
+                "github.ref == 'refs/heads/dev'",
+                "github.ref == 'refs/heads/main'",
+            )
+            + workflow_text[real_job_end:]
+        )
+        self.assertNotIn("github.ref == 'refs/heads/dev'", real_job_block.replace(
             "github.ref == 'refs/heads/dev'",
             "github.ref == 'refs/heads/main'",
-            1,
-        )
+        ))
         self.assertTrue(
             any(
                 "canonical dev ref condition" in issue
