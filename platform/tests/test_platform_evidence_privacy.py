@@ -191,6 +191,27 @@ class EvidencePrivacyTests(unittest.TestCase):
                         "sample_interval": 16,
                         "client_identity": "Authorization Bearer secret-token",
                     },
+                    "authenticated_read_admission_shed": {
+                        "observed": 4,
+                        "shed": 2,
+                        "not_shed": 1,
+                        "unknown": 1,
+                    },
+                    "request_ids": ["private-request-id"],
+                    "raw_route": "/api/v1/tournaments/private-slug/workspace",
+                    "by_route": {
+                        "tournament_workspace": {
+                            "requests": 4,
+                            "authenticated_read_admission_shed": {
+                                "observed": 4,
+                                "shed": 2,
+                                "not_shed": 1,
+                                "unknown": 1,
+                            },
+                            "request_ids": ["private-request-id"],
+                            "raw_route": "/api/v1/tournaments/private-slug/workspace",
+                        },
+                    },
                 }
             },
         )
@@ -209,7 +230,60 @@ class EvidencePrivacyTests(unittest.TestCase):
                 "sample_interval": 16,
             },
         )
+        self.assertEqual(
+            request_perf["authenticated_read_admission_shed"],
+            {
+                "observed": 4,
+                "shed": 2,
+                "not_shed": 1,
+                "unknown": 1,
+            },
+        )
+        self.assertEqual(
+            request_perf["by_route"]["tournament_workspace"],
+            {
+                "requests": 4,
+                "authenticated_read_admission_shed": {
+                    "observed": 4,
+                    "shed": 2,
+                    "not_shed": 1,
+                    "unknown": 1,
+                },
+            },
+        )
+        invalid_admission_counts = (
+            {"observed": True, "shed": 1, "not_shed": 0, "unknown": 0},
+            {"observed": -1, "shed": 0, "not_shed": 0, "unknown": 0},
+            {"observed": 1.0, "shed": 1, "not_shed": 0, "unknown": 0},
+            {"observed": 1, "shed": 1, "not_shed": 0},
+            {"observed": 1, "shed": 1, "not_shed": 0, "unknown": 0, "extra": 0},
+            {"observed": 3, "shed": 1, "not_shed": 0, "unknown": 0},
+        )
+        for invalid_counts in invalid_admission_counts:
+            malformed = project_public_artifact(
+                "server_observability",
+                {
+                    "server_request_perf_logs": {
+                        "authenticated_read_admission_shed": invalid_counts,
+                        "by_route": {
+                            "tournament_workspace": {
+                                "requests": 1,
+                                "authenticated_read_admission_shed": invalid_counts,
+                            },
+                        },
+                    },
+                },
+            )
+            projected_request_perf = malformed["server_request_perf_logs"]
+            self.assertNotIn("authenticated_read_admission_shed", projected_request_perf)
+            self.assertNotIn(
+                "authenticated_read_admission_shed",
+                projected_request_perf.get("by_route", {})
+                .get("tournament_workspace", {}),
+            )
         self.assertNotIn("client_identity", serialized(report))
+        self.assertNotIn("private-request-id", serialized(report))
+        self.assertNotIn("private-slug", serialized(report))
         for value in FORBIDDEN_VALUES:
             self.assertNotIn(value.lower(), serialized(report).lower())
 

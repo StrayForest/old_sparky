@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -1167,7 +1168,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "state": "success",
                     "description": "Platform security and build passed",
                     "target_url": "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/2",
-                    "updated_at": "2026-09-11T10:00:00Z",
+                    "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "creator": {
                         "login": "github-actions[bot]",
                         "type": "Bot",
@@ -1702,7 +1703,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 "state": "success",
                 "description": "Platform security and build passed",
                 "target_url": f"{run['html_url']}/attempts/{run['run_attempt']}",
-                "updated_at": "2026-09-11T10:00:00Z",
+                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "creator": {
                     "login": "github-actions[bot]",
                     "type": "Bot",

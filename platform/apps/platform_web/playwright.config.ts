@@ -1,6 +1,11 @@
 import { defineConfig, devices } from "@playwright/test";
 
 const preparedBuildDir = process.env.PLATFORM_WEB_HERMETIC_BUILD_DIR;
+const capture404Diagnostics = process.env.PLATFORM_WEB_404_DIAGNOSTICS === "1";
+const diagnosticOutputPath = process.env.PLATFORM_WEB_404_DIAGNOSTIC_FILE;
+if (capture404Diagnostics && !diagnosticOutputPath) {
+  throw new Error("The hermetic 404 diagnostic capture path is unavailable.");
+}
 const desktopOnlySpecs = [
   "account-email-flow.spec.ts",
   "admin-progressive-tournaments.spec.ts",
@@ -27,7 +32,9 @@ const standaloneWebServerCommand = [
   preparedBuildDir
     ? `cp -a "${preparedBuildDir}/static" .next/standalone/.next/static && cp -a "${preparedBuildDir}/public" .next/standalone/public`
     : "cp -R .next/static .next/standalone/.next/static && cp -R public .next/standalone/public",
-  "../../tools/platform_node.sh .next/standalone/server.js"
+  (capture404Diagnostics
+    ? "../../tools/platform_node.sh tests/support/capture-standalone-web-server.mjs .next/standalone/server.js"
+    : "../../tools/platform_node.sh .next/standalone/server.js")
 ].join(" && ");
 
 export default defineConfig({
@@ -74,11 +81,16 @@ export default defineConfig({
         HOSTNAME: "127.0.0.1",
         PORT: "3100",
         PLATFORM_API_BASE_URL: "http://127.0.0.1:3199/api/v1",
-        PLATFORM_ADSENSE_ENABLED: "false"
+        PLATFORM_ADSENSE_ENABLED: "false",
+        ...(capture404Diagnostics ? {
+          PLATFORM_WEB_404_DIAGNOSTICS: "1",
+          PLATFORM_WEB_404_DIAGNOSTIC_FILE: diagnosticOutputPath ?? ""
+        } : {})
       },
       url: "http://127.0.0.1:3100",
       reuseExistingServer: false,
-      timeout: 120_000
+      timeout: 120_000,
+      ...(capture404Diagnostics ? { stdout: "ignore" as const, stderr: "ignore" as const } : {})
     }
   ],
   projects: [

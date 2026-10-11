@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-10
+- Last reviewed: 2026-10-11
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
@@ -123,6 +123,7 @@ these five catalog contours:
 The timeout values are the catalog's executable contract, not a moving test count or an estimate derived from the current number of methods. The catalog rejects unknown, duplicate, overlapping or unowned IDs and detects snapshot drift through `verification-contract`; add tests by updating the executable catalog and its self-test, never by hard-coding a count or editing a workflow filename list. The stable gate and command registry remains the [canonical verifier](../tools/platform_verify.py), which delegates `backend` and each sub-contour to the guarded runner.
 
 `test_platform_external_load` (performance-contract) covers bounded HTTP body failures and phase accounting; `test_platform_live_qa_runtime_install` (backend-privileged) exercises the copied dispatcher against its installed release validator, including missing/tampered refusal.
+The SSR admission-shed parser remains in `test_platform_ssr_observability` (performance-contract), public projection privacy in `test_platform_evidence_privacy` (backend-tool-contract), and the bounded web scheduler in the existing `frontend-audit-regressions.spec.ts` smoke owner; no test IDs or gate-ownership entries are added.
 
 Every aggregate and backend sub-contour is guarded before test discovery by
 one pure, fail-closed resource validator. It requires the exact values

@@ -2064,6 +2064,109 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             diagnostics_branch,
         )
 
+        diagnostics_args_start = diagnostics_branch.index(
+            "web_ssr_profile_args=("
+        )
+        diagnostics_args_end = diagnostics_branch.index(")", diagnostics_args_start)
+        diagnostics_keys = re.findall(
+            r"--only ([A-Z0-9_]+)",
+            diagnostics_branch[diagnostics_args_start:diagnostics_args_end],
+        )
+        candidate_args_start = workflow.index(
+            "    candidate_profile_args=(",
+            workflow.index(
+                "  read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|"
+            ),
+        )
+        candidate_args_end = workflow.index(")", candidate_args_start)
+        restore_keys = re.findall(
+            r"--only ([A-Z0-9_]+)",
+            workflow[candidate_args_start:candidate_args_end],
+        )
+        self.assertIn("PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC", restore_keys)
+
+        preserved_settings = {
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED": "true",
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "24",
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "8",
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "250",
+            "PLATFORM_API_WORKERS": "2",
+            "PLATFORM_DB_POOL_SIZE": "24",
+            "PLATFORM_DB_MAX_OVERFLOW": "0",
+            "PLATFORM_DB_POOL_TIMEOUT_SECONDS": "10",
+            "PLATFORM_HOME_CONTENT_CACHE_SECONDS": "2100",
+        }
+        current_lines = [f"{key}={value}" for key, value in preserved_settings.items()]
+        current_lines.extend(
+            (
+                "PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC=false",
+                "PLATFORM_SSR_PERF_LOG_ENABLED=false",
+                "PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=false",
+                "PLATFORM_SSR_HEAP_METRICS_ENABLED=false",
+                "PLATFORM_WEB_WORKERS=1",
+                "PLATFORM_WEB_SERVER_AUTH_TRANSPORT=fetch",
+            )
+        )
+        original_merge = platform_configure_shared_env.merge_baseline
+
+        def apply_profile(profile: str, selected_keys: list[str]) -> dict[str, str]:
+            selected_content: dict[str, str] = {}
+
+            def capture_merge(
+                lines: list[str], *, baseline: dict[str, str] | None = None
+            ) -> tuple[str, list[str]]:
+                content, changed = original_merge(lines, baseline=baseline)
+                selected_content["content"] = content
+                return content, changed
+
+            args = SimpleNamespace(
+                profile=profile,
+                only=[*selected_keys, "PLATFORM_SSR_HEAP_METRICS_ENABLED"],
+                env_file=Path("/unused/test-shared-env"),
+                apply=False,
+                confirm="",
+                as_json=False,
+            )
+            with (
+                patch.object(platform_configure_shared_env, "parse_args", return_value=args),
+                patch.object(
+                    platform_configure_shared_env,
+                    "read_env",
+                    side_effect=lambda _path: (current_lines, {}, None),
+                ),
+                patch.object(
+                    platform_configure_shared_env,
+                    "merge_baseline",
+                    side_effect=capture_merge,
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(platform_configure_shared_env.main(), 0)
+            return dict(
+                line.split("=", 1)
+                for line in selected_content["content"].splitlines()
+                if "=" in line
+            )
+
+        diagnostic_values = apply_profile("web-ssr-diagnostics", diagnostics_keys)
+        self.assertEqual(
+            diagnostic_values["PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC"], "true"
+        )
+        for key, expected in preserved_settings.items():
+            self.assertEqual(diagnostic_values[key], expected, key)
+
+        current_lines = [
+            f"{key}={value}" for key, value in diagnostic_values.items()
+        ]
+        restored_values = apply_profile(
+            "authenticated-read-admission-24x8", restore_keys
+        )
+        self.assertEqual(
+            restored_values["PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC"], "false"
+        )
+        for key, expected in preserved_settings.items():
+            self.assertEqual(restored_values[key], expected, key)
+
     def test_auto_deploy_preserves_static_eight_runtime_profile(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"

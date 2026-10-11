@@ -464,28 +464,15 @@ changes remain outside that 14-member closure. The pin-bearing **P** records
 the raw SHA-256 digests and Git modes of all 14 files from **C**. This source
 identity alone does not establish installation or deployment.
 
-The follow-on CPU diagnostic controller uses source commit **C**
-`80af72d5fec4c868897baf3cd0172af1c17b3fa6` and pin-only commit **E**
-`4af43c5afd84af29bd40d91e9e3002ab540142c5`. E selects the exact 15-member,
-four-component v4 closure and records its source modes and digests. This pin
-selection does not establish installation: the verified T application
-deployment at source `7e5769ba3f8596cb9950735f3685835013eb1085` still used the
-previous v3 host generation. Exact-SHA CI, approved provisioning and a
-post-provision capability check remain required before the CPU diagnostic
-action is available.
+The follow-on CPU diagnostic controller uses source **C** `80af72d5fec4c868897baf3cd0172af1c17b3fa6` and pin-only **E** `4af43c5afd84af29bd40d91e9e3002ab540142c5`; E selects the exact 15-member, four-component v4 closure and records its source modes and digests. This does not establish installation: verified T at `7e5769ba3f8596cb9950735f3685835013eb1085` still used v3; exact-SHA CI, approved provisioning and a post-provision capability check remain required.
 
 The source-quality correction **C2** `7c4a4b43434b3d104c060778583f44d0bb22e682`, descended from **E**, changes only the dispatcher and CPU-plan controller bytes; the 15-member v4 layout and capabilities are unchanged. Pin-only **E2** `801e785840adce76528389e47cd22cfa9c6b62d5` names C2 and records its exact closure digests. Neither commit proves C2 provisioned or installed.
 
-The capability-order compatibility correction uses **C3**
-`16eee656fbca10c485728b34b8490917b4de64a2`, descended from **E2**. It changes
-only the v4 capability tuple order to the exact order accepted by the trusted
-builder; the 15-member closure, capability set and component groups are
-unchanged. Pin-only **E3**
-`dfb291ca0ca31e001aecc58f2c75e4e06eddf26b` names C3 and records its exact
-closure digests. The strict resolver selects C3 from E3, but this selection
-does not prove that C3 has been provisioned or installed.
+The capability-order compatibility correction uses **C3** `16eee656fbca10c485728b34b8490917b4de64a2`, descended from **E2**; it changes only the v4 capability tuple order accepted by the trusted builder, leaving the 15-member closure, capability set and component groups unchanged. Pin-only **E3** `dfb291ca0ca31e001aecc58f2c75e4e06eddf26b` names C3 and records its closure digests; resolver selection does not prove provisioning or installation.
 
 Source **C4** `6d9f593e2214dacfda55d119b2090e7264ef1ab7` adds external-load cleanup diagnostics/finalization; its only 15-member host-tools closure change is `platform_workflow_remote_dispatch.py`. Pin-only **P4** `2082b89780e7990bace7f5b00a60382b89971a8f` selects C4 with the exact closure digest. Exact-P CI, read-only preflight/signed bundle, approved provisioning and installed self-test remain required; neither SHA proves installation.
+
+The bounded SSR follow-up uses source **C5** `d2afef17db081bf435514fa59b6e1d1b3e41c838`: it bounds server-side read-only workspace/auth requests, adds sampled admission-shed aggregates and their public projection, and restores the SSR workspace-error flag with `authenticated-read-admission-24x8`. Its only host-tools change is the supervisor restore selector; the other 14 pinned helpers, modes, v4 layout and capability contract are unchanged. Pin-only **P5** `a2e8dfaa16962074c59047428d22ed2f823cd521` selects C5 and records that supervisor digest. CI, signed artifact verification, approved provisioning and deployment remain separate required evidence.
 
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains

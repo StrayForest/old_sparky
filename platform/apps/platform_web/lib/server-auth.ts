@@ -9,6 +9,7 @@ import {
   isSsrDiagnosticsEnabled,
   measureSsrStage
 } from "@/lib/server-ssr-observability";
+import { runWithServerInternalRead } from "@/lib/server-internal-read-scheduler";
 
 export type ServerAuthSnapshot = {
   status: "authenticated" | "anonymous" | "unavailable";
@@ -77,33 +78,37 @@ export const getServerCurrentUser = cache(async (
   if (!baseUrl) {
     return { status: "unavailable", user: null };
   }
-  return measureSsrStage("auth_current_user_fetch", async () => {
-    try {
-      const requestHeaders = isSsrDiagnosticsEnabled()
-        ? await getServerRequestCorrelationHeaders()
-        : { accept: "application/json", cookie: cookieHeader };
-      if (requestHeaders instanceof Headers) {
-        requestHeaders.set("accept", "application/json");
-        requestHeaders.set("cookie", cookieHeader);
-      }
-      const response = await requestServerAuthJson(`${baseUrl}/users/me`, requestHeaders);
-      if (response.status === 401 || response.status === 403) {
-        return { status: "anonymous", user: null };
-      }
-      if (!response.ok) {
+  return measureSsrStage("auth_current_user_fetch", () =>
+    runWithServerInternalRead(async (): Promise<ServerAuthSnapshot> => {
+      try {
+        const requestHeaders = isSsrDiagnosticsEnabled()
+          ? await getServerRequestCorrelationHeaders()
+          : { accept: "application/json", cookie: cookieHeader };
+        if (requestHeaders instanceof Headers) {
+          requestHeaders.set("accept", "application/json");
+          requestHeaders.set("cookie", cookieHeader);
+        }
+        const response = await requestServerAuthJson(`${baseUrl}/users/me`, requestHeaders);
+        if (response.status === 401 || response.status === 403) {
+          await cancelServerAuthBody(response);
+          return { status: "anonymous", user: null };
+        }
+        if (!response.ok) {
+          await cancelServerAuthBody(response);
+          return { status: "unavailable", user: null };
+        }
+        const user = await response.json() as unknown;
+        if (!isPlatformUser(user)) {
+          return { status: "unavailable", user: null };
+        }
+        return { status: "authenticated", user };
+      } catch {
+        // Public pages remain available during a transient internal API failure;
+        // protected APIs still enforce the session independently.
         return { status: "unavailable", user: null };
       }
-      const user = await response.json() as unknown;
-      if (!isPlatformUser(user)) {
-        return { status: "unavailable", user: null };
-      }
-      return { status: "authenticated", user };
-    } catch {
-      // Public pages remain available during a transient internal API failure;
-      // protected APIs still enforce the session independently.
-      return { status: "unavailable", user: null };
-    }
-  });
+    }).catch((): ServerAuthSnapshot => ({ status: "unavailable", user: null }))
+  );
 });
 
 export const getServerAuthBootstrap = cache(async (
@@ -116,32 +121,47 @@ export const getServerAuthBootstrap = cache(async (
   if (!baseUrl) {
     return { status: "unavailable", user: null };
   }
-  return measureSsrStage("auth_bootstrap_fetch", async () => {
-    try {
-      const requestHeaders = isSsrDiagnosticsEnabled()
-        ? await getServerRequestCorrelationHeaders()
-        : { accept: "application/json", cookie: cookieHeader };
-      if (requestHeaders instanceof Headers) {
-        requestHeaders.set("accept", "application/json");
-        requestHeaders.set("cookie", cookieHeader);
-      }
-      const response = await requestServerAuthJson(`${baseUrl}/auth/bootstrap`, requestHeaders);
-      if (response.status === 401 || response.status === 403) {
-        return { status: "anonymous", user: null };
-      }
-      if (!response.ok) {
+  return measureSsrStage("auth_bootstrap_fetch", () =>
+    runWithServerInternalRead(async (): Promise<ServerAuthSnapshot> => {
+      try {
+        const requestHeaders = isSsrDiagnosticsEnabled()
+          ? await getServerRequestCorrelationHeaders()
+          : { accept: "application/json", cookie: cookieHeader };
+        if (requestHeaders instanceof Headers) {
+          requestHeaders.set("accept", "application/json");
+          requestHeaders.set("cookie", cookieHeader);
+        }
+        const response = await requestServerAuthJson(`${baseUrl}/auth/bootstrap`, requestHeaders);
+        if (response.status === 401 || response.status === 403) {
+          await cancelServerAuthBody(response);
+          return { status: "anonymous", user: null };
+        }
+        if (!response.ok) {
+          await cancelServerAuthBody(response);
+          return { status: "unavailable", user: null };
+        }
+        const bootstrap = await response.json() as unknown;
+        if (!isPlatformAuthBootstrap(bootstrap)) {
+          return { status: "unavailable", user: null };
+        }
+        return { status: "authenticated", user: bootstrap };
+      } catch {
         return { status: "unavailable", user: null };
       }
-      const bootstrap = await response.json() as unknown;
-      if (!isPlatformAuthBootstrap(bootstrap)) {
-        return { status: "unavailable", user: null };
-      }
-      return { status: "authenticated", user: bootstrap };
-    } catch {
-      return { status: "unavailable", user: null };
-    }
-  });
+    }).catch((): ServerAuthSnapshot => ({ status: "unavailable", user: null }))
+  );
 });
+
+async function cancelServerAuthBody(
+  response: Response | ServerJsonResponse
+): Promise<void> {
+  if (!("body" in response) || !response.body) return;
+  try {
+    await response.body.cancel();
+  } catch {
+    // Keep the established auth outcome when a non-success body cannot be drained.
+  }
+}
 
 function requestServerAuthJson(
   input: string,

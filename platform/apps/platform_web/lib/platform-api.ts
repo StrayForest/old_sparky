@@ -1,6 +1,10 @@
 import { notifyPlatformUnauthorized } from "@/lib/auth-session-signal";
 import { deadlockHeroes } from "@/lib/deadlock";
 import {
+  runWithServerInternalRead,
+  ServerInternalReadQueueError
+} from "@/lib/server-internal-read-scheduler";
+import {
   normalizeVisibility,
   ranks,
   registrationTimerLabel,
@@ -319,6 +323,44 @@ export class PlatformApiError extends Error {
     this.code = options.code ?? null;
     this.retryable = options.retryable ?? false;
   }
+}
+
+type InternalReadDiagnosticRoute = "detail" | "bracket" | "bracket_summary";
+type InternalReadDiagnosticStage =
+  | "admission_start"
+  | "permit_acquired"
+  | "fetch_start"
+  | "response_received"
+  | "cancel_start"
+  | "cancel_complete"
+  | "not_found_result"
+  | "permit_released"
+  | "queue_failed"
+  | "operation_failed"
+  | "page_not_found";
+
+/** Temporary hermetic-only evidence. Emits fixed fields and never request data. */
+export function recordServerInternalReadDiagnostic(
+  route: InternalReadDiagnosticRoute,
+  stage: InternalReadDiagnosticStage,
+  status?: number,
+  elapsedMs?: number,
+): void {
+  if (
+    typeof window !== "undefined"
+    || process.env.PLATFORM_WEB_404_DIAGNOSTICS !== "1"
+  ) {
+    return;
+  }
+  const safeStatus = status !== undefined
+    && Number.isInteger(status) && status >= 100 && status <= 599
+    ? ` status=${status}`
+    : "";
+  const safeElapsed = elapsedMs !== undefined
+    && Number.isFinite(elapsedMs) && elapsedMs >= 0
+    ? ` elapsed_ms=${Math.round(elapsedMs)}`
+    : "";
+  console.error(`[WEB_404_DIAG] route=${route} stage=${stage}${safeStatus}${safeElapsed}`);
 }
 
 async function platformFetch(
@@ -812,50 +854,126 @@ export async function getTournamentWorkspace(
     params.set("invite_code", inviteCode);
   }
 
-  const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/workspace?${params.toString()}`, {
-    headers,
-    credentials: "include",
-    cache: "no-store",
-    signal: options.signal
-  });
-  if (response.status === 404) {
-    return null;
-  }
-  if (!response.ok) {
-    throw new PlatformApiError(response.statusText || "Failed to load tournament.", response.status);
-  }
-
-  const workspace = await response.json() as ApiTournamentWorkspace;
-  const registrations = workspace.participants_available
-    ? dedupeRegistrations((workspace.participants ?? []).map(mapRegistration))
-    : [];
-  const assignmentState = workspace.auto_assignment ?? null;
-  const activeCommitment = workspace.current_user_active_commitment ?? null;
-  return {
-    tournament: mapTournamentDetail(
-      workspace.tournament,
-      registrations,
-      workspace.bracket ? mapBracket(workspace.bracket) : null,
-      {
-        serverTime: workspace.server_time,
-        readyCheckState: workspace.ready_check ?? null,
-        deadlockAssignment: assignmentState?.published_run ?? assignmentState?.latest_run ?? null,
-        activeCommitment: activeCommitment
-          ? {
-              id: activeCommitment.id,
-              tournamentId: activeCommitment.tournament_id,
-              tournamentSlug: activeCommitment.tournament_slug,
-              tournamentName: activeCommitment.tournament_name,
-              assignmentRunId: activeCommitment.assignment_run_id,
-              teamId: activeCommitment.team_id,
-              teamName: activeCommitment.team_name,
-              activatedAt: activeCommitment.activated_at
-            }
-          : null
-      }
-    ),
-    currentUser: workspace.current_user ?? null
+  const diagnosticRoute: InternalReadDiagnosticRoute =
+    options.workspaceView === "detail" ? "detail"
+      : options.workspaceView === "bracket_summary" ? "bracket_summary"
+        : "bracket";
+  const diagnosticsEnabled = typeof window === "undefined"
+    && process.env.PLATFORM_WEB_404_DIAGNOSTICS === "1";
+  const diagnosticStartedAt = diagnosticsEnabled ? performance.now() : 0;
+  const markDiagnostic = (
+    stage: InternalReadDiagnosticStage,
+    status?: number,
+    startedAt?: number,
+  ) => {
+    if (!diagnosticsEnabled) return;
+    recordServerInternalReadDiagnostic(
+      diagnosticRoute,
+      stage,
+      status,
+      startedAt === undefined ? undefined : performance.now() - startedAt,
+    );
   };
+
+  const loadWorkspace = async () => {
+    markDiagnostic("permit_acquired", undefined, diagnosticStartedAt);
+    markDiagnostic("fetch_start");
+    const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/workspace?${params.toString()}`, {
+      headers,
+      credentials: "include",
+      cache: "no-store",
+      signal: options.signal
+    });
+    markDiagnostic("response_received", response.status, diagnosticStartedAt);
+    if (response.status === 404) {
+      const cancelStartedAt = diagnosticsEnabled ? performance.now() : 0;
+      markDiagnostic("cancel_start", response.status);
+      await cancelResponseBody(response);
+      markDiagnostic("cancel_complete", response.status, cancelStartedAt);
+      markDiagnostic("not_found_result", response.status);
+      return null;
+    }
+    if (!response.ok) {
+      const cancelStartedAt = diagnosticsEnabled ? performance.now() : 0;
+      markDiagnostic("cancel_start", response.status);
+      await cancelResponseBody(response);
+      markDiagnostic("cancel_complete", response.status, cancelStartedAt);
+      throw new PlatformApiError(response.statusText || "Failed to load tournament.", response.status);
+    }
+
+    const workspace = await response.json() as ApiTournamentWorkspace;
+    const registrations = workspace.participants_available
+      ? dedupeRegistrations((workspace.participants ?? []).map(mapRegistration))
+      : [];
+    const assignmentState = workspace.auto_assignment ?? null;
+    const activeCommitment = workspace.current_user_active_commitment ?? null;
+    return {
+      tournament: mapTournamentDetail(
+        workspace.tournament,
+        registrations,
+        workspace.bracket ? mapBracket(workspace.bracket) : null,
+        {
+          serverTime: workspace.server_time,
+          readyCheckState: workspace.ready_check ?? null,
+          deadlockAssignment: assignmentState?.published_run ?? assignmentState?.latest_run ?? null,
+          activeCommitment: activeCommitment
+            ? {
+                id: activeCommitment.id,
+                tournamentId: activeCommitment.tournament_id,
+                tournamentSlug: activeCommitment.tournament_slug,
+                tournamentName: activeCommitment.tournament_name,
+                assignmentRunId: activeCommitment.assignment_run_id,
+                teamId: activeCommitment.team_id,
+                teamName: activeCommitment.team_name,
+                activatedAt: activeCommitment.activated_at
+              }
+            : null
+        }
+      ),
+      currentUser: workspace.current_user ?? null
+    };
+  };
+
+  try {
+    const serverRequest = typeof window === "undefined";
+    if (serverRequest) {
+      markDiagnostic("admission_start");
+    }
+    const workspace = serverRequest
+      ? await runWithServerInternalRead(loadWorkspace, options.signal)
+      : await loadWorkspace();
+    if (serverRequest) {
+      markDiagnostic(
+        "permit_released",
+        workspace === null ? 404 : undefined,
+        diagnosticStartedAt,
+      );
+    }
+    return workspace;
+  } catch (error) {
+    if (error instanceof ServerInternalReadQueueError) {
+      markDiagnostic("queue_failed", 503);
+      throw new PlatformApiError(
+        "Server read capacity is temporarily unavailable.",
+        503,
+        null,
+        { code: "server_read_capacity" }
+      );
+    }
+    markDiagnostic(
+      "operation_failed",
+      error instanceof PlatformApiError ? error.status : undefined,
+    );
+    throw error;
+  }
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Preserve the original upstream status/error while releasing the read slot.
+  }
 }
 
 export async function getPlatformStatsOverview(): Promise<PlatformStatsOverview> {
