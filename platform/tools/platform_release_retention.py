@@ -374,6 +374,15 @@ def release_operation_lock(app_dir: Path) -> Iterator[Path]:
         yield resolved_app_dir
 
 
+@contextmanager
+def retention_operation_locks(app_dir: Path) -> Iterator[Path]:
+    """Exclude release writers and active retained-load work in lock order."""
+
+    with release_operation_lock(app_dir) as resolved_app_dir:
+        with exclusive_retained_load_lock():
+            yield resolved_app_dir
+
+
 def resolved_release_target(app_dir: Path, link_name: str, releases_dir: Path) -> Path:
     link_path = app_dir / link_name
     if not link_path.is_symlink():
@@ -572,7 +581,7 @@ def main() -> int:
             print("No files changed. Re-run with --apply to delete candidates.")
             return 0
 
-        with release_operation_lock(args.app_dir) as resolved_app_dir:
+        with retention_operation_locks(args.app_dir) as resolved_app_dir:
             plan = build_retention_plan(
                 resolved_app_dir,
                 keep=args.keep,

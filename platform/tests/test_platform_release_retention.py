@@ -14,7 +14,6 @@ from tools import platform_release_retention as retention
 from tools.platform_release_retention import (
     apply_plan,
     build_retention_plan,
-    release_operation_lock,
 )
 
 
@@ -23,13 +22,18 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self._lock_guard = None
         self._release_lock = None
+        self._retained_load_lock = None
         self.original_release_lock_path = retention.RELEASE_LOCK_PATH
+        self.original_retained_load_lock_path = retention.RETAINED_LOAD_LOCK_PATH
         try:
             self._lock_guard = lock_support.create_test_lock("retention-guard")
             self._lock_guard.acquire()
             self._release_lock = lock_support.create_test_lock("retention-release")
             self.release_lock_path = self._release_lock.path
             retention.RELEASE_LOCK_PATH = self.release_lock_path
+            self._retained_load_lock = lock_support.create_test_lock("retention-load")
+            self.retained_load_lock_path = self._retained_load_lock.path
+            retention.RETAINED_LOAD_LOCK_PATH = self.retained_load_lock_path
             self.app_dir = Path(self.temp_dir.name) / "platform"
             self.releases_dir = self.app_dir / "releases"
             self.releases_dir.mkdir(parents=True)
@@ -37,7 +41,8 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
             self.now = datetime(2026, 6, 11, tzinfo=UTC)
         except BaseException:
             retention.RELEASE_LOCK_PATH = self.original_release_lock_path
-            for lock in (self._release_lock, self._lock_guard):
+            retention.RETAINED_LOAD_LOCK_PATH = self.original_retained_load_lock_path
+            for lock in (self._retained_load_lock, self._release_lock, self._lock_guard):
                 if lock is not None:
                     lock.cleanup()
             self.temp_dir.cleanup()
@@ -47,9 +52,10 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         cleanup_errors: list[BaseException] = []
         try:
             retention.RELEASE_LOCK_PATH = self.original_release_lock_path
+            retention.RETAINED_LOAD_LOCK_PATH = self.original_retained_load_lock_path
         finally:
             self.temp_dir.cleanup()
-            for lock in (self._release_lock, self._lock_guard):
+            for lock in (self._retained_load_lock, self._release_lock, self._lock_guard):
                 if lock is not None:
                     try:
                         lock.cleanup()
@@ -475,17 +481,36 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
                 path.unlink()
 
     def test_release_lock_contention_fails_closed(self) -> None:
-        try:
-            assert self._release_lock is not None
-            self._release_lock.acquire(nonblocking=True)
-            with self.assertRaisesRegex(
-                RuntimeError, "holds the platform release lock"
-            ):
-                with release_operation_lock(self.app_dir):
-                    self.fail("contended retention lock was acquired")
-        finally:
-            assert self._release_lock is not None
-            self._release_lock.release()
+        current = self.add_release("release-current", age_days=30)
+        previous = self.add_release("release-previous", age_days=29)
+        candidate = self.add_release("release-old", age_days=20)
+        self.link("current", current)
+        self.link("previous", previous)
+        for lock, message in (
+            (self._release_lock, "holds the platform release lock"),
+            (self._retained_load_lock, "holds the retained-load lock"),
+        ):
+            with self.subTest(lock=message):
+                assert lock is not None
+                lock.acquire(nonblocking=True)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                try:
+                    with mock.patch("sys.argv", [
+                        "platform_release_retention.py",
+                        "--app-dir", str(self.app_dir),
+                        "--keep", "0",
+                        "--apply",
+                        "--json-receipt",
+                        "--expected-candidate", candidate.name,
+                    ]), redirect_stdout(stdout), redirect_stderr(stderr):
+                        status = retention.main()
+                    self.assertEqual(status, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("retention failed (lock)", stderr.getvalue())
+                    self.assertTrue(candidate.is_dir())
+                finally:
+                    lock.release()
 
     def test_test_lock_creation_rejects_precreated_symlink(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
