@@ -1446,6 +1446,10 @@ jobs:
                   or not isinstance(backup.get("preexisting_sidecar_count"), int)
                   or isinstance(backup.get("preexisting_sidecar_count"), bool)
                   or backup.get("preexisting_sidecar_count", -1) < 0
+                  or backup.get("preexisting_sidecar_count") != backup.get("preexisting_archive_count")
+                  or not isinstance(backup.get("postexisting_archive_count"), int)
+                  or isinstance(backup.get("postexisting_archive_count"), bool)
+                  or backup.get("postexisting_archive_count") != backup.get("preexisting_archive_count", -1) + 1
                   or not re.fullmatch(r"[0-9a-f]{64}", str(backup.get("preexisting_archive_inventory_sha256") or ""))
                   or backup.get("preexisting_archive_inventory_sha256") != backup.get("postexisting_archive_inventory_sha256")
               ):

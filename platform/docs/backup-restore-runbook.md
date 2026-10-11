@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-10
+- Last reviewed: 2026-10-12
 
 ## Local verified backup
 
@@ -35,10 +35,15 @@ database. The monitor is sampled, so the lead is an early-stop margin rather
 than a guarantee against a single write burst. A failed or unavailable disk
 sample stops the drill; it does not rotate or remove any retained backup.
 
-Backup-only preserves every archive and metadata sidecar that exists before
-the run; it does not apply the 14-copy rotation limit. The backup operation
-checks the pre-existing archive inventory before publishing the new pair and
-fails closed if that inventory changes. Use full storage maintenance with
+Backup-only preserves every complete archive/metadata pair that exists before
+the run; it does not apply the 14-copy rotation limit. Under the ordered
+maintenance locks, it validates that each sidecar names the matching dump and
+records its exact size and SHA-256. The preservation inventory hashes both
+files and binds their paths, inode identities, modes, link counts, sizes and
+modification times. The operation checks that inventory before publishing and
+afterward, confirms exactly one new complete pair, and fails closed on an
+orphan, mismatch or change. It never deletes a pre-existing pair. Use full
+storage maintenance with
 `--backup-keep 14` when the reviewed maintenance policy calls for bounded
 rotation. The low-level backup CLI retains its historical rotation default;
 the lock-aware backup-only caller explicitly selects preservation.

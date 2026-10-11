@@ -749,6 +749,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "rotation_mode": "preserve-existing",
             "preexisting_archive_count": 9,
             "preexisting_sidecar_count": 9,
+            "postexisting_archive_count": 10,
             "preexisting_archive_inventory_sha256": "a" * 64,
             "postexisting_archive_inventory_sha256": "a" * 64,
             "preexisting_archives_preserved": True,
@@ -798,6 +799,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(result["rotation_mode"], "rotate-existing")
         self.assertTrue(preserved_result["preexisting_archives_preserved"])
         self.assertEqual(preserved_result["preexisting_archive_count"], 9)
+        self.assertEqual(preserved_result["postexisting_archive_count"], 10)
 
         with mock.patch.object(
             maintenance.subprocess,
@@ -1061,6 +1063,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "rotation_mode": "preserve-existing",
                     "preexisting_archive_count": 9,
                     "preexisting_sidecar_count": 9,
+                    "postexisting_archive_count": 10,
                     "preexisting_archive_inventory_sha256": "a" * 64,
                     "postexisting_archive_inventory_sha256": "a" * 64,
                     "preexisting_archives_preserved": True,
@@ -1634,6 +1637,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn('backup.get("removed_count") != 0', workflow)
         self.assertIn('isinstance(backup.get("preexisting_archive_count"), int)', workflow)
         self.assertIn('isinstance(backup.get("preexisting_sidecar_count"), int)', workflow)
+        self.assertIn('backup.get("preexisting_sidecar_count") != backup.get("preexisting_archive_count")', workflow)
+        self.assertIn('backup.get("postexisting_archive_count") != backup.get("preexisting_archive_count", -1) + 1', workflow)
         self.assertIn('r"[0-9a-f]{64}"', workflow)
         self.assertIn("BACKUP_FAILURE schema=1 stage=", workflow)
         self.assertIn('test "$(id -u)" -eq 0', workflow)

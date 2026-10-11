@@ -1010,14 +1010,66 @@ def prune_unverified_backups(
     return removed
 
 
-def backup_inventory(output_dir: pathlib.Path) -> tuple[tuple[str, int, int, int, int, int, int], ...]:
-    entries: list[tuple[str, int, int, int, int, int, int]] = []
+def _inventory_file(path: pathlib.Path) -> tuple[os.stat_result, str, bytes | None]:
+    """Hash one closed regular file without following links or accepting races."""
+
+    try:
+        path_stat = path.lstat()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError("Refusing an unsafe or changing existing backup entry.") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or (before.st_dev, before.st_ino) != (path_stat.st_dev, path_stat.st_ino)
+        ):
+            raise RuntimeError("Refusing unsafe existing backup entry.")
+        digest = hashlib.sha256()
+        chunks: list[bytes] | None = [] if path.suffix == ".json" else None
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+            if chunks is not None:
+                if total > 1024 * 1024:
+                    raise RuntimeError("Refusing oversized existing backup metadata.")
+                chunks.append(chunk)
+        after = os.fstat(descriptor)
+        current_path = path.lstat()
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_gid",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(getattr(before, field) != getattr(after, field) for field in stable_fields) or any(
+            getattr(after, field) != getattr(current_path, field) for field in stable_fields
+        ) or total != before.st_size:
+            raise RuntimeError("Existing backup entry changed while being inventoried.")
+        return after, digest.hexdigest(), b"".join(chunks) if chunks is not None else None
+    finally:
+        os.close(descriptor)
+
+
+def backup_inventory(
+    output_dir: pathlib.Path,
+) -> tuple[tuple[str, int, int, int, int, int, int, str, int, int, int], ...]:
+    entries: list[tuple[str, int, int, int, int, int, int, str, int, int, int]] = []
     for path in sorted(output_dir.iterdir(), key=lambda item: item.name):
         if not path.name.startswith("platformdb-") or path.suffix not in {".dump", ".json"}:
             continue
-        metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise RuntimeError("Refusing unsafe existing backup entry.")
+        metadata, content_sha256, _ = _inventory_file(path)
         entries.append(
             (
                 path.name,
@@ -1027,13 +1079,55 @@ def backup_inventory(output_dir: pathlib.Path) -> tuple[tuple[str, int, int, int
                 metadata.st_nlink,
                 metadata.st_size,
                 metadata.st_mtime_ns,
+                content_sha256,
+                metadata.st_uid,
+                metadata.st_gid,
+                metadata.st_ctime_ns,
             )
         )
     return tuple(entries)
 
 
+def validate_complete_backup_pairs(
+    output_dir: pathlib.Path,
+    entries: tuple[tuple[str, int, int, int, int, int, int, str, int, int, int], ...],
+) -> None:
+    """Require exact dump/sidecar pairs whose recorded bytes match on disk."""
+
+    by_name = {entry[0]: entry for entry in entries}
+    if len(by_name) != len(entries):
+        raise RuntimeError("Refusing duplicate existing backup entry names.")
+    if not by_name:
+        return
+    dump_names = {name for name in by_name if name.endswith(".dump")}
+    sidecar_names = {name for name in by_name if name.endswith(".json")}
+    dump_stems = {name[:-5] for name in dump_names}
+    sidecar_stems = {name[:-5] for name in sidecar_names}
+    if not dump_names or dump_stems != sidecar_stems:
+        raise RuntimeError("Refusing incomplete existing backup pairs.")
+    for dump_name in sorted(dump_names):
+        sidecar_name = f"{dump_name[:-5]}.json"
+        try:
+            sidecar_stat, sidecar_digest, sidecar_bytes = _inventory_file(output_dir / sidecar_name)
+            metadata = json.loads((sidecar_bytes or b"").decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError) as exc:
+            raise RuntimeError("Refusing invalid existing backup metadata.") from exc
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("dump_file") != dump_name
+            or type(metadata.get("size_bytes")) is not int
+            or metadata.get("size_bytes") != by_name[dump_name][5]
+            or not isinstance(metadata.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]) is None
+            or metadata["sha256"] != by_name[dump_name][7]
+            or sidecar_digest != by_name[sidecar_name][7]
+            or (sidecar_stat.st_dev, sidecar_stat.st_ino) != (by_name[sidecar_name][1], by_name[sidecar_name][2])
+        ):
+            raise RuntimeError("Refusing mismatched existing backup pair.")
+
+
 def backup_inventory_digest(
-    entries: tuple[tuple[str, int, int, int, int, int, int], ...],
+    entries: tuple[tuple[str, int, int, int, int, int, int, str, int, int, int], ...],
 ) -> str:
     encoded = json.dumps(entries, separators=(",", ":"), ensure_ascii=True).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
@@ -1363,6 +1457,8 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     rotate_existing = bool(getattr(args, "rotate_existing", True))
     preserve_existing = not rotate_existing
     initial_inventory = backup_inventory(output_dir) if preserve_existing else ()
+    if preserve_existing and initial_inventory:
+        validate_complete_backup_pairs(output_dir, initial_inventory)
     initial_inventory_digest = backup_inventory_digest(initial_inventory)
     timestamp = utc_now()
     timestamp_slug = timestamp.strftime("%Y%m%dT%H%M%SZ")
@@ -1453,6 +1549,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         }
         if preserve_existing:
             before_publish_inventory = backup_inventory(output_dir)
+            validate_complete_backup_pairs(output_dir, before_publish_inventory)
             before_publish_digest = backup_inventory_digest(before_publish_inventory)
             if before_publish_inventory != initial_inventory:
                 raise RuntimeError("Pre-existing backup inventory changed before publication.")
@@ -1502,12 +1599,25 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         if restore_verified and rotate_existing:
             removed.extend(prune_unverified_backups(output_dir, preserve_metadata=metadata_path))
             removed.extend(prune_backups(output_dir, keep=args.keep))
+        postexisting_archive_count: int | None = None
+        if preserve_existing:
+            post_publish_inventory = backup_inventory(output_dir)
+            validate_complete_backup_pairs(output_dir, post_publish_inventory)
+            postexisting_archive_count = sum(
+                1 for entry in post_publish_inventory if entry[0].endswith(".dump")
+            )
+            expected_archive_count = sum(
+                1 for entry in initial_inventory if entry[0].endswith(".dump")
+            ) + 1
+            if postexisting_archive_count != expected_archive_count:
+                raise RuntimeError("Preserve mode did not retain exactly one new complete backup pair.")
         result = {
             "ok": restore_error is None,
             **metadata,
             "rotation_mode": "rotate-existing" if rotate_existing else "preserve-existing",
             "metadata_file": str(metadata_path),
             "removed": removed,
+            "postexisting_archive_count": postexisting_archive_count,
         }
         if restore_error is not None:
             raise RuntimeError(f"Platform backup was created but restore verification failed: {restore_error}")
@@ -1522,6 +1632,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         if preserve_existing:
             try:
                 current_inventory = backup_inventory(output_dir)
+                validate_complete_backup_pairs(output_dir, current_inventory)
                 owned = {dump_path.name: published_dump_identity}
                 owned[metadata_path.name] = published_metadata_identity
                 current_old_inventory = tuple(

@@ -809,6 +809,10 @@ def run_backup(
         if isinstance(result.get("preexisting_sidecar_count"), int)
         and not isinstance(result.get("preexisting_sidecar_count"), bool)
         else None,
+        "postexisting_archive_count": result.get("postexisting_archive_count")
+        if isinstance(result.get("postexisting_archive_count"), int)
+        and not isinstance(result.get("postexisting_archive_count"), bool)
+        else None,
         "preexisting_archive_inventory_sha256": result.get(
             "preexisting_archive_inventory_sha256"
         )
