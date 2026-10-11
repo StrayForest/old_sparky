@@ -1077,7 +1077,10 @@ jobs:
           load_log="$artifact_dir/client-raw.log"
           load_args=(/usr/bin/python3 platform/tools/platform_load.py run --profile "$PROFILE_ID" --manifest "$RUNNER_TEMP/external-manifest/manifest.json" --report-path "$load_report")
           if [[ "$TIMEOUT_DIAGNOSTICS" == true ]]; then load_args+=(--timeout-diagnostics-run-id "$GITHUB_RUN_ID"); fi
-          if [[ "$TIMEOUT_DIAGNOSTICS" != true ]]; then load_args+=(--defer-pending-origin); fi
+          # Preserve the worker's real exit status in the report.  The
+          # platform_load orchestration code 3 is accepted below only after
+          # the same closed SLO-failure predicate is independently checked.
+          load_args+=(--defer-pending-origin)
           if [[ "$profile_status" == 0 ]]; then
             set +e
             run_checked_out_client "${load_args[@]}" > "$load_log" 2>&1
@@ -1093,9 +1096,77 @@ jobs:
           chmod 600 "$load_report" "$load_log" 2>/dev/null || true
           client_exit_status="$load_status"
           candidate_state=failed
-          if [[ "$TIMEOUT_DIAGNOSTICS" == true && "$load_status" == 0 ]]; then
+          if [[ "$TIMEOUT_DIAGNOSTICS" == true && "$load_status" == 3 && "$report_ready" == 1 ]]; then
+            # Exit 3 is the runner's reserved receipt for a fully closed
+            # pending-origin report.  A timeout diagnostic may carry it
+            # forward only when the exact auth-page profile also has a real
+            # closed SLO/status failure; pending observer evidence alone is
+            # never enough.  The evaluator repeats this check after artifact
+            # download before it invokes the timeout joiner.
+            set +e
+            PYTHONPATH="$GITHUB_WORKSPACE/platform/tools" \
+              SOURCE_GIT_SHA="$SOURCE_GIT_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" \
+              SOURCE_BINDING_BASE64="$SOURCE_BINDING_BASE64" \
+              SOURCE_BINDING_SHA256="$SOURCE_BINDING_SHA256" \
+              GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+              /usr/bin/python3 - "$load_report" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from types import SimpleNamespace
+
+          sys.path.insert(0, str(Path.cwd() / "platform" / "tools"))
+          try:
+              import platform_load
+              report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+              profile = platform_load.get_profile("authenticated-page-load-v1")
+              supervisor = report.get("runtime_supervisor")
+              acceptance = report.get("acceptance")
+              runtime_budget = report.get("runtime_budget")
+              if (
+                  profile.get("acceptance", {}).get("kind") != "stress"
+              or not isinstance(supervisor, dict)
+              or not isinstance(acceptance, dict)
+              or not isinstance(runtime_budget, dict)
+              or report.get("worker_failure") is not None
+              or runtime_budget.get("budget_exceeded") is not False
+                  or runtime_budget.get("within_duration_budget") is not True
+                  or runtime_budget.get("within_runner_budget") is not True
+                  or runtime_budget.get("reason") != "none"
+                  or not platform_load._closed_terminal_status_failure(profile, report)
+              ):
+                  raise ValueError
+              result = SimpleNamespace(
+                  returncode=supervisor.get("returncode"),
+                  report=report,
+                  worker_started=True,
+                  worker_exited=type(supervisor.get("returncode")) is int,
+                  killed=supervisor.get("signal") is not None,
+                  signal=supervisor.get("signal"),
+                  reason=supervisor.get("reason"),
+                  partial_work=report.get("partial_work"),
+                  inflight_unknown=report.get("inflight_unknown"),
+                  descendants_reaped=supervisor.get("descendants_reaped"),
+                  isolation=report.get("isolation"),
+                  namespace_closed=report.get("namespace_closed"),
+              )
+              if not platform_load._is_closed_pending_origin_candidate(profile, result):
+                  raise ValueError
+          except Exception:
+              raise SystemExit("timeout diagnostic is not a closed SLO-failure report")
+          PY
+            diagnostic_candidate_status="$?"
+            set -e
+            if [[ "$diagnostic_candidate_status" == 0 ]]; then
+              candidate_state=timeout_diagnostics
+              client_exit_status=1
+              load_status=0
+            else
+              load_status=1
+            fi
+          elif [[ "$TIMEOUT_DIAGNOSTICS" == true && "$load_status" == 0 ]]; then
             candidate_state=timeout_diagnostics
-          elif [[ "$load_status" == 0 ]]; then
+          elif [[ "$TIMEOUT_DIAGNOSTICS" != true && "$load_status" == 0 ]]; then
             candidate_state=produced
           elif [[ "$TIMEOUT_DIAGNOSTICS" != true && "$load_status" == 3 && "$report_ready" == 1 ]]; then
             candidate_state=pending_origin
@@ -2918,6 +2989,50 @@ jobs:
           ):
               raise SystemExit("candidate report runner/app source binding is inconsistent")
           state, raw_status = payload["candidate_state"], payload["client_exit_status"]
+
+          def closed_timeout_slo_failure(report):
+              if profile_id != "authenticated-page-load-v1" or timeout_diagnostics != "true":
+                  return False
+              try:
+                  from pathlib import Path
+                  from types import SimpleNamespace
+                  sys.path.insert(0, str(Path.cwd() / "platform" / "tools"))
+                  import platform_load
+                  profile = platform_load.get_profile(profile_id)
+                  supervisor = report.get("runtime_supervisor")
+                  acceptance = report.get("acceptance")
+                  runtime_budget = report.get("runtime_budget")
+                  if (
+                      profile.get("acceptance", {}).get("kind") != "stress"
+                      or not isinstance(supervisor, dict)
+                      or not isinstance(acceptance, dict)
+                      or not isinstance(runtime_budget, dict)
+                      or report.get("worker_failure") is not None
+                      or runtime_budget.get("budget_exceeded") is not False
+                      or runtime_budget.get("within_duration_budget") is not True
+                      or runtime_budget.get("within_runner_budget") is not True
+                      or runtime_budget.get("reason") != "none"
+                      or not platform_load._closed_terminal_status_failure(profile, report)
+                  ):
+                      return False
+                  result = SimpleNamespace(
+                      returncode=supervisor.get("returncode"),
+                      report=report,
+                      worker_started=True,
+                      worker_exited=type(supervisor.get("returncode")) is int,
+                      killed=supervisor.get("signal") is not None,
+                      signal=supervisor.get("signal"),
+                      reason=supervisor.get("reason"),
+                      partial_work=report.get("partial_work"),
+                      inflight_unknown=report.get("inflight_unknown"),
+                      descendants_reaped=supervisor.get("descendants_reaped"),
+                      isolation=report.get("isolation"),
+                      namespace_closed=report.get("namespace_closed"),
+                  )
+                  return platform_load._is_closed_pending_origin_candidate(profile, result)
+              except Exception:
+                  return False
+
           worker_failure = report_payload.get("worker_failure")
           worker_failure_keys = {
               "schema", "stage", "exception_class", "module", "line", "traceback_truncated"
@@ -2995,7 +3110,14 @@ jobs:
           valid_state = (
               (state == "pending_origin" and raw_status == 3 and timeout_diagnostics == "false")
               or (state == "produced" and raw_status == 0 and timeout_diagnostics == "false")
-              or (state == "timeout_diagnostics" and raw_status == 0 and timeout_diagnostics == "true")
+              or (
+                  state == "timeout_diagnostics"
+                  and timeout_diagnostics == "true"
+                  and (
+                      raw_status == 0
+                      or (raw_status == 1 and closed_timeout_slo_failure(report_payload))
+                  )
+              )
           )
           if valid_failed_worker:
               print("worker_failure")

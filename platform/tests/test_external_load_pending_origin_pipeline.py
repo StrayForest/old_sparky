@@ -11,6 +11,7 @@ from contextlib import ExitStack, redirect_stdout
 from copy import deepcopy
 import hashlib
 import base64
+import copy
 import io
 import json
 import os
@@ -30,7 +31,7 @@ from unittest.mock import patch
 
 import yaml
 
-from tools import platform_load
+from tools import platform_load, platform_load_runtime, platform_load_worker
 from tools.platform_external_load import RequestResult, VirtualUser
 from tools.platform_load_runtime import PID_NAMESPACE_ISOLATION, WORKER_REPORT_SCHEMA
 from tools.platform_load_acceptance import _acceptance_budget_evidence
@@ -451,6 +452,16 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                         profile_id, failure_kind, expected_status, expected_error
                     )
 
+        report = self._exercise_closed_failure_builder(
+            "authenticated-page-load-v1",
+            "http_error",
+            500,
+            "server_error",
+            preserve_profile=True,
+            timeout_diagnostics_run_id=RUN_ID,
+        )
+        self._assert_timeout_diagnostic_receipt(report)
+
     def test_explicit_child_boundary_disables_non_ready_raw_alias(self) -> None:
         self._exercise_closed_failure_builder(
             "read-mix-stress-v2",
@@ -468,9 +479,39 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
         expected_error: str,
         *,
         add_explicit_child: bool = False,
-    ) -> None:
+        preserve_profile: bool = False,
+        timeout_diagnostics_run_id: str | None = None,
+    ) -> dict[str, object]:
         profile = deepcopy(platform_load.get_profile(profile_id))
-        profile, manifest, users = _small_profile(profile)
+        if preserve_profile:
+            fixture = profile["fixture"]
+            tournament_count = int(fixture["tournament_count"])
+            users_per_tournament = int(fixture["users_per_tournament"])
+            manifest = {
+                "origin": "https://old-sparky.com",
+                "session_cookie_name": "deadlock_platform_session",
+                "csrf_cookie_name": "deadlock_platform_session_csrf",
+                "marker": "preprod26082900000000ab",
+                "tournaments": [
+                    {
+                        "id": f"tournament-{index + 1}",
+                        "slug": f"qa-tournament-{index + 1}",
+                        "user_count": users_per_tournament,
+                    }
+                    for index in range(tournament_count)
+                ],
+            }
+            users = [
+                VirtualUser(
+                    user_id=f"user-{index + 1:08d}",
+                    tournament_slug=f"qa-tournament-{index // users_per_tournament + 1}",
+                    session_token=f"{index + 1:064x}",
+                    csrf_token=f"{index + 1:064x}",
+                )
+                for index in range(tournament_count * users_per_tournament)
+            ]
+        else:
+            profile, manifest, users = _small_profile(profile)
         if (
             profile.get("mode") == "read-mix"
             and profile.get("traffic", {}).get("concurrency_stages") is not None
@@ -487,14 +528,15 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             users.append(
                 VirtualUser(
                     user_id=f"user-{index:08d}",
-                    tournament_slug="qa-tournament",
-                    session_token=chr(ord("s") + index) * 64,
-                    csrf_token=chr(ord("c") + index) * 64,
+                    tournament_slug=users[0].tournament_slug,
+                    session_token=f"{index:064x}",
+                    csrf_token=f"{index:064x}",
                 )
             )
-        profile["fixture"]["users_per_tournament"] = target_users
-        profile["fixture"]["max_total_users"] = target_users
-        manifest["tournaments"][0]["user_count"] = target_users
+        if not preserve_profile:
+            profile["fixture"]["users_per_tournament"] = target_users
+            profile["fixture"]["max_total_users"] = target_users
+            manifest["tournaments"][0]["user_count"] = target_users
         users = [
             VirtualUser(
                 user_id=user.user_id,
@@ -502,12 +544,12 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 session_token=(
                     user.session_token
                     if index == 0
-                    else chr(ord("s") + index) * 64
+                    else f"{index + 1:064x}"
                 ),
                 csrf_token=(
                     user.csrf_token
                     if index == 0
-                    else chr(ord("c") + index) * 64
+                    else f"{index + 1:064x}"
                 ),
             )
             for index, user in enumerate(users)
@@ -618,6 +660,8 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="terminal-failure-builder-") as temporary:
             report_path = Path(temporary) / "report.json"
+            manifest_path = Path(temporary) / "manifest.json"
+            manifest_path.write_text("{}\n", encoding="utf-8")
             with ExitStack() as stack:
                 stack.enter_context(
                     patch("tools.platform_external_load.load_manifest", return_value=(manifest, users))
@@ -643,32 +687,166 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     patch.dict(os.environ, {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID}, clear=False)
                 )
                 with redirect_stdout(io.StringIO()):
-                    worker_exit = platform_load.run_profile_worker(
-                        profile, Path(temporary) / "manifest.json", report_path
-                    )
+                    if preserve_profile:
+                        def supervised_worker(
+                            *,
+                            worker_report_path: Path,
+                            worker_config: dict[str, object],
+                            max_duration_seconds: float,
+                            max_runner_minutes: float,
+                            report_path: Path,
+                            **_kwargs: object,
+                        ) -> platform_load_runtime.SupervisorResult:
+                            started = time.monotonic()
+                            worker_config = {
+                                **worker_config,
+                                "runtime_protocol": platform_load_runtime.RUNTIME_PROTOCOL_VERSION,
+                                "started_at_monotonic": started,
+                                "scenario_deadline_monotonic": (
+                                    started + max_duration_seconds
+                                ),
+                                "runner_deadline_monotonic": (
+                                    started + max_runner_minutes * 60.0
+                                ),
+                                "worker_report_path": str(worker_report_path),
+                                "namespace_required": False,
+                            }
+                            config_path = worker_report_path.with_name(
+                                "test-worker-config.json"
+                            )
+                            config_path.write_text(
+                                json.dumps(worker_config, sort_keys=True) + "\n",
+                                encoding="utf-8",
+                            )
+                            try:
+                                with patch.object(
+                                    platform_load_runtime,
+                                    "_set_parent_death_signal",
+                                    return_value=None,
+                                ):
+                                    worker_exit = platform_load_runtime.worker_entry(
+                                        platform_load_worker._worker,
+                                        config_path=config_path,
+                                    )
+                            finally:
+                                config_path.unlink(missing_ok=True)
+                            worker_report = json.loads(
+                                worker_report_path.read_text(encoding="utf-8")
+                            )
+                            closed_report = platform_load_runtime._close_reaped_worker_report(
+                                worker_report, returncode=worker_exit
+                            )
+                            platform_load_runtime._write_json_atomic(
+                                report_path, closed_report
+                            )
+                            return platform_load_runtime.SupervisorResult(
+                                returncode=worker_exit,
+                                report=closed_report,
+                                worker_started=True,
+                                worker_exited=True,
+                                killed=False,
+                                signal=None,
+                                reason="none",
+                                partial_work=False,
+                                inflight_unknown=False,
+                                descendants_reaped=True,
+                                isolation=PID_NAMESPACE_ISOLATION,
+                                namespace_closed=True,
+                                namespace_init_pid=None,
+                            )
+
+                        stack.enter_context(
+                            patch(
+                                "tools.platform_load_runtime.require_pid_namespace_capability",
+                                return_value=None,
+                            )
+                        )
+                        stack.enter_context(
+                            patch(
+                                "tools.platform_load_runtime.run_supervised",
+                                side_effect=supervised_worker,
+                            )
+                        )
+                        candidate_exit = platform_load.run_profile(
+                            profile,
+                            manifest_path,
+                            report_path,
+                            timeout_diagnostics_run_id=timeout_diagnostics_run_id,
+                            defer_pending_origin=True,
+                        )
+                        assembled_report = json.loads(
+                            report_path.read_text(encoding="utf-8")
+                        )
+                        self.assertEqual(
+                            candidate_exit,
+                            3,
+                            {
+                                "acceptance": {
+                                    key: (assembled_report.get("acceptance") or {}).get(key)
+                                    for key in (
+                                        "decision",
+                                        "contract_ok",
+                                        "passed",
+                                        "pending_origin_evidence",
+                                    )
+                                },
+                                "worker_exit_code": assembled_report.get("worker_exit_code"),
+                                "report_complete": assembled_report.get("report_complete"),
+                                "runtime_budget": assembled_report.get("runtime_budget"),
+                                "terminal_status_failure": platform_load._closed_terminal_status_failure(
+                                    profile, assembled_report
+                                ),
+                                "pending_candidate": platform_load._is_closed_pending_origin_candidate(
+                                    profile,
+                                    SimpleNamespace(
+                                        returncode=1,
+                                        report=assembled_report,
+                                        worker_started=True,
+                                        worker_exited=True,
+                                        killed=False,
+                                        signal=None,
+                                        reason="none",
+                                        partial_work=False,
+                                        inflight_unknown=False,
+                                        descendants_reaped=True,
+                                        isolation=PID_NAMESPACE_ISOLATION,
+                                        namespace_closed=True,
+                                    ),
+                                ),
+                            },
+                        )
+                        worker_exit = 1
+                    else:
+                        worker_exit = platform_load.run_profile_worker(
+                            profile,
+                            manifest_path,
+                            report_path,
+                            timeout_diagnostics_run_id=timeout_diagnostics_run_id,
+                        )
             report = json.loads(report_path.read_text(encoding="utf-8"))
 
-        report.update(
-            {
-                "worker_report_schema": WORKER_REPORT_SCHEMA,
-                "report_complete": True,
-                "namespace_closed": True,
-                "isolation": PID_NAMESPACE_ISOLATION,
-                "partial_work": False,
-                "inflight_unknown": False,
-                "worker_exit_code": worker_exit,
-                "runtime_supervisor": {
-                    "reason": "none",
-                    "returncode": worker_exit,
-                    "isolation": PID_NAMESPACE_ISOLATION,
+        if not preserve_profile:
+            report.update(
+                {
+                    "worker_report_schema": WORKER_REPORT_SCHEMA,
+                    "report_complete": True,
                     "namespace_closed": True,
-                    "descendants_reaped": True,
+                    "isolation": PID_NAMESPACE_ISOLATION,
                     "partial_work": False,
                     "inflight_unknown": False,
-                    "report_error": None,
-                },
-            }
-        )
+                    "worker_exit_code": worker_exit,
+                    "runtime_supervisor": {
+                        "reason": "none",
+                        "returncode": worker_exit,
+                        "isolation": PID_NAMESPACE_ISOLATION,
+                        "namespace_closed": True,
+                        "descendants_reaped": True,
+                        "partial_work": False,
+                        "inflight_unknown": False,
+                        "report_error": None,
+                    },
+                }
+            )
         if add_explicit_child:
             self.assertTrue(
                 _add_explicit_child_to_first_raw_summary(report.get("phases"))
@@ -748,6 +926,188 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             report["raw_http"]["error_kinds"].get(expected_error),
             observed_failures,
         )
+        return report
+
+    def _assert_timeout_diagnostic_receipt(
+        self, report: dict[str, object]
+    ) -> None:
+        profile = platform_load.get_profile("authenticated-page-load-v1")
+        runtime_budget = report.get("runtime_budget")
+        self.assertEqual(profile.get("acceptance", {}).get("kind"), "stress")
+        with patch.dict(
+            os.environ,
+            {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID},
+            clear=False,
+        ):
+            self.assertTrue(
+                platform_load._closed_terminal_status_failure(profile, report)
+            )
+        self.assertIsInstance(runtime_budget, dict)
+        assert isinstance(runtime_budget, dict)
+        self.assertEqual(
+            {
+                key: runtime_budget.get(key)
+                for key in (
+                    "budget_exceeded",
+                    "within_duration_budget",
+                    "within_runner_budget",
+                    "reason",
+                )
+            },
+            {
+                "budget_exceeded": False,
+                "within_duration_budget": True,
+                "within_runner_budget": True,
+                "reason": "none",
+            },
+        )
+        load_step = _run_step("load-client", "Run checked-out external HTTP load client")
+        evaluate_step = _run_step("evaluate-load", "Evaluate checked-out load report")
+        status_start = load_step.index('client_exit_status="$load_status"')
+        status_end = load_step.index(
+            'if [[ "$TIMEOUT_DIAGNOSTICS" == true ]]; then', status_start
+        )
+        status_branch = load_step[status_start:status_end]
+        with tempfile.TemporaryDirectory(prefix="timeout-status-receipt-") as temporary:
+            root = Path(temporary)
+            report_path = root / "external-load.json"
+            input_path = root / "external-input.json"
+            receipt_path = root / "load-status.json"
+            report_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+            input_path.write_text(
+                json.dumps({"schema": 1, "target_sha": SOURCE_SHA}) + "\n",
+                encoding="ascii",
+            )
+            branch_shell = "\n".join(
+                (
+                    'TIMEOUT_DIAGNOSTICS=true',
+                    'GITHUB_WORKSPACE="$PWD"',
+                    f'SOURCE_GIT_SHA={SOURCE_SHA}',
+                    f'APP_TARGET_SHA={SOURCE_SHA}',
+                    f'GITHUB_RUN_ID={RUN_ID}',
+                    'GITHUB_RUN_ATTEMPT=1',
+                    'SOURCE_BINDING_BASE64=',
+                    'SOURCE_BINDING_SHA256=',
+                    f'load_report="{report_path}"',
+                    'load_status=3',
+                    'report_ready=1',
+                    'client_exit_status="$load_status"',
+                    'candidate_state=failed',
+                    status_branch,
+                    'printf "%s:%s:%s:%s\\n" "$load_status" "$client_exit_status" "$candidate_state" "$report_ready"',
+                )
+            )
+            branch_result = subprocess.run(
+                ["/bin/bash", "-e", "-o", "pipefail", "-c", branch_shell],
+                cwd=REPOSITORY_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(branch_result.returncode, 0, branch_result.stderr)
+            self.assertEqual(
+                branch_result.stdout.strip(),
+                "0:1:timeout_diagnostics:1",
+                branch_result.stderr,
+            )
+
+            receipt_writer = _python_block(
+                load_step, '/usr/bin/python3 - "$artifact_dir/load-status.json"'
+            )
+            evaluator_match = re.search(
+                r'validation_kind="\$\(/usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "\$SOURCE_GIT_SHA" "\$APP_TARGET_SHA" "\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
+                r"(?P<script>.*?)\nPY",
+                evaluate_step,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(evaluator_match)
+            assert evaluator_match is not None
+            verifier = evaluator_match.group("script")
+
+            def verify(
+                report_value: dict[str, object] | None = None,
+                *,
+                client_status: str = "1",
+                state: str = "timeout_diagnostics",
+                timeout: str = "true",
+            ) -> subprocess.CompletedProcess[str]:
+                report_bytes = (
+                    json.dumps(report if report_value is None else report_value, sort_keys=True)
+                    + "\n"
+                ).encode("utf-8")
+                report_path.write_bytes(report_bytes)
+                writer_result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        receipt_writer,
+                        str(receipt_path),
+                        "0",
+                        client_status,
+                        state,
+                        "1",
+                        SOURCE_SHA,
+                        SOURCE_SHA,
+                        "",
+                        RUN_ID,
+                        "1",
+                        "authenticated-page-load-v1",
+                        str(report_path),
+                        str(input_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(writer_result.returncode, 0, writer_result.stderr)
+                payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload["client_exit_status"], int(client_status))
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        verifier,
+                        str(receipt_path),
+                        str(report_path),
+                        str(input_path),
+                        SOURCE_SHA,
+                        SOURCE_SHA,
+                        RUN_ID,
+                        "1",
+                        "authenticated-page-load-v1",
+                        timeout,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    cwd=REPOSITORY_ROOT,
+                    env={
+                        **os.environ,
+                        "SOURCE_GIT_SHA": SOURCE_SHA,
+                        "APP_TARGET_SHA": SOURCE_SHA,
+                        "GITHUB_RUN_ID": RUN_ID,
+                    },
+                )
+
+            accepted_receipt = verify()
+            self.assertEqual(accepted_receipt.returncode, 0, accepted_receipt.stderr)
+            self.assertNotEqual(verify(client_status="2").returncode, 0)
+            self.assertNotEqual(verify(state="failed").returncode, 0)
+            self.assertNotEqual(verify(timeout="false").returncode, 0)
+            for label, mutate in (
+                ("worker failure", lambda value: value.update({"worker_failure": {"stage": "worker_callback"}})),
+                ("partial work", lambda value: value.update({"partial_work": True})),
+                ("inflight unknown", lambda value: value.update({"inflight_unknown": True})),
+                ("runtime budget failure", lambda value: value["runtime_budget"].update({"budget_exceeded": True})),
+                ("no terminal status failure", lambda value: value["raw_http"].update({"status_counts": {"200": 20_000}})),
+                ("unrecognized status", lambda value: value["raw_http"].update({"status_counts": {"200": 19_999, "418": 1}})),
+                ("wrong run binding", lambda value: value.update({"external_run_id": "987654321"})),
+                ("origin already attached", lambda value: value.update({"origin_observability": {"binding": {"complete": True}}})),
+            ):
+                with self.subTest(rejected=label):
+                    invalid = copy.deepcopy(report)
+                    mutate(invalid)
+                    self.assertNotEqual(verify(invalid).returncode, 0)
 
     def test_cli_pending_then_origin_budget_failure_reaches_yaml_publish_and_final_fail(self) -> None:
         for profile_id in ("read-mix-human-v2", "ready-vote-capacity-ramp-v2"):
@@ -808,19 +1168,19 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             # Preserve one real successful mutation before the typed transport
             # failure so the producer still performs its final state read.
             target_users = max(2, len(users))
-            profile["fixture"]["users_per_tournament"] = target_users
-            profile["fixture"]["max_total_users"] = target_users
-            manifest["tournaments"][0]["user_count"] = target_users
-            while len(users) < target_users:
-                index = len(users) + 1
-                users.append(
-                    VirtualUser(
-                        user_id=f"user-{index:08d}",
-                        tournament_slug="qa-tournament",
-                        session_token=chr(ord("s") + index) * 64,
-                        csrf_token=chr(ord("c") + index) * 64,
-                    )
+        profile["fixture"]["users_per_tournament"] = target_users
+        profile["fixture"]["max_total_users"] = target_users
+        manifest["tournaments"][0]["user_count"] = target_users
+        while len(users) < target_users:
+            index = len(users) + 1
+            users.append(
+                VirtualUser(
+                    user_id=f"user-{index:08d}",
+                    tournament_slug="qa-tournament",
+                    session_token=chr(ord("s") + index) * 64,
+                    csrf_token=chr(ord("c") + index) * 64,
                 )
+            )
         report_marker = str(manifest["marker"])
         app_target_sha = SOURCE_SHA
         source_binding_digest: str | None = None
