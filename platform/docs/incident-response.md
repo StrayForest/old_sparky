@@ -46,6 +46,13 @@ producer with no records is represented as a fixed `empty` summary. There is no
 unavailable/raw-log fallback. Do not disable the release preflight or dump an
 unbounded journal.
 
+On collection failure, the run retains a fixed-schema artifact bound to the
+requested release SHA and time window. It records the runner/SSH/remote stage,
+producer status, and an allowlisted stderr class with a byte count; the raw
+SSH captures are deleted. An SSH exit code of 255 alone does not identify a
+transport failure. Treat missing or malformed stage markers as unknown and
+keep the diagnostic failed.
+
 ## Playbooks
 
 ### Auth, role or data exposure

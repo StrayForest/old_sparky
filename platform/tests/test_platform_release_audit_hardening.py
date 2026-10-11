@@ -20,6 +20,8 @@ import time
 import unittest
 from unittest import mock
 
+import yaml
+
 from tests import platform_test_lock_support as lock_support
 
 
@@ -1284,6 +1286,11 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("platform_nginx_error_summary.py", workflow)
         self.assertIn("platform_web_runtime_diagnostics_summary.py", workflow)
         self.assertIn('"kind":"web_runtime_diagnostics"', workflow)
+        locked_start = workflow.index("<<'LOCKED'\n") + len("<<'LOCKED'\n")
+        locked_end = workflow.index("\n          LOCKED\n", locked_start)
+        locked_script = workflow[locked_start:locked_end]
+        self.assertIn("nginx_error_log=/var/log/nginx/error.log", locked_script)
+        self.assertIn('test -f "$nginx_error_log"', locked_script)
         keyscan_start = workflow.index(
             "      - name: Configure pinned production SSH"
         )
@@ -1335,6 +1342,149 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertNotIn("web_cgroup_status", workflow)
         self.assertNotIn("active_release=", workflow)
         self.assertNotIn("sed -E", workflow[collection_start:cleanup_start])
+
+        parsed = yaml.safe_load(workflow)
+        collection_step = next(
+            step
+            for step in parsed["jobs"]["collect"]["steps"]
+            if step.get("name") == "Collect exact-window read-only evidence"
+        )
+        command = collection_step["run"]
+        fake_ssh = textwrap.dedent(
+            """\
+            #!/bin/bash
+            : > "$FAKE_SSH_MARKER"
+            cat "$FAKE_SSH_STDOUT"
+            cat "$FAKE_SSH_STDERR" >&2
+            exit "$FAKE_SSH_STATUS"
+            """
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            ssh = bin_dir / "ssh"
+            ssh.write_text(fake_ssh, encoding="utf-8")
+            ssh.chmod(0o700)
+            ssh_dir = root / "ssh"
+            ssh_dir.mkdir(mode=0o700)
+            (ssh_dir / "id_ed25519").write_text("synthetic-key\n", encoding="utf-8")
+            (ssh_dir / "known_hosts").write_text("synthetic-host-key\n", encoding="utf-8")
+            run_temp = root / "runner-temp"
+            run_temp.mkdir(mode=0o700)
+            stdout_path = root / "ssh.stdout"
+            stderr_path = root / "ssh.stderr"
+            base_env = {
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "RUNNER_TEMP": str(run_temp),
+                "SSH_DIR": str(ssh_dir),
+                "PROD_SSH_HOST": "synthetic.invalid",
+                "PROD_SSH_USER": "runner",
+                "EXPECTED_SHA": "a" * 40,
+                "SINCE_UTC": "2026-10-11T10:00:00Z",
+                "UNTIL_UTC": "2026-10-11T10:05:00Z",
+                "FAKE_SSH_STDOUT": str(stdout_path),
+                "FAKE_SSH_STDERR": str(stderr_path),
+                "GITHUB_ENV": str(root / "github-env"),
+            }
+            remote_ok = (
+                b'{"schema":1,"kind":"web_runtime_diagnostics"}\n'
+                b"safe-summary\n"
+                b"WEB_RUNTIME_COLLECTION_RESULT schema=1 stage=nginx_error_log_tail status=0 producer_status=0\n"
+                b"WEB_RUNTIME_REMOTE_RESULT schema=1 stage=release_lock status=0\n"
+            )
+
+            def run_case(
+                name: str,
+                stdout: bytes,
+                stderr: bytes = b"",
+                ssh_status: int = 0,
+                *,
+                setup_failure: bool = False,
+            ) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None, Path]:
+                case_dir = root / name
+                case_dir.mkdir()
+                case_env = dict(base_env)
+                case_env["RUNNER_TEMP"] = str(case_dir)
+                case_env["FAKE_SSH_STATUS"] = str(ssh_status)
+                ssh_marker = case_dir / "ssh-called"
+                case_env["FAKE_SSH_MARKER"] = str(ssh_marker)
+                stdout_path.write_bytes(stdout)
+                stderr_path.write_bytes(stderr)
+                if setup_failure:
+                    (case_dir / "platform-production-web-runtime-diagnostics.txt").mkdir()
+                result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", command],
+                    cwd=root,
+                    env=case_env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                artifact_path = case_dir / "platform-production-web-runtime-diagnostics-artifact.txt"
+                payload = None
+                if artifact_path.is_file():
+                    try:
+                        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError:
+                        pass
+                self.assertFalse((case_dir / "platform-production-web-runtime-diagnostics-ssh-error.log").exists())
+                self.assertFalse((case_dir / "platform-production-web-runtime-diagnostics.txt").is_file())
+                if payload is not None:
+                    encoded = json.dumps(payload, sort_keys=True)
+                    self.assertNotIn("PRIVATE_SENTINEL", encoded)
+                    self.assertEqual(artifact_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(ssh_marker.exists(), not setup_failure)
+                return result, payload, artifact_path
+
+            result, payload, artifact_path = run_case("success", remote_ok)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIsNone(payload)
+            self.assertIn("safe-summary", artifact_path.read_text(encoding="utf-8"))
+            self.assertNotIn("WEB_RUNTIME_", artifact_path.read_text(encoding="utf-8"))
+
+            producer_failure = (
+                b"WEB_RUNTIME_COLLECTION_RESULT schema=1 stage=deadlock_web_journalctl status=23 producer_status=23\n"
+                b"WEB_RUNTIME_REMOTE_RESULT schema=1 stage=release_lock status=23\n"
+            )
+            result, payload, _ = run_case(
+                "producer-failure",
+                producer_failure,
+                b"deadlock-web journalctl producer failed with status 23. PRIVATE_SENTINEL\n",
+                23,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(payload["collection_stage"], "deadlock_web_journalctl")
+            self.assertEqual(payload["producer_status"], 23)
+            self.assertEqual(payload["stderr_class"], "unclassified")
+
+            auth_failure = b"Permission denied (publickey).\n"
+            result, payload, _ = run_case("auth-failure", b"", auth_failure, 255)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(payload["ssh_exit_code"], 255)
+            self.assertEqual(payload["stderr_class"], "authentication_denied")
+            result, payload, _ = run_case("unknown-255", b"", b"opaque PRIVATE_SENTINEL\n", 255)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(payload["stderr_class"], "unclassified")
+
+            malformed = remote_ok.replace(b"stage=release_lock", b"stage=unexpected")
+            result, payload, _ = run_case("malformed-marker", malformed)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(payload["remote_marker_status"], "missing_or_invalid")
+            result, payload, _ = run_case("missing-marker", b"safe but unmarked\n")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(payload["remote_marker_status"], "missing_or_invalid")
+
+            result, payload, _ = run_case("oversized-capture", b"x" * (1024 * 1024 + 1))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(payload["capture_size_exceeded"])
+
+            result, payload, _ = run_case("setup-failure", b"", setup_failure=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(payload["runner_stage"], "runner_capture_setup")
+            self.assertIsNone(payload["ssh_exit_code"])
 
     def test_runtime_diagnostic_summary_is_fixed_and_redacts_adversarial_lines(self) -> None:
         lines = (
