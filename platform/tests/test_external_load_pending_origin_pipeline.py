@@ -42,6 +42,7 @@ REPOSITORY_ROOT = PLATFORM_ROOT.parent
 WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/platform-production-external-load.yml"
 SOURCE_SHA = "a" * 40
 RUN_ID = "123456789"
+READY_VOTE_TRANSPORT_PAIR_PROFILE_ID = "ready-vote-transport-pair-v1"
 
 
 def _run_step(job: str, step_name: str) -> str:
@@ -239,7 +240,19 @@ def _add_explicit_child_to_first_raw_summary(value: object) -> bool:
 class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
     def test_all_authored_profiles_have_closed_budget_builder_contracts(self) -> None:
         profiles = platform_load.load_profiles()
+        self.assertEqual(len(profiles), 12)
+        diagnostic = profiles.pop(READY_VOTE_TRANSPORT_PAIR_PROFILE_ID)
         self.assertEqual(len(profiles), 11)
+        self.assertEqual(diagnostic["portfolio"]["class"], "diagnostic")
+        diagnostic_evidence = _acceptance_budget_evidence(
+            diagnostic["acceptance"], require_statuses=True
+        )
+        self.assertIs(diagnostic_evidence["complete"], True)
+        self.assertIsInstance(diagnostic_evidence["checks"], dict)
+        self.assertTrue(diagnostic_evidence["checks"])
+        self.assertTrue(
+            all(type(value) is bool for value in diagnostic_evidence["checks"].values())
+        )
         for profile_id, profile in profiles.items():
             with self.subTest(profile=profile_id):
                 evidence = _acceptance_budget_evidence(
@@ -436,7 +449,11 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 )
 
     def test_all_authored_builders_close_transport_and_server_failures(self) -> None:
-        for profile_id in platform_load.load_profiles():
+        profiles = platform_load.load_profiles()
+        self.assertEqual(len(profiles), 12)
+        ordinary_profiles = set(profiles) - {READY_VOTE_TRANSPORT_PAIR_PROFILE_ID}
+        self.assertEqual(len(ordinary_profiles), 11)
+        for profile_id in ordinary_profiles:
             profile = platform_load.get_profile(profile_id)
             for failure_kind, expected_status, expected_error in (
                 ("transport", 0, "transport"),
@@ -451,6 +468,21 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     self._exercise_closed_failure_builder(
                         profile_id, failure_kind, expected_status, expected_error
                     )
+
+        for failure_kind, expected_status, expected_error in (
+            ("transport", 0, "transport"),
+            ("http_error", 500, "server_error"),
+        ):
+            with self.subTest(
+                profile=READY_VOTE_TRANSPORT_PAIR_PROFILE_ID,
+                failure=failure_kind,
+            ):
+                self._exercise_closed_failure_builder(
+                    READY_VOTE_TRANSPORT_PAIR_PROFILE_ID,
+                    failure_kind,
+                    expected_status,
+                    expected_error,
+                )
 
         report = self._exercise_closed_failure_builder(
             "authenticated-page-load-v1",
@@ -483,6 +515,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
         timeout_diagnostics_run_id: str | None = None,
     ) -> dict[str, object]:
         profile = deepcopy(platform_load.get_profile(profile_id))
+        exact_transport_pair = profile_id == READY_VOTE_TRANSPORT_PAIR_PROFILE_ID
         if preserve_profile:
             fixture = profile["fixture"]
             tournament_count = int(fixture["tournament_count"])
@@ -510,6 +543,30 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 )
                 for index in range(tournament_count * users_per_tournament)
             ]
+        elif exact_transport_pair:
+            manifest = {
+                "origin": "https://old-sparky.com",
+                "session_cookie_name": "deadlock_platform_session",
+                "csrf_cookie_name": "deadlock_platform_session_csrf",
+                "marker": "preprod26082900000000ab",
+                "tournaments": [
+                    {
+                        "id": f"tournament-{index + 1}",
+                        "slug": f"qa-tournament-{index + 1}",
+                        "user_count": 500,
+                    }
+                    for index in range(20)
+                ],
+            }
+            users = [
+                VirtualUser(
+                    user_id=f"user-{index + 1:08d}",
+                    tournament_slug=f"qa-tournament-{index // 500 + 1}",
+                    session_token=f"{index + 1:064x}",
+                    csrf_token=f"{index + 1:064x}",
+                )
+                for index in range(10_000)
+            ]
         else:
             profile, manifest, users = _small_profile(profile)
         if (
@@ -533,7 +590,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     csrf_token=f"{index:064x}",
                 )
             )
-        if not preserve_profile:
+        if not preserve_profile and not exact_transport_pair:
             profile["fixture"]["users_per_tournament"] = target_users
             profile["fixture"]["max_total_users"] = target_users
             manifest["tournaments"][0]["user_count"] = target_users
@@ -558,6 +615,12 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
         failing_session_token = users[0].session_token
         failing_attempts = 0
         failed_once = False
+        pair_ready_counts = {
+            str(tournament["slug"]): 420
+            for tournament in manifest["tournaments"]
+        } if exact_transport_pair else {}
+        if exact_transport_pair:
+            pair_ready_counts[users[0].tournament_slug] -= 1
 
         class FakeResponse:
             status = 200
@@ -629,9 +692,24 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 )
             body = (
                 json.dumps(
-                    {"active_round": {"ready_count": max(0, len(users) - 1)}}
+                    {
+                        "active_round": {
+                            "ready_count": (
+                                next(
+                                    (
+                                        count
+                                        for slug, count in pair_ready_counts.items()
+                                        if f"/tournaments/{slug}/" in path
+                                    ),
+                                    0,
+                                )
+                                if exact_transport_pair
+                                else max(0, len(users) - 1)
+                            )
+                        }
+                    }
                 ).encode("ascii")
-                if path.endswith("/deadlock/ready-check")
+                if method == "GET" and "/deadlock/ready-check" in path
                 else b'{"changed":true}'
                 if method == "POST"
                 else b"<!doctype html><html><body>ok</body></html>"
@@ -658,6 +736,30 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 500 if inject_failure and failure_kind == "http_error" else 200
             )
 
+        def transport_pair_request(
+            _client: object,
+            method: str,
+            _path: str,
+            *,
+            headers: dict[str, str],
+            **_kwargs: object,
+        ) -> object:
+            cookie = headers.get("Cookie", "")
+            inject_failure = failing_session_token in cookie
+            if inject_failure and failure_kind == "transport":
+                raise URLError("synthetic bounded paired-transport failure")
+            status = 500 if inject_failure and failure_kind == "http_error" else 200
+            body = b'{"error":"synthetic"}' if status >= 400 else b'{"changed":true}'
+            return SimpleNamespace(
+                status=status,
+                reason="synthetic",
+                headers={"etag": '"fixture-etag"', "cf-ray": "fixture-ray"},
+                body=body,
+                http_version="1.1",
+                connection_reused=False,
+                timing={"ttfb_ms": 1.0, "total_ms": 1.0},
+            )
+
         with tempfile.TemporaryDirectory(prefix="terminal-failure-builder-") as temporary:
             report_path = Path(temporary) / "report.json"
             manifest_path = Path(temporary) / "manifest.json"
@@ -679,6 +781,20 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 else:
                     stack.enter_context(
                         patch("tools.platform_external_load.urlopen", side_effect=urlopen)
+                    )
+                if exact_transport_pair:
+                    stack.enter_context(
+                        patch(
+                            "tools.platform_http_transport.HTTP11KeepAliveClient.request",
+                            autospec=True,
+                            side_effect=transport_pair_request,
+                        )
+                    )
+                    stack.enter_context(
+                        patch(
+                            "tools.platform_external_load.spread_offsets",
+                            side_effect=lambda count, _duration: [0.0] * count,
+                        )
                     )
                 stack.enter_context(
                     patch("socket.socket.connect", side_effect=AssertionError("network access is forbidden in this test"))
