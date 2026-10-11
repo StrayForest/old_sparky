@@ -1106,6 +1106,24 @@ def _project_request_perf_sampling(value: Any) -> dict[str, Any]:
     return output
 
 
+def _project_admission_shed_counts(value: Any) -> dict[str, int] | None:
+    """Project the fixed admission-shed population counters fail-closed."""
+
+    source = _mapping(value)
+    fields = ("observed", "shed", "not_shed", "unknown")
+    if set(source) != set(fields):
+        return None
+    counts: dict[str, int] = {}
+    for key in fields:
+        number = source.get(key)
+        if type(number) is not int or number < 0 or number > 1_000_000_000_000:
+            return None
+        counts[key] = number
+    if counts["observed"] != counts["shed"] + counts["not_shed"] + counts["unknown"]:
+        return None
+    return counts
+
+
 def _copy_status(source: dict[str, Any], key: str) -> int | None:
     value = source.get(key)
     if type(value) is not int:
@@ -1479,6 +1497,11 @@ def _project_summary(value: Any) -> dict[str, Any]:
     )
     if request_perf_sampling:
         output["request_perf_sampling"] = request_perf_sampling
+    admission_shed = _project_admission_shed_counts(
+        source.get("authenticated_read_admission_shed")
+    )
+    if admission_shed is not None:
+        output["authenticated_read_admission_shed"] = admission_shed
     timing = _project_timing(source.get("timing"))
     if timing:
         output["timing"] = timing
