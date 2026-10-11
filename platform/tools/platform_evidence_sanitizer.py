@@ -102,6 +102,14 @@ SAFE_PHASES = frozenset(
         "manual_refresh",
         "authenticated_page_load",
         "write_burst",
+        "close_a",
+        "keepalive_b",
+        "keepalive_c",
+        "close_d",
+        "write_external_vote_close_a",
+        "write_external_vote_keepalive_b",
+        "write_external_vote_keepalive_c",
+        "write_external_vote_close_d",
         "page_load",
         "other",
     }
@@ -886,7 +894,12 @@ PUBLIC_TRANSPORT_PHASES = frozenset(
         "total_ms",
     }
 )
-PUBLIC_TRANSPORT_NAMES = frozenset({"urllib-http1-close", "http1-keepalive", "other"})
+PUBLIC_TRANSPORT_NAMES = frozenset(
+    {"urllib-http1-close", "http1-close", "http1-keepalive", "other"}
+)
+PUBLIC_CLIENT_TRANSPORTS = frozenset(
+    {*PUBLIC_TRANSPORT_NAMES, "ready-vote-http1-reuse-pair"}
+)
 PUBLIC_HTTP_VERSIONS = frozenset({"1.0", "1.1", "2", "3", "other"})
 PUBLIC_PROCESS_LABELS = frozenset(
     {
@@ -1707,6 +1720,11 @@ def _project_phase(value: Any) -> dict[str, Any]:
     status = source.get("status")
     if _allowed_string(status, frozenset({"complete", "incomplete", "other"})) is not None:
         output["status"] = status
+    transport = source.get("transport")
+    if _allowed_string(
+        transport, frozenset({"http1-close", "http1-keepalive"})
+    ) is not None:
+        output["transport"] = transport
     concurrency_stages = source.get("concurrency_stages")
     if isinstance(concurrency_stages, list):
         projected_stages: list[int] = []
@@ -2226,7 +2244,7 @@ def _project_external_load(value: Any) -> dict[str, Any]:
     ) is not None:
         output["scenario_kind"] = scenario
     transport = source.get("client_transport")
-    if _allowed_string(transport, PUBLIC_TRANSPORT_NAMES) is not None:
+    if _allowed_string(transport, PUBLIC_CLIENT_TRANSPORTS) is not None:
         output["client_transport"] = transport
     trace = _mapping(source.get("trace"))
     if trace:
@@ -2474,7 +2492,7 @@ def _observer_timeline_metrics_valid(row: dict[str, Any]) -> bool:
             "max_write_mb_per_second",
         }
     )
-    for key in ("api_process", "web_process"):
+    for key in ("api_process", "web_process", "nginx_process"):
         process = row.get(key)
         if process is None:
             continue
@@ -2486,8 +2504,40 @@ def _observer_timeline_metrics_valid(row: dict[str, Any]) -> bool:
                     return False
         for field in process_number_fields:
             if field in process and process[field] is not None:
-                if finite_number(process[field]) is None:
+                number = finite_number(process[field])
+                if number is None or (key == "nginx_process" and number < 0):
                     return False
+
+    nginx_cpu_status = row.get("nginx_cpu_status")
+    nginx_process = row.get("nginx_process")
+    if nginx_cpu_status is not None:
+        if nginx_cpu_status not in {"known", "unknown"}:
+            return False
+        if nginx_cpu_status == "known":
+            if not isinstance(nginx_process, dict):
+                return False
+            process_count = safe_int(nginx_process.get("process_count"))
+            cpu_percent = finite_number(nginx_process.get("cpu_percent"))
+            core_source = row.get("cpu_per_core_percent")
+            has_valid_core_sample = isinstance(core_source, dict) and any(
+                isinstance(core, str)
+                and core in PUBLIC_CPU_CORE_KEYS
+                and finite_number(value) is not None
+                and 0 <= finite_number(value) <= 100
+                for core, value in core_source.items()
+            )
+            if (
+                process_count is None
+                or process_count <= 0
+                or cpu_percent is None
+                or cpu_percent < 0
+                or not has_valid_core_sample
+            ):
+                return False
+        elif nginx_process is not None:
+            return False
+    elif nginx_process is not None:
+        return False
 
     connection_fields = frozenset({"total", "established", "limit", "used", "available"})
     for key in ("api_connections",):
@@ -2641,6 +2691,11 @@ def _project_observer_timeline(
             "deadlock-api": row.get("api_process"),
             "deadlock-web": row.get("web_process"),
         }
+        nginx_cpu_status = row.get("nginx_cpu_status")
+        if nginx_cpu_status is not None:
+            projected["nginx_cpu_status"] = nginx_cpu_status
+            if nginx_cpu_status == "known":
+                process_source["nginx"] = row.get("nginx_process")
         processes = _project_process_metrics(process_source)
         if processes:
             projected["processes"] = processes

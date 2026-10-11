@@ -91,8 +91,23 @@ RESPONSE_JSON_CAPTURE_LIMIT = 64 * 1024
 MAX_MEASUREMENT = 1_000_000_000_000.0
 DEFAULT_CLIENT_TRANSPORT = "urllib-http1-close"
 HTTP11_KEEPALIVE_TRANSPORT = "http1-keepalive"
+HTTP11_CLOSE_TRANSPORT = "http1-close"
+READY_VOTE_TRANSPORT_PAIR_PROFILE_ID = "ready-vote-transport-pair-v1"
+READY_VOTE_TRANSPORT_PAIR_LABEL = "ready-vote-http1-reuse-pair"
+READY_VOTE_TRANSPORT_PAIR_PHASES = (
+    ("close-a", HTTP11_CLOSE_TRANSPORT),
+    ("keepalive-b", HTTP11_KEEPALIVE_TRANSPORT),
+    ("keepalive-c", HTTP11_KEEPALIVE_TRANSPORT),
+    ("close-d", HTTP11_CLOSE_TRANSPORT),
+)
+READY_VOTE_TRANSPORT_PAIR_PHASE_ACTIONS = 2_100
+READY_VOTE_TRANSPORT_PAIR_TOURNAMENTS_PER_PHASE = 5
+READY_VOTE_TRANSPORT_PAIR_USERS_PER_TOURNAMENT = 420
 SUPPORTED_PAGE_TRANSPORTS = frozenset(
     {DEFAULT_CLIENT_TRANSPORT, HTTP11_KEEPALIVE_TRANSPORT}
+)
+SUPPORTED_TRANSPORT_TIMING_NAMES = frozenset(
+    {*SUPPORTED_PAGE_TRANSPORTS, HTTP11_CLOSE_TRANSPORT}
 )
 MARKER_RE = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,139}$")
@@ -405,6 +420,117 @@ SOURCE_BINDING_KEYS = frozenset(
 
 class ExternalLoadError(RuntimeError):
     """Raised when a manifest or load contract is invalid."""
+
+
+def build_ready_vote_transport_pair_plan(
+    profile_id: str,
+    manifest: Mapping[str, Any],
+    users: list[VirtualUser],
+    phase_plan: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Build the one closed, four-leg Ready Vote transport diagnostic plan.
+
+    Each ABBA phase owns five whole tournaments and exactly 420 actors from
+    each. The remaining 80 actors in every tournament are fixture-only and
+    never appear in a measured phase. No caller-provided transport or cohort
+    mapping is accepted.
+    """
+
+    if profile_id != READY_VOTE_TRANSPORT_PAIR_PROFILE_ID:
+        raise ExternalLoadError("Ready Vote transport pair profile is unsupported")
+    tournaments = manifest.get("tournaments")
+    if not isinstance(tournaments, list) or len(tournaments) != 20:
+        raise ExternalLoadError("Ready Vote transport pair tournament fixture is invalid")
+    slugs: list[str] = []
+    for entry in tournaments:
+        if not isinstance(entry, Mapping):
+            raise ExternalLoadError("Ready Vote transport pair tournament fixture is invalid")
+        slug = entry.get("slug")
+        if not isinstance(slug, str) or not slug or slug in slugs:
+            raise ExternalLoadError("Ready Vote transport pair tournament fixture is invalid")
+        if entry.get("user_count") != 500:
+            raise ExternalLoadError("Ready Vote transport pair tournament fixture is invalid")
+        slugs.append(slug)
+    if len(users) != 10_000 or len(phase_plan) != len(READY_VOTE_TRANSPORT_PAIR_PHASES):
+        raise ExternalLoadError("Ready Vote transport pair actor fixture is invalid")
+
+    users_by_slug: dict[str, list[VirtualUser]] = {slug: [] for slug in slugs}
+    all_user_ids: set[str] = set()
+    for user in users:
+        if user.tournament_slug not in users_by_slug or user.user_id in all_user_ids:
+            raise ExternalLoadError("Ready Vote transport pair actor fixture is invalid")
+        all_user_ids.add(user.user_id)
+        users_by_slug[user.tournament_slug].append(user)
+    if any(len(group) != 500 for group in users_by_slug.values()):
+        raise ExternalLoadError("Ready Vote transport pair actor fixture is invalid")
+
+    expected_names = tuple(name for name, _transport in READY_VOTE_TRANSPORT_PAIR_PHASES)
+    expected_users_by_phase: dict[str, tuple[VirtualUser, ...]] = {}
+    expected_slugs_by_phase: dict[str, tuple[str, ...]] = {}
+    for index, (phase, (expected_name, _transport)) in enumerate(
+        zip(phase_plan, READY_VOTE_TRANSPORT_PAIR_PHASES, strict=True)
+    ):
+        if (
+            phase.get("name") != expected_name
+            or phase.get("logical_actions") != READY_VOTE_TRANSPORT_PAIR_PHASE_ACTIONS
+            or phase.get("duration_seconds") != 30
+            or phase.get("target_logical_actions_per_second") != 70
+        ):
+            raise ExternalLoadError("Ready Vote transport pair phase contract is invalid")
+        start = index * READY_VOTE_TRANSPORT_PAIR_TOURNAMENTS_PER_PHASE
+        phase_slugs = tuple(
+            slugs[start : start + READY_VOTE_TRANSPORT_PAIR_TOURNAMENTS_PER_PHASE]
+        )
+        phase_users = tuple(
+            user
+            for slug in phase_slugs
+            for user in users_by_slug[slug][
+                :READY_VOTE_TRANSPORT_PAIR_USERS_PER_TOURNAMENT
+            ]
+        )
+        if len(phase_users) != READY_VOTE_TRANSPORT_PAIR_PHASE_ACTIONS:
+            raise ExternalLoadError("Ready Vote transport pair cohort is invalid")
+        if any(
+            sum(user.tournament_slug == slug for user in phase_users)
+            != READY_VOTE_TRANSPORT_PAIR_USERS_PER_TOURNAMENT
+            for slug in phase_slugs
+        ):
+            raise ExternalLoadError("Ready Vote transport pair cohort is invalid")
+        expected_users_by_phase[expected_name] = phase_users
+        expected_slugs_by_phase[expected_name] = phase_slugs
+
+    phase_user_ids = [
+        {user.user_id for user in expected_users_by_phase[name]}
+        for name in expected_names
+    ]
+    phase_tournament_sets = [
+        set(expected_slugs_by_phase[name]) for name in expected_names
+    ]
+    for left in range(len(expected_names)):
+        for right in range(left + 1, len(expected_names)):
+            if phase_user_ids[left] & phase_user_ids[right]:
+                raise ExternalLoadError("Ready Vote transport pair actors overlap")
+            if phase_tournament_sets[left] & phase_tournament_sets[right]:
+                raise ExternalLoadError("Ready Vote transport pair tournaments overlap")
+    if set().union(*phase_tournament_sets) != set(slugs):
+        raise ExternalLoadError("Ready Vote transport pair cohort set is incomplete")
+    selected_user_ids = set().union(*phase_user_ids)
+    if len(selected_user_ids) != 8_400:
+        raise ExternalLoadError("Ready Vote transport pair actor set is incomplete")
+    if any(
+        len(users_by_slug[slug][READY_VOTE_TRANSPORT_PAIR_USERS_PER_TOURNAMENT :])
+        != 80
+        for slug in slugs
+    ):
+        raise ExternalLoadError("Ready Vote transport pair unused cohort is invalid")
+    return {
+        name: {
+            "transport": transport,
+            "tournament_slugs": expected_slugs_by_phase[name],
+            "users": expected_users_by_phase[name],
+        }
+        for name, transport in READY_VOTE_TRANSPORT_PAIR_PHASES
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -976,7 +1102,7 @@ class _ResultAccumulator:
         if result.transport_timing:
             transport = result.transport_timing
             transport_name = transport.get("transport")
-            if transport_name in SUPPORTED_PAGE_TRANSPORTS:
+            if transport_name in SUPPORTED_TRANSPORT_TIMING_NAMES:
                 self.transport_names[str(transport_name)] += 1
             elif transport_name is not None:
                 self.transport_names["other"] += 1
@@ -1738,6 +1864,7 @@ def _request(
     attempt_number: int = 1,
     url_prefix: str = "/api/v1",
     diagnostic_id: str | None = None,
+    transport_client: HTTP11KeepAliveClient | None = None,
     budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     if budget is not None:
@@ -1781,6 +1908,7 @@ def _request(
     cf_error_origin: str | None = None
     retry_after: str | None = None
     exception_at_utc: str | None = None
+    transport_timing: dict[str, Any] | None = None
 
     def diagnostic_headers(headers: Any) -> tuple[str | None, str | None, str | None]:
         if status < 400:
@@ -1792,34 +1920,68 @@ def _request(
         )
 
     try:
-        # URL is constructed only from the fixed manifest origin and a route
-        # selected by this module; this is not an arbitrary fetch primitive.
-        with urlopen(
-            request,
-            timeout=timeout,
-            context=_default_https_context(),
-        ) as response:  # nosec B310
+        if transport_client is not None:
+            deadline = None
+            if budget is not None:
+                deadline = budget.scenario_deadline_monotonic
+                if budget.runner_deadline_monotonic is not None:
+                    deadline = min(deadline, budget.runner_deadline_monotonic)
+            response = transport_client.request(
+                method,
+                f"{url_prefix}{path}",
+                headers=headers,
+                body=body,
+                timeout=timeout,
+                deadline=deadline,
+            )
+            transport_timing = response.timing
             status = int(response.status)
             cf_ray = response.headers.get("cf-ray", "")[:128] or None
             cf_error_type, cf_error_origin, retry_after = diagnostic_headers(response.headers)
             response_etag = response.headers.get("etag", "")[:512] or None
-            time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
-            response_bytes, captured_body, response_body_error = _read_response_body(
-                response,
-                capture_json=_response_requires_json_projection(method, path),
-            )
-            if response_body_error is not None:
-                error_kind = response_body_error
-                if error_kind == "TimeoutError" and diagnostic_id:
-                    exception_at_utc = datetime.now(UTC).isoformat()
-            if budget is not None:
-                budget.check(phase, operation="body_complete")
+            measured_ttfb = response.timing.get("ttfb_ms")
+            if isinstance(measured_ttfb, (int, float)) and math.isfinite(float(measured_ttfb)):
+                time_to_first_byte_ms = float(measured_ttfb)
+            response_bytes = len(response.body)
             if response_body_error is None:
                 response_json = _response_json_projection(
                     method=method,
                     path=path,
-                    body=captured_body,
+                    body=response.body[:RESPONSE_JSON_CAPTURE_LIMIT],
                 )
+            if status >= 400:
+                error_kind = "http_error"
+            if budget is not None:
+                budget.check(phase, operation="body_complete")
+        else:
+            # URL is constructed only from the fixed manifest origin and a route
+            # selected by this module; this is not an arbitrary fetch primitive.
+            with urlopen(
+                request,
+                timeout=timeout,
+                context=_default_https_context(),
+            ) as response:  # nosec B310
+                status = int(response.status)
+                cf_ray = response.headers.get("cf-ray", "")[:128] or None
+                cf_error_type, cf_error_origin, retry_after = diagnostic_headers(response.headers)
+                response_etag = response.headers.get("etag", "")[:512] or None
+                time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
+                response_bytes, captured_body, response_body_error = _read_response_body(
+                    response,
+                    capture_json=_response_requires_json_projection(method, path),
+                )
+                if response_body_error is not None:
+                    error_kind = response_body_error
+                    if error_kind == "TimeoutError" and diagnostic_id:
+                        exception_at_utc = datetime.now(UTC).isoformat()
+                if budget is not None:
+                    budget.check(phase, operation="body_complete")
+                if response_body_error is None:
+                    response_json = _response_json_projection(
+                        method=method,
+                        path=path,
+                        body=captured_body,
+                    )
     except HTTPError as exc:
         status = int(exc.code)
         cf_ray = exc.headers.get("cf-ray", "")[:128] or None
@@ -1845,9 +2007,13 @@ def _request(
             )
     except http.client.HTTPException:
         error_kind = "transport_http_protocol"
-    except (URLError, TimeoutError, OSError) as exc:
+        if transport_client is not None:
+            transport_timing = dict(transport_client.last_timing)
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
         exception_at_utc = datetime.now(UTC).isoformat()
         error_kind = type(exc).__name__
+        if transport_client is not None:
+            transport_timing = dict(transport_client.last_timing)
     finished_at = time.monotonic()
     elapsed_ms = (finished_at - started_at) * 1000
     finished_at_utc = datetime.now(UTC).isoformat()
@@ -1875,6 +2041,7 @@ def _request(
         started_at_utc=started_at_utc if diagnostic_id else None,
         exception_at_utc=exception_at_utc if diagnostic_id else None,
         finished_at_utc=finished_at_utc if diagnostic_id else None,
+        transport_timing=transport_timing,
         started_at_monotonic=started_at,
         finished_at_monotonic=finished_at,
         user_observed_elapsed_ms=elapsed_ms,
@@ -2507,6 +2674,7 @@ def _ready_vote_request(
     session_cookie_name: str,
     csrf_cookie_name: str,
     attempt_number: int = 1,
+    transport_client: HTTP11KeepAliveClient | None = None,
     budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     return _request(
@@ -2520,6 +2688,7 @@ def _ready_vote_request(
         csrf_cookie_name=csrf_cookie_name,
         json_payload={"choice": "yes"},
         attempt_number=attempt_number,
+        transport_client=transport_client,
         budget=budget,
     )
 
@@ -2573,6 +2742,7 @@ def _ready_vote_action(
     session_cookie_name: str,
     csrf_cookie_name: str,
     retry_policy: dict[str, Any] | None = None,
+    transport_client: HTTP11KeepAliveClient | None = None,
     budget: LoadRuntimeBudget | None = None,
 ) -> LogicalRequestResult:
     """Issue one request plus only the profile's explicit overload retries."""
@@ -2591,6 +2761,7 @@ def _ready_vote_action(
             session_cookie_name=session_cookie_name,
             csrf_cookie_name=csrf_cookie_name,
             attempt_number=retry_index + 1,
+            transport_client=transport_client,
             budget=budget,
         )
         attempts.append(result)
@@ -2842,6 +3013,30 @@ def _run_load_impl(
         raise ExternalLoadError(
             "non-default client transports are only supported for page-load"
         )
+    transport_pair_plan: dict[str, dict[str, Any]] | None = None
+    if expected_profile_id == READY_VOTE_TRANSPORT_PAIR_PROFILE_ID:
+        if (
+            mode != "ready-vote"
+            or scenario_kind != "stress"
+            or client_transport != DEFAULT_CLIENT_TRANSPORT
+            or spread_seconds != 0
+            or concurrency != 128
+            or timeout != 30
+            or duplicate_count != 0
+            or manual_refresh_count != 0
+            or expected_profile_version != 1
+            or expected_primary_action_count != 8_400
+            or expected_total_logical_action_count != 8_400
+            or expected_state_read_count != 20
+            or max_http_attempts != 25_220
+        ):
+            raise ExternalLoadError("Ready Vote transport pair execution contract is invalid")
+        transport_pair_plan = build_ready_vote_transport_pair_plan(
+            expected_profile_id,
+            manifest,
+            users,
+            phase_plan or [],
+        )
     planned_attempts = planned_http_attempts(
         mode=mode,
         user_count=len(users),
@@ -2998,6 +3193,38 @@ def _run_load_impl(
     overall_raw_acc = _ResultAccumulator()
 
     if mode == "ready-vote":
+        pair_phase_client_contexts: dict[
+            str,
+            tuple[Callable[[], HTTP11KeepAliveClient], list[HTTP11KeepAliveClient]],
+        ] = {}
+
+        def make_pair_phase_client_context(
+            phase_name: str,
+        ) -> tuple[Callable[[], HTTP11KeepAliveClient], list[HTTP11KeepAliveClient]]:
+            if transport_pair_plan is None:
+                raise ExternalLoadError("Ready Vote transport pair is unavailable")
+            phase_contract = transport_pair_plan[phase_name]
+            reuse_connection = phase_contract["transport"] == HTTP11_KEEPALIVE_TRANSPORT
+            phase_clients: list[HTTP11KeepAliveClient] = []
+            phase_clients_lock = threading.Lock()
+            phase_thread_local = threading.local()
+
+            def get_client() -> HTTP11KeepAliveClient:
+                client = getattr(phase_thread_local, "client", None)
+                if client is None:
+                    client = HTTP11KeepAliveClient(
+                        origin,
+                        timeout=timeout,
+                        max_response_bytes=RESPONSE_BODY_LIMIT,
+                        reuse_connection=reuse_connection,
+                    )
+                    phase_thread_local.client = client
+                    with phase_clients_lock:
+                        phase_clients.append(client)
+                return client
+
+            return get_client, phase_clients
+
         def vote_builder(
             origin_value: str,
             user: VirtualUser,
@@ -3012,6 +3239,10 @@ def _run_load_impl(
                 kwargs["retry_policy"] = retry_policy
             if runtime_budget is not None:
                 kwargs["budget"] = runtime_budget
+            phase_name = phase.removeprefix("write_external_vote_")
+            phase_context = pair_phase_client_contexts.get(phase_name)
+            if phase_context is not None:
+                kwargs["transport_client"] = phase_context[0]()
             return _ready_vote_action(
                 origin_value,
                 user,
@@ -3072,12 +3303,25 @@ def _run_load_impl(
                     raise ExternalLoadError(
                         f"phase {phase_name!r} must have a positive duration, rate and action count"
                     )
-                phase_users = users[cursor : cursor + action_count]
+                pair_phase = (
+                    transport_pair_plan.get(phase_name)
+                    if transport_pair_plan is not None
+                    else None
+                )
+                phase_users = (
+                    list(pair_phase["users"])
+                    if pair_phase is not None
+                    else users[cursor : cursor + action_count]
+                )
                 if len(phase_users) != action_count:
                     raise ExternalLoadError(
                         "phase plan requires more unique fixture users than the manifest provides"
                     )
                 cursor += action_count
+                if pair_phase is not None:
+                    pair_phase_client_contexts[phase_name] = (
+                        make_pair_phase_client_context(phase_name)
+                    )
                 phase_started_at_utc = datetime.now(UTC)
                 phase_started = time.monotonic()
                 phase_logical_acc = _LogicalAccumulator()
@@ -3095,17 +3339,23 @@ def _run_load_impl(
                     for attempt in action.attempts:
                         primary_raw_acc.add(attempt)
 
-                _, phase_submission_window = run_progress_rate_phase(
-                    origin,
-                    phase_users,
-                    phase=f"write_external_vote_{phase_name}",
-                    duration_seconds=duration_seconds,
-                    concurrency=concurrency,
-                    timeout=timeout,
-                    request_builder=vote_builder,
-                    budget=runtime_budget,
-                    result_consumer=consume_primary_phase,
-                )
+                try:
+                    _, phase_submission_window = run_progress_rate_phase(
+                        origin,
+                        phase_users,
+                        phase=f"write_external_vote_{phase_name}",
+                        duration_seconds=duration_seconds,
+                        concurrency=concurrency,
+                        timeout=timeout,
+                        request_builder=vote_builder,
+                        budget=runtime_budget,
+                        result_consumer=consume_primary_phase,
+                    )
+                finally:
+                    phase_context = pair_phase_client_contexts.pop(phase_name, None)
+                    if phase_context is not None:
+                        for client in phase_context[1]:
+                            client.close()
                 offered_window_seconds += phase_submission_window
                 phase_wall_seconds = max(0.001, time.monotonic() - phase_started)
                 phase_finished_at_utc = datetime.now(UTC)
@@ -3145,6 +3395,9 @@ def _run_load_impl(
                         and timing_summary_is_complete(phase_raw.get("timing"))
                     ),
                     "target_logical_actions_per_second": target_rate,
+                    "transport": (
+                        pair_phase["transport"] if pair_phase is not None else None
+                    ),
                     "duration_seconds": duration_seconds,
                     "started_at": phase_started_at_utc.isoformat(),
                     "finished_at": phase_finished_at_utc.isoformat(),
@@ -3152,7 +3405,15 @@ def _run_load_impl(
                     "raw_http": phase_raw,
                     "logical": phase_logical,
                 }
-            primary_users = users[:cursor]
+            primary_users = (
+                [
+                    user
+                    for phase_name, _transport in READY_VOTE_TRANSPORT_PAIR_PHASES
+                    for user in transport_pair_plan[phase_name]["users"]
+                ]
+                if transport_pair_plan is not None
+                else users[:cursor]
+            )
             phase_results["ramp"] = {
                 "phases": planned_phases,
                 "logical_actions": cursor,
@@ -3801,7 +4062,11 @@ def _run_load_impl(
         "wall_seconds": round(wall_seconds, 6),
         "opening_spread_seconds": spread_seconds,
         "scenario_kind": scenario_kind,
-        "client_transport": client_transport,
+        "client_transport": (
+            READY_VOTE_TRANSPORT_PAIR_LABEL
+            if transport_pair_plan is not None
+            else client_transport
+        ),
         "duplicate_count": duplicate_count,
         "manual_refresh_count": manual_refresh_count,
         "concurrency": concurrency,

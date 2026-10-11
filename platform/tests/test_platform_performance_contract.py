@@ -10,6 +10,7 @@ import re
 import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -17,10 +18,13 @@ from tools.platform_external_load import (
     ExternalLoadError,
     RequestResult,
     VirtualUser,
+    _annotate_timing,
+    build_ready_vote_transport_pair_plan,
     planned_http_attempts,
     run_load,
     summarize_results,
 )
+from tools.platform_http_transport import TransportResponse
 from tools.platform_external_load_observer import (
     ObserverProgressReceipt,
     OBSERVER_PROGRESS_NAME,
@@ -121,7 +125,7 @@ class PerformanceProfileContractTests(unittest.TestCase):
     def test_active_registry_exposes_bounded_portfolio_metadata(self) -> None:
         profiles = load_profiles()
 
-        self.assertEqual(len(profiles), 11)
+        self.assertEqual(len(profiles), 12)
         self.assertEqual(
             {profile["portfolio"]["status"] for profile in profiles.values()},
             {"active"},
@@ -143,15 +147,382 @@ class PerformanceProfileContractTests(unittest.TestCase):
             else:
                 self.assertTrue(profile["execution"]["require_exact_observer_binding"])
 
+        transport_pair = profiles["ready-vote-transport-pair-v1"]
+        self.assertEqual(transport_pair["category"], "stress")
+        self.assertEqual(transport_pair["acceptance"]["kind"], "stress")
+        self.assertEqual(transport_pair["mode"], "ready-vote")
+        self.assertEqual(
+            transport_pair["portfolio"]["class"],
+            "diagnostic",
+        )
+        self.assertEqual(transport_pair["portfolio"]["cadence"], "on-demand")
+        self.assertEqual(
+            transport_pair["fixture"],
+            {
+                "tournament_count": 20,
+                "users_per_tournament": 500,
+                "setup_concurrency": 20,
+                "max_total_users": 10000,
+            },
+        )
+        self.assertEqual(
+            [
+                (
+                    phase["name"],
+                    phase["target_logical_actions_per_second"],
+                    phase["duration_seconds"],
+                    phase["logical_actions"],
+                )
+                for phase in transport_pair["traffic"]["phases"]
+            ],
+            [
+                ("close-a", 70, 30, 2100),
+                ("keepalive-b", 70, 30, 2100),
+                ("keepalive-c", 70, 30, 2100),
+                ("close-d", 70, 30, 2100),
+            ],
+        )
+        self.assertNotIn("client_transport", transport_pair)
+
     def test_runtime_budget_includes_retries_duplicates_and_state_reads(self) -> None:
         profiles = load_profiles()
         capacity = profiles["ready-vote-capacity-ramp-v2"]
         saturation = profiles["ready-vote-saturation-ramp-v4"]
+        transport_pair = profiles["ready-vote-transport-pair-v1"]
 
         self.assertEqual(profile_contract(capacity)["planned_work"]["http_attempts"], 31_540)
         self.assertEqual(capacity["portfolio"]["request_budget"]["max_http_attempts"], 31_540)
         self.assertEqual(profile_contract(saturation)["planned_work"]["http_attempts"], 45_940)
         self.assertEqual(saturation["portfolio"]["request_budget"]["max_http_attempts"], 50_000)
+        self.assertEqual(
+            profile_contract(transport_pair)["planned_work"]["logical_actions"],
+            8_400,
+        )
+        self.assertEqual(
+            profile_contract(transport_pair)["planned_work"]["http_attempts"],
+            25_220,
+        )
+        self.assertEqual(
+            transport_pair["portfolio"]["request_budget"],
+            {
+                "max_logical_actions": 8_400,
+                "max_http_attempts": 25_220,
+                "max_duration_seconds": 300,
+            },
+        )
+        self.assertEqual(transport_pair["portfolio"]["cost_budget"]["max_runner_minutes"], 30)
+        pair_manifest = {
+            "tournaments": [
+                {"slug": f"pair-tournament-{index:02d}", "user_count": 500}
+                for index in range(20)
+            ]
+        }
+        pair_users = [
+            VirtualUser(
+                user_id=f"pair-user-{tournament_index:02d}-{user_index:03d}",
+                tournament_slug=f"pair-tournament-{tournament_index:02d}",
+                session_token=f"session-{tournament_index:02d}-{user_index:03d}",
+                csrf_token=f"csrf-{tournament_index:02d}-{user_index:03d}",
+            )
+            for tournament_index in range(20)
+            for user_index in range(500)
+        ]
+        pair_plan = build_ready_vote_transport_pair_plan(
+            "ready-vote-transport-pair-v1",
+            pair_manifest,
+            pair_users,
+            transport_pair["traffic"]["phases"],
+        )
+        expected_transports = {
+            "close-a": "http1-close",
+            "keepalive-b": "http1-keepalive",
+            "keepalive-c": "http1-keepalive",
+            "close-d": "http1-close",
+        }
+        used_pair_user_ids: set[str] = set()
+        used_pair_tournament_slugs: set[str] = set()
+        for phase_name, expected_transport in expected_transports.items():
+            phase = pair_plan[phase_name]
+            self.assertEqual(phase["transport"], expected_transport)
+            self.assertEqual(len(phase["tournament_slugs"]), 5)
+            self.assertEqual(len(phase["users"]), 2100)
+            self.assertFalse(used_pair_user_ids & {user.user_id for user in phase["users"]})
+            self.assertFalse(used_pair_tournament_slugs & set(phase["tournament_slugs"]))
+            used_pair_user_ids.update(user.user_id for user in phase["users"])
+            used_pair_tournament_slugs.update(phase["tournament_slugs"])
+            for slug in phase["tournament_slugs"]:
+                self.assertEqual(
+                    sum(user.tournament_slug == slug for user in phase["users"]),
+                    420,
+                )
+        self.assertEqual(len(used_pair_user_ids), 8400)
+        self.assertEqual(len(used_pair_tournament_slugs), 20)
+        self.assertEqual(len(pair_users) - len(used_pair_user_ids), 1600)
+
+        overlapping_pair_users = list(pair_users)
+        overlapping_pair_users[2500] = VirtualUser(
+            user_id=overlapping_pair_users[0].user_id,
+            tournament_slug=overlapping_pair_users[2500].tournament_slug,
+            session_token=overlapping_pair_users[2500].session_token,
+            csrf_token=overlapping_pair_users[2500].csrf_token,
+        )
+        with self.assertRaisesRegex(ExternalLoadError, "actor fixture is invalid"):
+            build_ready_vote_transport_pair_plan(
+                "ready-vote-transport-pair-v1",
+                pair_manifest,
+                overlapping_pair_users,
+                transport_pair["traffic"]["phases"],
+            )
+
+        wrong_pair_phases = deepcopy(transport_pair["traffic"]["phases"])
+        wrong_pair_phases[1]["name"] = "close-b"
+        with self.assertRaisesRegex(ExternalLoadError, "phase contract"):
+            build_ready_vote_transport_pair_plan(
+                "ready-vote-transport-pair-v1",
+                pair_manifest,
+                pair_users,
+                wrong_pair_phases,
+            )
+
+        class RecordingTransportClient:
+            instances: list["RecordingTransportClient"] = []
+
+            def __init__(
+                self,
+                _origin: str,
+                *,
+                timeout: float,
+                max_response_bytes: int,
+                reuse_connection: bool,
+            ) -> None:
+                self.timeout = timeout
+                self.max_response_bytes = max_response_bytes
+                self.reuse_connection = reuse_connection
+                self.requests: list[dict[str, object]] = []
+                self.closed = False
+                self.last_timing: dict[str, object] = {}
+                self.__class__.instances.append(self)
+
+            def request(
+                self,
+                method: str,
+                path: str,
+                *,
+                headers: dict[str, str],
+                body: bytes | None = None,
+                timeout: float | None = None,
+                deadline: float | None = None,
+            ) -> TransportResponse:
+                del timeout, deadline
+                reused = self.reuse_connection and bool(self.requests)
+                self.requests.append(
+                    {
+                        "method": method,
+                        "path": path,
+                        "headers": dict(headers),
+                        "body": body,
+                        "reused": reused,
+                    }
+                )
+                timing: dict[str, object] = {
+                    "transport": (
+                        "http1-keepalive"
+                        if self.reuse_connection
+                        else "http1-close"
+                    ),
+                    "connection_reused": reused,
+                    "request_write_ms": 0.1,
+                    "edge_wait_ms": 0.2,
+                    "ttfb_ms": 0.3,
+                    "body_receive_ms": 0.1,
+                    "total_ms": 0.4,
+                    "http_version": "1.1",
+                }
+                self.last_timing = timing
+                return TransportResponse(
+                    status=200,
+                    reason="OK",
+                    headers={"connection": "keep-alive"},
+                    body=b'{"changed":true}',
+                    http_version="1.1",
+                    connection_reused=reused,
+                    timing=timing,
+                )
+
+            def close(self) -> None:
+                self.closed = True
+
+        phase_observations: list[dict[str, object]] = []
+
+        def fast_rate_phase(
+            origin: str,
+            phase_users: list[VirtualUser],
+            *,
+            phase: str,
+            duration_seconds: float,
+            request_builder,
+            result_consumer,
+            **_kwargs: object,
+        ) -> tuple[list[object], float]:
+            phase_observations.append(
+                {"phase": phase, "users": len(phase_users), "duration": duration_seconds}
+            )
+            for index, user in enumerate(phase_users):
+                scheduled_at = time.monotonic()
+                result = request_builder(origin, user, phase, 30)
+                result = _annotate_timing(
+                    result,
+                    scheduled_at=scheduled_at,
+                    enqueued_at=scheduled_at,
+                    fallback_started_at=scheduled_at,
+                    fallback_finished_at=scheduled_at + 0.001,
+                )
+                result.submission_index = index
+                for attempt in result.attempts:
+                    attempt.submission_index = index
+                result_consumer(result)
+            return [], duration_seconds
+
+        def empty_duplicate_phase(*_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+        from tools.platform_external_load import _request as production_request
+
+        def request_with_state_fixture(
+            origin: str,
+            user: VirtualUser,
+            **kwargs: object,
+        ) -> RequestResult:
+            if kwargs.get("method") == "GET":
+                return RequestResult(
+                    phase=str(kwargs["phase"]),
+                    method="GET",
+                    path=str(kwargs["path"]),
+                    status=200,
+                    elapsed_ms=0.1,
+                    ok=True,
+                    response_bytes=1,
+                    response_json={"active_round": {"ready_count": 420}},
+                    time_to_first_byte_ms=0.1,
+                )
+            return production_request(origin, user, **kwargs)
+
+        runner_manifest = {
+            "origin": "https://load-test.invalid",
+            "session_cookie_name": "deadlock_platform_session",
+            "csrf_cookie_name": "deadlock_platform_session_csrf",
+            "marker": "preprod26082900000000ab",
+            "tournaments": [
+                {
+                    "id": f"pair-id-{index:02d}",
+                    "slug": f"pair-tournament-{index:02d}",
+                    "user_count": 500,
+                }
+                for index in range(20)
+            ],
+        }
+        RecordingTransportClient.instances.clear()
+        with (
+            patch("tools.platform_external_load.HTTP11KeepAliveClient", RecordingTransportClient),
+            patch("tools.platform_external_load.run_rate_phase", fast_rate_phase),
+            patch("tools.platform_external_load.run_phase", empty_duplicate_phase),
+            patch("tools.platform_external_load._request", side_effect=request_with_state_fixture),
+            patch(
+                "tools.platform_external_load._trace",
+                return_value={"status": "200", "ip": "192.0.2.10", "colo": "TEST"},
+            ),
+        ):
+            pair_report = run_load(
+                runner_manifest,
+                pair_users,
+                mode="ready-vote",
+                spread_seconds=0,
+                concurrency=128,
+                timeout=30,
+                duplicate_count=0,
+                manual_refresh_count=0,
+                p95_budget_ms=5000,
+                p99_budget_ms=8000,
+                retry_policy=transport_pair["traffic"]["retry"],
+                phase_plan=transport_pair["traffic"]["phases"],
+                scenario_kind="stress",
+                expected_profile_id="ready-vote-transport-pair-v1",
+                expected_profile_version=1,
+                expected_profile_digest=profile_contract(transport_pair)["profile_digest"],
+                expected_primary_action_count=8400,
+                expected_total_logical_action_count=8400,
+                expected_state_read_count=20,
+                max_http_attempts=25220,
+            )
+
+        self.assertEqual(
+            phase_observations,
+            [
+                {"phase": "write_external_vote_close-a", "users": 2100, "duration": 30.0},
+                {"phase": "write_external_vote_keepalive-b", "users": 2100, "duration": 30.0},
+                {"phase": "write_external_vote_keepalive-c", "users": 2100, "duration": 30.0},
+                {"phase": "write_external_vote_close-d", "users": 2100, "duration": 30.0},
+            ],
+        )
+        self.assertEqual(len(RecordingTransportClient.instances), 4)
+        phase_transport_counts: dict[str, dict[str, int]] = {}
+        for client in RecordingTransportClient.instances:
+            self.assertTrue(client.closed)
+            self.assertEqual(len(client.requests), 2100)
+            self.assertEqual(
+                {request["method"] for request in client.requests},
+                {"POST"},
+            )
+            self.assertEqual(
+                {request["body"] for request in client.requests},
+                {b'{"choice":"yes"}'},
+            )
+            headers = [request["headers"] for request in client.requests]
+            self.assertEqual(
+                {header["X-CSRF-Token"] for header in headers},
+                {header["Cookie"].rsplit("=", 1)[1] for header in headers},
+            )
+            self.assertTrue(
+                all(
+                    header["Cookie"].startswith("deadlock_platform_session=session-")
+                    for header in headers
+                )
+            )
+            phase_names = {header["X-Platform-QA-Phase"] for header in headers}
+            self.assertEqual(len(phase_names), 1)
+            phase_name = next(iter(phase_names))
+            phase_transport_counts[phase_name] = {
+                "calls": len(client.requests),
+                "reused": sum(request["reused"] is True for request in client.requests),
+                "transport_reuse": int(client.reuse_connection),
+            }
+        self.assertEqual(
+            phase_transport_counts,
+            {
+                "write_external_vote_close-a": {
+                    "calls": 2100,
+                    "reused": 0,
+                    "transport_reuse": 0,
+                },
+                "write_external_vote_keepalive-b": {
+                    "calls": 2100,
+                    "reused": 2099,
+                    "transport_reuse": 1,
+                },
+                "write_external_vote_keepalive-c": {
+                    "calls": 2100,
+                    "reused": 2099,
+                    "transport_reuse": 1,
+                },
+                "write_external_vote_close-d": {
+                    "calls": 2100,
+                    "reused": 0,
+                    "transport_reuse": 0,
+                },
+            },
+        )
+        self.assertEqual(pair_report["phases"]["primary"]["logical"]["actions"], 8400)
+        self.assertEqual(pair_report["phases"]["state"]["requests"], 20)
         self.assertEqual(
             planned_http_attempts(
                 mode="ready-vote",

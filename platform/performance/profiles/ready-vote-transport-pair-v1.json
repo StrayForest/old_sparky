@@ -1,0 +1,75 @@
+{
+  "schema": 2,
+  "profile_id": "ready-vote-transport-pair-v1",
+  "profile_version": 1,
+  "portfolio": {
+    "owner": "platform-performance",
+    "hypothesis": "Compare HTTP/1.1 connection reuse under matched Ready Vote load without changing server behavior or counting toward the final profile matrix.",
+    "class": "diagnostic",
+    "status": "active",
+    "cadence": "on-demand",
+    "environment": "production",
+    "request_budget": {"max_logical_actions": 8400, "max_http_attempts": 25220, "max_duration_seconds": 300},
+    "cost_budget": {"max_runner_minutes": 30, "basis": "external runner wall-clock budget"}
+  },
+  "category": "stress",
+  "purpose": "Compare HTTP/1.1 close versus keepalive transport timings under the same fixed Ready Vote workload.",
+  "description": "Diagnostic-only ABBA transport pair with disjoint synthetic tournament cohorts; it does not qualify or replace any final matrix profile.",
+  "mode": "ready-vote",
+  "fixture": {
+    "tournament_count": 20,
+    "users_per_tournament": 500,
+    "setup_concurrency": 20,
+    "max_total_users": 10000
+  },
+  "traffic": {
+    "concurrency": 128,
+    "spread_seconds": 0,
+    "timeout_seconds": 30,
+    "duplicate_count": 0,
+    "manual_refresh_count": 0,
+    "phases": [
+      {"name": "close-a", "target_logical_actions_per_second": 70, "duration_seconds": 30, "logical_actions": 2100},
+      {"name": "keepalive-b", "target_logical_actions_per_second": 70, "duration_seconds": 30, "logical_actions": 2100},
+      {"name": "keepalive-c", "target_logical_actions_per_second": 70, "duration_seconds": 30, "logical_actions": 2100},
+      {"name": "close-d", "target_logical_actions_per_second": 70, "duration_seconds": 30, "logical_actions": 2100}
+    ],
+    "retry": {
+      "max_retries": 2,
+      "overload_status": 503,
+      "overload_code": "READY_VOTE_OVERLOADED",
+      "server_retry_after": "max",
+      "jitter_windows_ms": [[150, 350], [400, 800]]
+    }
+  },
+  "acceptance": {
+    "kind": "stress",
+    "minimum_useful_goodput_actions_per_second": 1,
+    "accepted_request_latency": {"p50_ms": 1500, "p90_ms": 3000, "p95_ms": 5000, "p99_ms": 8000},
+    "logical_latency": {"p95_ms": 8000, "p99_ms": 12000},
+    "max_shed_percent": 0.5,
+    "max_retry_amplification_percent": 0.5,
+    "max_postgres_backend_connections": 52,
+    "max_waiting_backends": 20,
+    "max_lock_waiters": 20,
+    "max_cpu_per_core_percent": 100,
+    "pool_checkout_wait_ms": {"p95_ms": 5000, "p99_ms": 10000},
+    "require_origin_evidence": true,
+    "expected_statuses": [200, 503],
+    "unexpected_statuses": 0
+  },
+  "correctness": {
+    "successful_votes_are_durable": true,
+    "authoritative_ready_count_matches_successful_votes": true,
+    "cleanup_required": true
+  },
+  "execution": {
+    "generator": "GitHub-hosted external runner",
+    "require_exact_observer_binding": true,
+    "measured_origin": "https://old-sparky.com",
+    "origin_role": "fixture preparation, lightweight observer and exact cleanup only",
+    "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
+    "cleanup_workflow": "platform-production-retained-load-cleanup.yml",
+    "abort_workflow": "platform-production-retained-load-abort.yml"
+  }
+}

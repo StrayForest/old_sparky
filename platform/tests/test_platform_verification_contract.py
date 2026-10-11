@@ -2660,6 +2660,7 @@ except lock.VerificationLockError as exc:
             set(profiles),
             {
                 "ready-vote-slo-v2",
+                "ready-vote-transport-pair-v1",
                 "ready-vote-capacity-ramp-v2",
                 "ready-vote-saturation-ramp-v4",
                 "ready-vote-stress-15k-v2",

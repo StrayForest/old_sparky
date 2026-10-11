@@ -149,9 +149,16 @@ class _TimedHTTPSConnection(_TimedHTTPConnection):
 
 
 class HTTP11KeepAliveClient:
-    """Issue bounded GETs over a per-thread HTTP/1.1 connection."""
+    """Issue bounded HTTP/1.1 requests over one optional per-thread socket."""
 
-    def __init__(self, origin: str, *, timeout: float, max_response_bytes: int) -> None:
+    def __init__(
+        self,
+        origin: str,
+        *,
+        timeout: float,
+        max_response_bytes: int,
+        reuse_connection: bool = True,
+    ) -> None:
         parsed = urlsplit(origin)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("HTTP transport origin must be an absolute HTTP(S) URL")
@@ -163,6 +170,7 @@ class HTTP11KeepAliveClient:
         self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
         self._timeout = timeout
         self._max_response_bytes = max_response_bytes
+        self._reuse_connection = reuse_connection
         self._connection: _TimedHTTPConnection | None = None
         self._ssl_context = ssl.create_default_context()
         self.last_timing: dict[str, Any] = {}
@@ -217,6 +225,29 @@ class HTTP11KeepAliveClient:
         timeout: float | None = None,
         deadline: float | None = None,
     ) -> TransportResponse:
+        return self.request(
+            "GET",
+            path,
+            headers=headers,
+            timeout=timeout,
+            deadline=deadline,
+        )
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str],
+        body: bytes | None = None,
+        timeout: float | None = None,
+        deadline: float | None = None,
+    ) -> TransportResponse:
+        # Timing belongs to this physical request attempt only. In particular,
+        # a rejected deadline must not surface a previous request's timings.
+        self.last_timing = {}
+        if method not in {"GET", "POST"}:
+            raise ValueError("HTTP transport method is unsupported")
         if not path.startswith("/") or "\r" in path or "\n" in path:
             raise ValueError("HTTP transport path is invalid")
         if timeout is not None:
@@ -240,16 +271,21 @@ class HTTP11KeepAliveClient:
         started = time.perf_counter()
         connection.phase_timing = {}
         timing: dict[str, Any] = {
-            "transport": "http1-keepalive",
+            "transport": (
+                "http1-keepalive" if self._reuse_connection else "http1-close"
+            ),
             "connection_reused": reused,
         }
         try:
             connection.request(
-                "GET",
+                method,
                 path,
+                body=body,
                 headers={
                     **headers,
-                    "Connection": "keep-alive",
+                    "Connection": (
+                        "keep-alive" if self._reuse_connection else "close"
+                    ),
                 },
             )
             write_finished = time.perf_counter()
@@ -282,6 +318,8 @@ class HTTP11KeepAliveClient:
                 if value
             }
             if response.will_close or safe_headers.get("connection", "").lower() == "close":
+                self.close()
+            elif not self._reuse_connection:
                 self.close()
             self.last_timing = timing
             return TransportResponse(

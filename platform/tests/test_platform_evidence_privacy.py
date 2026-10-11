@@ -325,10 +325,19 @@ class EvidencePrivacyTests(unittest.TestCase):
                     "read_bytes_per_second": 2.0,
                     "write_bytes_per_second": 1.0,
                 },
+                "nginx": {
+                    "process_count": 1,
+                    "cpu_percent": 7.5,
+                    "rss_bytes": 3600,
+                    "pid": 5678,
+                    "process_name": "nginx-private-name",
+                },
             },
             "api_connections": {"established": 4, "total": 5},
         }
         observer_row = _public_timeline_sample_row(sampler_row)
+        self.assertEqual(observer_row["nginx_cpu_status"], "known")
+        self.assertEqual(observer_row["nginx_process"]["cpu_percent"], 7.5)
         source: dict[str, object] = {
             "started_at": "2026-10-11T10:00:00Z",
             "finished_at": "2026-10-11T10:00:03Z",
@@ -357,12 +366,47 @@ class EvidencePrivacyTests(unittest.TestCase):
         first_public_row = system["timeline"][0]
         self.assertEqual(first_public_row["processes"]["deadlock-api"]["cpu_percent"], 35.0)
         self.assertEqual(first_public_row["processes"]["deadlock-web"]["cpu_percent"], 12.0)
+        self.assertEqual(first_public_row["processes"]["nginx"]["cpu_percent"], 7.5)
+        self.assertEqual(first_public_row["nginx_cpu_status"], "known")
         self.assertEqual(first_public_row["api_connections"], {"established": 4, "total": 5})
         self.assertEqual(first_public_row["postgres_tcp_established_connections"], 9)
         self.assertEqual(system["timeline"][1], {
             "timestamp": "2026-10-11T10:00:02+00:00",
             "cpu_per_core_percent": {"cpu0": 20.0},
         })
+        no_interval_row = _public_timeline_sample_row(
+            {
+                "timestamp": "2026-10-11T10:00:02Z",
+                "cpu_per_core_percent": {},
+                "processes": {
+                    "nginx": {
+                        "process_count": 1,
+                        "cpu_percent": 7.5,
+                        "pid": 5678,
+                    }
+                },
+            }
+        )
+        self.assertEqual(no_interval_row["nginx_cpu_status"], "unknown")
+        self.assertIsNone(no_interval_row["nginx_process"])
+        unknown_source = copy.deepcopy(source)
+        unknown_source["system"]["timeline"][1] = no_interval_row  # type: ignore[index]
+        unknown_timeline = project_public_artifact(
+            "server_observability", unknown_source
+        )["system"]["timeline"]
+        self.assertEqual(unknown_timeline[1]["nginx_cpu_status"], "unknown")
+        self.assertNotIn("nginx", unknown_timeline[1].get("processes", {}))
+
+        forged_known = copy.deepcopy(source)
+        forged_known["system"]["timeline"][0]["cpu_per_core_percent"] = {  # type: ignore[index]
+            "host-secret": 100.0
+        }
+        invalid_known = project_public_artifact(
+            "server_observability", forged_known
+        )["system"]
+        self.assertEqual(invalid_known["timeline_status"], "invalid")
+        self.assertNotIn("timeline", invalid_known)
+
         serialized_timeline = serialized(system["timeline"])
         for forbidden in (
             "host-secret",
@@ -370,9 +414,11 @@ class EvidencePrivacyTests(unittest.TestCase):
             "4321",
             "pid",
             "private_backend_label",
+            "nginx-private-name",
             "must-not-be-published",
             '"postgres_tcp_connections"',
             '"total": 27',
+            '"pid": 5678',
         ):
             self.assertNotIn(forbidden, serialized_timeline)
 
@@ -1013,12 +1059,28 @@ class EvidencePrivacyTests(unittest.TestCase):
             "tournaments": 1,
             "concurrency_stages": [16, 32],
             "dropped_work": 0,
+            "client_transport": "ready-vote-http1-reuse-pair",
             "passed": True,
             "status": "complete",
             "raw_http": {
                 "requests": 10,
                 "errors": 1,
                 "latency": {"p95_ms": 42.5},
+                "transport": {
+                    "names": {"http1-close": 2, "http1-keepalive": 3, "https://private/path": 99},
+                    "http_versions": {"1.1": 5, "private": 9},
+                    "connection_reused": 3,
+                    "connection_new": 2,
+                    "phase_timings": {
+                        "tcp_connect_ms": {"count": 2, "p95_ms": 5.5},
+                        "ttfb_ms": {"count": 5, "p95_ms": 18.0},
+                        "private_header": {"count": 1, "p95_ms": 9.0},
+                    },
+                    "cookie": "session=synthetic-secret",
+                    "csrf": "synthetic-csrf",
+                    "body": "{\"choice\":\"yes\"}",
+                    "path": "/private/tournament/slug",
+                },
                 "by_route": {
                     "POST ready_vote": {"p95_ms": 42.5},
                     "POST /tournaments/private-slug": {"p95_ms": 999.0},
@@ -1053,6 +1115,20 @@ class EvidencePrivacyTests(unittest.TestCase):
                 "checks": {"complete": True, "run_identity": True},
             },
             "phases": {
+                "write_external_vote_close_a": {
+                    "status": "complete",
+                    "transport": "http1-close",
+                    "raw_http": {
+                        "requests": 2,
+                        "transport": {
+                            "names": {"http1-close": 2},
+                            "phase_timings": {
+                                "ttfb_ms": {"count": 2, "p95_ms": 17.0},
+                            },
+                            "cookie": "session=synthetic-secret",
+                        },
+                    },
+                },
                 "capacity_ramp": {
                     "concurrency_stages": [16, 32],
                     "stages": {"16": {"raw_http": {"requests": 2}}},
@@ -1085,6 +1161,33 @@ class EvidencePrivacyTests(unittest.TestCase):
             self.assertNotIn(value.lower(), public_output.lower())
         self.assertEqual(public_report["raw_http"]["requests"], 10)
         self.assertEqual(public_report["raw_http"]["latency"]["p95_ms"], 42.5)
+        self.assertEqual(
+            public_report["client_transport"], "ready-vote-http1-reuse-pair"
+        )
+        self.assertEqual(
+            public_report["raw_http"]["transport"]["names"],
+            {"http1-close": 2, "http1-keepalive": 3},
+        )
+        self.assertEqual(
+            public_report["raw_http"]["transport"]["phase_timings"]["ttfb_ms"]["p95_ms"],
+            18.0,
+        )
+        self.assertEqual(
+            public_report["phases"]["write_external_vote_close_a"]["transport"],
+            "http1-close",
+        )
+        self.assertEqual(
+            public_report["phases"]["write_external_vote_close_a"]["raw_http"]["transport"]["names"],
+            {"http1-close": 2},
+        )
+        for forbidden in (
+            "synthetic-secret",
+            "synthetic-csrf",
+            "private_header",
+            "private/tournament/slug",
+            "https://private/path",
+        ):
+            self.assertNotIn(forbidden.lower(), public_output.lower())
         self.assertTrue(public_report["acceptance"]["checks"]["complete"])
         self.assertEqual(public_report["concurrency_stages"], [16, 32])
         self.assertEqual(public_report["phases"]["capacity_ramp"]["concurrency_stages"], [16, 32])

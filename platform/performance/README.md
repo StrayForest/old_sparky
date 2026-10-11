@@ -22,6 +22,7 @@ active registry and is not selectable by the production workflow.
 | `ready-vote-slo-v2` | default/active | 500-user human-shaped Ready Vote supported-load contract |
 | `ready-vote-capacity-ramp-v2` | default/active | 20–80 logical Ready Vote actions/s, 30s steady phases |
 | `ready-vote-saturation-ramp-v4` | diagnostic/active | 120–135 logical Ready Vote actions/s, 30s steady phases |
+| `ready-vote-transport-pair-v1` | diagnostic/active | On-demand HTTP/1.1 close-versus-keepalive ABBA comparison at 70 actions/s |
 | `ready-vote-stress-15k-v2` | default/active | 15,000-user aggressive Ready Vote behavior test |
 | `ready-vote-stress-20k-v2` | diagnostic/active | Optional 20,000-user unresolved-question stress test |
 | `ready-vote-spike-v1` | default/active | Normal → burst → normal with recovery phases |
@@ -31,9 +32,15 @@ active registry and is not selectable by the production workflow.
 | `authenticated-page-load-v1` | default/active | Full authenticated Next.js tournament HTML control |
 | `authenticated-page-load-v2` | diagnostic/active | HTTP/1.1 keep-alive transport comparison |
 
-The current source portfolio contains 11 active profiles, all dispatchable
-through the production external-load workflow. The retired saturation v1–v3
-contracts are retained only under
+The current source portfolio contains 12 active profiles, all dispatchable
+through the production external-load workflow. Eleven profiles form the final
+load matrix; `ready-vote-transport-pair-v1` is a separate on-demand diagnostic
+and never counts toward that matrix or its capacity result. It uses four
+30-second 70-action/s phases in close/keepalive/keepalive/close order, each on
+a distinct five-tournament cohort with 420 actors per tournament (the other
+80 fixture users per tournament remain untouched); its timing comparison does
+not alter the matrix profiles or their acceptance thresholds. The retired
+saturation v1–v3 contracts are retained only under
 [`profiles/retained-v1/`](profiles/retained-v1/README.md); lifecycle QA has no
 canonical JSON placeholder in this registry and remains a separate
 preproduction harness concern. Derive this portfolio from the executable
@@ -304,6 +311,13 @@ tournament slugs, raw URLs/queries, request/diagnostic/correlation IDs, user
 digests, edge IP/location, Cloudflare ray values, cookies, authorization or
 SQL text. Unknown route/error/backend values collapse to `other`; control
 account state is only `control_account_preserved: bool`.
+
+For production external-load runs, the fixture `matrix-summary.json` is a
+pre-cleanup measurement/setup receipt and deliberately leaves control-account
+preservation false. The later `cleanup-summary.json` is the authoritative
+preservation receipt: it is emitted only after the run-bound cleanup verifies
+the designated control account remains and the synthetic fixture is removed.
+Keep those stage-specific booleans separate when reviewing artifacts.
 
 CPU profile projection is capped at 32 profile summaries and 100 function rows
 per profile. It keeps only the availability flag, a restricted Python symbol

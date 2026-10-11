@@ -1509,6 +1509,30 @@ def _public_timeline_sample_row(sample: dict[str, object]) -> dict[str, object]:
     processes = sample.get("processes")
     if not isinstance(processes, dict):
         processes = {}
+    nginx_process = processes.get("nginx")
+    nginx_cpu_status = "unknown"
+    nginx_process_count = (
+        safe_int(nginx_process.get("process_count"))
+        if isinstance(nginx_process, dict)
+        else None
+    )
+    nginx_cpu_percent = (
+        finite_number(nginx_process.get("cpu_percent"))
+        if isinstance(nginx_process, dict)
+        else None
+    )
+    core_metrics = sample.get("cpu_per_core_percent")
+    if (
+        nginx_process_count is not None
+        and nginx_process_count > 0
+        and nginx_cpu_percent is not None
+        and nginx_cpu_percent >= 0
+        and isinstance(core_metrics, dict)
+        and core_metrics
+    ):
+        nginx_cpu_status = "known"
+    else:
+        nginx_process = None
     return {
         "timestamp": sample.get("timestamp"),
         "cpu_per_core_percent": sample.get("cpu_per_core_percent"),
@@ -1530,6 +1554,8 @@ def _public_timeline_sample_row(sample: dict[str, object]) -> dict[str, object]:
         "celery_backlog": sample.get("celery_backlog"),
         "api_process": processes.get("deadlock-api"),
         "web_process": processes.get("deadlock-web"),
+        "nginx_cpu_status": nginx_cpu_status,
+        "nginx_process": nginx_process,
     }
 
 
