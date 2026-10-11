@@ -17,6 +17,7 @@ from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
 import tools.platform_external_load as external_load
+from tools.platform_evidence_sanitizer import project_public_artifact
 from tools.platform_external_load import (
     ExternalLoadError,
     LogicalRequestResult,
@@ -2024,6 +2025,28 @@ class ExternalLoadTests(unittest.TestCase):
             [2, 2],
         )
         self.assertTrue(all(phase.startswith("scale_external_read_mix_c") for phase in calls))
+        self.assertEqual(report["phase_windows_status"], "complete")
+        self.assertEqual(
+            [window["phase"] for window in report["phase_windows"]],
+            ["read_mix_c1", "read_mix_c2"],
+        )
+        run_started = report["started_at"]
+        run_finished = report["finished_at"]
+        previous_finish = run_started
+        for window in report["phase_windows"]:
+            self.assertGreaterEqual(window["started_at"], run_started)
+            self.assertLessEqual(window["finished_at"], run_finished)
+            self.assertGreaterEqual(window["started_at"], previous_finish)
+            self.assertLess(window["started_at"], window["finished_at"])
+            previous_finish = window["finished_at"]
+
+        public_report = project_public_artifact("external_load", report)
+        self.assertEqual(public_report["run_window_status"], "complete")
+        self.assertEqual(public_report["phase_windows_status"], "complete")
+        self.assertEqual(
+            [window["phase"] for window in public_report["phase_windows"]],
+            ["read_mix_c1", "read_mix_c2"],
+        )
 
     def test_ready_vote_rate_plan_reports_offered_rate_per_phase(self) -> None:
         payload = manifest_payload()

@@ -260,6 +260,18 @@ def safe_phase(value: Any) -> str:
     raw = str(value or "").strip().lower().replace("-", "_")
     if raw in SAFE_PHASES:
         return raw
+    # Read-mix concurrency ramps use a stable producer-owned phase shape.
+    # Preserve the bounded stage value so public timing windows remain
+    # distinguishable, without accepting arbitrary labels or values beyond
+    # the runner's closed concurrency limit.
+    for prefix in ("scale_external_read_mix_c", "read_mix_c"):
+        if raw.startswith(prefix):
+            suffix = raw[len(prefix) :]
+            if re.fullmatch(r"[1-9][0-9]{0,2}", suffix):
+                concurrency = int(suffix)
+                if concurrency <= 512:
+                    return f"read_mix_c{concurrency}"
+            return "other"
     if re.fullmatch(r"rate_[0-9]{1,4}", raw):
         return raw if int(raw.split("_", 1)[1]) <= 10_000 else "other"
     if raw in {
