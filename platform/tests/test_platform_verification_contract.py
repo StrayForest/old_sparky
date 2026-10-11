@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import io
+import asyncio
+import importlib
 import os
 import re
+import runpy
 import selectors
 import signal
 import shutil
@@ -701,6 +704,72 @@ class PlatformVerificationContractTests(unittest.TestCase):
             (diagnostic_directory / "hard-linked-progress.log").unlink(missing_ok=True)
             (diagnostic_directory / "bounded-progress.log").unlink(missing_ok=True)
             diagnostic_directory.rmdir()
+
+        from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+
+        class SyncConnectionSentinel:
+            pass
+
+        sync_connection = SyncConnectionSentinel()
+        engine = create_async_engine("postgresql+asyncpg://test:test@127.0.0.1/test")
+        sync_connect = patch.object(
+            engine.sync_engine,
+            "connect",
+            return_value=sync_connection,
+        )
+        async_run_sync = patch.object(
+            AsyncConnection,
+            "run_sync",
+            new=unittest.mock.AsyncMock(return_value=None),
+        )
+        async_close = patch.object(
+            AsyncConnection,
+            "close",
+            new=unittest.mock.AsyncMock(return_value=None),
+        )
+        async_dispose = patch.object(
+            AsyncEngine,
+            "dispose",
+            new=unittest.mock.AsyncMock(return_value=None),
+        )
+        alembic_config = SimpleNamespace(
+            config_file_name=None,
+            config_ini_section="alembic",
+            get_main_option=lambda _key: "postgresql+asyncpg://test:test@127.0.0.1/test",
+            get_section=lambda _section, _defaults: {},
+            set_main_option=lambda _key, _value: None,
+        )
+        alembic_context = SimpleNamespace(
+            config=alembic_config,
+            is_offline_mode=lambda: True,
+            configure=lambda **_kwargs: None,
+            begin_transaction=nullcontext,
+            run_migrations=lambda: None,
+        )
+        with (
+            patch.object(importlib.import_module("alembic"), "context", alembic_context),
+            patch(
+                "python_packages.platform_infra.config.get_settings",
+                return_value=SimpleNamespace(platform_database_url="postgresql+asyncpg://test:test@127.0.0.1/test"),
+            ),
+            patch("python_packages.platform_infra.config.validate_platform_settings"),
+            sync_connect as sync_connect_mock,
+            async_run_sync as async_run_sync_mock,
+            async_close as async_close_mock,
+            async_dispose as async_dispose_mock,
+        ):
+            migration_env = runpy.run_path(
+                str(Path(__file__).parents[1] / "alembic" / "env.py")
+            )
+            migration_globals = migration_env["run_async_migrations"].__globals__
+            migration_globals["async_engine_from_config"] = lambda *_args, **_kwargs: engine
+            migration_globals["record_migration_progress"] = lambda _stage: None
+            asyncio.run(migration_env["run_async_migrations"]())
+        sync_connect_mock.assert_called_once_with()
+        async_run_sync_mock.assert_awaited_once()
+        async_close_mock.assert_awaited_once()
+        async_dispose_mock.assert_awaited_once()
+
         captured: dict[str, object] = {}
 
         def capture_migration_run(

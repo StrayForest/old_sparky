@@ -127,22 +127,24 @@ async def run_async_migrations() -> None:
     )
 
     record_migration_progress("alembic-connection-started")
+    connection_opened = False
     try:
-        connection = await connectable.connect()
+        async with connectable.connect() as connection:
+            connection_opened = True
+            record_migration_progress("alembic-connection-opened")
+            record_migration_progress("alembic-migrations-started")
+            try:
+                await connection.run_sync(do_run_migrations)
+            except Exception:
+                record_migration_progress("alembic-migrations-error")
+                raise
+            record_migration_progress("alembic-migrations-completed")
     except Exception:
-        record_migration_progress("alembic-connection-failed")
+        if not connection_opened:
+            record_migration_progress("alembic-connection-failed")
         raise
-    async with connection:
-        record_migration_progress("alembic-connection-opened")
-        record_migration_progress("alembic-migrations-started")
-        try:
-            await connection.run_sync(do_run_migrations)
-        except Exception:
-            record_migration_progress("alembic-migrations-error")
-            raise
-        record_migration_progress("alembic-migrations-completed")
-
-    await connectable.dispose()
+    finally:
+        await connectable.dispose()
     record_migration_progress("alembic-connection-closed")
 
 

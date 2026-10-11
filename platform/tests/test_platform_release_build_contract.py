@@ -4555,11 +4555,16 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn('event_name == "workflow_dispatch"', finalizer)
         self.assertIn('os.environ.get("WORKFLOW_REF") == "refs/heads/dev"', finalizer)
         self.assertIn('os.environ.get("PR_BASE_REF") == "dev"', finalizer)
-        self.assertIn(
-            'requires_release_runtime = baseline_mode or runtime_sensitive or '
+        self.assertIn("deployable_full_dev_push = (", finalizer)
+        self.assertIn("or deployable_full_dev_push", finalizer)
+        runtime_requirement = finalizer.split("requires_release_runtime = (", 1)[1].split(")", 1)[0]
+        for condition in (
+            "baseline_mode",
+            "runtime_sensitive",
             'raw_fallback == "true"',
-            finalizer,
-        )
+            "deployable_full_dev_push",
+        ):
+            self.assertIn(condition, runtime_requirement)
         self.assertIn("or raw_fallback == \"true\"", finalizer)
         self.assertIn(
             "requires_real_release_runtime = requires_release_runtime and trusted_real_event",
