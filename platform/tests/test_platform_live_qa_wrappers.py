@@ -2716,6 +2716,199 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             'summary_error = "none" if payload.get("ok") is True else "missing"',
             retained,
         )
+        self._exercise_retained_cleanup_outputs_survive_marker_parse_failure()
+
+    def _exercise_retained_cleanup_outputs_survive_marker_parse_failure(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml"
+        ).read_text(encoding="utf-8")
+        step_start = workflow.index(
+            "      - name: Clean the exact retained load run on production\n"
+        )
+        run_start = workflow.index("        run: |\n", step_start) + len("        run: |\n")
+        run_end = workflow.index("\n      - name:", run_start)
+        script = textwrap.dedent(workflow[run_start:run_end])
+        source_sha, app_sha = "a" * 40, "b" * 40
+        marker = (
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=2 stage=complete "
+            "dispatcher_exit=0 child_state=exited child_exit=0 stdout_eof=true "
+            f"timed_out=false source_sha={source_sha} app_sha={app_sha} "
+            "run_id=123456 run_attempt=2 load_run_id=234567 "
+            "profile=retained-load-cleanup"
+        )
+        self.assertIn("if parsed_cleanup_diagnostic=", script)
+        self.assertIn("trap cleanup_exit_trap EXIT", script)
+        failure_gate = workflow.split(
+            "      - name: Fail if cleanup was not verified\n", 1
+        )[1].split("\n      - name:", 1)[0]
+        self.assertIn("remote_exit_code", failure_gate)
+        self.assertIn("remote_diagnostic_status", failure_gate)
+
+        with tempfile.TemporaryDirectory(prefix="retained-cleanup-shell-test-") as temp:
+            root = Path(temp)
+            bin_dir = root / "bin"
+            fixtures = root / "fixtures"
+            bin_dir.mkdir(mode=0o700)
+            fixtures.mkdir(mode=0o700)
+            (fixtures / "cleanup-summary.json").write_text(
+                '{"schema":1,"ok":true,"markers":1,"users_deleted":2,'
+                '"tournaments_deleted":3,"control_account_preserved":true}\n',
+                encoding="ascii",
+            )
+            (fixtures / "canonical.log").write_text(
+                '{"schema":1,"status":"passed","line_count":1,'
+                '"retained_line_count":1,"truncated":false}\n',
+                encoding="ascii",
+            )
+            ssh = bin_dir / "ssh"
+            ssh.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/bin/bash
+                    set -euo pipefail
+                    if [[ " $* " == *" retained-cleanup-exports "* ]]; then exit 0; fi
+                    printf 'called\\n' >> "$SSH_INVOKED"
+                    case "$SSH_MODE" in
+                      valid) printf '%s\\n' "$SSH_MARKER"; exit 0 ;;
+                      invalid) printf '%s\\n' 'INVALID_MARKER RAW_SENTINEL'; exit 0 ;;
+                      missing) printf '%s\\n' 'Permission denied (publickey).' >&2; exit 255 ;;
+                    esac
+                    exit 70
+                    """
+                ),
+                encoding="ascii",
+            )
+            ssh.chmod(0o700)
+            scp = bin_dir / "scp"
+            scp.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/bin/bash
+                    set -euo pipefail
+                    previous=""
+                    current=""
+                    for argument in "$@"; do
+                      previous="$current"
+                      current="$argument"
+                    done
+                    destination="$current"
+                    source="$previous"
+                    case "$source" in
+                      */cleanup-summary.json) cp "$FIXTURES/cleanup-summary.json" "$destination" ;;
+                      */canonical.log) cp "$FIXTURES/canonical.log" "$destination" ;;
+                      *) exit 71 ;;
+                    esac
+                    """
+                ),
+                encoding="ascii",
+            )
+            scp.chmod(0o700)
+            install = bin_dir / "install"
+            install.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/bin/bash
+                    set -euo pipefail
+                    if [[ "$FAIL_INSTALL" == "1" && "$1" == "-d" ]]; then exit 73; fi
+                    exec /usr/bin/install "$@"
+                    """
+                ),
+                encoding="ascii",
+            )
+            install.chmod(0o700)
+
+            for mode in ("valid", "invalid", "missing", "setup-failure"):
+                with self.subTest(mode=mode):
+                    case_root = root / mode
+                    case_root.mkdir(mode=0o700)
+                    runner_temp = case_root / "runner-temp"
+                    runner_temp.mkdir(mode=0o700)
+                    input_path = runner_temp / "platform-retained-cleanup-input.json"
+                    input_path.write_text("{}\n", encoding="ascii")
+                    input_path.chmod(0o600)
+                    ssh_dir = runner_temp / "production-retained-cleanup-ssh"
+                    ssh_dir.mkdir(mode=0o700)
+                    for name, content in (("config", "Host *\n"), ("id_ed25519", "synthetic\n")):
+                        item = ssh_dir / name
+                        item.write_text(content, encoding="ascii")
+                        item.chmod(0o600)
+                    output_path = case_root / "github-output"
+                    output_path.touch(mode=0o600)
+                    summary_path = case_root / "step-summary"
+                    summary_path.touch(mode=0o600)
+                    invoked = case_root / "ssh-invoked"
+                    env = {
+                        "PATH": f"{bin_dir}:/usr/bin:/bin",
+                        "RUNNER_TEMP": str(runner_temp),
+                        "SSH_DIR": str(ssh_dir),
+                        "GITHUB_OUTPUT": str(output_path),
+                        "GITHUB_STEP_SUMMARY": str(summary_path),
+                        "GITHUB_RUN_ID": "123456",
+                        "GITHUB_RUN_ATTEMPT": "2",
+                        "HOST_TOOLS_SHA": "c" * 40,
+                        "TARGET_SHA": source_sha,
+                        "APP_TARGET_SHA": app_sha,
+                        "LOAD_RUN_ID": "234567",
+                        "PROD_SSH_HOST": "fixture.invalid",
+                        "PROD_SSH_USER": "synthetic-runner",
+                        "SSH_MODE": (
+                            "valid" if mode == "valid" else
+                            "invalid" if mode == "invalid" else "missing"
+                        ),
+                        "SSH_MARKER": marker,
+                        "SSH_INVOKED": str(invoked),
+                        "FIXTURES": str(fixtures),
+                        "FAIL_INSTALL": "1" if mode == "setup-failure" else "0",
+                    }
+                    result = subprocess.run(
+                        ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=10,
+                    )
+                    if mode == "setup-failure":
+                        self.assertEqual(result.returncode, 73)
+                    else:
+                        self.assertEqual(
+                            result.returncode,
+                            0,
+                            result.stdout + result.stderr + output_path.read_text() + summary_path.read_text(),
+                        )
+                    fields = dict(
+                        line.split("=", 1) for line in output_path.read_text().splitlines()
+                    )
+                    self.assertEqual(fields["remote_exit_code"], "0" if mode == "valid" else "1")
+                    self.assertEqual(fields["remote_diagnostic_status"], "0" if mode == "valid" else "1")
+                    self.assertEqual(fields["remote_stage"], "complete" if mode == "valid" else "unknown")
+                    self.assertEqual(
+                        fields["runner_failure_stage"],
+                        {
+                            "valid": "remote_dispatch_complete",
+                            "invalid": "remote_diagnostic_invalid",
+                            "missing": "remote_diagnostic_invalid",
+                            "setup-failure": "artifact_directory_setup",
+                        }[mode],
+                    )
+                    self.assertEqual(
+                        fields["remote_stderr_class"],
+                        {
+                            "valid": "empty",
+                            "invalid": "empty",
+                            "missing": "authentication_denied",
+                            "setup-failure": "unavailable",
+                        }[mode],
+                    )
+                    summary = summary_path.read_text(encoding="utf-8")
+                    self.assertIn("stderr_bytes=", summary)
+                    self.assertNotIn("RAW_SENTINEL", summary)
+                    self.assertNotIn("Permission denied", summary)
+                    self.assertFalse((runner_temp / "production-retained-cleanup-ssh-output").exists())
+                    self.assertFalse((runner_temp / "production-retained-cleanup-ssh-stderr").exists())
+                    self.assertFalse(input_path.exists())
+                    self.assertFalse(ssh_dir.exists())
+                    self.assertEqual(invoked.exists(), mode != "setup-failure")
 
     def test_live_launch_inline_handoff_verifier_uses_api_digest_and_exact_run(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-live-launch.yml").read_text(

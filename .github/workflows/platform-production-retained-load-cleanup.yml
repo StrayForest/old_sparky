@@ -632,26 +632,177 @@ jobs:
           remote_diagnostic_status=1
           cleanup_artifact_status=1
           cleanup_export_status=1
+          runner_failure_stage=preflight
+          remote_stderr_class=unavailable
+          remote_stderr_bytes=0
+          remote_stderr_truncated=false
+          cleanup_outputs_written=0
+          cleanup_summary_written=0
+          ssh_output_owned=0
+          ssh_stderr_owned=0
           input_path="$RUNNER_TEMP/platform-retained-cleanup-input.json"
           ssh_output_file="$RUNNER_TEMP/production-retained-cleanup-ssh-output"
+          ssh_stderr_file="$RUNNER_TEMP/production-retained-cleanup-ssh-stderr"
           canonical_raw="$RUNNER_TEMP/production-retained-cleanup-canonical.raw"
           artifact_dir="$RUNNER_TEMP/production-retained-cleanup-artifacts"
           cleanup_summary="$artifact_dir/cleanup-summary.json"
           canonical_log="$artifact_dir/canonical.log"
           export_dir="/tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID"
+
+          classify_cleanup_stderr() {
+            local classification
+            classification="$(/usr/bin/python3 - "$ssh_stderr_file" <<'PY'
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          try:
+              before = path.lstat()
+              if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                      or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600):
+                  raise OSError
+              if before.st_size > 65536:
+                  classification, size, truncated = "oversized", 65536, "true"
+              else:
+                  descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                  try:
+                      opened = os.fstat(descriptor)
+                      if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                          raise OSError
+                      raw = os.read(descriptor, 4097)
+                      after = os.fstat(descriptor)
+                  finally:
+                      os.close(descriptor)
+                  if len(raw) > 4096 or (after.st_dev, after.st_ino, after.st_size,
+                          after.st_mtime_ns, after.st_ctime_ns) != (
+                          before.st_dev, before.st_ino, before.st_size,
+                          before.st_mtime_ns, before.st_ctime_ns):
+                      raise OSError
+                  if not raw:
+                      classification = "empty"
+                  elif re.search(rb"(?m)^Permission denied \(publickey\)\.?$", raw):
+                      classification = "authentication_denied"
+                  elif re.search(rb"(?m)^Host key verification failed\.?$", raw):
+                      classification = "host_key_rejected"
+                  elif re.search(rb"(?m)^ssh: connect to host [^\n]+ port [0-9]+: Connection timed out\.?$", raw):
+                      classification = "connect_timeout"
+                  elif re.search(rb"(?m)^ssh: connect to host [^\n]+ port [0-9]+: Connection refused\.?$", raw):
+                      classification = "connection_refused"
+                  elif re.search(rb"(?m)^ssh: Could not resolve hostname [^:]+: Name or service not known\.?$", raw):
+                      classification = "name_resolution_failed"
+                  else:
+                      classification = "unclassified"
+                  size = before.st_size
+                  truncated = "false"
+          except OSError:
+              classification, size, truncated = "unavailable", 0, "false"
+          print(f"{classification}\t{size}\t{truncated}")
+          PY
+          )" || classification="unavailable"
+            IFS=$'\t' read -r remote_stderr_class remote_stderr_bytes remote_stderr_truncated <<< "$classification"
+            case "$remote_stderr_class" in
+              empty|authentication_denied|host_key_rejected|connect_timeout|connection_refused|name_resolution_failed|unclassified|oversized|unavailable) ;;
+              *) remote_stderr_class=unavailable; remote_stderr_bytes=0; remote_stderr_truncated=false ;;
+            esac
+            case "$remote_stderr_bytes" in
+              ''|*[!0-9]*) remote_stderr_bytes=0 ;;
+            esac
+            case "$remote_stderr_truncated" in
+              true|false) ;;
+              *) remote_stderr_truncated=false ;;
+            esac
+          }
+
+          write_cleanup_outputs() {
+            printf 'remote_exit_code=%s\n' "$remote_status" >> "$GITHUB_OUTPUT"
+            printf 'remote_ssh_exit_code=%s\n' "$remote_ssh_exit_code" >> "$GITHUB_OUTPUT"
+            printf 'remote_stage=%s\n' "$remote_stage" >> "$GITHUB_OUTPUT"
+            printf 'remote_dispatch_exit_code=%s\n' "$remote_dispatch_exit_code" >> "$GITHUB_OUTPUT"
+            printf 'remote_child_state=%s\n' "$remote_child_state" >> "$GITHUB_OUTPUT"
+            printf 'remote_child_exit=%s\n' "$remote_child_exit" >> "$GITHUB_OUTPUT"
+            printf 'remote_stdout_eof=%s\n' "$remote_stdout_eof" >> "$GITHUB_OUTPUT"
+            printf 'remote_timed_out=%s\n' "$remote_timed_out" >> "$GITHUB_OUTPUT"
+            printf 'remote_diagnostic_status=%s\n' "$remote_diagnostic_status" >> "$GITHUB_OUTPUT"
+            printf 'cleanup_artifact_status=%s\n' "$cleanup_artifact_status" >> "$GITHUB_OUTPUT"
+            printf 'cleanup_export_status=%s\n' "$cleanup_export_status" >> "$GITHUB_OUTPUT"
+            printf 'runner_failure_stage=%s\n' "$runner_failure_stage" >> "$GITHUB_OUTPUT"
+            printf 'remote_stderr_class=%s\n' "$remote_stderr_class" >> "$GITHUB_OUTPUT"
+            printf 'remote_stderr_bytes=%s\n' "$remote_stderr_bytes" >> "$GITHUB_OUTPUT"
+            printf 'remote_stderr_truncated=%s\n' "$remote_stderr_truncated" >> "$GITHUB_OUTPUT"
+          }
+
+          write_cleanup_summary() {
+            printf 'Retained cleanup diagnostic: ssh_exit=%s stage=%s dispatch_exit=%s child_state=%s child_exit=%s stdout_eof=%s timed_out=%s bound=%s runner_stage=%s stderr_class=%s stderr_bytes=%s stderr_truncated=%s\n' \
+              "$remote_ssh_exit_code" "$remote_stage" "$remote_dispatch_exit_code" \
+              "$remote_child_state" "$remote_child_exit" "$remote_stdout_eof" \
+              "$remote_timed_out" "$remote_diagnostic_status" "$runner_failure_stage" \
+              "$remote_stderr_class" "$remote_stderr_bytes" "$remote_stderr_truncated" \
+              >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          cleanup_exit_trap() {
+            local original_status="$?"
+            set +e
+            if [[ "$cleanup_outputs_written" != "1" ]]; then
+              remote_status=1
+              remote_diagnostic_status=1
+              classify_cleanup_stderr
+              write_cleanup_outputs
+              cleanup_outputs_written=1
+            fi
+            if [[ "$cleanup_summary_written" != "1" ]]; then
+              write_cleanup_summary
+              cleanup_summary_written=1
+            fi
+            if [[ "$ssh_output_owned" == "1" ]]; then
+              rm -f -- "$ssh_output_file"
+            fi
+            if [[ "$ssh_stderr_owned" == "1" ]]; then
+              rm -f -- "$ssh_stderr_file"
+            fi
+            rm -f -- "$input_path"
+            test ! -e "$input_path"
+            ssh_dir="$RUNNER_TEMP/production-retained-cleanup-ssh"
+            if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+              if [[ -d "$ssh_dir" && ! -L "$ssh_dir" ]]; then
+                rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/known_hosts.scan.1" "$ssh_dir/known_hosts.scan.2" "$ssh_dir/config" "$ssh_dir/control.sock" "$ssh_dir/control-master" "$ssh_dir/control-master.sock"
+                rmdir -- "$ssh_dir"
+              fi
+            fi
+            test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+            return "$original_status"
+          }
+          trap cleanup_exit_trap EXIT
+
+          runner_failure_stage=handoff_validation
           test -s "$input_path" \
             || { echo "Cleanup workflow handoff is missing; refusing remote cleanup" >&2; exit 1; }
+          runner_failure_stage=host_tools_validation
           [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "Retained-load host-tools pin is invalid; refusing remote export cleanup" >&2; exit 1; }
           retained_load_dispatcher="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA/platform_workflow_remote_dispatch.py"
+          runner_failure_stage=artifact_directory_setup
           install -d -m 700 "$artifact_dir"
+          runner_failure_stage=capture_path_check
           if [[ -e "$ssh_output_file" || -L "$ssh_output_file" ]]; then
             echo "Cleanup SSH output path already exists; refusing to overwrite it." >&2
             exit 1
           fi
+          if [[ -e "$ssh_stderr_file" || -L "$ssh_stderr_file" ]]; then
+            echo "Cleanup SSH error path already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+          runner_failure_stage=capture_file_create
           install -m 600 /dev/null "$ssh_output_file"
-          test "$(stat -c '%F:%h:%a:%u' -- "$ssh_output_file")" = "regular file:1:600:$(id -u)"
-          trap 'rm -f -- "$ssh_output_file" "$input_path"; test ! -e "$input_path"; ssh_dir="$RUNNER_TEMP/production-retained-cleanup-ssh"; if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then test -d "$ssh_dir" && test ! -L "$ssh_dir"; rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/known_hosts.scan.1" "$ssh_dir/known_hosts.scan.2" "$ssh_dir/config" "$ssh_dir/control.sock" "$ssh_dir/control-master" "$ssh_dir/control-master.sock"; rmdir -- "$ssh_dir"; fi; test ! -e "$ssh_dir" && test ! -L "$ssh_dir"' EXIT
+          ssh_output_owned=1
+          install -m 600 /dev/null "$ssh_stderr_file"
+          ssh_stderr_owned=1
+          runner_failure_stage=capture_file_validate
+          test "$(stat -c '%F:%h:%a:%u' -- "$ssh_output_file")" = "regular empty file:1:600:$(id -u)"
+          test "$(stat -c '%F:%h:%a:%u' -- "$ssh_stderr_file")" = "regular empty file:1:600:$(id -u)"
 
           project_cleanup_summary() {
             local source="$1"
@@ -710,6 +861,7 @@ jobs:
           PY
           }
 
+          runner_failure_stage=ssh_invocation
           set +e
           # The remote command is fixed; all cleanup identity is in the
           # validated mode-600 JSON stdin document.
@@ -725,11 +877,13 @@ jobs:
             /usr/bin/python3.12 -I -B \
             /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
             retained-cleanup --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --load-run-id "$LOAD_RUN_ID" < "$input_path" > "$ssh_output_file" 2>&1
+            --load-run-id "$LOAD_RUN_ID" < "$input_path" > "$ssh_output_file" 2> "$ssh_stderr_file"
           remote_status="$?"
           remote_ssh_exit_code="$remote_status"
           set -e
-          parsed_cleanup_diagnostic="$(/usr/bin/python3 - "$ssh_output_file" "$TARGET_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$LOAD_RUN_ID" <<'PY' 2>/dev/null
+          runner_failure_stage=diagnostic_validation
+          parsed_cleanup_diagnostic=""
+          if parsed_cleanup_diagnostic="$(/usr/bin/python3 - "$ssh_output_file" "$TARGET_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$LOAD_RUN_ID" <<'PY' 2>/dev/null
           import os
           import re
           import stat
@@ -793,7 +947,11 @@ jobs:
               raise SystemExit(1)
           print("\t".join((stage, dispatch_exit, child_state, child_exit, eof, timed_out)))
           PY
-          )"
+          )"; then
+            :
+          else
+            parsed_cleanup_diagnostic=""
+          fi
           if [[ -n "$parsed_cleanup_diagnostic" ]]; then
             IFS=$'\t' read -r remote_stage remote_dispatch_exit_code remote_child_state \
               remote_child_exit remote_stdout_eof remote_timed_out <<< "$parsed_cleanup_diagnostic"
@@ -801,8 +959,19 @@ jobs:
               remote_diagnostic_status=0
             fi
           fi
-          rm -f -- "$ssh_output_file"
+          classify_cleanup_stderr
+          if [[ "$remote_diagnostic_status" != "0" ]]; then
+            runner_failure_stage=remote_diagnostic_invalid
+          elif [[ "$remote_ssh_exit_code" != "0" ]]; then
+            runner_failure_stage=ssh_returned_nonzero
+          else
+            runner_failure_stage=remote_dispatch_complete
+          fi
+          rm -f -- "$ssh_output_file" "$ssh_stderr_file"
+          ssh_output_owned=0
+          ssh_stderr_owned=0
           test ! -e "$ssh_output_file"
+          test ! -e "$ssh_stderr_file"
 
           # Project the public summary before asking the host to delete its
           # private export inventory.  The projection has a closed schema and
@@ -884,22 +1053,15 @@ jobs:
           if [[ "$remote_status" == "0" ]] \
             && { [[ "$cleanup_artifact_status" != "0" ]] || [[ "$cleanup_export_status" != "0" ]]; }; then
             remote_status=1
+            runner_failure_stage=artifact_or_export_cleanup
           fi
-          echo "remote_exit_code=$remote_status" >> "$GITHUB_OUTPUT"
-          echo "remote_ssh_exit_code=$remote_ssh_exit_code" >> "$GITHUB_OUTPUT"
-          echo "remote_stage=$remote_stage" >> "$GITHUB_OUTPUT"
-          echo "remote_dispatch_exit_code=$remote_dispatch_exit_code" >> "$GITHUB_OUTPUT"
-          echo "remote_child_state=$remote_child_state" >> "$GITHUB_OUTPUT"
-          echo "remote_child_exit=$remote_child_exit" >> "$GITHUB_OUTPUT"
-          echo "remote_stdout_eof=$remote_stdout_eof" >> "$GITHUB_OUTPUT"
-          echo "remote_timed_out=$remote_timed_out" >> "$GITHUB_OUTPUT"
-          echo "remote_diagnostic_status=$remote_diagnostic_status" >> "$GITHUB_OUTPUT"
-          echo "cleanup_artifact_status=$cleanup_artifact_status" >> "$GITHUB_OUTPUT"
-          echo "cleanup_export_status=$cleanup_export_status" >> "$GITHUB_OUTPUT"
-          printf 'Retained cleanup diagnostic: ssh_exit=%s stage=%s dispatch_exit=%s child_state=%s child_exit=%s stdout_eof=%s timed_out=%s bound=%s\n' \
-            "$remote_ssh_exit_code" "$remote_stage" "$remote_dispatch_exit_code" \
-            "$remote_child_state" "$remote_child_exit" "$remote_stdout_eof" \
-            "$remote_timed_out" "$remote_diagnostic_status" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$remote_status" != "0" && "$runner_failure_stage" == "remote_dispatch_complete" ]]; then
+            runner_failure_stage=remote_cleanup_failed
+          fi
+          write_cleanup_outputs
+          cleanup_outputs_written=1
+          write_cleanup_summary
+          cleanup_summary_written=1
           # The final always-run gate reports the preserved primary status and
           # rejects any incomplete artifact projection or export deletion.
           exit 0
