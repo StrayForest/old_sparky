@@ -103,6 +103,17 @@ calling the task complete.
      --app-dir /opt/oldsparky/platform --keep 5 --min-age-days 0 --apply
    ```
 
+   Repeat `--protected-release <validated-release-slug>` to keep an exact release
+   out of the computed deletion candidates. This only narrows the candidate
+   set; `--expected-candidate`, when supplied, must still list the complete
+   remaining deletion set. A protected release does not bypass the release
+   lock, pointer checks, or candidate revalidation.
+
+   Signed task-retention wrappers may add `--json-receipt` only with `--apply`
+   and the complete `--expected-candidate` set. It emits a fixed success count
+   receipt only after the lock-held postcondition confirms every planned path
+   is absent; it never prints candidate slugs or paths.
+
    This emergency staging step may delete only unprotected old release
    directories. Run `deadlock-maintenance.service` immediately afterward so
    the fresh restore-verified backup and remaining retention checks complete.

@@ -229,6 +229,7 @@ class RecoveryBootstrapBundleTests(unittest.TestCase):
         )
 
     def test_build_is_closed_deterministic_and_digest_bound(self) -> None:
+        self.assertIn("platform_release_retention.py", recovery.RECOVERY_FILES)
         first = self.build()
         original = self.bundle.read_bytes()
         second_bundle = self.root / "bundle-2.zip"
@@ -248,6 +249,15 @@ class RecoveryBootstrapBundleTests(unittest.TestCase):
         self.assertEqual(result["bundle_sha256"], hashlib.sha256(original).hexdigest())
         self.assertEqual(set(result["members"]), set(recovery.RECOVERY_FILES) | {"manifest.json"})
         self.assertFalse(result["manifest"]["deployable"])
+        self.assertEqual(
+            result["manifest"]["capabilities"],
+            [
+                "abort_retained_only",
+                "recover_pending",
+                "quarantine_populated_quiesce",
+                "prune_task_releases",
+            ],
+        )
 
     def test_source_symlink_hardlink_and_special_file_are_rejected(self) -> None:
         target = self.source / "platform" / "tools" / recovery.RECOVERY_FILES[0]
@@ -984,9 +994,24 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         release_recover = (REPO_ROOT / ".github/workflows/platform-production-release-recover.yml").read_text(encoding="utf-8")
         self.assertIn('"platform_release_systemd_state.py:444"', release_recover)
         self.assertIn('"platform_release_transaction.py:444"', release_recover)
+        self.assertIn('"platform_release_retention.py:555"', release_recover)
         self.assertIn('"platform_recover_pending.sh:555"', release_recover)
         self.assertIn("validate-generation", release_recover)
         self.assertIn("platform_recover_pending.sh", release_recover)
+        for prune_contract in (
+            "prune_task_releases",
+            "PRUNE-TASK-RELEASES",
+            "expected_candidates_json",
+            "protected_releases_json",
+            "platform_release_retention.py",
+        ):
+            self.assertIn(prune_contract, release_recover)
+        retention_wrapper = (
+            TOOLS / "platform_recover_pending.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('RECOVERY_CAPABILITY="prune_task_releases"', retention_wrapper)
+        self.assertIn("--json-receipt", retention_wrapper)
+        self.assertIn('"candidate_count", "deleted_count", "reclaimed_bytes"', retention_wrapper)
         self.assertIn("security_run_id", release_recover)
         self.assertIn("security_run_attempt", release_recover)
         for provenance_field in (

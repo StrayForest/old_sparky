@@ -1211,6 +1211,26 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "d" * 64,
         )
         quarantine_root = self.shared / transaction.QUARANTINE_DIR_NAME
+        release_record = candidate / "RELEASE.json"
+        release_record.chmod(0o644)
+        release_record.write_text(
+            json.dumps({"source_git_commit": "e" * 40}) + "\n",
+            encoding="ascii",
+        )
+        release_record.chmod(0o444)
+        source_mismatch = self.run_transaction(
+            "quarantine-populated-quiesce", *command_args, check=False
+        )
+        self.assertNotEqual(source_mismatch.returncode, 0)
+        self.assertFalse(quarantine_root.exists())
+        self.assertTrue(candidate.is_dir())
+        self.assertTrue((self.shared / STATE_NAME).is_file())
+        release_record.chmod(0o644)
+        release_record.write_text(
+            json.dumps({"source_git_commit": source_sha}) + "\n",
+            encoding="ascii",
+        )
+        release_record.chmod(0o444)
         quarantine_root.mkdir(mode=0o700)
         collision = quarantine_root / candidate_slug
         collision.mkdir(mode=0o700)

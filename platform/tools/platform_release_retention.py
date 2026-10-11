@@ -78,6 +78,14 @@ def parse_args() -> argparse.Namespace:
         help="Delete planned candidates. Without this flag the command is read-only.",
     )
     parser.add_argument(
+        "--json-receipt",
+        action="store_true",
+        help=(
+            "Emit a fixed success receipt after exact candidates are absent. "
+            "Requires --apply and --expected-candidate."
+        ),
+    )
+    parser.add_argument(
         "--expected-candidate",
         action="append",
         default=None,
@@ -85,6 +93,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Require this release slug to be in the complete deletion plan. "
             "Repeat once for every approved candidate; any plan mismatch fails closed."
+        ),
+    )
+    parser.add_argument(
+        "--protected-release",
+        action="append",
+        default=None,
+        metavar="SLUG",
+        help=(
+            "Retain this release even if it is otherwise a deletion candidate. "
+            "Repeat for each release to protect."
         ),
     )
     args = parser.parse_args()
@@ -102,6 +120,16 @@ def parse_args() -> argparse.Namespace:
             for slug in args.expected_candidate
         ):
             parser.error("--expected-candidate must be a valid release slug")
+    if args.json_receipt and (not args.apply or args.expected_candidate is None):
+        parser.error("--json-receipt requires --apply and --expected-candidate")
+    if args.protected_release is not None:
+        if len(args.protected_release) != len(set(args.protected_release)):
+            parser.error("--protected-release values must be unique")
+        if any(
+            SAFE_RELEASE_ID_RE.fullmatch(slug) is None
+            for slug in args.protected_release
+        ):
+            parser.error("--protected-release must be a valid release slug")
     return args
 
 
@@ -354,8 +382,14 @@ def build_retention_plan(
     *,
     keep: int,
     min_age_days: int,
+    protect_releases: tuple[str, ...] = (),
     now: datetime | None = None,
 ) -> RetentionPlan:
+    if len(protect_releases) != len(set(protect_releases)) or any(
+        SAFE_RELEASE_ID_RE.fullmatch(slug) is None for slug in protect_releases
+    ):
+        raise RuntimeError("Protected release identifiers are invalid")
+    protected_names = set(protect_releases)
     resolved_app_dir = app_dir.resolve(strict=True)
     releases_dir = (resolved_app_dir / "releases").resolve(strict=True)
     if not releases_dir.is_dir():
@@ -396,7 +430,11 @@ def build_retention_plan(
     for entry in entries:
         if entry.path in protected_paths:
             continue
-        if entry.path in newest_paths or entry.modified_at > cutoff:
+        if (
+            entry.path.name in protected_names
+            or entry.path in newest_paths
+            or entry.modified_at > cutoff
+        ):
             retained.append(entry)
         else:
             candidates.append(entry)
@@ -511,6 +549,7 @@ def main() -> int:
                 args.app_dir,
                 keep=args.keep,
                 min_age_days=args.min_age_days,
+                protect_releases=tuple(args.protected_release or ()),
             )
             print_plan(
                 plan,
@@ -527,14 +566,16 @@ def main() -> int:
                 resolved_app_dir,
                 keep=args.keep,
                 min_age_days=args.min_age_days,
+                protect_releases=tuple(args.protected_release or ()),
             )
-            print_plan(
-                plan,
-                app_dir=resolved_app_dir,
-                keep=args.keep,
-                min_age_days=args.min_age_days,
-                apply=True,
-            )
+            if not args.json_receipt:
+                print_plan(
+                    plan,
+                    app_dir=resolved_app_dir,
+                    keep=args.keep,
+                    min_age_days=args.min_age_days,
+                    apply=True,
+                )
             apply_plan(
                 plan,
                 app_dir=resolved_app_dir,
@@ -544,7 +585,17 @@ def main() -> int:
                     else None
                 ),
             )
-            print(f"Deleted {len(plan.candidates)} release(s).")
+            if args.json_receipt:
+                if any(os.path.lexists(entry.path) for entry in plan.candidates):
+                    raise RuntimeError("A planned release remains after deletion")
+                print(
+                    "{"
+                    f'"schema":1,"status":"passed","candidate_count":{len(plan.candidates)},'
+                    f'"deleted_count":{len(plan.candidates)},"reclaimed_bytes":{plan.reclaimable_bytes}'
+                    "}"
+                )
+            else:
+                print(f"Deleted {len(plan.candidates)} release(s).")
             return 0
     except Exception as exc:
         message = str(exc).lower()

@@ -174,6 +174,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 f"release_slug={shlex.quote(release_slug)}",
                 f"target_sha={shlex.quote(source_sha)}",
                 f"candidate_result={shlex.quote(result)}",
+                'candidate_diag_state=""',
+                'candidate_diag_reason=""',
+                'candidate_install_class=""',
+                'candidate_install_stage=""',
+                'candidate_install_exit_status=""',
                 functions,
                 parser,
             )
@@ -3714,7 +3719,9 @@ fail 'private lock detail must not cross the public channel'
             self.assertEqual(failed.stderr, "")
             self.assertRegex(
                 failed.stdout,
-                r"^candidate_status=23 capture_state=truncated\n$",
+                r"^candidate_status=23 capture_state=truncated "
+                r"install_diag_state=unknown install_diag_reason=truncated "
+                r"install_class=unknown install_stage=unknown install_exit=none\n$",
             )
             run_dir = private_parent / "oldsparky-release-diagnostics" / f"{run_id}-{attempt}"
             self.assertEqual(stat.S_IMODE(run_dir.stat().st_mode), 0o700)
@@ -3750,6 +3757,8 @@ fail 'private lock detail must not cross the public channel'
             expected_marker = (
                 "RELEASE_DEPLOY schema=1 status=failed class=deployment "
                 "phase=candidate reason=activation_failed "
+                "candidate_diag_state=unknown candidate_diag_reason=truncated "
+                "candidate_class=unknown candidate_stage=unknown candidate_exit_status=23 "
                 f"release_slug={release_slug} source_sha={target_sha}\n"
             )
             marker_harness = self._candidate_diagnostic_marker_harness(
@@ -3798,7 +3807,12 @@ fail 'private lock detail must not cross the public channel'
                 host_tools_sha=host_tools_sha,
             )
             self.assertEqual(succeeded.returncode, 0, succeeded.stderr)
-            self.assertEqual(succeeded.stdout, "candidate_status=0 capture_state=complete\n")
+            self.assertEqual(
+                succeeded.stdout,
+                "candidate_status=0 capture_state=complete "
+                "install_diag_state=unknown install_diag_reason=missing "
+                "install_class=unknown install_stage=unknown install_exit=none\n",
+            )
             self.assertFalse(
                 (private_parent / "oldsparky-release-diagnostics" / f"{success_run_id}-{attempt}").exists()
             )
@@ -3830,6 +3844,188 @@ fail 'private lock detail must not cross the public channel'
                     / f"{bound_run_id}-{run_attempt}",
                 )
 
+            # The real runner parses only a single exact private installer
+            # record. Cleanup's later pending-operation line must not replace
+            # the first failure classification in the public marker.
+            diagnostic_candidate = root / "installer-diagnostic-candidate"
+            diagnostic_run_id = int(run_id) + 10
+            diagnostic_expected_slug = (
+                f"gha-{diagnostic_run_id}-{attempt}-{target_sha[:12]}"
+            )
+            accepted_diag = (
+                "RELEASE_INSTALL_DIAG schema=1 status=failed "
+                "class=production_guard stage=disk_guard exit_status=23 "
+                "release_slug={slug}\n"
+            )
+            cleanup_marker = (
+                "RELEASE_INSTALL status=failed class=pending_operation "
+                "release_slug={slug}\n"
+            )
+            diagnostic_candidate.write_text(
+                "#!/usr/bin/python3\n"
+                "import sys\n"
+                f"sys.stderr.write({accepted_diag!r}.format(slug={diagnostic_expected_slug!r}))\n"
+                f"sys.stderr.write({cleanup_marker!r}.format(slug={diagnostic_expected_slug!r}))\n"
+                "raise SystemExit(23)\n",
+                encoding="ascii",
+            )
+            diagnostic_candidate.chmod(0o700)
+            diagnostic, diagnostic_slug, diagnostic_dir = invoke(
+                diagnostic_candidate, diagnostic_run_id
+            )
+            self.assertEqual(diagnostic.returncode, 0, diagnostic.stderr)
+            self.assertEqual(diagnostic.stderr, "")
+            self.assertEqual(
+                diagnostic.stdout,
+                "candidate_status=23 capture_state=complete "
+                "install_diag_state=classified install_diag_reason=matched "
+                "install_class=production_guard install_stage=disk_guard install_exit=23\n",
+            )
+            private_stderr = (diagnostic_dir / "candidate.stderr").read_text(
+                encoding="ascii"
+            )
+            self.assertIn("RELEASE_INSTALL_DIAG", private_stderr)
+            self.assertIn("class=pending_operation", private_stderr)
+            self.assertNotIn("RELEASE_INSTALL_DIAG", diagnostic.stdout)
+            self.assertNotIn("pending_operation", diagnostic.stdout)
+            diagnostic_harness = self._candidate_diagnostic_marker_harness(
+                supervisor,
+                result=diagnostic.stdout.rstrip("\n"),
+                release_slug=diagnostic_slug,
+                source_sha=target_sha,
+            )
+            public = subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-c", diagnostic_harness],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin"},
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(public.returncode, 23, public.stderr)
+            self.assertEqual(
+                public.stdout,
+                "RELEASE_DEPLOY schema=1 status=failed class=deployment "
+                "phase=candidate reason=activation_failed "
+                "candidate_diag_state=classified candidate_diag_reason=matched "
+                "candidate_class=production_guard candidate_stage=disk_guard "
+                f"candidate_exit_status=23 release_slug={diagnostic_slug} "
+                f"source_sha={target_sha}\n",
+            )
+            self.assertNotIn("RELEASE_INSTALL_DIAG", public.stdout)
+            self.assertNotIn("pending_operation", public.stdout)
+
+            diagnostic_cases = (
+                (
+                    "malformed",
+                    "RELEASE_INSTALL_DIAG schema=1 status=failed class=invalid "
+                    "stage=disk_guard exit_status=23 release_slug={slug}\n",
+                    "malformed",
+                ),
+                (
+                    "wrong_slug",
+                    "RELEASE_INSTALL_DIAG schema=1 status=failed "
+                    "class=production_guard stage=disk_guard exit_status=23 "
+                    "release_slug=gha-1-1-bbbbbbbbbbbb\n",
+                    "malformed",
+                ),
+                (
+                    "wrong_status",
+                    "RELEASE_INSTALL_DIAG schema=1 status=failed "
+                    "class=production_guard stage=disk_guard exit_status=24 "
+                    "release_slug={slug}\n",
+                    "status_mismatch",
+                ),
+                ("duplicate", accepted_diag + accepted_diag, "duplicate"),
+            )
+            for index, (case, record, reason) in enumerate(diagnostic_cases, start=1):
+                with self.subTest(installer_diagnostic=case):
+                    candidate = root / f"installer-diagnostic-{case}"
+                    case_run_id = diagnostic_run_id + index
+                    expected_slug = f"gha-{case_run_id}-{attempt}-{target_sha[:12]}"
+                    candidate.write_text(
+                        "#!/usr/bin/python3\n"
+                        "import sys\n"
+                        f"sys.stderr.write({record!r}.format(slug={expected_slug!r}))\n"
+                        "raise SystemExit(23)\n",
+                        encoding="ascii",
+                    )
+                    candidate.chmod(0o700)
+                    result, slug, _run_dir = invoke(candidate, case_run_id)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(
+                        f"install_diag_state=unknown install_diag_reason={reason} "
+                        "install_class=unknown install_stage=unknown install_exit=none",
+                        result.stdout,
+                    )
+                    self.assertNotIn("RELEASE_INSTALL_DIAG", result.stdout)
+                    marker_harness = self._candidate_diagnostic_marker_harness(
+                        supervisor,
+                        result=result.stdout.rstrip("\n"),
+                        release_slug=slug,
+                        source_sha=target_sha,
+                    )
+                    marker = subprocess.run(
+                        ["/bin/bash", "--noprofile", "--norc", "-c", marker_harness],
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env={"PATH": "/usr/bin:/bin"},
+                        timeout=5,
+                        check=False,
+                    )
+                    self.assertEqual(marker.returncode, 23, marker.stderr)
+                    self.assertIn("candidate_diag_state=unknown", marker.stdout)
+                    self.assertNotIn("RELEASE_INSTALL_DIAG", marker.stdout)
+                    self.assertNotIn("class=invalid", marker.stdout)
+                    self.assertNotIn("bbbbbbbbbbbb", marker.stdout)
+
+            truncated_candidate = root / "installer-diagnostic-truncated"
+            truncated_run_id = diagnostic_run_id + 20
+            truncated_expected_slug = (
+                f"gha-{truncated_run_id}-{attempt}-{target_sha[:12]}"
+            )
+            truncated_candidate.write_text(
+                "#!/usr/bin/python3\n"
+                "import sys\n"
+                f"sys.stderr.write({accepted_diag!r}.format(slug={truncated_expected_slug!r}))\n"
+                "sys.stderr.write('x' * 70000)\n"
+                "raise SystemExit(23)\n",
+                encoding="ascii",
+            )
+            truncated_candidate.chmod(0o700)
+            truncated, truncated_slug, _truncated_dir = invoke(
+                truncated_candidate, truncated_run_id
+            )
+            self.assertEqual(truncated.returncode, 0, truncated.stderr)
+            self.assertIn("capture_state=truncated", truncated.stdout)
+            self.assertIn("install_diag_reason=truncated", truncated.stdout)
+            self.assertIn(
+                "install_class=unknown install_stage=unknown install_exit=none",
+                truncated.stdout,
+            )
+            self.assertNotIn("RELEASE_INSTALL_DIAG", truncated.stdout)
+            truncated_harness = self._candidate_diagnostic_marker_harness(
+                supervisor,
+                result=truncated.stdout.rstrip("\n"),
+                release_slug=truncated_slug,
+                source_sha=target_sha,
+            )
+            truncated_public = subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-c", truncated_harness],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin"},
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(truncated_public.returncode, 23, truncated_public.stderr)
+            self.assertIn("candidate_diag_state=unknown", truncated_public.stdout)
+            self.assertIn("candidate_diag_reason=truncated", truncated_public.stdout)
+            self.assertNotIn("RELEASE_INSTALL_DIAG", truncated_public.stdout)
+
             signal_candidate = root / "signal-candidate"
             signal_candidate.write_text(
                 "#!/usr/bin/python3\n"
@@ -3843,7 +4039,9 @@ fail 'private lock detail must not cross the public channel'
             )
             self.assertEqual(
                 signal_result.stdout,
-                "candidate_status=143 capture_state=complete\n",
+                "candidate_status=143 capture_state=complete "
+                "install_diag_state=unknown install_diag_reason=missing "
+                "install_class=unknown install_stage=unknown install_exit=none\n",
             )
             signal_metadata = json.loads((signal_dir / "candidate.json").read_text())
             self.assertEqual(signal_metadata["candidate_exit_status"], 143)
@@ -3865,6 +4063,8 @@ fail 'private lock detail must not cross the public channel'
                 signal_output.getvalue(),
                 "RELEASE_DEPLOY schema=1 status=failed class=deployment "
                 "phase=candidate reason=activation_failed "
+                "candidate_diag_state=unknown candidate_diag_reason=missing "
+                "candidate_class=unknown candidate_stage=unknown candidate_exit_status=143 "
                 f"release_slug={signal_slug} source_sha={target_sha}\n",
             )
 
@@ -3975,7 +4175,9 @@ fail 'private lock detail must not cross the public channel'
             )
             self.assertEqual(
                 spawn_failed.stdout,
-                "candidate_status=none capture_state=spawn_failed\n",
+                "candidate_status=none capture_state=spawn_failed "
+                "install_diag_state=unknown install_diag_reason=capture_incomplete "
+                "install_class=unknown install_stage=unknown install_exit=none\n",
             )
             self.assertTrue(spawn_dir.is_dir())
             spawn_metadata = json.loads((spawn_dir / "candidate.json").read_text())
@@ -4034,7 +4236,10 @@ fail 'private lock detail must not cross the public channel'
             )
             self.assertRegex(
                 timed_out.stdout,
-                r"^candidate_status=(1[2-9][0-9]|[2-9][0-9]{2}) capture_state=timeout\n$",
+                r"^candidate_status=(1[2-9][0-9]|[2-9][0-9]{2}) "
+                r"capture_state=timeout install_diag_state=unknown "
+                r"install_diag_reason=capture_incomplete install_class=unknown "
+                r"install_stage=unknown install_exit=none\n$",
             )
             timeout_metadata = json.loads((timeout_dir / "candidate.json").read_text())
             self.assertEqual(timeout_metadata["capture_state"], "timeout")
@@ -4054,10 +4259,13 @@ fail 'private lock detail must not cross the public channel'
                     expected_release_marker=("deploy", timeout_slug, target_sha),
                 )
             self.assertEqual(timeout_status, 1)
+            timeout_candidate_status = timed_out.stdout.split()[0].split("=", 1)[1]
             self.assertEqual(
                 timeout_output.getvalue(),
                 "RELEASE_DEPLOY schema=1 status=failed class=deployment "
                 "phase=candidate reason=activation_failed "
+                "candidate_diag_state=unknown candidate_diag_reason=capture_incomplete "
+                f"candidate_class=unknown candidate_stage=unknown candidate_exit_status={timeout_candidate_status} "
                 f"release_slug={timeout_slug} source_sha={target_sha}\n",
             )
 
@@ -4108,7 +4316,9 @@ fail 'private lock detail must not cross the public channel'
             self.assertEqual(unreaped.returncode, 0, unreaped.stderr)
             self.assertEqual(
                 unreaped.stdout,
-                "candidate_status=none capture_state=cleanup_unreaped\n",
+                "candidate_status=none capture_state=cleanup_unreaped "
+                "install_diag_state=unknown install_diag_reason=capture_incomplete "
+                "install_class=unknown install_stage=unknown install_exit=none\n",
             )
             unreaped_metadata = json.loads((unreaped_dir / "candidate.json").read_text())
             self.assertTrue(unreaped_metadata["candidate_started"])
@@ -4171,7 +4381,9 @@ fail 'private lock detail must not cross the public channel'
             )
             self.assertEqual(
                 inherited.stdout,
-                "candidate_status=0 capture_state=inherited_pipe_open\n",
+                "candidate_status=0 capture_state=inherited_pipe_open "
+                "install_diag_state=unknown install_diag_reason=capture_incomplete "
+                "install_class=unknown install_stage=unknown install_exit=none\n",
             )
             inherited_metadata = json.loads((inherited_dir / "candidate.json").read_text())
             self.assertEqual(inherited_metadata["capture_state"], "inherited_pipe_open")
@@ -4182,6 +4394,17 @@ fail 'private lock detail must not cross the public channel'
                 release_slug=inherited_slug,
                 source_sha=target_sha,
             )
+            inherited_direct = subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-c", inherited_marker],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin"},
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(inherited_direct.returncode, 1, inherited_direct.stderr)
+            self.assertIn("RELEASE_DEPLOY", inherited_direct.stdout, repr(inherited_direct.stdout))
             inherited_output = io.StringIO()
             with redirect_stdout(inherited_output):
                 inherited_status = platform_workflow_remote_dispatch._run_bounded_child(

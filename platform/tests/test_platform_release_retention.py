@@ -102,6 +102,77 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
             {old_candidate.name},
         )
 
+    def test_protected_release_only_removes_matching_candidates_and_keeps_allowlist_exact(self) -> None:
+        current = self.add_release("release-current", age_days=30)
+        previous = self.add_release("release-previous", age_days=29)
+        protected = self.add_release("release-preserve-failure", age_days=20)
+        candidate = self.add_release("release-old", age_days=19)
+        self.link("current", current)
+        self.link("previous", previous)
+
+        plan = build_retention_plan(
+            self.app_dir,
+            keep=0,
+            min_age_days=0,
+            protect_releases=(protected.name,),
+            now=self.now,
+        )
+
+        self.assertEqual(
+            {entry.path.name for entry in plan.candidates}, {candidate.name}
+        )
+        self.assertIn(protected.name, {entry.path.name for entry in plan.retained})
+        with self.assertRaisesRegex(RuntimeError, "expected candidates"):
+            apply_plan(
+                plan,
+                app_dir=self.app_dir,
+                expected_candidates=(protected.name, candidate.name),
+            )
+        self.assertTrue(protected.is_dir())
+        self.assertTrue(candidate.is_dir())
+
+        apply_plan(plan, app_dir=self.app_dir, expected_candidates=(candidate.name,))
+        self.assertTrue(protected.is_dir())
+        self.assertFalse(candidate.exists())
+        self.assertTrue(current.is_dir())
+        self.assertTrue(previous.is_dir())
+
+        receipt_candidate = self.add_release("release-cli-obsolete", age_days=18)
+        argv = [
+            "platform_release_retention.py",
+            "--app-dir",
+            str(self.app_dir),
+            "--keep",
+            "0",
+            "--min-age-days",
+            "0",
+            "--apply",
+            "--protected-release",
+            protected.name,
+            "--expected-candidate",
+            receipt_candidate.name,
+            "--json-receipt",
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(retention.sys, "argv", argv),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            result = retention.main()
+        self.assertEqual(result, 0, stderr.getvalue())
+        self.assertEqual(
+            stdout.getvalue(),
+            '{"schema":1,"status":"passed","candidate_count":1,'
+            '"deleted_count":1,"reclaimed_bytes":16}\n',
+        )
+        self.assertNotIn(receipt_candidate.name, stdout.getvalue())
+        self.assertFalse(receipt_candidate.exists())
+        self.assertTrue(protected.exists())
+        self.assertTrue(current.exists())
+        self.assertTrue(previous.exists())
+
     def test_apply_deletes_only_candidates(self) -> None:
         current = self.add_release("release-current", age_days=30)
         previous = self.add_release("release-previous", age_days=29)
@@ -192,7 +263,31 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         with mock.patch.object(
             retention.sys,
             "argv",
+            [
+                "platform_release_retention.py",
+                "--protected-release",
+                "release-old",
+                "--protected-release",
+                "release-current",
+            ],
+        ):
+            protected_args = retention.parse_args()
+        self.assertEqual(
+            protected_args.protected_release, ["release-old", "release-current"]
+        )
+
+        with mock.patch.object(
+            retention.sys,
+            "argv",
             ["platform_release_retention.py", "--expected-candidate", "release-old"],
+        ):
+            with self.assertRaises(SystemExit):
+                retention.parse_args()
+
+        with mock.patch.object(
+            retention.sys,
+            "argv",
+            ["platform_release_retention.py", "--json-receipt"],
         ):
             with self.assertRaises(SystemExit):
                 retention.parse_args()
@@ -204,6 +299,17 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
             argv = ["platform_release_retention.py", "--apply"]
             for value in values:
                 argv.extend(("--expected-candidate", value))
+            with mock.patch.object(retention.sys, "argv", argv):
+                with self.assertRaises(SystemExit):
+                    retention.parse_args()
+
+        for values in (
+            ("release-old", "release-old"),
+            ("../outside",),
+        ):
+            argv = ["platform_release_retention.py"]
+            for value in values:
+                argv.extend(("--protected-release", value))
             with mock.patch.object(retention.sys, "argv", argv):
                 with self.assertRaises(SystemExit):
                     retention.parse_args()
@@ -224,6 +330,7 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
             "--min-age-days",
             "0",
             "--apply",
+            "--json-receipt",
             "--expected-candidate",
             candidate_one.name,
         ]
@@ -238,6 +345,7 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
             result = retention.main()
 
         self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
         self.assertIn("Release retention failed", stderr.getvalue())
         self.assertTrue(candidate_one.is_dir())
         self.assertTrue(candidate_two.is_dir())
