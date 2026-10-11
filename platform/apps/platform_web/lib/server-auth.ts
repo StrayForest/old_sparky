@@ -10,6 +10,10 @@ import {
   measureSsrStage
 } from "@/lib/server-ssr-observability";
 import { runWithServerInternalRead } from "@/lib/server-internal-read-scheduler";
+import {
+  cancelServerAuthFetchTerminalResponse,
+  cancelServerFetchResponse
+} from "@/lib/server-fetch-response";
 
 export type ServerAuthSnapshot = {
   status: "authenticated" | "anonymous" | "unavailable";
@@ -41,6 +45,8 @@ type ServerJsonResponse = {
   ok: boolean;
   json: () => Promise<unknown>;
 };
+
+const serverAuthFetchControllers = new WeakMap<Response, AbortController>();
 
 export function platformSessionCookieName(): string {
   return process.env.PLATFORM_SESSION_COOKIE_NAME?.trim()
@@ -89,6 +95,11 @@ export const getServerCurrentUser = cache(async (
           requestHeaders.set("cookie", cookieHeader);
         }
         const response = await requestServerAuthJson(`${baseUrl}/users/me`, requestHeaders);
+        const fetchController = getServerAuthFetchController(response);
+        const fetchTerminal = fetchController
+          ? cancelServerAuthFetchTerminalResponse(response as Response, fetchController)
+          : null;
+        if (fetchTerminal) return fetchTerminal;
         if (response.status === 401 || response.status === 403) {
           await cancelServerAuthBody(response);
           return { status: "anonymous", user: null };
@@ -132,6 +143,11 @@ export const getServerAuthBootstrap = cache(async (
           requestHeaders.set("cookie", cookieHeader);
         }
         const response = await requestServerAuthJson(`${baseUrl}/auth/bootstrap`, requestHeaders);
+        const fetchController = getServerAuthFetchController(response);
+        const fetchTerminal = fetchController
+          ? cancelServerAuthFetchTerminalResponse(response as Response, fetchController)
+          : null;
+        if (fetchTerminal) return fetchTerminal;
         if (response.status === 401 || response.status === 403) {
           await cancelServerAuthBody(response);
           return { status: "anonymous", user: null };
@@ -152,9 +168,23 @@ export const getServerAuthBootstrap = cache(async (
   );
 });
 
+function getServerAuthFetchController(
+  response: Response | ServerJsonResponse
+): AbortController | undefined {
+  if (!(response instanceof Response)) return undefined;
+  const controller = serverAuthFetchControllers.get(response);
+  if (controller) serverAuthFetchControllers.delete(response);
+  return controller;
+}
+
 async function cancelServerAuthBody(
   response: Response | ServerJsonResponse
 ): Promise<void> {
+  const controller = getServerAuthFetchController(response);
+  if (controller && response instanceof Response) {
+    cancelServerFetchResponse(response, controller);
+    return;
+  }
   if (!("body" in response) || !response.body) return;
   try {
     await response.body.cancel();
@@ -170,10 +200,15 @@ function requestServerAuthJson(
   if (serverAuthTransport === "node") {
     return requestServerJson(input, headers);
   }
+  const controller = new AbortController();
+  const timeout = AbortSignal.timeout(serverAuthTimeoutMs);
   return fetch(input, {
     headers,
     cache: "no-store",
-    signal: AbortSignal.timeout(serverAuthTimeoutMs),
+    signal: AbortSignal.any([controller.signal, timeout]),
+  }).then((response) => {
+    serverAuthFetchControllers.set(response, controller);
+    return response;
   });
 }
 

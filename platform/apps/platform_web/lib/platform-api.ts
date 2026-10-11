@@ -4,6 +4,7 @@ import {
   runWithServerInternalRead,
   ServerInternalReadQueueError
 } from "@/lib/server-internal-read-scheduler";
+import { cancelServerFetchResponse } from "@/lib/server-fetch-response";
 import {
   normalizeVisibility,
   ranks,
@@ -800,6 +801,13 @@ export async function getTournamentWorkspace(
     signal?: AbortSignal;
   } = {}
 ): Promise<{ tournament: TournamentDetail; currentUser: PlatformUser | null } | null> {
+  const serverRequest = typeof window === "undefined";
+  const serverFetchController = serverRequest ? new AbortController() : null;
+  const fetchSignal = serverFetchController
+    ? options.signal
+      ? AbortSignal.any([options.signal, serverFetchController.signal])
+      : serverFetchController.signal
+    : options.signal;
   const headers = new Headers(requestHeaders);
   headers.set("accept", "application/json");
   const participantsLimit = Math.max(0, options.participantsLimit ?? 25);
@@ -821,14 +829,22 @@ export async function getTournamentWorkspace(
       headers,
       credentials: "include",
       cache: "no-store",
-      signal: options.signal
+      signal: fetchSignal
     });
     if (response.status === 404) {
-      await cancelResponseBody(response);
+      if (serverFetchController) {
+        cancelServerFetchResponse(response, serverFetchController);
+      } else {
+        await cancelResponseBody(response);
+      }
       return null;
     }
     if (!response.ok) {
-      await cancelResponseBody(response);
+      if (serverFetchController) {
+        cancelServerFetchResponse(response, serverFetchController);
+      } else {
+        await cancelResponseBody(response);
+      }
       throw new PlatformApiError(response.statusText || "Failed to load tournament.", response.status);
     }
 
@@ -866,7 +882,7 @@ export async function getTournamentWorkspace(
   };
 
   try {
-    return typeof window === "undefined"
+    return serverRequest
       ? await runWithServerInternalRead(loadWorkspace, options.signal)
       : await loadWorkspace();
   } catch (error) {

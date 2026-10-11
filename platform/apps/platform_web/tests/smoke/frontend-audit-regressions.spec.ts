@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 import { NextRequest } from "next/server";
+import { getTournamentWorkspace, PlatformApiError } from "../../lib/platform-api";
+import { cancelServerAuthFetchTerminalResponse } from "../../lib/server-fetch-response";
 import { formatWorkspaceApiErrorDiagnostic } from "../../lib/ssr-error-diagnostic";
 import { hasAuthorizedDiagnosticRunMarker } from "../../lib/performance-diagnostic-marker";
 import {
@@ -62,6 +64,131 @@ test("server internal reads share a bounded FIFO permit through body completion"
   expect(order).toEqual(["second", "third"]);
   expect(scheduler.activeCount).toBe(0);
   expect(scheduler.pendingCount).toBe(0);
+});
+
+test("terminal server workspace responses release the permit without waiting for body cancellation", async () => {
+  const originalFetch = globalThis.fetch;
+  const schedulerKey = "__oldsparkyServerInternalReadScheduler__";
+  const sharedGlobal = globalThis as typeof globalThis & Record<string, unknown>;
+  const hadOriginalScheduler = Object.hasOwn(sharedGlobal, schedulerKey);
+  const originalScheduler = sharedGlobal[schedulerKey];
+  const scheduler = new ServerInternalReadScheduler({
+    activeLimit: 1,
+    pendingLimit: 1,
+    queueDeadlineMs: 500,
+  });
+  sharedGlobal[schedulerKey] = scheduler;
+  const cancellationStarted = deferred();
+  let releaseNeverSettlingCancellation!: () => void;
+  const neverSettlingCancellation = new Promise<void>((resolve) => {
+    releaseNeverSettlingCancellation = resolve;
+  });
+  const fetchSignals: Array<AbortSignal | null | undefined> = [];
+  let fetchCount = 0;
+
+  globalThis.fetch = async (_input, init) => {
+    fetchSignals.push(init?.signal);
+    fetchCount += 1;
+    if (fetchCount === 1) {
+      return new Response(new ReadableStream({
+        cancel() {
+          cancellationStarted.resolve();
+          return neverSettlingCancellation;
+        }
+      }), { status: 404 });
+    }
+    return new Response(new ReadableStream({
+      cancel() {
+        return Promise.reject(new Error("synthetic body cancellation failure"));
+      }
+    }), { status: 503 });
+  };
+
+  const callerController = new AbortController();
+  let firstRequest: Promise<Awaited<ReturnType<typeof getTournamentWorkspace>>> | undefined;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    firstRequest = getTournamentWorkspace("missing-fixture", {}, {
+      workspaceView: "detail",
+      participantsLimit: 0,
+      signal: callerController.signal
+    });
+    const deadline = new Promise<symbol>((resolve) => {
+      deadlineTimer = setTimeout(() => resolve(Symbol.for("cancel-did-not-settle")), 250);
+    });
+    const missing = await Promise.race([firstRequest, deadline]);
+    if (typeof missing === "symbol") {
+      releaseNeverSettlingCancellation();
+      await firstRequest;
+      throw new Error("The server workspace result waited for body cancellation.");
+    }
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    await cancellationStarted.promise;
+    expect(missing).toBeNull();
+    expect(scheduler.activeCount).toBe(0);
+    expect(scheduler.pendingCount).toBe(0);
+    expect(fetchSignals[0]?.aborted).toBe(true);
+    expect(callerController.signal.aborted).toBe(false);
+
+    await expect(getTournamentWorkspace("unavailable-fixture", {}, {
+      workspaceView: "detail",
+      participantsLimit: 0
+    })).rejects.toMatchObject({
+      name: "PlatformApiError",
+      status: 503
+    } satisfies Partial<PlatformApiError>);
+    expect(fetchSignals[1]?.aborted).toBe(true);
+    expect(fetchCount).toBe(2);
+    expect(scheduler.activeCount).toBe(0);
+    expect(scheduler.pendingCount).toBe(0);
+  } finally {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    releaseNeverSettlingCancellation();
+    globalThis.fetch = originalFetch;
+    try {
+      if (firstRequest) await firstRequest;
+    } finally {
+      if (hadOriginalScheduler) {
+        sharedGlobal[schedulerKey] = originalScheduler;
+      } else {
+        delete sharedGlobal[schedulerKey];
+      }
+    }
+  }
+});
+
+test("terminal server auth fetch responses retain snapshots without awaiting body cancellation", async () => {
+  const cases = [
+    { status: 401, snapshot: { status: "anonymous", user: null } },
+    { status: 403, snapshot: { status: "anonymous", user: null } },
+    { status: 503, snapshot: { status: "unavailable", user: null } },
+  ] as const;
+
+  for (const { status, snapshot } of cases) {
+    const scheduler = new ServerInternalReadScheduler({
+      activeLimit: 1,
+      pendingLimit: 0,
+      queueDeadlineMs: 500,
+    });
+    const cancellationStarted = deferred();
+    const controller = new AbortController();
+    const response = new Response(new ReadableStream({
+      cancel() {
+        cancellationStarted.resolve();
+        return new Promise<void>(() => {});
+      }
+    }), { status });
+
+    const result = await scheduler.run(async () =>
+      cancelServerAuthFetchTerminalResponse(response, controller)
+    );
+
+    await cancellationStarted.promise;
+    expect(result).toEqual(snapshot);
+    expect(controller.signal.aborted).toBe(true);
+    expect(scheduler.activeCount).toBe(0);
+    expect(scheduler.pendingCount).toBe(0);
+  }
 });
 
 test("server internal read waiters are removed on abort/deadline and permits release on error", async () => {
@@ -253,6 +380,12 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(api).toContain('{ code: "server_read_capacity" }');
   expect(auth.match(/runWithServerInternalRead\(/gu)).toHaveLength(2);
   expect(auth).toContain("await cancelServerAuthBody(response)");
+  expect(auth).toContain("cancelServerAuthFetchTerminalResponse(response as Response, fetchController)");
+  expect(auth).toContain("signal: AbortSignal.any([controller.signal, timeout])");
+  expect(auth).toContain("serverAuthFetchControllers.set(response, controller)");
+  expect(auth).toContain("cancelServerFetchResponse(response, controller);");
+  expect(auth).toContain("return { status: \"anonymous\", user: null }");
+  expect(auth).toContain("return { status: \"unavailable\", user: null }");
   expect(scheduler).toContain("activeLimit: 24");
   expect(scheduler).toContain("pendingLimit: 128");
   expect(scheduler).toContain("queueDeadlineMs: 5_000");
