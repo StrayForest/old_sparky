@@ -521,36 +521,73 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(waits["wait_state_counts"], {"lock": 3, "other": 4})
         self.assertEqual(lifecycle["deadlock-api"], {"new_process_count": 1, "missing_process_count": 1})
 
-        ssr_output = serialized(
-            summarize_ssr_observability(
-                [],
-                [
-                    {
-                        "method": "GET",
-                        "status": 504,
-                        "uri": "/tournaments/private-slug?invite=INVITE-CODE",
-                        "timeout_diagnostic_id": "tdiag-secret",
-                        "request_id": "request-secret",
-                        "cf_ray": "ray-secret",
-                        "request_completion": "timeout",
-                        "upstream_addr": "127.0.0.1:3000",
-                        "upstream_status": "504",
-                        "request_time": "30.0",
-                    }
-                ],
-                [],
-                timeout_diagnostic_ids={"tdiag-secret"},
-            )
+        diagnostic_id = "tdiag-123-00003"
+        nginx_record = {
+            "method": "GET",
+            "status": 504,
+            "uri": "/tournaments/private-slug?invite=INVITE-CODE",
+            "timeout_diagnostic_id": diagnostic_id,
+            "request_id": "request-secret",
+            "cf_ray": "ray-secret",
+            "request_completion": "timeout",
+            "upstream_addr": "127.0.0.1:3000",
+            "upstream_status": "504",
+            "request_time": "30.0",
+        }
+        private_ssr = summarize_ssr_observability(
+            [],
+            [nginx_record],
+            [],
+            timeout_diagnostic_ids={diagnostic_id},
         )
+        private_ssr_output = serialized(private_ssr)
+        # The exact ID is required only in this private observer intermediate
+        # so the timeout joiner can match the client and origin rows.
+        self.assertIn(diagnostic_id, private_ssr_output)
+        self.assertIn('"route_class": "tournament_page"', private_ssr_output)
+
+        malformed_ssr = summarize_ssr_observability(
+            [],
+            [{**nginx_record, "timeout_diagnostic_id": "tdiag-secret"}],
+            [],
+            timeout_diagnostic_ids={"tdiag-secret"},
+        )
+        self.assertEqual(malformed_ssr["timeout_diagnostics"]["nginx_records"], 0)
+        self.assertEqual(malformed_ssr["timeout_diagnostics"]["rows"], [])
+
+        public_observer = project_public_artifact(
+            "server_observability",
+            {
+                "schema": 1,
+                "system": {
+                    "processes": {
+                        "deadlock-api": {
+                            "process_count": 1,
+                            "rss_bytes": 123456,
+                            "pid": 987654,
+                            "uid": 876543,
+                            "application_name": "oldsparky-worker",
+                        }
+                    }
+                },
+                "server_ssr_observability": private_ssr,
+            },
+        )
+        public_ssr_output = serialized(public_observer)
         for value in FORBIDDEN_VALUES + (
             "private-slug",
             "INVITE-CODE",
-            "tdiag-secret",
+            diagnostic_id,
             "request-secret",
             "ray-secret",
+            "987654",
+            "876543",
+            "oldsparky-worker",
         ):
-            self.assertNotIn(value.lower(), ssr_output.lower())
-        self.assertIn('"route_class": "tournament_page"', ssr_output)
+            self.assertNotIn(value.lower(), public_ssr_output.lower())
+        projected_timeout = public_observer["server_ssr_observability"]["timeout_diagnostics"]
+        self.assertEqual(projected_timeout["nginx_records"], 1)
+        self.assertEqual(projected_timeout["rows"][0]["route_class"], "tournament_page")
 
     def test_cli_summary_exposes_only_control_preservation_boolean(self) -> None:
         report = {
