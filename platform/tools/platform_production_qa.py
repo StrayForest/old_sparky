@@ -3084,9 +3084,10 @@ def summarize_ssr_observability(
 
     for record in nginx_records:
         diagnostic_id = str(record.get("timeout_diagnostic_id") or "").strip()
-        if not diagnostic_id or (
-            timeout_diagnostic_ids is not None
-            and diagnostic_id not in timeout_diagnostic_ids
+        if (
+            TIMEOUT_DIAGNOSTIC_ID_RE.fullmatch(diagnostic_id) is None
+            or timeout_diagnostic_ids is None
+            or diagnostic_id not in timeout_diagnostic_ids
         ):
             continue
         upstream_addr = str(record.get("upstream_addr") or "").strip()
@@ -3107,6 +3108,9 @@ def summarize_ssr_observability(
             api_rows = api_perf_by_cf_ray.get(cf_ray, [])
         timeout_diagnostic_rows.append(
             {
+                # This is private correlation metadata. The public observer
+                # projection has a closed field allowlist and drops it.
+                "diagnostic_id": diagnostic_id,
                 "route_class": safe_route_class(record.get("uri") or "", page=True),
                 "method": safe_method(record.get("method")),
                 "status": safe_status(record.get("status")),

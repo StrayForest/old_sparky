@@ -4,10 +4,11 @@
 This tool is diagnostic-only.  It never makes requests, changes runtime state,
 or treats a missing layer record as proof that the layer was healthy.  The
 client report is the complete timeout population; the origin report contains
-only the bounded rows selected for the same diagnostic window.  Correlation
-identifiers are intentionally not required or emitted.  Rows are paired by
-their bounded observation order and all public fields pass through the same
-closed route/status/error schema used by the load producers.
+only the bounded rows selected for the same diagnostic window.  Origin rows
+are matched only by a unique, validated private diagnostic identifier;
+missing, malformed, or ambiguous IDs remain unmatched.  Identifiers are
+stripped before output, and public fields pass through the same closed
+route/status/error schema used by the load producers.
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ NGINX_TIMEOUT_POLICY = {
     "source": "canonical_nginx_timeout_policy",
 }
 PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]{1,4}$")
+TIMEOUT_DIAGNOSTIC_ID_RE = re.compile(r"^tdiag-[0-9]{1,32}-[0-9]{5}$")
 
 
 def load_object(path: Path) -> dict[str, Any]:
@@ -117,6 +119,12 @@ def classify_timeout(
         "next_accept_or_node_queue",
         "next_accepted_without_ssr",
     )
+
+
+def _validated_diagnostic_id(value: Any) -> str | None:
+    if not isinstance(value, str) or TIMEOUT_DIAGNOSTIC_ID_RE.fullmatch(value) is None:
+        return None
+    return value
 
 
 def _safe_client_timeout_row(row: Any) -> dict[str, Any] | None:
@@ -207,9 +215,13 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
     client_summary = client.get("overall") or client.get("raw_http") or {}
     if not isinstance(client_summary, dict):
         client_summary = {}
-    client_rows = [
-        sanitized
+    client_entries = [
+        (
+            _validated_diagnostic_id(row.get("diagnostic_id")),
+            sanitized,
+        )
         for row in client_summary.get("timeout_diagnostics") or []
+        if isinstance(row, dict)
         if (sanitized := _safe_client_timeout_row(row)) is not None
     ]
     server_section = server.get("server_ssr_observability") or {}
@@ -218,11 +230,32 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
     server_timeout_section = server_section.get("timeout_diagnostics") or {}
     if not isinstance(server_timeout_section, dict):
         server_timeout_section = {}
-    origin_rows = [
-        sanitized
+    origin_entries = [
+        (
+            _validated_diagnostic_id(row.get("diagnostic_id")),
+            sanitized,
+        )
         for row in server_timeout_section.get("rows") or []
+        if isinstance(row, dict)
         if (sanitized := _safe_origin_timeout_row(row)) is not None
     ]
+    client_id_counts = Counter(
+        diagnostic_id
+        for diagnostic_id, _row in client_entries
+        if diagnostic_id is not None
+    )
+    origin_id_counts = Counter(
+        diagnostic_id
+        for diagnostic_id, _row in origin_entries
+        if diagnostic_id is not None
+    )
+    origin_by_id = {
+        diagnostic_id: row
+        for diagnostic_id, row in origin_entries
+        if diagnostic_id is not None and origin_id_counts[diagnostic_id] == 1
+    }
+    client_rows = [row for _diagnostic_id, row in client_entries]
+    origin_rows = [row for _diagnostic_id, row in origin_entries]
     system = server.get("system") or {}
     event_loop = server_section.get("event_loop") or {}
 
@@ -236,11 +269,17 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
     origin_started_after_timeout = 0
     origin_start_timing_ambiguous = 0
     origin_completed_before_timeout = 0
-    # No request/diagnostic/correlation identifier is persisted.  Pair only
-    # bounded rows by observation order; an absent origin row remains explicit
-    # and cannot be interpreted as a successful origin response.
-    for index, client_row in enumerate(client_rows):
-        origin_row = origin_rows[index] if index < len(origin_rows) else None
+    # Match only one-to-one validated IDs from the private producer inputs.
+    # The ID is discarded before output; absent or ambiguous evidence never
+    # falls back to row order.
+    for index, (diagnostic_id, client_row) in enumerate(client_entries):
+        origin_row = None
+        if (
+            diagnostic_id is not None
+            and client_id_counts[diagnostic_id] == 1
+            and origin_id_counts[diagnostic_id] == 1
+        ):
+            origin_row = origin_by_id[diagnostic_id]
         next_row = origin_row.get("next") if origin_row else {}
         api_row = origin_row.get("api") if origin_row else {}
         classification, reason_class = classify_timeout(
