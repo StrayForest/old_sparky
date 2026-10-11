@@ -2895,7 +2895,11 @@ def _trusted_runtime_root() -> Path:
         ):
             raise GuardError("referenced live-QA engine provider file is unsafe")
         if relative.startswith(("node/", "browsers/", "web/node_modules/")):
-            actual_files[relative] = _sha256_regular(path, expected_uid=0)
+            actual_files[relative] = _sha256_regular(
+                path,
+                expected_uid=0,
+                maximum=MAX_ZIP_MEMBER_BYTES,
+            )
         elif relative not in {
             "web/package-lock.json", "web/playwright.live.config.ts",
             "web/tests/smoke/live-launch.spec.ts",

@@ -172,9 +172,12 @@ atomically switching the active pointer. A missing, stale or incompatible
 provider fails closed; it is not replaced by a path from the environment or
 candidate checkout. Existing complete v1 generations remain immutable and may
 serve as the provider only when their exact engine file map and package-lock
-digest match the candidate manifest. Release bootstrap validates the complete
-archive and source SHA before omitting only the wheelhouse and standalone web
-bundle from its temporary control tree; full release contents remain intact.
+digest match the candidate manifest. Provider members are hashed in bounded
+chunks under the signed archive's per-member size limit; small trusted helper
+hashes retain their tighter default bound. Release bootstrap validates the
+complete archive and source SHA before omitting only the wheelhouse and
+standalone web bundle from its temporary control tree; full release contents
+remain intact.
 The fixed root-owned supervisor at
 `/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh` (mode `0755`) then
 dispatches only that active generation; a missing, stale, symlinked or

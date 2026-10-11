@@ -284,7 +284,7 @@ Release retention tests own locked candidate-set rechecks and belong to
 `backend-privileged`.
 
 `test_platform_backup_restore_drill` and `test_platform_storage_maintenance` own newest-pair restore, lock-held build-cache eviction and fallback-compaction integration in `backend-privileged`; `test_platform_release_build_contract` covers pinned cache integrity/regeneration.
-`test_platform_live_qa_guard` owns the reversible Chromium subtree transaction, partial-delete recovery and sandboxed probes in the same contour.
+`test_platform_live_qa_guard` owns the reversible Chromium subtree transaction, partial-delete recovery, sandboxed probes and signed-provider verification, including bounded hashing of large runtime members, in the same contour.
 
 The `platform-host-tools-candidate.yml` workflow is a separate trusted `workflow_run` contract, not
 a production gate. Its validator and bundle tests belong to `backend-tool-contract` through

@@ -1663,6 +1663,187 @@ class LiveQaGuardTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             guard._parser().parse_args(["runtime-root", "/tmp/untrusted-runtime"])
 
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned runtime provider contract")
+    def test_trusted_runtime_root_hashes_bounded_large_provider_member(self) -> None:
+        source_sha = "a" * 40
+        provider_sha = "b" * 40
+        node_bytes = b"trusted-node-binary" * 60_000
+        self.assertGreater(len(node_bytes), 1024 * 1024)
+
+        def make_provider(
+            base: Path,
+            *,
+            node_size: int = len(node_bytes),
+            expected_node_digest: str | None = None,
+            node_mode: int = 0o444,
+            node_symlink: bool = False,
+        ) -> tuple[Path, Path]:
+            payloads = base / "trusted" / "releases"
+            active_payload = payloads / source_sha
+            provider_payload = payloads / provider_sha
+            active_payload.mkdir(mode=0o755, parents=True)
+            (active_payload / "runtime").mkdir(mode=0o555)
+            (active_payload / "runtime" / "runtime-manifest.json").write_text(
+                "{}\n", encoding="ascii"
+            )
+            os.chmod(active_payload / "runtime" / "runtime-manifest.json", 0o444)
+            runtime_root = provider_payload / "runtime"
+            node_path = runtime_root / "node" / "bin" / "node"
+            node_path.parent.mkdir(mode=0o555, parents=True)
+            with node_path.open("wb") as stream:
+                if node_size == len(node_bytes):
+                    stream.write(node_bytes)
+                else:
+                    stream.truncate(node_size)
+            os.chmod(node_path, node_mode)
+            if node_symlink:
+                target = base / "node-target"
+                node_path.replace(target)
+                node_path.symlink_to(target)
+
+            engine_files: dict[str, str] = {
+                "node/bin/node": (
+                    expected_node_digest
+                    if expected_node_digest is not None
+                    else hashlib.sha256(node_bytes).hexdigest()
+                )
+            }
+            for browser in sorted(guard.LIVE_QA_BROWSER_ROOTS):
+                browser_root = runtime_root / "browsers" / browser
+                browser_root.mkdir(mode=0o555, parents=True)
+                relative = f"browsers/{browser}/engine.bin"
+                content = f"{browser}-fixture".encode("ascii")
+                browser_file = runtime_root / relative
+                browser_file.write_bytes(content)
+                os.chmod(browser_file, 0o444)
+                engine_files[relative] = hashlib.sha256(content).hexdigest()
+
+            sandbox_relative = guard.CHROMIUM_SANDBOX_RELATIVE.as_posix()
+            sandbox_path = runtime_root / sandbox_relative
+            sandbox_path.parent.mkdir(mode=0o555, parents=True, exist_ok=True)
+            sandbox_path.write_bytes(platform_chromium_sandbox_fixture.read_bytes())
+            os.chmod(sandbox_path, 0o4755)
+            engine_files[sandbox_relative] = guard.CHROMIUM_SANDBOX_SHA256
+
+            web_root = runtime_root / "web"
+            web_root.mkdir(mode=0o555)
+            package_lock = b"{}\n"
+            (web_root / "package-lock.json").write_bytes(package_lock)
+            os.chmod(web_root / "package-lock.json", 0o444)
+            package_lock_sha = hashlib.sha256(package_lock).hexdigest()
+            engine_digest = hashlib.sha256(
+                b"oldsparky-liveqa-engine-v1\0"
+                + guard.NODE_VERSION.encode("ascii")
+                + b"\0"
+                + package_lock_sha.encode("ascii")
+                + b"\0"
+            )
+            for relative, file_digest in sorted(engine_files.items()):
+                engine_digest.update(relative.encode("utf-8") + b"\0f\0")
+                engine_digest.update(bytes.fromhex(file_digest))
+            suite_manifest = {
+                "version": 2,
+                "node_version": guard.NODE_VERSION,
+                "package_lock_sha256": package_lock_sha,
+                "engine_tree_sha256": engine_digest.hexdigest(),
+                "engine_files": engine_files,
+            }
+            (active_payload / "runtime" / "runtime-manifest.json").write_text(
+                json.dumps(suite_manifest, sort_keys=True, separators=(",", ":")),
+                encoding="ascii",
+            )
+            os.chmod(active_payload / "runtime" / "runtime-manifest.json", 0o444)
+            provider = {
+                "version": 1,
+                "source_sha": source_sha,
+                "provider_sha": provider_sha,
+                "engine_tree_sha256": engine_digest.hexdigest(),
+                "node_version": guard.NODE_VERSION,
+                "package_lock_sha256": package_lock_sha,
+                "engine_files": engine_files,
+            }
+            provider_path = active_payload / "runtime-provider.json"
+            provider_path.write_text(
+                json.dumps(provider, sort_keys=True, separators=(",", ":")),
+                encoding="ascii",
+            )
+            os.chmod(provider_path, 0o444)
+            source_file = provider_payload / "source-sha"
+            source_file.write_text(provider_sha + "\n", encoding="ascii")
+            os.chmod(source_file, 0o444)
+
+            for directory in sorted(
+                (path for path in payloads.rglob("*") if path.is_dir()),
+                key=lambda path: len(path.parts),
+                reverse=True,
+            ):
+                os.chmod(directory, 0o555)
+            pointer = base / "trusted" / "active"
+            pointer.symlink_to(Path("releases") / source_sha)
+            return pointer, node_path
+
+        def resolve(pointer: Path, payloads: Path) -> Path:
+            with (
+                mock.patch.object(guard, "TRUSTED_ACTIVE_POINTER", pointer),
+                mock.patch.object(guard, "TRUSTED_PAYLOAD_ROOT", payloads),
+                mock.patch.object(
+                    guard, "_validate_installed_payload_root", return_value=source_sha
+                ),
+            ):
+                return guard._trusted_runtime_root()
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            base = Path(temporary)
+            pointer, node = make_provider(base)
+            self.assertEqual(
+                resolve(pointer, base / "trusted" / "releases"),
+                base / "trusted" / "releases" / provider_sha / "runtime",
+            )
+            with self.assertRaisesRegex(
+                guard.GuardError, "helper file metadata is unsafe"
+            ):
+                guard._sha256_regular(node, expected_uid=0)
+
+        with self.subTest("hash mismatch"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(
+                    base, expected_node_digest="0" * 64
+                )
+                with self.assertRaisesRegex(
+                    guard.GuardError, "provider digest does not match"
+                ):
+                    resolve(pointer, base / "trusted" / "releases")
+
+        with self.subTest("oversized member"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(
+                    base, node_size=guard.MAX_ZIP_MEMBER_BYTES + 1
+                )
+                with self.assertRaisesRegex(
+                    guard.GuardError, "helper file metadata is unsafe"
+                ):
+                    resolve(pointer, base / "trusted" / "releases")
+
+        with self.subTest("unsafe member mode"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(base, node_mode=0o644)
+                with self.assertRaisesRegex(
+                    guard.GuardError, "provider file is unsafe"
+                ):
+                    resolve(pointer, base / "trusted" / "releases")
+
+        with self.subTest("symlink member"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(base, node_symlink=True)
+                with self.assertRaisesRegex(
+                    guard.GuardError, "provider contains unsafe metadata"
+                ):
+                    resolve(pointer, base / "trusted" / "releases")
+
     @unittest.skipUnless(os.geteuid() == 0, "root-owned runtime mapping contract")
     def test_runtime_mount_aliases_are_fixed_empty_root_owned_and_removed_by_identity(
         self,
