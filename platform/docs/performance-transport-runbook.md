@@ -37,7 +37,15 @@ SSR/event-loop diagnostics and API request logging off; its required evidence
 is the bounded client-timeout to Nginx route/status/upstream-timing join.
 Applying the profile restarts both
 `deadlock-api` and `deadlock-web` with readiness checks because the API gate is read at process
-startup; restoring `ready-vote-static-8` returns both services to baseline.
+startup. Before applying it, record the exact prior runtime profile and verify
+that its web-worker and auth-transport values match the diagnostic profile's
+one-worker/fetch defaults. Restore the recorded profile through the supported
+runtime-profile workflow; do not assume `ready-vote-static-8` is the prior
+profile or edit the shared environment directly. When the prior profile is
+`authenticated-read-admission-24x8`, use the supported baseline-then-prior
+sequence, checking readiness after each transition. The 24x8 restore selector explicitly resets
+`PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC=false` while preserving the 24/8/250ms
+admission tuple and existing API/database pool settings.
 The API only accepts internal SSR diagnostic headers from the loopback SSR
 hop; every public API proxy location clears those headers. The API auth/bootstrap gate
 also requires the expected route, method, internal trace marker and startup
@@ -73,15 +81,33 @@ log value.
   ELU, process CPU and GC duration to identify scheduling/queueing.
 
 Run this only as one explicitly reviewed `web-ssr-diagnostics` window using the
-canonical external authenticated-page profile. It does not change workers,
-transport, compression, database pools or capacity limits. If the observer
+canonical external authenticated-page profile. It leaves compression,
+database pools, API admission and capacity limits unchanged; its selected web
+worker and auth-transport values are one and `fetch`, so verify those match the
+recorded prior profile before applying it. If the observer
 records a web restart or any unexpected status, treat the window as diagnostic
 evidence rather than a clean latency result and follow [Web restart evidence](#web-restart-evidence).
-Restore `ready-vote-static-8` after the window so the diagnostic keys and API
-logging selectors return to their baseline values
+Restore the exact recorded prior profile after the window so the diagnostic
+keys and API logging selectors return to their baseline values
 (`PLATFORM_SSR_PERF_LOG_ENABLED=false`,
 `PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=false`, `PLATFORM_LOG_LEVEL=INFO` and
 `PLATFORM_PERF_LOG_ENABLED=true`).
+
+The server-side SSR read scheduler bounds internal read-only workspace,
+bootstrap and current-user requests per web process: 24 active operations,
+128 FIFO waiters and a five-second queue deadline. It holds a permit through
+response-body parsing or cancellation and releases it on success, error or
+abort. Queue saturation does not retry an API request or change browser
+requests, authentication, API admission, database pools or write paths. This
+is a request-fanout guard, not a capacity increase; validate its effect only
+with the complete external-load profile matrix.
+
+`server_request_perf_logs` reports
+`authenticated_read_admission_shed.{observed,shed,not_shed,unknown}` globally
+and for each safe route class. These are counters from the selected
+`request_perf` journal population, not all HTTP requests. Missing or malformed
+boolean values count as unknown, and sampled counts must not be extrapolated
+to the full client population.
 
 The separate `PLATFORM_SSR_HEAP_METRICS_ENABLED` selector is false in the
 public baseline and is carried only to the web process. The reviewed
