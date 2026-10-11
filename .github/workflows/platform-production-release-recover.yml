@@ -235,13 +235,15 @@ jobs:
               failed = json.loads((root / "failed-deploy-run.json").read_text(encoding="utf-8"))
               failed_jobs_payload = json.loads((root / "failed-deploy-jobs.json").read_text(encoding="utf-8"))
               failed_jobs = failed_jobs_payload.get("jobs") if isinstance(failed_jobs_payload, dict) else None
+              failed_source = failed.get("head_sha")
               if (
                   failed.get("id") != failed_id
                   or failed.get("run_attempt") != failed_attempt
                   or failed.get("name") != "Platform production deploy"
                   or failed.get("path") != ".github/workflows/platform-production-deploy.yml"
                   or failed.get("head_branch") != "dev"
-                  or failed.get("head_sha") != source
+                  or not isinstance(failed_source, str)
+                  or re.fullmatch(r"[0-9a-f]{40}", failed_source) is None
                   or failed.get("event") not in {"workflow_dispatch", "workflow_run"}
                   or failed.get("status") != "completed"
                   or failed.get("conclusion") != "failure"
@@ -259,13 +261,13 @@ jobs:
                   and row.get("name") == "Deploy production"
                   and row.get("run_id") == failed_id
                   and row.get("run_attempt") == failed_attempt
-                  and row.get("head_sha") == source
+                  and row.get("head_sha") == failed_source
                   and row.get("status") == "completed"
                   and row.get("conclusion") == "failure"
               ]
               if len(failed_job_matches) != 1:
                   raise SystemExit("exact failed production deploy job is missing")
-              failed_deploy_values = (failed_id, failed_attempt, source)
+              failed_deploy_values = (failed_id, failed_attempt, failed_source)
           elif os.environ["RECOVERY_ACTION"] == "prune_task_releases":
               slug_re = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}\Z")
               candidates_raw = os.environ["EXPECTED_CANDIDATES_JSON"]
@@ -876,7 +878,7 @@ jobs:
           if [[ "$recovery_action" == quarantine_populated_quiesce ]]; then
             [[ "$failed_deploy_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
             [[ "$failed_deploy_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
-            [[ "$failed_deploy_source_sha" == "$source_sha" ]]
+            [[ "$failed_deploy_source_sha" =~ ^[0-9a-f]{40}$ ]]
             [[ -z "$expected_candidates_csv$protected_releases_csv$expected_candidate_count" ]]
           elif [[ "$recovery_action" == prune_task_releases ]]; then
             [[ -z "$failed_deploy_run_id$failed_deploy_run_attempt$failed_deploy_source_sha" ]]
