@@ -2527,6 +2527,41 @@ def _project_ssr(value: Any) -> dict[str, Any]:
         correlated_output["api_request_perf_join"] = joins
     if correlated_output:
         output["correlated_html"] = correlated_output
+    errors = _mapping(source.get("ssr_workspace_errors"))
+    if errors:
+        population = errors.get("population")
+        error_output: dict[str, Any] = {
+            "population": (
+                population if population == "sampled_ssr_requests" else "unknown"
+            )
+        }
+        for key in (
+            "observed_records",
+            "invalid_records",
+            "matched_by_request_id",
+            "unmatched_request_ids",
+            "ambiguous_request_ids",
+        ):
+            number = _copy_int(errors, key)
+            if number is not None:
+                error_output[key] = number
+        for key, allowed in (
+            ("by_stage", frozenset({"tournament_workspace", "other"})),
+            ("by_family", frozenset({"platform_api_error", "other"})),
+            ("by_response_code", frozenset({"unavailable", "other"})),
+        ):
+            counts = _project_counter(errors.get(key), allowed)
+            if counts:
+                error_output[key] = counts
+        for key in (
+            "by_status",
+            "matched_nginx_statuses",
+            "matched_upstream_statuses",
+        ):
+            counts = _project_status_counter(errors.get(key))
+            if counts:
+                error_output[key] = counts
+        output["ssr_workspace_errors"] = error_output
     timeout = _project_timeout_collection(source.get("timeout_diagnostics"))
     if timeout:
         output["timeout_diagnostics"] = timeout

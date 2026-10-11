@@ -589,6 +589,77 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(projected_timeout["nginx_records"], 1)
         self.assertEqual(projected_timeout["rows"][0]["route_class"], "tournament_page")
 
+        private_ssr["ssr_workspace_errors"] = {
+            "population": "sampled_ssr_requests",
+            "observed_records": 4,
+            "invalid_records": 1,
+            "matched_by_request_id": 2,
+            "unmatched_request_ids": 1,
+            "ambiguous_request_ids": 0,
+            "by_stage": {"tournament_workspace": 2, "private_stage": 8},
+            "by_family": {"platform_api_error": 2, "private_family": 8},
+            "by_status": {"500": 1, "503": 1, "private-status": 9},
+            "by_response_code": {"unavailable": 1, "private-code": 9},
+            "matched_nginx_statuses": {"500": 1},
+            "matched_upstream_statuses": {"500": 1},
+            "request_ids": ["ssr-private-request"],
+            "diagnostic_ids": ["tdiag-private"],
+            "exception": "operator@example.test /home/operator/private-report.json",
+        }
+        public_error_observer = project_public_artifact(
+            "server_observability",
+            {"schema": 1, "server_ssr_observability": private_ssr},
+        )
+        error_output = serialized(public_error_observer)
+        for value in (
+            "ssr-private-request",
+            "tdiag-private",
+            "private_stage",
+            "private_family",
+            "private-status",
+            "private-code",
+            "operator@example.test",
+            "/home/operator/private-report.json",
+        ):
+            self.assertNotIn(value.lower(), error_output.lower())
+        self.assertEqual(
+            public_error_observer["server_ssr_observability"]["ssr_workspace_errors"],
+            {
+                "population": "sampled_ssr_requests",
+                "observed_records": 4,
+                "invalid_records": 1,
+                "matched_by_request_id": 2,
+                "unmatched_request_ids": 1,
+                "ambiguous_request_ids": 0,
+                "by_stage": {"tournament_workspace": 2},
+                "by_family": {"platform_api_error": 2},
+                "by_status": {"500": 1, "503": 1},
+                "by_response_code": {"unavailable": 1},
+                "matched_nginx_statuses": {"500": 1},
+                "matched_upstream_statuses": {"500": 1},
+            },
+        )
+        malformed_error_observer = project_public_artifact(
+            "server_observability",
+            {
+                "schema": 1,
+                "server_ssr_observability": {
+                    "ssr_workspace_errors": {
+                        "population": "operator@example.test",
+                        "observed_records": True,
+                        "by_stage": {"tournament_workspace": True},
+                        "by_status": {"500": True},
+                        "raw_exception": "secret-token",
+                    }
+                },
+            },
+        )
+        self.assertEqual(
+            malformed_error_observer["server_ssr_observability"]["ssr_workspace_errors"],
+            {"population": "unknown"},
+        )
+        self.assertNotIn("secret-token", serialized(malformed_error_observer))
+
     def test_cli_summary_exposes_only_control_preservation_boolean(self) -> None:
         report = {
             "marker": "preprod26082900000000ab",
