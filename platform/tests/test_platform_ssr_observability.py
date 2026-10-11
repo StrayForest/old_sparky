@@ -6,11 +6,13 @@ from tempfile import TemporaryDirectory
 
 from tools.platform_production_qa import (
     collect_nginx_access_records,
+    parse_request_perf_line,
     parse_request_perf_start_line,
     parse_ssr_event_loop_line,
     parse_ssr_perf_line,
     parse_ssr_stream_line,
     parse_ssr_workspace_error_line,
+    summarize_request_perf_logs,
     summarize_ssr_observability,
 )
 
@@ -75,6 +77,60 @@ class SsrObservabilityTests(unittest.TestCase):
 
     def test_ssr_stage_parser_keeps_only_safe_scalar_diagnostics(self) -> None:
         self._assert_workspace_error_tuple_is_closed_and_summary_joins_unique_ids_only()
+        self.assertIs(
+            parse_request_perf_line(
+                "api: request_perf status=503 authenticated_read_admission_shed=True"
+            )["authenticated_read_admission_shed"],
+            True,
+        )
+        self.assertIs(
+            parse_request_perf_line(
+                "api: request_perf status=200 authenticated_read_admission_shed=False"
+            )["authenticated_read_admission_shed"],
+            False,
+        )
+        self.assertIs(
+            parse_request_perf_line(
+                "api: request_perf status=503 authenticated_read_admission_shed=1"
+            )["authenticated_read_admission_shed"],
+            True,
+        )
+        self.assertIs(
+            parse_request_perf_line(
+                "api: request_perf status=200 authenticated_read_admission_shed=0"
+            )["authenticated_read_admission_shed"],
+            False,
+        )
+        malformed = parse_request_perf_line(
+            "api: request_perf status=503 authenticated_read_admission_shed=maybe"
+        )
+        self.assertNotIn("authenticated_read_admission_shed", malformed)
+        shed_summary = summarize_request_perf_logs(
+            [
+                "api: request_perf request_id=private-1 method=GET "
+                "path=/api/v1/tournaments/demo/workspace "
+                "status=503 authenticated_read_admission_shed=True",
+                "api: request_perf request_id=private-2 method=GET "
+                "path=/api/v1/tournaments/demo/workspace "
+                "status=503 authenticated_read_admission_shed=False",
+                "api: request_perf request_id=private-3 method=GET "
+                "path=/api/v1/tournaments/demo/workspace "
+                "status=503 authenticated_read_admission_shed=malformed",
+            ],
+            tournament_slug="demo",
+        )
+        self.assertEqual(
+            shed_summary["authenticated_read_admission_shed"],
+            {"observed": 2, "shed": 1, "not_shed": 1, "unknown": 1},
+        )
+        serialized_shed_summary = json.dumps(shed_summary)
+        for private_value in ("private-1", "private-2", "private-3", "/api/v1/tournaments/"):
+            self.assertNotIn(private_value, serialized_shed_summary)
+        workspace_summary = shed_summary["by_route"].get("tournament_workspace")
+        self.assertEqual(
+            workspace_summary["authenticated_read_admission_shed"],
+            {"observed": 2, "shed": 1, "not_shed": 1, "unknown": 1},
+        )
         row = parse_ssr_perf_line(
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=tournament_workspace "
             "duration_ms=123.456 outcome=ok"

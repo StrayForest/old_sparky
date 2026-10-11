@@ -1844,7 +1844,6 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
         "authenticated_read_admission_wait_ms": float,
         "authenticated_read_admission_limit": int,
         "authenticated_read_admission_inflight": int,
-        "authenticated_read_admission_shed": int,
         "redis_read_model_get_ms": float,
         "redis_read_model_build_ms": float,
         "redis_read_model_set_ms": float,
@@ -1877,6 +1876,14 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
             continue
         with suppress(ValueError):
             values[key] = caster(values[key])
+    if "authenticated_read_admission_shed" in values:
+        shed_value = values["authenticated_read_admission_shed"]
+        if shed_value in {"True", "1"}:
+            values["authenticated_read_admission_shed"] = True
+        elif shed_value in {"False", "0"}:
+            values["authenticated_read_admission_shed"] = False
+        else:
+            values.pop("authenticated_read_admission_shed")
     journal_timestamp = _journal_timestamp(line)
     if journal_timestamp is not None:
         values["journal_timestamp"] = journal_timestamp
@@ -1950,6 +1957,19 @@ def summarize_request_perf_logs(
     def row_metric_stats(key: str, row_values: list[dict[str, Any]]) -> dict[str, Any]:
         values = [float(row[key]) for row in row_values if isinstance(row.get(key), (int, float))]
         return metric_stats(values)
+
+    def admission_shed_counts(row_values: list[dict[str, Any]]) -> dict[str, int]:
+        observed = [
+            row["authenticated_read_admission_shed"]
+            for row in row_values
+            if isinstance(row.get("authenticated_read_admission_shed"), bool)
+        ]
+        return {
+            "observed": len(observed),
+            "shed": sum(observed),
+            "not_shed": len(observed) - sum(observed),
+            "unknown": len(row_values) - len(observed),
+        }
 
     def non_sql_after_pool_time(row: dict[str, Any]) -> float:
         return max(
@@ -2128,6 +2148,7 @@ def summarize_request_perf_logs(
             "authenticated_read_admission_wait_ms": row_metric_stats(
                 "authenticated_read_admission_wait_ms", row_values
             ),
+            "authenticated_read_admission_shed": admission_shed_counts(row_values),
             "ready_vote": ready_vote_spans,
             "ready_vote_controller_state_counts": controller_state_counts(row_values),
             "redis_read_models": read_model_summary(row_values),
@@ -2154,6 +2175,7 @@ def summarize_request_perf_logs(
         "pool_checkout_wait_ms": metric_stats(pool_wait_times),
         "pool_connection_hold_ms": metric_stats(pool_hold_times),
         "authenticated_read_admission_wait_ms": metric_stats(admission_wait_times),
+        "authenticated_read_admission_shed": admission_shed_counts(rows),
         "non_sql_after_pool_time": metric_stats([
             non_sql_after_pool_time(row)
             for row in rows
