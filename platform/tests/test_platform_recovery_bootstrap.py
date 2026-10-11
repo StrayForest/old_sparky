@@ -1055,19 +1055,26 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             'failed.get("name") != "Platform production deploy"',
             'failed.get("path") != ".github/workflows/platform-production-deploy.yml"',
             'failed.get("head_branch") != "dev"',
-            'failed.get("head_sha") != source',
+            'failed_source = failed.get("head_sha")',
+            'not isinstance(failed_source, str)',
+            're.fullmatch(r"[0-9a-f]{40}", failed_source) is None',
             'failed.get("status") != "completed"',
             'failed.get("conclusion") != "failure"',
             'row.get("name") == "Deploy production"',
             'row.get("run_id") == failed_id',
             'row.get("run_attempt") == failed_attempt',
-            'row.get("head_sha") == source',
+            'row.get("head_sha") == failed_source',
             'row.get("conclusion") == "failure"',
+            'failed_deploy_values = (failed_id, failed_attempt, failed_source)',
+            'stream.write(f"source_sha={source}\\n")',
+            'stream.write(f"failed_deploy_source_sha={failed_source}\\n")',
             'stream.write(f"candidate_slug=gha-{failed_id}-{failed_attempt}-{failed_source[:12]}\\n")',
         )
         for predicate in failed_deploy_binding:
             with self.subTest(failed_deploy_predicate=predicate):
                 self.assertIn(predicate, release_recover)
+        self.assertNotIn('failed.get("head_sha") != source', release_recover)
+        self.assertNotIn('failed_deploy_source_sha" == "$source_sha"', release_recover)
         self.assertNotIn("candidate_slug:", release_recover.split("jobs:", 1)[0])
         self.assertIn(
             "evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}-{os.environ['PUBLISHER_RUN_ID']}-{os.environ['PUBLISHER_RUN_ATTEMPT']}.json",
@@ -2782,6 +2789,30 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 self.assertIn('row.get("id") > 0', text_value)
                 self.assertIn('row.get("run_id") ==', text_value)
                 self.assertIn('row.get("run_attempt") ==', text_value)
+
+        recovery_workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
+        ).read_text(encoding="utf-8")
+        for predicate in (
+            'source = security.get("head_sha")',
+            'and row.get("head_sha") == source',
+            'and row["workflow_run"].get("head_sha") == source',
+            'failed_source = failed.get("head_sha")',
+            're.fullmatch(r"[0-9a-f]{40}", failed_source) is None',
+            'row.get("head_sha") == failed_source',
+            'failed_deploy_values = (failed_id, failed_attempt, failed_source)',
+            'stream.write(f"source_sha={source}\\n")',
+            'stream.write(f"failed_deploy_source_sha={failed_source}\\n")',
+            'stream.write(f"candidate_slug=gha-{failed_id}-{failed_attempt}-{failed_source[:12]}\\n")',
+        ):
+            with self.subTest(recovery_source_predicate=predicate):
+                self.assertIn(predicate, recovery_workflow)
+        self.assertNotIn('failed.get("head_sha") != source', recovery_workflow)
+        self.assertNotIn('failed_deploy_source_sha" == "$source_sha"', recovery_workflow)
+        recovery_source = "f" * 40
+        failed_source = "b" * 40
+        self.assertNotEqual(failed_source, recovery_source)
+        self.assertEqual(f"gha-38138072763-1-{failed_source[:12]}", "gha-38138072763-1-bbbbbbbbbbbb")
 
     def test_publisher_self_job_predicate_is_exact_and_in_progress_only(self) -> None:
         text_value = (
