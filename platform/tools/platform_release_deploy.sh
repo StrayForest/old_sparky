@@ -993,7 +993,7 @@ verify_recorded_service_readiness() {
 }
 
 restore_recorded_services() {
-  if transaction_path_present; then
+  if transaction_exists; then
     local transaction_operation
     transaction_operation="$(transaction_json | json_field operation)" || {
       public_status failed transaction >&2
@@ -1009,8 +1009,16 @@ restore_recorded_services() {
     /usr/bin/python3 -I "$TRANSACTION_TOOL" purge-legacy-profile-access-cache \
       --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || {
         public_status failed cache_purge >&2
-        return 1
-      }
+      return 1
+    }
+  elif transaction_path_present && ! quiesce_receipt_exists; then
+    # A quiesce-pending receipt shares the operation-state pathname but does
+    # not represent a candidate that reached staging/migration.  Its
+    # transaction-bound snapshot is already in memory, and no legacy cache
+    # boundary was crossed.  Malformed, symlinked or unknown state remains a
+    # hard failure rather than being treated as an absent transaction.
+    public_status failed transaction >&2
+    return 1
   fi
   restart_recorded_services || return 1
   verify_recorded_service_readiness || return 1

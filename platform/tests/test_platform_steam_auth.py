@@ -499,6 +499,8 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             update={
                 "platform_email_verification_required": True,
                 "platform_support_smtp_host": "smtp.example.com",
+                "platform_support_smtp_username": "steam-test-smtp-user",
+                "platform_support_smtp_password": "steam-test-smtp-password",
                 "platform_support_smtp_sender_email": "noreply@old-sparky.com",
             }
         )

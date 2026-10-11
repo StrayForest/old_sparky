@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 import unittest
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -48,8 +48,12 @@ from tools.platform_verify import (
     CI_GATE_IDS,
     DETERMINISTIC_GATE_IDS,
     GATES_BY_ID,
+    RELEASE_RUNTIME_TEST_IDS,
     VerificationError,
+    _cleanup_timed_out_backend_privileged_resources,
+    _privileged_runner_python,
     _run,
+    _validated_privileged_environment,
     _verification_contract_commands,
     dispatch,
     registry_payload,
@@ -61,6 +65,8 @@ from tools.platform_test_runner import (
     _summary,
     _integration_preflight_error,
     _require_integration_resources_ready,
+    _require_redis_db15_ready,
+    _teardown_privileged_redis_resource,
     main as test_runner_main,
     validate_test_resource_configuration,
     verify_backend_components,
@@ -78,6 +84,7 @@ from tools.platform_verify_contract import (
     PRODUCTION_WORKFLOW,
     SECURITY_WORKFLOW,
     _production_secret_scope_issues,
+    _backend_workflow_issues,
     action_pin_issues,
     collect_issues,
     _ci_dependency_issues,
@@ -635,6 +642,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             temp_root = Path(temp_dir)
             marker = f"verifier-timeout-{os.getpid()}-{time.monotonic_ns()}"
             child_pid_path = temp_root / "grandchild.pid"
+            parent_pid_path = temp_root / "child.pid"
             child_code = (
                 "import signal,sys,time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
@@ -642,7 +650,8 @@ class PlatformVerificationContractTests(unittest.TestCase):
             )
             parent_code = "\n".join(
                 (
-                    "import pathlib,subprocess,sys,time",
+                    "import os,pathlib,subprocess,sys,time",
+                    f"pathlib.Path({str(parent_pid_path)!r}).write_text(str(os.getpid()))",
                     "child=subprocess.Popen([sys.executable, '-c', "
                     f"{child_code!r}, {marker!r}])",
                     f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))",
@@ -668,18 +677,37 @@ class PlatformVerificationContractTests(unittest.TestCase):
             try:
                 stdout = io.StringIO()
                 stderr = io.StringIO()
+                cleanup_observations: list[bool] = []
+
+                def verify_timeout_cleanup_order() -> None:
+                    self.assertTrue(parent_pid_path.is_file())
+                    owned_process_pid = int(parent_pid_path.read_text(encoding="ascii"))
+                    identity = child_identity(owned_process_pid)
+                    cleanup_observations.append(
+                        identity is None
+                        or identity[0] == "Z"
+                        or marker.encode() not in identity[1]
+                    )
+                    cleanup_observations.append(sentinel.poll() is None)
+
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     status = _run(
                         "timeout process group contract",
                         [sys.executable, "-c", parent_code],
                         timeout_seconds=0.2,
+                        timeout_cleanup=verify_timeout_cleanup_order,
                     )
                 self.assertEqual(status, 124)
                 self.assertIn("[GATE START] timeout process group contract", stdout.getvalue())
+                self.assertIn(
+                    "[GATE TIMEOUT RESOURCE CLEANUP] timeout process group contract status=passed\n",
+                    stdout.getvalue(),
+                )
                 self.assertEqual(
                     stderr.getvalue(),
                     "[GATE TIMEOUT] timeout process group contract exceeded 0.2s\n",
                 )
+                self.assertEqual(cleanup_observations, [True, True])
                 self.assertIsNone(sentinel.poll(), "an unrelated session was signalled")
                 self.assertTrue(child_pid_path.is_file(), "timed-out parent did not start child")
                 child_pid = int(child_pid_path.read_text(encoding="ascii"))
@@ -703,6 +731,31 @@ class PlatformVerificationContractTests(unittest.TestCase):
                     )
                 self.assertEqual(success_status, 0)
                 self.assertIn("[GATE PASS] success status contract", success_stdout.getvalue())
+
+                failed_cleanup_stdout = io.StringIO()
+                failed_cleanup_stderr = io.StringIO()
+
+                def fail_timeout_cleanup() -> None:
+                    raise RuntimeError("private synthetic cleanup failure")
+
+                with redirect_stdout(failed_cleanup_stdout), redirect_stderr(failed_cleanup_stderr):
+                    failed_cleanup_status = _run(
+                        "timeout cleanup failure contract",
+                        [sys.executable, "-c", "import time; time.sleep(60)"],
+                        timeout_seconds=0.05,
+                        timeout_cleanup=fail_timeout_cleanup,
+                    )
+                self.assertEqual(failed_cleanup_status, 124)
+                self.assertIn(
+                    "[GATE TIMEOUT RESOURCE CLEANUP FAIL] "
+                    "timeout cleanup failure contract class=RuntimeError\n",
+                    failed_cleanup_stderr.getvalue(),
+                )
+                self.assertIn(
+                    "[GATE TIMEOUT] timeout cleanup failure contract exceeded 0.05s\n",
+                    failed_cleanup_stderr.getvalue(),
+                )
+                self.assertNotIn("private synthetic cleanup failure", failed_cleanup_stderr.getvalue())
             finally:
                 if child_pid is not None:
                     identity = child_identity(child_pid)
@@ -911,7 +964,396 @@ class PlatformVerificationContractTests(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 _require_integration_resources_ready()
+            with self.assertRaises(SystemExit):
+                _require_redis_db15_ready(contour="backend-privileged")
         self.assertFalse(any(name == "sqlalchemy" or name.startswith("redis") for name in imported))
+
+        self.assertTrue(CONTOUR_METADATA["backend-privileged"]["requires_redis"])
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/platform-security.yml"
+        ).read_text(encoding="utf-8")
+        privileged_job = re.search(
+            r"^  backend-privileged:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(privileged_job)
+        assert privileged_job is not None
+        self.assertRegex(privileged_job.group("body"), r"(?m)^\s+redis:\n")
+        self.assertIn("image: redis:7", privileged_job.group("body"))
+        self.assertIn("- 6379:6379", privileged_job.group("body"))
+        self.assertIn('--health-cmd="redis-cli ping"', privileged_job.group("body"))
+        safe_environment = {
+            "PLATFORM_ENVIRONMENT": "test",
+            "PLATFORM_DB_SCHEMA": "platform",
+            "PLATFORM_DATABASE_URL": (
+                "postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test"
+            ),
+            "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+        }
+
+        class FakeRedis:
+            def __init__(self) -> None:
+                self.keys = {b"purge-test-key"}
+                self.ping_count = 0
+                self.closed = False
+
+            async def ping(self) -> bool:
+                self.ping_count += 1
+                return True
+
+            async def flushdb(self) -> bool:
+                self.keys.clear()
+                return True
+
+            async def dbsize(self) -> int:
+                return len(self.keys)
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        fake_redis = FakeRedis()
+        with (
+            patch.dict(os.environ, safe_environment, clear=True),
+            patch(
+                "redis.asyncio.from_url",
+                return_value=fake_redis,
+            ) as from_url,
+        ):
+            _require_redis_db15_ready(contour="backend-privileged")
+            _teardown_privileged_redis_resource()
+        self.assertEqual(from_url.call_count, 2)
+        self.assertEqual(
+            from_url.call_args_list[0].args,
+            ("redis://127.0.0.1:6379/15",),
+        )
+        self.assertEqual(from_url.call_args_list[0].kwargs, {"decode_responses": False})
+        self.assertEqual(fake_redis.ping_count, 2)
+        self.assertEqual(fake_redis.keys, set())
+        self.assertTrue(fake_redis.closed)
+
+        invalid_redis_environment = {
+            **safe_environment,
+            "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/0",
+        }
+        imported.clear()
+        with (
+            patch.dict(os.environ, invalid_redis_environment, clear=True),
+            patch("builtins.__import__", side_effect=recording_import),
+        ):
+            with self.assertRaises(SystemExit):
+                _require_redis_db15_ready(contour="backend-privileged")
+            with self.assertRaises(RuntimeError):
+                _teardown_privileged_redis_resource()
+        self.assertFalse(any(name.startswith("redis") for name in imported))
+
+        # The verifier resolves dotenv once and passes the same validated
+        # mapping to both the child and post-timeout Redis cleanup. A file
+        # value takes precedence over an inherited value, matching the shell
+        # runner, while invalid file content blocks before process creation.
+        with tempfile.TemporaryDirectory(prefix="platform-privileged-env-") as temp_dir:
+            env_path = Path(temp_dir) / ".env.platform"
+            env_path.write_text(
+                "PLATFORM_ENVIRONMENT=test\n"
+                "PLATFORM_DB_SCHEMA=platform\n"
+                "PLATFORM_DATABASE_URL=postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test\n"
+                "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15\n",
+                encoding="utf-8",
+            )
+            env_path.chmod(0o600)
+            inherited = {
+                "PLATFORM_ENV_FILE": str(env_path),
+                "PLATFORM_ENVIRONMENT": "test",
+                "PLATFORM_DB_SCHEMA": "platform",
+                "PLATFORM_DATABASE_URL": (
+                    "postgresql+asyncpg://u:p@remote.invalid:5432/platformdb_test"
+                ),
+                "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/0",
+            }
+            checkout_root = Path(temp_dir) / "checkout"
+            pinned_python = checkout_root / ".venv_platform/bin/python"
+            pinned_python.parent.mkdir(parents=True)
+            pinned_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            pinned_python.chmod(0o755)
+
+            def fake_tool(name: str) -> str:
+                return str(checkout_root / "tools" / name)
+
+            observed: dict[str, object] = {}
+
+            def capture_run(label: str, command: object, **kwargs: object) -> int:
+                observed["label"] = label
+                observed["command"] = command
+                observed["kwargs"] = kwargs
+                callback = kwargs.get("timeout_cleanup")
+                self.assertTrue(callable(callback))
+                callback()
+                return 0
+
+            with (
+                patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+                patch("tools.platform_verify._tool", side_effect=fake_tool),
+                patch("tools.platform_verify._run", side_effect=capture_run),
+                patch(
+                    "tools.platform_verify._cleanup_timed_out_backend_privileged_resources"
+                ) as cleanup,
+            ):
+                self.assertEqual(dispatch("release-runtime"), 0)
+            kwargs = observed["kwargs"]
+            assert isinstance(kwargs, dict)
+            child_env = kwargs["env"]
+            self.assertIsInstance(child_env, dict)
+            assert isinstance(child_env, dict)
+            self.assertEqual(
+                child_env["PLATFORM_DATABASE_URL"],
+                "postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test",
+            )
+            self.assertEqual(
+                observed["command"],
+                [
+                    str(pinned_python),
+                    fake_tool("platform_test_runner.py"),
+                    "--contour",
+                    "backend-privileged",
+                    "--focused",
+                    *RELEASE_RUNTIME_TEST_IDS,
+                ],
+            )
+            self.assertEqual(kwargs["timeout_seconds"], 600)
+            cleanup.assert_called_once_with(
+                {
+                    "platform_environment": "test",
+                    "platform_database_url": (
+                        "postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test"
+                    ),
+                    "platform_db_schema": "platform",
+                    "platform_redis_url": "redis://127.0.0.1:6379/15",
+                }
+            )
+            observed.clear()
+            with (
+                patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+                patch("tools.platform_verify._tool", side_effect=fake_tool),
+                patch("tools.platform_verify._run", side_effect=capture_run),
+                patch(
+                    "tools.platform_verify._cleanup_timed_out_backend_privileged_resources"
+                ) as cleanup,
+            ):
+                self.assertEqual(dispatch("backend-privileged"), 0)
+            command = observed["command"]
+            self.assertEqual(
+                command,
+                [
+                    str(pinned_python),
+                    fake_tool("platform_test_runner.py"),
+                    "--contour",
+                    "backend-privileged",
+                ],
+            )
+            backend_kwargs = observed["kwargs"]
+            assert isinstance(backend_kwargs, dict)
+            self.assertEqual(backend_kwargs["env"]["PLATFORM_DATABASE_URL"], safe_environment["PLATFORM_DATABASE_URL"])
+            cleanup.assert_called_once_with(
+                {
+                    "platform_environment": "test",
+                    "platform_database_url": safe_environment["PLATFORM_DATABASE_URL"],
+                    "platform_db_schema": "platform",
+                    "platform_redis_url": "redis://127.0.0.1:6379/15",
+                }
+            )
+
+            observed.clear()
+            with (
+                patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+                patch("tools.platform_verify._tool", side_effect=fake_tool),
+                patch("tools.platform_verify._run", side_effect=capture_run),
+                patch(
+                    "tools.platform_verify._cleanup_timed_out_backend_privileged_resources"
+                ) as cleanup,
+            ):
+                self.assertEqual(
+                    dispatch(
+                        "backend-privileged",
+                        ["--", "--focused", "tests.synthetic.Owner.test_case"],
+                    ),
+                    0,
+                )
+            command = observed["command"]
+            self.assertEqual(command[0], str(pinned_python))
+            self.assertEqual(
+                command[-2:],
+                ["--focused", "tests.synthetic.Owner.test_case"],
+            )
+            backend_kwargs = observed["kwargs"]
+            assert isinstance(backend_kwargs, dict)
+            self.assertEqual(backend_kwargs["timeout_seconds"], CONTOUR_TIMEOUT_SECONDS["backend-privileged"])
+            cleanup.assert_called_once()
+            pinned_python.chmod(0o600)
+            with (
+                patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+                patch("tools.platform_verify._tool", side_effect=fake_tool),
+                patch("tools.platform_verify._run") as child_run,
+            ):
+                with self.assertRaisesRegex(VerificationError, "Python runtime is unavailable"):
+                    dispatch("backend-privileged")
+            child_run.assert_not_called()
+            pinned_python.chmod(0o755)
+
+            with (
+                patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+                patch("tools.platform_verify._tool", side_effect=fake_tool),
+                patch("tools.platform_verify._run") as child_run,
+            ):
+                with self.assertRaises(VerificationError):
+                    dispatch("backend-privileged", ["--unknown"])
+            child_run.assert_not_called()
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "PLATFORM_ENV_FILE": str(env_path),
+                        "PLATFORM_TEST_AGGREGATE_ONLY": "1",
+                        "PLATFORM_PYTHON_BIN": "",
+                        **safe_environment,
+                    },
+                    clear=True,
+                ),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+                patch("tools.platform_verify._run") as child_run,
+            ):
+                aggregate_env, aggregate_settings = _validated_privileged_environment()
+                self.assertEqual(aggregate_env["PLATFORM_PYTHON_BIN"], "/usr/bin/python3")
+                self.assertEqual(_privileged_runner_python(aggregate_env), "/usr/bin/python3")
+                self.assertEqual(
+                    aggregate_settings["platform_redis_url"],
+                    "redis://127.0.0.1:6379/15",
+                )
+            with (
+                patch.dict(
+                    os.environ,
+                    {"PLATFORM_ENV_FILE": str(env_path)},
+                    clear=True,
+                ),
+                patch("tools.platform_verify.os.geteuid", return_value=1000),
+                patch("tools.platform_verify._run") as child_run,
+            ):
+                with self.assertRaisesRegex(VerificationError, "root test user"):
+                    dispatch("release-runtime")
+            child_run.assert_not_called()
+
+            env_path.write_text(
+                "PLATFORM_ENVIRONMENT=test\n"
+                "PLATFORM_DB_SCHEMA=platform\n"
+                "PLATFORM_DATABASE_URL=postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test\n"
+                "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/0\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify._run") as child_run,
+            ):
+                with self.assertRaises(VerificationError):
+                    dispatch("release-runtime")
+            child_run.assert_not_called()
+
+        safe_resource_settings = {
+            "platform_environment": "test",
+            "platform_database_url": safe_environment["PLATFORM_DATABASE_URL"],
+            "platform_db_schema": "platform",
+            "platform_redis_url": "redis://127.0.0.1:6379/15",
+        }
+        invalid_resource_settings = {
+            **safe_resource_settings,
+            "platform_redis_url": "redis://127.0.0.1:6379/0",
+        }
+        imported.clear()
+        with (
+            patch.dict(os.environ, safe_environment, clear=True),
+            patch("builtins.__import__", side_effect=recording_import),
+        ):
+            with self.assertRaises(RuntimeError):
+                _teardown_privileged_redis_resource(invalid_resource_settings)
+        self.assertFalse(any(name.startswith("redis") for name in imported))
+
+        lock_events: list[str] = []
+
+        @contextmanager
+        def parent_resource_lock(contour: str):
+            lock_events.append(f"lock:{contour}:enter")
+            try:
+                yield
+            finally:
+                lock_events.append(f"lock:{contour}:exit")
+
+        with (
+            patch.dict(os.environ, safe_environment, clear=True),
+            patch(
+                "tools.platform_verification_lock.verification_resource_lock",
+                side_effect=parent_resource_lock,
+            ) as parent_lock,
+            patch(
+                "tools.platform_test_runner._teardown_privileged_redis_resource",
+                side_effect=lambda _settings: lock_events.append("redis-db15-teardown"),
+            ) as parent_teardown,
+        ):
+            _cleanup_timed_out_backend_privileged_resources(safe_resource_settings)
+        parent_lock.assert_called_once_with("backend-privileged")
+        parent_teardown.assert_called_once_with(safe_resource_settings)
+        self.assertEqual(
+            lock_events,
+            [
+                "lock:backend-privileged:enter",
+                "redis-db15-teardown",
+                "lock:backend-privileged:exit",
+            ],
+        )
+
+        lock_events.clear()
+        imported.clear()
+        with (
+            patch.dict(os.environ, invalid_redis_environment, clear=True),
+            patch(
+                "tools.platform_verification_lock.verification_resource_lock",
+                side_effect=parent_resource_lock,
+            ),
+            patch("builtins.__import__", side_effect=recording_import),
+        ):
+            with self.assertRaises(RuntimeError):
+                _cleanup_timed_out_backend_privileged_resources(
+                    invalid_resource_settings
+                )
+        self.assertEqual(lock_events, ["lock:backend-privileged:enter", "lock:backend-privileged:exit"])
+        self.assertFalse(any(name.startswith("redis") for name in imported))
+
+        with (
+            patch.dict(os.environ, safe_environment, clear=True),
+            patch(
+                "tools.platform_test_runner.verification_resource_lock",
+                return_value=nullcontext(),
+            ) as resource_lock,
+            patch("tools.platform_test_runner._select_cases", return_value=()),
+            patch(
+                "tools.platform_test_runner._load_suite",
+                return_value=unittest.TestSuite(),
+            ),
+            patch("tools.platform_test_runner._require_redis_db15_ready") as runner_preflight,
+            patch("tools.platform_test_runner._teardown_privileged_redis_resource") as runner_cleanup,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(
+                test_runner_main(["--contour", "backend-privileged", "--focused", "probe"]),
+                0,
+            )
+        resource_lock.assert_called_once_with("backend-privileged")
+        runner_preflight.assert_called_once_with(contour="backend-privileged")
+        runner_cleanup.assert_called_once_with()
 
     def test_db_free_contour_validates_without_resource_calls(self) -> None:
         safe_environment = {
@@ -932,6 +1374,40 @@ class PlatformVerificationContractTests(unittest.TestCase):
             )
         preflight.assert_not_called()
         teardown.assert_not_called()
+
+        class ProgressCase(unittest.TestCase):
+            def test_visible_progress(self) -> None:
+                self.assertTrue(True)
+
+        progress_test = ProgressCase("test_visible_progress")
+        catalog_case = CatalogTestCase(
+            test_id=progress_test.id(),
+            module=ProgressCase.__module__,
+            class_name="ProgressCase",
+            method_name="test_visible_progress",
+            line=1,
+            is_async=False,
+            contour=VERIFICATION_CONTOUR,
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.dict(os.environ, safe_environment, clear=True),
+            patch("tools.platform_test_runner._select_cases", return_value=(catalog_case,)),
+            patch(
+                "tools.platform_test_runner._load_suite",
+                return_value=unittest.TestSuite((progress_test,)),
+            ),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(
+                test_runner_main(
+                    ["--contour", "verification-contract", "--focused", catalog_case.test_id]
+                ),
+                0,
+            )
+        self.assertIn("test_visible_progress", stderr.getvalue())
 
     def test_privileged_contour_blocks_non_root_before_loading_tests_or_resources(self) -> None:
         """A non-root privileged launch must fail before unittest/resource imports."""
@@ -1493,6 +1969,43 @@ except lock.VerificationLockError as exc:
         self.assertEqual(action_pin_issues(), [])
         self.assertEqual(workflow_level_permission_issues(), [])
         workflow_text = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(_backend_workflow_issues(workflow_text), [])
+        privileged_match = re.search(
+            r"^  backend-privileged:\n(?P<block>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow_text,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(privileged_match)
+        assert privileged_match is not None
+        privileged_block = "  backend-privileged:\n" + privileged_match.group("block")
+        privileged_start = privileged_match.start()
+        privileged_end = privileged_match.end()
+        missing_privileged_redis = (
+            workflow_text[:privileged_start]
+            + privileged_block.replace("    services:\n      redis:\n", "", 1)
+            + workflow_text[privileged_end:]
+        )
+        self.assertTrue(
+            any(
+                "backend-privileged must declare only its isolated Redis service" in issue
+                for issue in _backend_workflow_issues(missing_privileged_redis)
+            )
+        )
+        privileged_with_postgres = (
+            workflow_text[:privileged_start]
+            + privileged_block.replace(
+                "    services:\n      redis:\n",
+                "    services:\n      postgres:\n        image: postgres:16\n      redis:\n",
+                1,
+            )
+            + workflow_text[privileged_end:]
+        )
+        self.assertTrue(
+            any(
+                "backend-privileged must declare only its isolated Redis service" in issue
+                for issue in _backend_workflow_issues(privileged_with_postgres)
+            )
+        )
         self.assertEqual(
             security_status_permission_issues(workflow_text),
             [],
@@ -1527,6 +2040,41 @@ except lock.VerificationLockError as exc:
             )
         )
         self.assertEqual(release_runtime_workflow_issues(workflow_text), [])
+        runtime_match = re.search(
+            r"^  release-runtime:\n(?P<block>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow_text,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(runtime_match)
+        assert runtime_match is not None
+        runtime_block = runtime_match.group("block")
+        self.assertIn("image: redis:7", runtime_block)
+        missing_runtime_redis = workflow_text.replace(
+            runtime_block,
+            runtime_block.replace("    services:\n      redis:\n", "", 1),
+            1,
+        )
+        self.assertTrue(
+            any(
+                "release-runtime fixture must declare isolated Redis DB 15" in issue
+                for issue in release_runtime_workflow_issues(missing_runtime_redis)
+            )
+        )
+        runtime_with_postgres = workflow_text.replace(
+            runtime_block,
+            runtime_block.replace(
+                "    services:\n      redis:\n",
+                "    services:\n      postgres:\n        image: postgres:16\n      redis:\n",
+                1,
+            ),
+            1,
+        )
+        self.assertTrue(
+            any(
+                "release-runtime fixture must declare isolated Redis DB 15" in issue
+                for issue in release_runtime_workflow_issues(runtime_with_postgres)
+            )
+        )
         missing_manual_route = workflow_text.replace(
             "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&",
             "(github.event_name == 'push') &&",

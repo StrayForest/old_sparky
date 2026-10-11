@@ -648,6 +648,16 @@ jobs:
     if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
     env:
       PLATFORM_ENVIRONMENT: test
       PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
@@ -1118,6 +1128,16 @@ jobs:
     if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
     permissions:
       contents: read
     env:

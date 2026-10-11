@@ -34,12 +34,13 @@ BACKEND_AGGREGATE = "backend"
 VERIFICATION_CONTOUR = "verification-contract"
 
 # CI uses one inexpensive DB-free job for the first, second and fifth contours,
-# while the two serial contours remain isolated jobs.  Keep this metadata next
-# to the ownership catalog so the workflow and the executable registry cannot
-# quietly disagree about service or privilege boundaries.  The privileged
-# contour owns release/install and root-identity contracts even when their
-# fixtures are otherwise hermetic: those tests exercise production paths that
-# deliberately refuse an unprivileged caller or require root-owned metadata.
+# while the two serial contours remain isolated jobs. Keep this metadata next
+# to the ownership catalog so the workflow and executable registry cannot
+# quietly disagree about service or privilege boundaries. The privileged
+# contour owns release/install and root-identity contracts even when fixtures
+# are temporary: those tests exercise production paths that deliberately
+# refuse an unprivileged caller or require root-owned metadata. One purge owner
+# also needs the validated disposable Redis DB 15, but no PostgreSQL service.
 CONTOUR_METADATA: Mapping[str, Mapping[str, object]] = {
     BACKEND_AGGREGATE: {
         "local_safe": True,
@@ -73,7 +74,7 @@ CONTOUR_METADATA: Mapping[str, Mapping[str, object]] = {
         "local_safe": False,
         "serial_resources": True,
         "requires_postgres": False,
-        "requires_redis": False,
+        "requires_redis": True,
         "requires_root": True,
     },
     "performance-contract": {

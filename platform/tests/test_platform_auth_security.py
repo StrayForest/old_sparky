@@ -1238,6 +1238,8 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             _env_file=None,
             platform_email_verification_required=True,
             platform_support_smtp_host="smtp.example.com",
+            platform_support_smtp_username="auth-test-smtp-user",
+            platform_support_smtp_password="auth-test-smtp-password",
             platform_support_smtp_sender_email="noreply@old-sparky.com",
             platform_auth_generic_response_min_seconds=0,
             platform_auth_delivery_cooldown_seconds=30,

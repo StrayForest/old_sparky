@@ -114,7 +114,7 @@ these five catalog contours:
 | `backend-unit` | 300s | not serial-resource constrained | unit/domain/backend tests with no external operator contour |
 | `backend-tool-contract` | 600s | not serial-resource constrained | repository tool and contract tests that are hermetic and do not require root-owned host metadata; privacy-safe sampling projections (`test_platform_evidence_privacy`) |
 | `backend-integration` | 1200s | serial | PostgreSQL/Redis integration tests and real workflow races |
-| `backend-privileged` | 1200s | serial | root/service-identity, media, release/install/systemd, root-owned artifact metadata and privileged wrapper tests |
+| `backend-privileged` | 1200s | serial | root/service-identity, media, Redis DB 15 purge, release/install/systemd, root-owned artifact metadata and privileged wrapper tests |
 | `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts, including request sampling (`test_platform_request_performance`) and production-QA summary (`test_platform_production_qa_write_burst_profile`) |
 | `backend` (aggregate) | 3600s | serial orchestration | disjoint union of the five contours |
 
@@ -139,13 +139,14 @@ Alembic head and the complete initial role seed, and Redis DB 15 must answer a
 ping. A missing migration or seed is a `LOCAL GATE BLOCKED` refusal with an
 instruction to run the migration gate, so an already-cleaned disposable
 database cannot produce a misleading cascade of HTTP 503 test failures.
-`backend-integration` and `backend-privileged` are serial because they use
-shared database, Redis or host-identity resources; the aggregate preserves
-that serial boundary. Release/install and systemd contract modules remain in
-the privileged contour even when their fixtures are temporary directories:
-their production paths intentionally enforce root ownership, fixed release
-paths or systemd state. Tests must mock subprocess contracts rather than
-requiring a real mount namespace or `CAP_SYS_ADMIN` on the CI runner.
+`backend-privileged` requires root and disposable Redis DB 15, but not PostgreSQL. The verifier resolves
+the safe dotenv once, validates the fixed target, and passes that mapping to the child and timeout cleanup;
+CI provisions Redis 7 for both privileged lanes. Teardown flushes only DB 15. On timeout, the parent
+reaps its direct child before reacquiring the privileged lock; cleanup errors do not replace timeout 124.
+`backend-integration` and `backend-privileged` are serial because they share database, Redis or host-identity resources; the aggregate preserves that boundary. Release/install and systemd modules
+remain privileged even with temporary-directory fixtures because production paths enforce root
+ownership, fixed release paths or systemd state. Tests mock subprocess contracts instead of requiring
+a real mount namespace or `CAP_SYS_ADMIN` on the CI runner.
 `test_profile_access_cache_purge_is_fixed_bounded_and_verified` is
 `backend-integration`; it verifies fixed rollback/restore namespaces, bounded scans and fail-closed handling. `test_restore_profile_access_cache_purge_requires_stopped_services_and_skips_retention` is `backend-privileged`; it verifies restore purge requires stopped API/worker and skips backup/retention.
 `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher`

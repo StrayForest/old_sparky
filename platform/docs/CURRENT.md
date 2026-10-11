@@ -69,7 +69,7 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-Current next step: prove exact-run cleanup for the failed authenticated-page diagnostic, then complete the source and release gates before considering another bounded production QA step. The failed run has no performance acceptance or final-matrix credit.
+Current next step: finish exact-SHA CI and the documented host-tools provisioning/release path for the pending external-load observer before any new production QA. Run `38071042340` ended with a runtime-budget-failed client envelope; request and origin totals are unavailable, so app/origin attribution remains unknown. Accepted fixture cleanup is still unproven. After the source is released, use the new bounded diagnostics to verify cleanup for that exact run before considering another production profile. The failed run has no performance acceptance or final-matrix credit.
 The historical production performance stage completed on 2026-09-07 against deployed SHA `bba3fb278e348906a6942aee8462b758c3d616ef`. The measurement
 boundary and retained-load runtime contour were corrected, then the exact
 13-profile matrix was rerun with the original contracts, thresholds and

@@ -470,13 +470,7 @@ previous v3 host generation. Exact-SHA CI, approved provisioning and a
 post-provision capability check remain required before the CPU diagnostic
 action is available.
 
-The source-quality correction uses **C2**
-`7c4a4b43434b3d104c060778583f44d0bb22e682`, descended from **E**. It changes
-only the pinned dispatcher and CPU-plan controller bytes; the 15-member v4
-layout and capabilities are unchanged. Pin-only **E2**
-`801e785840adce76528389e47cd22cfa9c6b62d5` names C2 and records its exact
-closure digests. The strict resolver selects C2 from E2, but neither commit
-proves that C2 has been provisioned or installed.
+The source-quality correction **C2** `7c4a4b43434b3d104c060778583f44d0bb22e682`, descended from **E**, changes only the dispatcher and CPU-plan controller bytes; the 15-member v4 layout and capabilities are unchanged. Pin-only **E2** `801e785840adce76528389e47cd22cfa9c6b62d5` names C2 and records its exact closure digests. Neither commit proves C2 provisioned or installed.
 
 The capability-order compatibility correction uses **C3**
 `16eee656fbca10c485728b34b8490917b4de64a2`, descended from **E2**. It changes
@@ -486,6 +480,8 @@ unchanged. Pin-only **E3**
 `dfb291ca0ca31e001aecc58f2c75e4e06eddf26b` names C3 and records its exact
 closure digests. The strict resolver selects C3 from E3, but this selection
 does not prove that C3 has been provisioned or installed.
+
+Source **C4** `6d9f593e2214dacfda55d119b2090e7264ef1ab7` adds external-load cleanup diagnostics/finalization; its only 15-member host-tools closure change is `platform_workflow_remote_dispatch.py`. Pin-only **P4** `2082b89780e7990bace7f5b00a60382b89971a8f` selects C4 with the exact closure digest. Exact-P CI, read-only preflight/signed bundle, approved provisioning and installed self-test remain required; neither SHA proves installation.
 
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains

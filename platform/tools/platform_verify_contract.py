@@ -1448,10 +1448,33 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
     integration = blocks["backend-integration"]
     privileged = blocks["backend-privileged"]
     aggregate = blocks["backend"]
-    if "services:" in static or "services:" in privileged:
-        issues.append("DB-free and privileged backend jobs must not declare services")
+    if "services:" in static:
+        issues.append("DB-free backend-static job must not declare services")
     if "services:" not in integration or "postgres:" not in integration or "redis:" not in integration:
-        issues.append("backend-integration must be the only backend contour with PostgreSQL/Redis services")
+        issues.append("backend-integration must declare PostgreSQL and Redis services")
+
+    def service_names(block: str) -> set[str]:
+        lines = block.splitlines()
+        for index, line in enumerate(lines):
+            if line.strip() != "services:" or len(line) - len(line.lstrip()) != 4:
+                continue
+            names: set[str] = set()
+            for service_line in lines[index + 1 :]:
+                if not service_line.strip():
+                    continue
+                indent = len(service_line) - len(service_line.lstrip())
+                if indent <= 4:
+                    break
+                if indent == 6:
+                    match = re.fullmatch(r"([A-Za-z0-9_-]+):\s*", service_line.strip())
+                    if match is not None:
+                        names.add(match.group(1))
+            return names
+        return set()
+
+    privileged_services = service_names(privileged)
+    if privileged_services != {"redis"}:
+        issues.append("backend-privileged must declare only its isolated Redis service")
     for marker in (
         "id -u",
         "Pillow",
@@ -1588,6 +1611,12 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         issues.append("release-runtime fixture must gate the baseline proof lane")
     if "timeout-minutes: 15" not in fixture:
         issues.append("release-runtime fixture must retain a 15-minute timeout")
+    if (
+        "services:\n      redis:\n        image: redis:7\n        ports:\n"
+        "          - 6379:6379\n        options: >-\n"
+        '          --health-cmd="redis-cli ping"\n'
+    ) not in fixture or "postgres:" in fixture:
+        issues.append("release-runtime fixture must declare isolated Redis DB 15")
     if "permissions:\n      contents: read" not in fixture:
         issues.append("release-runtime fixture must have contents: read permissions")
     fixture_checkout = next(

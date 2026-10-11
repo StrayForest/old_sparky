@@ -1131,10 +1131,26 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     if workflow_source.startswith(f"{dispatch_mode} ", position)
                 ]
                 self.assertGreaterEqual(len(mode_positions), 1, mode)
-                mode_position = mode_positions[-1]
-                ssh_position = workflow_source.rfind("ssh \\\n", 0, mode_position)
-                if ssh_position < 0:
-                    ssh_position = workflow_source.rfind("ssh ", 0, mode_position)
+                if workflow_source is source:
+                    # The live workflow also refers to its mode in validation
+                    # and report steps. Bound this assertion to the actual SSH
+                    # step so private handoff/sanitizer references elsewhere
+                    # cannot be mistaken for remote command arguments.
+                    step_start = workflow_source.index(
+                        "      - name: Run the dedicated production browser supervisor"
+                    )
+                    step_end = workflow_source.index(
+                        "      - name: Remove production SSH material", step_start
+                    )
+                    ssh_position = workflow_source.index("          ssh \\\n", step_start)
+                    mode_position = workflow_source.index(
+                        '            live-launch < "$input_path"', ssh_position, step_end
+                    )
+                else:
+                    mode_position = mode_positions[-1]
+                    ssh_position = workflow_source.rfind("ssh \\\n", 0, mode_position)
+                    if ssh_position < 0:
+                        ssh_position = workflow_source.rfind("ssh ", 0, mode_position)
                 self.assertGreaterEqual(ssh_position, 0)
                 command = workflow_source[
                     ssh_position : mode_position + len(dispatch_mode) + 1
@@ -2664,15 +2680,31 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             for field in fields:
                 self.assertIn(field, step)
             self.assertNotIn("GITHUB_STEP_SUMMARY", step)
-            self.assertNotRegex(step, r"(?:PROD_SSH|CONTROL_EMAIL|TARGET_SHA|LOAD_RUN_ID)")
+            # Source/run identities are consumed as private parser inputs so
+            # receipts can be bound to their invocation. Secret-bearing SSH
+            # and control-account values must never enter these diagnostics,
+            # and identity values must not be printed to public runner output.
+            self.assertNotRegex(step, r"(?:PROD_SSH|CONTROL_EMAIL)")
+            self.assertNotRegex(
+                step,
+                r"(?im)^\s*(?:echo|printf|print\s*\()[^\n]*(?:\$TARGET_SHA|"
+                r"\$LOAD_RUN_ID|TARGET_SHA|LOAD_RUN_ID)",
+            )
             self.assertNotRegex(step, r"print\([^\n]*(?:path|raw|payload|email|secret)")
+            if source is retained and marker == "      - name: Diagnose cleanup evidence inputs":
+                self.assertIn(
+                    "CLEANUP_LOAD_RUN_ID: ${{ inputs.load_run_id }}", step
+                )
+                self.assertIn(
+                    'os.environ.get("CLEANUP_LOAD_RUN_ID", "")', step
+                )
 
         self.assertIn(
             "if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.normalize_abort_evidence.outcome == 'success' }}",
             abort,
         )
         self.assertIn(
-            "if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.validate_cleanup_evidence.outcome == 'success' }}",
+            "if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.diagnose-cleanup-inputs.outcome == 'success' && steps.validate_cleanup_evidence.outcome == 'success' }}",
             retained,
         )
         self.assertIn(

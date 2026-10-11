@@ -328,6 +328,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         current = self.add_release("current-only-current")
         (self.app_dir / "current").symlink_to(current)
         self.add_current_control_helper_bombs(current)
+        self.prepare_wrapper_cache_purge_venv("current-only")
         candidate = self.create_wrapper_transaction(
             current,
             None,
@@ -340,6 +341,9 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             },
             timer_active=True,
         )
+        # Current-only recovery crosses the old-service restart boundary, so
+        # the install candidate is the transaction-bound v1 purge source.
+        self.prepare_wrapper_cache_purge(candidate)
         systemctl = self.write_stateful_systemctl(
             {
                 "deadlock-api": "inactive",
@@ -383,6 +387,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         generation = self.install_recovery_generation()
         current = self.add_release("current-only-pointer-window-current")
         (self.app_dir / "current").symlink_to(current)
+        self.prepare_wrapper_cache_purge_venv("current-only-pointer-window")
         candidate = self.create_wrapper_transaction(
             current,
             None,
@@ -395,6 +400,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             },
             timer_active=True,
         )
+        self.prepare_wrapper_cache_purge(candidate)
         # Reproduce the exact durable window: previous has moved, current has
         # moved, but the transaction still carries previous-switched.
         self.run_transaction("phase", "--expected", "staged", "--phase", "migration-pending")
@@ -567,6 +573,9 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 generation = self.install_recovery_generation()
                 current = self.add_release(f"current-only-retry-{index}-current")
                 (self.app_dir / "current").symlink_to(current)
+                self.prepare_wrapper_cache_purge_venv(
+                    f"current-only-retry-{index}"
+                )
                 candidate = self.create_wrapper_transaction(
                     current,
                     None,
@@ -579,6 +588,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                     },
                     timer_active=True,
                 )
+                self.prepare_wrapper_cache_purge(candidate)
                 initial_state = {
                     "deadlock-api": "inactive",
                     "deadlock-worker": "inactive",
@@ -1377,6 +1387,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "inactive",
         )
         candidate.mkdir()
+        self.prepare_wrapper_cache_purge(current)
         systemctl = self.write_stateful_systemctl(
             {
                 "deadlock-api": "inactive",
@@ -2461,6 +2472,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual(nginx_state.read_text(), "candidate\n")
         self.assertEqual(self.state_phase(), "nginx-pending")
 
+        self.prepare_wrapper_cache_purge(candidate)
         abort = self.copy_abort_script("abort-after-nginx-apply.sh")
         result = self.run_script(
             abort,
@@ -4201,6 +4213,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "mutable-current-only-staged",
             complete_snapshot=True,
         )
+        self.prepare_wrapper_cache_purge(candidate)
         systemctl = self.write_stateful_systemctl(
             {
                 "deadlock-api": "inactive",
@@ -4301,6 +4314,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             )
         )
 
+        self.prepare_wrapper_cache_purge(current)
         abort = self.copy_abort_script_with_systemctl(systemctl)
         result = self.run_script(
             abort,
@@ -4323,11 +4337,13 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
     def test_stage_failure_recovers_pre_active_services_without_swallowing_failure(
         self,
     ) -> None:
-        current, _previous, _candidate = self.prepare_install_state(
+        current, _previous, candidate = self.prepare_install_state(
             with_fake_python=True,
             service_state_required=True,
         )
         self.add_runtime_stubs(current)
+        self.add_runtime_stubs(candidate)
+        self.prepare_wrapper_cache_purge(candidate)
         (self.shared / STATE_NAME).unlink()
         artifact = self.root / "stage-failure.tar.gz"
         artifact.write_bytes(b"not reached")
@@ -4534,6 +4550,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.run_transaction(
             "phase", "--expected", "migration-pending", "--phase", "migration-failed"
         )
+        self.prepare_wrapper_cache_purge(candidate)
         systemctl = self.write_stateful_systemctl(
             {
                 "deadlock-api": "inactive",
@@ -4775,6 +4792,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         rollback.mkdir()
         snapshot = rollback / "shared-venv-before-install"
         shutil.copytree(self.shared / "venv", snapshot)
+        self.prepare_wrapper_cache_purge(current)
         (rollback / "previous-release").write_text(f"{previous}\n")
         (rollback / "previous-release").chmod(0o600)
         (rollback / "venv-transition").write_text("snapshot\n")
@@ -4926,9 +4944,13 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                     for option in ("--service-enabled", f"{unit}=disabled")
                 )
                 if current is None
-                else (),
+                else tuple(
+                    option
+                    for unit in ("deadlock-api", "deadlock-worker", "deadlock-web")
+                    for option in ("--service-enabled", f"{unit}=enabled")
+                ),
                 "--timer-enabled-before",
-                "disabled",
+                "disabled" if current is None else "enabled",
             )
         return candidate
 
@@ -5013,8 +5035,22 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         python_path.unlink(missing_ok=True)
         python_path.symlink_to("/usr/bin/python3.12")
 
-        (current / "tools").mkdir(parents=True, exist_ok=True)
-        safe_env = current / "tools/platform_safe_env_exec.py"
+        self.add_cache_purge_source_fixture(current)
+        return {"path": python_path, "original": original}
+
+    def prepare_wrapper_cache_purge_venv(self, marker: str) -> None:
+        """Create the no-op shared venv before the transaction snapshots it."""
+
+        venv = self.shared / "venv"
+        self.add_fake_venv(venv, marker=marker)
+        self.write_fake_python(venv / "bin/python")
+
+    def add_cache_purge_source_fixture(self, release: Path) -> None:
+        """Give a synthetic purge source its fixed env and import closure."""
+
+        tools = release / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        safe_env = tools / "platform_safe_env_exec.py"
         safe_env.write_text(
             "import base64\n"
             "value = base64.b64encode(b'redis://127.0.0.1:6379/15').decode('ascii')\n"
@@ -5022,10 +5058,10 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             encoding="ascii",
         )
         safe_env.chmod(0o555)
-        services = current / "apps/platform_api/app/services"
+        services = release / "apps/platform_api/app/services"
         services.mkdir(parents=True, exist_ok=True)
         for package in (
-            current / "apps/platform_api/app/__init__.py",
+            release / "apps/platform_api/app/__init__.py",
             services.parent / "__init__.py",
             services / "__init__.py",
         ):
@@ -5037,7 +5073,6 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             encoding="ascii",
         )
         (services / "tournament_profile_access.py").chmod(0o444)
-        return {"path": python_path, "original": original}
 
     def write_failing_systemctl(
         self, label: str, *, exit_code: int = 99
@@ -5347,6 +5382,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         rollback.mkdir()
         snapshot = rollback / "shared-venv-before-install"
         shutil.copytree(self.shared / "venv", snapshot)
+        self.prepare_wrapper_cache_purge(current)
         (rollback / "previous-release").write_text(f"{self.releases / 'previous'}\n")
         (rollback / "previous-release").chmod(0o600)
         (rollback / "venv-transition").write_text("snapshot\n")
@@ -5362,10 +5398,21 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "printf '%s\\n' \"$PLATFORM_TEST_UNITS_LABEL\" > \"$PLATFORM_TEST_UNITS_STATE\"\n"
         )
         units.chmod(0o755)
-        for name in ("platform_install_nginx.py", "platform_deploy_smoke.py"):
-            helper = tools / name
-            helper.write_text("# test stub\n")
-            helper.chmod(0o755)
+        nginx = tools / "platform_install_nginx.py"
+        nginx.write_text(
+            "import os\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "if len(sys.argv) > 1 and sys.argv[1] == '--apply':\n"
+            "    Path(os.environ['PLATFORM_TEST_NGINX_STATE']).write_text(\n"
+            "        os.environ['PLATFORM_TEST_NGINX_LABEL'] + '\\n', encoding='ascii'\n"
+            "    )\n",
+            encoding="ascii",
+        )
+        nginx.chmod(0o755)
+        smoke = tools / "platform_deploy_smoke.py"
+        smoke.write_text("pass\n", encoding="ascii")
+        smoke.chmod(0o755)
         runtime_installer = tools / "platform_live_qa_runtime_install.py"
         runtime_installer.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n")
         runtime_installer.chmod(0o755)
@@ -5449,6 +5496,12 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         release = self.releases / name
         release.mkdir(mode=0o755)
         release.chmod(0o755)
+        (release / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": hashlib.sha1(name.encode("utf-8")).hexdigest()})
+            + "\n",
+            encoding="ascii",
+        )
+        (release / "RELEASE.json").chmod(0o444)
         return release
 
     def add_fake_venv(self, venv: Path, *, marker: str) -> None:

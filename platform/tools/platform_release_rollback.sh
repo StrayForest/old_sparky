@@ -950,7 +950,7 @@ else
   verify_rollback_systemd_state
   /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
     --state "$TRANSACTION_STATE" \
-    --expected rollback-runtime-pending \
+    --expected rollback-cache-purged \
     --phase rollback-runtime-applied
 fi
   /usr/bin/python3 -I "$TRANSACTION_TOOL" complete \

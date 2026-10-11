@@ -3,9 +3,10 @@
 
 The runner keeps normal unittest semantics, but constructs the suite from the
 AST ownership catalog and emits a small machine-readable timing/skip summary.
-The integration and privileged contours are intentionally serial: the
-canonical runner provides the isolated ``platformdb_test`` and Redis
-environment, while this process never invents worker databases or namespaces.
+The integration and privileged contours are intentionally serial. Integration
+uses isolated ``platformdb_test`` plus Redis DB 15; privileged uses only
+validated Redis DB 15 for its real purge owner and never mutates PostgreSQL.
+This process never invents worker databases or namespaces.
 """
 
 from __future__ import annotations
@@ -73,7 +74,9 @@ except ModuleNotFoundError:  # Import as tools.platform_test_runner in tests.
 
 
 TEST_ENV_CONTOURS = frozenset((BACKEND_AGGREGATE, *BACKEND_CONTOURS))
-TEST_RESOURCE_CONTOURS = frozenset((BACKEND_AGGREGATE, "backend-integration"))
+TEST_RESOURCE_CONTOURS = frozenset(
+    (BACKEND_AGGREGATE, "backend-integration", "backend-privileged")
+)
 AUTH_RATE_LIMIT_KEY_PATTERN = "platform:auth-rate:v1:*"
 AUTH_RATE_LIMIT_KEY_PREFIX = b"platform:auth-rate:v1:"
 AUTH_RATE_LIMIT_CLEANUP_SCAN_COUNT = 200
@@ -310,7 +313,6 @@ def _require_integration_resources_ready() -> None:
     try:
         from sqlalchemy import text
         from sqlalchemy.ext.asyncio import create_async_engine
-        from redis.asyncio import from_url
     except (ImportError, ModuleNotFoundError) as exc:
         raise SystemExit(
             "LOCAL GATE BLOCKED: backend-integration preflight dependencies are unavailable."
@@ -362,7 +364,25 @@ def _require_integration_resources_ready() -> None:
     if error:
         raise SystemExit("LOCAL GATE BLOCKED: " + error)
 
+    _require_redis_db15_ready(configuration, contour="backend-integration")
+
+
+def _require_redis_db15_ready(
+    configuration: TestResourceConfiguration | None = None,
+    *,
+    contour: str,
+) -> None:
+    """Ping only the validated disposable Redis DB 15 for one resource contour."""
+
+    if configuration is None:
+        try:
+            configuration = validate_test_resource_configuration()
+        except TestResourceConfigurationError as exc:
+            raise SystemExit(f"LOCAL GATE BLOCKED: {exc}") from exc
+
     async def check_redis() -> None:
+        from redis.asyncio import from_url
+
         redis = from_url(configuration.redis_url, decode_responses=False)
         try:
             await redis.ping()
@@ -373,7 +393,7 @@ def _require_integration_resources_ready() -> None:
         asyncio.run(check_redis())
     except Exception as exc:
         raise SystemExit(
-            "LOCAL GATE BLOCKED: backend-integration Redis DB15 preflight is unavailable."
+            f"LOCAL GATE BLOCKED: {contour} Redis DB15 preflight is unavailable."
         ) from exc
 
 
@@ -443,6 +463,36 @@ def _teardown_test_resources() -> None:
             await redis.aclose()
 
     asyncio.run(reset())
+
+
+def _teardown_privileged_redis_resource(
+    settings: object | Mapping[str, object] | None = None,
+) -> None:
+    """Clear only the validated disposable Redis DB 15 for privileged tests.
+
+    A parent verifier may supply the exact immutable resource mapping used to
+    launch a timed-out child.  Direct runner invocation continues to validate
+    its own process environment.
+    """
+
+    try:
+        configuration = validate_test_resource_configuration(settings)
+    except TestResourceConfigurationError as exc:
+        raise RuntimeError(f"refusing unsafe privileged Redis teardown: {exc}") from exc
+
+    async def reset_redis() -> None:
+        from redis.asyncio import from_url
+
+        redis = from_url(configuration.redis_url, decode_responses=False)
+        try:
+            await redis.ping()
+            await redis.flushdb()
+            if int(await redis.dbsize()) != 0:
+                raise RuntimeError("Redis DB15 privileged teardown left keys")
+        finally:
+            await redis.aclose()
+
+    asyncio.run(reset_redis())
 
 
 def _clear_integration_auth_rate_limit_keys() -> None:
@@ -1264,7 +1314,7 @@ def _run_contour(args: argparse.Namespace) -> int:
                 else ()
             )
             suite = _load_suite(_flatten_ids(cases))
-            runner = TimingRunner(verbosity=0 if args.quiet else 1)
+            runner = TimingRunner(verbosity=0 if args.quiet else 2)
             if args.contour == "backend-integration":
                 runner.between_case_cleanup = _clear_integration_auth_rate_limit_keys
             result = runner.run(suite)
@@ -1280,7 +1330,10 @@ def _run_contour(args: argparse.Namespace) -> int:
             and not args.list_ids
         ):
             try:
-                _teardown_test_resources()
+                if args.contour == "backend-privileged":
+                    _teardown_privileged_redis_resource()
+                else:
+                    _teardown_test_resources()
             except Exception as exc:
                 cleanup_error = f"{type(exc).__name__}: {exc}"
                 print(
@@ -1389,6 +1442,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 and args.contour in {BACKEND_AGGREGATE, "backend-integration"}
             ):
                 _require_integration_resources_ready()
+            elif (
+                args.component_dir is None
+                and not args.list_ids
+                and args.contour == "backend-privileged"
+                and CONTOUR_METADATA[args.contour].get("requires_redis")
+            ):
+                _require_redis_db15_ready(contour=args.contour)
             return _run_contour(args)
     except VerificationLockError as exc:
         raise SystemExit(f"LOCAL GATE BLOCKED: {exc}") from exc

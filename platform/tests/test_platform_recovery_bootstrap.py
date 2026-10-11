@@ -552,6 +552,11 @@ class RecoveryLegacyReadinessTests(unittest.TestCase):
                 ),
                 mock.patch.object(transaction, "_load_record", return_value=record),
                 mock.patch.object(transaction, "_validate_legacy_liveqa_recovery"),
+                # This fixture targets the bounded readiness loop. The
+                # release-transaction owners independently verify durable
+                # purge-proof binding; model that prerequisite here so the
+                # test reaches the readiness subprocess path.
+                mock.patch.object(transaction, "_require_profile_access_cache_purge_proof"),
                 mock.patch.object(
                     transaction,
                     "_read_systemctl_enabled",

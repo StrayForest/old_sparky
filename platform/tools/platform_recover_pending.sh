@@ -454,8 +454,55 @@ if [[ -z "$original_previous" ]]; then
   /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-recovery-pointers \
     --state "$STATE" >/dev/null 2>/dev/null \
     || { public_status failed topology >&2; exit 1; }
+  if [[ -n "$original_current" ]]; then
+    # A current-only upgrade has a complete snapshot but no first-install
+    # systemd receipt.  Restore it through the same durable retry boundary as
+    # an upgrade, while retaining the transaction until services are verified.
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-service-snapshot \
+      --state "$STATE" --require present \
+      >/dev/null 2>/dev/null \
+      || { public_status failed service_state >&2; exit 1; }
+    case "$transaction_phase" in
+      filesystem-restored-services-pending)
+        ;;
+      recovery-restored)
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+          --state "$STATE" >/dev/null 2>/dev/null \
+          || { public_status failed transaction >&2; exit 1; }
+        test ! -e "$STATE" && test ! -L "$STATE" \
+          || { public_status failed transaction >&2; exit 1; }
+        public_status passed recovery
+        exit 0
+        ;;
+      prepared|venv-transitioned|snapshot-placed|current-switched|previous-switched|pointers-switched|staged|recovery-authorized)
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+          --retain --service-pending --state "$STATE" \
+          >/dev/null 2>/dev/null \
+          || { public_status failed transaction >&2; exit 1; }
+        ;;
+      *)
+        public_status failed transaction >&2
+        exit 1
+        ;;
+    esac
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" restore-services \
+      --state "$STATE" --systemctl "$SYSTEMCTL_BIN" \
+      >/dev/null 2>/dev/null \
+      || { public_status failed service_state >&2; exit 1; }
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+      --state "$STATE" --expected filesystem-restored-services-pending \
+      --phase recovery-restored >/dev/null 2>/dev/null \
+      || { public_status failed transaction >&2; exit 1; }
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+      --state "$STATE" >/dev/null 2>/dev/null \
+      || { public_status failed transaction >&2; exit 1; }
+    test ! -e "$STATE" && test ! -L "$STATE" \
+      || { public_status failed transaction >&2; exit 1; }
+    public_status passed recovery
+    exit 0
+  fi
+  initial_systemd_authority=0
   if [[ -z "$original_current" ]]; then
-    initial_systemd_authority=0
     case "$transaction_phase" in
       staged|migration-pending|migration-failed|migration-applied|activation-pending|\
       services-restarted|nginx-pending|nginx-applied|smoke-passed|\

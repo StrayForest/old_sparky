@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
 import hashlib
@@ -14,7 +15,9 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from urllib.parse import urlsplit
 from unittest import mock
+import uuid
 import zipfile
 
 from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
@@ -81,12 +84,37 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             self.fake_systemctl.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
-                "case \"${1:-}\" in\n"
-                "  is-active) echo active; exit 0 ;;\n"
-                "  is-enabled) echo enabled; exit 0 ;;\n"
-                "  enable|disable|start|stop|restart|daemon-reload|reload) exit 0 ;;\n"
-                "  *) exit 0 ;;\n"
+                "command=\"${1:-}\"\n"
+                "unit=\"${2:-}\"\n"
+                "status=64\n"
+                "output=\"\"\n"
+                "case \"$command\" in\n"
+                "  is-active) status=0; output=active ;;\n"
+                "  is-enabled) status=0; output=enabled ;;\n"
+                "  enable|disable|start|stop|restart|daemon-reload|reload) status=0 ;;\n"
+                "  *) status=64 ;;\n"
                 "esac\n"
+                "if [[ -n \"${unit:-}\" ]]; then\n"
+                "  case \"$unit\" in\n"
+                "    deadlock-api.service|deadlock-worker.service|deadlock-web.service|"
+                "deadlock-maintenance.service|deadlock-maintenance.timer|"
+                "deadlock-logrotate.service|deadlock-logrotate.timer|"
+                "deadlock-offsite-backup.service|deadlock-offsite-backup.timer|"
+                "deadlock-cloudflare-ips.service|deadlock-cloudflare-ips.timer|"
+                "deadlock-health-monitor.service|deadlock-health-monitor.timer) ;;\n"
+                "    nginx.service)\n"
+                "      if [[ \"$command\" == reload ]]; then status=0; else status=65; fi\n"
+                "      output=\"\"\n"
+                "      ;;\n"
+                "    *) status=65 ;;\n"
+                "  esac\n"
+                "fi\n"
+                "if [[ -n \"${PLATFORM_TEST_SYSTEMCTL_TRACE:-}\" ]]; then\n"
+                "  umask 077\n"
+                "  printf '%s\\t%s\\t%s\\t%s\\n' \"$command\" \"$unit\" \"$status\" \"$output\" >> \"$PLATFORM_TEST_SYSTEMCTL_TRACE\"\n"
+                "fi\n"
+                "if [[ -n \"$output\" ]]; then printf '%s\\n' \"$output\"; fi\n"
+                "exit \"$status\"\n"
             )
             self.fake_systemctl.chmod(0o755)
         except BaseException:
@@ -104,6 +132,11 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
 
     def test_fresh_offline_venv_is_retained_for_release_rollback(self) -> None:
         previous_release = self.add_installed_release("previous-release")
+        # Rollback reads the restored target's historical release identity
+        # before it installs the recovery shim.  The old release does not need
+        # the new purge API, but it does need its authentic manifest shape.
+        self.write_release_manifest(previous_release, "a" * 40)
+        self.install_restore_nginx_helper(previous_release)
         protected_release = self.add_installed_release("protected-release")
         (self.app_dir / "current").symlink_to(previous_release)
         (self.app_dir / "previous").symlink_to(protected_release)
@@ -219,7 +252,11 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             f"{previous_release}\n",
         )
 
+        purge_v1_keys, preserve_v2_keys = self.prepare_profile_access_purge_runtime(
+            current_release, self.shared_dir / "venv"
+        )
         self.run_script(ROLLBACK_SCRIPT, "--app-dir", str(self.app_dir), "--no-restart")
+        self.assert_profile_access_cache_purged(purge_v1_keys, preserve_v2_keys)
 
         self.assertEqual((self.app_dir / "current").resolve(), previous_release)
         self.assertEqual((self.app_dir / "previous").resolve(), current_release)
@@ -939,6 +976,9 @@ else:
         self,
     ) -> None:
         original_current = self.add_installed_release("current-release")
+        self.write_release_manifest(original_current, "a" * 40)
+        self.install_restore_nginx_helper(original_current)
+        self.install_restore_runtime_reconcile_helper(original_current, self.app_dir)
         protected_release = self.add_installed_release("protected-release")
         (self.app_dir / "current").symlink_to(original_current)
         (self.app_dir / "previous").symlink_to(protected_release)
@@ -975,7 +1015,20 @@ else:
             self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
         self.assertFalse((rollback_dir / "shared-venv-before-install").exists())
 
-        self.run_script(ROLLBACK_SCRIPT, "--app-dir", str(self.app_dir), "--no-restart")
+        purge_v1_keys, preserve_v2_keys = self.prepare_profile_access_purge_runtime(
+            candidate, self.shared_dir / "venv"
+        )
+        self.install_restore_nginx_helper(candidate)
+        self.refresh_unchanged_venv_freeze_receipt(
+            candidate, self.shared_dir / "venv"
+        )
+        self.run_script(
+            ROLLBACK_SCRIPT,
+            "--app-dir",
+            str(self.app_dir),
+            "--no-restart",
+        )
+        self.assert_profile_access_cache_purged(purge_v1_keys, preserve_v2_keys)
 
         restored_identity = (self.shared_dir / "venv").stat()
         self.assertEqual((self.app_dir / "current").resolve(), original_current)
@@ -1452,6 +1505,9 @@ else:
 
     def test_rollback_helper_path_survives_current_symlink_switch(self) -> None:
         current_release, previous_release, _snapshot = self.prepare_rollback_fixture()
+        self.write_release_manifest(current_release, "b" * 40)
+        self.write_release_manifest(previous_release, "c" * 40)
+        self.install_restore_nginx_helper(previous_release)
         release_tools = current_release / "tools"
         release_tools.mkdir(exist_ok=True)
         shutil.copy2(ROLLBACK_SCRIPT, release_tools / ROLLBACK_SCRIPT.name)
@@ -1467,13 +1523,36 @@ else:
         invoked_through_current = (
             self.app_dir / "current" / "tools" / ROLLBACK_SCRIPT.name
         )
+        transaction_diagnostic = self.root / "transaction-diagnostic.txt"
+        self.install_bounded_transaction_diagnostic(
+            current_release, transaction_diagnostic
+        )
+        purge_v1_keys, preserve_v2_keys = self.prepare_profile_access_purge_runtime(
+            current_release, self.shared_dir / "venv"
+        )
 
-        self.run_script(
+        result = self.run_script(
             invoked_through_current,
             "--app-dir",
             str(self.app_dir),
             "--no-restart",
+            check=False,
         )
+        if result.returncode != 0:
+            # The shell intentionally keeps transaction internals out of its
+            # public marker and its EXIT recovery may remove the active receipt.
+            # This test-only copy records only a bounded, path-free validator
+            # reason before that recovery runs.
+            self.assertTrue(transaction_diagnostic.is_file())
+            metadata = transaction_diagnostic.lstat()
+            self.assertFalse(stat.S_ISLNK(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.fail(
+                "bounded transaction diagnostic: "
+                + transaction_diagnostic.read_text(encoding="ascii").strip()
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_profile_access_cache_purged(purge_v1_keys, preserve_v2_keys)
 
         self.assertEqual((self.app_dir / "current").resolve(), previous_release)
         self.assertEqual((self.app_dir / "previous").resolve(), current_release)
@@ -1502,6 +1581,320 @@ else:
         expected.write_text(f"{previous_release}\n")
         expected.chmod(0o600)
         return current_release, previous_release, snapshot
+
+    def prepare_profile_access_purge_runtime(
+        self, source_release: Path, venv: Path
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Give a positive rollback case the real bounded purge child closure."""
+
+        import sys
+        import sysconfig
+
+        from redis.asyncio import from_url
+
+        from tools.platform_test_runner import validate_test_resource_configuration
+
+        resources = validate_test_resource_configuration()
+        self.assertEqual(resources.database_name, "platformdb_test")
+        self.assertEqual(resources.database_schema, "platform")
+        self.assertEqual(resources.redis_database, "15")
+        self.assertEqual(resources.redis_host, "127.0.0.1")
+        parsed_redis_url = urlsplit(resources.redis_url)
+        self.assertEqual(
+            (parsed_redis_url.scheme, parsed_redis_url.hostname, parsed_redis_url.port, parsed_redis_url.path),
+            ("redis", "127.0.0.1", 6379, "/15"),
+        )
+        self.assertIsNone(parsed_redis_url.username)
+        self.assertIsNone(parsed_redis_url.password)
+        redis_url = "redis://127.0.0.1:6379/15"
+
+        env_file = self.shared_dir / ".env.platform"
+        env_file.write_text(f"PLATFORM_REDIS_URL={redis_url}\n", encoding="ascii")
+        env_file.chmod(0o600)
+
+        platform_root = REPO_ROOT / "platform"
+        safe_env_tool = source_release / "tools" / "platform_safe_env_exec.py"
+        shutil.copyfile(platform_root / "tools" / "platform_safe_env_exec.py", safe_env_tool)
+        safe_env_tool.chmod(0o555)
+
+        api_source = platform_root / "apps" / "platform_api" / "app"
+        api_destination = source_release / "apps" / "platform_api" / "app"
+        api_destination.mkdir(parents=True, exist_ok=True)
+        for package in ("__init__.py",):
+            shutil.copyfile(api_source / package, api_destination / package)
+        service_source = api_source / "services"
+        service_destination = api_destination / "services"
+        service_destination.mkdir()
+        shutil.copyfile(service_source / "__init__.py", service_destination / "__init__.py")
+        shutil.copyfile(
+            service_source / "tournament_profile_access.py",
+            service_destination / "tournament_profile_access.py",
+        )
+        packages_source = platform_root / "python_packages"
+        packages_destination = source_release / "python_packages"
+        packages_destination.mkdir()
+        shutil.copyfile(packages_source / "__init__.py", packages_destination / "__init__.py")
+        shutil.copytree(
+            packages_source / "platform_infra",
+            packages_destination / "platform_infra",
+        )
+
+        self.assertEqual(sys.version_info[:2], (3, 12))
+        fixed_python = Path("/usr/bin/python3.12")
+        self.assertTrue(fixed_python.is_file())
+        fixed_python_identity = fixed_python.resolve(strict=True)
+        venv_bin = venv / "bin"
+        python = venv_bin / "python"
+        try:
+            python_metadata = python.lstat()
+        except FileNotFoundError:
+            python_metadata = None
+        if python_metadata is not None:
+            if stat.S_ISLNK(python_metadata.st_mode):
+                self.assertEqual(
+                    python.resolve(strict=True),
+                    fixed_python_identity,
+                    "existing venv launcher is not the pinned interpreter",
+                )
+            elif stat.S_ISREG(python_metadata.st_mode):
+                # The just-built fixture venv may already contain a launcher.
+                # Replace only that regular file with the exact pinned runtime.
+                python.unlink()
+            else:
+                self.fail("venv launcher has an unsupported file type")
+        if not python.is_symlink():
+            self.assertFalse(os.path.lexists(python))
+            python.symlink_to(fixed_python)
+        self.assertEqual(python.resolve(strict=True), fixed_python_identity)
+        purelib = Path(sysconfig.get_path("purelib")).resolve(strict=True)
+        try:
+            purelib.relative_to(Path(sys.prefix).resolve(strict=True))
+        except ValueError as exc:
+            raise AssertionError("test child packages are outside the pinned venv") from exc
+        for dependency in ("redis", "sqlalchemy", "pydantic_settings"):
+            self.assertTrue((purelib / dependency).exists(), dependency)
+        (venv / "pyvenv.cfg").write_text(
+            "home = /usr/bin\n"
+            "include-system-site-packages = false\n"
+            f"version = {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n",
+            encoding="ascii",
+        )
+        site_packages = (
+            venv
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        )
+        site_packages.parent.mkdir(parents=True, exist_ok=True)
+        self.assertTrue(site_packages.parent.is_dir())
+        self.assertFalse(site_packages.parent.is_symlink())
+        try:
+            site_packages_metadata = site_packages.lstat()
+        except FileNotFoundError:
+            site_packages_metadata = None
+        if site_packages_metadata is not None and stat.S_ISLNK(
+            site_packages_metadata.st_mode
+        ):
+            self.assertEqual(
+                site_packages.resolve(strict=True),
+                purelib,
+                "existing venv site-packages link is not the pinned package set",
+            )
+        elif site_packages_metadata is None:
+            site_packages.symlink_to(purelib, target_is_directory=True)
+        else:
+            self.assertTrue(stat.S_ISDIR(site_packages_metadata.st_mode))
+            bridge = site_packages / "platform_test_pinned_packages.pth"
+            bridge_contents = f"{purelib}\n"
+            if os.path.lexists(bridge):
+                bridge_metadata = bridge.lstat()
+                self.assertTrue(stat.S_ISREG(bridge_metadata.st_mode))
+                self.assertEqual(bridge.read_text(encoding="ascii"), bridge_contents)
+            else:
+                descriptor = os.open(
+                    bridge,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o644,
+                )
+                with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+                    stream.write(bridge_contents)
+
+        nonce = uuid.uuid4().hex
+        v1_keys = tuple(
+            f"platform:tournament:{namespace}:v1:rollback-fixture-{nonce}"
+            for namespace in ("profile-access", "profile-viewers", "profile-roster")
+        )
+        v2_keys = tuple(
+            f"platform:tournament:{namespace}:v2:rollback-fixture-{nonce}"
+            for namespace in ("profile-access", "profile-viewers", "profile-roster")
+        )
+
+        async def seed() -> None:
+            client = from_url(redis_url, decode_responses=False)
+            try:
+                self.assertTrue(await client.ping())
+                self.assertEqual(await client.exists(*v1_keys, *v2_keys), 0)
+                await client.mset(
+                    {
+                        **{key: b"legacy-v1" for key in v1_keys},
+                        **{key: b"preserve-v2" for key in v2_keys},
+                    }
+                )
+            finally:
+                await client.aclose()
+
+        asyncio.run(seed())
+        self.addCleanup(self.delete_profile_access_fixture_keys, redis_url, v1_keys, v2_keys)
+        return v1_keys, v2_keys
+
+    def assert_profile_access_cache_purged(
+        self, v1_keys: tuple[str, ...], v2_keys: tuple[str, ...]
+    ) -> None:
+        from redis.asyncio import from_url
+
+        async def check() -> None:
+            client = from_url("redis://127.0.0.1:6379/15", decode_responses=False)
+            try:
+                self.assertTrue(await client.ping())
+                self.assertEqual(await client.exists(*v1_keys), 0)
+                self.assertEqual(
+                    await client.mget(v2_keys),
+                    [b"preserve-v2"] * len(v2_keys),
+                )
+            finally:
+                await client.aclose()
+
+        asyncio.run(check())
+
+    def refresh_unchanged_venv_freeze_receipt(
+        self, release: Path, venv: Path
+    ) -> None:
+        """Bind skip-deps rollback metadata to the real pinned test venv."""
+
+        env = {
+            "HOME": "/nonexistent",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "PIP_CONFIG_FILE": "/dev/null",
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_NO_INDEX": "1",
+        }
+        result = subprocess.run(
+            [str(venv / "bin/python"), "-I", "-m", "pip", "freeze", "--all"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+            close_fds=True,
+            env=env,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, "pinned venv freeze failed")
+        frozen = "".join(f"{line}\n" for line in sorted(result.stdout.splitlines()))
+        freeze = release / "requirements-platform.freeze.txt"
+        freeze.write_text(frozen, encoding="utf-8")
+        freeze.chmod(0o444)
+        digest = hashlib.sha256(freeze.read_bytes()).hexdigest()
+        receipt = release / ".rollback" / "shared-freeze.sha256"
+        receipt.write_text(f"{digest}\n", encoding="ascii")
+        receipt.chmod(0o600)
+
+    def delete_profile_access_fixture_keys(
+        self,
+        redis_url: str,
+        v1_keys: tuple[str, ...],
+        v2_keys: tuple[str, ...],
+    ) -> None:
+        from redis.asyncio import from_url
+
+        async def delete() -> None:
+            client = from_url(redis_url, decode_responses=False)
+            try:
+                await client.delete(*v1_keys, *v2_keys)
+            finally:
+                await client.aclose()
+
+        asyncio.run(delete())
+
+    def write_release_manifest(self, release: Path, source_sha: str) -> None:
+        manifest = release / "RELEASE.json"
+        manifest.write_text(
+            json.dumps({"source_git_commit": source_sha}, sort_keys=True) + "\n",
+            encoding="ascii",
+        )
+        manifest.chmod(0o444)
+
+    def install_restore_nginx_helper(self, release: Path) -> None:
+        """Make the restored release's Python-invoked helper executable code."""
+
+        helper = release / "tools" / "platform_install_nginx.py"
+        source = (
+            "import sys\n"
+            "valid_args = sys.argv[1:] == ['--apply', '--reload', '--json']\n"
+            "if not valid_args:\n"
+            "    raise SystemExit(64)\n"
+        )
+        compile(source, str(helper), "exec")
+        helper.write_text(source, encoding="ascii")
+        helper.chmod(0o755)
+
+    def install_restore_runtime_reconcile_helper(
+        self, release: Path, app_dir: Path
+    ) -> None:
+        """Model the restored release's exact Python reconcile entrypoint."""
+
+        helper = release / "tools" / "platform_live_qa_runtime_install.py"
+        expected_app_dir = str(app_dir)
+        source = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            f"expected = ['reconcile', '--app-dir', {expected_app_dir!r}]\n"
+            "if sys.argv[1:] != expected:\n"
+            "    raise SystemExit(64)\n"
+            "app_dir = Path(sys.argv[3])\n"
+            "current = app_dir / 'current'\n"
+            "release = Path(__file__).resolve().parent.parent\n"
+            "if not app_dir.is_absolute() or not current.is_symlink():\n"
+            "    raise SystemExit(65)\n"
+            "if current.resolve(strict=True) != release:\n"
+            "    raise SystemExit(65)\n"
+        )
+        compile(source, str(helper), "exec")
+        helper.write_text(source, encoding="ascii")
+        helper.chmod(0o755)
+
+    def install_bounded_transaction_diagnostic(
+        self, release: Path, diagnostic_path: Path
+    ) -> None:
+        """Instrument only the copied CLI with a private, bounded failure code."""
+
+        helper = release / "tools" / "platform_release_transaction.py"
+        source = helper.read_text(encoding="utf-8")
+        needle = "    except TransactionError as exc:\n"
+        self.assertEqual(source.count(needle), 1)
+        diagnostic = (
+            "        try:\n"
+            f"            _diag_fd = os.open({str(diagnostic_path)!r}, "
+            "os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)\n"
+            "            _diag_message = str(exc)\n"
+            "            _diag_safe = (\n"
+            "                len(_diag_message) <= 160\n"
+            "                and all(ch.isascii() and (ch.isalnum() or ch in ' _-') for ch in _diag_message)\n"
+            "            )\n"
+            "            _diag_text = (\n"
+            "                type(exc).__name__ + '\\t' + (_diag_message if _diag_safe else 'unclassified') + '\\n'\n"
+            "            ).encode('ascii')\n"
+            "            with os.fdopen(_diag_fd, 'wb') as _diag_stream:\n"
+            "                _diag_stream.write(_diag_text)\n"
+            "                _diag_stream.flush()\n"
+            "                os.fsync(_diag_stream.fileno())\n"
+            "        except OSError:\n"
+            "            pass\n"
+        )
+        helper.write_text(source.replace(needle, needle + diagnostic, 1), encoding="utf-8")
+        helper.chmod(0o755)
 
     def _script_with_physical_tools(self, source: Path) -> str:
         lines = source.read_text().splitlines(keepends=True)
@@ -1874,6 +2267,9 @@ raise SystemExit("unsupported fake pip invocation: " + repr(arguments))
         command_env = os.environ.copy()
         command_env["PLATFORM_ENVIRONMENT"] = "test"
         command_env["PLATFORM_TESTING"] = "1"
+        command_env["PLATFORM_TEST_SYSTEMCTL_TRACE"] = str(
+            self.root / "systemctl-calls.log"
+        )
         if relocation_case is not None:
             if relocation_case not in {
                 "hashed-cache-row", "duplicate-cache-row", "noncanonical-cache-row",
@@ -1966,7 +2362,6 @@ PYTEST_RELOCATION_CACHE
                 f"stdout={result.stdout}\nstderr={result.stderr}"
             )
         return result
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
@@ -319,6 +319,97 @@ def _terminate_owned_process_group(process: subprocess.Popen[bytes]) -> bool:
     return cleanup_complete
 
 
+def _cleanup_timed_out_backend_privileged_resources(
+    resource_settings: dict[str, str],
+) -> None:
+    """Revalidate and empty only disposable Redis DB 15 after child reaping."""
+
+    from tools.platform_test_runner import _teardown_privileged_redis_resource
+    from tools.platform_verification_lock import verification_resource_lock
+
+    with verification_resource_lock("backend-privileged"):
+        _teardown_privileged_redis_resource(resource_settings)
+
+
+def _validated_privileged_environment() -> tuple[dict[str, str], dict[str, str]]:
+    """Resolve one safe test environment for both child and timeout cleanup.
+
+    This mirrors the shell runner's dotenv precedence without asking a later
+    child process to reread a mutable file.  The returned resource mapping is
+    syntax-validated before a child can import a Redis client or access a
+    service.
+    """
+
+    child_env = os.environ.copy()
+    app_parent = PLATFORM_ROOT.parent
+    if app_parent.name == "releases" and (app_parent.parent / "shared").is_dir():
+        app_dir = app_parent.parent
+    else:
+        app_dir = app_parent
+    child_env["PLATFORM_ROOT_DIR"] = str(PLATFORM_ROOT)
+    child_env["PLATFORM_APP_DIR"] = child_env.get("PLATFORM_APP_DIR") or str(app_dir)
+    child_env["PLATFORM_SHARED_DIR"] = str(PLATFORM_ROOT)
+    if not child_env.get("PLATFORM_NODE_BIN"):
+        node_26 = PLATFORM_ROOT / "node-v26.3.1/bin/node"
+        node_current = PLATFORM_ROOT / "node-current/bin/node"
+        if os.access(node_26, os.X_OK):
+            child_env["PLATFORM_NODE_BIN"] = str(node_26)
+        elif os.access(node_current, os.X_OK):
+            child_env["PLATFORM_NODE_BIN"] = str(node_current)
+        else:
+            child_env["PLATFORM_NODE_BIN"] = "/usr/bin/node"
+    if child_env.get("PLATFORM_TEST_AGGREGATE_ONLY") == "1":
+        child_env["PLATFORM_PYTHON_BIN"] = (
+            child_env.get("PLATFORM_PYTHON_BIN") or "/usr/bin/python3"
+        )
+    else:
+        child_env["PLATFORM_PYTHON_BIN"] = str(
+            PLATFORM_ROOT / ".venv_platform" / "bin" / "python"
+        )
+    env_file_value = child_env.get("PLATFORM_ENV_FILE") or str(
+        PLATFORM_ROOT / ".env.platform"
+    )
+    env_file = Path(env_file_value)
+    if not env_file.is_absolute():
+        env_file = PLATFORM_ROOT / env_file
+    child_env["PLATFORM_ENV_FILE"] = str(env_file)
+
+    try:
+        try:
+            from tools.platform_safe_env_exec import load_env_file
+            from tools.platform_test_runner import validate_test_resource_configuration
+        except ModuleNotFoundError:  # Direct execution from platform/tools.
+            from platform_safe_env_exec import load_env_file
+            from platform_test_runner import validate_test_resource_configuration
+
+        if os.path.lexists(env_file):
+            child_env.update(load_env_file(env_file))
+        resource_settings = {
+            "platform_environment": child_env.get("PLATFORM_ENVIRONMENT"),
+            "platform_database_url": child_env.get("PLATFORM_DATABASE_URL"),
+            "platform_db_schema": child_env.get("PLATFORM_DB_SCHEMA"),
+            "platform_redis_url": child_env.get("PLATFORM_REDIS_URL"),
+        }
+        validate_test_resource_configuration(resource_settings)
+    except Exception as exc:
+        # Parser and validator errors are intentionally kept free of dotenv
+        # values and are reported as a single local-boundary failure.
+        raise VerificationError(
+            "privileged test environment is unsafe or does not target the "
+            "disposable platformdb_test/Redis DB 15 resources"
+        ) from exc
+    return child_env, resource_settings
+
+
+def _privileged_runner_python(child_env: dict[str, str]) -> str:
+    """Mirror the wrapper's pinned interpreter selection and executable check."""
+
+    python = child_env.get("PLATFORM_PYTHON_BIN") or ""
+    if not os.access(python, os.X_OK):
+        raise VerificationError("pinned test Python runtime is unavailable")
+    return python
+
+
 def _wait_for_owned_process_exit(
     process: subprocess.Popen[bytes],
     timeout_seconds: float | None,
@@ -352,6 +443,7 @@ def _run(
     env: dict[str, str] | None = None,
     cwd: Path = PLATFORM_ROOT,
     timeout_seconds: float | None = None,
+    timeout_cleanup: Callable[[], None] | None = None,
 ) -> int:
     print(f"[GATE START] {label}", flush=True)
     previous_term_handler = signal.getsignal(signal.SIGTERM)
@@ -398,6 +490,20 @@ def _run(
                     f"[GATE TIMEOUT CLEANUP INCOMPLETE] {label}",
                     file=sys.stderr,
                 )
+            elif timeout_cleanup is not None:
+                try:
+                    timeout_cleanup()
+                except Exception as exc:
+                    print(
+                        f"[GATE TIMEOUT RESOURCE CLEANUP FAIL] {label} "
+                        f"class={type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"[GATE TIMEOUT RESOURCE CLEANUP] {label} status=passed",
+                        flush=True,
+                    )
             timeout_label = (
                 f"{timeout_seconds:g}s" if timeout_seconds is not None else "the configured timeout"
             )
@@ -538,6 +644,30 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
     BACKEND_CONTOURS = _backend_catalog_module().BACKEND_CONTOURS
 
     if gate_id in BACKEND_CONTOURS:
+        if gate_id == "backend-privileged":
+            if os.geteuid() != 0:
+                raise VerificationError("backend-privileged requires the root test user")
+            wrapper_command = _backend_contour_command(gate_id, arguments)
+            runner_arguments = wrapper_command[3:]
+            child_env, resource_settings = _validated_privileged_environment()
+            command = [
+                _privileged_runner_python(child_env),
+                _tool("platform_test_runner.py"),
+                "--contour",
+                gate_id,
+                *runner_arguments,
+            ]
+
+            def timeout_cleanup() -> None:
+                _cleanup_timed_out_backend_privileged_resources(resource_settings)
+
+            return _run(
+                gate_id,
+                command,
+                env=child_env,
+                timeout_seconds=_backend_catalog_module().CONTOUR_TIMEOUT_SECONDS[gate_id],
+                timeout_cleanup=timeout_cleanup,
+            )
         return _run(
             gate_id,
             _backend_contour_command(gate_id, arguments),
@@ -546,17 +676,26 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
     if gate_id == "release-runtime":
         if arguments:
             raise VerificationError("release-runtime does not accept extra arguments.")
+        if os.geteuid() != 0:
+            raise VerificationError("backend-privileged requires the root test user")
+        child_env, resource_settings = _validated_privileged_environment()
+
+        def timeout_cleanup() -> None:
+            _cleanup_timed_out_backend_privileged_resources(resource_settings)
+
         return _run(
             gate_id,
             [
-                _python(),
+                _privileged_runner_python(child_env),
                 _tool("platform_test_runner.py"),
                 "--contour",
                 "backend-privileged",
                 "--focused",
                 *RELEASE_RUNTIME_TEST_IDS,
             ],
+            env=child_env,
             timeout_seconds=600,
+            timeout_cleanup=timeout_cleanup,
         )
     if arguments and gate_id not in {"backend", "verification-contract"}:
         raise VerificationError(f"{gate_id} does not accept extra arguments.")
