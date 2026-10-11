@@ -66,13 +66,27 @@ class RestoreGuardStop(RuntimeError):
         *,
         free_bytes: int | None = None,
         required_free_bytes: int | None = None,
+        phase: str | None = None,
     ) -> None:
         if reason not in _RESTORE_GUARD_MESSAGES:
             raise ValueError("unknown restore guard reason")
         self.reason = reason
         self.free_bytes = free_bytes
         self.required_free_bytes = required_free_bytes
+        self.phase = phase
         super().__init__(_RESTORE_GUARD_MESSAGES[reason])
+
+    def private_backup_disk_diagnostic(self) -> dict[str, Any] | None:
+        if self.phase not in _BACKUP_DISK_DIAGNOSTIC_PHASES:
+            return None
+        value = {
+            "schema": 1,
+            "phase": self.phase,
+            "guard_reason": self.reason,
+            "free_bytes": self.free_bytes,
+            "required_free_bytes": self.required_free_bytes,
+        }
+        return value if valid_backup_disk_diagnostic(value) else None
 
 
 _RESTORE_GUARD_MESSAGES = {
@@ -81,6 +95,20 @@ _RESTORE_GUARD_MESSAGES = {
     "child_unstopped": "Backup or restore command could not be confirmed stopped.",
     "command_start_failed": "Backup or restore command could not be started.",
     "command_failed": "Backup or restore command exited unsuccessfully.",
+}
+_BACKUP_DISK_DIAGNOSTIC_PHASES = {
+    "backup_admission",
+    "pg_dump_pre_spawn",
+    "pg_dump_post_start",
+    "pg_dump_monitor",
+    "pg_dump_post_exit",
+}
+_BACKUP_DISK_DIAGNOSTIC_REASONS = {
+    "disk_floor",
+    "disk_unavailable",
+    "child_unstopped",
+    "command_start_failed",
+    "command_failed",
 }
 _RESTORE_DIAGNOSTIC_STAGES = {
     "pre_create_admission",
@@ -102,6 +130,37 @@ _RESTORE_DROP_OUTCOMES = {
     "absence_unconfirmed",
     "confirmed_absent",
 }
+
+
+def valid_backup_disk_diagnostic(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "phase",
+        "guard_reason",
+        "free_bytes",
+        "required_free_bytes",
+    }:
+        return False
+    if (
+        type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or type(value.get("phase")) is not str
+        or value["phase"] not in _BACKUP_DISK_DIAGNOSTIC_PHASES
+        or type(value.get("guard_reason")) is not str
+        or value["guard_reason"] not in _BACKUP_DISK_DIAGNOSTIC_REASONS
+        or any(
+            item is not None and (type(item) is not int or item < 0)
+            for item in (value.get("free_bytes"), value.get("required_free_bytes"))
+        )
+    ):
+        return False
+    if value["guard_reason"] == "disk_floor":
+        return (
+            type(value["free_bytes"]) is int
+            and type(value["required_free_bytes"]) is int
+            and value["free_bytes"] < value["required_free_bytes"]
+        )
+    return True
 
 
 def _valid_restore_diagnostic(value: Any) -> bool:
@@ -321,35 +380,40 @@ def run_command(
     )
 
 
-def _required_disk_floor(total_bytes: int) -> int:
+def _required_disk_floor(total_bytes: int, *, phase: str | None = None) -> int:
     if type(total_bytes) is not int or total_bytes <= 0:
-        raise RestoreGuardStop("disk_unavailable")
+        raise RestoreGuardStop("disk_unavailable", phase=phase)
     fifteen_percent_ceil = (total_bytes * 15 + 99) // 100
     return max(RESTORE_DISK_MINIMUM_BYTES, fifteen_percent_ceil)
 
 
-def require_restore_headroom(*paths: pathlib.Path) -> None:
+def require_restore_headroom(
+    *paths: pathlib.Path, phase: str | None = None
+) -> None:
     """Fail closed unless every affected filesystem has policy floor plus lead."""
 
     checked_paths = paths or (pathlib.Path("/"),)
     try:
         snapshots = [snapshot_for_path(path) for path in checked_paths]
     except OSError as exc:
-        raise RestoreGuardStop("disk_unavailable") from exc
+        raise RestoreGuardStop("disk_unavailable", phase=phase) from exc
     for snapshot in snapshots:
         if not snapshot.valid:
-            raise RestoreGuardStop("disk_unavailable")
-        floor = _required_disk_floor(snapshot.total_bytes)
+            raise RestoreGuardStop("disk_unavailable", phase=phase)
+        floor = _required_disk_floor(snapshot.total_bytes, phase=phase)
         required_free_bytes = floor + RESTORE_DISK_LEAD_BYTES
         if snapshot.free_bytes < required_free_bytes:
             raise RestoreGuardStop(
                 "disk_floor",
                 free_bytes=snapshot.free_bytes,
                 required_free_bytes=required_free_bytes,
+                phase=phase,
             )
 
 
-def _stop_owned_child(process: subprocess.Popen[bytes]) -> None:
+def _stop_owned_child(
+    process: subprocess.Popen[bytes], *, phase: str | None = None
+) -> None:
     """Stop and reap only the child process started by this call."""
 
     if process.poll() is not None:
@@ -373,7 +437,7 @@ def _stop_owned_child(process: subprocess.Popen[bytes]) -> None:
         # is followed by a wait on this exact Popen until it has been reaped.
         process.wait()
     except OSError as exc:
-        raise RestoreGuardStop("child_unstopped") from exc
+        raise RestoreGuardStop("child_unstopped", phase=phase) from exc
 
 
 def run_disk_guarded_command(
@@ -387,7 +451,9 @@ def run_disk_guarded_command(
 
     if stage not in {"pg_dump", "pg_restore"}:
         raise ValueError("unknown disk-guarded command stage")
-    require_restore_headroom(*disk_paths)
+    phase = f"{stage}_pre_spawn"
+    backup_phase = phase if stage == "pg_dump" else None
+    require_restore_headroom(*disk_paths, phase=backup_phase)
     try:
         process = subprocess.Popen(
             command,
@@ -398,25 +464,31 @@ def run_disk_guarded_command(
             close_fds=True,
         )
     except OSError as exc:
-        raise RestoreGuardStop("command_start_failed") from exc
+        raise RestoreGuardStop("command_start_failed", phase=backup_phase) from exc
 
     try:
         # Always take a post-start sample, including when pg_restore is short.
-        require_restore_headroom(*disk_paths)
+        phase = f"{stage}_post_start"
+        backup_phase = phase if stage == "pg_dump" else None
+        require_restore_headroom(*disk_paths, phase=backup_phase)
         while process.poll() is None:
             time.sleep(RESTORE_DISK_SAMPLE_SECONDS)
             if process.poll() is not None:
                 break
-            require_restore_headroom(*disk_paths)
+            phase = f"{stage}_monitor"
+            backup_phase = phase if stage == "pg_dump" else None
+            require_restore_headroom(*disk_paths, phase=backup_phase)
         return_code = process.wait()
         # Catch a floor crossing between the final sample and child exit.
-        require_restore_headroom(*disk_paths)
+        phase = f"{stage}_post_exit"
+        backup_phase = phase if stage == "pg_dump" else None
+        require_restore_headroom(*disk_paths, phase=backup_phase)
     except BaseException:
         if process.poll() is None:
-            _stop_owned_child(process)
+            _stop_owned_child(process, phase=backup_phase)
         raise
     if return_code != 0:
-        raise RestoreGuardStop("command_failed")
+        raise RestoreGuardStop("command_failed", phase=backup_phase)
 
 
 def run_restore_command(
@@ -1469,7 +1541,9 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
 
     # Check before creating the temporary output file; the child monitor then
     # guards the actual archive write against the same filesystem policy.
-    require_restore_headroom(pathlib.Path("/"), output_dir)
+    require_restore_headroom(
+        pathlib.Path("/"), output_dir, phase="backup_admission"
+    )
 
     required = ["pg_dump", "pg_restore"]
     if not args.dump_only:
@@ -1742,6 +1816,13 @@ def main() -> int:
             diagnostic = getattr(exc, "restore_diagnostic", None)
             if _valid_restore_diagnostic(diagnostic):
                 report["restore_diagnostic"] = diagnostic
+            backup_disk_diagnostic = (
+                exc.private_backup_disk_diagnostic()
+                if isinstance(exc, RestoreGuardStop)
+                else None
+            )
+            if valid_backup_disk_diagnostic(backup_disk_diagnostic):
+                report["backup_disk_diagnostic"] = backup_disk_diagnostic
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
             print(f"[FAIL] {error_message}", file=sys.stderr)

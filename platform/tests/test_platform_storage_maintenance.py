@@ -849,6 +849,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "ok": False,
                     "error": "private failure detail",
                     "restore_diagnostic": diagnostic,
+                    "backup_disk_diagnostic": {
+                        "schema": 1,
+                        "phase": "pg_dump_monitor",
+                        "guard_reason": "disk_floor",
+                        "free_bytes": 100,
+                        "required_free_bytes": 200,
+                    },
                 }
             ),
             "child diagnostic",
@@ -863,6 +870,42 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     ["fixed-backup-child"], forward_failure_diagnostics=True
                 )
         self.assertEqual(failure_error.exception.restore_diagnostic, diagnostic)
+        self.assertEqual(
+            failure_error.exception.backup_disk_diagnostic,
+            {
+                "schema": 1,
+                "phase": "pg_dump_monitor",
+                "guard_reason": "disk_floor",
+                "free_bytes": 100,
+                "required_free_bytes": 200,
+            },
+        )
+        malformed_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            json.dumps(
+                {
+                    "ok": False,
+                    "backup_disk_diagnostic": {
+                        "schema": 1,
+                        "phase": "pg_dump_monitor",
+                        "guard_reason": "disk_floor",
+                        "free_bytes": 100,
+                        "required_free_bytes": 200,
+                        "private_path": "/must-not-cross-the-boundary",
+                    },
+                }
+            ),
+            "",
+        )
+        with (
+            mock.patch.object(
+                maintenance.subprocess, "run", return_value=malformed_failure
+            ),
+            self.assertRaisesRegex(RuntimeError, "Platform backup failed") as malformed_error,
+        ):
+            maintenance._run_backup_command(["fixed-backup-child"])
+        self.assertIsNone(malformed_error.exception.backup_disk_diagnostic)
         self.assertIn("private failure detail", private_stderr.getvalue())
         self.assertIn("child diagnostic", private_stderr.getvalue())
         public_stderr = io.StringIO()
@@ -2257,6 +2300,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "schema", "event", "run_id", "attempt", "operation", "source_sha",
                     "bundle_sha256", "stage", "public_summary_error", "exit_code", "report_state",
                     "report_error_class", "restore_diagnostic", "report_bytes",
+                    "backup_disk_diagnostic",
                     "report_sha256", "stderr_state",
                     "stderr_exception_class", "stderr_bytes", "stderr_sha256",
                 },
@@ -2293,6 +2337,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "temporary_database_absent": True,
                             "archive_sha256": "a" * 64,
                             "archive_size_bytes": 120,
+                        },
+                        "backup_disk_diagnostic": {
+                            "schema": 1,
+                            "phase": "backup_admission",
+                            "guard_reason": "disk_floor",
+                            "free_bytes": 10,
+                            "required_free_bytes": 20,
                         },
                     }
                 ),
@@ -2338,6 +2389,16 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(
                 typed_receipt["restore_diagnostic"]["required_free_bytes"], 20
             )
+            self.assertEqual(
+                typed_receipt["backup_disk_diagnostic"],
+                {
+                    "schema": 1,
+                    "phase": "backup_admission",
+                    "guard_reason": "disk_floor",
+                    "free_bytes": 10,
+                    "required_free_bytes": 20,
+                },
+            )
             self.assertNotIn(
                 "fixture-private detail",
                 typed_receipt_path.read_text(encoding="ascii"),
@@ -2361,6 +2422,14 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "temporary_database_absent": None,
                             "archive_sha256": "b" * 64,
                             "archive_size_bytes": 120,
+                        },
+                        "backup_disk_diagnostic": {
+                            "schema": 1,
+                            "phase": "backup_admission",
+                            "guard_reason": "disk_floor",
+                            "free_bytes": 10,
+                            "required_free_bytes": 20,
+                            "unexpected": "must not be retained",
                         },
                     }
                 ),
@@ -2402,6 +2471,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 uncertain_receipt["restore_diagnostic"]["restore_stage"],
                 "create_database",
             )
+            self.assertIsNone(uncertain_receipt["backup_disk_diagnostic"])
             self.assertFalse(typed_report.exists())
 
             trap_start = remote_script.index(

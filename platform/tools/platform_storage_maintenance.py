@@ -63,6 +63,7 @@ except ImportError:  # Direct execution from the tools directory.
 try:
     from . import platform_live_qa_guard as live_qa_guard
     from . import platform_build_node_cache
+    from .platform_backup_restore_drill import valid_backup_disk_diagnostic
     from .platform_release_retention import (
         RetentionPlan,
         apply_plan as apply_release_plan,
@@ -76,6 +77,7 @@ try:
 except ImportError:  # Direct execution from the tools directory.
     import platform_live_qa_guard as live_qa_guard
     import platform_build_node_cache
+    from platform_backup_restore_drill import valid_backup_disk_diagnostic
     from platform_release_retention import (
         RetentionPlan,
         apply_plan as apply_release_plan,
@@ -200,8 +202,13 @@ def _valid_restore_diagnostic(value: Any) -> bool:
 
 
 class BackupCommandFailure(RuntimeError):
-    def __init__(self, diagnostic: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        diagnostic: dict[str, Any] | None = None,
+        backup_disk_diagnostic: dict[str, Any] | None = None,
+    ) -> None:
         self.restore_diagnostic = diagnostic
+        self.backup_disk_diagnostic = backup_disk_diagnostic
         super().__init__("Platform backup failed.")
 
 
@@ -722,8 +729,18 @@ def _run_backup_command(
                 if not diagnostic_parts[-1].endswith("\n"):
                     sys.stderr.write("\n")
         diagnostic = result.get("restore_diagnostic") if isinstance(result, dict) else None
+        backup_disk_diagnostic = (
+            result.get("backup_disk_diagnostic")
+            if isinstance(result, dict)
+            else None
+        )
         raise BackupCommandFailure(
-            diagnostic if _valid_restore_diagnostic(diagnostic) else None
+            diagnostic if _valid_restore_diagnostic(diagnostic) else None,
+            (
+                backup_disk_diagnostic
+                if valid_backup_disk_diagnostic(backup_disk_diagnostic)
+                else None
+            ),
         )
     return result
 
@@ -2554,6 +2571,11 @@ def main() -> int:
             diagnostic = getattr(exc, "restore_diagnostic", None)
             if _valid_restore_diagnostic(diagnostic):
                 result["restore_diagnostic"] = diagnostic
+            backup_disk_diagnostic = getattr(
+                exc, "backup_disk_diagnostic", None
+            )
+            if valid_backup_disk_diagnostic(backup_disk_diagnostic):
+                result["backup_disk_diagnostic"] = backup_disk_diagnostic
             print(
                 json.dumps(result, ensure_ascii=False, indent=2)
             )

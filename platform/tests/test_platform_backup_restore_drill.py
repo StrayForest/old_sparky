@@ -361,6 +361,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._assert_unavailable_disk_fails_before_child_start(target)
         self._assert_normal_guarded_child_completes(target, high)
         self._assert_low_space_abort_stops_only_owned_dump()
+        self._assert_backup_admission_reports_private_disk_phase()
 
     def _assert_unavailable_disk_fails_before_child_start(
         self, target: backup_drill.DatabaseTarget
@@ -466,18 +467,86 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             mock.patch.object(backup_drill.subprocess, "Popen", return_value=child) as popen,
             mock.patch.object(backup_drill.time, "sleep"),
         ):
-            with self.assertRaisesRegex(backup_drill.RestoreGuardStop, "low-disk safety guard"):
+            with self.assertRaisesRegex(
+                backup_drill.RestoreGuardStop, "low-disk safety guard"
+            ) as raised:
                 backup_drill.run_disk_guarded_command(
                     ["pg_dump", "--file", "/private/temp.dump"],
                     target=target,
                     stage="pg_dump",
                 )
+        failure = raised.exception
 
         popen.assert_called_once()
         self.assertIs(popen.call_args.kwargs["stdout"], backup_drill.subprocess.DEVNULL)
         self.assertIs(popen.call_args.kwargs["stderr"], backup_drill.subprocess.DEVNULL)
         self.assertTrue(child.terminated)
         self.assertEqual(child.wait_calls, 1)
+        self.assertEqual(
+            failure.private_backup_disk_diagnostic(),
+            {
+                "schema": 1,
+                "phase": "pg_dump_monitor",
+                "guard_reason": "disk_floor",
+                "free_bytes": low.free_bytes,
+                "required_free_bytes": floor + backup_drill.RESTORE_DISK_LEAD_BYTES,
+            },
+        )
+
+    def _assert_backup_admission_reports_private_disk_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            old_dump, old_sidecar = self._write_backup_pair(
+                output_dir, "platformdb-existing.dump", b"retained backup"
+            )
+            before = {
+                path: (path.read_bytes(), path.lstat().st_ino, path.lstat().st_mode)
+                for path in (old_dump, old_sidecar)
+            }
+            args = argparse.Namespace(
+                env_file=str(output_dir / ".env.platform"),
+                output_dir=str(output_dir),
+                keep=1,
+                admin_database_url=None,
+                dump_only=True,
+                rotate_existing=False,
+            )
+            guard = backup_drill.RestoreGuardStop(
+                "disk_floor",
+                free_bytes=100,
+                required_free_bytes=200,
+                phase="backup_admission",
+            )
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    {"PLATFORM_DATABASE_URL": "postgresql://platform_user@localhost/platformdb"},
+                ),
+                mock.patch.object(backup_drill, "load_env", return_value={}),
+                mock.patch.object(backup_drill, "require_restore_headroom", side_effect=guard),
+                mock.patch.object(backup_drill, "require_commands") as require_commands,
+                mock.patch.object(backup_drill.tempfile, "mkstemp") as mkstemp,
+            ):
+                with self.assertRaises(backup_drill.RestoreGuardStop) as raised:
+                    backup_drill.create_backup(args)
+
+            require_commands.assert_not_called()
+            mkstemp.assert_not_called()
+            self.assertEqual(
+                raised.exception.private_backup_disk_diagnostic(),
+                {
+                    "schema": 1,
+                    "phase": "backup_admission",
+                    "guard_reason": "disk_floor",
+                    "free_bytes": 100,
+                    "required_free_bytes": 200,
+                },
+            )
+            for path, expected in before.items():
+                metadata = path.lstat()
+                self.assertEqual(
+                    (path.read_bytes(), metadata.st_ino, metadata.st_mode), expected
+                )
 
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

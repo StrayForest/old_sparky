@@ -771,6 +771,7 @@ jobs:
           stderr_state, stderr_bytes = read_private(capture_path, 65_536)
           report_error_class = "none"
           restore_diagnostic = None
+          backup_disk_diagnostic = None
           if report_state == "read":
               try:
                   report = json.loads(
@@ -785,6 +786,45 @@ jobs:
                       report_error_class = report["error_class"]
                       report_state = "typed_failure"
                       diagnostic = report.get("restore_diagnostic")
+                      backup_disk = report.get("backup_disk_diagnostic")
+                      backup_disk_phases = {
+                          "backup_admission", "pg_dump_pre_spawn", "pg_dump_post_start",
+                          "pg_dump_monitor", "pg_dump_post_exit",
+                      }
+                      backup_disk_reasons = {
+                          "disk_floor", "disk_unavailable", "child_unstopped",
+                          "command_start_failed", "command_failed",
+                      }
+                      if backup_disk is not None:
+                          expected_backup_disk = {
+                              "schema", "phase", "guard_reason", "free_bytes",
+                              "required_free_bytes",
+                          }
+                          valid_backup_disk = (
+                              isinstance(backup_disk, dict)
+                              and set(backup_disk) == expected_backup_disk
+                              and type(backup_disk.get("schema")) is int
+                              and backup_disk.get("schema") == 1
+                              and type(backup_disk.get("phase")) is str
+                              and backup_disk.get("phase") in backup_disk_phases
+                              and type(backup_disk.get("guard_reason")) is str
+                              and backup_disk.get("guard_reason") in backup_disk_reasons
+                              and all(
+                                  backup_disk.get(key) is None
+                                  or (type(backup_disk[key]) is int and backup_disk[key] >= 0)
+                                  for key in ("free_bytes", "required_free_bytes")
+                              )
+                              and (
+                                  backup_disk.get("guard_reason") != "disk_floor"
+                                  or (
+                                      type(backup_disk.get("free_bytes")) is int
+                                      and type(backup_disk.get("required_free_bytes")) is int
+                                      and backup_disk["free_bytes"] < backup_disk["required_free_bytes"]
+                                  )
+                              )
+                          )
+                          if valid_backup_disk:
+                              backup_disk_diagnostic = backup_disk
                       if diagnostic is not None:
                           stages = {
                               "pre_create_admission", "create_database", "extension_setup",
@@ -919,6 +959,7 @@ jobs:
                   "report_state": report_state,
                   "report_error_class": report_error_class,
                   "restore_diagnostic": restore_diagnostic,
+                  "backup_disk_diagnostic": backup_disk_diagnostic,
                   "report_bytes": len(report_bytes),
                   "report_sha256": hashlib.sha256(report_bytes).hexdigest() if report_bytes else None,
                   "stderr_state": stderr_state,

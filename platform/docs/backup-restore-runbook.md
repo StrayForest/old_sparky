@@ -35,6 +35,14 @@ database. The monitor is sampled, so the lead is an early-stop margin rather
 than a guarantee against a single write burst. A failed or unavailable disk
 sample stops the drill; it does not rotate or remove any retained backup.
 
+Keep this backup budget separate from the release installer budget. The
+release coexistence reserve covers release staging and is not backup capacity.
+Backup creation writes a temporary dump and, unless dump-only mode is
+explicitly selected by an approved workflow, restores it into a temporary
+database on its actual data filesystem. Forecast those operation-specific
+allocations against this backup guard before starting; if the temporary
+restore allocation is not bounded, available capacity remains unknown.
+
 Backup-only preserves every complete archive/metadata pair that exists before
 the run; it does not apply the 14-copy rotation limit. Under the ordered
 maintenance locks, it validates that each sidecar names the matching dump and
@@ -102,6 +110,12 @@ drop outcome. It records catalog-confirmed absence only after the exact drill
 database is checked through the admin connection. Missing evidence stays
 unknown; the receipt never includes the database name, raw command output,
 exception text, or credentials.
+
+A failed backup creation can also stop at the disk-floor guard before or while
+`pg_dump` runs. Its root-private failure receipt records only a fixed phase,
+guard reason and available/required byte counts; unavailable measurements stay
+null. It never records raw command output or changes the disk floor, restore
+lead, or backup-preservation behavior.
 
 For this opt-in only, if the canonical local build-output lock path
 `/root/old_sparky/platform/dist/releases` is absent, maintenance initializes
