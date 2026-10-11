@@ -10,12 +10,71 @@ from tools.platform_production_qa import (
     parse_ssr_event_loop_line,
     parse_ssr_perf_line,
     parse_ssr_stream_line,
+    parse_ssr_workspace_error_line,
     summarize_ssr_observability,
 )
 
 
 class SsrObservabilityTests(unittest.TestCase):
+    def _assert_workspace_error_tuple_is_closed_and_summary_joins_unique_ids_only(self) -> None:
+        raw = (
+            "web[1]: ssr_error request_id=req-private-1 cf_ray=ray-private-1 "
+            "diagnostic_run_id=0123456789abcdef0123456789abcdef "
+            "stage=tournament_workspace family=platform_api_error status=500 "
+            "response_code=unavailable"
+        )
+        parsed = parse_ssr_workspace_error_line(raw)
+        self.assertEqual(parsed["status"], 500)
+        self.assertIsNone(
+            parse_ssr_workspace_error_line(raw + " email=operator@example.test")
+        )
+        self.assertIsNone(
+            parse_ssr_workspace_error_line(raw.replace("status=500", "status=500 status=503"))
+        )
+        self.assertIsNone(
+            parse_ssr_workspace_error_line(raw.replace("status=500", "status=200"))
+        )
+
+        summary = summarize_ssr_observability(
+            [raw],
+            [
+                {
+                    "request_id": "req-private-1",
+                    "method": "GET",
+                    "uri": "/tournaments/private-slug",
+                    "status": 500,
+                    "upstream_status": "500",
+                    "request_time": "2.4",
+                    "upstream_time": "2.3",
+                }
+            ],
+        )
+        errors = summary["ssr_workspace_errors"]
+        self.assertEqual(errors["population"], "sampled_ssr_requests")
+        self.assertEqual(errors["matched_by_request_id"], 1)
+        self.assertEqual(errors["by_status"], {"500": 1})
+        self.assertEqual(errors["matched_nginx_statuses"], {"500": 1})
+        self.assertEqual(errors["matched_upstream_statuses"], {"500": 1})
+        serialized = json.dumps(summary)
+        for secret in ("req-private-1", "ray-private-1", "0123456789abcdef"):
+            self.assertNotIn(secret, serialized)
+
+        duplicate = summarize_ssr_observability(
+            [raw, raw],
+            [
+                {
+                    "request_id": "req-private-1",
+                    "method": "GET",
+                    "uri": "/tournaments/private-slug",
+                    "status": 500,
+                }
+            ],
+        )["ssr_workspace_errors"]
+        self.assertEqual(duplicate["ambiguous_request_ids"], 2)
+        self.assertEqual(duplicate["matched_by_request_id"], 0)
+
     def test_ssr_stage_parser_keeps_only_safe_scalar_diagnostics(self) -> None:
+        self._assert_workspace_error_tuple_is_closed_and_summary_joins_unique_ids_only()
         row = parse_ssr_perf_line(
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=tournament_workspace "
             "duration_ms=123.456 outcome=ok"

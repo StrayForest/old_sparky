@@ -100,6 +100,10 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         )
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_DB_POOL_PRE_PING"], "true")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_SSR_PERF_LOG_ENABLED"], "false")
+        self.assertEqual(
+            configure.PUBLIC_BASELINE["PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC"],
+            "false",
+        )
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_SSR_HEAP_METRICS_ENABLED"], "false")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_SSR_PERF_SAMPLE_RATE"], "0.01")
         self.assertEqual(
@@ -195,6 +199,7 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
             configure.RUNTIME_PROFILES["web-ssr-diagnostics"],
             {
                 "PLATFORM_SSR_PERF_LOG_ENABLED": "true",
+                "PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC": "true",
                 "PLATFORM_SSR_PERF_SAMPLE_RATE": "0.01",
                 "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
                 "PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED": "true",

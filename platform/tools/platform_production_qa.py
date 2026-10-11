@@ -105,6 +105,7 @@ NUMERIC_PATH_RE = re.compile(r"/\d+(?=/|$)")
 REQUEST_PERF_RE = re.compile(r"\brequest_perf\b(?P<body>.*)$")
 REQUEST_PERF_START_RE = re.compile(r"\brequest_perf_start\b(?P<body>.*)$")
 SSR_PERF_RE = re.compile(r"\bssr_perf\b(?P<body>.*)$")
+SSR_ERROR_RE = re.compile(r"\bssr_error\b(?P<body>.*)$")
 SSR_STREAM_RE = re.compile(r"\bssr_stream\b(?P<body>.*)$")
 SSR_EVENT_LOOP_RE = re.compile(r"\bssr_event_loop\b(?P<body>.*)$")
 TIMEOUT_DIAGNOSTIC_ID_RE = re.compile(r"^tdiag-[0-9]{1,32}-[0-9]{5}$")
@@ -2523,6 +2524,64 @@ def parse_ssr_perf_line(line: str) -> dict[str, Any] | None:
     return values
 
 
+def parse_ssr_workspace_error_line(line: str) -> dict[str, Any] | None:
+    """Parse only the closed, low-cardinality sampled SSR error tuple.
+
+    Request and edge identifiers are transient join keys and must never be
+    copied into a summary or public artifact.
+    """
+
+    match = SSR_ERROR_RE.search(line)
+    if match is None:
+        return None
+    values: dict[str, str] = {}
+    for token in match.group("body").strip().split():
+        if "=" not in token:
+            return None
+        key, raw_value = token.split("=", 1)
+        if key in values or key not in {
+            "request_id",
+            "cf_ray",
+            "diagnostic_run_id",
+            "stage",
+            "family",
+            "status",
+            "response_code",
+        }:
+            return None
+        values[key] = raw_value
+    required = {"request_id", "cf_ray", "stage", "family", "status", "response_code"}
+    if not required.issubset(values):
+        return None
+    if (
+        re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", values["request_id"]) is None
+        or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", values["cf_ray"]) is None
+        or values["stage"] != "tournament_workspace"
+        or values["family"] != "platform_api_error"
+        or values["response_code"] != "unavailable"
+    ):
+        return None
+    if "diagnostic_run_id" in values and re.fullmatch(
+        r"[0-9a-f]{32}", values["diagnostic_run_id"]
+    ) is None:
+        return None
+    try:
+        status = int(values["status"])
+    except ValueError:
+        return None
+    if not 400 <= status <= 599:
+        return None
+    return {
+        "request_id": values["request_id"],
+        "cf_ray": values["cf_ray"],
+        "diagnostic_run_id": values.get("diagnostic_run_id"),
+        "stage": values["stage"],
+        "family": values["family"],
+        "status": status,
+        "response_code": values["response_code"],
+    }
+
+
 def parse_ssr_stream_line(line: str) -> dict[str, Any] | None:
     match = SSR_STREAM_RE.search(line)
     if match is None:
@@ -2784,6 +2843,14 @@ def summarize_ssr_observability(
         for row in (parse_ssr_event_loop_line(line) for line in web_journal_lines)
         if row is not None
     ]
+    parsed_ssr_errors = [
+        row
+        for row in (parse_ssr_workspace_error_line(line) for line in web_journal_lines)
+        if row is not None
+    ]
+    ssr_error_line_count = sum(
+        1 for line in web_journal_lines if SSR_ERROR_RE.search(line) is not None
+    )
     by_stage: dict[str, list[float]] = defaultdict(list)
     by_request: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     by_request_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -2867,6 +2934,49 @@ def summarize_ssr_observability(
             api_perf_by_cf_ray[cf_ray].append(api_row)
 
     html_records = _nginx_html_records(nginx_records)
+    nginx_by_request_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in html_records:
+        request_id = str(record.get("request_id") or "").strip()
+        if request_id:
+            nginx_by_request_id[request_id].append(record)
+    ssr_error_by_request_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in parsed_ssr_errors:
+        ssr_error_by_request_id[str(row["request_id"])].append(row)
+    ssr_error_matched = 0
+    ssr_error_unmatched = 0
+    ssr_error_ambiguous = 0
+    matched_ssr_error_nginx_statuses: Counter[str] = Counter()
+    matched_ssr_error_upstream_statuses: Counter[str] = Counter()
+    for request_id, error_rows in ssr_error_by_request_id.items():
+        nginx_matches = nginx_by_request_id.get(request_id, [])
+        if len(error_rows) != 1 or len(nginx_matches) > 1:
+            ssr_error_ambiguous += len(error_rows)
+            continue
+        if len(nginx_matches) != 1:
+            ssr_error_unmatched += len(error_rows)
+            continue
+        ssr_error_matched += 1
+        nginx_record = nginx_matches[0]
+        matched_ssr_error_nginx_statuses[str(safe_status(nginx_record.get("status")))] += 1
+        upstream_statuses, _unknown_attempts = _nginx_upstream_status_values(nginx_record)
+        for status in upstream_statuses:
+            matched_ssr_error_upstream_statuses[status] += 1
+    ssr_workspace_error_diagnostics = {
+        "population": "sampled_ssr_requests",
+        "observed_records": len(parsed_ssr_errors),
+        "invalid_records": max(0, ssr_error_line_count - len(parsed_ssr_errors)),
+        "matched_by_request_id": ssr_error_matched,
+        "unmatched_request_ids": ssr_error_unmatched,
+        "ambiguous_request_ids": ssr_error_ambiguous,
+        "by_stage": dict(sorted(Counter(row["stage"] for row in parsed_ssr_errors).items())),
+        "by_family": dict(sorted(Counter(row["family"] for row in parsed_ssr_errors).items())),
+        "by_status": dict(sorted(Counter(str(row["status"]) for row in parsed_ssr_errors).items())),
+        "by_response_code": dict(
+            sorted(Counter(row["response_code"] for row in parsed_ssr_errors).items())
+        ),
+        "matched_nginx_statuses": dict(sorted(matched_ssr_error_nginx_statuses.items())),
+        "matched_upstream_statuses": dict(sorted(matched_ssr_error_upstream_statuses.items())),
+    }
     api_records = _nginx_api_records(nginx_records)
     correlated_rows: list[dict[str, Any]] = []
     api_join_by_request_id = 0
@@ -3364,6 +3474,7 @@ def summarize_ssr_observability(
                 for stage, values in sorted(by_stage.items())
             },
         },
+        "ssr_workspace_errors": ssr_workspace_error_diagnostics,
         "ssr_stream": {
             "logged_events": len(stream_rows),
             "sampled_requests": len(by_request_stream),

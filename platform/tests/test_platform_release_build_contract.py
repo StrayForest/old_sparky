@@ -2041,6 +2041,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "--only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED",
             diagnostics_branch,
         )
+        self.assertIn(
+            "--only PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC",
+            diagnostics_branch,
+        )
         self.assertIn("--only PLATFORM_LOG_LEVEL", diagnostics_branch)
         self.assertIn("--only PLATFORM_PERF_LOG_ENABLED", diagnostics_branch)
         self.assertIn(
@@ -2053,6 +2057,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         )
         self.assertIn(
             "grep -qx 'PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=true' \"$api_env\"",
+            diagnostics_branch,
+        )
+        self.assertIn(
+            "grep -qx 'PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC=true' \"$web_env\"",
             diagnostics_branch,
         )
 

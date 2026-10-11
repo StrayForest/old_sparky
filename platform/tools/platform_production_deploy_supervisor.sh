@@ -1228,6 +1228,7 @@ case "$runtime_profile" in
       --only PLATFORM_WEB_WORKERS \
       --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT \
       --only PLATFORM_SSR_PERF_LOG_ENABLED \
+      --only PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC \
       --only PLATFORM_SSR_PERF_SAMPLE_RATE \
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
     run_systemctl restart deadlock-api
@@ -1405,6 +1406,7 @@ case "$runtime_profile" in
       --only PLATFORM_LOG_LEVEL
       --only PLATFORM_PERF_LOG_ENABLED
       --only PLATFORM_SSR_PERF_LOG_ENABLED
+      --only PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC
       --only PLATFORM_SSR_PERF_SAMPLE_RATE
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
       --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
@@ -1415,12 +1417,15 @@ case "$runtime_profile" in
       --profile "$runtime_profile" \
       "${web_ssr_profile_args[@]}"
     api_env="$runtime/shared/env/api.env"
+    web_env="$runtime/shared/env/web.env"
     grep -qx 'PLATFORM_LOG_LEVEL=INFO' "$api_env" \
       || fail "web SSR diagnostic API env did not select INFO log level"
     grep -qx 'PLATFORM_PERF_LOG_ENABLED=true' "$api_env" \
       || fail "web SSR diagnostic API perf logging is not enabled"
     grep -qx 'PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=true' "$api_env" \
       || fail "web SSR diagnostic API auth bootstrap log gate is not enabled"
+    grep -qx 'PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC=true' "$web_env" \
+      || fail "web SSR diagnostic workspace error gate is not enabled"
     if ! restart_api_and_wait; then
       apply_shared_env_profile \
         --apply \

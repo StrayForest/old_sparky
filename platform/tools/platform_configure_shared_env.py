@@ -148,6 +148,9 @@ PUBLIC_BASELINE = {
     # Disabled by default. The web SSR diagnostic profile enables bounded
     # sampled stage logs for one reviewed load window.
     "PLATFORM_SSR_PERF_LOG_ENABLED": "false",
+    # Bounded, sampled workspace API-error tuples are available only in the
+    # explicitly selected SSR diagnostic profile.
+    "PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC": "false",
     # Separate process-level heap sampling from request-level SSR tracing.
     # Keep it disabled in every persistent runtime profile.
     "PLATFORM_SSR_HEAP_METRICS_ENABLED": "false",
@@ -218,6 +221,7 @@ RUNTIME_PROFILES = {
     },
     "web-ssr-diagnostics": {
         "PLATFORM_SSR_PERF_LOG_ENABLED": "true",
+        "PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC": "true",
         "PLATFORM_SSR_PERF_SAMPLE_RATE": "0.01",
         "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
         "PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED": "true",

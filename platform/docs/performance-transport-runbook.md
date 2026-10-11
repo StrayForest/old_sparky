@@ -49,6 +49,14 @@ Cloudflare ray. The report exposes only aggregate join counts and the join
 method class. Read
 `correlated_html.timeline[].api_request_perf[]` together with the SSR stages:
 
+The profile also enables the bounded `ssr_error` tuple for sampled workspace
+API failures. The observer joins these rows to Nginx only by a unique request
+ID and publishes stage, error family, status and response-code counts; request
+IDs, Cloudflare rays and diagnostic run IDs remain private and transient. This
+is a sampled error population: zero observed rows does not establish that no
+unsampled errors occurred. Restore the prior runtime profile after the window;
+the baseline sets `PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC=false`.
+
 The aggregate Nginx HTML observer includes exact `GET /tournaments/<slug>`
 records with client statuses from 100 through 599, so failed responses remain
 visible in the request/status and timing summaries. `upstream_statuses` counts
