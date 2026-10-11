@@ -57,6 +57,14 @@ except ImportError:  # The immutable recovery generation runs this file directly
 SCHEMA = 1
 CAPABILITY = "abort_retained_only"
 RECOVER_PENDING_CAPABILITY = "recover_pending"
+QUARANTINE_POPULATED_QUIESCE_CAPABILITY = "quarantine_populated_quiesce"
+PRUNE_TASK_RELEASES_CAPABILITY = "prune_task_releases"
+RECOVERY_CAPABILITIES = [
+    CAPABILITY,
+    RECOVER_PENDING_CAPABILITY,
+    QUARANTINE_POPULATED_QUIESCE_CAPABILITY,
+    PRUNE_TASK_RELEASES_CAPABILITY,
+]
 ENTRYPOINT = "platform_abort_retained_only.sh"
 MEMBER_ROOT = "platform-recovery-bootstrap"
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
@@ -126,6 +134,7 @@ RECOVERY_FILES = (
     "platform_live_qa_guard.py",
     "platform_live_qa_runtime_install.py",
     "platform_recover_pending.sh",
+    "platform_release_retention.py",
 )
 
 
@@ -1363,7 +1372,7 @@ def build_publish_evidence(
     payload: dict[str, object] = {
         "schema": 1 if legacy_publisher else 3,
         "capability": "recovery_bootstrap",
-        "capabilities": [CAPABILITY, RECOVER_PENDING_CAPABILITY],
+        "capabilities": RECOVERY_CAPABILITIES,
         "deployable": False,
         "bundle_name": bundle_name,
         "bundle_sha256": bundle_sha,
@@ -1401,7 +1410,7 @@ def _manifest(
     return {
         "schema": SCHEMA,
         "capability": CAPABILITY,
-        "capabilities": [CAPABILITY, RECOVER_PENDING_CAPABILITY],
+        "capabilities": RECOVERY_CAPABILITIES,
         "entrypoint": ENTRYPOINT,
         "source_sha": source_sha,
         "deployable": False,
@@ -1529,7 +1538,7 @@ def _validate_manifest(
         raise RecoveryBootstrapError("recovery manifest schema is not closed")
     if manifest.get("schema") != SCHEMA or manifest.get("capability") != CAPABILITY or manifest.get("entrypoint") != ENTRYPOINT:
         raise RecoveryBootstrapError("recovery manifest capability is invalid")
-    if manifest.get("capabilities") != [CAPABILITY, RECOVER_PENDING_CAPABILITY]:
+    if manifest.get("capabilities") != RECOVERY_CAPABILITIES:
         raise RecoveryBootstrapError("recovery manifest capabilities are invalid")
     if manifest.get("deployable") is not False:
         raise RecoveryBootstrapError("recovery manifest is deployable")
@@ -2725,7 +2734,7 @@ def _parser() -> argparse.ArgumentParser:
     validate_generation.add_argument("--provenance", type=Path)
     validate_generation.add_argument(
         "--capability",
-        choices=(CAPABILITY, RECOVER_PENDING_CAPABILITY),
+        choices=tuple(RECOVERY_CAPABILITIES),
         default=CAPABILITY,
     )
     install = commands.add_parser("install")
@@ -2736,7 +2745,7 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument("--provenance", type=Path)
     install.add_argument(
         "--capability",
-        choices=(CAPABILITY, RECOVER_PENDING_CAPABILITY),
+        choices=tuple(RECOVERY_CAPABILITIES),
         default=CAPABILITY,
     )
     abort = commands.add_parser("abort_retained_only")
@@ -2841,10 +2850,10 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(provenance, dict):
                 raise RecoveryBootstrapError("recovery provenance is invalid")
             result = build_bundle(args.source_root, source_sha=args.source_sha, provenance=provenance, output=args.output)
-            print(json.dumps({"schema": SCHEMA, "capability": "recovery_bootstrap", "capabilities": [CAPABILITY, RECOVER_PENDING_CAPABILITY], "bundle_sha256": result["bundle_sha256"], "deployable": False}, sort_keys=True))
+            print(json.dumps({"schema": SCHEMA, "capability": "recovery_bootstrap", "capabilities": RECOVERY_CAPABILITIES, "bundle_sha256": result["bundle_sha256"], "deployable": False}, sort_keys=True))
         elif args.command == "validate":
             result = verify_bundle(args.bundle, expected_source_sha=args.source_sha, expected_provenance=expected_provenance)
-            print(json.dumps({"schema": SCHEMA, "capability": "recovery_bootstrap", "capabilities": [CAPABILITY, RECOVER_PENDING_CAPABILITY], "bundle_sha256": result["bundle_sha256"], "deployable": False}, sort_keys=True))
+            print(json.dumps({"schema": SCHEMA, "capability": "recovery_bootstrap", "capabilities": RECOVERY_CAPABILITIES, "bundle_sha256": result["bundle_sha256"], "deployable": False}, sort_keys=True))
         elif args.command == "validate-generation":
             _validate_generation_tree(
                 args.generation,

@@ -42,9 +42,9 @@ cross-checked as an evidence/API pair; it is never inferred from or fabricated
 into the certificate URI.
 
 The host installs one root-owned, immutable, content-addressed generation
-under `shared/.release-recovery/generations/<bundle-sha256>`. Its manifest
-advertises the two closed capabilities `abort_retained_only` and
-`recover_pending`; the fixed abort entrypoint executes only
+under `shared/.release-recovery/generations/<bundle-sha256>`. The initial
+manifest advertised the two closed capabilities `abort_retained_only` and
+`recover_pending`; the superseding decisions below extend that set. The fixed abort entrypoint executes only
 `abort_retained_only`, accepts a v2
 `recovery-restored` install receipt, restores the recorded runtime, verifies
 the retained systemd receipt, and performs two-phase completion: it removes
@@ -122,6 +122,25 @@ partial state or an occupied candidate fail before any systemd call. This is
 separate from the operation-less `recovery-restored` receipt-owned cleanup
 bridge.
 
+## Superseding decision: populated v2 quiesce candidates
+
+The empty-only `recover_pending` and `abort-quiesce` contracts remain
+unchanged. A separate signed `quarantine_populated_quiesce` capability handles
+only a populated v2 `install`/`quiesce-pending` candidate after the recovery
+workflow validates the exact failed deployment run, attempt, workflow, ref,
+source and failed job, then derives the candidate slug from that tuple. Under
+the release lock, it binds the pending-receipt digest and pointer identities
+and atomically moves the candidate to same-filesystem private quarantine with
+no-replace semantics. A bounded no-follow tree digest records custody only:
+the tree remains untrusted evidence, is never executed or deleted, and is not
+claimed equivalent to the signed release artifact. Recovery restores and
+verifies the recorded service/timer snapshot before consuming only the exact
+pending receipt. Any mismatch retains the receipt and candidate bytes.
+Quarantine does not reclaim storage; later retention uses a separate signed
+capability with an exact derived candidate set and explicit protected release
+slugs, while preserving current/previous releases, host-tools generations and
+backups.
+
 When both pointers were absent before that receipt, the only accepted
 compatibility snapshot is fully inactive and disabled (version 2) or fully
 inactive with no enablement fields (version 1). That proof is a no-op: the
@@ -154,8 +173,23 @@ Readiness after service restoration shares one 30-second monotonic budget across
 the snapshot-active API and web endpoints. Bounded retries tolerate ordinary
 startup settling without accepting late success; expiry leaves the receipt and
 candidate for retry. Failed immutable children add only a fixed stage, outcome,
-and shell-equivalent exit status to stderr; the existing public failure marker
-stays unchanged and child arguments/output remain suppressed.
+and shell-equivalent exit status to private stderr; for candidate-install
+failures the supervisor may project one complete, exact-slug-bound fixed enum
+record into the closed public marker. Missing, malformed, duplicate, truncated
+or mismatched records remain `unknown`; child arguments and raw output stay
+private.
+
+The signed recovery generation also exposes `prune_task_releases` as a
+separate operator action. It accepts only bounded canonical slug lists: the
+complete expected deletion set and a disjoint protected set from the reviewed
+read-only inventory. The signed action fixes `keep=2`; the helper default is
+unchanged. The pinned retention helper replans under the canonical release
+lock and retained-load lock, then requires exact equality with the entire
+candidate set before unlinking. Every noncandidate release must be included in
+the explicit protected set. The wrapper then verifies all expected candidates
+are absent, every protected release still exists, current/previous pointers
+are unchanged, and runtime health remains good. This capability cannot alter
+backup or recovery-generation retention and does not lower the storage floor.
 
 The mutable systemd installer follows the same durable-boundary rule for
 retired unit files. Before its first stop/disable it records exact source and

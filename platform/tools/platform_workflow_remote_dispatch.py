@@ -307,7 +307,17 @@ RELEASE_MARKER_RE = re.compile(
     rb"validation_failed|provenance_invalid|candidate_missing|"
     rb"activation_failed|lock_lost|runtime_profile_failed|baseline_changed)"
     rb"(?: lock_stage=(?P<lock_stage>helper_metadata|release_supervise|"
-    rb"release_open|retained_supervise|retained_open))?)? "
+    rb"release_open|retained_supervise|retained_open))?"
+    rb"(?: candidate_diag_state=(?P<candidate_diag_state>classified|unknown)"
+    rb" candidate_diag_reason=(?P<candidate_diag_reason>matched|missing|malformed|"
+    rb"duplicate|truncated|capture_incomplete|status_mismatch)"
+    rb" candidate_class=(?P<candidate_class>argument|privilege|artifact|checksum|"
+    rb"environment|layout|production_guard|pending_operation|duplicate|pointer|"
+    rb"cleanup|liveqa_runtime_recovery|recovery|venv_policy|venv|rollback_metadata|"
+    rb"wheelhouse|liveqa_runtime|unknown)"
+    rb" candidate_stage=(?P<candidate_stage>artifact_validation|wheelhouse_validation|"
+    rb"disk_guard|environment_prepare|venv_setup|transaction_stage|runtime_prepare|unknown)"
+    rb" candidate_exit_status=(?P<candidate_exit_status>0|[1-9][0-9]{0,2}))?)? "
     rb"release_slug=(?P<release_slug>[A-Za-z0-9][A-Za-z0-9._-]{0,179}) "
     rb"source_sha=(?P<source_sha>[0-9a-f]{40,64})\n\Z"
 )
@@ -1521,6 +1531,47 @@ def _release_marker_is_valid(
     phase = match.group("phase")
     reason = match.group("reason")
     lock_stage = match.group("lock_stage")
+    candidate_diag_state = match.group("candidate_diag_state")
+    candidate_diag_reason = match.group("candidate_diag_reason")
+    candidate_class = match.group("candidate_class")
+    candidate_stage = match.group("candidate_stage")
+    candidate_exit_status = match.group("candidate_exit_status")
+    candidate_fields = (
+        candidate_diag_state,
+        candidate_diag_reason,
+        candidate_class,
+        candidate_stage,
+        candidate_exit_status,
+    )
+    has_candidate_fields = any(value is not None for value in candidate_fields)
+    if has_candidate_fields:
+        if (
+            any(value is None for value in candidate_fields)
+            or status != "failed"
+            or marker_class != "deployment"
+            or phase is None
+            or phase.decode("ascii") != "candidate"
+            or reason is None
+            or reason.decode("ascii") != "activation_failed"
+            or child_status == 0
+        ):
+            return False
+        try:
+            candidate_status = int(candidate_exit_status)
+        except (TypeError, ValueError):
+            return False
+        if candidate_status < 0 or candidate_status > 255:
+            return False
+        if candidate_diag_state == b"classified":
+            if candidate_diag_reason != b"matched" or candidate_status == 0:
+                return False
+        elif (
+            candidate_diag_state != b"unknown"
+            or candidate_diag_reason == b"matched"
+            or candidate_class != b"unknown"
+            or candidate_stage != b"unknown"
+        ):
+            return False
     if status == "passed":
         expected_class = "preflight" if mode == "preflight" else "deployment"
         return (

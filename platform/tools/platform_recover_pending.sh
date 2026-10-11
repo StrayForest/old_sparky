@@ -12,6 +12,14 @@ NGINX_TIMEOUT_BIN="/usr/bin/timeout"
 NGINX_CONFIG_TIMEOUT_SECONDS=30
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
+RECOVERY_ACTION="recover_pending"
+FAILED_DEPLOY_RUN_ID=""
+FAILED_DEPLOY_RUN_ATTEMPT=""
+FAILED_DEPLOY_SOURCE_SHA=""
+RECOVERY_RUN_ID=""
+RECOVERY_RUN_ATTEMPT=""
+EXPECTED_CANDIDATES=()
+PROTECTED_RELEASES=()
 
 public_status() {
   local status="$1" class="${2:-recovery}"
@@ -21,9 +29,41 @@ public_status() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --action)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      RECOVERY_ACTION="$2"; shift 2
+      ;;
     --app-dir)
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       APP_DIR="$2"; shift 2
+      ;;
+    --failed-deploy-run-id)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      FAILED_DEPLOY_RUN_ID="$2"; shift 2
+      ;;
+    --failed-deploy-run-attempt)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      FAILED_DEPLOY_RUN_ATTEMPT="$2"; shift 2
+      ;;
+    --failed-deploy-source-sha)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      FAILED_DEPLOY_SOURCE_SHA="$2"; shift 2
+      ;;
+    --recovery-run-id)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      RECOVERY_RUN_ID="$2"; shift 2
+      ;;
+    --recovery-run-attempt)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      RECOVERY_RUN_ATTEMPT="$2"; shift 2
+      ;;
+    --expected-candidate)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      EXPECTED_CANDIDATES+=("$2"); shift 2
+      ;;
+    --protected-release)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      PROTECTED_RELEASES+=("$2"); shift 2
       ;;
     --systemctl)
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
@@ -32,12 +72,40 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       cat <<'EOF'
 Usage: platform_recover_pending.sh --app-dir <path> [--systemctl <absolute-path>]
+       platform_recover_pending.sh --action quarantine-populated-quiesce
+         --failed-deploy-run-id <id> --failed-deploy-run-attempt <attempt>
+         --failed-deploy-source-sha <sha> --recovery-run-id <id>
+         --recovery-run-attempt <attempt> --app-dir <path>
+       platform_recover_pending.sh --action prune-task-releases
+         --expected-candidate <slug>... --protected-release <slug>...
 EOF
       exit 0
       ;;
     *) public_status failed argument >&2; exit 1 ;;
   esac
 done
+
+case "$RECOVERY_ACTION" in
+  recover_pending) RECOVERY_CAPABILITY="recover_pending" ;;
+  quarantine-populated-quiesce)
+    RECOVERY_CAPABILITY="quarantine_populated_quiesce"
+    [[ "$FAILED_DEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+      && "$FAILED_DEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ \
+      && "$FAILED_DEPLOY_SOURCE_SHA" =~ ^[0-9a-f]{40}$ \
+      && "$RECOVERY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+      && "$RECOVERY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] \
+      || { public_status failed argument >&2; exit 1; }
+    ;;
+  prune-task-releases)
+    RECOVERY_CAPABILITY="prune_task_releases"
+    [[ -z "$FAILED_DEPLOY_RUN_ID$FAILED_DEPLOY_RUN_ATTEMPT$FAILED_DEPLOY_SOURCE_SHA" \
+      && -z "$RECOVERY_RUN_ID$RECOVERY_RUN_ATTEMPT" \
+      && ${#EXPECTED_CANDIDATES[@]} -ge 1 && ${#EXPECTED_CANDIDATES[@]} -le 32 \
+      && ${#PROTECTED_RELEASES[@]} -ge 11 && ${#PROTECTED_RELEASES[@]} -le 32 ]] \
+      || { public_status failed argument >&2; exit 1; }
+    ;;
+  *) public_status failed argument >&2; exit 1 ;;
+esac
 
 [[ "$EUID" -eq 0 ]] || { public_status failed privilege >&2; exit 1; }
 [[ "$APP_DIR" == /* && "$APP_DIR" != "/" ]] || { public_status failed argument >&2; exit 1; }
@@ -81,11 +149,131 @@ validate_generation_helper platform_release_lock.sh 555
 validate_generation_helper platform_release_restore_runtime.sh 555
 validate_generation_helper platform_release_systemd_state.py 444
 validate_generation_helper platform_release_transaction.py 444
+validate_generation_helper platform_release_retention.py 555
 /usr/bin/python3 -I -B "$TOOLS_DIR/platform_recovery_bootstrap.py" \
   validate-generation --generation "$TOOLS_DIR" --bundle-sha "$GENERATION_SHA" \
-  --capability recover_pending \
+  --capability "$RECOVERY_CAPABILITY" \
   >/dev/null 2>/dev/null \
   || { public_status failed generation >&2; exit 1; }
+
+if [[ "$RECOVERY_ACTION" == "prune-task-releases" ]]; then
+  [[ "$APP_DIR" == "/opt/oldsparky/platform" ]] \
+    || { public_status failed argument >&2; exit 1; }
+  declare -A expected_seen=() protected_seen=()
+  for slug in "${EXPECTED_CANDIDATES[@]}"; do
+    [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] \
+      || { public_status failed argument >&2; exit 1; }
+    [[ -z "${expected_seen[$slug]:-}" ]] \
+      || { public_status failed argument >&2; exit 1; }
+    expected_seen["$slug"]=1
+  done
+  for slug in "${PROTECTED_RELEASES[@]}"; do
+    [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] \
+      || { public_status failed argument >&2; exit 1; }
+    [[ -z "${protected_seen[$slug]:-}" ]] \
+      || { public_status failed argument >&2; exit 1; }
+    protected_seen["$slug"]=1
+  done
+  for slug in "${EXPECTED_CANDIDATES[@]}"; do
+    [[ -z "${protected_seen[$slug]:-}" ]] \
+      || { public_status failed argument >&2; exit 1; }
+  done
+  [[ ! -e "$APP_DIR/shared/.release-operation.json" \
+    && ! -L "$APP_DIR/shared/.release-operation.json" \
+    && ! -e "$APP_DIR/shared/.release-quiesce.json" \
+    && ! -L "$APP_DIR/shared/.release-quiesce.json" \
+    && ! -e "$APP_DIR/shared/.release-systemd-state.json" \
+    && ! -L "$APP_DIR/shared/.release-systemd-state.json" ]] \
+    || { public_status failed transaction >&2; exit 1; }
+  [[ -L "$APP_DIR/current" && -L "$APP_DIR/previous" ]] \
+    || { public_status failed topology >&2; exit 1; }
+  current_before="$(readlink -f -- "$APP_DIR/current")" \
+    || { public_status failed topology >&2; exit 1; }
+  previous_before="$(readlink -f -- "$APP_DIR/previous")" \
+    || { public_status failed topology >&2; exit 1; }
+  [[ "$(dirname -- "$current_before")" == "$APP_DIR/releases" \
+    && "$(dirname -- "$previous_before")" == "$APP_DIR/releases" ]] \
+    || { public_status failed topology >&2; exit 1; }
+  current_slug="${current_before##*/}"
+  previous_slug="${previous_before##*/}"
+  [[ -n "${protected_seen[$current_slug]:-}" \
+    && -n "${protected_seen[$previous_slug]:-}" ]] \
+    || { public_status failed argument >&2; exit 1; }
+  for slug in "${PROTECTED_RELEASES[@]}"; do
+    [[ -d "$APP_DIR/releases/$slug" && ! -L "$APP_DIR/releases/$slug" ]] \
+      || { public_status failed topology >&2; exit 1; }
+  done
+  for service in deadlock-api deadlock-worker deadlock-web; do
+    run_systemctl is-active --quiet "$service" \
+      || { public_status failed service_state >&2; exit 1; }
+  done
+  run_nginx_config_test || { public_status failed nginx >&2; exit 1; }
+  /usr/bin/curl --fail --silent --show-error --max-time 5 \
+    http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null \
+    || { public_status failed service_state >&2; exit 1; }
+  /usr/bin/curl --fail --silent --show-error --max-time 5 \
+    http://127.0.0.1:3000/ >/dev/null 2>/dev/null \
+    || { public_status failed service_state >&2; exit 1; }
+  retention_args=(
+    --app-dir "$APP_DIR" --keep 2 --min-age-days 0 --apply --json-receipt
+  )
+  for slug in "${EXPECTED_CANDIDATES[@]}"; do
+    retention_args+=(--expected-candidate "$slug")
+  done
+  for slug in "${PROTECTED_RELEASES[@]}"; do
+    retention_args+=(--protected-release "$slug")
+  done
+  retention_result="$(/usr/bin/python3 -I -B "$TOOLS_DIR/platform_release_retention.py" \
+    "${retention_args[@]}" 2>/dev/null)" \
+    || { public_status failed retention >&2; exit 1; }
+  retention_counts="$(/usr/bin/python3 -I -B - "$retention_result" "${#EXPECTED_CANDIDATES[@]}" <<'PY'
+import json
+import sys
+try:
+    value = json.loads(sys.argv[1])
+except (TypeError, ValueError):
+    raise SystemExit(1)
+expected = int(sys.argv[2])
+keys = {"schema", "status", "candidate_count", "deleted_count", "reclaimed_bytes"}
+if (
+    not isinstance(value, dict) or set(value) != keys
+    or type(value.get("schema")) is not int or value["schema"] != 1
+    or value.get("status") != "passed"
+    or type(value.get("candidate_count")) is not int or value["candidate_count"] != expected
+    or type(value.get("deleted_count")) is not int or value["deleted_count"] != expected
+    or type(value.get("reclaimed_bytes")) is not int or value["reclaimed_bytes"] < 0
+):
+    raise SystemExit(1)
+print(f"{value['candidate_count']}\t{value['deleted_count']}\t{value['reclaimed_bytes']}")
+PY
+)" || { public_status failed retention >&2; exit 1; }
+  IFS=$'\t' read -r retention_candidates retention_deleted retention_bytes <<<"$retention_counts"
+  for slug in "${EXPECTED_CANDIDATES[@]}"; do
+    [[ ! -e "$APP_DIR/releases/$slug" && ! -L "$APP_DIR/releases/$slug" ]] \
+      || { public_status failed retention >&2; exit 1; }
+  done
+  for slug in "${PROTECTED_RELEASES[@]}"; do
+    [[ -d "$APP_DIR/releases/$slug" && ! -L "$APP_DIR/releases/$slug" ]] \
+      || { public_status failed retention >&2; exit 1; }
+  done
+  [[ "$(readlink -f -- "$APP_DIR/current")" == "$current_before" \
+    && "$(readlink -f -- "$APP_DIR/previous")" == "$previous_before" ]] \
+    || { public_status failed topology >&2; exit 1; }
+  for service in deadlock-api deadlock-worker deadlock-web; do
+    run_systemctl is-active --quiet "$service" \
+      || { public_status failed service_state >&2; exit 1; }
+  done
+  /usr/bin/curl --fail --silent --show-error --max-time 5 \
+    http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null \
+    || { public_status failed service_state >&2; exit 1; }
+  /usr/bin/curl --fail --silent --show-error --max-time 5 \
+    http://127.0.0.1:3000/ >/dev/null 2>/dev/null \
+    || { public_status failed service_state >&2; exit 1; }
+  printf 'PLATFORM_RETENTION schema=1 status=passed candidate_count=%s deleted_count=%s reclaimed_bytes=%s\n' \
+    "$retention_candidates" "$retention_deleted" "$retention_bytes"
+  public_status passed recovery
+  exit 0
+fi
 
 # This immutable wrapper owns lock/transaction/systemd/restore orchestration.
 # It is intentionally separate from the abort-retained-only entrypoint.
@@ -111,9 +299,148 @@ SYSTEMD_STATE="$APP_DIR/shared/.release-systemd-state.json"
 TRANSACTION_TOOL="$TOOLS_DIR/platform_release_transaction.py"
 SYSTEMD_STATE_TOOL="$TOOLS_DIR/platform_release_systemd_state.py"
 RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"
-test -f "$STATE" && test ! -L "$STATE" \
-  && test "$(stat -c '%u:%h:%a' "$STATE" 2>/dev/null)" = "0:1:600" \
-  || { public_status failed transaction >&2; exit 1; }
+if [[ -e "$STATE" || -L "$STATE" ]]; then
+  test -f "$STATE" && test ! -L "$STATE" \
+    && test "$(stat -c '%u:%h:%a' "$STATE" 2>/dev/null)" = "0:1:600" \
+    || { public_status failed transaction >&2; exit 1; }
+elif [[ "$RECOVERY_ACTION" != "quarantine-populated-quiesce" ]]; then
+  public_status failed transaction >&2
+  exit 1
+fi
+
+if [[ "$RECOVERY_ACTION" == "quarantine-populated-quiesce" ]]; then
+  PUBLIC_RELEASE_SLUG="gha-${FAILED_DEPLOY_RUN_ID}-${FAILED_DEPLOY_RUN_ATTEMPT}-${FAILED_DEPLOY_SOURCE_SHA:0:12}"
+  PUBLIC_SOURCE_SHA="$FAILED_DEPLOY_SOURCE_SHA"
+  bundle_sha="$GENERATION_SHA"
+  quarantine_args=(
+    --state "$STATE"
+    --failed-deploy-run-id "$FAILED_DEPLOY_RUN_ID"
+    --failed-deploy-run-attempt "$FAILED_DEPLOY_RUN_ATTEMPT"
+    --failed-deploy-source-sha "$FAILED_DEPLOY_SOURCE_SHA"
+    --recovery-run-id "$RECOVERY_RUN_ID"
+    --recovery-run-attempt "$RECOVERY_RUN_ATTEMPT"
+    --bundle-sha "$bundle_sha"
+  )
+  if [[ ! -e "$STATE" && ! -L "$STATE" ]]; then
+    resume_snapshot="$(/usr/bin/python3 -I "$TRANSACTION_TOOL" inspect-quarantined-quiesce \
+      "${quarantine_args[@]}" 2>/dev/null)" \
+      || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=resume_inspect\n' >&2; public_status failed transaction >&2; exit 1; }
+    resume_phase="$(json_field phase <<<"$resume_snapshot")"
+    [[ "$resume_phase" == services_restored || "$resume_phase" == receipt_consumed ]] \
+      || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=resume_phase\n' >&2; public_status failed transaction >&2; exit 1; }
+    run_nginx_config_test \
+      || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=resume_nginx_validation\n' >&2; public_status failed nginx >&2; exit 1; }
+    while IFS=$'\t' read -r unit expected_active expected_enabled; do
+      [[ -n "$unit" ]] || continue
+      actual=""; status=0
+      if actual="$(run_systemctl is-active "$unit" 2>/dev/null)"; then status=0; else status="$?"; fi
+      if [[ "$expected_active" == active ]]; then
+        [[ "$status:$actual" == 0:active ]] || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=resume_service_state\n' >&2; public_status failed service_state >&2; exit 1; }
+      else
+        [[ "$status:$actual" == 3:inactive ]] || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=resume_service_state\n' >&2; public_status failed service_state >&2; exit 1; }
+      fi
+      actual=""; status=0
+      if actual="$(run_systemctl is-enabled "$unit" 2>/dev/null)"; then status=0; else status="$?"; fi
+      [[ "$actual" == "$expected_enabled" && ( "$status" == 0 || "$status" == 1 ) ]] \
+        || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=resume_service_enabled\n' >&2; public_status failed service_state >&2; exit 1; }
+    done < <(/usr/bin/python3 -I - "$resume_snapshot" <<'PY'
+import json
+import sys
+value = json.loads(sys.argv[1])
+for unit, active in value["service_state_before"].items():
+    print(f"{unit}.service\t{active}\t{value['service_enabled_before'][unit]}")
+print(f"deadlock-cloudflare-ips.timer\t{'active' if value['timer_active_before'] else 'inactive'}\t{value['timer_enabled_before']}")
+PY
+    )
+    if [[ "$(json_field api <<<"$resume_snapshot")" == active ]]; then
+      /usr/bin/curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null \
+        || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=resume_api_readiness\n' >&2; public_status failed readiness >&2; exit 1; }
+    fi
+    if [[ "$(json_field web <<<"$resume_snapshot")" == active ]]; then
+      /usr/bin/curl --fail --silent --show-error --max-time 5 http://127.0.0.1:3000/ >/dev/null 2>/dev/null \
+        || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=resume_web_readiness\n' >&2; public_status failed readiness >&2; exit 1; }
+    fi
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" consume-quarantined-quiesce \
+      "${quarantine_args[@]}" >/dev/null 2>/dev/null \
+      || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=resume_consume\n' >&2; public_status failed transaction >&2; exit 1; }
+    printf 'RECOVERY_QUARANTINE schema=1 status=passed phase=receipt_consumed\n'
+    PUBLIC_RELEASE_SLUG="gha-${FAILED_DEPLOY_RUN_ID}-${FAILED_DEPLOY_RUN_ATTEMPT}-${FAILED_DEPLOY_SOURCE_SHA:0:12}"
+    PUBLIC_SOURCE_SHA="$FAILED_DEPLOY_SOURCE_SHA"
+    public_status passed recovery
+    exit 0
+  fi
+  quarantine_result="$(/usr/bin/python3 -I "$TRANSACTION_TOOL" quarantine-populated-quiesce \
+    "${quarantine_args[@]}" 2>/dev/null)" \
+    || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=quarantine\n' >&2; public_status failed transaction >&2; exit 1; }
+  quarantine_phase="$(json_field phase <<<"$quarantine_result")"
+  if [[ "$quarantine_phase" == quarantined ]]; then
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" restore-quiesce \
+      --state "$STATE" --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
+      || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=service_restore\n' >&2; public_status failed service_state >&2; exit 1; }
+  elif [[ "$quarantine_phase" != services_restored ]]; then
+    printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=quarantine_phase\n' >&2
+    public_status failed transaction >&2
+    exit 1
+  fi
+  run_nginx_config_test \
+    || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=nginx_validation\n' >&2; public_status failed nginx >&2; exit 1; }
+  service_state="$({ /usr/bin/python3 -I - "$STATE" <<'PY'
+import json
+import sys
+from pathlib import Path
+record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+for key in ("service_state_before", "timer_active_before"):
+    print(json.dumps(record[key], sort_keys=True, separators=(",", ":")))
+PY
+  } 2>/dev/null)" \
+    || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=snapshot\n' >&2; public_status failed transaction >&2; exit 1; }
+  mapfile -t expected_states <<<"$service_state"
+  api_expected="$(/usr/bin/python3 -I -c 'import json,sys; print(json.loads(sys.stdin.read())["deadlock-api"])' <<<"${expected_states[0]}")"
+  web_expected="$(/usr/bin/python3 -I -c 'import json,sys; print(json.loads(sys.stdin.read())["deadlock-web"])' <<<"${expected_states[0]}")"
+  timer_expected="$(/usr/bin/python3 -I -c 'import json,sys; print("active" if json.loads(sys.stdin.read()) else "inactive")' <<<"${expected_states[1]}")"
+  for unit in deadlock-api.service deadlock-worker.service deadlock-web.service; do
+    actual=""
+    status=0
+    if actual="$(run_systemctl is-active "$unit" 2>/dev/null)"; then status=0; else status="$?"; fi
+    case "$status:$actual" in 0:active|3:inactive) ;; *) printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=service_verify\n' >&2; public_status failed service_state >&2; exit 1 ;; esac
+  done
+  if [[ "$api_expected" == active ]]; then
+    ready=0
+    for attempt in {1..30}; do
+      if /usr/bin/curl --fail --silent --show-error --max-time 5 \
+        http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null; then ready=1; break; fi
+      sleep 1
+    done
+    [[ "$ready" == 1 ]] || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=api_readiness\n' >&2; public_status failed readiness >&2; exit 1; }
+  fi
+  if [[ "$web_expected" == active ]]; then
+    ready=0
+    for attempt in {1..30}; do
+      if /usr/bin/curl --fail --silent --show-error --max-time 5 \
+        http://127.0.0.1:3000/ >/dev/null 2>/dev/null; then ready=1; break; fi
+      sleep 1
+    done
+    [[ "$ready" == 1 ]] || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=web_readiness\n' >&2; public_status failed readiness >&2; exit 1; }
+  fi
+  timer_actual=""
+  timer_status=0
+  if timer_actual="$(run_systemctl is-active deadlock-cloudflare-ips.timer 2>/dev/null)"; then timer_status=0; else timer_status="$?"; fi
+  if [[ "$timer_expected:$timer_status:$timer_actual" != active:0:active \
+    && "$timer_expected:$timer_status:$timer_actual" != inactive:3:inactive ]]; then
+    printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=timer_verify\n' >&2
+    public_status failed service_state >&2
+    exit 1
+  fi
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" mark-quarantine-services-restored \
+    "${quarantine_args[@]}" >/dev/null 2>/dev/null \
+    || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=receipt_update\n' >&2; public_status failed transaction >&2; exit 1; }
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" consume-quarantined-quiesce \
+    "${quarantine_args[@]}" >/dev/null 2>/dev/null \
+    || { printf 'RECOVERY_QUARANTINE schema=1 status=failed stage=receipt_consume\n' >&2; public_status failed transaction >&2; exit 1; }
+  printf 'RECOVERY_QUARANTINE schema=1 status=passed phase=receipt_consumed\n'
+  public_status passed recovery
+  exit 0
+fi
 
 pending_operation="$({
   /usr/bin/python3 -I - "$STATE" <<'PY'

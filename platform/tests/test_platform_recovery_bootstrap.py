@@ -1014,6 +1014,14 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn('! -L "$APP_DIR/shared/.release-quiesce.json"', retention_wrapper)
         self.assertIn('! -e "$APP_DIR/shared/.release-systemd-state.json"', retention_wrapper)
         self.assertIn('! -L "$APP_DIR/shared/.release-systemd-state.json"', retention_wrapper)
+        self.assertIn(
+            '--app-dir "$APP_DIR" --keep 2 --min-age-days 0 --apply --json-receipt',
+            retention_wrapper,
+        )
+        retention_arg_parser = retention_wrapper.split(
+            'while [[ $# -gt 0 ]]; do', 1
+        )[1].split('\ndone', 1)[0]
+        self.assertNotRegex(retention_arg_parser, r"--(?:keep|min-age-days)(?:\s|\\)")
         self.assertIn("--json-receipt", retention_wrapper)
         self.assertIn('"candidate_count", "deleted_count", "reclaimed_bytes"', retention_wrapper)
         self.assertIn("security_run_id", release_recover)

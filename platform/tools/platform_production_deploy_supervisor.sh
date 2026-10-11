@@ -59,6 +59,11 @@ failure_class="preflight"
 failure_phase="preflight"
 failure_reason="internal"
 failure_lock_stage=""
+candidate_diag_state=""
+candidate_diag_reason=""
+candidate_install_class=""
+candidate_install_stage=""
+candidate_install_exit_status=""
 
 set_failure_context() {
   failure_class="$1"
@@ -111,13 +116,17 @@ service_is_active() {
 }
 
 emit_failure_marker() {
+  local marker="RELEASE_DEPLOY schema=1 status=failed class=$failure_class phase=$failure_phase reason=$failure_reason"
   if [[ -n "$failure_lock_stage" ]]; then
-    printf 'RELEASE_DEPLOY schema=1 status=failed class=%s phase=%s reason=%s lock_stage=%s release_slug=%s source_sha=%s\n' \
-      "$failure_class" "$failure_phase" "$failure_reason" "$failure_lock_stage" "$release_slug" "$target_sha"
-  else
-    printf 'RELEASE_DEPLOY schema=1 status=failed class=%s phase=%s reason=%s release_slug=%s source_sha=%s\n' \
-      "$failure_class" "$failure_phase" "$failure_reason" "$release_slug" "$target_sha"
+    marker+=" lock_stage=$failure_lock_stage"
   fi
+  if [[ "$failure_class:$failure_phase:$failure_reason" == "deployment:candidate:activation_failed" \
+    && -n "$candidate_diag_state" ]]; then
+    marker+=" candidate_diag_state=$candidate_diag_state candidate_diag_reason=$candidate_diag_reason"
+    marker+=" candidate_class=$candidate_install_class candidate_stage=$candidate_install_stage"
+    marker+=" candidate_exit_status=$candidate_install_exit_status"
+  fi
+  printf '%s release_slug=%s source_sha=%s\n' "$marker" "$release_slug" "$target_sha"
 }
 
 fail() {
@@ -714,6 +723,7 @@ termination_grace_seconds = 2.0
 run_name = f"{run_id}-{attempt}"
 file_names = ("candidate.stdout", "candidate.stderr", "candidate.json")
 opened_files = {}
+stderr_scan = bytearray()
 created_run = False
 root_fd = run_fd = var_tmp_fd = None
 capture_state = "setup_failed"
@@ -820,6 +830,8 @@ def drain_once(timeout):
             stderr_observed = min(capture_limit + 1, stderr_observed + len(chunk))
             stored = stderr_stored
         accepted = chunk[: max(0, capture_limit - stored)]
+        if channel == "stderr" and accepted:
+            stderr_scan.extend(accepted)
         if accepted and not write_failed:
             try:
                 write_all(opened_files[name], accepted)
@@ -1082,6 +1094,54 @@ finally:
         capture_state = "write_failed"
     if read_failed and capture_state in ("complete", "truncated"):
         capture_state = "read_failed"
+    install_diag_state = "unknown"
+    install_diag_reason = "missing"
+    install_diag_class = "unknown"
+    install_diag_stage = "unknown"
+    install_diag_exit = "none"
+    install_classes = (
+        b"argument|privilege|artifact|checksum|environment|layout|production_guard|"
+        b"pending_operation|duplicate|pointer|cleanup|liveqa_runtime_recovery|"
+        b"recovery|venv_policy|venv|rollback_metadata|wheelhouse|liveqa_runtime|unknown"
+    )
+    install_stages = (
+        b"artifact_validation|wheelhouse_validation|disk_guard|environment_prepare|"
+        b"venv_setup|transaction_stage|runtime_prepare|unknown"
+    )
+    install_diag_pattern = re.compile(
+        rb"RELEASE_INSTALL_DIAG schema=1 status=failed class=(?P<class>" + install_classes + rb") "
+        rb"stage=(?P<stage>" + install_stages + rb") "
+        rb"exit_status=(?P<status>[1-9][0-9]{0,2}) "
+        rb"release_slug=(?P<slug>[A-Za-z0-9][A-Za-z0-9._-]{0,179})\n"
+    )
+    marker_lines = [
+        line for line in stderr_scan.splitlines(keepends=True)
+        if line.startswith(b"RELEASE_INSTALL_DIAG ")
+    ]
+    if stderr_observed > capture_limit or capture_state == "truncated":
+        install_diag_reason = "truncated"
+    elif capture_state != "complete":
+        install_diag_reason = "capture_incomplete"
+    elif len(marker_lines) > 1:
+        install_diag_reason = "duplicate"
+    elif not marker_lines:
+        install_diag_reason = "missing"
+    elif exit_status is None:
+        install_diag_reason = "capture_incomplete"
+    else:
+        marker_match = install_diag_pattern.fullmatch(marker_lines[0])
+        if marker_match is None:
+            install_diag_reason = "malformed"
+        elif marker_match.group("slug").decode("ascii") != release_slug:
+            install_diag_reason = "malformed"
+        elif int(marker_match.group("status")) != exit_status:
+            install_diag_reason = "status_mismatch"
+        else:
+            install_diag_state = "classified"
+            install_diag_reason = "matched"
+            install_diag_class = marker_match.group("class").decode("ascii")
+            install_diag_stage = marker_match.group("stage").decode("ascii")
+            install_diag_exit = marker_match.group("status").decode("ascii")
     metadata = {
         "schema": 1,
         "source_sha": source_sha,
@@ -1151,21 +1211,46 @@ finally:
 
 print(
     f"candidate_status={exit_status if exit_status is not None else 'none'} "
-    f"capture_state={capture_state}"
+    f"capture_state={capture_state} install_diag_state={install_diag_state} "
+    f"install_diag_reason={install_diag_reason} install_class={install_diag_class} "
+    f"install_stage={install_diag_stage} install_exit={install_diag_exit}"
 )
 PY
   2>/dev/null
 )"; then
-  if [[ "$candidate_result" =~ ^candidate_status=(none|0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])\ capture_state=(complete|truncated|write_failed|read_failed|inherited_pipe_open|descendant_processes_open|metadata_failed|cleanup_failed|cleanup_unreaped|spawn_failed|setup_failed|timeout|interrupted)$ ]]; then
-    candidate_status="${BASH_REMATCH[1]}"
-    candidate_capture_state="${BASH_REMATCH[2]}"
+if [[ "$candidate_result" =~ ^candidate_status=(none|0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])\ capture_state=(complete|truncated|write_failed|read_failed|inherited_pipe_open|descendant_processes_open|metadata_failed|cleanup_failed|cleanup_unreaped|spawn_failed|setup_failed|timeout|interrupted)\ install_diag_state=(classified|unknown)\ install_diag_reason=(matched|missing|malformed|duplicate|truncated|capture_incomplete|status_mismatch)\ install_class=(argument|privilege|artifact|checksum|environment|layout|production_guard|pending_operation|duplicate|pointer|cleanup|liveqa_runtime_recovery|recovery|venv_policy|venv|rollback_metadata|wheelhouse|liveqa_runtime|unknown)\ install_stage=(artifact_validation|wheelhouse_validation|disk_guard|environment_prepare|venv_setup|transaction_stage|runtime_prepare|unknown)\ install_exit=(none|[1-9][0-9]{0,2})$ ]]; then
+  candidate_status="${BASH_REMATCH[1]}"
+  candidate_capture_state="${BASH_REMATCH[2]}"
+  install_diag_state="${BASH_REMATCH[3]}"
+  install_diag_reason="${BASH_REMATCH[4]}"
+  install_class="${BASH_REMATCH[5]}"
+  install_stage="${BASH_REMATCH[6]}"
+  install_exit="${BASH_REMATCH[7]}"
+  if [[ "$install_diag_state" == "classified" ]]; then
+    [[ "$install_diag_reason" == "matched" && "$install_exit" == "$candidate_status" ]] || {
+      set_failure_context preflight preflight internal
+      fail "candidate diagnostic result is inconsistent"
+    }
   else
+    [[ "$install_diag_reason" != "matched" && "$install_class:$install_stage:$install_exit" == "unknown:unknown:none" ]] || {
+      set_failure_context preflight preflight internal
+      fail "candidate diagnostic result is inconsistent"
+    }
+  fi
+else
     set_failure_context preflight preflight internal
     fail "candidate diagnostic result is invalid"
   fi
 else
   set_failure_context preflight preflight internal
   fail "candidate diagnostic capture could not be started"
+fi
+if [[ "$candidate_status" != "none" && "$candidate_status" != "0" ]]; then
+  candidate_diag_state="$install_diag_state"
+  candidate_diag_reason="$install_diag_reason"
+  candidate_install_class="$install_class"
+  candidate_install_stage="$install_stage"
+  candidate_install_exit_status="$candidate_status"
 fi
 if [[ "$candidate_capture_state" == setup_failed ]]; then
   set_failure_context preflight preflight internal

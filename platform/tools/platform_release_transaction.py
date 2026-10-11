@@ -40,6 +40,10 @@ except ImportError:  # The immutable recovery generation runs this file directly
 STATE_NAME = ".release-operation.json"
 SYSTEMD_STATE_NAME = ".release-systemd-state.json"
 QUIESCE_STATE_NAME = ".release-quiesce.json"
+QUARANTINE_DIR_NAME = ".release-quarantine"
+QUARANTINE_RECEIPT_SCHEMA = 1
+QUARANTINE_MAX_ENTRIES = 100_000
+QUARANTINE_MAX_BYTES = 8 * 1024 * 1024 * 1024
 STATE_VERSION = 2
 # Version 1 is the narrow operation-less receipt written before the installer
 # transaction exists.  It predates enabled-state capture and is retained only
@@ -497,6 +501,141 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _quarantine_tree_snapshot(root: Path) -> tuple[str, int, int, int]:
+    """Hash a bounded, no-follow release tree without treating it as trusted."""
+    root_meta = _safe_directory(root, label="candidate release")
+    if root_meta.st_gid != 0:
+        raise TransactionError("candidate release group ownership is unsafe")
+    rows: list[tuple[bytes, bytes]] = [
+        (
+            b"",
+            json.dumps(
+                ["", "directory", stat.S_IMODE(root_meta.st_mode), root_meta.st_uid, root_meta.st_gid],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("ascii"),
+        )
+    ]
+    pending = [root]
+    file_count = directory_count = total_bytes = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise TransactionError("candidate release tree cannot be enumerated") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            relative = path.relative_to(root).as_posix()
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise TransactionError("candidate release tree changed") from exc
+            if info.st_uid != 0 or info.st_gid != 0:
+                raise TransactionError("candidate release tree ownership is unsafe")
+            if stat.S_ISDIR(info.st_mode):
+                directory_count += 1
+                if directory_count + file_count > QUARANTINE_MAX_ENTRIES:
+                    raise TransactionError("candidate release tree exceeds entry limit")
+                pending.append(path)
+                descriptor = json.dumps(
+                    [relative, "directory", stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid],
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+                rows.append((os.fsencode(relative), descriptor))
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise TransactionError("candidate release tree contains a special file")
+            if info.st_nlink != 1:
+                raise TransactionError("candidate release tree contains a hard link")
+            file_count += 1
+            total_bytes += info.st_size
+            if file_count + directory_count > QUARANTINE_MAX_ENTRIES or total_bytes > QUARANTINE_MAX_BYTES:
+                raise TransactionError("candidate release tree exceeds evidence limits")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor_fd = -1
+            try:
+                descriptor_fd = os.open(path, flags)
+                before = os.fstat(descriptor_fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or _identity(before) != _identity(info)
+                    or before.st_nlink != 1
+                    or before.st_uid != 0
+                    or before.st_gid != 0
+                ):
+                    raise TransactionError("candidate release file changed")
+                digest = hashlib.sha256()
+                while chunk := os.read(descriptor_fd, 1024 * 1024):
+                    digest.update(chunk)
+                after = os.fstat(descriptor_fd)
+                if _identity(after) != _identity(before) or after.st_size != before.st_size:
+                    raise TransactionError("candidate release file changed during hashing")
+            except OSError as exc:
+                raise TransactionError("candidate release file cannot be read safely") from exc
+            finally:
+                if descriptor_fd >= 0:
+                    os.close(descriptor_fd)
+            descriptor = json.dumps(
+                [relative, "file", stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid, info.st_size, digest.hexdigest()],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            rows.append((os.fsencode(relative), descriptor))
+    rows.sort(key=lambda row: row[0])
+    tree_digest = hashlib.sha256()
+    for _, row in rows:
+        tree_digest.update(row)
+        tree_digest.update(b"\n")
+    return tree_digest.hexdigest(), file_count, directory_count, total_bytes
+
+
+def _quarantine_root(shared: Path, releases: Path) -> Path:
+    root = shared / QUARANTINE_DIR_NAME
+    if not _lexists(root):
+        try:
+            root.mkdir(mode=0o700)
+            os.chown(root, 0, 0)
+            os.chmod(root, 0o700)
+            _fsync_directory(shared)
+        except OSError as exc:
+            raise TransactionError("recovery quarantine directory cannot be created") from exc
+    try:
+        info = root.lstat()
+    except OSError as exc:
+        raise TransactionError("recovery quarantine directory is unavailable") from exc
+    releases_info = _safe_directory(releases, label="releases directory")
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_nlink < 2
+        or info.st_dev != releases_info.st_dev
+    ):
+        raise TransactionError("recovery quarantine directory metadata is unsafe")
+    return root
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    if source.stat().st_dev != destination.parent.stat().st_dev:
+        raise TransactionError("candidate quarantine crosses filesystems")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise TransactionError("atomic no-replace rename is unavailable")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(destination), 1) != 0:
+        error = ctypes.get_errno()
+        raise TransactionError(f"candidate quarantine rename failed: {errno.errorcode.get(error, error)}")
+    _fsync_directory(source.parent)
+    if destination.parent != source.parent:
+        _fsync_directory(destination.parent)
 
 
 def _read_fsync_record(
@@ -2424,6 +2563,599 @@ def _cleanup_recovered_install(
         _fsync_directory(state.parent)
 
 
+QUARANTINE_RECEIPT_KEYS = {
+    "schema",
+    "action",
+    "phase",
+    "failed_deploy_run_id",
+    "failed_deploy_run_attempt",
+    "failed_deploy_source_sha",
+    "recovery_run_id",
+    "recovery_run_attempt",
+    "recovery_bundle_sha",
+    "pending_sha256",
+    "candidate_slug",
+    "candidate_dev",
+    "candidate_ino",
+    "candidate_tree_sha256",
+    "candidate_file_count",
+    "candidate_directory_count",
+    "candidate_bytes",
+    "current_before",
+    "previous_before",
+    "service_state_before",
+    "service_enabled_before",
+    "timer_active_before",
+    "timer_enabled_before",
+    "quarantine_slug",
+    "quarantine_dev",
+    "quarantine_ino",
+}
+QUARANTINE_PHASES = frozenset(
+    {"prepared", "quarantined", "services_restored", "receipt_consumed"}
+)
+
+
+def _quarantine_values(
+    *,
+    failed_deploy_run_id: str,
+    failed_deploy_run_attempt: str,
+    failed_deploy_source_sha: str,
+    recovery_run_id: str,
+    recovery_run_attempt: str,
+    bundle_sha: str,
+) -> dict[str, str]:
+    for value, label in (
+        (failed_deploy_run_id, "failed deployment run id"),
+        (failed_deploy_run_attempt, "failed deployment attempt"),
+        (recovery_run_id, "recovery run id"),
+        (recovery_run_attempt, "recovery run attempt"),
+    ):
+        if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,31}", value) is None:
+            raise TransactionError(f"{label} is invalid")
+    if re.fullmatch(r"[0-9a-f]{40}", failed_deploy_source_sha) is None:
+        raise TransactionError("failed deployment source SHA is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", bundle_sha) is None:
+        raise TransactionError("recovery bundle SHA is invalid")
+    return {
+        "failed_deploy_run_id": failed_deploy_run_id,
+        "failed_deploy_run_attempt": failed_deploy_run_attempt,
+        "failed_deploy_source_sha": failed_deploy_source_sha,
+        "recovery_run_id": recovery_run_id,
+        "recovery_run_attempt": recovery_run_attempt,
+        "recovery_bundle_sha": bundle_sha,
+    }
+
+
+def _quarantine_receipt_path(root: Path, candidate_slug: str) -> Path:
+    return root / f"{candidate_slug}.json"
+
+
+def _read_quarantine_receipt(path: Path) -> dict[str, object]:
+    info = _safe_state_file(path)
+    if info.st_size > 64 * 1024:
+        raise TransactionError("quarantine receipt is too large")
+    try:
+        value = json.loads(path.read_text(encoding="ascii"), object_pairs_hook=_strict_object)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise TransactionError("quarantine receipt is invalid") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != QUARANTINE_RECEIPT_KEYS
+        or type(value.get("schema")) is not int
+        or value.get("schema") != QUARANTINE_RECEIPT_SCHEMA
+        or type(value.get("action")) is not str
+        or value.get("action") != "quarantine_populated_quiesce"
+        or type(value.get("phase")) is not str
+        or value.get("phase") not in QUARANTINE_PHASES
+    ):
+        raise TransactionError("quarantine receipt schema is invalid")
+    string_fields = (
+        "failed_deploy_run_id",
+        "failed_deploy_run_attempt",
+        "failed_deploy_source_sha",
+        "recovery_run_id",
+        "recovery_run_attempt",
+        "recovery_bundle_sha",
+        "pending_sha256",
+        "candidate_slug",
+        "candidate_tree_sha256",
+        "quarantine_slug",
+    )
+    if any(type(value.get(key)) is not str for key in string_fields):
+        raise TransactionError("quarantine receipt value types are invalid")
+    try:
+        _quarantine_values(
+            failed_deploy_run_id=cast(str, value["failed_deploy_run_id"]),
+            failed_deploy_run_attempt=cast(str, value["failed_deploy_run_attempt"]),
+            failed_deploy_source_sha=cast(str, value["failed_deploy_source_sha"]),
+            recovery_run_id=cast(str, value["recovery_run_id"]),
+            recovery_run_attempt=cast(str, value["recovery_run_attempt"]),
+            bundle_sha=cast(str, value["recovery_bundle_sha"]),
+        )
+    except TransactionError as exc:
+        raise TransactionError("quarantine receipt binding is invalid") from exc
+    for key in ("pending_sha256", "candidate_tree_sha256"):
+        if re.fullmatch(r"[0-9a-f]{64}", cast(str, value[key])) is None:
+            raise TransactionError("quarantine receipt digest is invalid")
+    if (
+        value["candidate_slug"]
+        != f"gha-{value['failed_deploy_run_id']}-{value['failed_deploy_run_attempt']}-{cast(str, value['failed_deploy_source_sha'])[:12]}"
+        or value["quarantine_slug"] != value["candidate_slug"]
+    ):
+        raise TransactionError("quarantine receipt slug is invalid")
+    for key in (
+        "candidate_dev",
+        "candidate_ino",
+        "candidate_file_count",
+        "candidate_directory_count",
+        "candidate_bytes",
+        "quarantine_dev",
+        "quarantine_ino",
+    ):
+        if type(value.get(key)) is not int or value[key] < 0:
+            raise TransactionError("quarantine receipt numeric values are invalid")
+    if value["candidate_ino"] <= 0 or value["quarantine_ino"] <= 0:
+        raise TransactionError("quarantine receipt inode is invalid")
+    service_state = value.get("service_state_before")
+    service_enabled = value.get("service_enabled_before")
+    if (
+        not isinstance(service_state, dict)
+        or set(service_state) != set(SERVICE_UNITS)
+        or any(type(item) is not str or item not in {"active", "inactive"} for item in service_state.values())
+        or not isinstance(service_enabled, dict)
+        or set(service_enabled) != set(SERVICE_UNITS)
+        or any(type(item) is not str or item not in {"enabled", "disabled"} for item in service_enabled.values())
+        or type(value.get("timer_active_before")) is not bool
+        or type(value.get("timer_enabled_before")) is not str
+        or value["timer_enabled_before"] not in {"enabled", "disabled"}
+    ):
+        raise TransactionError("quarantine service snapshot is invalid")
+    for key in ("current_before", "previous_before"):
+        identity = value.get(key)
+        if identity is not None and (
+            not isinstance(identity, dict)
+            or set(identity) != {"slug", "dev", "ino", "source_sha"}
+            or type(identity.get("slug")) is not str
+            or type(identity.get("dev")) is not int
+            or type(identity.get("ino")) is not int
+            or type(identity.get("source_sha")) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", identity["source_sha"]) is None
+            or identity["dev"] < 0
+            or identity["ino"] <= 0
+        ):
+            raise TransactionError("quarantine release pointer identity is invalid")
+    return value
+
+
+def _write_quarantine_receipt(path: Path, receipt: dict[str, object], *, creating: bool) -> None:
+    if set(receipt) != QUARANTINE_RECEIPT_KEYS:
+        raise TransactionError("quarantine receipt fields are invalid")
+    root = path.parent
+    _safe_directory(root, label="recovery quarantine directory")
+    if creating and _lexists(path):
+        raise TransactionError("quarantine receipt already exists")
+    temporary = root / f".{path.name}.{uuid4().hex}.tmp"
+    raw = (json.dumps(receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n").encode("ascii")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(raw)
+            stream.flush()
+        os.fsync(descriptor)
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    if creating:
+        os.link(temporary, path, follow_symlinks=False)
+        temporary.unlink()
+    else:
+        prior = _read_quarantine_receipt(path)
+        compare = dict(receipt)
+        compare["phase"] = prior["phase"]
+        compare["recovery_run_attempt"] = prior["recovery_run_attempt"]
+        allowed = {
+            "prepared": "quarantined",
+            "quarantined": "services_restored",
+            "services_restored": "receipt_consumed",
+        }
+        if (
+            prior != compare
+            or int(cast(str, receipt["recovery_run_attempt"]))
+            < int(cast(str, prior["recovery_run_attempt"]))
+            or (
+                receipt["phase"] != prior["phase"]
+                and allowed.get(cast(str, prior["phase"])) != receipt["phase"]
+            )
+        ):
+            raise TransactionError("quarantine receipt binding or phase changed")
+        os.replace(temporary, path)
+    temporary.unlink(missing_ok=True)
+    _fsync_directory(root)
+
+
+def _quarantine_release_identity(path: Path | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    meta = _safe_directory(path, label="protected release")
+    release = path / "RELEASE.json"
+    descriptor = -1
+    try:
+        release_meta = release.lstat()
+        if (
+            stat.S_ISLNK(release_meta.st_mode)
+            or not stat.S_ISREG(release_meta.st_mode)
+            or release_meta.st_uid != 0
+            or release_meta.st_nlink != 1
+            or release_meta.st_size > 64 * 1024
+        ):
+            raise TransactionError("protected release metadata is unsafe")
+        descriptor = os.open(
+            release,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _identity(opened) != _identity(release_meta)
+            or opened.st_uid != 0
+            or opened.st_nlink != 1
+            or opened.st_size != release_meta.st_size
+        ):
+            raise TransactionError("protected release metadata changed")
+        chunks = []
+        while chunk := os.read(descriptor, 8192):
+            chunks.append(chunk)
+            if sum(map(len, chunks)) > 64 * 1024:
+                raise TransactionError("protected release metadata is too large")
+        after = os.fstat(descriptor)
+        if _identity(after) != _identity(opened) or after.st_size != opened.st_size:
+            raise TransactionError("protected release metadata changed")
+        raw = b"".join(chunks)
+        payload = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+    except TransactionError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise TransactionError("protected release metadata is invalid") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    source = payload.get("source_git_commit") if isinstance(payload, dict) else None
+    if not isinstance(source, str) or re.fullmatch(r"[0-9a-f]{40}", source) is None:
+        raise TransactionError("protected release source identity is invalid")
+    return {"slug": path.name, "dev": meta.st_dev, "ino": meta.st_ino, "source_sha": source}
+
+
+def _assert_quarantine_pointers(
+    app: Path, receipt: dict[str, object]
+) -> None:
+    actual = {
+        "current_before": _quarantine_release_identity(_read_pointer(app, "current")),
+        "previous_before": _quarantine_release_identity(_read_pointer(app, "previous")),
+    }
+    if actual != {key: receipt[key] for key in actual}:
+        raise TransactionError("release pointers changed during quarantine recovery")
+
+
+def _accept_quarantine_recovery_attempt(
+    path: Path,
+    receipt: dict[str, object],
+    binding: dict[str, str],
+) -> dict[str, object]:
+    for key, value in binding.items():
+        if key != "recovery_run_attempt" and receipt.get(key) != value:
+            raise TransactionError("quarantine recovery binding changed")
+    if receipt.get("recovery_run_id") != binding["recovery_run_id"]:
+        raise TransactionError("quarantine recovery run changed")
+    incoming = int(binding["recovery_run_attempt"])
+    prior = int(cast(str, receipt["recovery_run_attempt"]))
+    if incoming < prior:
+        raise TransactionError("quarantine recovery attempt moved backwards")
+    if incoming > prior:
+        receipt["recovery_run_attempt"] = binding["recovery_run_attempt"]
+        _write_quarantine_receipt(path, receipt, creating=False)
+    return receipt
+
+
+def _assert_quarantine_tree(root: Path, receipt: dict[str, object]) -> None:
+    candidate = root / cast(str, receipt["quarantine_slug"])
+    metadata = _safe_directory(candidate, label="quarantined candidate")
+    tree_sha, file_count, directory_count, byte_count = _quarantine_tree_snapshot(candidate)
+    if (
+        metadata.st_dev != receipt["quarantine_dev"]
+        or metadata.st_ino != receipt["quarantine_ino"]
+        or tree_sha != receipt["candidate_tree_sha256"]
+        or file_count != receipt["candidate_file_count"]
+        or directory_count != receipt["candidate_directory_count"]
+        or byte_count != receipt["candidate_bytes"]
+    ):
+        raise TransactionError("quarantined candidate evidence changed")
+
+
+def quarantine_populated_quiesce(
+    state: Path,
+    *,
+    failed_deploy_run_id: str,
+    failed_deploy_run_attempt: str,
+    failed_deploy_source_sha: str,
+    recovery_run_id: str,
+    recovery_run_attempt: str,
+    bundle_sha: str,
+) -> dict[str, object]:
+    """Preserve, but never execute, one exact populated pre-promotion candidate."""
+    binding = _quarantine_values(
+        failed_deploy_run_id=failed_deploy_run_id,
+        failed_deploy_run_attempt=failed_deploy_run_attempt,
+        failed_deploy_source_sha=failed_deploy_source_sha,
+        recovery_run_id=recovery_run_id,
+        recovery_run_attempt=recovery_run_attempt,
+        bundle_sha=bundle_sha,
+    )
+    qrecord = _load_quiesce_record(state)
+    app = cast(Path, qrecord["app"])
+    shared = cast(Path, qrecord["shared"])
+    releases = cast(Path, qrecord["releases"])
+    if state != shared / STATE_NAME or qrecord.get("phase") != "quiesce-pending":
+        raise TransactionError("quarantine requires an operationless install quiesce receipt")
+    if qrecord.get("operation_id") is not None or qrecord.get("systemd_state_before") is not None:
+        raise TransactionError("quarantine receipt is not operationless")
+    if any(
+        _lexists(shared / name)
+        for name in (
+            QUIESCE_STATE_NAME,
+            SYSTEMD_STATE_NAME,
+            ".migration-pending.json",
+            ".migration-state.json",
+        )
+    ):
+        raise TransactionError("quarantine transaction has an ambiguous sidecar")
+    candidate = cast(Path, qrecord["candidate_path"])
+    expected_slug = (
+        f"gha-{failed_deploy_run_id}-{failed_deploy_run_attempt}-"
+        f"{failed_deploy_source_sha[:12]}"
+    )
+    if candidate.name != expected_slug:
+        raise TransactionError("candidate slug does not match failed deployment")
+    pending_info = _safe_state_file(state)
+    pending_raw = state.read_bytes()
+    if len(pending_raw) != pending_info.st_size:
+        raise TransactionError("pending receipt changed during quarantine")
+    pending_sha = hashlib.sha256(pending_raw).hexdigest()
+    current_tuple = _quarantine_release_identity(cast(Path | None, qrecord["current_before_path"]))
+    previous_tuple = _quarantine_release_identity(cast(Path | None, qrecord["previous_before_path"]))
+    _assert_quarantine_pointers(
+        app,
+        {
+            "current_before": current_tuple,
+            "previous_before": previous_tuple,
+        },
+    )
+    quarantine_path = shared / QUARANTINE_DIR_NAME
+    if not _lexists(candidate):
+        # A retry after the atomic rename must already have its durable
+        # quarantine root. Do not create state while validating an absent or
+        # mismatched candidate.
+        root = _quarantine_root(shared, releases)
+        receipt_path = _quarantine_receipt_path(root, expected_slug)
+        destination = root / expected_slug
+    else:
+        root = quarantine_path
+        receipt_path = _quarantine_receipt_path(root, expected_slug)
+        destination = root / expected_slug
+    if not _lexists(candidate) and _lexists(receipt_path):
+        receipt = _read_quarantine_receipt(receipt_path)
+        receipt = _accept_quarantine_recovery_attempt(receipt_path, receipt, binding)
+        if (
+            receipt.get("pending_sha256") != pending_sha
+            or receipt.get("candidate_slug") != expected_slug
+            or receipt.get("current_before") != current_tuple
+            or receipt.get("previous_before") != previous_tuple
+            or _lexists(candidate)
+            or not _lexists(destination)
+        ):
+            raise TransactionError("existing quarantine intent is not resumable")
+        _assert_quarantine_tree(root, receipt)
+        _assert_quarantine_pointers(app, receipt)
+        if receipt["phase"] == "prepared":
+            receipt["phase"] = "quarantined"
+            _write_quarantine_receipt(receipt_path, receipt, creating=False)
+        elif receipt["phase"] not in {"quarantined", "services_restored"}:
+            raise TransactionError("existing quarantine phase is not resumable")
+        return receipt
+    candidate_meta = _safe_directory(candidate, label="candidate release")
+    candidate_tuple = _quarantine_release_identity(candidate)
+    if candidate_tuple is None or candidate_tuple["source_sha"] != failed_deploy_source_sha:
+        raise TransactionError("candidate source does not match failed deployment")
+    tree_sha, file_count, directory_count, byte_count = _quarantine_tree_snapshot(candidate)
+    # Validate the populated candidate completely before creating the
+    # quarantine root; malformed candidates must not leave filesystem state.
+    root = _quarantine_root(shared, releases)
+    receipt_path = _quarantine_receipt_path(root, expected_slug)
+    destination = root / expected_slug
+    qslug = expected_slug
+    expected = {
+        "schema": QUARANTINE_RECEIPT_SCHEMA,
+        "action": "quarantine_populated_quiesce",
+        "phase": "prepared",
+        **binding,
+        "pending_sha256": pending_sha,
+        "candidate_slug": expected_slug,
+        "candidate_dev": candidate_meta.st_dev,
+        "candidate_ino": candidate_meta.st_ino,
+        "candidate_tree_sha256": tree_sha,
+        "candidate_file_count": file_count,
+        "candidate_directory_count": directory_count,
+        "candidate_bytes": byte_count,
+        "current_before": current_tuple,
+        "previous_before": previous_tuple,
+        "service_state_before": qrecord["service_state_before"],
+        "service_enabled_before": qrecord["service_enabled_before"],
+        "timer_active_before": qrecord["timer_active_before"],
+        "timer_enabled_before": qrecord["timer_enabled_before"],
+        "quarantine_slug": qslug,
+        "quarantine_dev": root.stat().st_dev,
+        "quarantine_ino": candidate_meta.st_ino,
+    }
+    if _lexists(receipt_path):
+        receipt = _read_quarantine_receipt(receipt_path)
+        receipt = _accept_quarantine_recovery_attempt(receipt_path, receipt, binding)
+        compare = dict(expected)
+        compare["phase"] = receipt["phase"]
+        if receipt != compare:
+            raise TransactionError("existing quarantine intent does not match exact recovery")
+    else:
+        if _lexists(destination):
+            raise TransactionError("quarantine destination already exists without intent")
+        _write_quarantine_receipt(receipt_path, expected, creating=True)
+        receipt = expected
+    if receipt["phase"] == "prepared":
+        if _lexists(candidate) and not _lexists(destination):
+            current_meta = _safe_directory(candidate, label="candidate release")
+            current_tree = _quarantine_tree_snapshot(candidate)
+            if _identity(current_meta) != {"dev": receipt["candidate_dev"], "ino": receipt["candidate_ino"]} or current_tree != (tree_sha, file_count, directory_count, byte_count):
+                raise TransactionError("candidate changed after quarantine intent")
+            _rename_noreplace(candidate, destination)
+        elif _lexists(candidate) or not _lexists(destination):
+            raise TransactionError("candidate quarantine recovery state is ambiguous")
+        _assert_quarantine_tree(root, receipt)
+        moved = _safe_directory(destination, label="quarantined candidate")
+        receipt["quarantine_dev"] = moved.st_dev
+        receipt["quarantine_ino"] = moved.st_ino
+        receipt["phase"] = "quarantined"
+        _write_quarantine_receipt(receipt_path, receipt, creating=False)
+    else:
+        _assert_quarantine_tree(root, receipt)
+    _assert_quarantine_pointers(app, receipt)
+    return receipt
+
+
+def mark_quarantine_services_restored(
+    state: Path,
+    *,
+    failed_deploy_run_id: str,
+    failed_deploy_run_attempt: str,
+    failed_deploy_source_sha: str,
+    recovery_run_id: str,
+    recovery_run_attempt: str,
+    bundle_sha: str,
+) -> dict[str, object]:
+    binding = _quarantine_values(
+        failed_deploy_run_id=failed_deploy_run_id,
+        failed_deploy_run_attempt=failed_deploy_run_attempt,
+        failed_deploy_source_sha=failed_deploy_source_sha,
+        recovery_run_id=recovery_run_id,
+        recovery_run_attempt=recovery_run_attempt,
+        bundle_sha=bundle_sha,
+    )
+    qrecord = _load_quiesce_record(state)
+    root = _quarantine_root(cast(Path, qrecord["shared"]), cast(Path, qrecord["releases"]))
+    slug = f"gha-{failed_deploy_run_id}-{failed_deploy_run_attempt}-{failed_deploy_source_sha[:12]}"
+    receipt_path = _quarantine_receipt_path(root, slug)
+    receipt = _read_quarantine_receipt(receipt_path)
+    receipt = _accept_quarantine_recovery_attempt(receipt_path, receipt, binding)
+    if receipt.get("candidate_slug") != slug:
+        raise TransactionError("quarantine recovery binding changed")
+    if receipt["phase"] not in {"quarantined", "services_restored"}:
+        raise TransactionError("quarantine is not ready for service restoration")
+    _assert_quarantine_tree(root, receipt)
+    _assert_quarantine_pointers(cast(Path, qrecord["app"]), receipt)
+    if receipt["phase"] == "quarantined":
+        receipt["phase"] = "services_restored"
+        _write_quarantine_receipt(receipt_path, receipt, creating=False)
+    return receipt
+
+
+def inspect_quarantined_quiesce(
+    state: Path,
+    *,
+    failed_deploy_run_id: str,
+    failed_deploy_run_attempt: str,
+    failed_deploy_source_sha: str,
+    recovery_run_id: str,
+    recovery_run_attempt: str,
+    bundle_sha: str,
+) -> dict[str, object]:
+    binding = _quarantine_values(
+        failed_deploy_run_id=failed_deploy_run_id,
+        failed_deploy_run_attempt=failed_deploy_run_attempt,
+        failed_deploy_source_sha=failed_deploy_source_sha,
+        recovery_run_id=recovery_run_id,
+        recovery_run_attempt=recovery_run_attempt,
+        bundle_sha=bundle_sha,
+    )
+    shared = state.parent
+    root = _quarantine_root(shared, shared.parent / "releases")
+    slug = f"gha-{failed_deploy_run_id}-{failed_deploy_run_attempt}-{failed_deploy_source_sha[:12]}"
+    receipt_path = _quarantine_receipt_path(root, slug)
+    receipt = _read_quarantine_receipt(receipt_path)
+    receipt = _accept_quarantine_recovery_attempt(receipt_path, receipt, binding)
+    _assert_quarantine_tree(root, receipt)
+    _assert_quarantine_pointers(shared.parent, receipt)
+    return {
+        "phase": receipt["phase"],
+        "service_state_before": receipt["service_state_before"],
+        "service_enabled_before": receipt["service_enabled_before"],
+        "timer_active_before": receipt["timer_active_before"],
+        "timer_enabled_before": receipt["timer_enabled_before"],
+        "api": cast(dict[str, str], receipt["service_state_before"])["deadlock-api"],
+        "web": cast(dict[str, str], receipt["service_state_before"])["deadlock-web"],
+    }
+
+
+def consume_quarantined_quiesce(
+    state: Path,
+    *,
+    failed_deploy_run_id: str,
+    failed_deploy_run_attempt: str,
+    failed_deploy_source_sha: str,
+    recovery_run_id: str,
+    recovery_run_attempt: str,
+    bundle_sha: str,
+) -> dict[str, object]:
+    binding = _quarantine_values(
+        failed_deploy_run_id=failed_deploy_run_id,
+        failed_deploy_run_attempt=failed_deploy_run_attempt,
+        failed_deploy_source_sha=failed_deploy_source_sha,
+        recovery_run_id=recovery_run_id,
+        recovery_run_attempt=recovery_run_attempt,
+        bundle_sha=bundle_sha,
+    )
+    shared = state.parent
+    root = _quarantine_root(shared, shared.parent / "releases")
+    slug = f"gha-{failed_deploy_run_id}-{failed_deploy_run_attempt}-{failed_deploy_source_sha[:12]}"
+    receipt_path = _quarantine_receipt_path(root, slug)
+    receipt = _read_quarantine_receipt(receipt_path)
+    receipt = _accept_quarantine_recovery_attempt(receipt_path, receipt, binding)
+    if receipt.get("candidate_slug") != slug:
+        raise TransactionError("quarantine recovery binding changed")
+    if receipt["phase"] == "receipt_consumed":
+        if _lexists(state):
+            raise TransactionError("consumed quarantine still has a pending receipt")
+        _assert_quarantine_tree(root, receipt)
+        _assert_quarantine_pointers(shared.parent, receipt)
+        return receipt
+    if receipt["phase"] != "services_restored":
+        raise TransactionError("quarantine recovery services are not restored")
+    _assert_quarantine_tree(root, receipt)
+    if _lexists(state):
+        qrecord = _load_quiesce_record(state)
+        if qrecord.get("phase") != "quiesce-pending":
+            raise TransactionError("pending receipt changed before quarantine completion")
+        raw = state.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != receipt["pending_sha256"]:
+            raise TransactionError("pending receipt digest changed before quarantine completion")
+        _assert_quarantine_pointers(cast(Path, qrecord["app"]), receipt)
+        abort_quiesce(state)
+    else:
+        _assert_quarantine_pointers(shared.parent, receipt)
+    if _lexists(state):
+        raise TransactionError("pending receipt remains after quarantine completion")
+    receipt["phase"] = "receipt_consumed"
+    _write_quarantine_receipt(receipt_path, receipt, creating=False)
+    return receipt
+
+
 def _cache_purge_runtime_paths(record: dict[str, object]) -> tuple[Path, Path]:
     """Resolve the transaction-bound source and venv locations for a purge."""
     transition = cast(str, record["transition"])
@@ -3236,6 +3968,20 @@ def _build_parser() -> argparse.ArgumentParser:
     restore_quiesce_parser = commands.add_parser("restore-quiesce")
     restore_quiesce_parser.add_argument("--state", required=True, type=Path)
     restore_quiesce_parser.add_argument("--systemctl", required=True)
+    for command_name in (
+        "quarantine-populated-quiesce",
+        "mark-quarantine-services-restored",
+        "inspect-quarantined-quiesce",
+        "consume-quarantined-quiesce",
+    ):
+        quarantine_parser = commands.add_parser(command_name)
+        quarantine_parser.add_argument("--state", required=True, type=Path)
+        quarantine_parser.add_argument("--failed-deploy-run-id", required=True)
+        quarantine_parser.add_argument("--failed-deploy-run-attempt", required=True)
+        quarantine_parser.add_argument("--failed-deploy-source-sha", required=True)
+        quarantine_parser.add_argument("--recovery-run-id", required=True)
+        quarantine_parser.add_argument("--recovery-run-attempt", required=True)
+        quarantine_parser.add_argument("--bundle-sha", required=True)
     validate_service_snapshot_parser = commands.add_parser("validate-service-snapshot")
     validate_service_snapshot_parser.add_argument("--state", required=True, type=Path)
     validate_service_snapshot_parser.add_argument(
@@ -3375,6 +4121,55 @@ def main() -> int:
             abort_quiesce(args.state)
         elif args.command == "restore-quiesce":
             restore_quiesce(args.state, systemctl=args.systemctl)
+        elif args.command in {
+            "quarantine-populated-quiesce",
+            "mark-quarantine-services-restored",
+            "inspect-quarantined-quiesce",
+            "consume-quarantined-quiesce",
+        }:
+            function = {
+                "quarantine-populated-quiesce": quarantine_populated_quiesce,
+                "mark-quarantine-services-restored": mark_quarantine_services_restored,
+                "inspect-quarantined-quiesce": inspect_quarantined_quiesce,
+                "consume-quarantined-quiesce": consume_quarantined_quiesce,
+            }[args.command]
+            receipt = function(
+                args.state,
+                failed_deploy_run_id=args.failed_deploy_run_id,
+                failed_deploy_run_attempt=args.failed_deploy_run_attempt,
+                failed_deploy_source_sha=args.failed_deploy_source_sha,
+                recovery_run_id=args.recovery_run_id,
+                recovery_run_attempt=args.recovery_run_attempt,
+                bundle_sha=args.bundle_sha,
+            )
+            projection: dict[str, object] = {
+                "schema": QUARANTINE_RECEIPT_SCHEMA,
+                "action": "quarantine_populated_quiesce",
+                "phase": receipt["phase"],
+            }
+            if args.command == "inspect-quarantined-quiesce":
+                projection.update(
+                    {
+                        key: receipt[key]
+                        for key in (
+                            "service_state_before",
+                            "service_enabled_before",
+                            "timer_active_before",
+                            "timer_enabled_before",
+                            "api",
+                            "web",
+                        )
+                    }
+                )
+            else:
+                projection["candidate_tree_sha256"] = receipt["candidate_tree_sha256"]
+            print(
+                json.dumps(
+                    projection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
         elif args.command == "validate-service-snapshot":
             validate_service_snapshot(args.state, require=args.require)
         elif args.command == "restore-services":

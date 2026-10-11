@@ -119,9 +119,18 @@ if [[ ! "$RELEASE_SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]]; then
 fi
 
 PUBLIC_RELEASE_SLUG="$RELEASE_SLUG"
+INSTALL_DIAGNOSTIC_STAGE="unknown"
+INSTALL_DIAGNOSTIC_CLASS="unknown"
 public_status() {
   local status="$1"
   local class="$2"
+  if [[ "$status" == "failed" && "$INSTALL_DIAGNOSTIC_CLASS" == "unknown" ]]; then
+    case "$class" in
+      argument|privilege|artifact|checksum|environment|layout|production_guard|pending_operation|duplicate|pointer|cleanup|liveqa_runtime_recovery|recovery|venv_policy|venv|rollback_metadata|wheelhouse|liveqa_runtime)
+        INSTALL_DIAGNOSTIC_CLASS="$class"
+        ;;
+    esac
+  fi
   printf 'RELEASE_INSTALL schema=1 status=%s class=%s release_slug=%s\n' \
     "$status" "$class" "$PUBLIC_RELEASE_SLUG"
 }
@@ -652,7 +661,7 @@ remove_tree() {
 }
 
 cleanup_failed_install() {
-  local cleanup_failed=0
+  local original_status=$? cleanup_failed=0
   if [[ "$INSTALL_COMPLETE" -eq 1 ]]; then
     platform_release_lock_close
     return
@@ -665,6 +674,7 @@ cleanup_failed_install() {
     # fails after promoting the receipt.
     echo "RELEASE_INSTALL status=failed class=pending_operation release_slug=$PUBLIC_RELEASE_SLUG" >&2
     platform_release_lock_close
+    emit_install_failure_diagnostic "$original_status"
     return
   fi
   if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
@@ -712,9 +722,20 @@ cleanup_failed_install() {
     rm -f -- "$FREEZE_CHECK_FILE"
   fi
   platform_release_lock_close
+  emit_install_failure_diagnostic "$original_status"
+}
+emit_install_failure_diagnostic() {
+  local exit_status="$1"
+  [[ "$exit_status" =~ ^(1[0-9]{2}|2[0-4][0-9]|25[0-5]|[1-9][0-9]?)$ ]] || return 0
+  [[ "$INSTALL_DIAGNOSTIC_STAGE" =~ ^(artifact_validation|wheelhouse_validation|disk_guard|environment_prepare|venv_setup|transaction_stage|runtime_prepare|unknown)$ ]] || return 0
+  [[ "$INSTALL_DIAGNOSTIC_CLASS" =~ ^(argument|privilege|artifact|checksum|environment|layout|production_guard|pending_operation|duplicate|pointer|cleanup|liveqa_runtime_recovery|recovery|venv_policy|venv|rollback_metadata|wheelhouse|liveqa_runtime|unknown)$ ]] || return 0
+  [[ "$PUBLIC_RELEASE_SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] || return 0
+  printf 'RELEASE_INSTALL_DIAG schema=1 status=failed class=%s stage=%s exit_status=%s release_slug=%s\n' \
+    "$INSTALL_DIAGNOSTIC_CLASS" "$INSTALL_DIAGNOSTIC_STAGE" "$exit_status" "$PUBLIC_RELEASE_SLUG" >&2
 }
 trap cleanup_failed_install EXIT
 
+INSTALL_DIAGNOSTIC_STAGE="artifact_validation"
 /usr/bin/python3 -I "$TOOLS_DIR/platform_validate_release_artifact.py" \
   --artifact "$ARTIFACT_PATH" \
   --checksum "$CHECKSUM_PATH" \
@@ -722,6 +743,7 @@ trap cleanup_failed_install EXIT
   --extract-to "$RELEASES_DIR" >/dev/null 2>/dev/null
 RELEASE_EXTRACTED=1
 
+INSTALL_DIAGNOSTIC_STAGE="wheelhouse_validation"
 /usr/bin/python3 -I "$TOOLS_DIR/platform_validate_wheelhouse.py" verify \
   --wheelhouse "$RELEASE_DIR/wheelhouse" \
   --requirements "$RELEASE_DIR/requirements-platform.txt" \
@@ -742,6 +764,7 @@ if [[ ! -d "$RELEASE_DIR/apps/platform_web/.next/standalone/.next/static" ]]; th
   exit 1
 fi
 
+INSTALL_DIAGNOSTIC_STAGE="environment_prepare"
 if [[ ! -f "$SHARED_ENV_FILE" ]]; then
   if [[ -n "$SEED_ENV_FROM" ]]; then
     install -o root -g root -m 0600 "$SEED_ENV_FROM" "$SHARED_ENV_FILE"
@@ -769,6 +792,7 @@ fi
 chown root:root "$SHARED_ENV_FILE"
 chmod 0600 "$SHARED_ENV_FILE"
 
+INSTALL_DIAGNOSTIC_STAGE="disk_guard"
 if [[ "$VENV_INSTALL_POLICY" == "require_proven_reuse" ]]; then
   INSTALL_SPACE="$(read_install_space)" || {
     public_status failed venv_policy
@@ -1077,6 +1101,7 @@ for script, original, (cache, cache_info, cache_digest) in cache_removals:
 PY
 }
 
+INSTALL_DIAGNOSTIC_STAGE="venv_setup"
 # A prior successful transaction can prove the shared venv already contains
 # the exact immutable dependencies and runtime required by this candidate.
 # A proof miss deliberately follows the normal fresh-venv + full-snapshot path.
@@ -1156,6 +1181,7 @@ else
   rm -f -- "$FREEZE_CHECK_FILE"
   FREEZE_CHECK_FILE=""
 
+  INSTALL_DIAGNOSTIC_STAGE="transaction_stage"
   TRANSACTION_TRANSITION="create"
   if [[ -e "$SHARED_VENV_DIR" || -L "$SHARED_VENV_DIR" ]]; then
     TRANSACTION_TRANSITION="exchange"
@@ -1301,6 +1327,7 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
     --phase venv-transitioned
 fi
 
+INSTALL_DIAGNOSTIC_STAGE="transaction_stage"
 if [[ "$STAGE_ONLY" -eq 1 ]]; then
   # Install units and prepare release-specific writable paths before activation.
   trap '' HUP INT TERM
@@ -1342,6 +1369,7 @@ trap '' HUP INT TERM
   --state "$TRANSACTION_STATE" \
   --expected "$POINTER_PHASE" \
   --phase pointers-switched
+INSTALL_DIAGNOSTIC_STAGE="runtime_prepare"
 # The active release and the trusted live-QA generation are one release
 # identity.  Reconcile while the canonical release lock is still held; a
 # failure leaves the transaction retained for guarded pointer/runtime recovery.
