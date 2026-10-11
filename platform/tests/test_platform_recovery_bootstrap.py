@@ -1010,6 +1010,10 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             TOOLS / "platform_recover_pending.sh"
         ).read_text(encoding="utf-8")
         self.assertIn('RECOVERY_CAPABILITY="prune_task_releases"', retention_wrapper)
+        self.assertIn('! -e "$APP_DIR/shared/.release-quiesce.json"', retention_wrapper)
+        self.assertIn('! -L "$APP_DIR/shared/.release-quiesce.json"', retention_wrapper)
+        self.assertIn('! -e "$APP_DIR/shared/.release-systemd-state.json"', retention_wrapper)
+        self.assertIn('! -L "$APP_DIR/shared/.release-systemd-state.json"', retention_wrapper)
         self.assertIn("--json-receipt", retention_wrapper)
         self.assertIn('"candidate_count", "deleted_count", "reclaimed_bytes"', retention_wrapper)
         self.assertIn("security_run_id", release_recover)

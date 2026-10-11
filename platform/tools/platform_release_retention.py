@@ -360,6 +360,17 @@ def release_operation_lock(app_dir: Path) -> Iterator[Path]:
         label="platform release",
         pending_state=shared_dir / ".release-operation.json",
     ):
+        # The operation receipt is primary, but recovery may also leave a
+        # quiesce or systemd snapshot sidecar if an earlier write/cleanup was
+        # interrupted. Never prune release trees while either recovery record
+        # remains, including a dangling symlink that lexists() can detect.
+        if any(
+            os.path.lexists(shared_dir / name)
+            for name in (".release-quiesce.json", ".release-systemd-state.json")
+        ):
+            raise RuntimeError(
+                "A pending release recovery record must be recovered before retention"
+            )
         yield resolved_app_dir
 
 

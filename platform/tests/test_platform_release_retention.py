@@ -434,12 +434,45 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         self.assertTrue(candidate.exists())
 
     def test_release_lock_refuses_pending_transaction(self) -> None:
-        state = self.app_dir / "shared" / ".release-operation.json"
-        state.write_text("pending\n", encoding="utf-8")
+        current = self.add_release("release-current", age_days=30)
+        previous = self.add_release("release-previous", age_days=29)
+        candidate = self.add_release("release-old", age_days=20)
+        self.link("current", current)
+        self.link("previous", previous)
 
-        with self.assertRaisesRegex(RuntimeError, "must be recovered"):
-            with release_operation_lock(self.app_dir):
-                self.fail("pending transaction unexpectedly acquired retention lock")
+        sidecars = (
+            ".release-operation.json",
+            ".release-quiesce.json",
+            ".release-systemd-state.json",
+        )
+        for sidecar in sidecars:
+            with self.subTest(sidecar=sidecar):
+                path = self.app_dir / "shared" / sidecar
+                if sidecar == ".release-quiesce.json":
+                    # lexists must fail closed for dangling sidecars too.
+                    path.symlink_to(self.app_dir / "missing-recovery-record")
+                else:
+                    path.write_text("pending\n", encoding="utf-8")
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch("sys.argv", [
+                    "platform_release_retention.py",
+                    "--app-dir", str(self.app_dir),
+                    "--keep", "0",
+                    "--apply",
+                    "--json-receipt",
+                    "--expected-candidate", candidate.name,
+                ]), redirect_stdout(stdout), redirect_stderr(stderr):
+                    status = retention.main()
+                self.assertEqual(status, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertNotIn("status=passed", stdout.getvalue())
+                self.assertTrue(candidate.is_dir())
+                self.assertEqual(
+                    current,
+                    (self.app_dir / "current").resolve(strict=True),
+                )
+                path.unlink()
 
     def test_release_lock_contention_fails_closed(self) -> None:
         try:
