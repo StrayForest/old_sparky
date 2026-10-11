@@ -1074,7 +1074,7 @@ jobs:
             "platform_release_restore_runtime.sh:555" \
             "platform_release_systemd_state.py:444" \
             "platform_release_transaction.py:444" \
-            "platform_release_retention.py:555" \
+            "platform_release_retention.py:444" \
             "platform_recover_pending.sh:555"; do
             helper_name="${helper_spec%%:*}"
             helper_mode="${helper_spec##*:}"

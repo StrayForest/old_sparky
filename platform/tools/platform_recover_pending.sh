@@ -149,7 +149,7 @@ validate_generation_helper platform_release_lock.sh 555
 validate_generation_helper platform_release_restore_runtime.sh 555
 validate_generation_helper platform_release_systemd_state.py 444
 validate_generation_helper platform_release_transaction.py 444
-validate_generation_helper platform_release_retention.py 555
+validate_generation_helper platform_release_retention.py 444
 /usr/bin/python3 -I -B "$TOOLS_DIR/platform_recovery_bootstrap.py" \
   validate-generation --generation "$TOOLS_DIR" --bundle-sha "$GENERATION_SHA" \
   --capability "$RECOVERY_CAPABILITY" \
