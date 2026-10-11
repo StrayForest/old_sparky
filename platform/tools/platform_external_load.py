@@ -17,6 +17,7 @@ from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import wraps
 import http.client
 import hashlib
 import json
@@ -100,9 +101,233 @@ SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]+$")
 PROFILE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+CLIENT_CPU_SAMPLE_INTERVAL_SECONDS = 1.0
+CLIENT_CPU_SAMPLE_LIMIT = 4096
+CLIENT_CPU_SAMPLE_JOIN_SECONDS = 2.0
+CLIENT_CGROUP_LINE_LIMIT = 256
+CLIENT_CGROUP_ANCESTOR_LIMIT = 32
 
 _DEFAULT_HTTPS_CONTEXT_LOCK = threading.Lock()
 _DEFAULT_HTTPS_CONTEXT: ssl.SSLContext | None = None
+
+
+def _effective_cpu_capacity_cores(
+    *,
+    cgroup_text: str | None = None,
+    cpu_max_reader: Callable[[Path], str] | None = None,
+    affinity_cpu_count: int | None = None,
+) -> float | None:
+    """Return a bounded cgroup-v2/affinity CPU ceiling, or UNKNOWN.
+
+    The optional inputs are a narrow parser seam for unit tests. Production
+    reads only the process cgroup record and `cpu.max` files on its ancestor
+    chain; no host-wide process or mount scan is performed.
+    """
+
+    if cgroup_text is None:
+        try:
+            cgroup_text = _read_bounded_ascii(Path("/proc/self/cgroup"))
+        except (OSError, UnicodeError, ValueError):
+            return None
+    if not isinstance(cgroup_text, str) or len(cgroup_text) > CLIENT_CGROUP_LINE_LIMIT:
+        return None
+    cgroup_path: str | None = None
+    for line in cgroup_text.splitlines():
+        if line.startswith("0::"):
+            cgroup_path = line[3:]
+            break
+    if (
+        cgroup_path is None
+        or len(cgroup_path) > CLIENT_CGROUP_LINE_LIMIT
+        or not cgroup_path.startswith("/")
+        or "\x00" in cgroup_path
+        or ".." in Path(cgroup_path).parts
+    ):
+        return None
+    reader = cpu_max_reader
+    if reader is None:
+        def reader(path: Path) -> str:
+            return _read_bounded_ascii(path)
+
+    try:
+        directory = (Path("/sys/fs/cgroup") / cgroup_path.lstrip("/")).resolve(
+            strict=False
+        )
+        mount = Path("/sys/fs/cgroup").resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    try:
+        directory.relative_to(mount)
+    except ValueError:
+        return None
+    quota_cores: list[float] = []
+    current = directory
+    for _ in range(CLIENT_CGROUP_ANCESTOR_LIMIT):
+        try:
+            raw = reader(current / "cpu.max")
+        except FileNotFoundError:
+            # A missing ancestor could hide a tighter quota, so capacity is
+            # unknown instead of being inferred from a partial chain.
+            return None
+        except (OSError, UnicodeError, ValueError):
+            return None
+        if not isinstance(raw, str) or len(raw) > CLIENT_CGROUP_LINE_LIMIT:
+            return None
+        fields = raw.split()
+        if (
+            len(fields) != 2
+            or not fields[1].isdigit()
+            or int(fields[1]) <= 0
+        ):
+            return None
+        if fields[0] != "max":
+            if not fields[0].isdigit():
+                return None
+            quota, period = int(fields[0]), int(fields[1])
+            if quota <= 0:
+                return None
+            quota_cores.append(quota / period)
+        if current == mount:
+            break
+        parent = current.parent
+        try:
+            parent.relative_to(mount)
+        except ValueError:
+            break
+        current = parent
+    else:
+        return None
+    if affinity_cpu_count is None:
+        return None
+    if type(affinity_cpu_count) is not int or not 1 <= affinity_cpu_count <= 4096:
+        return None
+    if not quota_cores:
+        return float(affinity_cpu_count)
+    quota_ceiling = min(quota_cores)
+    if not math.isfinite(quota_ceiling) or quota_ceiling <= 0:
+        return None
+    return min(float(affinity_cpu_count), quota_ceiling)
+
+
+def _read_bounded_ascii(path: Path) -> str:
+    with path.open("r", encoding="ascii") as stream:
+        value = stream.read(CLIENT_CGROUP_LINE_LIMIT + 1)
+    if len(value) > CLIENT_CGROUP_LINE_LIMIT:
+        raise ValueError("bounded cgroup input exceeded")
+    return value
+
+
+class _ProcessCpuSampler:
+    """Bounded low-frequency CPU samples for this external load worker."""
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._samples: list[dict[str, Any]] = []
+        self._thread: threading.Thread | None = None
+        self._last_monotonic_ns: int | None = None
+        self._last_process_ns: int | None = None
+        self._last_timestamp: str | None = None
+        self._error_class: str | None = None
+        self._truncated = False
+        try:
+            affinity = os.sched_getaffinity(0)
+            self.affinity_cpu_count: int | None = len(affinity) or None
+        except (AttributeError, OSError, ValueError):
+            self.affinity_cpu_count = None
+        try:
+            self.effective_cpu_capacity_cores = _effective_cpu_capacity_cores(
+                affinity_cpu_count=self.affinity_cpu_count
+            )
+        except (OSError, OverflowError, RuntimeError, TypeError, ValueError):
+            self.effective_cpu_capacity_cores = None
+
+    def start(self) -> None:
+        try:
+            self._last_monotonic_ns = time.monotonic_ns()
+            self._last_process_ns = time.process_time_ns()
+            self._last_timestamp = datetime.now(UTC).isoformat()
+            self._thread = threading.Thread(
+                target=self._sample_loop,
+                name="load-worker-cpu-sampler",
+                daemon=True,
+            )
+            self._thread.start()
+        except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+            self._error_class = type(exc).__name__
+            self._thread = None
+
+    def _sample(self) -> None:
+        monotonic_ns = time.monotonic_ns()
+        process_ns = time.process_time_ns()
+        timestamp = datetime.now(UTC).isoformat()
+        previous_monotonic = self._last_monotonic_ns
+        previous_process = self._last_process_ns
+        previous_timestamp = self._last_timestamp
+        self._last_monotonic_ns = monotonic_ns
+        self._last_process_ns = process_ns
+        self._last_timestamp = timestamp
+        if previous_monotonic is None or previous_process is None or previous_timestamp is None:
+            return
+        elapsed_ns = monotonic_ns - previous_monotonic
+        cpu_ns = process_ns - previous_process
+        if elapsed_ns <= 0 or cpu_ns < 0:
+            raise ValueError("invalid process CPU sampling interval")
+        process_cpu_percent = cpu_ns / elapsed_ns * 100.0
+        if not math.isfinite(process_cpu_percent) or process_cpu_percent > 100_000:
+            raise ValueError("process CPU sample is outside bounded range")
+        row: dict[str, Any] = {
+            "interval_started_at": previous_timestamp,
+            "timestamp": timestamp,
+            "interval_elapsed_ms": round(elapsed_ns / 1_000_000, 4),
+            "process_cpu_percent": round(process_cpu_percent, 4),
+        }
+        with self._lock:
+            if len(self._samples) >= CLIENT_CPU_SAMPLE_LIMIT:
+                self._truncated = True
+                self._stop.set()
+                return
+            self._samples.append(row)
+
+    def _sample_loop(self) -> None:
+        while not self._stop.wait(CLIENT_CPU_SAMPLE_INTERVAL_SECONDS):
+            try:
+                self._sample()
+            except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+                self._error_class = type(exc).__name__
+                self._stop.set()
+                return
+
+    def stop(self) -> dict[str, Any]:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(CLIENT_CPU_SAMPLE_JOIN_SECONDS)
+            if thread.is_alive():
+                self._error_class = "sampler_join_timeout"
+        status = "complete"
+        with self._lock:
+            samples = list(self._samples)
+            truncated = self._truncated
+        if truncated:
+            status = "truncated"
+        elif self._error_class is not None or thread is None or thread.is_alive():
+            status = "unavailable"
+        elif not samples:
+            status = "incomplete"
+        return {
+            "schema": 1,
+            "status": status,
+            "scope": "load_worker_process",
+            "sample_interval_ms": int(CLIENT_CPU_SAMPLE_INTERVAL_SECONDS * 1000),
+            "affinity_cpu_count": self.affinity_cpu_count,
+            "effective_cpu_capacity_cores": self.effective_cpu_capacity_cores,
+            "cpu_capacity_status": (
+                "known" if self.effective_cpu_capacity_cores is not None else "unknown"
+            ),
+            "sample_count": len(samples),
+            "samples": samples,
+        }
 
 
 def _default_https_context() -> ssl.SSLContext:
@@ -2401,7 +2626,7 @@ def _has_partial_timing(value: Any) -> bool:
     return incomplete or not found
 
 
-def run_load(
+def _run_load_impl(
     manifest: dict[str, Any],
     users: list[VirtualUser],
     *,
@@ -2434,15 +2659,55 @@ def run_load(
     runtime_budget: LoadRuntimeBudget | None = None,
     progress_callback: Callable[[str, Any | None], None] | None = None,
 ) -> dict[str, Any]:
+    phase_windows: list[dict[str, str]] = []
+    phase_windows_truncated = False
+    phase_windows_invalid = False
+
     def run_progress_phase(*args: Any, **kwargs: Any) -> Any:
+        nonlocal phase_windows_invalid, phase_windows_truncated
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
-        return run_phase(*args, **kwargs)
+        phase = safe_phase(kwargs.get("phase"))
+        started = datetime.now(UTC)
+        try:
+            return run_phase(*args, **kwargs)
+        finally:
+            finished = datetime.now(UTC)
+            if phase == "other":
+                phase_windows_invalid = True
+            elif len(phase_windows) >= 64:
+                phase_windows_truncated = True
+            else:
+                phase_windows.append(
+                    {
+                        "phase": phase,
+                        "started_at": started.isoformat(),
+                        "finished_at": finished.isoformat(),
+                    }
+                )
 
     def run_progress_rate_phase(*args: Any, **kwargs: Any) -> Any:
+        nonlocal phase_windows_invalid, phase_windows_truncated
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
-        return run_rate_phase(*args, **kwargs)
+        phase = safe_phase(kwargs.get("phase"))
+        started = datetime.now(UTC)
+        try:
+            return run_rate_phase(*args, **kwargs)
+        finally:
+            finished = datetime.now(UTC)
+            if phase == "other":
+                phase_windows_invalid = True
+            elif len(phase_windows) >= 64:
+                phase_windows_truncated = True
+            else:
+                phase_windows.append(
+                    {
+                        "phase": phase,
+                        "started_at": started.isoformat(),
+                        "finished_at": finished.isoformat(),
+                    }
+                )
 
     if runtime_budget is not None:
         runtime_budget.check("preflight", operation="run_start")
@@ -3489,7 +3754,7 @@ def run_load(
                 "authoritative_binding": False,
             },
         }
-    return {
+    report = {
         "schema": 1,
         "measurement_schema": 2,
         "timing_schema": 1,
@@ -3571,6 +3836,67 @@ def run_load(
         "authoritative": binding_is_authoritative,
         "dispatchable": binding_is_authoritative,
     }
+    report["phase_windows_status"] = (
+        "invalid"
+        if phase_windows_invalid
+        else "truncated"
+        if phase_windows_truncated
+        else "complete" if phase_windows else "unavailable"
+    )
+    if report["phase_windows_status"] == "complete":
+        report["phase_windows"] = phase_windows
+    return report
+
+
+@wraps(_run_load_impl)
+def run_load(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Run one client workload with bounded process-CPU observation."""
+
+    sampler = _ProcessCpuSampler()
+    sampler.start()
+    report: dict[str, Any] | None = None
+    try:
+        report = _run_load_impl(*args, **kwargs)
+        return report
+    finally:
+        usage = sampler.stop()
+        if report is not None:
+            start = _safe_load_timestamp(report.get("started_at"))
+            finish = _safe_load_timestamp(report.get("finished_at"))
+            if start is not None and finish is not None:
+                rows = usage.get("samples")
+                if isinstance(rows, list):
+                    usage["samples"] = [
+                        row
+                        for row in rows
+                        if (
+                            (interval_start := _safe_load_timestamp(row.get("interval_started_at")))
+                            is not None
+                            and (interval_end := _safe_load_timestamp(row.get("timestamp")))
+                            is not None
+                            and start <= interval_start < interval_end <= finish
+                        )
+                    ]
+                    usage["sample_count"] = len(usage["samples"])
+                    if not usage["samples"] and usage.get("status") == "complete":
+                        usage["status"] = "incomplete"
+            else:
+                usage["status"] = "incomplete"
+                usage["samples"] = []
+                usage["sample_count"] = 0
+            report["client_resource_usage"] = usage
+
+
+def _safe_load_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
 
 
 def parse_args() -> argparse.Namespace:

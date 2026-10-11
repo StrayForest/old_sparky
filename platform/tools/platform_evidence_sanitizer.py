@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import hashlib
 import json
 import math
@@ -922,6 +923,8 @@ PUBLIC_QUEUE_NAMES = frozenset(
     }
 )
 PUBLIC_CPU_CORE_KEYS = frozenset(f"cpu{index}" for index in range(256))
+PUBLIC_OBSERVER_TIMELINE_LIMIT = 4096
+PUBLIC_CLIENT_RESOURCE_SAMPLE_LIMIT = 4096
 PUBLIC_REQUEST_PERF_STAGES = frozenset(
     {
         "auth_bootstrap_auth_query_ms",
@@ -1081,6 +1084,35 @@ def _copy_number(source: dict[str, Any], key: str) -> float | None:
 def _copy_bool(source: dict[str, Any], key: str) -> bool | None:
     value = source.get(key)
     return value if type(value) is bool else None
+
+
+def _safe_utc_timestamp(value: Any) -> tuple[str, datetime] | None:
+    """Accept only bounded timezone-aware ISO timestamps and normalize UTC."""
+
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    normalized = parsed.astimezone(UTC)
+    return normalized.isoformat(), normalized
+
+
+def _project_timestamp_window(
+    source: dict[str, Any], *, lower: datetime | None = None, upper: datetime | None = None
+) -> dict[str, str] | None:
+    start = _safe_utc_timestamp(source.get("started_at"))
+    finish = _safe_utc_timestamp(source.get("finished_at"))
+    if start is None or finish is None or start[1] >= finish[1]:
+        return None
+    if lower is not None and start[1] < lower:
+        return None
+    if upper is not None and finish[1] > upper:
+        return None
+    return {"started_at": start[0], "finished_at": finish[0]}
 
 
 def _project_request_perf_sampling(value: Any) -> dict[str, Any]:
@@ -1665,6 +1697,9 @@ def _project_phase(value: Any) -> dict[str, Any]:
         number = _copy_number(source, key)
         if number is not None:
             output[key] = number
+    window = _project_timestamp_window(source)
+    if window is not None:
+        output.update(window)
     for key in ("complete",):
         flag = _copy_bool(source, key)
         if flag is not None:
@@ -2076,6 +2111,19 @@ def _project_external_load(value: Any) -> dict[str, Any]:
         number = _copy_int(source, key)
         if number is not None:
             output[key] = number
+    run_window = _project_timestamp_window(source)
+    run_started_at: datetime | None = None
+    run_finished_at: datetime | None = None
+    if run_window is not None:
+        output["run_window"] = run_window
+        run_started = _safe_utc_timestamp(run_window["started_at"])
+        run_finished = _safe_utc_timestamp(run_window["finished_at"])
+        if run_started is not None and run_finished is not None:
+            run_started_at = run_started[1]
+            run_finished_at = run_finished[1]
+        output["run_window_status"] = "complete"
+    else:
+        output["run_window_status"] = "unavailable"
     mode = source.get("mode")
     output["mode"] = (
         mode
@@ -2207,6 +2255,50 @@ def _project_external_load(value: Any) -> dict[str, Any]:
                 phase_output[phase] = projected
     if phase_output:
         output["phases"] = dict(sorted(phase_output.items()))
+    phase_windows_source = source.get("phase_windows")
+    phase_windows: list[dict[str, str]] = []
+    phase_windows_status = "unavailable"
+    if isinstance(phase_windows_source, list):
+        if len(phase_windows_source) > 64:
+            phase_windows_status = "truncated"
+        elif run_started_at is not None and run_finished_at is not None:
+            previous_finish: datetime | None = None
+            valid_windows = True
+            for item in phase_windows_source:
+                row = _mapping(item)
+                phase = safe_phase(row.get("phase"))
+                window = _project_timestamp_window(
+                    row, lower=run_started_at, upper=run_finished_at
+                )
+                if phase == "other" or window is None:
+                    valid_windows = False
+                    break
+                start = _safe_utc_timestamp(window["started_at"])
+                finish = _safe_utc_timestamp(window["finished_at"])
+                if (
+                    start is None
+                    or finish is None
+                    or (previous_finish is not None and start[1] < previous_finish)
+                ):
+                    valid_windows = False
+                    break
+                previous_finish = finish[1]
+                phase_windows.append({"phase": phase, **window})
+            if valid_windows:
+                phase_windows_status = "complete"
+            else:
+                phase_windows = []
+                phase_windows_status = "invalid"
+        else:
+            phase_windows_status = "unavailable"
+    output["phase_windows_status"] = phase_windows_status
+    if phase_windows_status == "complete":
+        output["phase_windows"] = phase_windows
+    output["client_resource_usage"] = _project_client_resource_usage(
+        source.get("client_resource_usage"),
+        run_started_at=run_started_at,
+        run_finished_at=run_finished_at,
+    )
     timeout = _mapping(source.get("timeout_path_diagnostics"))
     if timeout:
         timeout_output: dict[str, Any] = {}
@@ -2326,7 +2418,371 @@ def _project_process_metrics(value: Any) -> dict[str, dict[str, Any]]:
     return dict(sorted(output.items()))
 
 
-def _project_system(value: Any) -> dict[str, Any]:
+def _project_cpu_core_percent(value: Any) -> dict[str, float]:
+    source = _mapping(value)
+    output: dict[str, float] = {}
+    for key, raw in source.items():
+        if not isinstance(key, str) or key not in PUBLIC_CPU_CORE_KEYS:
+            continue
+        if isinstance(raw, bool):
+            return {}
+        number = finite_number(raw)
+        if number is None or not 0 <= number <= 100:
+            return {}
+        output[key] = number
+    return dict(sorted(output.items()))
+
+
+def _observer_timeline_metrics_valid(row: dict[str, Any]) -> bool:
+    """Reject malformed values for selected metrics without rejecting absence."""
+
+    for key in ("cpu_per_core_percent", "cpu_steal_per_core_percent"):
+        value = row.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            return False
+        for core, raw in value.items():
+            if core not in PUBLIC_CPU_CORE_KEYS or raw is None:
+                continue
+            number = finite_number(raw)
+            if number is None or number > 100:
+                return False
+
+    postgres_cpu = row.get("postgres_cpu_percent")
+    if postgres_cpu is not None:
+        number = finite_number(postgres_cpu)
+        if number is None or number > 100_000:
+            return False
+
+    process_integer_fields = frozenset(
+        {"process_count", "samples", "process_count_last", "process_count_max"}
+    )
+    process_number_fields = frozenset(
+        {
+            "cpu_percent",
+            "rss_bytes",
+            "read_bytes_per_second",
+            "write_bytes_per_second",
+            "avg_cpu_percent",
+            "max_cpu_percent",
+            "avg_rss_mb",
+            "max_rss_mb",
+            "avg_read_mb_per_second",
+            "max_read_mb_per_second",
+            "avg_write_mb_per_second",
+            "max_write_mb_per_second",
+        }
+    )
+    for key in ("api_process", "web_process"):
+        process = row.get(key)
+        if process is None:
+            continue
+        if not isinstance(process, dict):
+            return False
+        for field in process_integer_fields:
+            if field in process and process[field] is not None:
+                if safe_int(process[field]) is None:
+                    return False
+        for field in process_number_fields:
+            if field in process and process[field] is not None:
+                if finite_number(process[field]) is None:
+                    return False
+
+    connection_fields = frozenset({"total", "established", "limit", "used", "available"})
+    for key in ("api_connections",):
+        counts = row.get(key)
+        if counts is None:
+            continue
+        if not isinstance(counts, dict):
+            return False
+        for field in connection_fields:
+            if field in counts and counts[field] is not None:
+                if safe_int(counts[field]) is None:
+                    return False
+
+    for key in (
+        "postgres_tcp_established_connections",
+        "postgres_backend_connections",
+    ):
+        value = row.get(key)
+        if value is not None and safe_int(value, maximum=1_000_000) is None:
+            return False
+
+    waits = row.get("postgres_waits")
+    if waits is not None:
+        if not isinstance(waits, dict):
+            return False
+        wait_integer_fields = frozenset(
+            {
+                "samples",
+                "lock_waiters",
+                "waiting_backends",
+                "active_backends",
+                "ungranted_locks",
+                "backend_connections",
+                "max_lock_waiters",
+                "max_waiting_backends",
+                "max_ungranted_locks",
+                "mismatches",
+            }
+        )
+        wait_number_fields = frozenset(
+            {"max_waiting_query_ms", "max_lock_waiting_query_ms"}
+        )
+        for field in wait_integer_fields:
+            if field in waits and waits[field] is not None and safe_int(waits[field]) is None:
+                return False
+        for field in wait_number_fields:
+            if field in waits and waits[field] is not None and finite_number(waits[field]) is None:
+                return False
+        for map_key, allowed in (
+            ("wait_state_counts", SAFE_WAIT_STATES),
+            ("backend_ownership", SAFE_BACKENDS),
+        ):
+            metric_map = waits.get(map_key)
+            if metric_map is None:
+                continue
+            if not isinstance(metric_map, dict):
+                return False
+            for label, raw in metric_map.items():
+                if label not in allowed or raw is None:
+                    continue
+                if isinstance(raw, dict):
+                    for field in PUBLIC_METRIC_FIELDS:
+                        if field not in raw or raw[field] is None:
+                            continue
+                        number = safe_int(raw[field]) if field == "count" else finite_number(raw[field])
+                        if number is None:
+                            return False
+                elif safe_int(raw) is None:
+                    return False
+        consistency = waits.get("backend_ownership_consistency")
+        if consistency is not None:
+            if not isinstance(consistency, dict):
+                return False
+            for field in ("samples", "mismatches"):
+                if field in consistency and consistency[field] is not None:
+                    if safe_int(consistency[field]) is None:
+                        return False
+            if (
+                "all_match" in consistency
+                and consistency["all_match"] is not None
+                and type(consistency["all_match"]) is not bool
+            ):
+                return False
+
+    backlog = row.get("celery_backlog")
+    if backlog is not None:
+        if not isinstance(backlog, dict):
+            return False
+        if "samples" in backlog and backlog["samples"] is not None:
+            if safe_int(backlog["samples"]) is None:
+                return False
+        queue_map = backlog.get("by_queue")
+        if queue_map is not None:
+            if not isinstance(queue_map, dict):
+                return False
+            for queue, raw in queue_map.items():
+                if queue not in PUBLIC_QUEUE_NAMES or raw is None:
+                    continue
+                if isinstance(raw, dict):
+                    for field in PUBLIC_METRIC_FIELDS:
+                        if field not in raw or raw[field] is None:
+                            continue
+                        number = safe_int(raw[field]) if field == "count" else finite_number(raw[field])
+                        if number is None:
+                            return False
+                elif safe_int(raw) is None:
+                    return False
+    return True
+
+
+def _project_observer_timeline(
+    value: Any,
+    *,
+    started_at: datetime | None,
+    finished_at: datetime | None,
+    expected_samples: int | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Project bounded resource samples only when the complete series is valid."""
+
+    if started_at is None or finished_at is None or not isinstance(value, list):
+        return "unavailable", []
+    if len(value) > PUBLIC_OBSERVER_TIMELINE_LIMIT:
+        return "truncated", []
+    if expected_samples is None or expected_samples != len(value) or not value:
+        return "invalid", []
+    output: list[dict[str, Any]] = []
+    previous: datetime | None = None
+    for item in value:
+        row = _mapping(item)
+        timestamp = _safe_utc_timestamp(row.get("timestamp"))
+        if (
+            timestamp is None
+            or timestamp[1] < started_at
+            or timestamp[1] > finished_at
+            or (previous is not None and timestamp[1] <= previous)
+            or not _observer_timeline_metrics_valid(row)
+        ):
+            return "invalid", []
+        previous = timestamp[1]
+        projected: dict[str, Any] = {"timestamp": timestamp[0]}
+        for key in ("cpu_per_core_percent", "cpu_steal_per_core_percent"):
+            cores = _project_cpu_core_percent(row.get(key))
+            if cores:
+                projected[key] = cores
+        postgres_cpu = row.get("postgres_cpu_percent")
+        if not isinstance(postgres_cpu, bool):
+            number = finite_number(postgres_cpu)
+            if number is not None and 0 <= number <= 100_000:
+                projected["postgres_cpu_percent"] = number
+        process_source = {
+            "deadlock-api": row.get("api_process"),
+            "deadlock-web": row.get("web_process"),
+        }
+        processes = _project_process_metrics(process_source)
+        if processes:
+            projected["processes"] = processes
+        for key in ("api_connections",):
+            connections = _project_connection_counts(row.get(key))
+            if connections:
+                projected[key] = connections
+        for key in (
+            "postgres_tcp_established_connections",
+            "postgres_backend_connections",
+        ):
+            number = safe_int(row.get(key), maximum=1_000_000)
+            if number is not None:
+                projected[key] = number
+        waits = _project_waits(row.get("postgres_waits"))
+        if waits:
+            projected["postgres_waits"] = waits
+        backlog_source = _mapping(row.get("celery_backlog"))
+        backlog = _project_nested_metric_map(
+            backlog_source.get("by_queue"), PUBLIC_QUEUE_NAMES
+        )
+        if backlog:
+            projected["celery_backlog"] = backlog
+        output.append(projected)
+    return "complete", output
+
+
+def _project_client_resource_usage(
+    value: Any,
+    *,
+    run_started_at: datetime | None,
+    run_finished_at: datetime | None,
+) -> dict[str, Any]:
+    source = _mapping(value)
+    status = source.get("status")
+    if status not in {"complete", "incomplete", "unavailable", "truncated"}:
+        status = "unavailable"
+    output: dict[str, Any] = {
+        "schema": 1,
+        "status": status,
+        "scope": "load_worker_process",
+        "cpu_capacity_basis": "affinity_and_cgroup_v2_cpu_max",
+    }
+    interval = _copy_int(source, "sample_interval_ms")
+    if interval is not None and 100 <= interval <= 60_000:
+        output["sample_interval_ms"] = interval
+    capacity = _copy_int(source, "affinity_cpu_count")
+    if capacity is not None and 1 <= capacity <= 4096:
+        output["affinity_cpu_count"] = capacity
+    effective_capacity = source.get("effective_cpu_capacity_cores")
+    effective_number: float | None = None
+    if not isinstance(effective_capacity, bool):
+        effective_number = finite_number(effective_capacity)
+    capacity_status = source.get("cpu_capacity_status")
+    if (
+        capacity_status == "known"
+        and effective_number is not None
+        and 0 < effective_number <= 4096
+    ):
+        output["effective_cpu_capacity_cores"] = effective_number
+        output["cpu_capacity_status"] = "known"
+    else:
+        output["cpu_capacity_status"] = "unknown"
+    raw_rows = source.get("samples")
+    expected = _copy_int(source, "sample_count")
+    if not isinstance(raw_rows, list):
+        output["status"] = "unavailable"
+        output["sample_count"] = 0
+        output["samples"] = []
+        return output
+    if len(raw_rows) > PUBLIC_CLIENT_RESOURCE_SAMPLE_LIMIT:
+        output["status"] = "truncated"
+        output["sample_count"] = 0
+        output["samples"] = []
+        return output
+    if status != "complete":
+        output["sample_count"] = 0
+        output["samples"] = []
+        return output
+    if expected != len(raw_rows) or run_started_at is None or run_finished_at is None:
+        output["status"] = "incomplete"
+        output["sample_count"] = 0
+        output["samples"] = []
+        return output
+    projected_rows: list[dict[str, Any]] = []
+    previous: datetime | None = None
+    for item in raw_rows:
+        row = _mapping(item)
+        interval_start = _safe_utc_timestamp(row.get("interval_started_at"))
+        timestamp = _safe_utc_timestamp(row.get("timestamp"))
+        process_cpu = row.get("process_cpu_percent")
+        interval_elapsed = row.get("interval_elapsed_ms")
+        if (
+            interval_start is None
+            or timestamp is None
+            or interval_start[1] < run_started_at
+            or timestamp[1] > run_finished_at
+            or interval_start[1] >= timestamp[1]
+            or (previous is not None and interval_start[1] < previous)
+            or (previous is not None and timestamp[1] <= previous)
+            or isinstance(process_cpu, bool)
+            or isinstance(interval_elapsed, bool)
+        ):
+            output["status"] = "incomplete"
+            output["sample_count"] = 0
+            output["samples"] = []
+            return output
+        process_number = finite_number(process_cpu)
+        elapsed_number = finite_number(interval_elapsed)
+        if (
+            process_number is None
+            or not 0 <= process_number <= 100_000
+            or elapsed_number is None
+            or not 100 <= elapsed_number <= 60_000
+            or abs((timestamp[1] - interval_start[1]).total_seconds() * 1000 - elapsed_number)
+            > max(500.0, elapsed_number * 0.25)
+        ):
+            output["status"] = "incomplete"
+            output["sample_count"] = 0
+            output["samples"] = []
+            return output
+        previous = timestamp[1]
+        safe_row: dict[str, Any] = {
+            "interval_started_at": interval_start[0],
+            "timestamp": timestamp[0],
+            "interval_elapsed_ms": elapsed_number,
+            "process_cpu_percent": process_number,
+        }
+        projected_rows.append(safe_row)
+    output["sample_count"] = len(projected_rows)
+    output["samples"] = projected_rows
+    if not projected_rows and status == "complete":
+        output["status"] = "incomplete"
+    return output
+
+
+def _project_system(
+    value: Any,
+    *,
+    observation_started_at: datetime | None = None,
+    observation_finished_at: datetime | None = None,
+) -> dict[str, Any]:
     source = _mapping(value)
     output: dict[str, Any] = {}
     for key in ("samples",):
@@ -2438,6 +2894,15 @@ def _project_system(value: Any) -> dict[str, Any]:
             lifecycle_output[label] = projected
     if lifecycle_output:
         output["process_lifecycle"] = dict(sorted(lifecycle_output.items()))
+    timeline_status, timeline = _project_observer_timeline(
+        source.get("timeline"),
+        started_at=observation_started_at,
+        finished_at=observation_finished_at,
+        expected_samples=_copy_int(source, "samples"),
+    )
+    output["timeline_status"] = timeline_status
+    if timeline_status == "complete":
+        output["timeline"] = timeline
     return output
 
 
@@ -2809,7 +3274,24 @@ def _project_observer(value: Any) -> dict[str, Any]:
         flag = _copy_bool(source, key)
         if flag is not None:
             output[key] = flag
-    system = _project_system(source.get("system"))
+    observation_window = _project_timestamp_window(source)
+    observation_started_at: datetime | None = None
+    observation_finished_at: datetime | None = None
+    if observation_window is not None:
+        output["observation_window"] = observation_window
+        output["observation_window_status"] = "complete"
+        started = _safe_utc_timestamp(observation_window["started_at"])
+        finished = _safe_utc_timestamp(observation_window["finished_at"])
+        if started is not None and finished is not None:
+            observation_started_at = started[1]
+            observation_finished_at = finished[1]
+    else:
+        output["observation_window_status"] = "unavailable"
+    system = _project_system(
+        source.get("system"),
+        observation_started_at=observation_started_at,
+        observation_finished_at=observation_finished_at,
+    )
     if system:
         output["system"] = system
     request_perf = _project_summary(source.get("server_request_perf_logs"))

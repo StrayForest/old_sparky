@@ -14,7 +14,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import tools.platform_external_load as external_load
 from tools.platform_external_load import (
@@ -152,6 +152,181 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def test_effective_cpu_capacity_uses_affinity_and_strict_ancestor_quotas(self) -> None:
+        root = Path("/sys/fs/cgroup")
+        cpu_max = {
+            root / "tenant/job/cpu.max": "250000 100000\n",
+            root / "tenant/cpu.max": "max 100000\n",
+            root / "cpu.max": "150000 100000\n",
+        }
+
+        def reader(path: Path) -> str:
+            return cpu_max[path]
+
+        self.assertEqual(
+            external_load._effective_cpu_capacity_cores(
+                cgroup_text="0::/tenant/job\n",
+                cpu_max_reader=reader,
+                affinity_cpu_count=8,
+            ),
+            1.5,
+        )
+        self.assertEqual(
+            external_load._effective_cpu_capacity_cores(
+                cgroup_text="0::/tenant/job\n",
+                cpu_max_reader=lambda path: "max 100000\n",
+                affinity_cpu_count=2,
+            ),
+            2.0,
+        )
+        self.assertIsNone(
+            external_load._effective_cpu_capacity_cores(
+                cgroup_text="0::/tenant/job\n",
+                cpu_max_reader=lambda path: "max 100000\n",
+                affinity_cpu_count=None,
+            )
+        )
+        self.assertIsNone(
+            external_load._effective_cpu_capacity_cores(
+                cgroup_text="0::/tenant/job\n",
+                cpu_max_reader=lambda path: (
+                    "250000 100000\n" if path == root / "tenant/job/cpu.max" else "bad\n"
+                ),
+                affinity_cpu_count=8,
+            )
+        )
+        self.assertEqual(
+            external_load._effective_cpu_capacity_cores(
+                cgroup_text="0::/tenant/job\n",
+                cpu_max_reader=lambda path: "max 100000\n",
+                affinity_cpu_count=8,
+            ),
+            8.0,
+        )
+        self.assertIsNone(
+            external_load._effective_cpu_capacity_cores(
+                cgroup_text="0::/tenant/job\n",
+                cpu_max_reader=lambda path: "max nope\n",
+                affinity_cpu_count=8,
+            )
+        )
+
+        def missing_ancestor(path: Path) -> str:
+            if path == root / "tenant/job/cpu.max":
+                return "250000 100000\n"
+            raise FileNotFoundError
+
+        self.assertIsNone(
+            external_load._effective_cpu_capacity_cores(
+                cgroup_text="0::/tenant/job\n",
+                cpu_max_reader=missing_ancestor,
+                affinity_cpu_count=8,
+            )
+        )
+        self.assertIsNone(
+            external_load._effective_cpu_capacity_cores(
+                cgroup_text="0::/tenant/../escape\n",
+                cpu_max_reader=reader,
+                affinity_cpu_count=8,
+            )
+        )
+
+    def test_process_cpu_sampler_is_bounded_and_reports_truncation(self) -> None:
+        with patch.object(external_load.time, "process_time_ns", side_effect=OSError):
+            unavailable = external_load._ProcessCpuSampler()
+            unavailable.start()
+            unavailable_report = unavailable.stop()
+        self.assertEqual(unavailable_report["status"], "unavailable")
+        self.assertEqual(unavailable_report["samples"], [])
+
+        with (
+            patch.object(external_load, "CLIENT_CPU_SAMPLE_LIMIT", 4),
+        ):
+            sampler = external_load._ProcessCpuSampler()
+            sampler.start()
+            time.sleep(1.15)
+            report = sampler.stop()
+        self.assertEqual(report["scope"], "load_worker_process")
+        self.assertIn(report["status"], {"complete", "truncated"})
+        self.assertGreaterEqual(report["sample_count"], 1)
+        self.assertLessEqual(report["sample_count"], 4)
+        self.assertEqual(report["sample_count"], len(report["samples"]))
+        for row in report["samples"]:
+            self.assertLess(row["interval_started_at"], row["timestamp"])
+            self.assertGreaterEqual(row["interval_elapsed_ms"], 100)  # sampler is still monotonic
+            self.assertGreaterEqual(row["process_cpu_percent"], 0)
+
+        with (
+            patch.object(external_load, "CLIENT_CPU_SAMPLE_INTERVAL_SECONDS", 0.005),
+            patch.object(external_load, "CLIENT_CPU_SAMPLE_LIMIT", 1),
+        ):
+            capped = external_load._ProcessCpuSampler()
+            capped.start()
+            time.sleep(0.03)
+            capped_report = capped.stop()
+        self.assertEqual(capped_report["status"], "truncated")
+        self.assertEqual(capped_report["sample_count"], 1)
+
+    def test_run_load_stops_cpu_sampler_when_workload_raises(self) -> None:
+        sampler = Mock()
+        sampler.stop.return_value = {"status": "unavailable", "samples": [], "sample_count": 0}
+        with (
+            patch.object(external_load, "_ProcessCpuSampler", return_value=sampler),
+            patch.object(external_load, "_run_load_impl", side_effect=ExternalLoadError("fixture")),
+            self.assertRaises(ExternalLoadError),
+        ):
+            run_load()
+        sampler.start.assert_called_once_with()
+        sampler.stop.assert_called_once_with()
+
+    def test_run_load_attaches_only_cpu_intervals_inside_its_window(self) -> None:
+        sampler = Mock()
+        sampler.stop.return_value = {
+            "schema": 1,
+            "status": "complete",
+            "scope": "load_worker_process",
+            "sample_interval_ms": 1000,
+            "affinity_cpu_count": 2,
+            "effective_cpu_capacity_cores": None,
+            "cpu_capacity_status": "unknown",
+            "sample_count": 3,
+            "samples": [
+                {
+                    "interval_started_at": "2026-10-11T10:00:00Z",
+                    "timestamp": "2026-10-11T10:00:01Z",
+                    "interval_elapsed_ms": 1000,
+                    "process_cpu_percent": 20.0,
+                },
+                {
+                    "interval_started_at": "2026-10-11T10:00:01Z",
+                    "timestamp": "2026-10-11T10:00:02Z",
+                    "interval_elapsed_ms": 1000,
+                    "process_cpu_percent": 25.0,
+                },
+                {
+                    "interval_started_at": "2026-10-11T10:00:02Z",
+                    "timestamp": "2026-10-11T10:00:03Z",
+                    "interval_elapsed_ms": 1000,
+                    "process_cpu_percent": 30.0,
+                },
+            ],
+        }
+        report_source = {
+            "started_at": "2026-10-11T10:00:00.5Z",
+            "finished_at": "2026-10-11T10:00:02.5Z",
+        }
+        with (
+            patch.object(external_load, "_ProcessCpuSampler", return_value=sampler),
+            patch.object(external_load, "_run_load_impl", return_value=report_source),
+        ):
+            report = run_load()
+        sampler.start.assert_called_once_with()
+        sampler.stop.assert_called_once_with()
+        usage = report["client_resource_usage"]
+        self.assertEqual(usage["status"], "complete")
+        self.assertEqual(usage["sample_count"], 1)
+        self.assertEqual(usage["samples"][0]["timestamp"], "2026-10-11T10:00:02Z")
+
     def test_progress_callback_reports_only_completed_status_aggregates(self) -> None:
         users = [
             VirtualUser(f"progress-{index}", "synthetic", "s" * 32, "c" * 32)

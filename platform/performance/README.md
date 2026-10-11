@@ -211,6 +211,16 @@ spike and capacity report; a percentile from a partial population is not a
 passing result. The executable rule is
 [`timing_summary_is_complete`](../tools/platform_load_acceptance.py).
 
+The public client report also carries a bounded UTC run window, ordered phase
+windows and process-CPU intervals. A CPU interval is publishable only when
+its full monotonic-measured interval lies inside the run window; an incomplete,
+malformed, or truncated series remains explicitly non-complete. Effective
+client CPU capacity is reported only when affinity and every visible cgroup-v2
+ancestor quota are valid; otherwise capacity is unknown. Observer resource
+timelines follow the same all-or-nothing rule, with a 4,096-row cap. These
+fields align client and server observations; they do not imply whole-window
+coverage when either report says unavailable or incomplete.
+
 For production external profiles that require exact origin evidence, the
 observer binding's `fixture_marker` and `external_run_id` must match the
 fixture and external workflow run, and it must report `complete=true` before

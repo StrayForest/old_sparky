@@ -171,6 +171,219 @@ class EvidencePrivacyTests(unittest.TestCase):
         )
         self.assertNotIn("source_git_sha", legacy)
 
+    def test_external_load_cpu_usage_projection_requires_complete_in_window_samples(self) -> None:
+        base: dict[str, object] = {
+            "started_at": "2026-10-11T10:00:00Z",
+            "finished_at": "2026-10-11T10:00:03Z",
+            "phase_windows": [
+                {
+                    "phase": "read_burst",
+                    "started_at": "2026-10-11T10:00:00.5Z",
+                    "finished_at": "2026-10-11T10:00:02.5Z",
+                }
+            ],
+            "client_resource_usage": {
+                "schema": 1,
+                "status": "complete",
+                "scope": "load_worker_process",
+                "sample_interval_ms": 1000,
+                "affinity_cpu_count": 4,
+                "effective_cpu_capacity_cores": 2.0,
+                "cpu_capacity_status": "known",
+                "sample_count": 1,
+                "samples": [
+                    {
+                        "interval_started_at": "2026-10-11T10:00:01Z",
+                        "timestamp": "2026-10-11T10:00:02Z",
+                        "interval_elapsed_ms": 1000.0,
+                        "process_cpu_percent": 135.5,
+                        "pid": 1234,
+                        "request_id": "private-id",
+                    }
+                ],
+            },
+        }
+        projected = project_public_artifact("external_load", base)
+        self.assertEqual(projected["run_window_status"], "complete")
+        self.assertEqual(projected["phase_windows_status"], "complete")
+        usage = projected["client_resource_usage"]
+        self.assertEqual(usage["status"], "complete")
+        self.assertEqual(usage["cpu_capacity_status"], "known")
+        self.assertEqual(usage["effective_cpu_capacity_cores"], 2.0)
+        self.assertEqual(usage["sample_count"], 1)
+        serialized_usage = serialized(usage)
+        self.assertNotIn("private-id", serialized_usage)
+        self.assertNotIn("1234", serialized_usage)
+
+        outside = copy.deepcopy(base)
+        outside["client_resource_usage"]["samples"][0]["interval_started_at"] = "2026-10-11T09:59:59Z"  # type: ignore[index]
+        outside_projection = project_public_artifact("external_load", outside)
+        self.assertEqual(outside_projection["client_resource_usage"]["status"], "incomplete")
+        self.assertEqual(outside_projection["client_resource_usage"]["samples"], [])
+        self.assertEqual(outside_projection["client_resource_usage"]["sample_count"], 0)
+
+        malformed_phase = copy.deepcopy(base)
+        malformed_phase["phase_windows"] = [
+            {
+                "phase": "read_burst",
+                "started_at": "2026-10-11T10:00:02Z",
+                "finished_at": "2026-10-11T10:00:01Z",
+            }
+        ]
+        self.assertEqual(
+            project_public_artifact("external_load", malformed_phase)["phase_windows_status"],
+            "invalid",
+        )
+
+        legacy = project_public_artifact("external_load", {"status": "complete"})
+        self.assertEqual(legacy["run_window_status"], "unavailable")
+        self.assertEqual(legacy["client_resource_usage"]["status"], "unavailable")
+        self.assertEqual(legacy["client_resource_usage"]["cpu_capacity_status"], "unknown")
+        self.assertNotIn("effective_cpu_capacity_cores", legacy["client_resource_usage"])
+
+        inconsistent_capacity = copy.deepcopy(base)
+        inconsistent_capacity["client_resource_usage"]["cpu_capacity_status"] = "unknown"  # type: ignore[index]
+        inconsistent = project_public_artifact("external_load", inconsistent_capacity)
+        self.assertEqual(
+            inconsistent["client_resource_usage"]["cpu_capacity_status"], "unknown"
+        )
+        self.assertNotIn(
+            "effective_cpu_capacity_cores", inconsistent["client_resource_usage"]
+        )
+
+        for status in ("incomplete", "unavailable", "truncated"):
+            with self.subTest(status=status):
+                partial = copy.deepcopy(base)
+                partial["client_resource_usage"]["status"] = status  # type: ignore[index]
+                partial_projection = project_public_artifact("external_load", partial)
+                self.assertEqual(
+                    partial_projection["client_resource_usage"]["status"], status
+                )
+                self.assertEqual(
+                    partial_projection["client_resource_usage"]["sample_count"], 0
+                )
+                self.assertEqual(
+                    partial_projection["client_resource_usage"]["samples"], []
+                )
+
+        capped = copy.deepcopy(base)
+        capped["client_resource_usage"]["sample_count"] = 4097  # type: ignore[index]
+        capped["client_resource_usage"]["samples"] = [{}] * 4097  # type: ignore[index]
+        capped_projection = project_public_artifact("external_load", capped)
+        self.assertEqual(capped_projection["client_resource_usage"]["status"], "truncated")
+        self.assertEqual(capped_projection["client_resource_usage"]["samples"], [])
+
+    def test_public_observer_timeline_is_whole_bounded_ordered_and_windowed(self) -> None:
+        # SystemSampler emits process groups under `processes`; the observer
+        # turns those into the fixed api_process/web_process fields consumed
+        # by the public sanitizer. Keep this representative boundary in one
+        # owner so a source-shape change cannot silently erase process CPU.
+        sampler_row: dict[str, object] = {
+            "timestamp": "2026-10-11T10:00:01Z",
+            "cpu_per_core_percent": {"cpu0": 12.5, "host-secret": 100},
+            "cpu_steal_per_core_percent": {"cpu0": 0.0},
+            "postgres_cpu_percent": 4.0,
+            "processes": {
+                "deadlock-api": {
+                    "process_count": 2,
+                    "cpu_percent": 35.0,
+                    "rss_bytes": 1200,
+                    "read_bytes_per_second": 10.0,
+                    "write_bytes_per_second": 5.0,
+                    "pid": 4321,
+                },
+                "deadlock-web": {
+                    "process_count": 1,
+                    "cpu_percent": 12.0,
+                    "rss_bytes": 2400,
+                    "read_bytes_per_second": 2.0,
+                    "write_bytes_per_second": 1.0,
+                },
+            },
+            "api_connections": {"established": 4, "total": 5},
+        }
+        observer_row = {
+            "timestamp": sampler_row["timestamp"],
+            "cpu_per_core_percent": sampler_row["cpu_per_core_percent"],
+            "cpu_steal_per_core_percent": sampler_row["cpu_steal_per_core_percent"],
+            "postgres_cpu_percent": sampler_row["postgres_cpu_percent"],
+            "api_connections": sampler_row["api_connections"],
+            "api_process": sampler_row["processes"]["deadlock-api"],  # type: ignore[index]
+            "web_process": sampler_row["processes"]["deadlock-web"],  # type: ignore[index]
+        }
+        source: dict[str, object] = {
+            "started_at": "2026-10-11T10:00:00Z",
+            "finished_at": "2026-10-11T10:00:03Z",
+            "system": {
+                "samples": 2,
+                "timeline": [
+                    observer_row,
+                    {
+                        "timestamp": "2026-10-11T10:00:02Z",
+                        "cpu_per_core_percent": {"cpu0": 20.0},
+                        "cpu_steal_per_core_percent": None,
+                        "postgres_cpu_percent": None,
+                        "api_connections": None,
+                        "api_process": None,
+                        "web_process": None,
+                        "postgres_waits": None,
+                        "celery_backlog": None,
+                    },
+                ],
+            },
+        }
+        projected = project_public_artifact("server_observability", source)
+        system = projected["system"]
+        self.assertEqual(system["timeline_status"], "complete")
+        self.assertEqual(len(system["timeline"]), 2)
+        first_public_row = system["timeline"][0]
+        self.assertEqual(first_public_row["processes"]["deadlock-api"]["cpu_percent"], 35.0)
+        self.assertEqual(first_public_row["processes"]["deadlock-web"]["cpu_percent"], 12.0)
+        self.assertEqual(first_public_row["api_connections"], {"established": 4, "total": 5})
+        self.assertEqual(system["timeline"][1], {
+            "timestamp": "2026-10-11T10:00:02+00:00",
+            "cpu_per_core_percent": {"cpu0": 20.0},
+        })
+        serialized_timeline = serialized(system["timeline"])
+        for forbidden in ("host-secret", "private-request", "4321", "pid"):
+            self.assertNotIn(forbidden, serialized_timeline)
+
+        out_of_window = copy.deepcopy(source)
+        out_of_window["system"]["timeline"][1]["timestamp"] = "2026-10-11T10:00:04Z"  # type: ignore[index]
+        invalid = project_public_artifact("server_observability", out_of_window)["system"]
+        self.assertEqual(invalid["timeline_status"], "invalid")
+        self.assertNotIn("timeline", invalid)
+
+        malformed_metric = copy.deepcopy(source)
+        malformed_metric["system"]["timeline"][0]["cpu_per_core_percent"]["cpu0"] = float("nan")  # type: ignore[index]
+        invalid_metric = project_public_artifact(
+            "server_observability", malformed_metric
+        )["system"]
+        self.assertEqual(invalid_metric["timeline_status"], "invalid")
+        self.assertNotIn("timeline", invalid_metric)
+
+        oversized = copy.deepcopy(source)
+        oversized["system"]["samples"] = 4097  # type: ignore[index]
+        oversized["system"]["timeline"] = source["system"]["timeline"] * 2049  # type: ignore[index]
+        truncated = project_public_artifact("server_observability", oversized)["system"]
+        self.assertEqual(truncated["timeline_status"], "truncated")
+        self.assertNotIn("timeline", truncated)
+
+        full_hour = copy.deepcopy(source)
+        full_hour["finished_at"] = "2026-10-11T12:00:00Z"
+        full_hour["system"]["samples"] = 3600  # type: ignore[index]
+        full_hour["system"]["timeline"] = [  # type: ignore[index]
+            {
+                "timestamp": f"2026-10-11T{10 + index // 3600:02}:"
+                f"{(index % 3600) // 60:02}:{index % 60:02}Z",
+                "cpu_per_core_percent": {"cpu0": 30.0},
+            }
+            for index in range(3600)
+        ]
+        accepted = project_public_artifact("server_observability", full_hour)["system"]
+        self.assertEqual(accepted["timeline_status"], "complete")
+        self.assertEqual(len(accepted["timeline"]), 3600)
+
     def test_server_observability_projects_only_safe_request_perf_sampling_fields(
         self,
     ) -> None:
