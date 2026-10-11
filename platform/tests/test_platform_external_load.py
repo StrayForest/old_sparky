@@ -172,6 +172,14 @@ class ExternalLoadTests(unittest.TestCase):
             1.5,
         )
         self.assertEqual(
+            external_load._effective_cpu_capacity_details(
+                cgroup_text="0::/tenant/job\n",
+                cpu_max_reader=reader,
+                affinity_cpu_count=8,
+            ),
+            (1.5, "known"),
+        )
+        self.assertEqual(
             external_load._effective_cpu_capacity_cores(
                 cgroup_text="0::/tenant/job\n",
                 cpu_max_reader=lambda path: "max 100000\n",
@@ -216,6 +224,22 @@ class ExternalLoadTests(unittest.TestCase):
                 return "250000 100000\n"
             raise FileNotFoundError
 
+        self.assertEqual(
+            external_load._effective_cpu_capacity_details(
+                cgroup_text="0::/tenant/job\n",
+                cpu_max_reader=missing_ancestor,
+                affinity_cpu_count=8,
+            ),
+            (None, "cpu_max_missing"),
+        )
+        self.assertEqual(
+            external_load._effective_cpu_capacity_details(
+                cgroup_text="0::/tenant/../private/path\n",
+                cpu_max_reader=reader,
+                affinity_cpu_count=8,
+            ),
+            (None, "cgroup_path_invalid"),
+        )
         self.assertIsNone(
             external_load._effective_cpu_capacity_cores(
                 cgroup_text="0::/tenant/job\n",

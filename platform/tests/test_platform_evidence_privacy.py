@@ -21,6 +21,7 @@ from tools.platform_evidence_sanitizer import (
 )
 from tools.platform_external_load import RequestResult, summarize_results
 from tools.platform_external_load_observer import (
+    _public_timeline_sample_row,
     _safe_postgres_wait_snapshot,
     _safe_process_lifecycle,
     postgres_statement_delta,
@@ -189,6 +190,7 @@ class EvidencePrivacyTests(unittest.TestCase):
                 "sample_interval_ms": 1000,
                 "affinity_cpu_count": 4,
                 "effective_cpu_capacity_cores": 2.0,
+                "cpu_capacity_reason": "known",
                 "cpu_capacity_status": "known",
                 "sample_count": 1,
                 "samples": [
@@ -209,6 +211,7 @@ class EvidencePrivacyTests(unittest.TestCase):
         usage = projected["client_resource_usage"]
         self.assertEqual(usage["status"], "complete")
         self.assertEqual(usage["cpu_capacity_status"], "known")
+        self.assertEqual(usage["cpu_capacity_reason"], "known")
         self.assertEqual(usage["effective_cpu_capacity_cores"], 2.0)
         self.assertEqual(usage["sample_count"], 1)
         serialized_usage = serialized(usage)
@@ -243,12 +246,30 @@ class EvidencePrivacyTests(unittest.TestCase):
 
         inconsistent_capacity = copy.deepcopy(base)
         inconsistent_capacity["client_resource_usage"]["cpu_capacity_status"] = "unknown"  # type: ignore[index]
+        inconsistent_capacity["client_resource_usage"]["cpu_capacity_reason"] = "cpu_max_missing"  # type: ignore[index]
         inconsistent = project_public_artifact("external_load", inconsistent_capacity)
         self.assertEqual(
             inconsistent["client_resource_usage"]["cpu_capacity_status"], "unknown"
         )
         self.assertNotIn(
             "effective_cpu_capacity_cores", inconsistent["client_resource_usage"]
+        )
+        self.assertEqual(
+            inconsistent["client_resource_usage"]["cpu_capacity_reason"],
+            "cpu_max_missing",
+        )
+
+        malformed_capacity_reason = copy.deepcopy(inconsistent_capacity)
+        malformed_capacity_reason["client_resource_usage"]["cpu_capacity_reason"] = (
+            "/sys/fs/cgroup/private/job/cpu.max"
+        )  # type: ignore[index]
+        malformed_reason_projection = project_public_artifact(
+            "external_load", malformed_capacity_reason
+        )
+        malformed_usage = malformed_reason_projection["client_resource_usage"]
+        self.assertEqual(malformed_usage["cpu_capacity_reason"], "unknown")
+        self.assertNotIn(
+            "/sys/fs/cgroup", serialized(malformed_reason_projection)
         )
 
         for status in ("incomplete", "unavailable", "truncated"):
@@ -283,6 +304,11 @@ class EvidencePrivacyTests(unittest.TestCase):
             "cpu_per_core_percent": {"cpu0": 12.5, "host-secret": 100},
             "cpu_steal_per_core_percent": {"cpu0": 0.0},
             "postgres_cpu_percent": 4.0,
+            "postgres_tcp_connections": {
+                "total": 27,
+                "established": 9,
+                "private_backend_label": "must-not-be-published",
+            },
             "processes": {
                 "deadlock-api": {
                     "process_count": 2,
@@ -302,15 +328,7 @@ class EvidencePrivacyTests(unittest.TestCase):
             },
             "api_connections": {"established": 4, "total": 5},
         }
-        observer_row = {
-            "timestamp": sampler_row["timestamp"],
-            "cpu_per_core_percent": sampler_row["cpu_per_core_percent"],
-            "cpu_steal_per_core_percent": sampler_row["cpu_steal_per_core_percent"],
-            "postgres_cpu_percent": sampler_row["postgres_cpu_percent"],
-            "api_connections": sampler_row["api_connections"],
-            "api_process": sampler_row["processes"]["deadlock-api"],  # type: ignore[index]
-            "web_process": sampler_row["processes"]["deadlock-web"],  # type: ignore[index]
-        }
+        observer_row = _public_timeline_sample_row(sampler_row)
         source: dict[str, object] = {
             "started_at": "2026-10-11T10:00:00Z",
             "finished_at": "2026-10-11T10:00:03Z",
@@ -340,12 +358,22 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(first_public_row["processes"]["deadlock-api"]["cpu_percent"], 35.0)
         self.assertEqual(first_public_row["processes"]["deadlock-web"]["cpu_percent"], 12.0)
         self.assertEqual(first_public_row["api_connections"], {"established": 4, "total": 5})
+        self.assertEqual(first_public_row["postgres_tcp_established_connections"], 9)
         self.assertEqual(system["timeline"][1], {
             "timestamp": "2026-10-11T10:00:02+00:00",
             "cpu_per_core_percent": {"cpu0": 20.0},
         })
         serialized_timeline = serialized(system["timeline"])
-        for forbidden in ("host-secret", "private-request", "4321", "pid"):
+        for forbidden in (
+            "host-secret",
+            "private-request",
+            "4321",
+            "pid",
+            "private_backend_label",
+            "must-not-be-published",
+            '"postgres_tcp_connections"',
+            '"total": 27',
+        ):
             self.assertNotIn(forbidden, serialized_timeline)
 
         out_of_window = copy.deepcopy(source)

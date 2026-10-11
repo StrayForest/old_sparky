@@ -1497,6 +1497,42 @@ def _safe_process_lifecycle(value: object) -> dict[str, dict[str, int]]:
     return output
 
 
+def _public_timeline_sample_row(sample: dict[str, object]) -> dict[str, object]:
+    """Project one producer sample into the closed public timeline shape."""
+
+    tcp_connections = sample.get("postgres_tcp_connections")
+    postgres_tcp_established: object = None
+    if isinstance(tcp_connections, dict):
+        postgres_tcp_established = tcp_connections.get("established")
+    waits = sample.get("postgres_waits")
+    safe_waits = _safe_postgres_wait_snapshot(waits)
+    processes = sample.get("processes")
+    if not isinstance(processes, dict):
+        processes = {}
+    return {
+        "timestamp": sample.get("timestamp"),
+        "cpu_per_core_percent": sample.get("cpu_per_core_percent"),
+        "cpu_steal_per_core_percent": sample.get("cpu_steal_per_core_percent"),
+        "postgres_cpu_percent": sample.get("postgres_cpu_percent"),
+        "api_connections": sample.get("api_connections"),
+        "postgres_tcp_established_connections": postgres_tcp_established,
+        "postgres_backend_connections": safe_waits.get("backend_connections"),
+        "postgres_backend_ownership": safe_waits.get("backend_ownership", {}),
+        "tcp_socket_states": sample.get("tcp_socket_states"),
+        "tcp_listen_counters": sample.get("tcp_listen_counters"),
+        "conntrack": sample.get("conntrack"),
+        "process_lifecycle": _safe_process_lifecycle(
+            sample.get("process_lifecycle")
+        ),
+        "redis_connections": sample.get("redis_connections"),
+        "gunicorn": sample.get("gunicorn"),
+        "postgres_waits": safe_waits,
+        "celery_backlog": sample.get("celery_backlog"),
+        "api_process": processes.get("deadlock-api"),
+        "web_process": processes.get("deadlock-web"),
+    }
+
+
 async def async_main() -> int:
     args = parse_args()
     progress_command_status = _record_progress_from_args(args)
@@ -1623,35 +1659,7 @@ async def async_main() -> int:
 
     system_summary = sampler.summary()
     system_summary["timeline"] = [
-        {
-            "timestamp": sample.get("timestamp"),
-            "cpu_per_core_percent": sample.get("cpu_per_core_percent"),
-            "cpu_steal_per_core_percent": sample.get("cpu_steal_per_core_percent"),
-            "postgres_cpu_percent": sample.get("postgres_cpu_percent"),
-            "api_connections": sample.get("api_connections"),
-            "postgres_tcp_established_connections": sample.get("postgres_tcp_connections"),
-            "postgres_backend_connections": (
-                (sample.get("postgres_waits") or {}).get("backend_connections")
-            ),
-            "postgres_backend_ownership": _safe_postgres_wait_snapshot(
-                sample.get("postgres_waits")
-            ).get("backend_ownership", {}),
-            "tcp_socket_states": sample.get("tcp_socket_states"),
-            "tcp_listen_counters": sample.get("tcp_listen_counters"),
-            "conntrack": sample.get("conntrack"),
-            "process_lifecycle": _safe_process_lifecycle(
-                sample.get("process_lifecycle")
-            ),
-            "redis_connections": sample.get("redis_connections"),
-            "gunicorn": sample.get("gunicorn"),
-            "postgres_waits": _safe_postgres_wait_snapshot(
-                sample.get("postgres_waits")
-            ),
-            "celery_backlog": sample.get("celery_backlog"),
-            "api_process": (sample.get("processes") or {}).get("deadlock-api"),
-            "web_process": (sample.get("processes") or {}).get("deadlock-web"),
-        }
-        for sample in sampler.samples
+        _public_timeline_sample_row(sample) for sample in sampler.samples
     ]
 
     if progress is not None:

@@ -2695,8 +2695,26 @@ def _project_client_resource_usage(
     if not isinstance(effective_capacity, bool):
         effective_number = finite_number(effective_capacity)
     capacity_status = source.get("cpu_capacity_status")
+    capacity_reason = source.get("cpu_capacity_reason")
+    allowed_capacity_reasons = {
+        "known",
+        "cgroup_record_unavailable",
+        "cgroup_record_invalid",
+        "cgroup_v2_unavailable",
+        "cgroup_path_invalid",
+        "cpu_max_missing",
+        "cpu_max_unavailable",
+        "cpu_max_invalid",
+        "cgroup_ancestor_limit",
+        "affinity_unavailable",
+        "affinity_invalid",
+        "cgroup_capacity_unavailable",
+    }
+    if capacity_reason not in allowed_capacity_reasons:
+        capacity_reason = "unknown"
     if (
         capacity_status == "known"
+        and capacity_reason == "known"
         and effective_number is not None
         and 0 < effective_number <= 4096
     ):
@@ -2704,6 +2722,9 @@ def _project_client_resource_usage(
         output["cpu_capacity_status"] = "known"
     else:
         output["cpu_capacity_status"] = "unknown"
+        if capacity_status == "known" or capacity_reason == "known":
+            capacity_reason = "unknown"
+    output["cpu_capacity_reason"] = capacity_reason
     raw_rows = source.get("samples")
     expected = _copy_int(source, "sample_count")
     if not isinstance(raw_rows, list):

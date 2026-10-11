@@ -216,10 +216,12 @@ windows and process-CPU intervals. A CPU interval is publishable only when
 its full monotonic-measured interval lies inside the run window; an incomplete,
 malformed, or truncated series remains explicitly non-complete. Effective
 client CPU capacity is reported only when affinity and every visible cgroup-v2
-ancestor quota are valid; otherwise capacity is unknown. Observer resource
-timelines follow the same all-or-nothing rule, with a 4,096-row cap. These
-fields align client and server observations; they do not imply whole-window
-coverage when either report says unavailable or incomplete.
+ancestor quota are valid; otherwise capacity is unknown with a closed,
+path-free reason category. Observer resource timelines follow the same
+all-or-nothing rule, with a 4,096-row cap; a present malformed selected metric
+invalidates the series, while an absent optional metric remains unavailable.
+These fields align client and server observations; they do not imply
+whole-window coverage when either report says unavailable or incomplete.
 
 For production external profiles that require exact origin evidence, the
 observer binding's `fixture_marker` and `external_run_id` must match the

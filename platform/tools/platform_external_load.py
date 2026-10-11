@@ -111,26 +111,27 @@ _DEFAULT_HTTPS_CONTEXT_LOCK = threading.Lock()
 _DEFAULT_HTTPS_CONTEXT: ssl.SSLContext | None = None
 
 
-def _effective_cpu_capacity_cores(
+def _effective_cpu_capacity_details(
     *,
     cgroup_text: str | None = None,
     cpu_max_reader: Callable[[Path], str] | None = None,
     affinity_cpu_count: int | None = None,
-) -> float | None:
-    """Return a bounded cgroup-v2/affinity CPU ceiling, or UNKNOWN.
+) -> tuple[float | None, str]:
+    """Return bounded CPU capacity and a path-free reason category.
 
     The optional inputs are a narrow parser seam for unit tests. Production
     reads only the process cgroup record and `cpu.max` files on its ancestor
-    chain; no host-wide process or mount scan is performed.
+    chain; no host-wide process or mount scan is performed. Failure categories
+    expose neither filesystem paths nor exception text.
     """
 
     if cgroup_text is None:
         try:
             cgroup_text = _read_bounded_ascii(Path("/proc/self/cgroup"))
         except (OSError, UnicodeError, ValueError):
-            return None
+            return None, "cgroup_record_unavailable"
     if not isinstance(cgroup_text, str) or len(cgroup_text) > CLIENT_CGROUP_LINE_LIMIT:
-        return None
+        return None, "cgroup_record_invalid"
     cgroup_path: str | None = None
     for line in cgroup_text.splitlines():
         if line.startswith("0::"):
@@ -143,7 +144,7 @@ def _effective_cpu_capacity_cores(
         or "\x00" in cgroup_path
         or ".." in Path(cgroup_path).parts
     ):
-        return None
+        return None, "cgroup_v2_unavailable" if cgroup_path is None else "cgroup_path_invalid"
     reader = cpu_max_reader
     if reader is None:
         def reader(path: Path) -> str:
@@ -155,11 +156,11 @@ def _effective_cpu_capacity_cores(
         )
         mount = Path("/sys/fs/cgroup").resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
-        return None
+        return None, "cgroup_path_invalid"
     try:
         directory.relative_to(mount)
     except ValueError:
-        return None
+        return None, "cgroup_path_invalid"
     quota_cores: list[float] = []
     current = directory
     for _ in range(CLIENT_CGROUP_ANCESTOR_LIMIT):
@@ -168,25 +169,28 @@ def _effective_cpu_capacity_cores(
         except FileNotFoundError:
             # A missing ancestor could hide a tighter quota, so capacity is
             # unknown instead of being inferred from a partial chain.
-            return None
+            return None, "cpu_max_missing"
         except (OSError, UnicodeError, ValueError):
-            return None
+            return None, "cpu_max_unavailable"
         if not isinstance(raw, str) or len(raw) > CLIENT_CGROUP_LINE_LIMIT:
-            return None
+            return None, "cpu_max_invalid"
         fields = raw.split()
         if (
             len(fields) != 2
             or not fields[1].isdigit()
             or int(fields[1]) <= 0
         ):
-            return None
+            return None, "cpu_max_invalid"
         if fields[0] != "max":
             if not fields[0].isdigit():
-                return None
+                return None, "cpu_max_invalid"
             quota, period = int(fields[0]), int(fields[1])
             if quota <= 0:
-                return None
-            quota_cores.append(quota / period)
+                return None, "cpu_max_invalid"
+            try:
+                quota_cores.append(quota / period)
+            except OverflowError:
+                return None, "cpu_max_invalid"
         if current == mount:
             break
         parent = current.parent
@@ -196,17 +200,33 @@ def _effective_cpu_capacity_cores(
             break
         current = parent
     else:
-        return None
+        return None, "cgroup_ancestor_limit"
     if affinity_cpu_count is None:
-        return None
+        return None, "affinity_unavailable"
     if type(affinity_cpu_count) is not int or not 1 <= affinity_cpu_count <= 4096:
-        return None
+        return None, "affinity_invalid"
     if not quota_cores:
-        return float(affinity_cpu_count)
+        return float(affinity_cpu_count), "known"
     quota_ceiling = min(quota_cores)
     if not math.isfinite(quota_ceiling) or quota_ceiling <= 0:
-        return None
-    return min(float(affinity_cpu_count), quota_ceiling)
+        return None, "cpu_max_invalid"
+    return min(float(affinity_cpu_count), quota_ceiling), "known"
+
+
+def _effective_cpu_capacity_cores(
+    *,
+    cgroup_text: str | None = None,
+    cpu_max_reader: Callable[[Path], str] | None = None,
+    affinity_cpu_count: int | None = None,
+) -> float | None:
+    """Return a bounded cgroup-v2/affinity CPU ceiling, or UNKNOWN."""
+
+    capacity, _reason = _effective_cpu_capacity_details(
+        cgroup_text=cgroup_text,
+        cpu_max_reader=cpu_max_reader,
+        affinity_cpu_count=affinity_cpu_count,
+    )
+    return capacity
 
 
 def _read_bounded_ascii(path: Path) -> str:
@@ -236,11 +256,15 @@ class _ProcessCpuSampler:
         except (AttributeError, OSError, ValueError):
             self.affinity_cpu_count = None
         try:
-            self.effective_cpu_capacity_cores = _effective_cpu_capacity_cores(
+            (
+                self.effective_cpu_capacity_cores,
+                self.cpu_capacity_reason,
+            ) = _effective_cpu_capacity_details(
                 affinity_cpu_count=self.affinity_cpu_count
             )
         except (OSError, OverflowError, RuntimeError, TypeError, ValueError):
             self.effective_cpu_capacity_cores = None
+            self.cpu_capacity_reason = "cgroup_capacity_unavailable"
 
     def start(self) -> None:
         try:
@@ -322,6 +346,7 @@ class _ProcessCpuSampler:
             "sample_interval_ms": int(CLIENT_CPU_SAMPLE_INTERVAL_SECONDS * 1000),
             "affinity_cpu_count": self.affinity_cpu_count,
             "effective_cpu_capacity_cores": self.effective_cpu_capacity_cores,
+            "cpu_capacity_reason": self.cpu_capacity_reason,
             "cpu_capacity_status": (
                 "known" if self.effective_cpu_capacity_cores is not None else "unknown"
             ),
