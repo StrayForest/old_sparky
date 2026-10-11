@@ -1872,7 +1872,10 @@ else:
 
         helper = release / "tools" / "platform_release_transaction.py"
         source = helper.read_text(encoding="utf-8")
-        needle = "    except TransactionError as exc:\n"
+        needle = (
+            "    except TransactionError as exc:\n"
+            "        # Error details can contain private release/shared paths from the\n"
+        )
         self.assertEqual(source.count(needle), 1)
         diagnostic = (
             "        try:\n"

@@ -66,6 +66,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tests/test_platform_release_build_contract.py",
         "platform/tests/test_platform_release_build_diagnostics.py",
         "platform/tests/test_platform_release_recovery_boundaries.py",
+        "platform/tests/test_platform_release_retention.py",
         "platform/tests/test_platform_storage_maintenance.py",
         "platform/tests/test_platform_release_systemd_state.py",
         "platform/tests/test_platform_release_venv_rollback.py",
@@ -82,6 +83,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_live_qa_runtime_install.py",
         "platform/tools/platform_production_classifier_artifact.py",
         "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_release_retention.py",
         "platform/tools/platform_tournament_list_read_model_recovery.py",
         "platform/tools/platform_release_restore_runtime.sh",
         "platform/tools/platform_production_deploy_supervisor.sh",
@@ -103,9 +105,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/python_packages/platform_infra/db.py",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 63
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 65
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "d542d27ef613aae1c67ae9778bae97f4f68340d05a3e87fe9eb2c7704cd65bfb"
+    "0656d020f21dda9ae2dc796da5b863f5ca84f905ac32616208499085d6b63907"
 )
 
 # These paths are deliberately present in the recovery route allowlist but are
@@ -160,6 +162,7 @@ RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
         "platform/tests/test_platform_db.py",
         "platform/tests/test_platform_release_audit_hardening.py",
         "platform/tests/test_platform_release_recovery_boundaries.py",
+        "platform/tests/test_platform_release_retention.py",
         "platform/tests/test_platform_storage_maintenance.py",
         "platform/tools/platform_ci_classifier.py",
         "platform/tools/platform_install_nginx.py",
@@ -169,6 +172,7 @@ RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
         "platform/tools/platform_production_deploy_supervisor.sh",
         "platform/tools/platform_recover_pending.sh",
         "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_release_retention.py",
         "platform/tools/platform_tournament_list_read_model_recovery.py",
         "platform/tools/platform_release_restore_runtime.sh",
         "platform/tools/platform_release_transaction.py",
@@ -183,9 +187,9 @@ RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
         "platform/tools/platform_workflow_remote_dispatch.py",
     }
 )
-RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT = 41
+RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT = 43
 RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST = (
-    "b652927afc218ffa583265a74facec3ca531c453b20fb9519bee8029dc4695bd"
+    "efde01f81ace41eba0be44093484a7941768df99cf951fe5e3c4fc0b8560d8c8"
 )
 
 
@@ -994,7 +998,11 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         release_recover = (REPO_ROOT / ".github/workflows/platform-production-release-recover.yml").read_text(encoding="utf-8")
         self.assertIn('"platform_release_systemd_state.py:444"', release_recover)
         self.assertIn('"platform_release_transaction.py:444"', release_recover)
-        self.assertIn('"platform_release_retention.py:555"', release_recover)
+        self.assertIn(
+            f'"platform_release_retention.py:{recovery.DATA_MODE:o}"',
+            release_recover,
+        )
+        self.assertNotIn('"platform_release_retention.py:555"', release_recover)
         self.assertIn('"platform_recover_pending.sh:555"', release_recover)
         self.assertIn("validate-generation", release_recover)
         self.assertIn("platform_recover_pending.sh", release_recover)

@@ -124,6 +124,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self,
     ) -> None:
         generation = self.install_recovery_generation()
+        retention_helper = (generation / "platform_release_retention.py").lstat()
+        self.assertEqual(stat.S_IMODE(retention_helper.st_mode), recovery.DATA_MODE)
         candidate = self.create_wrapper_transaction(None, None, "first-install")
         systemctl, systemctl_log = self.write_failing_systemctl("first-install")
 

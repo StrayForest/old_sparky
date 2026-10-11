@@ -2333,7 +2333,14 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn("exec 9<", recover)
         self.assertNotIn("flock -n 9", recover)
         self.assertNotIn("PLATFORM_RELEASE_LOCK_FD=9", recover)
-        self.assertIn("--capability recover_pending", recover)
+        self.assertIn('recovery_capability="$recovery_action"', recover)
+        self.assertIn('--capability "$recovery_capability"', recover)
+        self.assertIn(
+            '[[ "$recovery_action" == recover_pending || '
+            '"$recovery_action" == quarantine_populated_quiesce || '
+            '"$recovery_action" == prune_task_releases ]]',
+            recover,
+        )
         self.assertIn('generation_name="$bundle_sha"', recover)
         self.assertIn("trusted_generation=\"$runtime/shared/.release-recovery/generations/$generation_name\"", recover)
         self.assertIn("platform_recover_pending.sh", recover)
@@ -2429,7 +2436,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertEqual(validated.returncode, 0, validated.stderr)
             validation_result = json.loads(validated.stdout)
             self.assertEqual(validation_result["capability"], "recovery_bootstrap")
-            self.assertEqual(validation_result["capabilities"], ["abort_retained_only", "recover_pending"])
+            self.assertEqual(
+                validation_result["capabilities"],
+                platform_recovery_bootstrap.RECOVERY_CAPABILITIES,
+            )
             self.assertEqual(validation_result["deployable"], False)
             missing_bundle = root / "missing-import.zip"
             with zipfile.ZipFile(bundle) as original, zipfile.ZipFile(
@@ -2468,7 +2478,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         )
         for key in input_keys:
             self.assertIn(f"check_recovery_input {key} ", recover)
-        self.assertIn("RECOVERY_INPUTS schema=1 count=13 status=valid", recover)
+        self.assertIn("checked_input_count=13", recover)
+        self.assertIn('if [[ "$RECOVERY_ACTION" == prune_task_releases ]]; then', recover)
+        self.assertIn("checked_input_count=16", recover)
+        self.assertIn(
+            "printf 'RECOVERY_INPUTS schema=1 count=%s status=valid\\n' \"$checked_input_count\"",
+            recover,
+        )
         self.assertIn("RECOVERY_INPUT_INVALID schema=1 key=%s\\n", recover)
         output_copy_start = recover.index('          {\n            echo "source_sha=')
         output_copy_end_marker = '          } >> "$GITHUB_OUTPUT"'

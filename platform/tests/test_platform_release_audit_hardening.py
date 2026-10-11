@@ -341,7 +341,14 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("Transfer exact attested recovery bundle", recover_workflow)
         self.assertIn('"$bootstrap_tool" install', recover_workflow)
-        self.assertIn("--capability recover_pending", recover_workflow)
+        self.assertIn('recovery_capability="$recovery_action"', recover_workflow)
+        self.assertIn('--capability "$recovery_capability"', recover_workflow)
+        self.assertIn(
+            '[[ "$recovery_action" == recover_pending || '
+            '"$recovery_action" == quarantine_populated_quiesce || '
+            '"$recovery_action" == prune_task_releases ]]',
+            recover_workflow,
+        )
         self.assertIn("generation_name=\"$bundle_sha\"", recover_workflow)
         self.assertIn("trusted_generation=\"$runtime/shared/.release-recovery/generations/$generation_name\"", recover_workflow)
         self.assertIn("platform_recover_pending.sh", recover_workflow)
