@@ -20,6 +20,12 @@ sessions and audit rows while preserving the control account. The [cleanup
 tool](../tools/platform_cleanup_retained_matrix.py) calls `dispose_engine()` and
 `dispose_redis_clients()`; close warnings are failures, not harmless noise.
 
+The retained-cleanup workflow keeps SSH stdout/stderr in runner-private files
+until it records the closed diagnostic status. Missing or invalid remote
+markers remain unverified and fail closed; only allowlisted stderr classes and
+bounded byte counts are projected, and raw captures are removed by the exit
+trap.
+
 The canonical [hermetic runner](../tools/platform_web_hermetic.sh) builds one
 standalone Next artifact in a temporary immutable directory, runs the
 source-only contract once, then runs smoke and participant suites sequentially
