@@ -959,6 +959,381 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             if mutation == "occupied":
                 self.assertTrue((candidate / "unbound.txt").exists())
 
+    def test_quarantine_populated_quiesce_preserves_exact_tree_until_snapshot_restore(self) -> None:
+        source_sha = "a" * 40
+        failed_run_id = "123456"
+        failed_attempt = "2"
+        recovery_run_id = "234567"
+        recovery_attempt = "1"
+        bundle_sha = "b" * 64
+        candidate_slug = f"gha-{failed_run_id}-{failed_attempt}-{source_sha[:12]}"
+        current = self.add_release("quarantine-current")
+        previous = self.add_release("quarantine-previous")
+        candidate = self.releases / candidate_slug
+        candidate.mkdir(mode=0o755)
+        (candidate / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": source_sha}) + "\n", encoding="ascii"
+        )
+        (candidate / "RELEASE.json").chmod(0o444)
+        payload = candidate / "nested" / "evidence.txt"
+        payload.parent.mkdir(mode=0o755)
+        payload.write_bytes(b"preserve the populated untrusted candidate\n")
+        payload.chmod(0o444)
+        (self.app_dir / "current").symlink_to(current)
+        (self.app_dir / "previous").symlink_to(previous)
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--candidate-may-exist",
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "active",
+        )
+        original_pending = (self.shared / STATE_NAME).read_bytes()
+        original_candidate_inode = candidate.stat().st_ino
+        original_payload = payload.read_bytes()
+        quarantine_root = self.shared / transaction.QUARANTINE_DIR_NAME
+        receipt_path = quarantine_root / f"{candidate_slug}.json"
+        quarantine_path = quarantine_root / candidate_slug
+        command_args = (
+            "--failed-deploy-run-id",
+            failed_run_id,
+            "--failed-deploy-run-attempt",
+            failed_attempt,
+            "--failed-deploy-source-sha",
+            source_sha,
+            "--recovery-run-id",
+            recovery_run_id,
+            "--recovery-run-attempt",
+            recovery_attempt,
+            "--bundle-sha",
+            bundle_sha,
+        )
+
+        quarantined = self.run_transaction(
+            "quarantine-populated-quiesce", *command_args
+        )
+        self.assertEqual(json.loads(quarantined.stdout)["phase"], "quarantined")
+        receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+        self.assertEqual(set(receipt), transaction.QUARANTINE_RECEIPT_KEYS)
+        self.assertEqual(receipt["phase"], "quarantined")
+        self.assertEqual(
+            receipt["service_state_before"],
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+            },
+        )
+        self.assertEqual(
+            receipt["service_enabled_before"],
+            {
+                "deadlock-api": "enabled",
+                "deadlock-worker": "enabled",
+                "deadlock-web": "enabled",
+            },
+        )
+        self.assertIs(receipt["timer_active_before"], True)
+        self.assertEqual(receipt["timer_enabled_before"], "disabled")
+        self.assertEqual(
+            receipt["pending_sha256"], hashlib.sha256(original_pending).hexdigest()
+        )
+        self.assertEqual(receipt["failed_deploy_run_id"], failed_run_id)
+        self.assertEqual(receipt["failed_deploy_run_attempt"], failed_attempt)
+        self.assertEqual(receipt["failed_deploy_source_sha"], source_sha)
+        self.assertEqual(receipt["recovery_run_id"], recovery_run_id)
+        self.assertEqual(receipt["recovery_run_attempt"], recovery_attempt)
+        self.assertFalse(candidate.exists())
+        self.assertEqual(quarantine_path.stat().st_ino, original_candidate_inode)
+        self.assertEqual((quarantine_path / "nested/evidence.txt").read_bytes(), original_payload)
+
+        # JSON booleans are integers in Python; the receipt validator must
+        # reject that ambiguity before changing the retained evidence.
+        malformed_receipt = dict(receipt)
+        malformed_receipt["candidate_file_count"] = True
+        receipt_path.write_text(
+            json.dumps(malformed_receipt, sort_keys=True, separators=(",", ":")),
+            encoding="ascii",
+        )
+        malformed = self.run_transaction(
+            "inspect-quarantined-quiesce", *command_args, check=False
+        )
+        self.assertNotEqual(malformed.returncode, 0)
+        self.assertEqual((self.shared / STATE_NAME).read_bytes(), original_pending)
+        self.assertEqual(quarantine_path.stat().st_ino, original_candidate_inode)
+        receipt_path.write_bytes(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("ascii")
+        )
+        receipt_path.chmod(0o600)
+
+        # A repeated exact recovery binding resumes safely. A different
+        # failed attempt cannot claim or move the preserved candidate.
+        replay = self.run_transaction("quarantine-populated-quiesce", *command_args)
+        self.assertEqual(json.loads(replay.stdout)["phase"], "quarantined")
+        wrong_binding = list(command_args)
+        wrong_binding[3] = "3"
+        mismatch = self.run_transaction(
+            "quarantine-populated-quiesce", *wrong_binding, check=False
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertEqual(quarantine_path.stat().st_ino, original_candidate_inode)
+        advanced_binding = list(command_args)
+        advanced_binding[9] = "2"
+        advanced = self.run_transaction(
+            "quarantine-populated-quiesce", *advanced_binding
+        )
+        self.assertEqual(json.loads(advanced.stdout)["phase"], "quarantined")
+        self.assertEqual(
+            json.loads(receipt_path.read_text(encoding="ascii"))["recovery_run_attempt"],
+            "2",
+        )
+        wrong_recovery_run = list(advanced_binding)
+        wrong_recovery_run[7] = "345678"
+        rejected_recovery = self.run_transaction(
+            "quarantine-populated-quiesce", *wrong_recovery_run, check=False
+        )
+        self.assertNotEqual(rejected_recovery.returncode, 0)
+        stale_recovery_attempt = list(command_args)
+        rejected_stale_attempt = self.run_transaction(
+            "quarantine-populated-quiesce", *stale_recovery_attempt, check=False
+        )
+        self.assertNotEqual(rejected_stale_attempt.returncode, 0)
+        command_args = tuple(advanced_binding)
+        quarantined_payload = quarantine_path / "nested/evidence.txt"
+        quarantined_payload.chmod(0o644)
+        quarantined_payload.write_bytes(b"changed after quarantine\n")
+        quarantined_payload.chmod(0o444)
+        changed_tree = self.run_transaction(
+            "quarantine-populated-quiesce", *command_args, check=False
+        )
+        self.assertNotEqual(changed_tree.returncode, 0)
+        quarantined_payload.chmod(0o644)
+        quarantined_payload.write_bytes(original_payload)
+        quarantined_payload.chmod(0o444)
+
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+            }
+        )
+        self.run_transaction("restore-quiesce", "--systemctl", str(systemctl))
+        restored = self.run_transaction(
+            "mark-quarantine-services-restored", *command_args
+        )
+        self.assertEqual(json.loads(restored.stdout)["phase"], "services_restored")
+        pending_state = self.shared / STATE_NAME
+        pending_state.write_bytes(original_pending + b" ")
+        changed_pending = self.run_transaction(
+            "consume-quarantined-quiesce", *command_args, check=False
+        )
+        self.assertNotEqual(changed_pending.returncode, 0)
+        self.assertTrue(pending_state.is_file())
+        pending_state.write_bytes(original_pending)
+        pending_state.chmod(0o600)
+        consumed = self.run_transaction("consume-quarantined-quiesce", *command_args)
+        self.assertEqual(json.loads(consumed.stdout)["phase"], "receipt_consumed")
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertEqual(
+            json.loads((self.root / "systemd-state.json").read_text(encoding="ascii")),
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+                "deadlock-cloudflare-ips.timer": "active",
+            },
+        )
+        self.assertEqual((quarantine_path / "nested/evidence.txt").read_bytes(), original_payload)
+        self.assertEqual(
+            json.loads(receipt_path.read_text(encoding="ascii"))["phase"],
+            "receipt_consumed",
+        )
+        inspected = self.run_transaction(
+            "inspect-quarantined-quiesce", *command_args
+        )
+        inspection = json.loads(inspected.stdout)
+        self.assertEqual(inspection["phase"], "receipt_consumed")
+        self.assertEqual(inspection["api"], "active")
+        self.assertEqual(inspection["web"], "active")
+
+    def test_quarantine_populated_quiesce_rejects_collision_and_pointer_change(self) -> None:
+        source_sha = "c" * 40
+        candidate_slug = f"gha-345678-1-{source_sha[:12]}"
+        current = self.add_release("quarantine-negative-current")
+        candidate = self.releases / candidate_slug
+        candidate.mkdir(mode=0o755)
+        (candidate / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": source_sha}) + "\n", encoding="ascii"
+        )
+        (candidate / "RELEASE.json").chmod(0o444)
+        evidence = candidate / "payload.bin"
+        evidence.write_bytes(b"retain")
+        evidence.chmod(0o444)
+        (self.app_dir / "current").symlink_to(current)
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--candidate-may-exist",
+            "--service-state",
+            "deadlock-api=inactive",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=inactive",
+            "--timer-active-before",
+            "inactive",
+        )
+        command_args = (
+            "--failed-deploy-run-id",
+            "345678",
+            "--failed-deploy-run-attempt",
+            "1",
+            "--failed-deploy-source-sha",
+            source_sha,
+            "--recovery-run-id",
+            "456789",
+            "--recovery-run-attempt",
+            "1",
+            "--bundle-sha",
+            "d" * 64,
+        )
+        quarantine_root = self.shared / transaction.QUARANTINE_DIR_NAME
+        quarantine_root.mkdir(mode=0o700)
+        collision = quarantine_root / candidate_slug
+        collision.mkdir(mode=0o700)
+        before_pending = (self.shared / STATE_NAME).read_bytes()
+        result = self.run_transaction(
+            "quarantine-populated-quiesce", *command_args, check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(evidence.read_bytes(), b"retain")
+        self.assertEqual((self.shared / STATE_NAME).read_bytes(), before_pending)
+
+        collision.rmdir()
+        self.run_transaction("quarantine-populated-quiesce", *command_args)
+        changed_current = self.add_release("quarantine-negative-replacement-current")
+        (self.app_dir / "current").unlink()
+        (self.app_dir / "current").symlink_to(changed_current)
+        mark = self.run_transaction(
+            "mark-quarantine-services-restored", *command_args, check=False
+        )
+        self.assertNotEqual(mark.returncode, 0)
+        self.assertTrue((quarantine_root / candidate_slug / "payload.bin").exists())
+        self.assertTrue((self.shared / STATE_NAME).is_file())
+
+    def test_quarantine_tree_scan_rejects_unsafe_entries_and_enforces_bounds(self) -> None:
+        candidate = self.releases / "quarantine-tree-boundary"
+        candidate.mkdir(mode=0o755)
+        release_file = candidate / "RELEASE.json"
+        release_file.write_text(
+            json.dumps({"source_git_commit": "e" * 40}) + "\n", encoding="ascii"
+        )
+        release_file.chmod(0o444)
+        target = self.root / "outside-evidence.txt"
+        target.write_text("do not follow or modify this target\n", encoding="ascii")
+        target.chmod(0o444)
+        link = candidate / "linked-evidence.txt"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(transaction.TransactionError, "special file"):
+            transaction._quarantine_tree_snapshot(candidate)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(target.read_text(encoding="ascii"), "do not follow or modify this target\n")
+        link.unlink()
+
+        hardlink = candidate / "hardlinked-evidence.txt"
+        hardlink.hardlink_to(target)
+        with self.assertRaisesRegex(transaction.TransactionError, "hard link"):
+            transaction._quarantine_tree_snapshot(candidate)
+        self.assertTrue(hardlink.exists())
+        self.assertEqual(target.read_text(encoding="ascii"), "do not follow or modify this target\n")
+        hardlink.unlink()
+
+        special = candidate / "special-entry"
+        os.mkfifo(special)
+        with self.assertRaisesRegex(transaction.TransactionError, "special file"):
+            transaction._quarantine_tree_snapshot(candidate)
+        self.assertTrue(special.exists())
+        special.unlink()
+
+        with mock.patch.object(transaction, "QUARANTINE_MAX_ENTRIES", 0):
+            with self.assertRaisesRegex(transaction.TransactionError, "evidence limits"):
+                transaction._quarantine_tree_snapshot(candidate)
+        with mock.patch.object(transaction, "QUARANTINE_MAX_BYTES", 1):
+            with self.assertRaisesRegex(transaction.TransactionError, "evidence limits"):
+                transaction._quarantine_tree_snapshot(candidate)
+        self.assertEqual(
+            release_file.read_text(encoding="ascii"),
+            json.dumps({"source_git_commit": "e" * 40}) + "\n",
+        )
+
+        source_sha = "f" * 40
+        candidate_slug = f"gha-678901-1-{source_sha[:12]}"
+        transaction_candidate = self.releases / candidate_slug
+        transaction_candidate.mkdir(mode=0o755)
+        transaction_release = transaction_candidate / "RELEASE.json"
+        transaction_release.write_text(
+            json.dumps({"source_git_commit": source_sha}) + "\n", encoding="ascii"
+        )
+        transaction_release.chmod(0o444)
+        unsafe_link = transaction_candidate / "linked-evidence.txt"
+        unsafe_link.symlink_to(target)
+        current = self.add_release("quarantine-tree-current")
+        (self.app_dir / "current").symlink_to(current)
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(transaction_candidate),
+            "--candidate-may-exist",
+            "--service-state",
+            "deadlock-api=inactive",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=inactive",
+            "--timer-active-before",
+            "inactive",
+        )
+        pending_before = (self.shared / STATE_NAME).read_bytes()
+        rejected = self.run_transaction(
+            "quarantine-populated-quiesce",
+            "--failed-deploy-run-id",
+            "678901",
+            "--failed-deploy-run-attempt",
+            "1",
+            "--failed-deploy-source-sha",
+            source_sha,
+            "--recovery-run-id",
+            "789012",
+            "--recovery-run-attempt",
+            "1",
+            "--bundle-sha",
+            "d" * 64,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual((self.shared / STATE_NAME).read_bytes(), pending_before)
+        self.assertTrue(transaction_candidate.is_dir())
+        self.assertTrue(unsafe_link.is_symlink())
+        self.assertEqual(target.read_text(encoding="ascii"), "do not follow or modify this target\n")
+        self.assertFalse(
+            (self.shared / transaction.QUARANTINE_DIR_NAME / candidate_slug).exists()
+        )
+
     def test_recursive_release_cleanup_validates_complete_tree_before_delete(self) -> None:
         for mutation in ("hardlink", "symlink", "special"):
             with self.subTest(mutation=mutation):

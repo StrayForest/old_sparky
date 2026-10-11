@@ -393,14 +393,12 @@ restart, then checks only services that were active before quiesce. Intentionall
 inactive services and timers remain stopped. A pointer, identity, restart or
 readiness mismatch retains the receipt for another guarded attempt.
 
-An interrupted pre-promotion install has a separate immutable recovery path.
-Only an exact operation-less version-1 `quiesce-pending` receipt with complete
-service/timer state, unchanged pointer identities, an absent candidate and no
-systemd receipt is accepted; an empty, canonical root-owned candidate directory
-is also safe to remove. The recovery generation restores the recorded
-snapshot and then consumes the receipt with `abort-quiesce`; malformed,
-partial, occupied-candidate or other operation-less receipts fail before a
-systemd query. This is not the legacy `recovery-restored` cleanup bridge.
+An interrupted pre-promotion install uses the signed immutable recovery workflow `.github/workflows/platform-production-release-recover.yml`. Ordinary `recover_pending` restores the exact v1/v2 service/timer snapshot only when the candidate is absent or empty.
+The separate `quarantine_populated_quiesce` capability requires the recovery workflow to validate the exact failed deploy run, attempt, workflow, `dev` ref, source SHA and failed job before deriving the candidate slug from that tuple.
+Under the release lock, the host binds the pending-receipt digest and pointer identities, then moves the root-owned candidate with same-filesystem no-replace semantics into private quarantine.
+The candidate remains untrusted evidence: recovery never executes or deletes it and does not claim signed-artifact equivalence.
+After snapshot restoration/readiness verification, it consumes only the matching quiesce receipt; the inspect action supports a bound retry after that receipt is consumed. Mismatches retain receipts and candidate bytes.
+Quarantine preserves storage use; later removal needs separate identity-bound retention authorization. Never invoke recovery helpers directly or normal deploy.
 
 For code/runtime rollback after reviewing database compatibility, the guarded
 abort restores recorded pointers/venv and never downgrades Alembic. Invoke only

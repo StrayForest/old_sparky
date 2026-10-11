@@ -587,7 +587,7 @@ the exact run ID.
 The privileged contour owns immutable recovery-bootstrap tests (`tests.test_platform_recovery_bootstrap`); backend-tool-contract owns cumulative-baseline provenance tests (`tests.test_platform_workflow_provenance`).
 Verification-contract owns failed-report caller tests and the synthetic `unittest.subTest` accounting regression: multiple failures/errors count as one executed parent ID while native failure/error rows remain in the summary. Backend-tool-contract also owns the deferred-origin budget-failure pipeline (`tests.test_external_load_pending_origin_pipeline`).
 Contract tests cover closed bundles, exact manifest/provenance schemas, content-addressed installation, receipt identity, migration-uncertainty guards, and secret/SSH ordering. `tests.test_platform_release_systemd_state` covers operation-ID/path/inode mismatch, helper-manifest tampering and rollback-target retry binding; `tests.test_platform_release_recovery_boundaries` covers rollback/recovery subprocess faults.
-Recovery-bootstrap tests retain attestation variants and the legacy-v2 no-systemd cleanup bridge; live execution remains an explicit operator recovery action.
+`test_platform_release_recovery_boundaries` remains `backend-privileged` and owns populated-quiesce quarantine, exact-receipt resume and fail-closed identity/collision cases alongside the empty-only abort guard. Recovery-bootstrap tests retain attestation variants and the legacy-v2 no-systemd bridge; live recovery remains workflow-only.
 Migration diagnostics use a bounded mode-600 local temp report retained on failure; CI does not upload it, and ephemeral runner files disappear after the job.
 
 The `docs` gate checks document shape, repository-local links and project skill

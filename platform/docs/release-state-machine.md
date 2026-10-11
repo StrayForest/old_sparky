@@ -150,18 +150,29 @@ fully promoted pair; the immutable validator rejects every other combination.
 Mutable systemd calls are individually bounded so a wedged manager leaves this
 durable phase available for retry.
 
-The immutable recovery wrapper has one deliberately narrow operation-less
-exception for this boundary: an exact version-1 `install` receipt in
-`quiesce-pending`, with complete active/inactive API/worker/web/timer state,
-unchanged pointer identities, no populated candidate path and no systemd
-receipt. New version-2 receipts additionally carry the exact enabled/disabled
-state; version 1 has no enabled fields and never infers them. An empty,
-canonical root-owned candidate directory is also safe to remove. It restores
-that recorded service/timer snapshot through the generation's transaction
-helper, then performs `abort-quiesce`. A malformed receipt, an unexpected
-phase, an occupied or replaced candidate, or any partial snapshot remains
-retained before
-the first systemd call. This pre-promotion branch is not the legacy
+The immutable recovery wrapper has a deliberately narrow operation-less
+exception for `install`/`quiesce-pending`. The ordinary `recover_pending`
+action accepts an absent candidate or an empty canonical root-owned directory;
+version 2 also restores the exact enabled/disabled service and timer snapshot.
+An occupied or replaced candidate remains retained before any systemd call.
+The separate signed `quarantine_populated_quiesce` capability accepts only the
+exact failed deployment run/attempt, workflow, `dev` ref, source SHA and failed
+job validated by the recovery workflow, plus its derived candidate slug. Under
+the release lock it binds the current pending-receipt digest and original
+pointer identities, then atomically moves the root-owned candidate to a
+same-filesystem private quarantine using no-replace semantics. It records a
+bounded no-follow tree digest as custody evidence only: the candidate is
+untrusted, is never executed or deleted, and is not claimed equivalent to the
+signed release artifact. The durable quarantine receipt advances through
+`prepared`, `quarantined`, `services_restored` and `receipt_consumed`; retries
+must match its exact receipt, inode/tree and pointer bindings. Only after the
+recorded service/timer snapshot is restored and verified may recovery consume
+the exact original quiesce receipt. A mismatch or partial step retains both
+receipts and all candidate bytes. `inspect-quarantined-quiesce` validates the
+durable quarantine receipt and restored pointers after the original pending
+receipt has been consumed, so a retry can confirm the exact unit/timer
+snapshot without inferring state from missing files; readiness is checked
+separately before receipt consumption. This is separate from the legacy
 `recovery-restored` cleanup bridge.
 
 For a no-current, operation-less pre-promotion topology, a complete
@@ -309,12 +320,13 @@ The same explicit abort path may recover a `staged` receipt when staging has
 already quiesced services. It still requires the confirmation flag for a
 single guarded operator command, but no migration authorization is applied to
 that phase. A SIGKILL before promotion is represented by
-`.release-operation.json` with `phase=quiesce-pending`; `--abort-retained`
-consumes that receipt, restores its exact service state and removes only an
-empty, canonical candidate directory. A populated or replaced candidate is
-retained with the receipt. Missing or malformed
-service-state data is never interpreted as “all active”; recovery stops before
-any service start and retains the receipt.
+`.release-operation.json` with `phase=quiesce-pending`; ordinary abort consumes
+that receipt, restores its exact service state and removes only an empty,
+canonical candidate directory. A populated candidate uses the separate signed
+quarantine capability above. Missing or malformed service-state data is never
+interpreted as “all active”; recovery stops before any service start and
+retains the receipt. Quarantining preserves evidence and does not reclaim its
+storage; later retention requires its own identity-bound authorization.
 
 The retained state is the recovery receipt: the pre-quiesce transaction phase
 records the original pointers, candidate path and service snapshot, while the

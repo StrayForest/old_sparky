@@ -1002,6 +1002,28 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("timeout --foreground 10s ssh", release_recover)
         self.assertIn('rm -f -- "$stage/bundle.zip" || true', release_recover)
         self.assertNotIn("$runtime/current/tools", release_recover)
+        failed_deploy_binding = (
+            '"$api/actions/runs/$FAILED_DEPLOY_RUN_ID/attempts/$FAILED_DEPLOY_RUN_ATTEMPT"',
+            '"$api/actions/runs/$FAILED_DEPLOY_RUN_ID/attempts/$FAILED_DEPLOY_RUN_ATTEMPT/jobs?per_page=100&page=1"',
+            'failed.get("id") != failed_id',
+            'failed.get("run_attempt") != failed_attempt',
+            'failed.get("name") != "Platform production deploy"',
+            'failed.get("path") != ".github/workflows/platform-production-deploy.yml"',
+            'failed.get("head_branch") != "dev"',
+            'failed.get("head_sha") != source',
+            'failed.get("status") != "completed"',
+            'failed.get("conclusion") != "failure"',
+            'row.get("name") == "Deploy production"',
+            'row.get("run_id") == failed_id',
+            'row.get("run_attempt") == failed_attempt',
+            'row.get("head_sha") == source',
+            'row.get("conclusion") == "failure"',
+            'stream.write(f"candidate_slug=gha-{failed_id}-{failed_attempt}-{failed_source[:12]}\\n")',
+        )
+        for predicate in failed_deploy_binding:
+            with self.subTest(failed_deploy_predicate=predicate):
+                self.assertIn(predicate, release_recover)
+        self.assertNotIn("candidate_slug:", release_recover.split("jobs:", 1)[0])
         self.assertIn(
             "evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}-{os.environ['PUBLISHER_RUN_ID']}-{os.environ['PUBLISHER_RUN_ATTEMPT']}.json",
             workflow,
