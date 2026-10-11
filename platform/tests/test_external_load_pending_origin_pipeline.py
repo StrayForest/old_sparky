@@ -1164,6 +1164,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
     ) -> dict[str, object] | None:
         profile = _hermetic_profile(profile_id)
         profile, manifest, users = _small_profile(profile)
+        target_users = len(users)
         if transport_failure:
             # Preserve one real successful mutation before the typed transport
             # failure so the producer still performs its final state read.
