@@ -97,6 +97,49 @@ test("server internal read waiters are removed on abort/deadline and permits rel
     throw new Error("upstream failure");
   })).rejects.toThrow("upstream failure");
   expect(scheduler.activeCount).toBe(0);
+
+  const delayedTimerScheduler = new ServerInternalReadScheduler({
+    activeLimit: 1,
+    pendingLimit: 2,
+    queueDeadlineMs: 25,
+  });
+  const delayedHold = deferred();
+  const delayedActiveStarted = deferred();
+  const delayedActive = delayedTimerScheduler.run(async () => {
+    delayedActiveStarted.resolve();
+    await delayedHold.promise;
+  });
+  await delayedActiveStarted.promise;
+
+  let expiredOperationStarted = false;
+  const expiredBeforeDrain = delayedTimerScheduler.run(async () => {
+    expiredOperationStarted = true;
+  });
+
+  // Block this event loop after the waiter deadline so its timer callback
+  // cannot run before releasing the active permit and draining the queue.
+  Atomics.wait(
+    new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)),
+    0,
+    0,
+    60,
+  );
+  let nextOperationStarted = false;
+  const nextOperation = delayedTimerScheduler.run(async () => {
+    nextOperationStarted = true;
+  });
+  delayedHold.resolve();
+
+  await delayedActive;
+  await expect(expiredBeforeDrain).rejects.toMatchObject({
+    name: "ServerInternalReadQueueError",
+    failure: "deadline",
+  } satisfies Partial<ServerInternalReadQueueError>);
+  await expect(nextOperation).resolves.toBeUndefined();
+  expect(expiredOperationStarted).toBe(false);
+  expect(nextOperationStarted).toBe(true);
+  expect(delayedTimerScheduler.activeCount).toBe(0);
+  expect(delayedTimerScheduler.pendingCount).toBe(0);
 });
 
 test("public timeout metadata cannot promote SSR trace sampling", () => {

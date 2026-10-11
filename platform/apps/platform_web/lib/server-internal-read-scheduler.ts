@@ -22,6 +22,7 @@ type QueuedPermit = {
   signal?: AbortSignal;
   resolve: (release: () => void) => void;
   reject: (error: Error) => void;
+  deadlineAt: number;
   timer: ReturnType<typeof setTimeout>;
   onAbort?: () => void;
   settled: boolean;
@@ -74,10 +75,12 @@ export class ServerInternalReadScheduler {
     }
 
     return new Promise((resolve, reject) => {
+      const deadlineAt = performance.now() + this.options.queueDeadlineMs;
       const waiter: QueuedPermit = {
         signal,
         resolve,
         reject,
+        deadlineAt,
         timer: setTimeout(() => {
           this.rejectWaiter(waiter, new ServerInternalReadQueueError("deadline"));
         }, this.options.queueDeadlineMs),
@@ -92,16 +95,27 @@ export class ServerInternalReadScheduler {
   }
 
   private rejectWaiter(waiter: QueuedPermit, error: Error): void {
-    if (waiter.settled) return;
+    if (!this.settleWaiter(waiter, error, true)) return;
+    this.drain();
+  }
+
+  private settleWaiter(
+    waiter: QueuedPermit,
+    error: Error,
+    removeFromQueue: boolean,
+  ): boolean {
+    if (waiter.settled) return false;
     waiter.settled = true;
-    const index = this.pending.indexOf(waiter);
-    if (index >= 0) this.pending.splice(index, 1);
+    if (removeFromQueue) {
+      const index = this.pending.indexOf(waiter);
+      if (index >= 0) this.pending.splice(index, 1);
+    }
     clearTimeout(waiter.timer);
     if (waiter.signal && waiter.onAbort) {
       waiter.signal.removeEventListener("abort", waiter.onAbort);
     }
     waiter.reject(error);
-    this.drain();
+    return true;
   }
 
   private drain(): void {
@@ -109,7 +123,15 @@ export class ServerInternalReadScheduler {
       const waiter = this.pending.shift();
       if (!waiter || waiter.settled) continue;
       if (waiter.signal?.aborted) {
-        this.rejectWaiter(waiter, abortError(waiter.signal));
+        this.settleWaiter(waiter, abortError(waiter.signal), false);
+        continue;
+      }
+      if (performance.now() >= waiter.deadlineAt) {
+        this.settleWaiter(
+          waiter,
+          new ServerInternalReadQueueError("deadline"),
+          false,
+        );
         continue;
       }
       waiter.settled = true;
