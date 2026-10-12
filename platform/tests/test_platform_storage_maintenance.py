@@ -1683,6 +1683,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             total_job_budget_seconds,
             poll_seconds + preflight_and_cleanup_budget_seconds + operation_reserve_seconds,
         )
+        self.assertLessEqual(backup_operation_budget_seconds, operation_reserve_seconds)
         self.assertIn('run.get("head_sha") != expected_sha', workflow)
         self.assertIn('ref.get("ref") != "refs/heads/dev"', workflow)
         self.assertIn('ref["object"].get("sha") != sys.argv[2]', workflow)
