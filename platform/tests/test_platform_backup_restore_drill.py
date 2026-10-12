@@ -1733,8 +1733,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
                 self.assertIs(raised.exception, worker_failure)
                 if private:
-                    self.assertEqual(stdout_capture.buffer.getvalue(), b"known pg_restore stdout")
-                    self.assertEqual(stderr_capture.buffer.getvalue(), b"known pg_restore stderr")
+                    self.assertEqual(stdout_capture.buffer.getvalue(), b"")
+                    self.assertEqual(
+                        stderr_capture.buffer.getvalue(),
+                        b"known pg_restore stdoutknown pg_restore stderr",
+                    )
                 else:
                     self.assertEqual(stdout_capture.buffer.getvalue(), b"")
                     self.assertEqual(stderr_capture.buffer.getvalue(), b"")
