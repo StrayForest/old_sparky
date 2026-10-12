@@ -89,6 +89,175 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             )
 
     def _assert_scratch_unit_diagnostic_caps_and_private_envelope(self) -> None:
+        required_memory = backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES
+        available_memory = required_memory - 4096
+        admission_diagnostic = {
+            "schema": 1,
+            "phase": "pre_create_admission",
+            "guard_reason": "memory_reserve",
+            "available_bytes": available_memory,
+            "required_bytes": required_memory,
+            "helper_rss_bytes": 8 * 1024 * 1024,
+            "direct_parent_rss_bytes": 12 * 1024 * 1024,
+            "observed_pair_rss_bytes": 20 * 1024 * 1024,
+            "observed_process_count": 2,
+        }
+        self.assertTrue(backup_drill.valid_scratch_admission_diagnostic(admission_diagnostic))
+        for key, value in (
+            ("schema", True),
+            ("phase", "unit_exited_before_confinement"),
+            ("guard_reason", "other"),
+            ("available_bytes", True),
+            ("available_bytes", required_memory),
+            ("required_bytes", required_memory - 1),
+        ):
+            malformed_admission = dict(admission_diagnostic)
+            malformed_admission[key] = value
+            self.assertFalse(backup_drill.valid_scratch_admission_diagnostic(malformed_admission))
+        malformed_admission = {**admission_diagnostic, "unexpected": 1}
+        self.assertFalse(backup_drill.valid_scratch_admission_diagnostic(malformed_admission))
+        for key, value in (
+            ("helper_rss_bytes", True),
+            ("direct_parent_rss_bytes", -1),
+            ("observed_pair_rss_bytes", 1),
+            ("observed_process_count", True),
+            ("observed_process_count", 1),
+        ):
+            malformed_admission = dict(admission_diagnostic)
+            malformed_admission[key] = value
+            self.assertFalse(backup_drill.valid_scratch_admission_diagnostic(malformed_admission))
+        one_sample = {
+            **admission_diagnostic,
+            "direct_parent_rss_bytes": None,
+            "observed_pair_rss_bytes": None,
+            "observed_process_count": 1,
+        }
+        self.assertTrue(backup_drill.valid_scratch_admission_diagnostic(one_sample))
+        no_samples = {
+            **admission_diagnostic,
+            "helper_rss_bytes": None,
+            "direct_parent_rss_bytes": None,
+            "observed_pair_rss_bytes": None,
+            "observed_process_count": 0,
+        }
+        self.assertTrue(backup_drill.valid_scratch_admission_diagnostic(no_samples))
+
+        with mock.patch.object(
+            backup_drill,
+            "_scratch_proc_status_sample",
+            side_effect=[(10, 20, 1024), (20, 1, 2048)],
+        ), mock.patch.object(backup_drill.os, "getpid", return_value=10), mock.patch.object(
+            backup_drill.os, "getppid", return_value=20
+        ):
+            rss_sample = backup_drill._scratch_admission_rss_snapshot()
+        self.assertEqual(
+            rss_sample,
+            {
+                "helper_rss_bytes": 1024,
+                "direct_parent_rss_bytes": 2048,
+                "observed_pair_rss_bytes": 3072,
+                "observed_process_count": 2,
+            },
+        )
+        with mock.patch.object(
+            backup_drill,
+            "_scratch_proc_status_sample",
+            side_effect=OSError("best-effort telemetry failure"),
+        ), mock.patch.object(backup_drill.os, "getpid", return_value=10), mock.patch.object(
+            backup_drill.os, "getppid", return_value=20
+        ):
+            unavailable_rss = backup_drill._scratch_admission_rss_snapshot()
+        self.assertEqual(
+            unavailable_rss,
+            {
+                "helper_rss_bytes": None,
+                "direct_parent_rss_bytes": None,
+                "observed_pair_rss_bytes": None,
+                "observed_process_count": 0,
+            },
+        )
+
+        with (
+            mock.patch.object(backup_drill, "require_restore_headroom") as headroom,
+            mock.patch.object(backup_drill, "_scratch_mem_available_bytes", return_value=available_memory),
+            mock.patch.object(backup_drill, "_scratch_admission_rss_snapshot", return_value={
+                "helper_rss_bytes": 8 * 1024 * 1024,
+                "direct_parent_rss_bytes": 12 * 1024 * 1024,
+                "observed_pair_rss_bytes": 20 * 1024 * 1024,
+                "observed_process_count": 2,
+            }),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"Scratch restore admission memory reserve is unavailable\."
+            ) as admission_failure:
+                backup_drill._scratch_host_guard()
+        headroom.assert_called_once_with(pathlib.Path("/"))
+        self.assertEqual(
+            admission_failure.exception.scratch_admission_diagnostic,
+            admission_diagnostic,
+        )
+        with (
+            mock.patch.object(backup_drill, "require_restore_headroom"),
+            mock.patch.object(backup_drill, "_scratch_mem_available_bytes", return_value=available_memory),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_admission_rss_snapshot",
+                side_effect=RuntimeError("telemetry must not replace admission"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"Scratch restore admission memory reserve is unavailable\."
+            ) as telemetry_failure:
+                backup_drill._scratch_host_guard()
+        self.assertEqual(
+            telemetry_failure.exception.scratch_admission_diagnostic,
+            {
+                "schema": 1,
+                "phase": "pre_create_admission",
+                "guard_reason": "memory_reserve",
+                "available_bytes": available_memory,
+                "required_bytes": required_memory,
+                "helper_rss_bytes": None,
+                "direct_parent_rss_bytes": None,
+                "observed_pair_rss_bytes": None,
+                "observed_process_count": 0,
+            },
+        )
+
+        # The guard is unchanged at the exact threshold and rejects before it
+        # tries to open or stage the supplied archive.
+        with (
+            mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+            mock.patch.object(backup_drill, "require_commands") as require_commands,
+            mock.patch.object(backup_drill, "require_restore_headroom"),
+            mock.patch.object(backup_drill, "_scratch_mem_available_bytes", return_value=available_memory),
+            mock.patch.object(backup_drill, "_scratch_admission_rss_snapshot", return_value={
+                "helper_rss_bytes": None,
+                "direct_parent_rss_bytes": None,
+                "observed_pair_rss_bytes": None,
+                "observed_process_count": 0,
+            }),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"Scratch restore admission memory reserve is unavailable\."
+            ):
+                backup_drill._run_isolated_restore_drill(
+                    pathlib.Path("/missing-archive-must-not-be-opened.dump"),
+                    timestamp_slug="20261012T000000Z",
+                    private_scratch_diagnostics=True,
+                )
+        require_commands.assert_called_once_with("systemd-run", "systemctl", "pg_config", "runuser")
+
+        with (
+            mock.patch.object(backup_drill, "require_restore_headroom"),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_mem_available_bytes",
+                return_value=required_memory,
+            ),
+        ):
+            backup_drill._scratch_host_guard()
+
         stdout = b"o" * (backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES + 1)
         stderr = b"e" * (backup_drill.SCRATCH_PRIVATE_STDERR_BYTES + 1)
         diagnostic = backup_drill._scratch_unit_diagnostic(
@@ -207,6 +376,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
         private_failure = RuntimeError("fixed backup failure")
         private_failure.scratch_unit_diagnostic = diagnostic
+        private_failure.scratch_admission_diagnostic = admission_diagnostic
         private_failure.scratch_unit_private_output = (
             stdout[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES],
             stderr[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES],
@@ -230,6 +400,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertEqual(backup_drill.main(), 1)
         private_report = json.loads(private_stdout.getvalue())
         self.assertEqual(private_report["scratch_unit_diagnostic"], diagnostic)
+        self.assertEqual(private_report["scratch_admission_diagnostic"], admission_diagnostic)
         self.assertNotIn(stdout[:32].decode("ascii"), private_stdout.getvalue())
         self.assertEqual(
             private_stderr.getvalue().encode("ascii"),
@@ -242,6 +413,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         # A collected transient unit can have no typed systemd properties.
         # Its bounded output still travels only through the private frame.
         private_failure.scratch_unit_diagnostic = None
+        private_failure.scratch_admission_diagnostic = None
         missing_state_stdout = io.StringIO()
         missing_state_stderr = io.StringIO()
         with (
@@ -253,6 +425,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertEqual(backup_drill.main(), 1)
         missing_state_report = json.loads(missing_state_stdout.getvalue())
         self.assertNotIn("scratch_unit_diagnostic", missing_state_report)
+        self.assertNotIn("scratch_admission_diagnostic", missing_state_report)
         self.assertNotIn(stdout[:32].decode("ascii"), missing_state_stdout.getvalue())
         self.assertEqual(
             missing_state_stderr.getvalue().encode("ascii"),
@@ -273,6 +446,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         ):
             self.assertEqual(backup_drill.main(), 1)
         self.assertNotIn("scratch_unit_diagnostic", public_stdout.getvalue())
+        self.assertNotIn("scratch_admission_diagnostic", public_stdout.getvalue())
         self.assertEqual(public_stderr.getvalue(), "")
 
     def _assert_scratch_early_exit_output_is_drained(self) -> None:

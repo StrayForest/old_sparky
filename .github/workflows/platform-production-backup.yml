@@ -1066,6 +1066,7 @@ jobs:
           report_error_class = "none"
           restore_diagnostic = None
           scratch_unit_diagnostic = None
+          scratch_admission_diagnostic = None
           backup_disk_diagnostic = None
           if report_state == "read":
               try:
@@ -1082,7 +1083,9 @@ jobs:
                       report_state = "typed_failure"
                       diagnostic = report.get("restore_diagnostic")
                       scratch_unit = report.get("scratch_unit_diagnostic")
+                      scratch_admission = report.get("scratch_admission_diagnostic")
                       backup_disk = report.get("backup_disk_diagnostic")
+                      valid_backup_disk = False
                       backup_disk_phases = {
                           "backup_admission", "pg_dump_pre_spawn", "pg_dump_post_start",
                           "pg_dump_monitor", "pg_dump_post_exit",
@@ -1119,8 +1122,58 @@ jobs:
                                   )
                               )
                           )
-                          if valid_backup_disk:
-                              backup_disk_diagnostic = backup_disk
+                      if valid_backup_disk:
+                          backup_disk_diagnostic = backup_disk
+                      if scratch_admission is not None:
+                          expected_scratch_admission = {
+                              "schema", "phase", "guard_reason", "available_bytes",
+                              "required_bytes", "helper_rss_bytes", "direct_parent_rss_bytes",
+                              "observed_pair_rss_bytes", "observed_process_count",
+                          }
+                          valid_scratch_admission = (
+                              isinstance(scratch_admission, dict)
+                              and set(scratch_admission) == expected_scratch_admission
+                              and type(scratch_admission.get("schema")) is int
+                              and scratch_admission["schema"] == 1
+                              and type(scratch_admission.get("phase")) is str
+                              and scratch_admission["phase"] == "pre_create_admission"
+                              and type(scratch_admission.get("guard_reason")) is str
+                              and scratch_admission["guard_reason"] == "memory_reserve"
+                              and type(scratch_admission.get("available_bytes")) is int
+                              and 0 <= scratch_admission["available_bytes"] < 1_073_741_824
+                              and type(scratch_admission.get("required_bytes")) is int
+                              and scratch_admission["required_bytes"] == 1_073_741_824
+                              and type(scratch_admission.get("observed_process_count")) is int
+                              and 0 <= scratch_admission["observed_process_count"] <= 2
+                          )
+                          if valid_scratch_admission:
+                              rss_values = (
+                                  scratch_admission.get("helper_rss_bytes"),
+                                  scratch_admission.get("direct_parent_rss_bytes"),
+                              )
+                              observed_pair_rss = scratch_admission.get("observed_pair_rss_bytes")
+                              valid_scratch_admission = (
+                                  all(
+                                      item is None
+                                      or (type(item) is int and 0 <= item <= (1 << 40))
+                                      for item in rss_values
+                                  )
+                                  and scratch_admission["observed_process_count"]
+                                  == sum(item is not None for item in rss_values)
+                                  and (
+                                      (observed_pair_rss is None and not all(item is not None for item in rss_values))
+                                      or (
+                                          type(observed_pair_rss) is int
+                                          and 0 <= observed_pair_rss <= (2 << 40)
+                                          and all(item is not None for item in rss_values)
+                                          and observed_pair_rss == sum(rss_values)
+                                      )
+                                  )
+                              )
+                          if valid_scratch_admission:
+                              scratch_admission_diagnostic = scratch_admission
+                          else:
+                              report_state = "unclassified_json"
                       if diagnostic is not None:
                           stages = {
                               "pre_create_admission", "create_database", "extension_setup",
@@ -1353,6 +1406,7 @@ jobs:
                   "report_error_class": report_error_class,
                   "restore_diagnostic": restore_diagnostic,
                   "scratch_unit_diagnostic": scratch_unit_diagnostic,
+                  "scratch_admission_diagnostic": scratch_admission_diagnostic,
                   "backup_disk_diagnostic": backup_disk_diagnostic,
                   "report_bytes": len(report_bytes),
                   "report_sha256": hashlib.sha256(report_bytes).hexdigest() if report_bytes else None,

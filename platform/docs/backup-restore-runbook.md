@@ -46,6 +46,11 @@ with at least 32 MiB headroom, swap remains disabled, and host `MemAvailable`
 stays at or above 1 GiB. It stops and reaps only the owned transient unit on a
 failed or unavailable sample. The monitor is sampled, so these margins are
 early-stop bounds rather than guarantees against a single allocation burst.
+A below-threshold host-memory admission failure retains the sampled
+`MemAvailable` value and best-effort bounded RSS samples for the helper and
+its direct parent in the root-private failure receipt. Unavailable process
+samples remain null; this telemetry never changes the 1 GiB admission guard
+and is not included in the public workflow output or artifact.
 A failed or unavailable disk, memory or mount sample stops the drill; it does
 not rotate or remove any retained backup. A failed isolated restore or
 preserve-existing post-publication check removes only the operation's

@@ -68,6 +68,8 @@ SCRATCH_TMPFS_BYTES = 512 * 1024**2
 SCRATCH_MEMORY_MAX_BYTES = 640 * 1024**2
 SCRATCH_MEMORY_RESERVE_BYTES = 384 * 1024**2
 SCRATCH_MEMORY_ADMISSION_BYTES = SCRATCH_MEMORY_MAX_BYTES + SCRATCH_MEMORY_RESERVE_BYTES
+SCRATCH_ADMISSION_RSS_MAX_BYTES = 1 << 40
+SCRATCH_PROC_STATUS_MAX_BYTES = 16 * 1024
 SCRATCH_MEMORY_STOP_MARGIN_BYTES = 32 * 1024**2
 SCRATCH_TMPFS_STOP_BYTES = 64 * 1024**2
 SCRATCH_RUNTIME_SECONDS = 15 * 60
@@ -228,6 +230,55 @@ def valid_backup_disk_diagnostic(value: Any) -> bool:
             and value["free_bytes"] < value["required_free_bytes"]
         )
     return True
+
+
+def valid_scratch_admission_diagnostic(value: Any) -> bool:
+    """Validate the closed numeric summary for a pre-unit scratch admission refusal."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "phase",
+        "guard_reason",
+        "available_bytes",
+        "required_bytes",
+        "helper_rss_bytes",
+        "direct_parent_rss_bytes",
+        "observed_pair_rss_bytes",
+        "observed_process_count",
+    }:
+        return False
+    available = value.get("available_bytes")
+    required = value.get("required_bytes")
+    helper_rss = value.get("helper_rss_bytes")
+    parent_rss = value.get("direct_parent_rss_bytes")
+    pair_rss = value.get("observed_pair_rss_bytes")
+    count = value.get("observed_process_count")
+    if not (
+        type(value.get("schema")) is int
+        and value["schema"] == 1
+        and type(value.get("phase")) is str
+        and value["phase"] == "pre_create_admission"
+        and type(value.get("guard_reason")) is str
+        and value["guard_reason"] == "memory_reserve"
+        and type(available) is int
+        and 0 <= available < SCRATCH_MEMORY_ADMISSION_BYTES
+        and type(required) is int
+        and required == SCRATCH_MEMORY_ADMISSION_BYTES
+        and all(
+            item is None or (type(item) is int and 0 <= item <= SCRATCH_ADMISSION_RSS_MAX_BYTES)
+            for item in (helper_rss, parent_rss)
+        )
+        and type(count) is int
+        and count == sum(item is not None for item in (helper_rss, parent_rss))
+        and count in {0, 1, 2}
+    ):
+        return False
+    if count == 2:
+        return (
+            type(pair_rss) is int
+            and pair_rss == helper_rss + parent_rss
+            and pair_rss <= 2 * SCRATCH_ADMISSION_RSS_MAX_BYTES
+        )
+    return pair_rss is None
 
 
 _SCRATCH_UNIT_SUBSTATES = {
@@ -1998,6 +2049,100 @@ def _scratch_mem_available_bytes() -> int:
     raise RuntimeError("Host memory availability could not be verified.")
 
 
+def _scratch_proc_status_sample(pid: int) -> tuple[int, int, int] | None:
+    """Return (pid, ppid, VmRSS bytes) for a bounded, stable root process sample."""
+    if type(pid) is not int or pid <= 1:
+        return None
+    status_path = pathlib.Path(f"/proc/{pid}/status")
+    exe_path = pathlib.Path(f"/proc/{pid}/exe")
+    try:
+        with status_path.open("rb") as status_file:
+            raw_before = status_file.read(SCRATCH_PROC_STATUS_MAX_BYTES + 1)
+        if len(raw_before) > SCRATCH_PROC_STATUS_MAX_BYTES:
+            return None
+        parsed_before = _parse_scratch_proc_status(raw_before)
+        if parsed_before is None or parsed_before[0] != pid:
+            return None
+        expected_exe = pathlib.Path("/proc/self/exe").stat()
+        sampled_exe = exe_path.stat()
+        if (sampled_exe.st_dev, sampled_exe.st_ino) != (expected_exe.st_dev, expected_exe.st_ino):
+            return None
+        with status_path.open("rb") as status_file:
+            raw_after = status_file.read(SCRATCH_PROC_STATUS_MAX_BYTES + 1)
+        if len(raw_after) > SCRATCH_PROC_STATUS_MAX_BYTES:
+            return None
+        parsed_after = _parse_scratch_proc_status(raw_after)
+        if parsed_after is None or parsed_before[:2] != parsed_after[:2]:
+            return None
+        return parsed_before
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def _parse_scratch_proc_status(raw: bytes) -> tuple[int, int, int] | None:
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeError:
+        return None
+    fields: dict[str, list[str]] = {}
+    for line in lines:
+        key, separator, value = line.partition(":")
+        if separator and key in {"Pid", "PPid", "Uid", "VmRSS"}:
+            if key in fields:
+                return None
+            fields[key] = value.split()
+    if set(fields) != {"Pid", "PPid", "Uid", "VmRSS"}:
+        return None
+    pid_values, ppid_values = fields["Pid"], fields["PPid"]
+    uid_values, rss_values = fields["Uid"], fields["VmRSS"]
+    if (
+        len(pid_values) != 1
+        or len(ppid_values) != 1
+        or len(uid_values) != 4
+        or len(rss_values) != 2
+        or any(not item.isdecimal() for item in (*pid_values, *ppid_values, *uid_values, rss_values[0]))
+        or rss_values[1] != "kB"
+        or any(item != "0" for item in uid_values)
+    ):
+        return None
+    rss_bytes = int(rss_values[0]) * 1024
+    if rss_bytes > SCRATCH_ADMISSION_RSS_MAX_BYTES:
+        return None
+    return int(pid_values[0]), int(ppid_values[0]), rss_bytes
+
+
+def _scratch_admission_rss_snapshot() -> dict[str, int | None]:
+    """Best-effort helper/parent RSS telemetry; never used for admission decisions."""
+    result: dict[str, int | None] = {
+        "helper_rss_bytes": None,
+        "direct_parent_rss_bytes": None,
+        "observed_pair_rss_bytes": None,
+        "observed_process_count": 0,
+    }
+    try:
+        helper_pid = os.getpid()
+        parent_pid = os.getppid()
+        helper = _scratch_proc_status_sample(helper_pid)
+        parent = _scratch_proc_status_sample(parent_pid)
+        if helper is not None and helper[1] == parent_pid and os.getpid() == helper_pid:
+            result["helper_rss_bytes"] = helper[2]
+        if parent is not None and os.getppid() == parent_pid:
+            result["direct_parent_rss_bytes"] = parent[2]
+        count = sum(
+            result[key] is not None
+            for key in ("helper_rss_bytes", "direct_parent_rss_bytes")
+        )
+        result["observed_process_count"] = count
+        if count == 2:
+            result["observed_pair_rss_bytes"] = (
+                result["helper_rss_bytes"] + result["direct_parent_rss_bytes"]
+            )
+    except Exception:
+        # Telemetry must not replace the original resource-admission failure.
+        pass
+    return result
+
+
 def _scratch_resource_guard(root: pathlib.Path) -> None:
     require_restore_headroom(pathlib.Path("/"))
     if _scratch_mem_available_bytes() < SCRATCH_MEMORY_ADMISSION_BYTES:
@@ -2612,8 +2757,29 @@ def _scratch_expected_properties(
 
 def _scratch_host_guard() -> None:
     require_restore_headroom(pathlib.Path("/"))
-    if _scratch_mem_available_bytes() < SCRATCH_MEMORY_ADMISSION_BYTES:
-        raise RuntimeError("Scratch restore admission memory reserve is unavailable.")
+    available_bytes = _scratch_mem_available_bytes()
+    if available_bytes < SCRATCH_MEMORY_ADMISSION_BYTES:
+        error = RuntimeError("Scratch restore admission memory reserve is unavailable.")
+        try:
+            rss_snapshot = _scratch_admission_rss_snapshot()
+        except Exception:
+            rss_snapshot = {
+                "helper_rss_bytes": None,
+                "direct_parent_rss_bytes": None,
+                "observed_pair_rss_bytes": None,
+                "observed_process_count": 0,
+            }
+        diagnostic = {
+            "schema": 1,
+            "phase": "pre_create_admission",
+            "guard_reason": "memory_reserve",
+            "available_bytes": available_bytes,
+            "required_bytes": SCRATCH_MEMORY_ADMISSION_BYTES,
+            **rss_snapshot,
+        }
+        if valid_scratch_admission_diagnostic(diagnostic):
+            error.scratch_admission_diagnostic = diagnostic
+        raise error
 
 
 def _scratch_mountpoint_is_mounted(path: pathlib.Path) -> bool:
@@ -3454,6 +3620,9 @@ def main() -> int:
             private_scratch_diagnostics = getattr(args, "private_scratch_diagnostics", False)
             if private_scratch_diagnostics and valid_scratch_unit_diagnostic(scratch_diagnostic):
                 report["scratch_unit_diagnostic"] = scratch_diagnostic
+            admission_diagnostic = getattr(exc, "scratch_admission_diagnostic", None)
+            if private_scratch_diagnostics and valid_scratch_admission_diagnostic(admission_diagnostic):
+                report["scratch_admission_diagnostic"] = admission_diagnostic
             print(json.dumps(report, ensure_ascii=False, indent=2))
             if private_scratch_diagnostics:
                 private_output = getattr(exc, "scratch_unit_private_output", None)

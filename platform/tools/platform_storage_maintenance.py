@@ -65,6 +65,7 @@ try:
     from . import platform_build_node_cache
     from .platform_backup_restore_drill import (
         valid_backup_disk_diagnostic,
+        valid_scratch_admission_diagnostic,
         valid_scratch_unit_diagnostic,
     )
     from .platform_release_retention import (
@@ -82,6 +83,7 @@ except ImportError:  # Direct execution from the tools directory.
     import platform_build_node_cache
     from platform_backup_restore_drill import (
         valid_backup_disk_diagnostic,
+        valid_scratch_admission_diagnostic,
         valid_scratch_unit_diagnostic,
     )
     from platform_release_retention import (
@@ -213,10 +215,12 @@ class BackupCommandFailure(RuntimeError):
         diagnostic: dict[str, Any] | None = None,
         backup_disk_diagnostic: dict[str, Any] | None = None,
         scratch_unit_diagnostic: dict[str, Any] | None = None,
+        scratch_admission_diagnostic: dict[str, Any] | None = None,
     ) -> None:
         self.restore_diagnostic = diagnostic
         self.backup_disk_diagnostic = backup_disk_diagnostic
         self.scratch_unit_diagnostic = scratch_unit_diagnostic
+        self.scratch_admission_diagnostic = scratch_admission_diagnostic
         super().__init__("Platform backup failed.")
 
 
@@ -745,6 +749,11 @@ def _run_backup_command(
         scratch_unit_diagnostic = (
             result.get("scratch_unit_diagnostic") if isinstance(result, dict) else None
         )
+        scratch_admission_diagnostic = (
+            result.get("scratch_admission_diagnostic")
+            if isinstance(result, dict)
+            else None
+        )
         raise BackupCommandFailure(
             diagnostic if _valid_restore_diagnostic(diagnostic) else None,
             (
@@ -756,6 +765,12 @@ def _run_backup_command(
                 scratch_unit_diagnostic
                 if forward_failure_diagnostics
                 and valid_scratch_unit_diagnostic(scratch_unit_diagnostic)
+                else None
+            ),
+            (
+                scratch_admission_diagnostic
+                if forward_failure_diagnostics
+                and valid_scratch_admission_diagnostic(scratch_admission_diagnostic)
                 else None
             ),
         )
@@ -2602,6 +2617,14 @@ def main() -> int:
                 and valid_scratch_unit_diagnostic(scratch_unit_diagnostic)
             ):
                 result["scratch_unit_diagnostic"] = scratch_unit_diagnostic
+            scratch_admission_diagnostic = getattr(
+                exc, "scratch_admission_diagnostic", None
+            )
+            if (
+                getattr(args, "private_backup_diagnostics", False)
+                and valid_scratch_admission_diagnostic(scratch_admission_diagnostic)
+            ):
+                result["scratch_admission_diagnostic"] = scratch_admission_diagnostic
             print(
                 json.dumps(result, ensure_ascii=False, indent=2)
             )

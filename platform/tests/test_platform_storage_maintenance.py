@@ -904,6 +904,17 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         "required_free_bytes": 200,
                     },
                     "scratch_unit_diagnostic": scratch_diagnostic,
+                    "scratch_admission_diagnostic": {
+                        "schema": 1,
+                        "phase": "pre_create_admission",
+                        "guard_reason": "memory_reserve",
+                        "available_bytes": 1_060_000_000,
+                        "required_bytes": 1_073_741_824,
+                        "helper_rss_bytes": 18_000_000,
+                        "direct_parent_rss_bytes": 9_000_000,
+                        "observed_pair_rss_bytes": 27_000_000,
+                        "observed_process_count": 2,
+                    },
                 }
             ),
             "SCRATCH_UNIT_PRIVATE_OUTPUT_V1\nprivate framed bytes\n",
@@ -929,6 +940,21 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             },
         )
         self.assertEqual(failure_error.exception.scratch_unit_diagnostic, scratch_diagnostic)
+        admission_diagnostic = {
+            "schema": 1,
+            "phase": "pre_create_admission",
+            "guard_reason": "memory_reserve",
+            "available_bytes": 1_060_000_000,
+            "required_bytes": 1_073_741_824,
+            "helper_rss_bytes": 18_000_000,
+            "direct_parent_rss_bytes": 9_000_000,
+            "observed_pair_rss_bytes": 27_000_000,
+            "observed_process_count": 2,
+        }
+        self.assertEqual(
+            failure_error.exception.scratch_admission_diagnostic,
+            admission_diagnostic,
+        )
         after_confinement_diagnostic = {
             **scratch_diagnostic,
             "phase": "unit_exited_after_confinement",
@@ -993,6 +1019,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             maintenance._run_backup_command(["fixed-backup-child"])
         self.assertIsNone(malformed_error.exception.backup_disk_diagnostic)
         self.assertIsNone(malformed_error.exception.scratch_unit_diagnostic)
+        self.assertIsNone(malformed_error.exception.scratch_admission_diagnostic)
         self.assertIn("private failure detail", private_stderr.getvalue())
         self.assertIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", private_stderr.getvalue())
         public_stderr = io.StringIO()
@@ -1003,6 +1030,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Platform backup failed") as public_error:
                 maintenance._run_backup_command(["fixed-backup-child"])
         self.assertIsNone(public_error.exception.scratch_unit_diagnostic)
+        self.assertIsNone(public_error.exception.scratch_admission_diagnostic)
         self.assertEqual(public_stderr.getvalue(), "")
 
     def test_backup_failure_prevents_retention_deletion(self) -> None:
@@ -3245,7 +3273,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 {
                     "schema", "event", "run_id", "attempt", "operation", "source_sha",
                     "bundle_sha256", "stage", "public_summary_error", "exit_code", "report_state",
-                    "report_error_class", "restore_diagnostic", "scratch_unit_diagnostic", "report_bytes",
+                    "report_error_class", "restore_diagnostic", "scratch_unit_diagnostic",
+                    "scratch_admission_diagnostic", "report_bytes",
                     "backup_disk_diagnostic",
                     "report_sha256", "stderr_state",
                     "stderr_exception_class", "stderr_bytes", "stderr_sha256",
@@ -3257,6 +3286,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(receipt["exit_code"], completed.returncode)
             self.assertEqual(receipt["report_error_class"], "none")
             self.assertIsNone(receipt["scratch_unit_diagnostic"])
+            self.assertIsNone(receipt["scratch_admission_diagnostic"])
             self.assertEqual(receipt["stderr_exception_class"], "none")
             self.assertNotIn("Current release symlink is missing", receipt_path.read_text())
             self.assertFalse(report_path.exists())
@@ -3309,6 +3339,17 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "verification_error": "os_error",
                             "verification_errno": 3,
                         },
+                        "scratch_admission_diagnostic": {
+                            "schema": 1,
+                            "phase": "pre_create_admission",
+                            "guard_reason": "memory_reserve",
+                            "available_bytes": 1_060_000_000,
+                            "required_bytes": 1_073_741_824,
+                            "helper_rss_bytes": 18_000_000,
+                            "direct_parent_rss_bytes": 9_000_000,
+                            "observed_pair_rss_bytes": 27_000_000,
+                            "observed_process_count": 2,
+                        },
                     }
                 ),
                 encoding="ascii",
@@ -3347,6 +3388,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             typed_receipt = json.loads(typed_receipt_path.read_text(encoding="ascii"))
             self.assertEqual(typed_receipt["report_state"], "typed_failure")
             self.assertEqual(typed_receipt["report_error_class"], "backup")
+            self.assertNotIn("1060000000", typed_completed.stdout)
+            self.assertNotIn("27000000", typed_completed.stdout)
             self.assertEqual(
                 typed_receipt["restore_diagnostic"]["guard_reason"], "disk_floor"
             )
@@ -3383,12 +3426,66 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "verification_errno": 3,
                 },
             )
+            self.assertEqual(
+                typed_receipt["scratch_admission_diagnostic"],
+                {
+                    "schema": 1,
+                    "phase": "pre_create_admission",
+                    "guard_reason": "memory_reserve",
+                    "available_bytes": 1_060_000_000,
+                    "required_bytes": 1_073_741_824,
+                    "helper_rss_bytes": 18_000_000,
+                    "direct_parent_rss_bytes": 9_000_000,
+                    "observed_pair_rss_bytes": 27_000_000,
+                    "observed_process_count": 2,
+                },
+            )
             self.assertNotIn(
                 "fixture-private detail",
                 typed_receipt_path.read_text(encoding="ascii"),
             )
             self.assertNotIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", typed_receipt_path.read_text(encoding="ascii"))
             self.assertFalse(typed_report.exists())
+
+            valid_admission = {
+                "schema": 1,
+                "phase": "pre_create_admission",
+                "guard_reason": "memory_reserve",
+                "available_bytes": 1_060_000_000,
+                "required_bytes": 1_073_741_824,
+                "helper_rss_bytes": 18_000_000,
+                "direct_parent_rss_bytes": 9_000_000,
+                "observed_pair_rss_bytes": 27_000_000,
+                "observed_process_count": 2,
+            }
+            invalid_admissions = []
+            for field, bad_value in (
+                ("available_bytes", True),
+                ("available_bytes", -1),
+                ("required_bytes", None),
+                ("helper_rss_bytes", True),
+                ("helper_rss_bytes", (1 << 40) + 1),
+                ("observed_pair_rss_bytes", 27_000_001),
+            ):
+                invalid_admissions.append(
+                    {**valid_admission, field: bad_value}
+                )
+            invalid_admissions.append(
+                {key: value for key, value in valid_admission.items() if key != "available_bytes"}
+            )
+            invalid_admissions.extend(
+                [
+                    {**valid_admission, "observed_process_count": True},
+                    {**valid_admission, "direct_parent_rss_bytes": (1 << 40) + 1},
+                    {**valid_admission, "observed_process_count": 1},
+                    {**valid_admission, "observed_pair_rss_bytes": None},
+                ]
+            )
+            self.assertTrue(maintenance.valid_scratch_admission_diagnostic(valid_admission))
+            for invalid_admission in invalid_admissions:
+                self.assertFalse(
+                    maintenance.valid_scratch_admission_diagnostic(invalid_admission)
+                )
 
             typed_report.write_text(
                 json.dumps(
@@ -3430,6 +3527,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
             self.assertNotEqual(after_confinement_completed.returncode, 0)
             after_confinement_receipt_path = typed_shared / "backup-failure-123460-1.json"
+            self.assertTrue(
+                after_confinement_receipt_path.exists(),
+                f"after-confinement receipt missing: files={sorted(path.name for path in typed_shared.iterdir())!r} "
+                f"stdout={after_confinement_completed.stdout!r} stderr={after_confinement_completed.stderr!r}",
+            )
             after_confinement_receipt = json.loads(
                 after_confinement_receipt_path.read_text(encoding="ascii")
             )
