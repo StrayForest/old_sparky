@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
-import os
-import signal
+import types
 import unittest
+import uuid
 from unittest import mock
 
 
@@ -169,6 +173,28 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             "CREATE ROLE platform_user LOGIN;",
         )
 
+        # The maintenance entrypoint must reject an unprivileged caller before
+        # inspecting an archive or starting any host-level scratch operation.
+        with (
+            mock.patch.object(backup_drill.os, "geteuid", return_value=1000),
+            mock.patch.object(backup_drill, "require_commands") as require_commands,
+            mock.patch.object(backup_drill, "_scratch_host_guard") as host_guard,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "requires the root maintenance owner"
+            ):
+                backup_drill._run_isolated_restore_drill(
+                    pathlib.Path("/does-not-need-to-exist.dump"),
+                    timestamp_slug="20261012T000000Z",
+                )
+        require_commands.assert_not_called()
+        host_guard.assert_not_called()
+
+    def test_isolated_restore_signal_cleanup_under_root(self) -> None:
+        self._assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db()
+        self._assert_scratch_sigterm_stops_and_reaps_launched_unit()
+        self._assert_scratch_worker_uses_pinned_archive_fd()
+
         with tempfile.TemporaryDirectory() as temporary_dir:
             scratch_root = pathlib.Path(temporary_dir) / "scratch"
             scratch_root.mkdir(mode=0o700)
@@ -192,8 +218,95 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertFalse(any("ReadWritePaths=" in item for item in command))
         self.assertFalse(any("PGPASSWORD" in item or "PLATFORM_DATABASE_URL" in item for item in command))
 
-        self._assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db()
-        self._assert_scratch_sigterm_stops_and_reaps_launched_unit()
+    def _assert_scratch_worker_uses_pinned_archive_fd(self) -> None:
+        self.assertEqual(backup_drill.os.geteuid(), 0)
+        scratch_root = pathlib.Path(
+            "/run/oldsparky-backup-restore-" + uuid.uuid4().hex[:24]
+        )
+        scratch_root.mkdir(mode=0o700)
+        archive_path = scratch_root / "archive.dump"
+        archive_bytes = b"PGDMPsynthetic worker archive"
+        archive_path.write_bytes(archive_bytes)
+        archive_path.chmod(0o600)
+        archive_stat = archive_path.stat()
+        args = argparse.Namespace(
+            _scratch_root=str(scratch_root),
+            _scratch_archive=str(archive_path),
+            _scratch_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+            _scratch_archive_dev=archive_stat.st_dev,
+            _scratch_archive_ino=archive_stat.st_ino,
+            _scratch_archive_size=archive_stat.st_size,
+            _scratch_timestamp_slug="20261012T010203Z",
+        )
+        command_results = [
+            subprocess.CompletedProcess(["pg_config"], 0, "/usr/lib/postgresql/16/bin\n", ""),
+            subprocess.CompletedProcess(["postgres"], 0, "postgres (PostgreSQL) 16.10\n", ""),
+        ]
+        command_calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def fake_run_command(command, **kwargs):
+            command_calls.append((command, kwargs))
+            if command[:2] == ["pg_config", "--bindir"]:
+                return command_results[0]
+            if command[-1:] == ["--version"]:
+                return command_results[1]
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        observed: dict[str, object] = {}
+
+        def fake_restore(dump_path, **kwargs):
+            observed["dump_path"] = dump_path
+            observed.update(kwargs)
+            handle = kwargs["archive_stdin"]
+            handle_stat = os.fstat(handle.fileno())
+            observed["archive_identity"] = (handle_stat.st_dev, handle_stat.st_ino)
+            observed["archive_offset"] = handle.tell()
+            observed["archive_open_during_restore"] = not handle.closed
+            observed["archive_mode"] = handle.mode
+            return 7
+
+        fake_postgres = types.SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+        try:
+            with (
+                mock.patch.object(backup_drill, "_scratch_mount_snapshot"),
+                mock.patch.object(backup_drill, "_scratch_cgroup_snapshot"),
+                mock.patch.object(backup_drill, "_scratch_mem_available_bytes", return_value=2**30),
+                mock.patch.object(backup_drill, "_scratch_resource_guard"),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill.pwd, "getpwnam", return_value=fake_postgres),
+                mock.patch.object(backup_drill.os, "chown"),
+                mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
+                mock.patch.object(backup_drill, "_scratch_create_application_role") as create_role,
+                mock.patch.object(backup_drill, "perform_restore_drill", side_effect=fake_restore),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.assertEqual(backup_drill._scratch_worker_main(args), 0)
+
+            self.assertEqual(
+                json.loads(stdout.getvalue()),
+                {"ok": True, "restored_table_count": 7},
+            )
+            self.assertEqual(observed["dump_path"], scratch_root / "archive.dump")
+            self.assertEqual(
+                observed["archive_identity"],
+                (archive_stat.st_dev, archive_stat.st_ino),
+            )
+            self.assertEqual(observed["archive_offset"], 0)
+            self.assertTrue(observed["archive_open_during_restore"])
+            self.assertEqual(observed["archive_mode"], "rb")
+            self.assertEqual(observed["app_target"].username, backup_drill.SCRATCH_APP_ROLE)
+            self.assertEqual(observed["admin_target"].username, "postgres")
+            self.assertTrue(observed["restore_as_postgres"])
+            self.assertTrue(observed["restore_no_tablespaces"])
+            self.assertTrue(callable(observed["resource_guard"]))
+            create_role.assert_called_once()
+            self.assertEqual(create_role.call_args.args[0].username, "postgres")
+            self.assertTrue(any(command[:2] == ["pg_config", "--bindir"] for command, _ in command_calls))
+            self.assertTrue(any(command[-1:] == ["start"] for command, _ in command_calls))
+            self.assertTrue(any(command[-1:] == ["stop"] for command, _ in command_calls))
+            self.assertFalse((scratch_root / "data" / "postmaster.pid").exists())
+        finally:
+            shutil.rmtree(scratch_root)
 
     def _assert_scratch_sigterm_stops_and_reaps_launched_unit(self) -> None:
         class LauncherProcess:

@@ -461,6 +461,11 @@ CLASS_CONTOUR_OVERRIDES: Mapping[tuple[str, str], str] = {
 
 TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
     (
+        "test_platform_backup_restore_drill",
+        "PlatformBackupRestoreDrillTests",
+        "test_isolated_restore_signal_cleanup_under_root",
+    ): "backend-privileged",
+    (
         "test_platform_host_tools_bundle",
         "HostToolsBundleTests",
         "test_active_release_baseline_reader_returns_stable_closed_tuple",
@@ -473,10 +478,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 165,
     "module_digest": "a2e512646a36ca0094e9c17fd599176f44afb06da1fe28d2a0abae3ba46a761d",
-    "test_count": 1853,
-    "test_id_digest": "3c3222d9f9496c2eb372a02c9289b60b0b8bbfcb15a39a762d7e18aae6caaad2",
-    "backend_test_count": 1781,
-    "backend_test_id_digest": "3f1148b260a6feb4d05622855f12b42552d6f229240c4ec7fe8244a1cd784c95",
+    "test_count": 1854,
+    "test_id_digest": "3eeffdae090682a987fa1001881996e3d539b1980aef1eddfa15aed9d3bba9f8",
+    "backend_test_count": 1782,
+    "backend_test_id_digest": "292d0d823c01082a1d8421fce7cd7da20121d9fd4ef6ce72732f3bb693b2d0c3",
     "verification_test_count": 72,
     "verification_test_id_digest": "3c52523e15a19be1b10831e2a505af8e7a711e7b9d667246e1198598c947a7c0",
     "verification_classifier_test_count": 38,
@@ -515,10 +520,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "baef477986dbda481ca0c79a19694015fdc1cc6ea5b2ee0a32723fc5e310eaf6",
     },
     "backend-privileged": {
-        "module_count": 25,
-        "module_digest": "dc52380f67150e2a68d0e738733503c893cee5a3a73b96d02d8af4956068dae6",
-        "test_count": 590,
-        "test_id_digest": "eb3008b8e3af871cfa1daaf9057d7eb5cb63150c36580e7b2e03d0167a7ea9cd",
+        "module_count": 26,
+        "module_digest": "210efce670a082b8360377da86457b71db79310b02abffc0d3849445b073748a",
+        "test_count": 591,
+        "test_id_digest": "c68f45ecb0964206ce1783f692f15a3533a1ecf2660ec8cf71d5851926cf8fdd",
     },
     "performance-contract": {
         "module_count": 11,

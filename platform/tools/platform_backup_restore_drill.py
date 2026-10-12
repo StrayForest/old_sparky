@@ -1794,7 +1794,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         or not root.is_dir()
     ):
         raise RuntimeError("Scratch restore root is invalid.")
-    mount = _scratch_mount_snapshot(root)
+    _scratch_mount_snapshot(root)
     _scratch_cgroup_snapshot()
     if _scratch_mem_available_bytes() < SCRATCH_MEMORY_ADMISSION_BYTES:
         raise RuntimeError("Scratch restore admission memory reserve is unavailable.")
@@ -1899,7 +1899,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
             database="postgres",
         )
         table_count = perform_restore_drill(
-            archive_path,
+            root / "archive.dump",
             app_target=scratch_target,
             admin_target=admin_target,
             timestamp_slug=args._scratch_timestamp_slug,
