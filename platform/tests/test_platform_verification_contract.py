@@ -100,6 +100,7 @@ from tools.platform_verify_contract import (
     host_tools_pin_verification_issues,
     release_runtime_workflow_issues,
     security_status_permission_issues,
+    source_bound_backup_dispatch_issues,
     workflow_level_permission_issues,
 )
 
@@ -2418,6 +2419,78 @@ except lock.VerificationLockError as exc:
         self.assertEqual(ALLOWED_ACTION_OWNERS, frozenset({"actions"}))
         self.assertEqual(action_pin_issues(), [])
         self.assertEqual(workflow_level_permission_issues(), [])
+        autodeploy = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/platform-production-autodeploy.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(source_bound_backup_dispatch_issues(autodeploy), [])
+        guard_start = autodeploy.index(
+            "      - name: Verify exact source-bound restore-verified backup"
+        )
+        dispatch_start = autodeploy.index(
+            "      - name: Dispatch production deployment or baseline reconciliation"
+        )
+        guard = autodeploy[guard_start:dispatch_start]
+        mutations = [
+            autodeploy.replace(guard, "", 1),
+            autodeploy.replace(
+                "        if: ${{ steps.gate.outputs.deploy == 'true' }}\n        shell: bash\n        env:\n          GH_TOKEN: ${{ github.token }}\n          GITHUB_REPOSITORY: ${{ github.repository }}\n          GITHUB_API_URL: ${{ github.api_url }}\n          SOURCE_SECURITY_RUN_ID:",
+                "        if: ${{ always() }}\n        shell: bash\n        env:\n          GH_TOKEN: ${{ github.token }}\n          GITHUB_REPOSITORY: ${{ github.repository }}\n          GITHUB_API_URL: ${{ github.api_url }}\n          SOURCE_SECURITY_RUN_ID:",
+                1,
+            ),
+            autodeploy.replace(
+                '          set -euo pipefail\n          /usr/bin/python3 -I "$BACKUP_GUARD_TOOL"',
+                '          set +e\n          /usr/bin/python3 -I "$BACKUP_GUARD_TOOL" || true',
+                1,
+            ),
+            autodeploy.replace(
+                '          "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches"',
+                '          "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches"\n          --request POST',
+                1,
+            ),
+            autodeploy.replace(guard, "", 1).replace(
+                "      - name: Dispatch production deployment or baseline reconciliation",
+                "      - name: Verify exact source-bound restore-verified backup\n        run: true\n\n"
+                "      - name: Dispatch production deployment or baseline reconciliation",
+                1,
+            ),
+            autodeploy.replace(
+                '/usr/bin/python3 -I "$BACKUP_GUARD_TOOL"',
+                '/usr/bin/python3 -I "$BACKUP_GUARD_TOOL" || echo ignored failure',
+                1,
+            ),
+            autodeploy.replace(
+                '/usr/bin/python3 -I "$BACKUP_GUARD_TOOL"',
+                '/usr/bin/python3 -I "$BACKUP_GUARD_TOOL"; status=$?; echo "$status"; exit 0',
+                1,
+            ),
+            autodeploy.replace(
+                '      - name: Verify exact source-bound restore-verified backup\n',
+                '      - name: Verify exact source-bound restore-verified backup\n'
+                '        continue-on-error: ${{ github.event_name == \'push\' }}\n',
+                1,
+            ),
+            "jobs:\n  malformed: [\n",
+        ]
+        for index, malformed in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.assertTrue(source_bound_backup_dispatch_issues(malformed))
+        dispatch_end = autodeploy.index("\n      - name: Auto-deploy summary", dispatch_start)
+        dispatch_step = autodeploy[dispatch_start:dispatch_end]
+        moved_dispatch = autodeploy[:dispatch_start] + autodeploy[dispatch_end:]
+        moved_dispatch = moved_dispatch.replace(
+            "jobs:\n",
+            "jobs:\n  unrelated-dispatch:\n    runs-on: ubuntu-latest\n    steps:\n"
+            + dispatch_step
+            + "\n",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "must be in the same job" in issue
+                for issue in source_bound_backup_dispatch_issues(moved_dispatch)
+            )
+        )
         workflow_text = SECURITY_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(_backend_workflow_issues(workflow_text), [])
         privileged_match = re.search(

@@ -430,6 +430,28 @@ def summarize_retention(raw: str) -> dict[str, object]:
         or backup_duration_seconds > 10**9
     ):
         backup_duration_seconds = None
+    archive_name = backup.get("archive_name")
+    if not isinstance(archive_name, str) or re.fullmatch(
+        r"platformdb-[0-9]{8}T[0-9]{6}Z\.dump", archive_name
+    ) is None:
+        archive_name = None
+    archive_sha256 = backup.get("archive_sha256")
+    if not isinstance(archive_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", archive_sha256) is None:
+        archive_sha256 = None
+    archive_format_version = backup.get("format_version")
+    if type(archive_format_version) is not int or archive_format_version not in {1, 2}:
+        archive_format_version = None
+    inventory_digests = {}
+    for key in (
+        "preexisting_archive_inventory_sha256",
+        "postexisting_archive_inventory_sha256",
+    ):
+        digest = backup.get(key)
+        inventory_digests[key] = (
+            digest
+            if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+            else None
+        )
     return {
         "schema": SCHEMA,
         "kind": "storage_retention",
@@ -459,6 +481,11 @@ def summarize_retention(raw: str) -> dict[str, object]:
         },
         "backup": {
             "status": backup_status,
+            "created": backup.get("created") is True,
+            "archive_name": archive_name,
+            "format_version": archive_format_version,
+            "archive_sha256": archive_sha256,
+            "sha256": archive_sha256,
             "restore_verified": restore_verified,
             "alembic_revision_verified": (
                 backup.get("alembic_revision_verified")
@@ -467,9 +494,30 @@ def summarize_retention(raw: str) -> dict[str, object]:
             ),
             "checksum_present": backup.get("checksum_present") is True,
             "size_bytes": _safe_int(backup.get("size_bytes")),
+            "rotation_mode": (
+                backup.get("rotation_mode")
+                if isinstance(backup.get("rotation_mode"), str)
+                and backup.get("rotation_mode") in {"preserve-existing", "rotate-existing"}
+                else None
+            ),
+            "preexisting_archive_count": _safe_int(backup.get("preexisting_archive_count")),
+            "preexisting_sidecar_count": _safe_int(backup.get("preexisting_sidecar_count")),
+            "postexisting_archive_count": _safe_int(backup.get("postexisting_archive_count")),
+            "preexisting_archives_preserved": backup.get("preexisting_archives_preserved") is True,
+            **inventory_digests,
             "duration_seconds": backup_duration_seconds,
             "restored_table_count": _safe_int(backup.get("restored_table_count")),
             "removed_count": _safe_int(backup.get("removed_count")),
+            "verified_existing": backup.get("verified_existing") is True,
+            "restore_verified_at_utc": (
+                backup.get("restore_verified_at_utc")
+                if isinstance(backup.get("restore_verified_at_utc"), str)
+                and re.fullmatch(
+                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z",
+                    backup["restore_verified_at_utc"],
+                )
+                else None
+            ),
         },
     }
 

@@ -123,6 +123,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_backend_audit_remediation
     test_platform_backup_offsite
     test_platform_backup_restore_drill
+    test_platform_backup_success_guard
     test_platform_bracket_graph_api
     test_platform_cdn_check
     test_platform_ci_classifier
@@ -345,6 +346,7 @@ TOOL_MODULES = frozenset(
     {
         "test_platform_backup_offsite",
         "test_platform_backup_restore_drill",
+        "test_platform_backup_success_guard",
         "test_platform_backend_test_catalog",
         "test_platform_cdn_check",
         "test_platform_cleanup_orphaned_integration",
@@ -476,12 +478,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 165,
-    "module_digest": "a2e512646a36ca0094e9c17fd599176f44afb06da1fe28d2a0abae3ba46a761d",
-    "test_count": 1857,
-    "test_id_digest": "0688d1c5132bbb0e10e9882df9f41a67c8abc494a9113ff4e29718e575c488a3",
-    "backend_test_count": 1785,
-    "backend_test_id_digest": "9a0dd4680903187a9cc581e7c44b46d070b00b0ab2da7331dc327e28a55a6fd4",
+    "module_count": 166,
+    "module_digest": "d95f05e241ec8dc79d681f306e40207e11bccc4c6f354384703879335ccf1967",
+    "test_count": 1878,
+    "test_id_digest": "cd8d9f7a28d074b15904afa73f52d6762f7f3eaf670b9174052891576f092c15",
+    "backend_test_count": 1806,
+    "backend_test_id_digest": "f9990b99f3fd2ec0713c887d2c0f10f441d7fe6893854ab1034c4bc673804348",
     "verification_test_count": 72,
     "verification_test_id_digest": "3c52523e15a19be1b10831e2a505af8e7a711e7b9d667246e1198598c947a7c0",
     "verification_classifier_test_count": 38,
@@ -494,7 +496,7 @@ EXPECTED_SNAPSHOT: Mapping[str, object] = {
 # registry so a future owner change must explain itself in the same change.
 CONTOUR_RATIONALE: Mapping[str, str] = {
     "backend-unit": "pure unit/domain/backend behavior without external operator resources",
-    "backend-tool-contract": "hermetic repository tools, immutable host-tools bytecode/inventory and contract tests without root-owned host state",
+    "backend-tool-contract": "hermetic repository tools, backup restore diagnostics and source-bound artifact proofs without root-owned host state",
     "backend-integration": "PostgreSQL/Redis workflows and concurrency behavior",
     "backend-privileged": "root/service-identity, release/install/systemd, artifact ownership and privileged wrappers",
     "performance-contract": "deterministic load, observer and acceptance contracts",
@@ -508,10 +510,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "90aa81e361a4e7790bc4b165ca0be59fa0082b69f692c399882ccea7fccc083f",
     },
     "backend-tool-contract": {
-        "module_count": 47,
-        "module_digest": "66a470c3aa1f3e4a3f25610624feca100e8539bc8a72a7028ea45034f9def83a",
-        "test_count": 432,
-        "test_id_digest": "1bd546482b5e047c944c5bb54bfe7337bfc785e4bc4d27093c9185370e5c7e23",
+        "module_count": 48,
+        "module_digest": "d9a68991996838b6eee941794b542a711113edf8a22213163f10929680660490",
+        "test_count": 452,
+        "test_id_digest": "e2046e8a885b46bac1a0cff3ab61396e754df1740d273545b2d9d942e3c821c8",
     },
     "backend-integration": {
         "module_count": 41,
@@ -522,8 +524,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 26,
         "module_digest": "210efce670a082b8360377da86457b71db79310b02abffc0d3849445b073748a",
-        "test_count": 591,
-        "test_id_digest": "c68f45ecb0964206ce1783f692f15a3533a1ecf2660ec8cf71d5851926cf8fdd",
+        "test_count": 592,
+        "test_id_digest": "511f1a2f3547880dea691c0c2bb43031d5791e694be0f63d74c69214d53b8dc3",
     },
     "performance-contract": {
         "module_count": 11,

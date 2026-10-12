@@ -144,7 +144,7 @@ the workflow requires at least 60 minutes to remain, allowing a 45-minute
 backup/restore budget plus 15 minutes for completion and cleanup. Each API
 request and sleep is capped by the remaining poll deadline. It never substitutes another run or a newer `dev`
 head. It validates the exact successful verification job, artifact digest,
-attestation, and six-file helper manifest before staging anything on the host.
+attestation, and seven-file helper manifest before staging anything on the host.
 It runs those staged, source-bound helper bytes for both create and
 verify-existing. If the run fails, times out, the source moves, or any bundle
 check fails, it stops without running a production backup or falling back to
@@ -186,11 +186,13 @@ gh workflow run platform-production-backup.yml \
   -f source_sha="$SOURCE_SHA"
 ```
 
-Wait for that exact `Platform production backup` run to pass before treating
-the queued automatic deployment as eligible to proceed. The backup run and
-deploy child share the production concurrency group, so dispatch the backup
-early enough that it starts while the exact security run is still active; do
-not dispatch another production operation in between. It invokes the
+Dispatch the backup while the exact Security run is still active so its
+production job reserves the shared slot before the automatic workflow can
+dispatch a deployment child. The auto-deploy workflow waits for that exact
+backup run to complete successfully and validates its source-bound receipt;
+only then does it make the single child-dispatch request. No deployment child
+is queued behind the backup while that proof is pending. Do not dispatch
+another production operation in between. The backup invokes the
 lock-aware backup-only mode and acquires locks in the fixed order
 release -> retained-load -> build -> live-QA. Backup-only does not apply
 production-release, source-artifact, transient-browser or live-QA retention.
@@ -203,6 +205,21 @@ failure diagnostics stay in a root-private file and are not copied to the
 public artifact. No backup-only branch rotates or removes existing archives.
 Full storage maintenance owns the separate archive-rotation path and applies
 its configured keep count only after a successful restore drill.
+
+The automatic deployment workflow waits for this exact create run before it
+dispatches a deployment child. It accepts one completed-success backup run
+whose workflow, source Security run ID and attempt, source SHA, `dev` ref,
+backup run attempt, production-job start time, artifact API digest and closed
+receipt all agree. The backup workflow and production job must have started
+while that source Security run was still in progress, proving that the backup
+reserved the shared production slot before the automatic child. The receipt
+is uploaded only after the remote operation, cleanup and final acceptance
+succeed. Missing, expired, duplicate, stale, malformed or mismatched evidence,
+an API/ZIP digest mismatch, or a polling deadline causes the auto-deploy job to
+fail before its only deployment-dispatch request. The existing age-limited
+backup preflight remains an additional check; it does not replace this
+source-bound proof. The auto-deploy workflow has no fallback to an older backup
+and does not dispatch a manual-deployment path.
 
 When the source-bound scratch restore service exits before its confinement can
 be verified, the explicit private-diagnostics path records only a closed unit

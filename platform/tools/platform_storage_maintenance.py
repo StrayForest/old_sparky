@@ -849,12 +849,28 @@ def run_backup(
         raise BackupCommandFailure()
     if result.get("restore_verified") is not True or check_result.get("restore_verified") is not True:
         raise RuntimeError("Platform backup was not restore-verified.")
+    archive_name = result.get("dump_file")
+    if (
+        not isinstance(archive_name, str)
+        or Path(archive_name).name != archive_name
+        or re.fullmatch(r"platformdb-[0-9]{8}T[0-9]{6}Z\.dump", archive_name) is None
+    ):
+        raise RuntimeError("Platform backup archive identity is invalid.")
+    archive_sha256 = result.get("sha256")
+    if not isinstance(archive_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", archive_sha256) is None:
+        raise RuntimeError("Platform backup archive checksum is invalid.")
+    format_version = result.get("format_version")
+    if type(format_version) is not int or format_version != 2:
+        raise RuntimeError("Platform backup format version is invalid.")
+    size_bytes = result.get("size_bytes")
+    if type(size_bytes) is not int or size_bytes <= 0:
+        raise RuntimeError("Platform backup size is invalid.")
     return {
-        "size_bytes": result.get("size_bytes")
-        if isinstance(result.get("size_bytes"), int)
-        and not isinstance(result.get("size_bytes"), bool)
-        and result.get("size_bytes") >= 0
-        else None,
+        "created": True,
+        "archive_name": archive_name,
+        "format_version": format_version,
+        "archive_sha256": archive_sha256,
+        "size_bytes": size_bytes,
         "duration_seconds": result.get("duration_seconds")
         if isinstance(result.get("duration_seconds"), (int, float))
         and not isinstance(result.get("duration_seconds"), bool)

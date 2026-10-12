@@ -12,6 +12,8 @@ import shlex
 import sys
 from typing import Iterable
 
+import yaml
+
 try:
     from tools.platform_test_catalog import (
         BACKEND_CONTOURS,
@@ -260,6 +262,96 @@ def workflow_level_permission_issues() -> list[str]:
                 f"permission {permission.group('permission')}: write is too broad; "
                 "scope it to the writing job"
             )
+    return issues
+
+
+def source_bound_backup_dispatch_issues(workflow_text: str) -> list[str]:
+    """Require the exact backup proof to gate the only production child POST."""
+
+    issues: list[str] = []
+    guard_name = "Verify exact source-bound restore-verified backup"
+    dispatch_name = "Dispatch production deployment or baseline reconciliation"
+    try:
+        document = yaml.safe_load(workflow_text)
+    except yaml.YAMLError:
+        return ["auto-deploy workflow YAML must parse for backup dispatch validation"]
+    if not isinstance(document, dict) or not isinstance(document.get("jobs"), dict):
+        return ["auto-deploy workflow must have a jobs mapping"]
+    step_rows: list[tuple[str, str, dict[str, object]]] = []
+    all_run_text: list[str] = []
+    for job_name, job in document["jobs"].items():
+        if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+            continue
+        for step in job["steps"]:
+            if not isinstance(step, dict):
+                continue
+            name = step.get("name")
+            if isinstance(name, str):
+                step_rows.append((str(job_name), name, step))
+            run = step.get("run")
+            if isinstance(run, str):
+                all_run_text.append(run)
+    guards = [(job_name, step) for job_name, name, step in step_rows if name == guard_name]
+    dispatches = [(job_name, step) for job_name, name, step in step_rows if name == dispatch_name]
+    if len(guards) != 1:
+        return ["auto-deploy must contain exactly one source-bound backup proof step"]
+    if len(dispatches) != 1:
+        return ["auto-deploy must contain exactly one production dispatch step"]
+    guard_job, guard = guards[0]
+    dispatch_job, dispatch = dispatches[0]
+    guard_index = next(index for index, (_, _, step) in enumerate(step_rows) if step is guard)
+    dispatch_index = next(index for index, (_, _, step) in enumerate(step_rows) if step is dispatch)
+    if guard_index >= dispatch_index:
+        issues.append("source-bound backup proof must precede the production dispatch")
+    if guard_job != dispatch_job:
+        issues.append("source-bound backup proof and production dispatch must be in the same job")
+    guard_keys = {"name", "if", "shell", "env", "run"}
+    if set(guard) != guard_keys:
+        issues.append("source-bound backup proof step must not add bypass or error-masking keys")
+    if (
+        guard.get("if") != "${{ steps.gate.outputs.deploy == 'true' }}"
+        or dispatch.get("if") != "${{ steps.gate.outputs.deploy == 'true' }}"
+    ):
+        issues.append("backup proof and production dispatch must share the deploy-success condition")
+    expected_env = {
+        "GH_TOKEN": "${{ github.token }}",
+        "GITHUB_REPOSITORY": "${{ github.repository }}",
+        "GITHUB_API_URL": "${{ github.api_url }}",
+        "SOURCE_SECURITY_RUN_ID": "${{ github.event.workflow_run.id }}",
+        "SOURCE_SECURITY_RUN_ATTEMPT": "${{ github.event.workflow_run.run_attempt }}",
+        "SOURCE_RUN_COMPLETED_AT": "${{ github.event.workflow_run.completed_at }}",
+        "TARGET_SHA": "${{ github.event.workflow_run.head_sha }}",
+        "BACKUP_GUARD_TOOL": "${{ github.workspace }}/platform/tools/platform_backup_success_guard.py",
+    }
+    expected_run = 'set -euo pipefail\n/usr/bin/python3 -I "$BACKUP_GUARD_TOOL"'
+    if (
+        guard.get("shell") != "bash"
+        or guard.get("env") != expected_env
+        or not isinstance(guard.get("run"), str)
+        or guard.get("run", "").strip() != expected_run
+    ):
+        issues.append("source-bound backup proof must run only the exact guard with exact Security source inputs")
+    if set(dispatch) - {"name", "if", "shell", "env", "run"}:
+        issues.append("production dispatch step must not use a bypass or error-masking key")
+    dispatch_run = dispatch.get("run")
+    if not isinstance(dispatch_run, str):
+        issues.append("production dispatch step must have a synchronous shell body")
+        dispatch_run = ""
+    endpoint = "/actions/workflows/platform-production-deploy.yml/dispatches"
+    total_posts = sum(run.count("--request POST") for run in all_run_text)
+    total_endpoints = sum(run.count(endpoint) for run in all_run_text)
+    post_index = dispatch_run.find("--request POST")
+    freshness_index = dispatch_run.find('test "$dev_sha" = "$TARGET_SHA"')
+    if total_endpoints != 1 or total_posts != 1 or endpoint not in dispatch_run:
+        issues.append("auto-deploy must have one post-proof production dispatch POST")
+    if (
+        dispatch.get("shell") != "bash"
+        or "set -euo pipefail" not in dispatch_run
+        or freshness_index < 0
+        or post_index < 0
+        or freshness_index > post_index
+    ):
+        issues.append("production dispatch must fail closed and recheck dev SHA before its only POST")
     return issues
 
 
@@ -2394,6 +2486,7 @@ def collect_issues() -> list[str]:
 
     auto_text = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
     production_text = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
+    issues.extend(source_bound_backup_dispatch_issues(auto_text))
     issues.extend(
         _checkout_credential_issues("platform-production-deploy.yml", production_text)
     )

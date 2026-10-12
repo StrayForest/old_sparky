@@ -1069,6 +1069,7 @@ jobs:
               "platform_release_retention.py",
               "platform_build_node_cache.py",
               "platform_storage_maintenance.py",
+              "platform_storage_evidence_summary.py",
           )
           expected_source_modes = {
               "platform_backup_restore_drill.py": 0o755,
@@ -1077,6 +1078,7 @@ jobs:
               "platform_release_retention.py": 0o755,
               "platform_build_node_cache.py": 0o644,
               "platform_storage_maintenance.py": 0o755,
+              "platform_storage_evidence_summary.py": 0o644,
           }
           entries = []
           payloads = {}

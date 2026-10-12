@@ -28,11 +28,12 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'dev'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 180
     env:
       TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
       SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
       SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      SOURCE_RUN_COMPLETED_AT: ${{ github.event.workflow_run.completed_at }}
       SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
       SECURITY_WORKFLOW_NAME: Platform security and build
       SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
@@ -889,6 +890,22 @@ jobs:
 
           echo "mode=$dispatch_mode" >> "$GITHUB_OUTPUT"
           echo "deploy=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify exact source-bound restore-verified backup
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          SOURCE_SECURITY_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_SECURITY_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_RUN_COMPLETED_AT: ${{ github.event.workflow_run.completed_at }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+          BACKUP_GUARD_TOOL: ${{ github.workspace }}/platform/tools/platform_backup_success_guard.py
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I "$BACKUP_GUARD_TOOL"
 
       - name: Dispatch production deployment or baseline reconciliation
         if: ${{ steps.gate.outputs.deploy == 'true' }}

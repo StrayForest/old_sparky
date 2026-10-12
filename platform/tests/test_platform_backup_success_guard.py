@@ -1,0 +1,784 @@
+"""Fail-closed contracts for the source-bound backup success proof."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import stat
+import unittest
+import warnings
+import zipfile
+from typing import Any
+from unittest import mock
+
+from tools import platform_backup_success_guard as backup_guard
+
+
+SECURITY_WORKFLOW = ".github/workflows/platform-security.yml"
+BACKUP_WORKFLOW = ".github/workflows/platform-production-backup.yml"
+BACKUP_JOB = "Create restore-verified backup"
+SECURITY_RUN_ID = 741_002
+SECURITY_ATTEMPT = 2
+BACKUP_RUN_ID = 741_991
+BACKUP_ATTEMPT = 1
+SOURCE_SHA = "85b287932efe846e126edf4b6fcdaa9b412cc000"
+RECEIPT_MEMBER = "backup-success-receipt.json"
+
+
+def _digest(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _binding(**overrides: str) -> backup_guard.BackupBinding:
+    values = {
+        "repository": "StrayForest/old_sparky",
+        "ref": "refs/heads/dev",
+        "source_security_run_id": str(SECURITY_RUN_ID),
+        "source_security_run_attempt": str(SECURITY_ATTEMPT),
+        "source_sha": SOURCE_SHA,
+        "source_security_completed_at": "2026-10-12T19:10:00Z",
+    }
+    values.update(overrides)
+    return backup_guard.BackupBinding(**values)
+
+
+def _receipt(**overrides: object) -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "schema": 1,
+        "kind": "platform_source_bound_backup_success",
+        "repository": "StrayForest/old_sparky",
+        "ref": "refs/heads/dev",
+        "operation": "create",
+        "source_security_run_id": str(SECURITY_RUN_ID),
+        "source_security_run_attempt": str(SECURITY_ATTEMPT),
+        "source_sha": SOURCE_SHA,
+        "backup_workflow_path": BACKUP_WORKFLOW,
+        "backup_run_id": str(BACKUP_RUN_ID),
+        "backup_run_attempt": str(BACKUP_ATTEMPT),
+        "backup_head_sha": SOURCE_SHA,
+        "archive_name": "platformdb-20261012T191000Z.dump",
+        "format_version": 2,
+        "archive_sha256": "a" * 64,
+        "archive_size_bytes": 8_192,
+        "created": True,
+        "restore_verified": True,
+        "alembic_revision_verified": True,
+        "restored_table_count": 137,
+        "preexisting_archives_preserved": True,
+        "rotation_mode": "preserve-existing",
+    }
+    receipt.update(overrides)
+    return receipt
+
+
+def _zip_receipt(
+    receipt_bytes: bytes | None,
+    *,
+    entries: list[tuple[str, bytes, int]] | None = None,
+    compression: int = zipfile.ZIP_DEFLATED,
+) -> bytes:
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", compression=compression) as archive:
+        if entries is not None:
+            for name, value, mode in entries:
+                item = zipfile.ZipInfo(name)
+                item.compress_type = compression
+                item.external_attr = (mode | 0o600) << 16
+                archive.writestr(item, value)
+        elif receipt_bytes is not None:
+            item = zipfile.ZipInfo(RECEIPT_MEMBER)
+            item.compress_type = compression
+            item.external_attr = (stat.S_IFREG | 0o600) << 16
+            archive.writestr(item, receipt_bytes)
+    return payload.getvalue()
+
+
+def _receipt_zip(**overrides: object) -> bytes:
+    body = json.dumps(_receipt(**overrides), sort_keys=True, separators=(",", ":")).encode()
+    return _zip_receipt(body)
+
+
+def _gh_time(value: str) -> str:
+    return f"2026-10-12T{value}Z"
+
+
+class FakeBackupProofApi:
+    """In-memory GitHub API projection; methods perform no network I/O."""
+
+    def __init__(self, archive: bytes | None = None) -> None:
+        self.archive = archive if archive is not None else _receipt_zip()
+        self.security = {
+            "id": SECURITY_RUN_ID,
+            "run_attempt": SECURITY_ATTEMPT,
+            "path": SECURITY_WORKFLOW,
+            "event": "push",
+            "head_branch": "dev",
+            "head_sha": SOURCE_SHA,
+            "status": "completed",
+            "conclusion": "success",
+            "run_started_at": _gh_time("18:59:00"),
+            "updated_at": _gh_time("19:10:00"),
+        }
+        self.workflow = {"id": 901, "path": BACKUP_WORKFLOW}
+        self.runs: list[dict[str, Any]] = [
+            {
+                "id": BACKUP_RUN_ID,
+                "workflow_id": 901,
+                "run_attempt": BACKUP_ATTEMPT,
+                "path": BACKUP_WORKFLOW,
+                "event": "workflow_dispatch",
+                "head_branch": "dev",
+                "head_sha": SOURCE_SHA,
+                "display_title": (
+                    f"Platform backup create s{SECURITY_RUN_ID}."
+                    f"{SECURITY_ATTEMPT} {SOURCE_SHA}"
+                ),
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": _gh_time("19:01:00"),
+                "run_started_at": _gh_time("19:02:00"),
+            }
+        ]
+        self.jobs: list[dict[str, Any]] = [
+            {
+                "id": 902,
+                "run_attempt": BACKUP_ATTEMPT,
+                "name": BACKUP_JOB,
+                "started_at": _gh_time("19:03:00"),
+                "completed_at": _gh_time("19:09:00"),
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+        self.artifacts: list[dict[str, Any]] = [
+            {
+                "id": 903,
+                "name": f"platform-backup-success-{BACKUP_RUN_ID}-{BACKUP_ATTEMPT}",
+                "expired": False,
+                "size_in_bytes": len(self.archive),
+                "created_at": _gh_time("19:08:00"),
+                "digest": f"sha256:{_digest(self.archive)}",
+                "workflow_run": {"id": BACKUP_RUN_ID, "head_sha": SOURCE_SHA},
+            }
+        ]
+        self.dev_sha = SOURCE_SHA
+        self.downloads: list[tuple[int, int, int]] = []
+        self.calls: list[str] = []
+
+    def security_run(self, run_id: str) -> dict[str, Any]:
+        self.calls.append("security_run")
+        return dict(self.security)
+
+    def backup_workflow(self, path: str) -> dict[str, Any]:
+        self.calls.append("backup_workflow")
+        return dict(self.workflow)
+
+    def backup_runs(
+        self, workflow_id: int, branch: str, event: str, head_sha: str
+    ) -> list[dict[str, Any]]:
+        self.calls.append("backup_runs")
+        return [dict(run) for run in self.runs]
+
+    def backup_jobs(self, run_id: str, attempt: str) -> list[dict[str, Any]]:
+        self.calls.append("backup_jobs")
+        return [dict(job) for job in self.jobs]
+
+    def backup_artifacts(self, run_id: int) -> list[dict[str, Any]]:
+        self.calls.append("backup_artifacts")
+        return [dict(artifact) for artifact in self.artifacts]
+
+    def download_artifact(self, run_id: int, artifact_id: int, max_bytes: int) -> bytes:
+        self.calls.append("download_artifact")
+        self.downloads.append((run_id, artifact_id, max_bytes))
+        return self.archive
+
+    def current_dev_sha(self) -> str:
+        self.calls.append("current_dev_sha")
+        return self.dev_sha
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class FakeHttpResponse:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.offset = 0
+        self.read_sizes: list[int] = []
+
+    def __enter__(self) -> FakeHttpResponse:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def read1(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        chunk = self.body[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+
+class FakeRedirectingOpener:
+    """Drive urllib's redirect callback without opening a socket."""
+
+    def __init__(self, handler: object, *, locations: tuple[str, ...], body: bytes) -> None:
+        self.handler = handler
+        self.locations = locations
+        self.body = body
+        self.initial_request = None
+        self.redirected_requests = []
+        self.timeout = None
+
+    def open(self, request, *, timeout: float) -> FakeHttpResponse:
+        self.initial_request = request
+        self.timeout = timeout
+        current_request = request
+        for location in self.locations:
+            current_request = self.handler.redirect_request(
+                current_request,
+                None,
+                302,
+                "Found",
+                {"Location": location},
+                location,
+            )
+            self.redirected_requests.append(current_request)
+        return FakeHttpResponse(self.body)
+
+
+class BackupSuccessGuardTests(unittest.TestCase):
+    def _assert_receipt_rejected(self, receipt: dict[str, object]) -> None:
+        body = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+        archive = _zip_receipt(body)
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.validate_receipt_archive(
+                archive,
+                f"sha256:{_digest(archive)}",
+                _binding(),
+                backup_run_id=str(BACKUP_RUN_ID),
+                backup_run_attempt=str(BACKUP_ATTEMPT),
+            )
+
+    def test_exact_bound_receipt_archive_is_accepted(self) -> None:
+        archive = _receipt_zip()
+        result = backup_guard.validate_receipt_archive(
+            archive,
+            f"sha256:{_digest(archive)}",
+            _binding(),
+            backup_run_id=str(BACKUP_RUN_ID),
+            backup_run_attempt=str(BACKUP_ATTEMPT),
+        )
+
+        self.assertEqual(result, _receipt())
+
+    def test_exact_completed_backup_proof_returns_single_receipt(self) -> None:
+        api = FakeBackupProofApi()
+        result = backup_guard.wait_for_backup_success(api, _binding())
+
+        self.assertEqual(result, _receipt())
+        self.assertEqual(api.downloads, [(str(BACKUP_RUN_ID), 903, 1_048_576)])
+        self.assertEqual(api.calls.count("download_artifact"), 1)
+
+    def test_dev_moving_during_artifact_download_invalidates_the_proof(self) -> None:
+        api = FakeBackupProofApi()
+        original_download = api.download_artifact
+
+        def move_dev_after_download(run_id: str, artifact_id: int, max_bytes: int) -> bytes:
+            payload = original_download(run_id, artifact_id, max_bytes)
+            api.dev_sha = "b" * 40
+            return payload
+
+        api.download_artifact = move_dev_after_download
+        with self.assertRaisesRegex(backup_guard.BackupProofError, "dev moved"):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertEqual(api.calls.count("current_dev_sha"), 2)
+
+    def test_missing_and_malformed_receipt_archives_fail_closed(self) -> None:
+        malformed = _zip_receipt(b"{not-json")
+        duplicate_json_key = _zip_receipt(
+            b'{"schema":1,"schema":1}'
+        )
+        missing = _zip_receipt(None, entries=[])
+        for archive in (malformed, duplicate_json_key, missing, b"not-a-zip"):
+            with self.subTest(archive=archive[:12]), self.assertRaises(
+                backup_guard.BackupProofError
+            ):
+                backup_guard.validate_receipt_archive(
+                    archive,
+                    f"sha256:{_digest(archive)}",
+                    _binding(),
+                    backup_run_id=str(BACKUP_RUN_ID),
+                    backup_run_attempt=str(BACKUP_ATTEMPT),
+                )
+
+    def test_duplicate_receipt_entries_and_unexpected_members_fail_closed(self) -> None:
+        body = json.dumps(_receipt(), sort_keys=True, separators=(",", ":")).encode()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            duplicate = _zip_receipt(
+                None,
+                entries=[
+                    (RECEIPT_MEMBER, body, stat.S_IFREG),
+                    (RECEIPT_MEMBER, body, stat.S_IFREG),
+                ],
+            )
+        extra = _zip_receipt(
+            None,
+            entries=[
+                (RECEIPT_MEMBER, body, stat.S_IFREG),
+                ("extra.json", b"{}", stat.S_IFREG),
+            ],
+        )
+        for archive in (duplicate, extra):
+            with self.subTest(digest=_digest(archive)), self.assertRaises(
+                backup_guard.BackupProofError
+            ):
+                backup_guard.validate_receipt_archive(
+                    archive,
+                    f"sha256:{_digest(archive)}",
+                    _binding(),
+                    backup_run_id=str(BACKUP_RUN_ID),
+                    backup_run_attempt=str(BACKUP_ATTEMPT),
+                )
+
+    def test_traversal_and_symlink_members_fail_closed(self) -> None:
+        body = json.dumps(_receipt(), sort_keys=True, separators=(",", ":")).encode()
+        traversal = _zip_receipt(
+            None, entries=[("../backup-success-receipt.json", body, stat.S_IFREG)]
+        )
+        symlink = _zip_receipt(
+            None, entries=[(RECEIPT_MEMBER, body, stat.S_IFLNK)]
+        )
+        for archive in (traversal, symlink):
+            with self.subTest(digest=_digest(archive)), self.assertRaises(
+                backup_guard.BackupProofError
+            ):
+                backup_guard.validate_receipt_archive(
+                    archive,
+                    f"sha256:{_digest(archive)}",
+                    _binding(),
+                    backup_run_id=str(BACKUP_RUN_ID),
+                    backup_run_attempt=str(BACKUP_ATTEMPT),
+                )
+
+    def test_expansion_limit_and_api_digest_mismatch_fail_closed(self) -> None:
+        ordinary = _receipt_zip()
+        oversized_member = _zip_receipt(
+            json.dumps(_receipt(), sort_keys=True, separators=(",", ":")).encode()
+            + b" " * 4_096
+        )
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.validate_receipt_archive(
+                oversized_member,
+                f"sha256:{_digest(oversized_member)}",
+                _binding(),
+                backup_run_id=str(BACKUP_RUN_ID),
+                backup_run_attempt=str(BACKUP_ATTEMPT),
+            )
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.validate_receipt_archive(
+                ordinary,
+                "sha256:" + "0" * 64,
+                _binding(),
+                backup_run_id=str(BACKUP_RUN_ID),
+                backup_run_attempt=str(BACKUP_ATTEMPT),
+            )
+
+        oversized_zip = _zip_receipt(
+            b"x" * (backup_guard.MAX_ARTIFACT_ZIP_BYTES + 1),
+            compression=zipfile.ZIP_STORED,
+        )
+        self.assertGreater(len(oversized_zip), backup_guard.MAX_ARTIFACT_ZIP_BYTES)
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.validate_receipt_archive(
+                oversized_zip,
+                f"sha256:{_digest(oversized_zip)}",
+                _binding(),
+                backup_run_id=str(BACKUP_RUN_ID),
+                backup_run_attempt=str(BACKUP_ATTEMPT),
+            )
+
+    def test_closed_receipt_rejects_missing_extra_and_false_fields(self) -> None:
+        cases = (
+            {key: value for key, value in _receipt().items() if key != "restore_verified"},
+            _receipt(unrecognized="ignored fields are forbidden"),
+            _receipt(restore_verified=False),
+            _receipt(created=False),
+            _receipt(alembic_revision_verified=False),
+            _receipt(preexisting_archives_preserved=False),
+            _receipt(restored_table_count=0),
+            _receipt(archive_size_bytes=0),
+        )
+        for receipt in cases:
+            with self.subTest(keys=tuple(receipt)):
+                self._assert_receipt_rejected(receipt)
+
+    def test_receipt_source_and_backup_attempt_bindings_are_exact(self) -> None:
+        mismatches = (
+            {"repository": "other/repo"},
+            {"ref": "refs/heads/feature"},
+            {"operation": "verify-existing"},
+            {"source_security_run_id": SECURITY_RUN_ID + 1},
+            {"source_security_run_attempt": SECURITY_ATTEMPT + 1},
+            {"source_sha": "b" * 40},
+            {"backup_workflow_path": ".github/workflows/other.yml"},
+            {"backup_run_id": BACKUP_RUN_ID + 1},
+            {"backup_run_attempt": BACKUP_ATTEMPT + 1},
+            {"backup_head_sha": "c" * 40},
+            {"archive_name": "platformdb-20261012T191000Z.dump/extra"},
+            {"format_version": 1},
+            {"rotation_mode": "rotate"},
+        )
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch):
+                self._assert_receipt_rejected(_receipt(**mismatch))
+
+    def test_current_dev_must_match_the_expected_source(self) -> None:
+        api = FakeBackupProofApi()
+        api.dev_sha = "d" * 40
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+    def test_security_run_path_ref_attempt_and_conclusion_are_bound(self) -> None:
+        mutations = (
+            {"id": SECURITY_RUN_ID + 1},
+            {"path": ".github/workflows/other.yml"},
+            {"event": "workflow_dispatch"},
+            {"head_branch": "other"},
+            {"head_sha": "e" * 40},
+            {"run_attempt": SECURITY_ATTEMPT - 1},
+            {"status": "in_progress"},
+            {"conclusion": "failure"},
+        )
+        for mutation in mutations:
+            api = FakeBackupProofApi()
+            api.security.update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(
+                backup_guard.BackupProofError
+            ):
+                backup_guard.wait_for_backup_success(api, _binding())
+            self.assertNotIn("download_artifact", api.calls)
+
+    def test_workflow_and_backup_run_attempt_identity_are_bound(self) -> None:
+        mutations = (
+            ("workflow", {"path": ".github/workflows/other.yml"}),
+            ("run", {"workflow_id": 902}),
+            ("run", {"path": ".github/workflows/other.yml"}),
+            ("run", {"event": "push"}),
+            ("run", {"head_branch": "other"}),
+            ("run", {"head_sha": "e" * 40}),
+            ("run", {"run_attempt": BACKUP_ATTEMPT + 1}),
+            ("run", {"display_title": "stale backup"}),
+            ("run", {"conclusion": "failure"}),
+        )
+        for target, mutation in mutations:
+            api = FakeBackupProofApi()
+            clock = FakeClock()
+            if target == "workflow":
+                api.workflow.update(mutation)
+            else:
+                api.runs[0].update(mutation)
+            with self.subTest(target=target, mutation=mutation), self.assertRaises(
+                backup_guard.BackupProofError
+            ):
+                backup_guard.wait_for_backup_success(
+                    api, _binding(), deadline_seconds=1, clock=clock, sleep=clock.sleep
+                )
+            self.assertNotIn("download_artifact", api.calls)
+
+        api = FakeBackupProofApi()
+        api.runs.append(dict(api.runs[0], id=BACKUP_RUN_ID + 1))
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+    def test_backup_must_start_before_security_run_completes(self) -> None:
+        api = FakeBackupProofApi()
+        api.runs[0]["created_at"] = _gh_time("19:11:00")
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+        api = FakeBackupProofApi()
+        api.runs[0]["created_at"] = _gh_time("18:58:00")
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+        api = FakeBackupProofApi()
+        api.jobs[0]["started_at"] = _gh_time("19:11:00")
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+    def test_job_and_artifact_must_be_unique_exact_and_successful(self) -> None:
+        job_failures = (
+            {"name": "Different job"},
+            {"run_attempt": BACKUP_ATTEMPT + 1},
+            {"conclusion": "failure"},
+        )
+        for mutation in job_failures:
+            api = FakeBackupProofApi()
+            clock = FakeClock()
+            api.jobs[0].update(mutation)
+            with self.subTest(job=mutation), self.assertRaises(
+                backup_guard.BackupProofError
+            ):
+                backup_guard.wait_for_backup_success(
+                    api, _binding(), deadline_seconds=1, clock=clock, sleep=clock.sleep
+                )
+            self.assertNotIn("download_artifact", api.calls)
+
+        artifact_failures_before_download = (
+            {"name": "old-artifact"},
+            {"expired": True},
+            {"created_at": None},
+            {"created_at": _gh_time("19:02:59")},
+            {"created_at": _gh_time("19:09:01")},
+            {"workflow_run": {"id": BACKUP_RUN_ID + 1, "head_sha": SOURCE_SHA}},
+        )
+        for mutation in artifact_failures_before_download:
+            api = FakeBackupProofApi()
+            clock = FakeClock()
+            api.artifacts[0].update(mutation)
+            with self.subTest(artifact=mutation), self.assertRaises(
+                backup_guard.BackupProofError
+            ):
+                backup_guard.wait_for_backup_success(
+                    api, _binding(), deadline_seconds=1, clock=clock, sleep=clock.sleep
+                )
+            self.assertNotIn("download_artifact", api.calls)
+
+        api = FakeBackupProofApi()
+        api.artifacts[0]["digest"] = "sha256:" + "0" * 64
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertEqual(api.calls.count("download_artifact"), 1)
+
+        api = FakeBackupProofApi()
+        api.jobs.append(dict(api.jobs[0], id=904))
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+        api = FakeBackupProofApi()
+        api.artifacts.append(dict(api.artifacts[0], id=905))
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+    def test_timeout_without_exact_backup_candidate_fails_closed(self) -> None:
+        api = FakeBackupProofApi()
+        api.runs.clear()
+        clock = FakeClock()
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(
+                api,
+                _binding(),
+                deadline_seconds=31,
+                clock=clock,
+                sleep=clock.sleep,
+            )
+        self.assertGreaterEqual(clock.now, 31)
+        self.assertTrue(clock.sleeps)
+        self.assertNotIn("download_artifact", api.calls)
+
+    def test_api_json_request_rejects_redirect_without_exposing_credentials(self) -> None:
+        token = "gh-token-sentinel"
+        signed_location = "https://account.blob.core.windows.net/a?sig=signed-url-sentinel"
+        api = backup_guard.GitHubBackupProofApi(
+            "StrayForest/old_sparky", "https://api.github.com", token
+        )
+        openers: list[FakeRedirectingOpener] = []
+
+        def build_opener(handler: object) -> FakeRedirectingOpener:
+            opener = FakeRedirectingOpener(
+                handler, locations=(signed_location,), body=b"{}"
+            )
+            openers.append(opener)
+            return opener
+
+        with mock.patch.object(backup_guard, "build_opener", side_effect=build_opener):
+            with self.assertRaises(backup_guard.BackupProofError) as caught:
+                api._request("/actions/runs/741002")
+
+        opener = openers[0]
+        self.assertEqual(
+            opener.initial_request.full_url,
+            "https://api.github.com/repos/StrayForest/old_sparky/actions/runs/741002",
+        )
+        self.assertEqual(opener.initial_request.get_header("Authorization"), f"Bearer {token}")
+        self.assertEqual(opener.redirected_requests, [])
+        self.assertNotIn(token, str(caught.exception))
+        self.assertNotIn(signed_location, str(caught.exception))
+
+    def test_artifact_download_uses_documented_endpoint_and_drops_auth_on_redirect(self) -> None:
+        token = "gh-token-sentinel"
+        signed_location = (
+            "https://Runner.BLOB.CORE.WINDOWS.NET:443/container/artifact.zip?"
+            "sig=signed-url-sentinel"
+        )
+        body = b"bounded artifact bytes"
+        api = backup_guard.GitHubBackupProofApi(
+            "StrayForest/old_sparky", "https://api.github.com", token
+        )
+        openers: list[FakeRedirectingOpener] = []
+
+        def build_opener(handler: object) -> FakeRedirectingOpener:
+            opener = FakeRedirectingOpener(handler, locations=(signed_location,), body=body)
+            openers.append(opener)
+            return opener
+
+        with mock.patch.object(backup_guard, "build_opener", side_effect=build_opener):
+            result = api.download_artifact(
+                str(BACKUP_RUN_ID), 903, backup_guard.MAX_ARTIFACT_ZIP_BYTES
+            )
+
+        opener = openers[0]
+        self.assertEqual(result, body)
+        self.assertEqual(
+            opener.initial_request.full_url,
+            "https://api.github.com/repos/StrayForest/old_sparky/actions/artifacts/903/zip",
+        )
+        self.assertEqual(opener.initial_request.get_header("Authorization"), f"Bearer {token}")
+        self.assertEqual(len(opener.redirected_requests), 1)
+        redirected = opener.redirected_requests[0]
+        self.assertEqual(redirected.full_url, signed_location)
+        self.assertIsNone(redirected.get_header("Authorization"))
+        self.assertEqual(redirected.get_header("Accept"), "application/octet-stream")
+        self.assertNotIn("Authorization", dict(redirected.header_items()))
+        self.assertNotIn("GH_TOKEN", dict(redirected.header_items()))
+
+        api = backup_guard.GitHubBackupProofApi(
+            "StrayForest/old_sparky", "https://api.github.com", token
+        )
+        actions_location = "https://cdn.actions.githubusercontent.com/file?sig=other-signed-url"
+        with mock.patch.object(
+            backup_guard,
+            "build_opener",
+            side_effect=lambda handler: FakeRedirectingOpener(
+                handler, locations=(actions_location,), body=body
+            ),
+        ):
+            self.assertEqual(
+                api.download_artifact(
+                    str(BACKUP_RUN_ID), 903, backup_guard.MAX_ARTIFACT_ZIP_BYTES
+                ),
+                body,
+            )
+
+    def test_artifact_redirect_boundary_rejects_untrusted_or_second_hops(self) -> None:
+        token = "gh-token-sentinel"
+        allowed = "https://account.blob.core.windows.net/archive?sig=signed-url-sentinel"
+        invalid_locations = (
+            "http://account.blob.core.windows.net/archive?sig=signed-url-sentinel",
+            "https://account.blob.core.windows.net:444/archive?sig=signed-url-sentinel",
+            "https://user:password@account.blob.core.windows.net/archive?sig=signed-url-sentinel",
+            "https://account.blob.core.windows.net./archive?sig=signed-url-sentinel",
+            "https://evilblob.core.windows.net/archive?sig=signed-url-sentinel",
+            "https://account.blob.core.windows.net.attacker.invalid/archive?sig=signed-url-sentinel",
+            "https://account.blob.core.windows.net:bad/archive?sig=signed-url-sentinel",
+            "https://account.blob.core.windows.net/archive#fragment",
+        )
+        location_sets = tuple((location,) for location in invalid_locations) + (
+            (allowed, allowed),
+        )
+        for locations in location_sets:
+            with self.subTest(locations=locations):
+                api = backup_guard.GitHubBackupProofApi(
+                    "StrayForest/old_sparky", "https://api.github.com", token
+                )
+                opener_holder: list[FakeRedirectingOpener] = []
+
+                def build_opener(handler: object) -> FakeRedirectingOpener:
+                    opener = FakeRedirectingOpener(handler, locations=locations, body=b"ok")
+                    opener_holder.append(opener)
+                    return opener
+
+                with mock.patch.object(
+                    backup_guard, "build_opener", side_effect=build_opener
+                ):
+                    with self.assertRaises(backup_guard.BackupProofError) as caught:
+                        api.download_artifact(
+                            str(BACKUP_RUN_ID), 903, backup_guard.MAX_ARTIFACT_ZIP_BYTES
+                        )
+                self.assertNotIn(token, str(caught.exception))
+                self.assertNotIn("signed-url-sentinel", str(caught.exception))
+                self.assertNotIn("sig=", str(caught.exception))
+
+    def test_authenticated_api_body_over_limit_is_rejected(self) -> None:
+        api = backup_guard.GitHubBackupProofApi(
+            "StrayForest/old_sparky", "https://api.github.com", "gh-token-sentinel"
+        )
+        openers: list[FakeRedirectingOpener] = []
+
+        def build_opener(handler: object) -> FakeRedirectingOpener:
+            opener = FakeRedirectingOpener(handler, locations=(), body=b"12345")
+            openers.append(opener)
+            return opener
+
+        with mock.patch.object(backup_guard, "build_opener", side_effect=build_opener):
+            with self.assertRaises(backup_guard.BackupProofError):
+                api._request("/actions/runs/741002", max_bytes=4)
+        self.assertEqual(openers[0].initial_request.get_header("Authorization"), "Bearer gh-token-sentinel")
+        self.assertEqual(openers[0].timeout, 15)
+
+        api = backup_guard.GitHubBackupProofApi(
+            "StrayForest/old_sparky", "https://api.github.com", "gh-token-sentinel"
+        )
+        oversized_body = b"x" * (backup_guard.MAX_ARTIFACT_ZIP_BYTES + 1)
+        with mock.patch.object(
+            backup_guard,
+            "build_opener",
+            side_effect=lambda handler: FakeRedirectingOpener(
+                handler,
+                locations=("https://account.blob.core.windows.net/file?sig=private",),
+                body=oversized_body,
+            ),
+        ):
+            with self.assertRaises(backup_guard.BackupProofError) as caught:
+                api.download_artifact(
+                    str(BACKUP_RUN_ID), 903, backup_guard.MAX_ARTIFACT_ZIP_BYTES
+                )
+        self.assertNotIn("gh-token-sentinel", str(caught.exception))
+        self.assertNotIn("sig=private", str(caught.exception))
+
+    def test_proof_deadline_expiring_inside_api_call_cannot_return_success(self) -> None:
+        clock = FakeClock()
+        api = FakeBackupProofApi()
+
+        class SlowBackupJobsApi(FakeBackupProofApi):
+            def backup_jobs(self, run_id: str, attempt: str) -> list[dict[str, Any]]:
+                jobs = super().backup_jobs(run_id, attempt)
+                clock.now = 2.0
+                return jobs
+
+        api = SlowBackupJobsApi()
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(
+                api,
+                _binding(),
+                deadline_seconds=1,
+                clock=clock,
+                sleep=clock.sleep,
+            )
+        self.assertIn("backup_jobs", api.calls)
+        self.assertNotIn("backup_artifacts", api.calls)
+        self.assertNotIn("download_artifact", api.calls)
+
+
+if __name__ == "__main__":
+    unittest.main()

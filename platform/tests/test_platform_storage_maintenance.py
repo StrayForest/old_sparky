@@ -2281,6 +2281,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "platform_release_retention.py",
                 "platform_build_node_cache.py",
                 "platform_storage_maintenance.py",
+                "platform_storage_evidence_summary.py",
             )
             source_modes = {
                 "platform_backup_restore_drill.py": 0o755,
@@ -2289,6 +2290,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "platform_release_retention.py": 0o755,
                 "platform_build_node_cache.py": 0o644,
                 "platform_storage_maintenance.py": 0o755,
+                "platform_storage_evidence_summary.py": 0o644,
             }
 
             producer_root = fixture_root / "checkout"
@@ -2789,6 +2791,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "platform_release_retention.py",
                 "platform_build_node_cache.py",
                 "platform_storage_maintenance.py",
+                "platform_storage_evidence_summary.py",
             }
             source_sha = "a" * 40
             members = {name: f"# helper {name}\n".encode() for name in helper_names}
@@ -3141,8 +3144,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             'helper_stage=__TEST_STAGE__',
         )
         remote_script += (
-            'printf "SELECTED_HELPER=%s\\nHELPER_SHA=%s\\n" '
-            '"$maintenance_tool" "$storage_helper_sha256"\nexit 0\n'
+            'printf "SELECTED_HELPER=%s\\nSUMMARY_HELPER=%s\\nHELPER_SHA=%s\\n" '
+            '"$maintenance_tool" "$summary_tool" "$storage_helper_sha256"\nexit 0\n'
         )
         helper_names = (
             "platform_backup_restore_drill.py",
@@ -3151,6 +3154,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "platform_release_retention.py",
             "platform_build_node_cache.py",
             "platform_storage_maintenance.py",
+            "platform_storage_evidence_summary.py",
         )
         helper_modes = {
             "platform_backup_restore_drill.py": 0o755,
@@ -3159,6 +3163,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "platform_release_retention.py": 0o755,
             "platform_build_node_cache.py": 0o644,
             "platform_storage_maintenance.py": 0o755,
+            "platform_storage_evidence_summary.py": 0o644,
         }
         source_sha = "a" * 40
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -3176,7 +3181,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "raise SystemExit('installed helper must not execute')\n", encoding="ascii"
             )
             (tools / "platform_storage_evidence_summary.py").write_text(
-                "raise SystemExit('summary is outside this fixture')\n", encoding="ascii"
+                "raise SystemExit('installed summary must not execute')\n", encoding="ascii"
             )
             python_bin = shared / "venv" / "bin" / "python"
             python_bin.parent.mkdir(parents=True, mode=0o755)
@@ -3259,8 +3264,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 )
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 expected_helper = operation_stage / "tools/platform_storage_maintenance.py"
+                expected_summary = operation_stage / "tools/platform_storage_evidence_summary.py"
                 expected_hash = hashlib.sha256(members["platform_storage_maintenance.py"]).hexdigest()
                 self.assertIn(f"SELECTED_HELPER={expected_helper}", completed.stdout)
+                self.assertIn(f"SUMMARY_HELPER={expected_summary}", completed.stdout)
                 self.assertIn(f"HELPER_SHA={expected_hash}", completed.stdout)
                 invocation = json.loads(invocation_log.read_text(encoding="ascii"))
                 self.assertEqual(invocation["script"], str(expected_helper))

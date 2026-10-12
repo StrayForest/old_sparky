@@ -2126,6 +2126,91 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         ).read_text()
         self.assertIn('"web_compression":"enabled"', workflow)
 
+    def test_backup_helper_bundle_is_source_bound_attested_and_staged_without_current_fallback(self) -> None:
+        security = (
+            REPO_ROOT / ".github/workflows/platform-security.yml"
+        ).read_text(encoding="utf-8")
+        backup = (
+            REPO_ROOT / ".github/workflows/platform-production-backup.yml"
+        ).read_text(encoding="utf-8")
+        autodeploy = (
+            REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
+        ).read_text(encoding="utf-8")
+
+        members = {
+            "platform_backup_restore_drill.py": "0o755",
+            "platform_disk_policy.py": "0o644",
+            "platform_live_qa_guard.py": "0o755",
+            "platform_release_retention.py": "0o755",
+            "platform_build_node_cache.py": "0o644",
+            "platform_storage_maintenance.py": "0o755",
+            "platform_storage_evidence_summary.py": "0o644",
+        }
+        for name, mode in members.items():
+            with self.subTest(member=name):
+                self.assertIn(f'"{name}"', security)
+                self.assertIn(f'"{name}": {mode}', security)
+                self.assertIn(f'"{name}"', backup)
+                self.assertIn(f'"{name}": {mode}', backup)
+
+        build_start = security.index("      - name: Build exact-source backup verifier helper bundle")
+        publish_start = security.index("      - name: Publish exact-source backup verifier helper bundle", build_start)
+        attest_start = security.index("      - name: Attest exact-source backup verifier helper bundle", publish_start)
+        build_step = security[build_start:publish_start]
+        publish_step = security[publish_start:attest_start]
+        attest_step = security[attest_start:]
+        self.assertIn('"platform/tools/{name}"', build_step)
+        self.assertIn('"sha256": hashlib.sha256(data).hexdigest()', build_step)
+        self.assertIn('"schema": 1', build_step)
+        self.assertIn('"repository": repository', build_step)
+        self.assertIn('"source_sha": source_sha', build_step)
+        self.assertIn('"files": entries', build_step)
+        self.assertIn('name: platform-backup-verifier-${{ github.run_id }}-${{ github.run_attempt }}', publish_step)
+        self.assertIn("if-no-files-found: error", publish_step)
+        self.assertIn("actions/attest-build-provenance@", attest_step)
+        self.assertIn("subject-path: ${{ runner.temp }}/platform-backup-verifier.zip", attest_step)
+
+        verify_start = backup.index("      - name: Download and verify exact-source backup helper bundle")
+        stage_start = backup.index("      - name: Stage the verified helper bundle on the production host", verify_start)
+        verify_step = backup[verify_start:stage_start]
+        stage_start_body = backup[stage_start:]
+        for binding in (
+            "--signer-workflow StrayForest/old_sparky/.github/workflows/platform-security.yml",
+            "--source-ref refs/heads/dev",
+            "--source-digest \"$SOURCE_SHA\"",
+            "runInvocationURI",
+            "expected_runner",
+            "subjects[0][\"digest\"].get(\"sha256\") == digest",
+        ):
+            self.assertIn(binding, verify_step)
+        self.assertIn('expected.add("platform-backup-verifier/manifest.json")', verify_step)
+        self.assertIn("len(infos) != len(expected_paths)", verify_step)
+        self.assertIn('"files"}', verify_step)
+        self.assertIn('hashlib.sha256(data).hexdigest() != row["sha256"]', verify_step)
+        self.assertIn('"bundle_sha256={digest}\\n"', verify_step)
+        self.assertIn('stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"', stage_start_body)
+
+        extract_start = backup.index('            helper_dir="$helper_stage/tools"', stage_start)
+        extract_end = backup.index('          else\n            failure_stage=preflight', extract_start)
+        extraction = backup[extract_start:extract_end]
+        self.assertIn('maintenance_tool="$helper_dir/platform_storage_maintenance.py"', extraction)
+        self.assertIn('summary_tool="$helper_dir/platform_storage_evidence_summary.py"', extraction)
+        self.assertIn('backup_drill_tool="$helper_stage/tools/platform_backup_restore_drill.py"', backup)
+        self.assertIn('"$python_bin" "$maintenance_tool"', backup)
+        self.assertNotIn('maintenance_tool="$current/tools/platform_storage_maintenance.py"', extraction)
+
+        proof_step = autodeploy.index("      - name: Verify exact source-bound restore-verified backup")
+        dispatch_step = autodeploy.index("      - name: Dispatch production deployment or baseline reconciliation", proof_step)
+        self.assertLess(proof_step, dispatch_step)
+        guarded_region = autodeploy[proof_step:dispatch_step]
+        self.assertIn("steps.gate.outputs.deploy == 'true'", guarded_region)
+        self.assertIn("github.event.workflow_run.id", guarded_region)
+        self.assertIn("github.event.workflow_run.run_attempt", guarded_region)
+        self.assertIn("github.event.workflow_run.completed_at", guarded_region)
+        self.assertIn("github.event.workflow_run.head_sha", guarded_region)
+        self.assertIn("platform_backup_success_guard.py", guarded_region)
+        self.assertNotIn("curl ", guarded_region)
+
     def test_baseline_runtime_profile_restores_ready_vote_admission_limits(self) -> None:
         workflow = DEPLOY_SUPERVISOR.read_text()
         baseline_start = workflow.index("  baseline)")
