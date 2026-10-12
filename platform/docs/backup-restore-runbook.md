@@ -23,10 +23,12 @@ cluster is stopped and its unit and mount are confirmed gone before a verified
 backup pair is published. Ordinary rotating maintenance retains 14 verified
 copies; backup-only preserve-existing mode keeps every complete pair.
 
-The low-level create/restore drill is invoked by storage maintenance; do not
-run its mutating mode directly on the production host because it does not
-acquire the host-wide operation locks. Create a production backup through the
-lock-aware backup-only mode:
+The lock-aware storage-maintenance path calls backup creation and freshness
+verification in-process, avoiding a second Python interpreter during the
+memory-intensive restore drill. The standalone helper CLI remains available
+for local diagnostics and checks. Do not run its mutating mode directly on the
+production host because it does not acquire the host-wide operation locks.
+Create a production backup through the lock-aware backup-only mode:
 
 ```bash
 cd /opt/oldsparky/platform/current

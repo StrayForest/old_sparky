@@ -3156,9 +3156,93 @@ jobs:
             --header "Accept: application/vnd.github+json"
             --header "X-GitHub-Api-Version: 2022-11-28"
           )
+          snapshot_deadline_ns="$(/usr/bin/python3 -I -B -c 'import time; print(time.monotonic_ns() + 180_000_000_000)')"
+          snapshot_request_timeout() {
+            /usr/bin/python3 -I -B - "$snapshot_deadline_ns" <<'PY'
+          import sys
+          import time
+
+          remaining = (int(sys.argv[1]) - time.monotonic_ns()) / 1_000_000_000
+          if remaining <= 0:
+              raise SystemExit(1)
+          request = min(10.0, remaining)
+          print(f"{min(5.0, request):.3f} {request:.3f}")
+          PY
+          }
+          snapshot_retry_delay() {
+            /usr/bin/python3 -I -B - "$snapshot_deadline_ns" <<'PY'
+          import sys
+          import time
+
+          remaining = (int(sys.argv[1]) - time.monotonic_ns()) / 1_000_000_000
+          if remaining <= 0:
+              raise SystemExit(1)
+          print(f"{min(1.0, remaining):.3f}")
+          PY
+          }
+          fetch_snapshot_get() {
+            local label="$1" url="$2" output_path="$3"
+            local attempt timeout_pair connect_timeout request_timeout tmp_path status_path error_path
+            local curl_exit http_status
+            [[ "$label" =~ ^(first|second)\.(workflow|run|statuses-page-[1-9][0-9]{0,3})$ ]] \
+              || { echo "security snapshot GET rejected request label" >&2; return 1; }
+            case "$output_path" in
+              "$provenance_dir"/*) ;;
+              *) echo "security snapshot GET output escaped private directory" >&2; return 1 ;;
+            esac
+            [[ ! -e "$output_path" && ! -L "$output_path" ]] \
+              || { echo "security snapshot GET destination already exists" >&2; return 1; }
+            for attempt in 1 2 3; do
+              if ! timeout_pair="$(snapshot_request_timeout)"; then
+                echo "security snapshot GET failed request=$label attempt=$attempt http_status=000 outcome=deadline" >&2
+                return 1
+              fi
+              read -r connect_timeout request_timeout <<<"$timeout_pair"
+              tmp_path="$(mktemp "$output_path.attempt.XXXXXX")"
+              status_path="$(mktemp "$output_path.status.XXXXXX")"
+              error_path="$(mktemp "$output_path.error.XXXXXX")"
+              if curl --fail-with-body --silent --show-error \
+                --connect-timeout "$connect_timeout" --max-time "$request_timeout" \
+                --max-filesize 1048576 "${api_headers[@]}" \
+                --output "$tmp_path" --write-out '%{http_code}' "$url" \
+                >"$status_path" 2>"$error_path"; then
+                curl_exit=0
+              else
+                curl_exit=$?
+              fi
+              http_status=""
+              IFS= read -r http_status <"$status_path" || :
+              if [[ "$curl_exit" -eq 0 && "$http_status" = 200 ]]; then
+                mv -- "$tmp_path" "$output_path"
+                rm -f -- "$status_path" "$error_path"
+                return 0
+              fi
+              rm -f -- "$tmp_path" "$status_path" "$error_path"
+              if [[ "$curl_exit" -eq 22 && "$http_status" =~ ^(502|503|504)$ && "$attempt" -lt 3 ]]; then
+                echo "security snapshot GET retry request=$label attempt=$attempt http_status=$http_status" >&2
+                local delay
+                if ! delay="$(snapshot_retry_delay)"; then
+                  echo "security snapshot GET failed request=$label attempt=$attempt http_status=$http_status outcome=deadline" >&2
+                  return 1
+                fi
+                sleep "$delay"
+                continue
+              fi
+              if [[ "$http_status" =~ ^[0-9]{3}$ ]]; then
+                echo "security snapshot GET failed request=$label attempt=$attempt http_status=$http_status curl_exit=$curl_exit" >&2
+              else
+                echo "security snapshot GET failed request=$label attempt=$attempt http_status=000 curl_exit=$curl_exit" >&2
+              fi
+              return 1
+            done
+            echo "security snapshot GET failed request=$label attempt=3 http_status=000 outcome=attempt_limit" >&2
+            return 1
+          }
           fetch_statuses() {
             local output_path="$1" page=1 count page_path
             local pages_dir="$output_path.pages"
+            local snapshot_name
+            snapshot_name="$(basename "$(dirname "$output_path")")"
             case "$pages_dir" in
               "$provenance_dir"/*) ;;
               *) echo "status page directory escaped the ephemeral provenance root" >&2; exit 1 ;;
@@ -3170,9 +3254,9 @@ jobs:
             test ! -L "$pages_dir"
             while :; do
               page_path="$pages_dir/page-${page}.json"
-              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              fetch_snapshot_get "$snapshot_name.statuses-page-$page" \
                 "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=${page}" \
-                --output "$page_path"
+                "$page_path"
               count="$(/usr/bin/python3 - "$page_path" <<'PY'
           import json
           from pathlib import Path
@@ -3207,13 +3291,15 @@ jobs:
           }
           fetch_snapshot() {
             local snapshot_dir="$1"
+            local snapshot_name
+            snapshot_name="$(basename "$snapshot_dir")"
             install -d -m 700 "$snapshot_dir"
-            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+            fetch_snapshot_get "$snapshot_name.workflow" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-security.yml" \
-              --output "$snapshot_dir/workflow.json"
-            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              "$snapshot_dir/workflow.json"
+            fetch_snapshot_get "$snapshot_name.run" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${CLASSIFIER_RUN_ID}" \
-              --output "$snapshot_dir/run.json"
+              "$snapshot_dir/run.json"
             fetch_statuses "$snapshot_dir/statuses.json"
           }
           for snapshot in first second; do

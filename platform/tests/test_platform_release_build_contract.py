@@ -1010,6 +1010,163 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             workflow.index("Mark production deployment pending"),
         )
 
+        self.assertIn("snapshot_deadline_ns=", workflow)
+        self.assertIn("--write-out '%{http_code}'", workflow)
+        self.assertIn("http_status=", workflow)
+        self.assertIn('[[ "$curl_exit" -eq 22 && "$http_status" =~ ^(502|503|504)$ && "$attempt" -lt 3 ]]', security_provenance)
+        self.assertNotIn("--retry-all-errors", security_provenance)
+
+        fetch_start = workflow.index("          snapshot_deadline_ns=")
+        fetch_end = workflow.index("          fetch_statuses() {", fetch_start)
+        fetch_helpers = textwrap.dedent(workflow[fetch_start:fetch_end])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/python3
+                    import os
+                    from pathlib import Path
+                    import sys
+
+                    args = sys.argv[1:]
+                    output = Path(args[args.index("--output") + 1])
+                    counter = Path(os.environ["CURL_COUNTER"])
+                    index = int(counter.read_text()) if counter.exists() else 0
+                    counter.write_text(str(index + 1), encoding="ascii")
+                    statuses = os.environ["CURL_STATUSES"].split(",")
+                    bodies = os.environ["CURL_BODIES"].split("|")
+                    status = int(statuses[min(index, len(statuses) - 1)])
+                    body = bodies[min(index, len(bodies) - 1)]
+                    output.write_text(body, encoding="utf-8")
+                    sys.stdout.write(f"{status:03d}")
+                    raise SystemExit(22 if status >= 400 else 0)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+
+            def run_fetch(
+                scenario: str,
+                statuses: str,
+                bodies: str,
+                *,
+                deadline_seconds: int = 180,
+                label: str = "first.workflow",
+            ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+                scenario_root = root / scenario
+                private_dir = scenario_root / "private"
+                private_dir.mkdir(parents=True, mode=0o700)
+                counter = scenario_root / "curl-count"
+                output = private_dir / "workflow.json"
+                harness = textwrap.dedent(
+                    """\
+                    set -euo pipefail
+                    provenance_dir="$TEST_PRIVATE_DIR"
+                    api_headers=(--header "Authorization: Bearer fixture-token")
+                    """
+                )
+                harness += fetch_helpers
+                harness += textwrap.dedent(
+                    """\
+                    snapshot_deadline_ns="$(/usr/bin/python3 -I -B - "$TEST_DEADLINE_SECONDS" <<'PY'
+                    import sys
+                    import time
+                    print(time.monotonic_ns() + int(sys.argv[1]) * 1_000_000_000)
+                    PY
+                    )"
+                    """
+                )
+                harness += '\nfetch_snapshot_get "$TEST_LABEL" https://api.example.invalid/path "$TEST_PRIVATE_DIR/workflow.json"\n'
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-c", harness],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env={
+                        "PATH": f"{fake_bin}:/usr/bin:/bin",
+                        "LC_ALL": "C.UTF-8",
+                        "TEST_PRIVATE_DIR": str(private_dir),
+                        "TEST_DEADLINE_SECONDS": str(deadline_seconds),
+                        "TEST_LABEL": label,
+                        "CURL_COUNTER": str(counter),
+                        "CURL_STATUSES": statuses,
+                        "CURL_BODIES": bodies,
+                    },
+                    timeout=15,
+                    check=False,
+                )
+                return result, output, counter
+
+            transient, transient_output, transient_count = run_fetch(
+                "transient", "502,200", "partial-502|{\"ok\":true}"
+            )
+            self.assertEqual(transient.returncode, 0, transient.stderr)
+            self.assertEqual(transient_output.read_text(encoding="utf-8"), '{"ok":true}')
+            self.assertEqual(transient_count.read_text(encoding="ascii"), "2")
+            self.assertIn("request=first.workflow attempt=1 http_status=502", transient.stderr)
+            self.assertNotIn("fixture-token", transient.stderr)
+            self.assertNotIn("api.example.invalid", transient.stderr)
+            self.assertEqual(sorted(path.name for path in transient_output.parent.iterdir()), ["workflow.json"])
+
+            exhausted, exhausted_output, exhausted_count = run_fetch(
+                "exhausted", "502,502,502", "failed-body|failed-body|failed-body"
+            )
+            self.assertNotEqual(exhausted.returncode, 0)
+            self.assertEqual(exhausted_count.read_text(encoding="ascii"), "3")
+            self.assertFalse(exhausted_output.exists())
+            self.assertEqual(list(exhausted_output.parent.iterdir()), [])
+            self.assertIn("request=first.workflow attempt=3 http_status=502", exhausted.stderr)
+
+            for rejected_status in (400, 401, 403, 429, 500):
+                with self.subTest(http_status=rejected_status):
+                    denied, denied_output, denied_count = run_fetch(
+                        f"denied-{rejected_status}",
+                        str(rejected_status),
+                        "denied-body",
+                        label="second.statuses-page-10" if rejected_status == 400 else "first.run",
+                    )
+                    self.assertNotEqual(denied.returncode, 0)
+                    self.assertEqual(denied_count.read_text(encoding="ascii"), "1")
+                    self.assertFalse(denied_output.exists())
+                    expected_label = "second.statuses-page-10" if rejected_status == 400 else "first.run"
+                    self.assertIn(f"request={expected_label} attempt=1 http_status={rejected_status}", denied.stderr)
+
+            expired, expired_output, expired_count = run_fetch(
+                "expired", "200", "must-not-be-requested", deadline_seconds=-1
+            )
+            self.assertNotEqual(expired.returncode, 0)
+            self.assertFalse(expired_count.exists())
+            self.assertFalse(expired_output.exists())
+            self.assertIn("outcome=deadline", expired.stderr)
+
+            mismatch, mismatch_output, mismatch_count = run_fetch(
+                "mismatch-200", "200", "{}"
+            )
+            self.assertEqual(mismatch.returncode, 0, mismatch.stderr)
+            self.assertEqual(mismatch_count.read_text(encoding="ascii"), "1")
+            from tools.platform_workflow_provenance import (
+                ProvenanceError,
+                validate_security_marker,
+            )
+
+            with self.assertRaises(ProvenanceError):
+                validate_security_marker(
+                    json.loads(mismatch_output.read_text(encoding="utf-8")),
+                    {},
+                    [],
+                    expected_run_id=1,
+                    expected_attempt=1,
+                    expected_target_sha="a" * 40,
+                    max_age=None,
+                )
+            self.assertIn('raise SystemExit("security provenance did not authorize deployment")', workflow)
+
     def test_production_classifier_artifact_reader_is_data_only_and_bounded(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
