@@ -63,6 +63,11 @@ into tmpfs. The tmpfs and systemd cgroup are jointly bounded; if either limit
 or the host-memory reserve is unavailable, verification fails without
 publishing a pair.
 
+After publishing both the dump and metadata entries, the drill fsyncs the
+backup directory before rotation or success. If that directory sync fails, it
+removes only the exact newly published inodes and leaves pre-existing pairs
+untouched; failure to confirm that rollback is reported as an integrity error.
+
 Backup-only preserves every complete archive/metadata pair that exists before
 the run; it does not apply the 14-copy rotation limit. Under the ordered
 maintenance locks, it validates that each sidecar names the matching dump and

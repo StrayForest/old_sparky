@@ -1145,6 +1145,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 self.assertEqual((path.read_bytes(), metadata.st_mode, metadata.st_ino), expected)
 
             self._assert_postpublication_inventory_failure_rolls_back_only_new_pair()
+            self._assert_directory_fsync_failure_rolls_back_only_new_pair()
 
             self._assert_preserve_existing_keeps_all_archives_after_success()
             self._assert_destination_collision_fails_before_dump_and_preserves_sidecar()
@@ -1209,6 +1210,63 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             for path, expected in before.items():
                 metadata = path.lstat()
                 self.assertEqual((path.read_bytes(), metadata.st_mode, metadata.st_ino), expected)
+
+    def _assert_directory_fsync_failure_rolls_back_only_new_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            old_entries: list[pathlib.Path] = []
+            for index in range(20):
+                dump, sidecar = self._write_backup_pair(
+                    output_dir,
+                    f"platformdb-existing-{index:02}.dump",
+                    f"prior-{index}".encode(),
+                )
+                old_entries.extend((dump, sidecar))
+            initial_inventory = backup_drill.backup_inventory(output_dir)
+            args = argparse.Namespace(
+                env_file=str(output_dir / ".env.platform"),
+                output_dir=str(output_dir),
+                keep=14,
+                admin_database_url=None,
+                dump_only=True,
+                rotate_existing=False,
+            )
+            real_fsync_directory = backup_drill._fsync_directory
+            fsync_calls = 0
+
+            def fail_publication_fsync(path: pathlib.Path) -> None:
+                nonlocal fsync_calls
+                fsync_calls += 1
+                if fsync_calls == 1:
+                    raise OSError("synthetic directory fsync failure")
+                real_fsync_directory(path)
+
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    {"PLATFORM_DATABASE_URL": "postgresql://platform_user@localhost/platformdb"},
+                ),
+                mock.patch.object(backup_drill, "load_env", return_value={}),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
+                mock.patch.object(
+                    backup_drill, "_fsync_directory", side_effect=fail_publication_fsync
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "synthetic directory fsync failure"):
+                    backup_drill.create_backup(args)
+
+            self.assertEqual(fsync_calls, 2)
+            self.assertEqual(backup_drill.backup_inventory(output_dir), initial_inventory)
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                {path.name for path in old_entries},
+            )
 
     def _assert_preserve_existing_keeps_all_archives_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -1562,6 +1620,23 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     pathlib.Path(command[command.index("--file") + 1]).write_bytes(b"new-archive")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
+            events: list[str] = []
+            real_fsync_directory = backup_drill._fsync_directory
+            real_prune_unverified = backup_drill.prune_unverified_backups
+            real_prune_backups = backup_drill.prune_backups
+
+            def record_fsync(path: pathlib.Path) -> None:
+                events.append("directory-fsync")
+                real_fsync_directory(path)
+
+            def record_prune_unverified(*args: object, **kwargs: object) -> list[str]:
+                events.append("prune-unverified")
+                return real_prune_unverified(*args, **kwargs)
+
+            def record_prune_backups(*args: object, **kwargs: object) -> list[str]:
+                events.append("prune-backups")
+                return real_prune_backups(*args, **kwargs)
+
             with (
                 mock.patch.dict(
                     backup_drill.os.environ,
@@ -1577,10 +1652,18 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 ),
                 mock.patch.object(backup_drill, "require_restore_headroom"),
                 mock.patch.object(backup_drill, "_run_isolated_restore_drill", return_value=20),
+                mock.patch.object(backup_drill, "_fsync_directory", side_effect=record_fsync),
+                mock.patch.object(
+                    backup_drill, "prune_unverified_backups", side_effect=record_prune_unverified
+                ),
+                mock.patch.object(backup_drill, "prune_backups", side_effect=record_prune_backups),
             ):
                 result = backup_drill.create_backup(args)
 
             self.assertEqual(result["rotation_mode"], "rotate-existing")
+            self.assertEqual(
+                events, ["directory-fsync", "prune-unverified", "prune-backups"]
+            )
             self.assertEqual(len(result["removed"]), 8)
             self.assertFalse(failed_dump.exists())
             self.assertFalse(failed_metadata.exists())

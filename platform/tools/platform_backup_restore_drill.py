@@ -2455,6 +2455,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     temporary_metadata_identity: tuple[int, int] | None = None
     published_dump_identity: tuple[int, int] | None = None
     published_metadata_identity: tuple[int, int] | None = None
+    published_directory_synced = False
     started_at = utc_now()
     restore_verified = False
     restored_table_count: int | None = None
@@ -2552,6 +2553,8 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         published_metadata = _publish_noclobber(temporary_metadata_path, metadata_path)
         published_metadata_identity = (published_metadata.st_dev, published_metadata.st_ino)
         temporary_metadata_path = None
+        _fsync_directory(output_dir)
+        published_directory_synced = True
 
         removed: list[str] = []
         if restore_verified and rotate_existing:
@@ -2585,22 +2588,25 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             (temporary_dump_identity.st_dev, temporary_dump_identity.st_ino),
         )
         _unlink_if_same_inode(temporary_metadata_path, temporary_metadata_identity)
+        if active_exception is not None and (
+            preserve_existing
+            or (published_dump_identity is not None and not published_directory_synced)
+        ):
+            try:
+                _rollback_published_backup_pair(
+                    dump_path,
+                    published_dump_identity,
+                    metadata_path,
+                    published_metadata_identity,
+                )
+            except Exception as rollback_error:
+                setattr(
+                    active_exception,
+                    "_backup_preservation_integrity",
+                    "new_pair_rollback_failed",
+                )
+                active_exception.add_note(str(rollback_error))
         if preserve_existing:
-            if active_exception is not None:
-                try:
-                    _rollback_published_backup_pair(
-                        dump_path,
-                        published_dump_identity,
-                        metadata_path,
-                        published_metadata_identity,
-                    )
-                except Exception as rollback_error:
-                    setattr(
-                        active_exception,
-                        "_backup_preservation_integrity",
-                        "new_pair_rollback_failed",
-                    )
-                    active_exception.add_note(str(rollback_error))
             try:
                 current_inventory = backup_inventory(output_dir)
                 validate_complete_backup_pairs(output_dir, current_inventory)
