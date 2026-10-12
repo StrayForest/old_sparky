@@ -191,6 +191,19 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         malformed = dict(verification_failure)
         malformed["active_state"] = "failed"
         self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
+        after_confinement = dict(diagnostic)
+        after_confinement.update(
+            phase="unit_exited_after_confinement",
+            active_state="inactive",
+            sub_state="dead",
+            result="exit-code",
+            verification_error="none",
+            verification_errno=None,
+        )
+        self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(after_confinement))
+        malformed = dict(after_confinement)
+        malformed["active_state"] = "active"
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
 
         private_failure = RuntimeError("fixed backup failure")
         private_failure.scratch_unit_diagnostic = diagnostic
@@ -440,6 +453,273 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertEqual(captured_stderr, expected_stderr)
             mountpoint = pathlib.Path(unit_command.call_args.kwargs["mountpoint"])
             self.assertFalse(mountpoint.exists())
+
+    def _assert_scratch_after_confinement_failure_preserves_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            archive_path.chmod(0o600)
+            stdout_payload = b"restore stdout:" + b"o" * 3000
+            stderr_payload = b"pg_restore detail:" + b"e" * 40000
+            child_code = (
+                "import sys,time; "
+                f"sys.stdout.buffer.write({stdout_payload!r}); sys.stdout.flush(); "
+                f"sys.stderr.buffer.write({stderr_payload!r}); sys.stderr.flush(); "
+                "time.sleep(0.35); sys.exit(17)"
+            )
+            command = [sys.executable, "-c", child_code]
+            unit_command = mock.Mock(return_value=command)
+            active = {
+                "properties": {
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "Result": "success",
+                    "ExecMainPID": "424242",
+                    "ExecMainStatus": "0",
+                    "ControlGroup": "/system.slice/scratch-after-confinement.service",
+                }
+            }
+            final = {
+                "properties": {
+                    "LoadState": "not-found",
+                    "ActiveState": "failed",
+                    "SubState": "dead",
+                    "Result": "exit-code",
+                    "ExecMainPID": "0",
+                    "ExecMainStatus": "17",
+                    "ControlGroup": "",
+                }
+            }
+            snapshots = [active, final, final]
+
+            with (
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill, "_scratch_host_guard"),
+                mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(
+                    backup_drill, "_scratch_service_snapshot", side_effect=lambda _name: snapshots.pop(0)
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_expected_properties",
+                    return_value="/system.slice/scratch-after-confinement.service",
+                ),
+                mock.patch.object(backup_drill, "_scratch_control_group_snapshot", return_value={}),
+                mock.patch.object(backup_drill, "_scratch_stop_unit"),
+                mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "failed after its confinement was verified"
+                ) as failure:
+                    backup_drill._run_isolated_restore_drill(
+                        archive_path,
+                        timestamp_slug="20261012T010207Z",
+                        private_scratch_diagnostics=True,
+                    )
+
+            diagnostic = failure.exception.scratch_unit_diagnostic
+            self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(diagnostic))
+            self.assertEqual(diagnostic["phase"], "unit_exited_after_confinement")
+            self.assertEqual(diagnostic["active_state"], "failed")
+            self.assertEqual(diagnostic["result"], "exit-code")
+            self.assertEqual(diagnostic["exec_main_status"], 17)
+            self.assertEqual(diagnostic["launcher_exit_status"], 17)
+            self.assertEqual(diagnostic["verification_error"], "none")
+            self.assertIsNone(diagnostic["verification_errno"])
+            self.assertEqual(
+                failure.exception.scratch_unit_private_output,
+                (
+                    stdout_payload[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES],
+                    stderr_payload[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES],
+                ),
+            )
+            self.assertTrue(diagnostic["stdout_truncated"])
+            self.assertTrue(diagnostic["stderr_truncated"])
+            self.assertTrue(unit_command.call_args.kwargs["private_scratch_diagnostics"])
+            self.assertFalse(pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists())
+
+    def _assert_scratch_worker_forwards_output_only_when_private(self) -> None:
+        class BinaryTextCapture:
+            def __init__(self) -> None:
+                self.buffer = io.BytesIO()
+
+            def write(self, value: str) -> int:
+                return self.buffer.write(value.encode("utf-8"))
+
+            def flush(self) -> None:
+                return None
+
+        for private in (True, False):
+            scratch_root = pathlib.Path("/run") / f"oldsparky-backup-restore-{uuid.uuid4().hex[:24]}"
+            scratch_root.mkdir(mode=0o700)
+            try:
+                archive_path = scratch_root / "archive.dump"
+                archive_bytes = b"PGDMPsynthetic worker archive"
+                archive_path.write_bytes(archive_bytes)
+                archive_path.chmod(0o600)
+                archive_stat = archive_path.stat()
+                args = argparse.Namespace(
+                    _scratch_root=str(scratch_root),
+                    _scratch_archive=str(archive_path),
+                    _scratch_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+                    _scratch_archive_dev=archive_stat.st_dev,
+                    _scratch_archive_ino=archive_stat.st_ino,
+                    _scratch_archive_size=archive_stat.st_size,
+                    _scratch_timestamp_slug="20261012T010208Z",
+                    private_scratch_diagnostics=private,
+                )
+                worker_failure = backup_drill.RestoreGuardStop("command_failed")
+                worker_failure.scratch_worker_private_output = (
+                    b"known pg_restore stdout",
+                    b"known pg_restore stderr",
+                    False,
+                    False,
+                )
+                command_results = [
+                    subprocess.CompletedProcess([], 0, "/usr/lib/postgresql/16/bin\n", ""),
+                    subprocess.CompletedProcess([], 0, "postgres (PostgreSQL) 16.10\n", ""),
+                ]
+
+                def fake_run_command(command, **_kwargs):
+                    if command[:2] == ["pg_config", "--bindir"]:
+                        return command_results[0]
+                    if command[-1:] == ["--version"]:
+                        return command_results[1]
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                stdout_capture = BinaryTextCapture()
+                stderr_capture = BinaryTextCapture()
+                with (
+                    mock.patch.object(backup_drill, "_scratch_mount_snapshot"),
+                    mock.patch.object(backup_drill, "_scratch_cgroup_snapshot"),
+                    mock.patch.object(backup_drill, "_scratch_mem_available_bytes", return_value=2**30),
+                    mock.patch.object(backup_drill, "_scratch_resource_guard"),
+                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(
+                        backup_drill.pwd,
+                        "getpwnam",
+                        return_value=types.SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid()),
+                    ),
+                    mock.patch.object(backup_drill.os, "chown"),
+                    mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
+                    mock.patch.object(backup_drill, "_scratch_create_application_role"),
+                    mock.patch.object(
+                        backup_drill, "perform_restore_drill", side_effect=worker_failure
+                    ),
+                    mock.patch.object(backup_drill.sys, "stdout", stdout_capture),
+                    mock.patch.object(backup_drill.sys, "stderr", stderr_capture),
+                ):
+                    with self.assertRaises(backup_drill.RestoreGuardStop) as raised:
+                        backup_drill._scratch_worker_main(args)
+
+                self.assertIs(raised.exception, worker_failure)
+                if private:
+                    self.assertEqual(stdout_capture.buffer.getvalue(), b"known pg_restore stdout")
+                    self.assertEqual(stderr_capture.buffer.getvalue(), b"known pg_restore stderr")
+                else:
+                    self.assertEqual(stdout_capture.buffer.getvalue(), b"")
+                    self.assertEqual(stderr_capture.buffer.getvalue(), b"")
+            finally:
+                shutil.rmtree(scratch_root)
+
+    def test_run_disk_guarded_command_captures_only_opted_in_failure_output(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", "synthetic-secret", "platformdb"
+        )
+        stdout_payload = b"pg_restore stdout:" + b"o" * 9000
+        stderr_payload = b"restore failure marker:" + b"e" * 40000
+        child_code = (
+            "import sys; "
+            f"sys.stdout.buffer.write({stdout_payload!r}); sys.stdout.flush(); "
+            f"sys.stderr.buffer.write({stderr_payload!r}); sys.stderr.flush(); sys.exit(23)"
+        )
+        with (
+            mock.patch.object(backup_drill, "require_restore_headroom"),
+            mock.patch.object(backup_drill, "command_env", return_value={"PATH": os.environ["PATH"]}),
+        ):
+            with self.assertRaises(backup_drill.RestoreGuardStop) as failure:
+                backup_drill.run_disk_guarded_command(
+                    [sys.executable, "-c", child_code],
+                    target=target,
+                    stage="pg_restore",
+                    capture_private_output=True,
+                )
+        self.assertEqual(failure.exception.reason, "command_failed")
+        private_output = failure.exception.scratch_worker_private_output
+        self.assertEqual(private_output[0], stdout_payload[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES])
+        self.assertEqual(private_output[1], stderr_payload[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES])
+        self.assertTrue(private_output[2])
+        self.assertTrue(private_output[3])
+
+        benign_code = (
+            "import sys; sys.stdout.write('result'); sys.stderr.write('benign notice')"
+        )
+        with (
+            mock.patch.object(backup_drill, "require_restore_headroom"),
+            mock.patch.object(backup_drill, "command_env", return_value={"PATH": os.environ["PATH"]}),
+        ):
+            backup_drill.run_disk_guarded_command(
+                [sys.executable, "-c", benign_code],
+                target=target,
+                stage="pg_restore",
+                capture_private_output=True,
+            )
+
+    def test_run_disk_guarded_command_preserves_primary_when_reap_fails(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", "synthetic-secret", "platformdb"
+        )
+        stdout_payload = b"restore reached child\n"
+        stderr_payload = b"bounded private failure detail\n"
+        child_code = (
+            "import sys,time; "
+            f"sys.stdout.buffer.write({stdout_payload!r}); sys.stdout.flush(); "
+            f"sys.stderr.buffer.write({stderr_payload!r}); sys.stderr.flush(); "
+            "time.sleep(30)"
+        )
+        resource_guard_calls = 0
+
+        def fail_after_spawn() -> None:
+            nonlocal resource_guard_calls
+            resource_guard_calls += 1
+            if resource_guard_calls == 2:
+                time.sleep(0.1)
+                raise RuntimeError("primary restore resource failure")
+
+        cleanup_calls: list[int] = []
+
+        def stop_then_report_failure(process, *, phase=None) -> None:
+            cleanup_calls.append(process.pid)
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise backup_drill.RestoreGuardStop("child_unstopped", phase=phase)
+
+        with (
+            mock.patch.object(backup_drill, "require_restore_headroom"),
+            mock.patch.object(backup_drill, "command_env", return_value={"PATH": os.environ["PATH"]}),
+            mock.patch.object(backup_drill, "_stop_owned_child", side_effect=stop_then_report_failure),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "primary restore resource failure") as failure:
+                backup_drill.run_disk_guarded_command(
+                    [sys.executable, "-c", child_code],
+                    target=target,
+                    stage="pg_restore",
+                    resource_guard=fail_after_spawn,
+                    capture_private_output=True,
+                )
+
+        self.assertEqual(len(cleanup_calls), 1)
+        self.assertEqual(failure.exception.scratch_worker_cleanup_error, "child_unstopped")
+        self.assertEqual(
+            failure.exception.scratch_worker_private_output,
+            (stdout_payload, stderr_payload, False, False),
+        )
 
     def _assert_scratch_startup_inactive_race_is_handled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -752,6 +1032,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._assert_scratch_startup_inactive_race_is_handled()
         self._assert_scratch_fast_launcher_cannot_skip_active_confinement()
         self._assert_scratch_absent_unit_has_bounded_startup_deadline()
+        self._assert_scratch_after_confinement_failure_preserves_output()
+        self._assert_scratch_worker_forwards_output_only_when_private()
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             scratch_root = pathlib.Path(temporary_dir) / "scratch"

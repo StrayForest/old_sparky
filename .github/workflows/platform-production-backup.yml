@@ -1241,6 +1241,7 @@ jobs:
                               and scratch_unit["phase"] in {
                                   "unit_exited_before_confinement",
                                   "confinement_verification_failed",
+                                  "unit_exited_after_confinement",
                               }
                               and type(scratch_unit.get("active_state")) is str
                               and (
@@ -1248,6 +1249,8 @@ jobs:
                                    and scratch_unit["active_state"] in {"failed", "inactive"})
                                   or (scratch_unit["phase"] == "confinement_verification_failed"
                                       and scratch_unit["active_state"] == "active")
+                                  or (scratch_unit["phase"] == "unit_exited_after_confinement"
+                                      and scratch_unit["active_state"] in {"failed", "inactive"})
                               )
                               and type(scratch_unit.get("sub_state")) is str
                               and scratch_unit["sub_state"] in scratch_substates
@@ -1299,6 +1302,9 @@ jobs:
                                       and scratch_unit["verification_error"] in {"os_error", "policy_error", "other"}
                                       and (scratch_unit["verification_error"] == "os_error"
                                            or scratch_unit["verification_errno"] is None))
+                                  or (scratch_unit["phase"] == "unit_exited_after_confinement"
+                                      and scratch_unit["verification_error"] == "none"
+                                      and scratch_unit["verification_errno"] is None)
                               )
                           )
                           if valid_scratch:

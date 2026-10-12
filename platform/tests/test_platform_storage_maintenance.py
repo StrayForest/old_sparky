@@ -929,6 +929,39 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             },
         )
         self.assertEqual(failure_error.exception.scratch_unit_diagnostic, scratch_diagnostic)
+        after_confinement_diagnostic = {
+            **scratch_diagnostic,
+            "phase": "unit_exited_after_confinement",
+            "active_state": "inactive",
+            "sub_state": "dead",
+            "exec_main_status": 1,
+        }
+        after_confinement_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "private failure detail",
+                    "scratch_unit_diagnostic": after_confinement_diagnostic,
+                }
+            ),
+            "SCRATCH_UNIT_PRIVATE_OUTPUT_V1\nprivate framed bytes\n",
+        )
+        with (
+            mock.patch.object(
+                maintenance.subprocess, "run", return_value=after_confinement_failure
+            ),
+            mock.patch.object(maintenance.sys, "stderr", io.StringIO()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Platform backup failed") as after_error:
+                maintenance._run_backup_command(
+                    ["fixed-backup-child"], forward_failure_diagnostics=True
+                )
+        self.assertEqual(
+            after_error.exception.scratch_unit_diagnostic,
+            after_confinement_diagnostic,
+        )
         malformed_failure = subprocess.CompletedProcess(
             [],
             1,
@@ -3355,6 +3388,106 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 typed_receipt_path.read_text(encoding="ascii"),
             )
             self.assertNotIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", typed_receipt_path.read_text(encoding="ascii"))
+            self.assertFalse(typed_report.exists())
+
+            typed_report.write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status": "failed",
+                        "error_class": "backup",
+                        "scratch_unit_diagnostic": {
+                            "schema": 1,
+                            "phase": "unit_exited_after_confinement",
+                            "active_state": "inactive",
+                            "sub_state": "dead",
+                            "result": "exit-code",
+                            "exec_main_status": 1,
+                            "launcher_exit_status": 1,
+                            "stdout_bytes": 0,
+                            "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+                            "stdout_truncated": False,
+                            "stderr_bytes": 0,
+                            "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                            "stderr_truncated": False,
+                            "verification_error": "none",
+                            "verification_errno": None,
+                        },
+                    }
+                ),
+                encoding="ascii",
+            )
+            typed_report.chmod(0o600)
+            after_confinement_completed = subprocess.run(
+                [
+                    "bash", "-s", "--", "123460", "1", "create", "a" * 40,
+                    "b" * 64, "false", "false", "false", "none", "none", "none",
+                ],
+                input=typed_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(after_confinement_completed.returncode, 0)
+            after_confinement_receipt_path = typed_shared / "backup-failure-123460-1.json"
+            after_confinement_receipt = json.loads(
+                after_confinement_receipt_path.read_text(encoding="ascii")
+            )
+            self.assertEqual(after_confinement_receipt["report_state"], "typed_failure")
+            self.assertEqual(
+                after_confinement_receipt["scratch_unit_diagnostic"]["phase"],
+                "unit_exited_after_confinement",
+            )
+            self.assertEqual(
+                after_confinement_receipt["scratch_unit_diagnostic"]["active_state"],
+                "inactive",
+            )
+            self.assertFalse(typed_report.exists())
+
+            typed_report.write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status": "failed",
+                        "error_class": "backup",
+                        "scratch_unit_diagnostic": {
+                            "schema": 1,
+                            "phase": "unit_exited_after_confinement",
+                            "active_state": "active",
+                            "sub_state": "running",
+                            "result": "exit-code",
+                            "exec_main_status": 1,
+                            "launcher_exit_status": 1,
+                            "stdout_bytes": 0,
+                            "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+                            "stdout_truncated": False,
+                            "stderr_bytes": 0,
+                            "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                            "stderr_truncated": False,
+                            "verification_error": "none",
+                            "verification_errno": None,
+                        },
+                    }
+                ),
+                encoding="ascii",
+            )
+            typed_report.chmod(0o600)
+            invalid_after_confinement_completed = subprocess.run(
+                [
+                    "bash", "-s", "--", "123461", "1", "create", "a" * 40,
+                    "b" * 64, "false", "false", "false", "none", "none", "none",
+                ],
+                input=typed_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(invalid_after_confinement_completed.returncode, 0)
+            invalid_after_confinement_receipt = json.loads(
+                (typed_shared / "backup-failure-123461-1.json").read_text(encoding="ascii")
+            )
+            self.assertEqual(invalid_after_confinement_receipt["report_state"], "unclassified_json")
+            self.assertIsNone(invalid_after_confinement_receipt["scratch_unit_diagnostic"])
             self.assertFalse(typed_report.exists())
 
             typed_report.write_text(

@@ -62,6 +62,11 @@ launcher exit fails closed. If
 confinement verification fails after the unit starts, the private diagnostic
 records only closed error and errno fields plus bounded output hashes; raw
 launcher output stays in the root-only workflow capture.
+If the unit reaches verified confinement and the restore command then exits
+unsuccessfully, the failure report records a separate closed
+`unit_exited_after_confinement` phase with the final unit state and bounded
+output hashes. This remains a failed restore; the diagnostic does not change
+the admission limits, confinement checks or backup publication rules.
 
 Keep this backup budget separate from the release installer budget. The
 release coexistence reserve covers release staging and is not backup capacity.

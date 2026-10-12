@@ -259,6 +259,7 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         or value.get("phase") not in {
             "unit_exited_before_confinement",
             "confinement_verification_failed",
+            "unit_exited_after_confinement",
         }
         or type(value.get("active_state")) is not str
         or value.get("active_state") not in {"failed", "inactive", "active"}
@@ -297,6 +298,13 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         return False
     if value["phase"] == "confinement_verification_failed":
         if value["active_state"] != "active" or value["verification_error"] == "none":
+            return False
+    elif value["phase"] == "unit_exited_after_confinement":
+        if (
+            value["active_state"] not in {"failed", "inactive"}
+            or value["verification_error"] != "none"
+            or value["verification_errno"] is not None
+        ):
             return False
     elif (
         value["active_state"] not in {"failed", "inactive"}
@@ -687,8 +695,14 @@ def run_disk_guarded_command(
     disk_paths: tuple[pathlib.Path, ...] = (pathlib.Path("/"),),
     stdin_handle: BinaryIO | None = None,
     resource_guard: Callable[[], None] | None = None,
+    capture_private_output: bool = False,
 ) -> None:
-    """Run one owned dump/restore child under bounded disk monitoring."""
+    """Run one owned dump/restore child under bounded disk monitoring.
+
+    Child output remains discarded by default. The isolated restore worker may
+    opt into bounded diagnostic prefixes; both pipes are drained concurrently
+    so a verbose failing command cannot block before its status is observed.
+    """
 
     if stage not in {"pg_dump", "pg_restore"}:
         raise ValueError("unknown disk-guarded command stage")
@@ -697,17 +711,64 @@ def run_disk_guarded_command(
     require_restore_headroom(*disk_paths, phase=backup_phase)
     if resource_guard is not None:
         resource_guard()
+    stdout_prefix = bytearray()
+    stderr_prefix = bytearray()
+    stdout_observed = 0
+    stderr_observed = 0
+    output_selector: selectors.BaseSelector | None = None
     try:
         process = subprocess.Popen(
             command,
             stdin=stdin_handle if stdin_handle is not None else subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture_private_output else subprocess.DEVNULL,
+            stderr=subprocess.PIPE if capture_private_output else subprocess.DEVNULL,
             env=command_env(target),
             close_fds=True,
+            bufsize=0,
         )
     except OSError as exc:
         raise RestoreGuardStop("command_start_failed", phase=backup_phase) from exc
+
+    if capture_private_output:
+        assert process.stdout is not None and process.stderr is not None
+        output_selector = selectors.DefaultSelector()
+        for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+            os.set_blocking(stream.fileno(), False)
+            output_selector.register(stream, selectors.EVENT_READ, name)
+
+    def drain_child_output(*, timeout: float) -> None:
+        nonlocal stdout_observed, stderr_observed
+        if output_selector is None:
+            return
+        for key, _ in output_selector.select(timeout=timeout):
+            try:
+                chunk = os.read(key.fileobj.fileno(), 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                output_selector.unregister(key.fileobj)
+                continue
+            if key.data == "stdout":
+                stdout_observed += len(chunk)
+                if len(stdout_prefix) < SCRATCH_PRIVATE_STDOUT_BYTES:
+                    stdout_prefix.extend(chunk[: SCRATCH_PRIVATE_STDOUT_BYTES - len(stdout_prefix)])
+            else:
+                stderr_observed += len(chunk)
+                if len(stderr_prefix) < SCRATCH_PRIVATE_STDERR_BYTES:
+                    stderr_prefix.extend(chunk[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_prefix)])
+
+    def retain_failure_output(error: BaseException) -> None:
+        if capture_private_output:
+            setattr(
+                error,
+                "scratch_worker_private_output",
+                (
+                    bytes(stdout_prefix),
+                    bytes(stderr_prefix),
+                    stdout_observed > len(stdout_prefix),
+                    stderr_observed > len(stderr_prefix),
+                ),
+            )
 
     try:
         # Always take a post-start sample, including when pg_restore is short.
@@ -717,7 +778,10 @@ def run_disk_guarded_command(
         if resource_guard is not None:
             resource_guard()
         while process.poll() is None:
-            time.sleep(RESTORE_DISK_SAMPLE_SECONDS)
+            if output_selector is None:
+                time.sleep(RESTORE_DISK_SAMPLE_SECONDS)
+            else:
+                drain_child_output(timeout=RESTORE_DISK_SAMPLE_SECONDS)
             if process.poll() is not None:
                 break
             phase = f"{stage}_monitor"
@@ -726,18 +790,51 @@ def run_disk_guarded_command(
             if resource_guard is not None:
                 resource_guard()
         return_code = process.wait()
+        if output_selector is not None:
+            # A child may write its final bytes in the interval between poll
+            # and exit. Drain through EOF after wait, with no unbounded storage.
+            while output_selector.get_map():
+                drain_child_output(timeout=0.05)
         # Catch a floor crossing between the final sample and child exit.
         phase = f"{stage}_post_exit"
         backup_phase = phase if stage == "pg_dump" else None
         require_restore_headroom(*disk_paths, phase=backup_phase)
         if resource_guard is not None:
             resource_guard()
-    except BaseException:
+    except BaseException as exc:
         if process.poll() is None:
-            _stop_owned_child(process, phase=backup_phase)
+            try:
+                _stop_owned_child(process, phase=backup_phase)
+            except BaseException as cleanup_error:
+                # Keep the operation failure primary, but retain a closed
+                # cleanup classification so callers can fail closed without
+                # losing the bounded child output captured below.
+                cleanup_reason = getattr(cleanup_error, "reason", None)
+                if type(cleanup_reason) is not str or cleanup_reason not in {
+                    "child_unstopped",
+                }:
+                    cleanup_reason = type(cleanup_error).__name__
+                setattr(exc, "scratch_worker_cleanup_error", cleanup_reason)
+                if hasattr(exc, "add_note"):
+                    exc.add_note(f"Child cleanup also failed: {cleanup_reason}")
+        if output_selector is not None:
+            try:
+                while output_selector.get_map():
+                    drain_child_output(timeout=0.05)
+            except BaseException:
+                pass
+        retain_failure_output(exc)
         raise
+    finally:
+        if output_selector is not None:
+            output_selector.close()
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
     if return_code != 0:
-        raise RestoreGuardStop("command_failed", phase=backup_phase)
+        failure = RestoreGuardStop("command_failed", phase=backup_phase)
+        retain_failure_output(failure)
+        raise failure
 
 
 def run_restore_command(
@@ -746,6 +843,7 @@ def run_restore_command(
     target: DatabaseTarget,
     stdin_handle: BinaryIO | None = None,
     resource_guard: Callable[[], None] | None = None,
+    capture_private_output: bool = False,
 ) -> None:
     run_disk_guarded_command(
         command,
@@ -753,6 +851,7 @@ def run_restore_command(
         stage="pg_restore",
         stdin_handle=stdin_handle,
         resource_guard=resource_guard,
+        capture_private_output=capture_private_output,
     )
 
 
@@ -1184,6 +1283,7 @@ def verify_latest_existing_backup(
     max_age_hours: float = 24.0,
     *,
     admin_database_url: str | None = None,
+    private_scratch_diagnostics: bool = False,
 ) -> dict[str, Any]:
     """Re-verify only the newest existing backup and update its sidecar on success.
 
@@ -1207,6 +1307,7 @@ def verify_latest_existing_backup(
         table_count = _run_isolated_restore_drill(
             dump_path,
             timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
+            private_scratch_diagnostics=private_scratch_diagnostics,
         )
     except Exception as exc:
         diagnostic = getattr(exc, "restore_diagnostic", None)
@@ -1533,6 +1634,7 @@ def perform_restore_drill(
     restore_as_postgres: bool = False,
     restore_no_tablespaces: bool = False,
     resource_guard: Callable[[], None] | None = None,
+    capture_private_output: bool = False,
 ) -> int:
     drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
     use_local_admin = (
@@ -1622,6 +1724,7 @@ def perform_restore_drill(
                 target=restore_target,
                 stdin_handle=archive_stdin,
                 resource_guard=resource_guard,
+                capture_private_output=capture_private_output,
             )
         failure_stage = "validate_table_count"
         table_count_result = run_command(
@@ -2082,10 +2185,49 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
             restore_as_postgres=True,
             restore_no_tablespaces=True,
             resource_guard=lambda: _scratch_resource_guard(root),
+            capture_private_output=getattr(args, "private_scratch_diagnostics", False),
         )
         _scratch_resource_guard(root)
     except BaseException as exc:
         primary_error = exc
+        if getattr(args, "private_scratch_diagnostics", False) and not hasattr(
+            exc, "scratch_worker_private_output"
+        ):
+            def bounded_output(value: Any, limit: int) -> bytes:
+                if isinstance(value, bytes):
+                    raw = value
+                elif isinstance(value, str):
+                    raw = value.encode("utf-8", errors="replace")
+                else:
+                    return b""
+                return raw[:limit]
+
+            output = bounded_output(
+                getattr(exc, "stdout", getattr(exc, "output", None)),
+                SCRATCH_PRIVATE_STDOUT_BYTES,
+            )
+            error_output = bounded_output(
+                getattr(exc, "stderr", None), SCRATCH_PRIVATE_STDERR_BYTES
+            )
+            if output or error_output:
+                raw_output = getattr(exc, "stdout", getattr(exc, "output", None))
+                raw_error_output = getattr(exc, "stderr", None)
+                output_size = len(raw_output) if isinstance(raw_output, (bytes, str)) else 0
+                error_output_size = (
+                    len(raw_error_output)
+                    if isinstance(raw_error_output, (bytes, str))
+                    else 0
+                )
+                setattr(
+                    exc,
+                    "scratch_worker_private_output",
+                    (
+                        output,
+                        error_output,
+                        output_size > len(output),
+                        error_output_size > len(error_output),
+                    ),
+                )
     finally:
         if started or (pgdata / "postmaster.pid").exists():
             try:
@@ -2098,6 +2240,28 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
                     primary_error = stop_error
         archive.close()
     if primary_error is not None:
+        if getattr(args, "private_scratch_diagnostics", False):
+            private_output = getattr(primary_error, "scratch_worker_private_output", None)
+            if (
+                isinstance(private_output, tuple)
+                and len(private_output) == 4
+                and type(private_output[0]) is bytes
+                and type(private_output[1]) is bytes
+                and type(private_output[2]) is bool
+                and type(private_output[3]) is bool
+            ):
+                output_stream = getattr(sys.stdout, "buffer", None)
+                error_stream = getattr(sys.stderr, "buffer", None)
+                if output_stream is not None:
+                    output_stream.write(private_output[0])
+                    if private_output[2]:
+                        output_stream.write(b"\0")
+                    output_stream.flush()
+                if error_stream is not None:
+                    error_stream.write(private_output[1])
+                    if private_output[3]:
+                        error_stream.write(b"\0")
+                    error_stream.flush()
         raise primary_error
     if table_count is None or (pgdata / "postmaster.pid").exists():
         raise RuntimeError("Scratch restore server teardown was not confirmed.")
@@ -2127,6 +2291,7 @@ def _scratch_unit_command(
     archive_sha256: str,
     timestamp_slug: str,
     unit_name: str,
+    private_scratch_diagnostics: bool = False,
 ) -> list[str]:
     source_script = pathlib.Path(__file__).resolve(strict=True)
     source_policy = source_script.with_name("platform_disk_policy.py").resolve(strict=True)
@@ -2198,6 +2363,8 @@ def _scratch_unit_command(
         "--_scratch-timestamp-slug",
         timestamp_slug,
     ]
+    if private_scratch_diagnostics:
+        command.extend(("--json", "--private-scratch-diagnostics"))
     if any("ReadWritePaths=" in part for part in command):
         raise RuntimeError("Scratch unit must not override its private tmpfs mount.")
     return command
@@ -2473,7 +2640,12 @@ def _scratch_stop_unit(unit_name: str) -> None:
         raise RuntimeError("Scratch restore service could not be confirmed stopped.") from exc
 
 
-def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str) -> int:
+def _run_isolated_restore_drill(
+    dump_path: pathlib.Path,
+    *,
+    timestamp_slug: str,
+    private_scratch_diagnostics: bool = False,
+) -> int:
     """Restore into a capped, disposable PostgreSQL cluster isolated from production."""
     if os.geteuid() != 0:
         raise RuntimeError("Isolated backup verification requires the root maintenance owner.")
@@ -2532,6 +2704,7 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
             archive_sha256=archive_sha256,
             timestamp_slug=timestamp_slug,
             unit_name=unit_name,
+            private_scratch_diagnostics=private_scratch_diagnostics,
         )
         environment = {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -2550,6 +2723,7 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
         verification_error = "none"
         verification_errno: int | None = None
         active_control_group: str | None = None
+        active_snapshot: dict[str, Any] | None = None
         selector: selectors.BaseSelector | None = None
         launch_started = False
         last_tick = time.monotonic()
@@ -2619,7 +2793,14 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                 control_group = properties.get("ControlGroup", "")
                 if active_state == "failed" or result_state not in {None, "", "success"}:
                     early_exit_snapshot = snapshot
-                    raise RuntimeError("Scratch restore service failed before its confinement was verified.")
+                    if active_control_group is not None:
+                        early_exit_phase = "unit_exited_after_confinement"
+                        raise RuntimeError(
+                            "Scratch restore service failed after its confinement was verified."
+                        )
+                    raise RuntimeError(
+                        "Scratch restore service failed before its confinement was verified."
+                    )
                 if active_state == "active" and pid_text not in {"", "0"} and control_group:
                     # Preserve the exact live snapshot before any identity or
                     # cgroup verification can raise. A disappearing /proc PID
@@ -2636,6 +2817,7 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                             ).resolve(strict=True),
                         )
                         _scratch_control_group_snapshot(active_control_group)
+                        active_snapshot = snapshot
                     except BaseException as verification_exception:
                         early_exit_phase = "confinement_verification_failed"
                         verification_error, verification_errno = (
@@ -2713,10 +2895,26 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                             if stderr_size > 65536:
                                 raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
             if return_code != 0 or stderr_size != 0:
+                try:
+                    final_snapshot = _scratch_service_snapshot(unit_name)
+                except BaseException as snapshot_error:
+                    if active_snapshot is not None:
+                        early_exit_snapshot = active_snapshot
+                        early_exit_phase = "confinement_verification_failed"
+                    verification_error, verification_errno = (
+                        _scratch_verification_error_details(snapshot_error)
+                    )
+                    raise RuntimeError(
+                        "Scratch restore final service state could not be verified."
+                    ) from snapshot_error
+                early_exit_snapshot = final_snapshot
+                early_exit_phase = "unit_exited_after_confinement"
                 raise RuntimeError("Isolated PostgreSQL backup restore did not complete successfully.")
             try:
                 decoded = json.loads(stdout_buffer.decode("ascii"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                early_exit_snapshot = _scratch_service_snapshot(unit_name)
+                early_exit_phase = "unit_exited_after_confinement"
                 raise RuntimeError("Isolated PostgreSQL backup restore returned an invalid result.") from exc
             if (
                 not isinstance(decoded, dict)
@@ -2725,6 +2923,8 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                 or type(decoded.get("restored_table_count")) is not int
                 or decoded["restored_table_count"] <= 0
             ):
+                early_exit_snapshot = _scratch_service_snapshot(unit_name)
+                early_exit_phase = "unit_exited_after_confinement"
                 raise RuntimeError("Isolated PostgreSQL backup restore result failed validation.")
             worker_result = decoded
         except BaseException as operation_error:
@@ -2974,6 +3174,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             restored_table_count = _run_isolated_restore_drill(
                 temporary_dump_path,
                 timestamp_slug=timestamp_slug,
+                private_scratch_diagnostics=getattr(args, "private_scratch_diagnostics", False),
             )
             restore_verified = True
         else:
@@ -3163,6 +3364,7 @@ def verify_existing_dump(args: argparse.Namespace) -> dict[str, Any]:
     table_count = _run_isolated_restore_drill(
         dump_path,
         timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
+        private_scratch_diagnostics=getattr(args, "private_scratch_diagnostics", False),
     )
     return {
         "ok": True,
@@ -3213,6 +3415,7 @@ def main() -> int:
                         pathlib.Path(args.env_file),
                         max_age_hours=args.max_age_hours,
                         admin_database_url=args.admin_database_url,
+                        private_scratch_diagnostics=getattr(args, "private_scratch_diagnostics", False),
                     )
                 else:
                     result = create_backup(args)
