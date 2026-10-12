@@ -71,7 +71,10 @@ SCRATCH_MEMORY_ADMISSION_BYTES = SCRATCH_MEMORY_MAX_BYTES + SCRATCH_MEMORY_RESER
 SCRATCH_MEMORY_STOP_MARGIN_BYTES = 32 * 1024**2
 SCRATCH_TMPFS_STOP_BYTES = 64 * 1024**2
 SCRATCH_RUNTIME_SECONDS = 15 * 60
+SCRATCH_STARTUP_SECONDS = 30
 SCRATCH_RUNTIME_SAMPLE_SECONDS = 0.25
+SCRATCH_EARLY_EXIT_DRAIN_SECONDS = 2.0
+SCRATCH_EARLY_EXIT_DRAIN_BYTES = 1024 * 1024
 SCRATCH_PG_PORT = 55432
 SCRATCH_WORKER_MODE = "--_scratch-restore-worker"
 SCRATCH_APP_ROLE = "platform_user"
@@ -2085,7 +2088,6 @@ def _scratch_unit_command(
     archive_target = mountpoint / "archive.dump"
     worker_target = mountpoint / "platform_backup_restore_drill.py"
     policy_target = mountpoint / "platform_disk_policy.py"
-    python_target = mountpoint / "python3"
     command = [
         "systemd-run",
         "--system",
@@ -2099,7 +2101,6 @@ def _scratch_unit_command(
         f"--property=BindReadOnlyPaths={archive_path}:{archive_target}",
         f"--property=BindReadOnlyPaths={source_script}:{worker_target}",
         f"--property=BindReadOnlyPaths={source_policy}:{policy_target}",
-        f"--property=BindReadOnlyPaths={python_binary}:{python_target}",
         f"--property=MemoryMax={SCRATCH_MEMORY_MAX_BYTES}",
         "--property=MemorySwapMax=0",
         "--property=RuntimeMaxSec=900s",
@@ -2126,7 +2127,12 @@ def _scratch_unit_command(
         "--setenv=SYSTEMD_COLORS=0",
         "--setenv=SYSTEMD_PAGER=cat",
         "--",
-        str(python_target),
+        # systemd resolves ExecStart in the manager's host namespace before
+        # entering the unit's private mounts. The bounded tmpfs does not yet
+        # contain its later read-only binds at that point, so ExecStart must
+        # name the already-resolved host interpreter. ProtectSystem=strict
+        # keeps that interpreter read-only inside the unit.
+        str(python_binary),
         "-I",
         "-B",
         str(worker_target),
@@ -2149,6 +2155,87 @@ def _scratch_unit_command(
     if any("ReadWritePaths=" in part for part in command):
         raise RuntimeError("Scratch unit must not override its private tmpfs mount.")
     return command
+
+
+def _scratch_drain_early_exit_output(
+    selector: selectors.BaseSelector,
+    process: subprocess.Popen[bytes],
+    stdout_buffer: bytearray,
+    stderr_buffer: bytearray,
+    stdout_observed: int,
+    stderr_observed: int,
+) -> tuple[dict[str, bool], int, int]:
+    """Drain stopped-launcher pipes to EOF, bounded by time and bytes.
+
+    A single nonblocking read can return ``EAGAIN`` while the writer is still
+    making progress. Keep selecting until both writers close, or explicitly
+    mark the corresponding prefix incomplete when a hard bound is reached.
+    """
+    streams = {
+        "stdout": (process.stdout, stdout_buffer, SCRATCH_PRIVATE_STDOUT_BYTES),
+        "stderr": (process.stderr, stderr_buffer, SCRATCH_PRIVATE_STDERR_BYTES),
+    }
+    complete: dict[str, bool] = {}
+    drained = {name: 0 for name in streams}
+    pending: set[str] = set()
+    for name, (stream, _prefix, _cap) in streams.items():
+        if stream is None:
+            complete[name] = True
+            continue
+        try:
+            selector.get_key(stream)
+        except KeyError:
+            # The normal monitor already observed EOF and unregistered it.
+            complete[name] = True
+            continue
+        complete[name] = False
+        pending.add(name)
+
+    deadline = time.monotonic() + SCRATCH_EARLY_EXIT_DRAIN_SECONDS
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        for key, _ in selector.select(timeout=min(0.05, remaining)):
+            name = key.data
+            if name not in pending:
+                continue
+            stream, prefix, cap = streams[name]
+            assert stream is not None
+            byte_budget = SCRATCH_EARLY_EXIT_DRAIN_BYTES + 1 - drained[name]
+            if byte_budget <= 0:
+                selector.unregister(stream)
+                pending.remove(name)
+                continue
+            try:
+                data = os.read(stream.fileno(), min(65536, byte_budget))
+            except BlockingIOError:
+                continue
+            except OSError:
+                selector.unregister(stream)
+                pending.remove(name)
+                continue
+            if not data:
+                selector.unregister(stream)
+                complete[name] = True
+                pending.remove(name)
+                continue
+            drained[name] += len(data)
+            if name == "stdout":
+                stdout_observed += len(data)
+            else:
+                stderr_observed += len(data)
+            if len(prefix) < cap:
+                prefix.extend(data[: cap - len(prefix)])
+            if drained[name] > SCRATCH_EARLY_EXIT_DRAIN_BYTES:
+                selector.unregister(stream)
+                pending.remove(name)
+
+    for name in pending:
+        stream = streams[name][0]
+        if stream is not None:
+            selector.unregister(stream)
+    return complete, stdout_observed, stderr_observed
 
 
 def _scratch_control_group_snapshot(control_group: str) -> dict[str, int]:
@@ -2230,7 +2317,13 @@ def _scratch_service_snapshot(unit_name: str) -> dict[str, Any]:
     return {"properties": properties, "load_state": properties.get("LoadState")}
 
 
-def _scratch_expected_properties(snapshot: dict[str, Any], *, unit_name: str, mountpoint: pathlib.Path) -> str:
+def _scratch_expected_properties(
+    snapshot: dict[str, Any],
+    *,
+    unit_name: str,
+    mountpoint: pathlib.Path,
+    python_binary: pathlib.Path,
+) -> str:
     properties = snapshot.get("properties")
     if not isinstance(properties, dict):
         raise RuntimeError("Scratch restore service properties are malformed.")
@@ -2269,6 +2362,16 @@ def _scratch_expected_properties(snapshot: dict[str, Any], *, unit_name: str, mo
         raise RuntimeError("Scratch restore worker process identity disappeared during verification.") from exc
     if process_cgroup != control_group:
         raise RuntimeError("Scratch restore worker is outside its reviewed systemd cgroup.")
+    try:
+        expected_python = python_binary.stat()
+        running_python = pathlib.Path(f"/proc/{pid_text}/exe").stat()
+    except OSError as exc:
+        raise RuntimeError("Scratch restore interpreter identity disappeared during verification.") from exc
+    if (running_python.st_dev, running_python.st_ino) != (
+        expected_python.st_dev,
+        expected_python.st_ino,
+    ):
+        raise RuntimeError("Scratch restore interpreter does not match the pinned host executable.")
     tmpfs = properties.get("TemporaryFileSystem", "")
     if str(mountpoint) not in tmpfs:
         raise RuntimeError("Scratch restore tmpfs request is not present in the active unit.")
@@ -2288,7 +2391,6 @@ def _scratch_expected_properties(snapshot: dict[str, Any], *, unit_name: str, mo
         str(mountpoint / "archive.dump"),
         str(mountpoint / "platform_backup_restore_drill.py"),
         str(mountpoint / "platform_disk_policy.py"),
-        str(mountpoint / "python3"),
     ):
         if required not in bind_paths:
             raise RuntimeError("Scratch restore service is missing a required read-only input bind.")
@@ -2435,6 +2537,7 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                 # invoked, even if Popen itself raises after systemd accepted
                 # the transient unit request.
                 launch_started = True
+                startup_deadline = time.monotonic() + SCRATCH_STARTUP_SECONDS
                 process = subprocess.Popen(
                     command,
                     stdin=subprocess.DEVNULL,
@@ -2460,14 +2563,45 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                 _scratch_host_guard()
                 snapshot = _scratch_service_snapshot(unit_name)
                 properties = snapshot.get("properties", {})
-                if properties.get("ActiveState") == "active" and properties.get("ExecMainPID", "0") not in {"", "0"}:
+                active_state = properties.get("ActiveState")
+                load_state = properties.get("LoadState")
+                result_state = properties.get("Result")
+                pid_text = properties.get("ExecMainPID", "0")
+                control_group = properties.get("ControlGroup", "")
+                if active_state == "failed" or result_state not in {None, "", "success"}:
+                    early_exit_snapshot = snapshot
+                    raise RuntimeError("Scratch restore service failed before its confinement was verified.")
+                if active_state == "active" and pid_text not in {"", "0"} and control_group:
                     active_control_group = _scratch_expected_properties(
-                        snapshot, unit_name=unit_name, mountpoint=mountpoint
+                        snapshot,
+                        unit_name=unit_name,
+                        mountpoint=mountpoint,
+                        python_binary=pathlib.Path(
+                            getattr(sys, "_base_executable", sys.executable)
+                        ).resolve(strict=True),
                     )
                     _scratch_control_group_snapshot(active_control_group)
-                elif properties.get("ActiveState") in {"failed", "inactive"}:
+                elif (
+                    active_state in {"inactive", "activating", "active"}
+                    and load_state in {"loaded", "not-found"}
+                    and (
+                        active_state == "activating"
+                        or (pid_text in {"", "0"} and not control_group)
+                    )
+                ):
+                    # systemd can briefly report the not-yet-created transient
+                    # unit as inactive after systemd-run has been launched. The
+                    # launcher is still making the request; poll through this
+                    # bounded startup window rather than treating absence as a
+                    # terminal unit failure.
+                    if process.poll() is not None or now >= startup_deadline:
+                        early_exit_snapshot = snapshot
+                        raise RuntimeError(
+                            "Scratch restore service did not become active with verified confinement before its startup deadline."
+                        )
+                else:
                     early_exit_snapshot = snapshot
-                    raise RuntimeError("Scratch restore service exited before its confinement was verified.")
+                    raise RuntimeError("Scratch restore service state cannot prove confinement startup.")
                 last_tick = now
                 for key, _ in selector.select(timeout=SCRATCH_RUNTIME_SAMPLE_SECONDS):
                     try:
@@ -2487,6 +2621,14 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                             stderr_buffer.extend(data[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
                         if stderr_size > 65536:
                             raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
+            if active_control_group is None:
+                # A very short-lived launcher may finish before the monitor
+                # observes an active unit. Never accept its worker result
+                # without having validated the live service confinement.
+                early_exit_snapshot = _scratch_service_snapshot(unit_name)
+                raise RuntimeError(
+                    "Scratch restore service exited before its confinement was verified."
+                )
             return_code = process.wait(timeout=5)
             for stream in (process.stdout, process.stderr):
                 if stream:
@@ -2551,32 +2693,17 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                     except BaseException as cleanup_error:
                         cleanup_errors.append(cleanup_error)
             if early_exit_snapshot is not None:
-                drain_complete = {"stdout": False, "stderr": False}
-                for name, stream, prefix, cap in (
-                    ("stdout", process.stdout if process is not None else None, stdout_buffer, SCRATCH_PRIVATE_STDOUT_BYTES),
-                    ("stderr", process.stderr if process is not None else None, stderr_buffer, SCRATCH_PRIVATE_STDERR_BYTES),
-                ):
-                    if stream is None:
-                        drain_complete[name] = True
-                        continue
-                    drained = 0
-                    while drained <= 1024 * 1024:
-                        try:
-                            data = os.read(stream.fileno(), min(65536, 1024 * 1024 + 1 - drained))
-                        except BlockingIOError:
-                            break
-                        except OSError:
-                            break
-                        if not data:
-                            drain_complete[name] = True
-                            break
-                        drained += len(data)
-                        if name == "stdout":
-                            stdout_observed += len(data)
-                        else:
-                            stderr_size += len(data)
-                        if len(prefix) < cap:
-                            prefix.extend(data[: cap - len(prefix)])
+                assert process is not None and selector is not None
+                drain_complete, stdout_observed, stderr_size = (
+                    _scratch_drain_early_exit_output(
+                        selector,
+                        process,
+                        stdout_buffer,
+                        stderr_buffer,
+                        stdout_observed,
+                        stderr_size,
+                    )
+                )
                 stdout_prefix = bytes(stdout_buffer[:SCRATCH_PRIVATE_STDOUT_BYTES])
                 stderr_prefix = bytes(stderr_buffer[:SCRATCH_PRIVATE_STDERR_BYTES])
                 diagnostic = _scratch_unit_diagnostic(

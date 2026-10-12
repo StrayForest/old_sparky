@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 import uuid
@@ -239,6 +241,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             archive_path.chmod(0o600)
             stdout_read, stdout_write = os.pipe()
             stderr_read, stderr_write = os.pipe()
+            pipe_capacities = []
+            for read_fd in (stdout_read, stderr_read):
+                pipe_capacities.append(fcntl.fcntl(read_fd, fcntl.F_SETPIPE_SZ, 4096))
+            self.assertTrue(
+                all(capacity < backup_drill.SCRATCH_PRIVATE_STDERR_BYTES for capacity in pipe_capacities)
+            )
             stdout_reader = os.fdopen(stdout_read, "rb", buffering=0)
             stderr_reader = os.fdopen(stderr_read, "rb", buffering=0)
             stdout_payload = b"o" * (backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES + 1)
@@ -279,6 +287,10 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 },
             ]
 
+            def snapshot(_unit_name):
+                value = snapshots.pop(0)
+                return value
+
             def stop_unit(_unit_name):
                 launcher.returncode = 1
 
@@ -288,12 +300,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     mock.patch.object(backup_drill, "_scratch_host_guard"),
                     mock.patch.object(backup_drill, "_scratch_unit_command", return_value=["systemd-run"]),
                     mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
-                    mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=snapshots),
+                    mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=snapshot),
                     mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit),
                     mock.patch.object(backup_drill.subprocess, "Popen", return_value=launcher),
                 ):
                     with self.assertRaisesRegex(
-                        RuntimeError, "exited before its confinement was verified"
+                        RuntimeError, "failed before its confinement was verified"
                     ) as failure:
                         backup_drill._run_isolated_restore_drill(
                             archive_path,
@@ -301,6 +313,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         )
                 stdout_writer.join(timeout=2)
                 stderr_writer.join(timeout=2)
+
                 self.assertFalse(stdout_writer.is_alive())
                 self.assertFalse(stderr_writer.is_alive())
                 diagnostic = failure.exception.scratch_unit_diagnostic
@@ -320,6 +333,202 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 stdout_writer.join(timeout=2)
                 stderr_writer.join(timeout=2)
 
+    def _assert_scratch_startup_inactive_race_is_handled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            archive_path.chmod(0o600)
+            command = [
+                sys.executable,
+                "-c",
+                "import json,time; print(json.dumps({'ok':True,'restored_table_count':1}),flush=True); time.sleep(0.6)",
+            ]
+            unit_command = mock.Mock(return_value=command)
+            real_popen = subprocess.Popen
+            launched = []
+
+            def launch(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                launched.append(process)
+                return process
+
+            snapshots_seen = []
+
+            def service_snapshot(_unit_name):
+                if not snapshots_seen:
+                    state = {
+                        "properties": {
+                            "LoadState": "not-found",
+                            "ActiveState": "inactive",
+                            "SubState": "dead",
+                            "Result": "success",
+                            "ExecMainPID": "0",
+                            "ControlGroup": "",
+                        }
+                    }
+                elif len(snapshots_seen) == 1:
+                    state = {
+                        "properties": {
+                            "LoadState": "loaded",
+                            "ActiveState": "inactive",
+                            "SubState": "dead",
+                            "Result": "success",
+                            "ExecMainPID": "0",
+                            "ControlGroup": "",
+                        }
+                    }
+                elif launched and launched[0].poll() is None:
+                    state = {
+                        "properties": {
+                            "LoadState": "loaded",
+                            "ActiveState": "active",
+                            "ExecMainPID": "123",
+                            "ControlGroup": "/system.slice/scratch-startup-race.service",
+                        }
+                    }
+                else:
+                    state = {
+                        "properties": {
+                            "LoadState": "not-found",
+                            "ActiveState": "inactive",
+                            "ExecMainPID": "0",
+                            "ControlGroup": "",
+                        }
+                    }
+                snapshots_seen.append(state["properties"]["ActiveState"])
+                return state
+
+            with (
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill, "_scratch_host_guard"),
+                mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=service_snapshot),
+                mock.patch.object(backup_drill, "_scratch_expected_properties", return_value="/system.slice/scratch-startup-race.service"),
+                mock.patch.object(backup_drill, "_scratch_control_group_snapshot", return_value={}),
+                mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
+                mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
+            ):
+                result = backup_drill._run_isolated_restore_drill(
+                    archive_path,
+                    timestamp_slug="20261012T010203Z",
+                )
+
+            self.assertEqual(result, 1)
+            self.assertEqual(snapshots_seen[0], "inactive")
+            self.assertEqual(snapshots_seen[1], "inactive")
+            self.assertIn("active", snapshots_seen)
+            self.assertFalse(launched[0].poll() is None)
+            mountpoint = pathlib.Path(unit_command.call_args.kwargs["mountpoint"])
+            self.assertFalse(mountpoint.exists())
+
+    def _assert_scratch_fast_launcher_cannot_skip_active_confinement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            archive_path.chmod(0o600)
+            command = [sys.executable, "-c", "print('{\"ok\":true,\"restored_table_count\":1}')"]
+            real_popen = subprocess.Popen
+            launched = []
+
+            def launch(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                process.wait(timeout=2)
+                launched.append(process)
+                return process
+
+            snapshots = []
+
+            def service_snapshot(_unit_name):
+                snapshots.append(True)
+                return {
+                    "properties": {
+                        "LoadState": "not-found",
+                        "ActiveState": "inactive",
+                        "ExecMainPID": "0",
+                        "ControlGroup": "",
+                    }
+                }
+
+            unit_command = mock.Mock(return_value=command)
+            with (
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill, "_scratch_host_guard"),
+                mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=service_snapshot),
+                mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
+                mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "exited before its confinement was verified"):
+                    backup_drill._run_isolated_restore_drill(
+                        archive_path,
+                        timestamp_slug="20261012T010204Z",
+                    )
+
+            self.assertTrue(launched)
+            self.assertTrue(snapshots)
+            self.assertIsNotNone(launched[0].returncode)
+            mountpoint = pathlib.Path(unit_command.call_args.kwargs["mountpoint"])
+            self.assertFalse(mountpoint.exists())
+
+    def _assert_scratch_absent_unit_has_bounded_startup_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            archive_path.chmod(0o600)
+            command = [sys.executable, "-c", "import time; time.sleep(10)"]
+            real_popen = subprocess.Popen
+            launched = []
+            snapshots = []
+
+            def launch(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                launched.append(process)
+                return process
+
+            def service_snapshot(_unit_name):
+                snapshots.append(True)
+                return {
+                    "properties": {
+                        "LoadState": "not-found",
+                        "ActiveState": "inactive",
+                        "SubState": "dead",
+                        "Result": "success",
+                        "ExecMainPID": "0",
+                        "ControlGroup": "",
+                    }
+                }
+
+            def stop_unit(_unit_name):
+                if launched and launched[0].poll() is None:
+                    launched[0].kill()
+                    launched[0].wait(timeout=2)
+
+            unit_command = mock.Mock(return_value=command)
+            started = time.monotonic()
+            with (
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill, "_scratch_host_guard"),
+                mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=service_snapshot),
+                mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit),
+                mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
+                mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
+                mock.patch.object(backup_drill, "SCRATCH_STARTUP_SECONDS", 0.05),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "startup deadline"):
+                    backup_drill._run_isolated_restore_drill(
+                        archive_path,
+                        timestamp_slug="20261012T010205Z",
+                    )
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 2)
+            self.assertGreaterEqual(len(snapshots), 2)
+            self.assertEqual(launched[0].returncode, -signal.SIGKILL)
+            self.assertFalse(pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists())
     def test_local_admin_commands_use_postgres_os_user(self) -> None:
         target = backup_drill.DatabaseTarget("127.0.0.1", 5432, "platform_user", None, "platformdb")
 
@@ -431,6 +640,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._assert_scratch_worker_uses_pinned_archive_fd()
         self._assert_scratch_unit_diagnostic_caps_and_private_envelope()
         self._assert_scratch_early_exit_output_is_drained()
+        self._assert_scratch_startup_inactive_race_is_handled()
+        self._assert_scratch_fast_launcher_cannot_skip_active_confinement()
+        self._assert_scratch_absent_unit_has_bounded_startup_deadline()
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             scratch_root = pathlib.Path(temporary_dir) / "scratch"
@@ -452,6 +664,21 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertIn("--property=OOMPolicy=kill", command)
         self.assertIn("--property=TemporaryFileSystem=" + str(scratch_root) + ":rw,size=536870912,mode=0700", command)
         self.assertTrue(any(item.startswith("--property=BindReadOnlyPaths=") and str(archive_path) in item for item in command))
+        separator = command.index("--")
+        expected_python = pathlib.Path(
+            getattr(backup_drill.sys, "_base_executable", backup_drill.sys.executable)
+        ).resolve(strict=True)
+        self.assertEqual(command[separator + 1], str(expected_python))
+        self.assertTrue(any(
+            item.startswith("--property=BindReadOnlyPaths=")
+            and str(scratch_root / "platform_backup_restore_drill.py") in item
+            for item in command
+        ))
+        self.assertFalse(any(
+            item.startswith("--property=BindReadOnlyPaths=")
+            and str(scratch_root / "python3") in item
+            for item in command
+        ))
         self.assertFalse(any("ReadWritePaths=" in item for item in command))
         self.assertFalse(any("PGPASSWORD" in item or "PLATFORM_DATABASE_URL" in item for item in command))
 

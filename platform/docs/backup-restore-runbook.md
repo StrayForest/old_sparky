@@ -161,6 +161,16 @@ private failure capture so the exact startup failure can be diagnosed; it is
 never copied into the shared marker or public workflow artifact. Invalid or
 oversized diagnostic data fails closed and cannot make a failed restore pass.
 
+After launch, the transient unit must reach `ActiveState=active` with a verified
+PID, executable, cgroup and confinement sample within 30 seconds. During that
+startup window, only loaded/not-found units reporting inactive, activating or
+active are eligible for polling, and only while the launcher remains live.
+Inactive or active states must not report a PID or cgroup; an activating state
+may have preliminary identity, which is not accepted as confinement. A failed
+unit result, launcher exit or unknown/partial identity fails closed. Worker
+output is never accepted as restore success unless an active confinement sample
+was observed.
+
 ### Re-verify the newest existing backup
 
 When the newest archive is present but its restore verification is missing or
