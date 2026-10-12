@@ -283,6 +283,171 @@ def valid_scratch_admission_diagnostic(value: Any) -> bool:
     return pair_rss is None
 
 
+_SCRATCH_HOST_GUARD_SITES = frozenset(
+    {
+        "parent_before_archive_open",
+        "parent_before_unit_launch",
+        "parent_active_poll",
+        "parent_after_worker_cleanup",
+        "worker_after_start_before_archive_open",
+        "worker_after_initdb_before_postgres_start",
+        "worker_after_postgres_start",
+        "worker_pg_restore_resource_guard",
+        "worker_after_restore_before_postgres_stop",
+    }
+)
+SCRATCH_HOST_GUARD_FRAME_MARKER = b"OLDS_PG_SCRATCH_HOST_GUARD_V1:"
+SCRATCH_HOST_GUARD_FRAME_MAX_BYTES = 512
+
+
+def valid_scratch_host_guard_diagnostic(value: Any) -> bool:
+    """Validate the closed private summary for an observed host-memory guard."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "guard_site",
+        "guard_reason",
+        "available_bytes",
+        "required_bytes",
+    }:
+        return False
+    available = value.get("available_bytes")
+    return (
+        type(value.get("schema")) is int
+        and value["schema"] == 2
+        and type(value.get("guard_site")) is str
+        and value["guard_site"] in _SCRATCH_HOST_GUARD_SITES
+        and type(value.get("guard_reason")) is str
+        and value["guard_reason"] == "memory_reserve"
+        and type(available) is int
+        and 0 <= available < SCRATCH_MEMORY_ADMISSION_BYTES
+        and type(value.get("required_bytes")) is int
+        and value["required_bytes"] == SCRATCH_MEMORY_ADMISSION_BYTES
+    )
+
+
+def parse_scratch_host_guard_frame(
+    stderr: bytes, *, truncated: bool
+) -> dict[str, Any] | None:
+    """Read exactly one bounded worker frame; malformed or incomplete is unknown."""
+    if type(stderr) is not bytes or type(truncated) is not bool or truncated:
+        return None
+    marker = SCRATCH_HOST_GUARD_FRAME_MARKER
+    if stderr.count(marker) != 1:
+        return None
+    marker_offset = stderr.find(marker)
+    line_end = stderr.find(b"\n", marker_offset)
+    if line_end < 0:
+        return None
+    frame = stderr[marker_offset + len(marker) : line_end]
+    if not frame or len(frame) > SCRATCH_HOST_GUARD_FRAME_MAX_BYTES:
+        return None
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate frame field")
+            result[key] = value
+        return result
+
+    try:
+        candidate = json.loads(frame.decode("ascii"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    return candidate if valid_scratch_host_guard_diagnostic(candidate) else None
+
+
+def parse_scratch_host_guard_failure_report(
+    stdout: bytes, *, truncated: bool
+) -> dict[str, Any] | None:
+    """Read only the helper's complete, closed stdout failure report."""
+    if (
+        type(stdout) is not bytes
+        or type(truncated) is not bool
+        or truncated
+        or not stdout.endswith(b"\n")
+        or len(stdout) > SCRATCH_PRIVATE_STDOUT_BYTES
+    ):
+        return None
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate report field")
+            result[key] = value
+        return result
+
+    try:
+        report = json.loads(
+            stdout.decode("utf-8"), object_pairs_hook=unique_object
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    allowed_keys = {
+        "ok",
+        "error",
+        "restore_diagnostic",
+        "backup_disk_diagnostic",
+        "scratch_unit_diagnostic",
+        "scratch_admission_diagnostic",
+        "scratch_host_guard_diagnostic",
+    }
+    if (
+        not isinstance(report, dict)
+        or not set(report).issubset(allowed_keys)
+        or type(report.get("ok")) is not bool
+        or report["ok"] is not False
+        or type(report.get("error")) is not str
+        or not valid_scratch_host_guard_diagnostic(
+            report.get("scratch_host_guard_diagnostic")
+        )
+    ):
+        return None
+    # Match the sole report writer in main(); this also rejects prefix/suffix
+    # data, multiple objects, and otherwise valid but noncanonical framing.
+    canonical = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    if stdout != canonical:
+        return None
+    return report["scratch_host_guard_diagnostic"]
+
+
+def _write_scratch_worker_private_output(stdout: bytes, stderr: bytes) -> None:
+    """Keep child output off the helper-owned JSON stdout channel."""
+    error_stream = getattr(sys.stderr, "buffer", None)
+    if error_stream is None:
+        return
+    if stdout:
+        error_stream.write(stdout)
+    if stderr:
+        error_stream.write(stderr)
+    error_stream.flush()
+
+
+def _parse_bound_scratch_host_guard_diagnostic(
+    stdout: bytes,
+    stderr: bytes,
+    *,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> dict[str, Any] | None:
+    """Promote only the same closed observation in both worker channels."""
+    report = parse_scratch_host_guard_failure_report(
+        stdout, truncated=stdout_truncated
+    )
+    frame = parse_scratch_host_guard_frame(stderr, truncated=stderr_truncated)
+    return report if report is not None and report == frame else None
+
+
+def _scratch_host_guard_frame(value: Any) -> bytes | None:
+    if not valid_scratch_host_guard_diagnostic(value):
+        return None
+    payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("ascii")
+    if len(payload) > SCRATCH_HOST_GUARD_FRAME_MAX_BYTES:
+        return None
+    return SCRATCH_HOST_GUARD_FRAME_MARKER + payload + b"\n"
+
+
 _SCRATCH_UNIT_SUBSTATES = {
     "dead", "failed", "exited", "start", "start-pre", "start-post",
     "running", "stop", "stop-sigterm", "stop-sigkill", "final-sigterm",
@@ -2270,10 +2435,58 @@ def _scratch_admission_rss_snapshot() -> dict[str, int | None]:
     return result
 
 
-def _scratch_resource_guard(root: pathlib.Path) -> None:
+def _raise_scratch_host_memory_reserve(
+    guard_site: str,
+    *,
+    message: str,
+    retain_legacy_admission: bool = False,
+) -> None:
+    available_bytes = _scratch_mem_available_bytes()
+    if available_bytes >= SCRATCH_MEMORY_ADMISSION_BYTES:
+        return
+    error = RuntimeError(message)
+    diagnostic = {
+        "schema": 2,
+        "guard_site": guard_site,
+        "guard_reason": "memory_reserve",
+        "available_bytes": available_bytes,
+        "required_bytes": SCRATCH_MEMORY_ADMISSION_BYTES,
+    }
+    if valid_scratch_host_guard_diagnostic(diagnostic):
+        error.scratch_host_guard_diagnostic = diagnostic
+    if retain_legacy_admission:
+        try:
+            rss_snapshot = _scratch_admission_rss_snapshot()
+        except Exception:
+            rss_snapshot = {
+                "helper_rss_bytes": None,
+                "direct_parent_rss_bytes": None,
+                "observed_pair_rss_bytes": None,
+                "observed_process_count": 0,
+            }
+        legacy = {
+            "schema": 1,
+            "phase": "pre_create_admission",
+            "guard_reason": "memory_reserve",
+            "available_bytes": available_bytes,
+            "required_bytes": SCRATCH_MEMORY_ADMISSION_BYTES,
+            **rss_snapshot,
+        }
+        if valid_scratch_admission_diagnostic(legacy):
+            error.scratch_admission_diagnostic = legacy
+    raise error
+
+
+def _scratch_resource_guard(
+    root: pathlib.Path,
+    *,
+    guard_site: str = "worker_pg_restore_resource_guard",
+) -> None:
     require_restore_headroom(pathlib.Path("/"))
-    if _scratch_mem_available_bytes() < SCRATCH_MEMORY_ADMISSION_BYTES:
-        raise RuntimeError("Scratch restore stopped by the host-memory reserve guard.")
+    _raise_scratch_host_memory_reserve(
+        guard_site,
+        message="Scratch restore stopped by the host-memory reserve guard.",
+    )
     _scratch_cgroup_snapshot()
     _scratch_mount_snapshot(root)
 
@@ -2453,8 +2666,10 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         raise RuntimeError("Scratch restore root is invalid.")
     _scratch_mount_snapshot(root)
     _scratch_cgroup_snapshot()
-    if _scratch_mem_available_bytes() < SCRATCH_MEMORY_ADMISSION_BYTES:
-        raise RuntimeError("Scratch restore admission memory reserve is unavailable.")
+    _raise_scratch_host_memory_reserve(
+        "worker_after_start_before_archive_open",
+        message="Scratch restore admission memory reserve is unavailable.",
+    )
     if os.geteuid() != 0:
         raise RuntimeError("Scratch restore supervisor is not root.")
     archive = _open_verified_scratch_archive(args)
@@ -2505,7 +2720,9 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     primary_error: BaseException | None = None
     table_count: int | None = None
     try:
-        _scratch_resource_guard(root)
+        _scratch_resource_guard(
+            root, guard_site="worker_after_initdb_before_postgres_start"
+        )
         server_options = shlex.join(
             [
                 "-c",
@@ -2538,7 +2755,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
             capture_output=True,
         )
         started = True
-        _scratch_resource_guard(root)
+        _scratch_resource_guard(root, guard_site="worker_after_postgres_start")
         admin_target = DatabaseTarget(
             host=str(socket_dir),
             port=SCRATCH_PG_PORT,
@@ -2562,10 +2779,14 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
             archive_stdin=archive,
             restore_as_postgres=True,
             restore_no_tablespaces=True,
-            resource_guard=lambda: _scratch_resource_guard(root),
+            resource_guard=lambda: _scratch_resource_guard(
+                root, guard_site="worker_pg_restore_resource_guard"
+            ),
             capture_private_output=getattr(args, "private_scratch_diagnostics", False),
         )
-        _scratch_resource_guard(root)
+        _scratch_resource_guard(
+            root, guard_site="worker_after_restore_before_postgres_stop"
+        )
     except BaseException as exc:
         primary_error = exc
         if getattr(args, "private_scratch_diagnostics", False) and not hasattr(
@@ -2628,18 +2849,13 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
                 and type(private_output[2]) is bool
                 and type(private_output[3]) is bool
             ):
-                output_stream = getattr(sys.stdout, "buffer", None)
-                error_stream = getattr(sys.stderr, "buffer", None)
-                if output_stream is not None:
-                    output_stream.write(private_output[0])
-                    if private_output[2]:
-                        output_stream.write(b"\0")
-                    output_stream.flush()
-                if error_stream is not None:
-                    error_stream.write(private_output[1])
-                    if private_output[3]:
-                        error_stream.write(b"\0")
-                    error_stream.flush()
+                output = private_output[0]
+                error_output = private_output[1]
+                if private_output[2]:
+                    output += b"\0"
+                if private_output[3]:
+                    error_output += b"\0"
+                _write_scratch_worker_private_output(output, error_output)
         raise primary_error
     if table_count is None or (pgdata / "postmaster.pid").exists():
         raise RuntimeError("Scratch restore server teardown was not confirmed.")
@@ -3120,31 +3336,15 @@ def _scratch_expected_properties(
     return control_group
 
 
-def _scratch_host_guard() -> None:
+def _scratch_host_guard(
+    guard_site: str = "parent_before_archive_open",
+) -> None:
     require_restore_headroom(pathlib.Path("/"))
-    available_bytes = _scratch_mem_available_bytes()
-    if available_bytes < SCRATCH_MEMORY_ADMISSION_BYTES:
-        error = RuntimeError("Scratch restore admission memory reserve is unavailable.")
-        try:
-            rss_snapshot = _scratch_admission_rss_snapshot()
-        except Exception:
-            rss_snapshot = {
-                "helper_rss_bytes": None,
-                "direct_parent_rss_bytes": None,
-                "observed_pair_rss_bytes": None,
-                "observed_process_count": 0,
-            }
-        diagnostic = {
-            "schema": 1,
-            "phase": "pre_create_admission",
-            "guard_reason": "memory_reserve",
-            "available_bytes": available_bytes,
-            "required_bytes": SCRATCH_MEMORY_ADMISSION_BYTES,
-            **rss_snapshot,
-        }
-        if valid_scratch_admission_diagnostic(diagnostic):
-            error.scratch_admission_diagnostic = diagnostic
-        raise error
+    _raise_scratch_host_memory_reserve(
+        guard_site,
+        message="Scratch restore admission memory reserve is unavailable.",
+        retain_legacy_admission=guard_site == "parent_before_archive_open",
+    )
 
 
 def _scratch_mountpoint_is_mounted(path: pathlib.Path) -> bool:
@@ -3183,7 +3383,7 @@ def _run_isolated_restore_drill(
     if re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", timestamp_slug) is None:
         raise ValueError("Scratch restore timestamp identity is invalid.")
     require_commands("systemd-run", "systemctl", "pg_config", "runuser")
-    _scratch_host_guard()
+    _scratch_host_guard("parent_before_archive_open")
     archive_path = dump_path.absolute()
     archive_descriptor = os.open(
         archive_path,
@@ -3288,7 +3488,7 @@ def _run_isolated_restore_drill(
             # A pending TERM/INT is delivered only after the exact host
             # mountpoint identity is ready for the normal cleanup path.
             signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
-            _scratch_host_guard()
+            _scratch_host_guard("parent_before_unit_launch")
             # Do not let a termination signal land after the client process
             # starts but before its handle and unit-cleanup state are recorded.
             previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
@@ -3320,7 +3520,7 @@ def _run_isolated_restore_drill(
                 now = time.monotonic()
                 if now >= deadline or now - last_tick > SCRATCH_RUNTIME_SAMPLE_SECONDS * 8:
                     raise RuntimeError("Scratch restore monitor exceeded its bounded runtime or sample interval.")
-                _scratch_host_guard()
+                _scratch_host_guard("parent_active_poll")
                 snapshot = _scratch_service_snapshot(unit_name)
                 properties = snapshot.get("properties", {})
                 active_state = properties.get("ActiveState")
@@ -3640,6 +3840,25 @@ def _run_isolated_restore_drill(
                 )
                 stdout_prefix = bytes(stdout_buffer[:SCRATCH_PRIVATE_STDOUT_BYTES])
                 stderr_prefix = bytes(stderr_buffer[:SCRATCH_PRIVATE_STDERR_BYTES])
+                if private_scratch_diagnostics:
+                    bound_diagnostic = _parse_bound_scratch_host_guard_diagnostic(
+                        stdout_prefix,
+                        stderr_prefix,
+                        stdout_truncated=(
+                            stdout_observed > len(stdout_prefix)
+                            or not drain_complete["stdout"]
+                        ),
+                        stderr_truncated=(
+                            stderr_size > len(stderr_prefix)
+                            or not drain_complete["stderr"]
+                        ),
+                    )
+                    if bound_diagnostic is not None:
+                        setattr(
+                            operation_error,
+                            "scratch_host_guard_diagnostic",
+                            bound_diagnostic,
+                        )
                 diagnostic = _scratch_unit_diagnostic(
                     early_exit_snapshot,
                     launcher_exit_status=process.returncode if process is not None else None,
@@ -3759,7 +3978,7 @@ def _run_isolated_restore_drill(
             raise RuntimeError("Scratch restore archive changed while it was being verified.")
         if worker_result is None:
             raise RuntimeError("Scratch restore completed without a verified worker result.")
-        _scratch_host_guard()
+        _scratch_host_guard("parent_after_worker_cleanup")
         return worker_result["restored_table_count"]
     finally:
         os.close(archive_descriptor)
@@ -4091,6 +4310,9 @@ def failure_report_for_exception(
     admission_diagnostic = getattr(exc, "scratch_admission_diagnostic", None)
     if private_scratch_diagnostics and valid_scratch_admission_diagnostic(admission_diagnostic):
         report["scratch_admission_diagnostic"] = admission_diagnostic
+    host_guard_diagnostic = getattr(exc, "scratch_host_guard_diagnostic", None)
+    if private_scratch_diagnostics and valid_scratch_host_guard_diagnostic(host_guard_diagnostic):
+        report["scratch_host_guard_diagnostic"] = host_guard_diagnostic
     return report
 
 
@@ -4098,15 +4320,22 @@ def private_failure_frame_for_exception(
     exc: Exception, *, enabled: bool
 ) -> str | None:
     """Return the existing bounded private frame, never raw text by default."""
-    private_output = getattr(exc, "scratch_unit_private_output", None)
-    if (
-        not enabled
-        or not isinstance(private_output, tuple)
-        or len(private_output) != 2
-        or not all(type(part) is bytes for part in private_output)
-    ):
+    if not enabled:
         return None
-    return _scratch_private_output_envelope(*private_output).decode("ascii")
+    private_output = getattr(exc, "scratch_unit_private_output", None)
+    frames: list[bytes] = []
+    if (
+        isinstance(private_output, tuple)
+        and len(private_output) == 2
+        and all(type(part) is bytes for part in private_output)
+    ):
+        frames.append(_scratch_private_output_envelope(*private_output))
+    host_guard_frame = _scratch_host_guard_frame(
+        getattr(exc, "scratch_host_guard_diagnostic", None)
+    )
+    if host_guard_frame is not None:
+        frames.append(host_guard_frame)
+    return b"".join(frames).decode("ascii") if frames else None
 
 
 def main() -> int:

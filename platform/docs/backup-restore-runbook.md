@@ -48,11 +48,24 @@ with at least 32 MiB headroom, swap remains disabled, and host `MemAvailable`
 stays at or above 1 GiB. It stops and reaps only the owned transient unit on a
 failed or unavailable sample. The monitor is sampled, so these margins are
 early-stop bounds rather than guarantees against a single allocation burst.
-A below-threshold host-memory admission failure retains the sampled
-`MemAvailable` value and best-effort bounded RSS samples for the helper and
-its direct parent in the root-private failure receipt. Unavailable process
-samples remain null; this telemetry never changes the 1 GiB admission guard
-and is not included in the public workflow output or artifact.
+A below-threshold host-memory guard retains a private closed schema-2
+diagnostic with the sampled `MemAvailable`, unchanged 1 GiB threshold and the
+source guard site. The sites distinguish parent checks before archive open,
+before unit launch, during parent polling, and after worker cleanup from worker
+checks after START/before archive open, after `initdb`, after PostgreSQL start,
+during the repeated `pg_restore` resource callback, and after restore/before
+PostgreSQL stop. The parent-poll site identifies only the parent check; the
+`pg_restore` site does not distinguish callback subphases. Worker diagnostics
+cross the helper boundary only in one bounded private frame matched against
+the helper's complete closed failure JSON report. In private-diagnostics mode,
+captured child output remains on the private stderr stream so it cannot forge
+or prefix the helper's stdout report. A missing,
+duplicate, truncated or malformed frame, or a frame that does not match the
+closed worker failure report, leaves the site unavailable. The sample
+identifies a guard observation, not its cause or sustained headroom.
+The legacy schema-1 admission receipt and its bounded best-effort RSS samples
+remain accepted unchanged. These diagnostics never change the 1 GiB guard and
+are excluded from public workflow output and artifacts.
 A failed or unavailable disk, memory or mount sample stops the drill; it does
 not rotate or remove any retained backup. A failed isolated restore or
 preserve-existing post-publication check removes only the operation's

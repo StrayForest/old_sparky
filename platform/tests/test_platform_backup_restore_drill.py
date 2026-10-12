@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
 import fcntl
 import hashlib
 import importlib.util
 import io
+import inspect
 import json
 import os
 import pathlib
@@ -259,6 +261,298 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         ):
             malformed = {**diagnostic, "terminal_snapshot": malformed_terminal}
             self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
+
+        required_bytes = backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES
+        guard_sites = (
+            "parent_before_archive_open",
+            "parent_before_unit_launch",
+            "parent_active_poll",
+            "parent_after_worker_cleanup",
+            "worker_after_start_before_archive_open",
+            "worker_after_initdb_before_postgres_start",
+            "worker_after_postgres_start",
+            "worker_pg_restore_resource_guard",
+            "worker_after_restore_before_postgres_stop",
+        )
+        for guard_site in guard_sites:
+            host_guard = {
+                "schema": 2,
+                "guard_site": guard_site,
+                "guard_reason": "memory_reserve",
+                "available_bytes": required_bytes - 1,
+                "required_bytes": required_bytes,
+            }
+            self.assertTrue(backup_drill.valid_scratch_host_guard_diagnostic(host_guard))
+            frame = backup_drill._scratch_host_guard_frame(host_guard)
+            self.assertIsNotNone(frame)
+            assert frame is not None
+            self.assertEqual(
+                backup_drill.parse_scratch_host_guard_frame(frame, truncated=False),
+                host_guard,
+            )
+            with mock.patch.object(
+                backup_drill,
+                "_scratch_mem_available_bytes",
+                return_value=required_bytes - 1,
+            ):
+                with self.assertRaises(RuntimeError) as reserve_failure:
+                    backup_drill._raise_scratch_host_memory_reserve(
+                        guard_site, message="fixed host reserve failure"
+                    )
+            self.assertEqual(
+                reserve_failure.exception.scratch_host_guard_diagnostic,
+                host_guard,
+            )
+        valid_host_guard = {
+            "schema": 2,
+            "guard_site": "worker_pg_restore_resource_guard",
+            "guard_reason": "memory_reserve",
+            "available_bytes": required_bytes - 1,
+            "required_bytes": required_bytes,
+        }
+        for malformed in (
+            {**valid_host_guard, "guard_site": "/private/host/path"},
+            {**valid_host_guard, "guard_reason": "disk_floor"},
+            {**valid_host_guard, "available_bytes": required_bytes},
+            {**valid_host_guard, "required_bytes": required_bytes - 1},
+            {**valid_host_guard, "unexpected": "private"},
+            {**valid_host_guard, "schema": True},
+        ):
+            self.assertFalse(backup_drill.valid_scratch_host_guard_diagnostic(malformed))
+
+        valid_frame = backup_drill._scratch_host_guard_frame(valid_host_guard)
+        assert valid_frame is not None
+        failure_report = json.dumps(
+            {
+                "ok": False,
+                "error": "fixed failure",
+                "scratch_host_guard_diagnostic": valid_host_guard,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8") + b"\n"
+        self.assertEqual(
+            backup_drill.parse_scratch_host_guard_failure_report(
+                failure_report,
+                truncated=False,
+            ),
+            valid_host_guard,
+        )
+        other_site_report = json.dumps(
+            {
+                "ok": False,
+                "error": "fixed failure",
+                "scratch_host_guard_diagnostic": {
+                    **valid_host_guard,
+                    "guard_site": "worker_after_postgres_start",
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8") + b"\n"
+        report_diagnostic = backup_drill.parse_scratch_host_guard_failure_report(
+            other_site_report, truncated=False
+        )
+        frame_diagnostic = backup_drill.parse_scratch_host_guard_frame(
+            valid_frame, truncated=False
+        )
+        self.assertIsNotNone(report_diagnostic)
+        self.assertIsNotNone(frame_diagnostic)
+        self.assertNotEqual(report_diagnostic, frame_diagnostic)
+        self.assertEqual(
+            backup_drill._parse_bound_scratch_host_guard_diagnostic(
+                failure_report,
+                valid_frame,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            ),
+            valid_host_guard,
+        )
+        self.assertIsNone(
+            backup_drill._parse_bound_scratch_host_guard_diagnostic(
+                other_site_report,
+                valid_frame,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+        )
+        self.assertIsNone(
+            backup_drill._parse_bound_scratch_host_guard_diagnostic(
+                b"",
+                valid_frame,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+        )
+        for forged_or_incomplete_stdout in (
+            b"bounded child output\n" + failure_report,
+            failure_report + b"untrusted trailing output",
+            failure_report[:-1],
+            failure_report + failure_report,
+            b'{"ok":false,"ok":false,"error":"x"}\n',
+            b'{"ok":false,"error":"x","scratch_host_guard_diagnostic":{}}\n',
+        ):
+            self.assertIsNone(
+                backup_drill.parse_scratch_host_guard_failure_report(
+                    forged_or_incomplete_stdout,
+                    truncated=False,
+                )
+            )
+        self.assertIsNone(
+            backup_drill.parse_scratch_host_guard_failure_report(
+                failure_report, truncated=True
+            )
+        )
+        report_without_diagnostic = json.dumps(
+            {"ok": False, "error": "ordinary worker failure"}
+        ).encode("utf-8")
+        self.assertIsNone(
+            backup_drill.parse_scratch_host_guard_failure_report(
+                report_without_diagnostic, truncated=False
+            )
+        )
+        self.assertIsNone(
+            backup_drill.parse_scratch_host_guard_frame(
+                valid_frame + valid_frame, truncated=False
+            )
+        )
+        self.assertIsNone(
+            backup_drill.parse_scratch_host_guard_frame(
+                valid_frame[:-1], truncated=False
+            )
+        )
+        self.assertIsNone(
+            backup_drill.parse_scratch_host_guard_frame(
+                valid_frame, truncated=True
+            )
+        )
+        duplicate_key_frame = (
+            backup_drill.SCRATCH_HOST_GUARD_FRAME_MARKER
+            + b'{"schema":2,"schema":2}\n'
+        )
+        self.assertIsNone(
+            backup_drill.parse_scratch_host_guard_frame(
+                duplicate_key_frame, truncated=False
+            )
+        )
+        self.assertIsNone(
+            backup_drill.parse_scratch_host_guard_failure_report(
+                b"child-forged frame exists without helper error JSON\n",
+                truncated=False,
+            )
+        )
+
+        worker_private_stderr = io.BytesIO()
+        worker_private_stdout = io.BytesIO()
+        with mock.patch.object(
+            backup_drill.sys,
+            "stderr",
+            types.SimpleNamespace(buffer=worker_private_stderr),
+        ), mock.patch.object(
+            backup_drill.sys,
+            "stdout",
+            types.SimpleNamespace(buffer=worker_private_stdout),
+        ):
+            backup_drill._write_scratch_worker_private_output(
+                b"private child stdout", b"private child stderr"
+            )
+        self.assertEqual(worker_private_stdout.getvalue(), b"")
+        self.assertEqual(
+            worker_private_stderr.getvalue(),
+            b"private child stdoutprivate child stderr",
+        )
+
+        public_error = RuntimeError("fixed failure")
+        public_error.scratch_host_guard_diagnostic = valid_host_guard
+        self.assertNotIn(
+            "scratch_host_guard_diagnostic",
+            backup_drill.failure_report_for_exception(
+                public_error, private_scratch_diagnostics=False
+            ),
+        )
+        self.assertEqual(
+            backup_drill.failure_report_for_exception(
+                public_error, private_scratch_diagnostics=True
+            )["scratch_host_guard_diagnostic"],
+            valid_host_guard,
+        )
+        self.assertIsNone(
+            backup_drill.private_failure_frame_for_exception(
+                public_error, enabled=False
+            )
+        )
+        private_frame = backup_drill.private_failure_frame_for_exception(
+            public_error, enabled=True
+        )
+        self.assertIsNotNone(private_frame)
+        assert private_frame is not None
+        self.assertIn(
+            backup_drill.SCRATCH_HOST_GUARD_FRAME_MARKER.decode("ascii"),
+            private_frame,
+        )
+        self.assertEqual(
+            backup_drill.parse_scratch_host_guard_frame(
+                private_frame.encode("ascii"), truncated=False
+            ),
+            valid_host_guard,
+        )
+        self.assertNotIn("/private/host/path", private_frame)
+
+        def call_site_constants(function: Any, function_name: str) -> list[str]:
+            tree = ast.parse(inspect.getsource(function))
+            result: list[str] = []
+            for node in sorted(
+                ast.walk(tree), key=lambda candidate: getattr(candidate, "lineno", 0)
+            ):
+                if not isinstance(node, ast.Call):
+                    continue
+                called_name = (
+                    node.func.id if isinstance(node.func, ast.Name) else None
+                )
+                if called_name != function_name:
+                    continue
+                if node.args and isinstance(node.args[0], ast.Constant):
+                    result.append(node.args[0].value)
+                else:
+                    result.extend(
+                        keyword.value.value
+                        for keyword in node.keywords
+                        if keyword.arg == "guard_site"
+                        and isinstance(keyword.value, ast.Constant)
+                    )
+            return result
+
+        self.assertEqual(
+            call_site_constants(
+                backup_drill._run_isolated_restore_drill, "_scratch_host_guard"
+            ),
+            [
+                "parent_before_archive_open",
+                "parent_before_unit_launch",
+                "parent_active_poll",
+                "parent_after_worker_cleanup",
+            ],
+        )
+        self.assertEqual(
+            call_site_constants(
+                backup_drill._scratch_worker_main,
+                "_raise_scratch_host_memory_reserve",
+            ),
+            ["worker_after_start_before_archive_open"],
+        )
+        self.assertEqual(
+            call_site_constants(backup_drill._scratch_worker_main, "_scratch_resource_guard"),
+            [
+                "worker_after_initdb_before_postgres_start",
+                "worker_after_postgres_start",
+                "worker_pg_restore_resource_guard",
+                "worker_after_restore_before_postgres_stop",
+            ],
+        )
+        self.assertEqual(
+            backup_drill._scratch_host_guard_frame({**valid_host_guard, "guard_site": "unknown"}),
+            None,
+        )
 
     def _assert_scratch_unit_diagnostic_caps_and_private_envelope(self) -> None:
         required_memory = backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES

@@ -855,8 +855,16 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "observed_pair_rss_bytes": 69_242_880,
             "observed_process_count": 2,
         }
+        host_guard_diagnostic = {
+            "schema": 2,
+            "guard_site": "worker_pg_restore_resource_guard",
+            "guard_reason": "memory_reserve",
+            "available_bytes": 1_060_000_000,
+            "required_bytes": 1_073_741_824,
+        }
         create_failure = RuntimeError("scratch admission failed")
         create_failure.scratch_admission_diagnostic = admission_diagnostic
+        create_failure.scratch_host_guard_diagnostic = host_guard_diagnostic
         create_failure.scratch_unit_private_output = (b"worker stdout", b"worker stderr")
         not_checked_after_failure = mock.Mock()
         public_stderr = io.StringIO()
@@ -886,6 +894,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         signal_scope.__exit__.assert_called_once()
         not_checked_after_failure.assert_not_called()
         self.assertIsNone(public_error.exception.scratch_admission_diagnostic)
+        self.assertIsNone(public_error.exception.scratch_host_guard_diagnostic)
         self.assertEqual(public_stderr.getvalue(), "")
 
         private_stderr = io.StringIO()
@@ -912,7 +921,15 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(
             private_error.exception.scratch_admission_diagnostic, admission_diagnostic
         )
+        self.assertEqual(
+            private_error.exception.scratch_host_guard_diagnostic,
+            host_guard_diagnostic,
+        )
         self.assertIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", private_stderr.getvalue())
+        self.assertIn(
+            maintenance.backup_restore_drill.SCRATCH_HOST_GUARD_FRAME_MARKER.decode("ascii"),
+            private_stderr.getvalue(),
+        )
         self.assertIn("scratch admission failed", private_stderr.getvalue())
         self.assertNotIn("worker stderr", private_stderr.getvalue())
 
@@ -1015,6 +1032,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         "observed_pair_rss_bytes": 27_000_000,
                         "observed_process_count": 2,
                     },
+                    "scratch_host_guard_diagnostic": {
+                        "schema": 2,
+                        "guard_site": "worker_pg_restore_resource_guard",
+                        "guard_reason": "memory_reserve",
+                        "available_bytes": 1_060_000_000,
+                        "required_bytes": 1_073_741_824,
+                    },
                 }
             ),
             "SCRATCH_UNIT_PRIVATE_OUTPUT_V1\nprivate framed bytes\n",
@@ -1054,6 +1078,17 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(
             failure_error.exception.scratch_admission_diagnostic,
             admission_diagnostic,
+        )
+        host_guard_diagnostic = {
+            "schema": 2,
+            "guard_site": "worker_pg_restore_resource_guard",
+            "guard_reason": "memory_reserve",
+            "available_bytes": 1_060_000_000,
+            "required_bytes": 1_073_741_824,
+        }
+        self.assertEqual(
+            failure_error.exception.scratch_host_guard_diagnostic,
+            host_guard_diagnostic,
         )
         after_confinement_diagnostic = {
             **scratch_diagnostic,
@@ -1106,6 +1141,14 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         **scratch_diagnostic,
                         "private_path": "/must-not-cross-the-boundary",
                     },
+                    "scratch_host_guard_diagnostic": {
+                        "schema": 2,
+                        "guard_site": "worker_pg_restore_resource_guard",
+                        "guard_reason": "memory_reserve",
+                        "available_bytes": 100,
+                        "required_bytes": 1_073_741_824,
+                        "private_path": "/must-not-cross-the-boundary",
+                    },
                 }
             ),
             "",
@@ -1120,6 +1163,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIsNone(malformed_error.exception.backup_disk_diagnostic)
         self.assertIsNone(malformed_error.exception.scratch_unit_diagnostic)
         self.assertIsNone(malformed_error.exception.scratch_admission_diagnostic)
+        self.assertIsNone(malformed_error.exception.scratch_host_guard_diagnostic)
         self.assertIn("private failure detail", private_stderr.getvalue())
         self.assertIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", private_stderr.getvalue())
         public_stderr = io.StringIO()
@@ -1131,6 +1175,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 maintenance._run_backup_command(["fixed-backup-child"])
         self.assertIsNone(public_error.exception.scratch_unit_diagnostic)
         self.assertIsNone(public_error.exception.scratch_admission_diagnostic)
+        self.assertIsNone(public_error.exception.scratch_host_guard_diagnostic)
         self.assertEqual(public_stderr.getvalue(), "")
 
     def test_backup_failure_prevents_retention_deletion(self) -> None:
