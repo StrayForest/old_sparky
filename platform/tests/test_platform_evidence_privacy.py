@@ -294,6 +294,186 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(capped_projection["client_resource_usage"]["status"], "truncated")
         self.assertEqual(capped_projection["client_resource_usage"]["samples"], [])
 
+    def test_external_load_cgroup_diagnostics_are_closed_path_free_and_never_complete_quota(self) -> None:
+        report = {
+            "client_resource_usage": {
+                "status": "unavailable",
+                "cpu_capacity_status": "unknown",
+                "cpu_capacity_reason": "cpu_max_missing",
+                "effective_cpu_capacity_cores": None,
+                "sample_count": 0,
+                "samples": [],
+                "cgroup_diagnostics": {
+                    "schema": 1,
+                    "status": "complete",
+                    "visible_evidence_status": "complete",
+                    "quota_completeness": "complete",
+                    "namespace_identity_stable": True,
+                    "membership_stable": True,
+                    "mount_identity_stable": True,
+                    "visible_mount_root_is_global": True,
+                    "visible_ancestor_count": 1,
+                    "reasons": ["trusted_host_root_unproven"],
+                    "private_path": "/private/host/path",
+                    "visible_ancestors": [
+                        {
+                            "path": "/sys/fs/cgroup/private/job",
+                            "cpu_max_kind": "quota",
+                            "cpu_max_quota_us": 99_999_999,
+                            "cpu_max_period_us": 100_000_000,
+                            "cpu_stat_completeness": "complete",
+                            "cpu_stat_delta": {
+                                "usage_usec": 10,
+                                "user_usec": 5,
+                                "system_usec": 5,
+                                "nr_periods": 1,
+                                "nr_throttled": 0,
+                                "throttled_usec": 0,
+                            },
+                            "host_id": "host-secret",
+                            "namespace_inode": 12345,
+                        }
+                    ],
+                    "private_extra": "must not pass through",
+                },
+            }
+        }
+        projected = project_public_artifact("external_load", report)
+        usage = projected["client_resource_usage"]
+        diagnostics = usage["cgroup_diagnostics"]
+        self.assertEqual(usage["cpu_capacity_status"], "unknown")
+        self.assertEqual(usage["cpu_capacity_reason"], "cpu_max_missing")
+        self.assertNotIn("effective_cpu_capacity_cores", usage)
+        self.assertEqual(diagnostics["status"], "complete")
+        self.assertEqual(diagnostics["quota_completeness"], "unknown")
+        self.assertEqual(diagnostics["visible_ancestors"][0]["cpu_max_kind"], "quota")
+        self.assertEqual(
+            diagnostics["visible_ancestors"][0]["cpu_max_quota_us"], 99_999_999
+        )
+        self.assertEqual(
+            diagnostics["visible_ancestors"][0]["cpu_max_period_us"], 100_000_000
+        )
+        serialized_report = serialized(projected)
+        for private in (
+            "/sys/fs/cgroup",
+            "/private/host/path",
+            "host-secret",
+            "namespace_inode",
+            "private_extra",
+        ):
+            self.assertNotIn(private, serialized_report)
+
+        partial = copy.deepcopy(report)
+        partial_diagnostics = partial["client_resource_usage"]["cgroup_diagnostics"]
+        partial_diagnostics["status"] = "incomplete"  # type: ignore[index]
+        partial_diagnostics["visible_evidence_status"] = "incomplete"  # type: ignore[index]
+        partial_diagnostics["reasons"].append("cpu_max_unavailable")  # type: ignore[index]
+        partial_diagnostics["reasons"].append("cpu_stat_partial")  # type: ignore[index]
+        partial_diagnostics["visible_ancestor_count"] = 2  # type: ignore[index]
+        partial_diagnostics["visible_ancestors"].append(  # type: ignore[index]
+            {
+                "cpu_max_kind": "unavailable",
+                "cpu_stat_completeness": "partial",
+                "cpu_stat_delta": {
+                    "usage_usec": 12,
+                    "user_usec": 5,
+                    "system_usec": 7,
+                },
+            }
+        )
+        partial_projection = project_public_artifact("external_load", partial)
+        partial_result = partial_projection["client_resource_usage"]["cgroup_diagnostics"]
+        self.assertEqual(partial_result["status"], "incomplete")
+        self.assertEqual(partial_result["quota_completeness"], "unknown")
+        self.assertEqual(partial_result["visible_ancestor_count"], 2)
+        self.assertEqual(partial_result["visible_ancestors"][1]["cpu_max_kind"], "unavailable")
+        self.assertEqual(
+            partial_result["visible_ancestors"][1]["cpu_stat_delta"],
+            {"usage_usec": 12, "user_usec": 5, "system_usec": 7},
+        )
+
+        reset = copy.deepcopy(partial)
+        reset["client_resource_usage"]["cgroup_diagnostics"]["reasons"].append("cpu_stat_reset")  # type: ignore[index]
+        reset_result = project_public_artifact("external_load", reset)["client_resource_usage"]["cgroup_diagnostics"]
+        self.assertEqual(reset_result["status"], "incomplete")
+        self.assertEqual(reset_result["visible_ancestors"], [])
+
+        malformed_partial = copy.deepcopy(partial)
+        malformed_partial_row = malformed_partial["client_resource_usage"]["cgroup_diagnostics"]["visible_ancestors"][1]  # type: ignore[index]
+        malformed_partial_row["cpu_stat_delta"] = {"usage_usec": 12}
+        malformed_partial_result = project_public_artifact("external_load", malformed_partial)["client_resource_usage"]["cgroup_diagnostics"]
+        self.assertEqual(malformed_partial_result["status"], "incomplete")
+        self.assertEqual(malformed_partial_result["visible_ancestors"], [])
+        self.assertIn("diagnostics_invalid", malformed_partial_result["reasons"])
+
+        unavailable_complete = copy.deepcopy(report)
+        unavailable_row = unavailable_complete["client_resource_usage"]["cgroup_diagnostics"]["visible_ancestors"][0]  # type: ignore[index]
+        unavailable_row["cpu_max_kind"] = "unavailable"
+        del unavailable_row["cpu_max_quota_us"]
+        del unavailable_row["cpu_max_period_us"]
+        unavailable_result = project_public_artifact("external_load", unavailable_complete)["client_resource_usage"]["cgroup_diagnostics"]
+        self.assertEqual(unavailable_result["status"], "incomplete")
+        self.assertEqual(unavailable_result["visible_ancestors"], [])
+        self.assertIn("diagnostics_invalid", unavailable_result["reasons"])
+
+        malformed = copy.deepcopy(report)
+        malformed["client_resource_usage"]["cgroup_diagnostics"]["visible_ancestor_count"] = 2  # type: ignore[index]
+        malformed_projection = project_public_artifact("external_load", malformed)
+        malformed_diagnostics = malformed_projection["client_resource_usage"]["cgroup_diagnostics"]
+        self.assertEqual(malformed_diagnostics["status"], "incomplete")
+        self.assertEqual(malformed_diagnostics["visible_ancestors"], [])
+        self.assertEqual(malformed_diagnostics["quota_completeness"], "unknown")
+
+        malformed_inputs = []
+        for location, value in (
+            ("reasons", [{}]),
+            ("status", {}),
+            ("visible_evidence_status", []),
+            ("reasons", ["/private/host/path"]),
+            ("status", "incomplete"),
+            ("reasons", ["cpu_stat_reset"]),
+        ):
+            candidate = copy.deepcopy(report)
+            candidate["client_resource_usage"]["cgroup_diagnostics"][location] = value  # type: ignore[index]
+            malformed_inputs.append(candidate)
+        malformed_kind = copy.deepcopy(report)
+        malformed_kind["client_resource_usage"]["cgroup_diagnostics"]["visible_ancestors"][0]["cpu_max_kind"] = []  # type: ignore[index]
+        malformed_inputs.append(malformed_kind)
+        for index, candidate in enumerate(malformed_inputs):
+            with self.subTest(case=index):
+                candidate_projection = project_public_artifact("external_load", candidate)
+                candidate_diagnostics = candidate_projection["client_resource_usage"]["cgroup_diagnostics"]
+                self.assertEqual(candidate_diagnostics["status"], "incomplete")
+                self.assertEqual(candidate_diagnostics["visible_ancestors"], [])
+
+        incomplete_claims = []
+        for field in ("cpu_stat_delta",):
+            candidate = copy.deepcopy(report)
+            del candidate["client_resource_usage"]["cgroup_diagnostics"]["visible_ancestors"][0][field]  # type: ignore[index]
+            incomplete_claims.append(candidate)
+        for flag in (
+            "namespace_identity_stable",
+            "membership_stable",
+            "mount_identity_stable",
+        ):
+            candidate = copy.deepcopy(report)
+            candidate["client_resource_usage"]["cgroup_diagnostics"][flag] = False  # type: ignore[index]
+            incomplete_claims.append(candidate)
+            candidate = copy.deepcopy(report)
+            del candidate["client_resource_usage"]["cgroup_diagnostics"][flag]  # type: ignore[index]
+            incomplete_claims.append(candidate)
+        empty_chain = copy.deepcopy(report)
+        empty_chain["client_resource_usage"]["cgroup_diagnostics"]["visible_ancestor_count"] = 0  # type: ignore[index]
+        empty_chain["client_resource_usage"]["cgroup_diagnostics"]["visible_ancestors"] = []  # type: ignore[index]
+        incomplete_claims.append(empty_chain)
+        for index, candidate in enumerate(incomplete_claims):
+            with self.subTest(complete_claim=index):
+                candidate_projection = project_public_artifact("external_load", candidate)
+                candidate_diagnostics = candidate_projection["client_resource_usage"]["cgroup_diagnostics"]
+                self.assertEqual(candidate_diagnostics["status"], "incomplete")
+                self.assertEqual(candidate_diagnostics["visible_ancestors"], [])
+                self.assertIn("diagnostics_invalid", candidate_diagnostics["reasons"])
+
     def test_public_observer_timeline_is_whole_bounded_ordered_and_windowed(self) -> None:
         # SystemSampler emits process groups under `processes`; the observer
         # turns those into the fixed api_process/web_process fields consumed

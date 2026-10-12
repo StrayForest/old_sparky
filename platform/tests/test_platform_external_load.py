@@ -153,6 +153,47 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    @staticmethod
+    def _cgroup_diagnostic_snapshot(
+        *,
+        usage_usec: int = 10,
+        membership: str = "/tenant/job",
+        mount_root: str = "/tenant",
+        mountpoint: str = "/sys/fs/cgroup",
+        mount_id: int = 36,
+        namespace_identity: tuple[int, int] = (1, 2),
+        max_files: dict[str, str] | None = None,
+        stat_override: str | None = None,
+    ) -> dict[str, object]:
+        mountinfo = (
+            f"{mount_id} 25 0:32 {mount_root} {mountpoint} rw - cgroup2 cgroup rw\n"
+        )
+        files = max_files or {}
+
+        def reader(path: Path) -> str:
+            if path.name == "cpu.max":
+                return files.get(str(path), "max 100000\n")
+            if path.name == "cpu.stat":
+                if stat_override is not None:
+                    return stat_override
+                values = {
+                    "usage_usec": usage_usec,
+                    "user_usec": usage_usec // 2,
+                    "system_usec": usage_usec // 2,
+                    "nr_periods": 4,
+                    "nr_throttled": 1,
+                    "throttled_usec": 2,
+                }
+                return "".join(f"{key} {value}\n" for key, value in values.items())
+            raise AssertionError("unexpected cgroup diagnostic file")
+
+        return external_load._read_cgroup_diagnostic_snapshot(
+            cgroup_text=f"0::{membership}\n",
+            mountinfo_text=mountinfo,
+            namespace_identity=namespace_identity,
+            file_reader=reader,
+        )
+
     def test_effective_cpu_capacity_uses_affinity_and_strict_ancestor_quotas(self) -> None:
         root = Path("/sys/fs/cgroup")
         cpu_max = {
@@ -255,6 +296,204 @@ class ExternalLoadTests(unittest.TestCase):
                 affinity_cpu_count=8,
             )
         )
+
+    def test_cgroup_diagnostics_keep_subroot_max_unknown_and_report_visible_deltas(self) -> None:
+        visible_limits = {
+            "/sys/fs/cgroup/job/cpu.max": "max 100000\n",
+            "/sys/fs/cgroup/cpu.max": "max 100000\n",
+        }
+        before = self._cgroup_diagnostic_snapshot(
+            usage_usec=100, max_files=visible_limits
+        )
+        after = self._cgroup_diagnostic_snapshot(
+            usage_usec=130, max_files=visible_limits
+        )
+        report = external_load._cgroup_diagnostic_report(before, after)
+        self.assertEqual(report["visible_evidence_status"], "complete")
+        self.assertEqual(report["quota_completeness"], "unknown")
+        self.assertFalse(report["visible_mount_root_is_global"])
+        self.assertEqual(report["visible_ancestor_count"], 2)
+        self.assertEqual(
+            [row["cpu_max_kind"] for row in report["visible_ancestors"]],
+            ["max", "max"],
+        )
+        self.assertEqual(report["visible_ancestors"][0]["cpu_stat_delta"]["usage_usec"], 30)
+        self.assertIn("trusted_host_root_unproven", report["reasons"])
+        self.assertNotIn("/sys/fs/cgroup", json.dumps(report))
+        self.assertNotIn("tenant", json.dumps(report))
+
+        finite_limits = {
+            "/sys/fs/cgroup/job/cpu.max": "99999999 100000000\n",
+            "/sys/fs/cgroup/cpu.max": "max 100000\n",
+        }
+        finite_report = external_load._cgroup_diagnostic_report(
+            self._cgroup_diagnostic_snapshot(usage_usec=100, max_files=finite_limits),
+            self._cgroup_diagnostic_snapshot(usage_usec=130, max_files=finite_limits),
+        )
+        self.assertEqual(
+            finite_report["visible_ancestors"][0]["cpu_max_quota_us"], 99_999_999
+        )
+        self.assertEqual(
+            finite_report["visible_ancestors"][0]["cpu_max_period_us"], 100_000_000
+        )
+
+    def test_cgroup_diagnostic_mapping_rejects_malformed_or_ambiguous_mounts(self) -> None:
+        with self.assertRaises(external_load._CgroupDiagnosticError) as mismatch:
+            external_load._read_cgroup_diagnostic_snapshot(
+                cgroup_text="0::/outside/job\n",
+                mountinfo_text="36 25 0:32 /tenant /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+                namespace_identity=(1, 2),
+                file_reader=lambda _path: "max 100000\n",
+            )
+        self.assertEqual(mismatch.exception.reason, "cgroup_mount_mapping_invalid")
+
+        duplicate_mounts = (
+            "36 25 0:32 /tenant /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+            "37 25 0:32 /tenant /other/cgroup rw - cgroup2 cgroup rw\n"
+        )
+        with self.assertRaises(external_load._CgroupDiagnosticError) as ambiguous:
+            external_load._read_cgroup_diagnostic_snapshot(
+                cgroup_text="0::/tenant/job\n",
+                mountinfo_text=duplicate_mounts,
+                namespace_identity=(1, 2),
+                file_reader=lambda _path: "max 100000\n",
+            )
+        self.assertEqual(ambiguous.exception.reason, "cgroup2_mount_ambiguous")
+
+        duplicate_stat = "".join(
+            f"{key} {value}\n"
+            for key, value in (
+                ("usage_usec", 10),
+                ("usage_usec", 11),
+                ("user_usec", 5),
+                ("system_usec", 5),
+                ("nr_periods", 4),
+                ("nr_throttled", 1),
+                ("throttled_usec", 2),
+            )
+        )
+        duplicate = self._cgroup_diagnostic_snapshot(stat_override=duplicate_stat)
+        self.assertIn("cpu_stat_invalid", duplicate["reasons"])
+        self.assertIsNone(duplicate["ancestors"][0]["cpu_stat"])
+        partial_optional = self._cgroup_diagnostic_snapshot(
+            stat_override="usage_usec 10\nuser_usec 5\nsystem_usec 5\nnr_periods 1\n"
+        )
+        self.assertIn("cpu_stat_invalid", partial_optional["reasons"])
+        self.assertIsNone(partial_optional["ancestors"][0]["cpu_stat"])
+
+    def test_cgroup_diagnostic_visible_root_omission_stays_unknown(self) -> None:
+        root = Path("/sys/fs/cgroup")
+        def snapshot(sequence: int) -> dict[str, object]:
+            def reader(path: Path) -> str:
+                if path == root / "job/cpu.max":
+                    return "250000 100000\n"
+                if path.name == "cpu.max":
+                    raise FileNotFoundError
+                if path.parent == root:
+                    values = {
+                        "usage_usec": 100 + sequence * 12,
+                        "user_usec": 50 + sequence * 5,
+                        "system_usec": 50 + sequence * 7,
+                    }
+                else:
+                    values = {
+                        "usage_usec": 10 + sequence * 15,
+                        "user_usec": 5 + sequence * 6,
+                        "system_usec": 5 + sequence * 9,
+                        "nr_periods": 1 + sequence,
+                        "nr_throttled": sequence,
+                        "throttled_usec": sequence * 3,
+                    }
+                return "".join(f"{key} {value}\n" for key, value in values.items())
+
+            return external_load._read_cgroup_diagnostic_snapshot(
+                cgroup_text="0::/tenant/job\n",
+                mountinfo_text="36 25 0:32 /tenant /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+                namespace_identity=(1, 2),
+                file_reader=reader,
+            )
+
+        report = external_load._cgroup_diagnostic_report(snapshot(0), snapshot(1))
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(report["quota_completeness"], "unknown")
+        self.assertIn("cpu_max_unavailable", report["reasons"])
+        self.assertIn("cpu_stat_partial", report["reasons"])
+        self.assertEqual(report["visible_ancestor_count"], 2)
+        child, visible_root = report["visible_ancestors"]
+        self.assertEqual(child["cpu_max_kind"], "quota")
+        self.assertEqual(child["cpu_stat_delta"]["usage_usec"], 15)
+        self.assertEqual(visible_root["cpu_max_kind"], "unavailable")
+        self.assertEqual(visible_root["cpu_stat_completeness"], "partial")
+        self.assertEqual(visible_root["cpu_stat_delta"]["usage_usec"], 12)
+        self.assertNotIn("nr_periods", visible_root["cpu_stat_delta"])
+
+        stable_before = snapshot(0)
+        stable_after = snapshot(1)
+        child_before = stable_before["ancestors"][0]
+        child_before["cpu_max"] = None
+        stable_before["reasons"] = ["cpu_max_unavailable"]
+        reverse_missing = external_load._cgroup_diagnostic_report(stable_before, stable_after)
+        reverse_child = reverse_missing["visible_ancestors"][0]
+        self.assertEqual(reverse_child["cpu_max_kind"], "unavailable")
+        self.assertEqual(reverse_child["cpu_stat_delta"]["usage_usec"], 15)
+        self.assertIn("cpu_max_unavailable", reverse_missing["reasons"])
+
+        stable_before = snapshot(0)
+        stable_after = snapshot(1)
+        stable_after["ancestors"][0]["cpu_max"] = None
+        stable_after["reasons"] = ["cpu_max_unavailable"]
+        forward_missing = external_load._cgroup_diagnostic_report(stable_before, stable_after)
+        forward_child = forward_missing["visible_ancestors"][0]
+        self.assertEqual(forward_child["cpu_max_kind"], "unavailable")
+        self.assertEqual(forward_child["cpu_stat_delta"]["usage_usec"], 15)
+        self.assertIn("cpu_max_unavailable", forward_missing["reasons"])
+
+        stable_before = snapshot(0)
+        stable_after = snapshot(1)
+        stable_after["ancestors"][0]["cpu_max"] = (300_000, 100_000)
+        changed = external_load._cgroup_diagnostic_report(stable_before, stable_after)
+        changed_child = changed["visible_ancestors"][0]
+        self.assertEqual(changed["status"], "incomplete")
+        self.assertEqual(changed_child["cpu_max_kind"], "unavailable")
+        self.assertNotIn("cpu_max_quota_us", changed_child)
+        self.assertEqual(changed_child["cpu_stat_delta"]["usage_usec"], 15)
+        self.assertIn("cpu_max_changed", changed["reasons"])
+
+    def test_cgroup_diagnostic_identity_changes_and_counter_resets_are_incomplete(self) -> None:
+        before = self._cgroup_diagnostic_snapshot(usage_usec=100)
+        variants = (
+            (
+                "namespace_identity_changed",
+                self._cgroup_diagnostic_snapshot(usage_usec=130, namespace_identity=(1, 3)),
+            ),
+            (
+                "membership_changed",
+                self._cgroup_diagnostic_snapshot(usage_usec=130, membership="/tenant/other"),
+            ),
+            (
+                "mount_identity_changed",
+                self._cgroup_diagnostic_snapshot(usage_usec=130, mount_id=37),
+            ),
+        )
+        for reason, after in variants:
+            with self.subTest(reason=reason):
+                report = external_load._cgroup_diagnostic_report(before, after)
+                self.assertEqual(report["status"], "incomplete")
+                self.assertIn(reason, report["reasons"])
+                self.assertEqual(report["quota_completeness"], "unknown")
+
+        changed_quota = self._cgroup_diagnostic_snapshot(
+            usage_usec=130,
+            max_files={"/sys/fs/cgroup/job/cpu.max": "50000 100000\n"},
+        )
+        changed_quota_report = external_load._cgroup_diagnostic_report(before, changed_quota)
+        self.assertEqual(changed_quota_report["status"], "incomplete")
+        self.assertIn("cpu_max_changed", changed_quota_report["reasons"])
+
+        reset = self._cgroup_diagnostic_snapshot(usage_usec=20)
+        reset_report = external_load._cgroup_diagnostic_report(before, reset)
+        self.assertEqual(reset_report["status"], "incomplete")
+        self.assertIn("cpu_stat_reset", reset_report["reasons"])
 
     def test_process_cpu_sampler_is_bounded_and_reports_truncation(self) -> None:
         with patch.object(external_load.time, "process_time_ns", side_effect=OSError):

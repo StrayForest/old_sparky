@@ -222,9 +222,28 @@ The public client report also carries a bounded UTC run window, ordered phase
 windows and process-CPU intervals. A CPU interval is publishable only when
 its full monotonic-measured interval lies inside the run window; an incomplete,
 malformed, or truncated series remains explicitly non-complete. Effective
-client CPU capacity is reported only when affinity and every visible cgroup-v2
-ancestor quota are valid; otherwise capacity is unknown with a closed,
-path-free reason category. Observer resource timelines follow the same
+client CPU capacity remains reported only by the existing affinity and
+`cpu.max` calculation; a missing visible interface such as `cpu_max_missing`
+continues to produce UNKNOWN. The client also records bounded before/after
+cgroup diagnostics: cgroup-v2 mount mapping, stable namespace/membership/mount
+identity, each visible ancestor's exact quota and period in microseconds, and
+nonnegative `cpu.stat` deltas. When an ancestor's quota interface is absent,
+the report can retain that ancestor's valid counters with
+`cpu_max_kind=unavailable` and an incomplete status. Counter completeness is
+explicit: `usage_usec`, `user_usec`, and `system_usec` are required; the
+`nr_periods`, `nr_throttled`, and `throttled_usec` group is either present as a
+whole or omitted as a whole, never filled with zeros. The closed public
+projection contains no paths or namespace, mount or host identifiers. It
+distinguishes valid evidence for the visible chain from full quota
+completeness. Full quota completeness stays
+UNKNOWN because the external runner cannot prove that its visible mount root
+matches the trusted host/init cgroup root; even a visible `cpu.max=max` does
+not prove an unlimited CPU allocation. Partial mappings, hidden ancestry,
+identity changes, missing
+interfaces, malformed input, counter resets, or bound exhaustion remain
+incomplete or unavailable. These diagnostics do not affect capacity math,
+acceptance, load profiles, retry scheduling, or workload timing. Observer
+resource timelines follow the same
 all-or-nothing rule, with a 4,096-row cap; a present malformed selected metric
 invalidates the series, while an absent optional metric remains unavailable.
 These fields align client and server observations; they do not imply

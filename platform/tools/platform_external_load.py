@@ -121,6 +121,49 @@ CLIENT_CPU_SAMPLE_LIMIT = 4096
 CLIENT_CPU_SAMPLE_JOIN_SECONDS = 2.0
 CLIENT_CGROUP_LINE_LIMIT = 256
 CLIENT_CGROUP_ANCESTOR_LIMIT = 32
+CLIENT_CGROUP_MOUNTINFO_LIMIT = 64 * 1024
+CLIENT_CGROUP_STAT_LIMIT = 4096
+CLIENT_CGROUP_MAX_VALUE = 10**15
+CLIENT_CGROUP_STAT_KEYS = (
+    "usage_usec",
+    "user_usec",
+    "system_usec",
+    "nr_periods",
+    "nr_throttled",
+    "throttled_usec",
+)
+CLIENT_CGROUP_STAT_REQUIRED_KEYS = frozenset(
+    {"usage_usec", "user_usec", "system_usec"}
+)
+CLIENT_CGROUP_STAT_OPTIONAL_KEYS = frozenset(
+    {"nr_periods", "nr_throttled", "throttled_usec"}
+)
+CLIENT_CGROUP_DIAGNOSTIC_REASONS = frozenset(
+    {
+        "cgroup_record_unavailable",
+        "cgroup_record_invalid",
+        "cgroup2_mount_missing",
+        "cgroup2_mount_ambiguous",
+        "mountinfo_unavailable",
+        "mountinfo_invalid",
+        "cgroup_mount_mapping_invalid",
+        "namespace_identity_unavailable",
+        "cpu_max_unavailable",
+        "cpu_max_invalid",
+        "cpu_stat_unavailable",
+        "cpu_stat_invalid",
+        "cpu_stat_partial",
+        "cpu_stat_keys_changed",
+        "visible_ancestor_limit",
+        "namespace_identity_changed",
+        "membership_changed",
+        "mount_identity_changed",
+        "cpu_max_changed",
+        "cpu_stat_reset",
+        "trusted_host_root_unproven",
+        "diagnostics_invalid",
+    }
+)
 
 _DEFAULT_HTTPS_CONTEXT_LOCK = threading.Lock()
 _DEFAULT_HTTPS_CONTEXT: ssl.SSLContext | None = None
@@ -252,6 +295,387 @@ def _read_bounded_ascii(path: Path) -> str:
     return value
 
 
+class _CgroupDiagnosticError(ValueError):
+    def __init__(self, reason: str) -> None:
+        if reason not in CLIENT_CGROUP_DIAGNOSTIC_REASONS:
+            reason = "mountinfo_invalid"
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _bounded_proc_text(path: Path, limit: int) -> str:
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(limit + 1)
+    except (OSError, ValueError) as exc:
+        raise _CgroupDiagnosticError("mountinfo_unavailable") from exc
+    if len(raw) > limit:
+        raise _CgroupDiagnosticError("mountinfo_invalid")
+    try:
+        return raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise _CgroupDiagnosticError("mountinfo_invalid") from exc
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    # mountinfo uses octal escapes for space, tab, newline and backslash.
+    output: list[str] = []
+    index = 0
+    escapes = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+    while index < len(value):
+        char = value[index]
+        if char != "\\":
+            output.append(char)
+            index += 1
+            continue
+        code = value[index + 1 : index + 4]
+        replacement = escapes.get(code)
+        if replacement is None:
+            raise _CgroupDiagnosticError("mountinfo_invalid")
+        output.append(replacement)
+        index += 4
+    decoded = "".join(output)
+    parts = decoded.split("/")[1:] if decoded != "/" else []
+    if (
+        not decoded.startswith("/")
+        or "\x00" in decoded
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise _CgroupDiagnosticError("mountinfo_invalid")
+    return decoded
+
+
+def _read_cgroup_diagnostic_snapshot(
+    *,
+    cgroup_text: str | None = None,
+    mountinfo_text: str | None = None,
+    namespace_identity: tuple[int, int] | None = None,
+    file_reader: Callable[[Path], str] | None = None,
+) -> dict[str, Any]:
+    """Read a bounded, private in-memory view of this process's cgroup tree.
+
+    Raw paths and namespace/mount identities are used only to validate the
+    mapping and are never returned by the public report projection.
+    """
+
+    if cgroup_text is None:
+        try:
+            cgroup_text = _read_bounded_ascii(Path("/proc/self/cgroup"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise _CgroupDiagnosticError("cgroup_record_unavailable") from exc
+    if len(cgroup_text) > CLIENT_CGROUP_LINE_LIMIT:
+        raise _CgroupDiagnosticError("cgroup_record_invalid")
+    memberships = [line[3:] for line in cgroup_text.splitlines() if line.startswith("0::")]
+    if len(memberships) != 1:
+        raise _CgroupDiagnosticError("cgroup_record_invalid")
+    membership = memberships[0]
+    membership_path = Path(membership)
+    membership_parts = membership.split("/")[1:] if membership != "/" else []
+    if (
+        not membership.startswith("/")
+        or "\x00" in membership
+        or any(part in {"", ".", ".."} for part in membership_parts)
+        or len(membership) > CLIENT_CGROUP_LINE_LIMIT
+    ):
+        raise _CgroupDiagnosticError("cgroup_record_invalid")
+
+    if mountinfo_text is None:
+        mountinfo = _bounded_proc_text(
+            Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
+        )
+    else:
+        mountinfo = mountinfo_text
+        if len(mountinfo) > CLIENT_CGROUP_MOUNTINFO_LIMIT:
+            raise _CgroupDiagnosticError("mountinfo_invalid")
+    cgroup2_mounts: list[dict[str, Any]] = []
+    for raw_line in mountinfo.splitlines():
+        if len(raw_line) > CLIENT_CGROUP_LINE_LIMIT * 8:
+            raise _CgroupDiagnosticError("mountinfo_invalid")
+        fields = raw_line.split()
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            raise _CgroupDiagnosticError("mountinfo_invalid") from None
+        if len(fields) < separator + 4 or len(fields) < 6:
+            raise _CgroupDiagnosticError("mountinfo_invalid")
+        if fields[separator + 1] != "cgroup2":
+            continue
+        if not fields[0].isdigit() or not fields[1].isdigit():
+            raise _CgroupDiagnosticError("mountinfo_invalid")
+        root = _decode_mountinfo_path(fields[3])
+        mountpoint = _decode_mountinfo_path(fields[4])
+        cgroup2_mounts.append(
+            {
+                "identity": (
+                    fields[0],
+                    fields[1],
+                    fields[2],
+                    root,
+                    mountpoint,
+                    fields[separator + 3],
+                ),
+                "root": Path(root),
+                "mountpoint": Path(mountpoint),
+            }
+        )
+    if not cgroup2_mounts:
+        raise _CgroupDiagnosticError("cgroup2_mount_missing")
+    if len(cgroup2_mounts) != 1:
+        raise _CgroupDiagnosticError("cgroup2_mount_ambiguous")
+    mount = cgroup2_mounts[0]
+    root = mount["root"]
+    mountpoint = mount["mountpoint"]
+    try:
+        relative_membership = membership_path.relative_to(root)
+    except ValueError as exc:
+        raise _CgroupDiagnosticError("cgroup_mount_mapping_invalid") from exc
+    directory = mountpoint / relative_membership
+    try:
+        directory.relative_to(mountpoint)
+    except ValueError as exc:
+        raise _CgroupDiagnosticError("cgroup_mount_mapping_invalid") from exc
+
+    if namespace_identity is None:
+        try:
+            namespace_stat = os.stat("/proc/self/ns/cgroup")
+        except (OSError, ValueError) as exc:
+            raise _CgroupDiagnosticError("namespace_identity_unavailable") from exc
+        namespace_identity = (namespace_stat.st_dev, namespace_stat.st_ino)
+    if (
+        not isinstance(namespace_identity, tuple)
+        or len(namespace_identity) != 2
+        or any(type(value) is not int or value < 0 for value in namespace_identity)
+    ):
+        raise _CgroupDiagnosticError("namespace_identity_unavailable")
+
+    ancestors: list[dict[str, Any]] = []
+    reasons: set[str] = set()
+    current = directory
+    for _ in range(CLIENT_CGROUP_ANCESTOR_LIMIT):
+        try:
+            current.relative_to(mountpoint)
+        except ValueError as exc:
+            raise _CgroupDiagnosticError("cgroup_mount_mapping_invalid") from exc
+        quota_period: tuple[int | None, int] | None = None
+        try:
+            cpu_max = (
+                file_reader(current / "cpu.max")
+                if file_reader is not None
+                else _read_bounded_ascii(current / "cpu.max")
+            )
+        except (OSError, UnicodeError, ValueError):
+            reasons.add("cpu_max_unavailable")
+        else:
+            fields = cpu_max.split()
+            if (
+                len(cpu_max) > CLIENT_CGROUP_LINE_LIMIT
+                or len(fields) != 2
+                or not fields[1].isdigit()
+                or not 0 < int(fields[1]) <= CLIENT_CGROUP_MAX_VALUE
+            ):
+                reasons.add("cpu_max_invalid")
+            elif fields[0] == "max":
+                quota_period = (None, int(fields[1]))
+            elif fields[0].isdigit() and 0 < int(fields[0]) <= CLIENT_CGROUP_MAX_VALUE:
+                quota_period = (int(fields[0]), int(fields[1]))
+            else:
+                reasons.add("cpu_max_invalid")
+        stat_values: dict[str, int] | None = None
+        try:
+            stat_text = (
+                file_reader(current / "cpu.stat")
+                if file_reader is not None
+                else _read_bounded_ascii(current / "cpu.stat")
+            )
+        except (OSError, UnicodeError, ValueError):
+            reasons.add("cpu_stat_unavailable")
+        else:
+            if len(stat_text) > CLIENT_CGROUP_STAT_LIMIT:
+                reasons.add("cpu_stat_invalid")
+            else:
+                parsed_stat: dict[str, int] = {}
+                valid_stat = True
+                for line in stat_text.splitlines():
+                    parts = line.split()
+                    if len(parts) != 2 or not parts[1].isdigit():
+                        valid_stat = False
+                        break
+                    if parts[0] in CLIENT_CGROUP_STAT_KEYS:
+                        if parts[0] in parsed_stat:
+                            valid_stat = False
+                            break
+                        value = int(parts[1])
+                        if value > CLIENT_CGROUP_MAX_VALUE:
+                            valid_stat = False
+                            break
+                        parsed_stat[parts[0]] = value
+                optional_present = set(parsed_stat) & CLIENT_CGROUP_STAT_OPTIONAL_KEYS
+                if (
+                    valid_stat
+                    and CLIENT_CGROUP_STAT_REQUIRED_KEYS.issubset(parsed_stat)
+                    and optional_present
+                    in (frozenset(), CLIENT_CGROUP_STAT_OPTIONAL_KEYS)
+                ):
+                    stat_values = parsed_stat
+                    if set(parsed_stat) != set(CLIENT_CGROUP_STAT_KEYS):
+                        reasons.add("cpu_stat_partial")
+                else:
+                    reasons.add("cpu_stat_invalid")
+        ancestors.append(
+            {
+                "path": current,
+                "cpu_max": quota_period,
+                "cpu_stat": stat_values,
+            }
+        )
+        if current == mountpoint:
+            break
+        current = current.parent
+    else:
+        reasons.add("visible_ancestor_limit")
+    return {
+        "membership": membership,
+        "mount_identity": mount["identity"],
+        "namespace_identity": namespace_identity,
+        "mount_root_is_global": root == Path("/"),
+        "ancestors": ancestors,
+        "reasons": sorted(reasons),
+    }
+
+
+def _cgroup_diagnostic_report(
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+    *,
+    before_error: str | None = None,
+    after_error: str | None = None,
+) -> dict[str, Any]:
+    """Build path-free visible evidence while keeping global quota proof UNKNOWN."""
+
+    reasons: set[str] = {"trusted_host_root_unproven"}
+    if before is None or after is None:
+        for reason in (before_error, after_error):
+            if reason in CLIENT_CGROUP_DIAGNOSTIC_REASONS:
+                reasons.add(reason)
+        return {
+            "schema": 1,
+            "status": "unavailable",
+            "visible_evidence_status": "unavailable",
+            "quota_completeness": "unknown",
+            "reasons": sorted(reasons),
+            "visible_ancestor_count": 0,
+            "visible_ancestors": [],
+        }
+
+    namespace_stable = before["namespace_identity"] == after["namespace_identity"]
+    membership_stable = before["membership"] == after["membership"]
+    mount_stable = before["mount_identity"] == after["mount_identity"]
+    if not namespace_stable:
+        reasons.add("namespace_identity_changed")
+    if not membership_stable:
+        reasons.add("membership_changed")
+    if not mount_stable:
+        reasons.add("mount_identity_changed")
+    if not (namespace_stable and membership_stable and mount_stable):
+        return {
+            "schema": 1,
+            "status": "incomplete",
+            "visible_evidence_status": "incomplete",
+            "quota_completeness": "unknown",
+            "namespace_identity_stable": namespace_stable,
+            "membership_stable": membership_stable,
+            "mount_identity_stable": mount_stable,
+            "reasons": sorted(reasons),
+            "visible_ancestor_count": 0,
+            "visible_ancestors": [],
+        }
+    before_rows = before["ancestors"]
+    after_rows = after["ancestors"]
+    reasons.update(
+        reason
+        for reason in (*before.get("reasons", ()), *after.get("reasons", ()))
+        if reason in CLIENT_CGROUP_DIAGNOSTIC_REASONS
+    )
+    if (
+        len(before_rows) != len(after_rows)
+        or any(left["path"] != right["path"] for left, right in zip(before_rows, after_rows))
+    ):
+        reasons.add("mount_identity_changed")
+        return {
+            "schema": 1,
+            "status": "incomplete",
+            "visible_evidence_status": "incomplete",
+            "quota_completeness": "unknown",
+            "namespace_identity_stable": namespace_stable,
+            "membership_stable": membership_stable,
+            "mount_identity_stable": False,
+            "reasons": sorted(reasons),
+            "visible_ancestor_count": 0,
+            "visible_ancestors": [],
+        }
+
+    public_rows: list[dict[str, Any]] = []
+    for left, right in zip(before_rows, after_rows):
+        if left["cpu_max"] is not None and right["cpu_max"] is not None and left["cpu_max"] != right["cpu_max"]:
+            reasons.add("cpu_max_changed")
+        deltas: dict[str, int] = {}
+        reset = False
+        counter_completeness = "unavailable"
+        if left["cpu_stat"] is not None and right["cpu_stat"] is not None:
+            if set(left["cpu_stat"]) != set(right["cpu_stat"]):
+                reasons.add("cpu_stat_keys_changed")
+            else:
+                for key in sorted(left["cpu_stat"]):
+                    delta = right["cpu_stat"][key] - left["cpu_stat"][key]
+                    if delta < 0:
+                        reasons.add("cpu_stat_reset")
+                        reset = True
+                    else:
+                        deltas[key] = delta
+                if set(deltas) == set(CLIENT_CGROUP_STAT_KEYS):
+                    counter_completeness = "complete"
+                elif deltas:
+                    counter_completeness = "partial"
+        if reset:
+            continue
+        cpu_max = left["cpu_max"]
+        if cpu_max is None or right["cpu_max"] is None or cpu_max != right["cpu_max"]:
+            row: dict[str, Any] = {"cpu_max_kind": "unavailable"}
+        else:
+            quota, period = right["cpu_max"]
+            row = {
+                "cpu_max_kind": "max" if quota is None else "quota",
+                "cpu_max_period_us": period,
+            }
+            if quota is not None:
+                row["cpu_max_quota_us"] = quota
+        row["cpu_stat_completeness"] = counter_completeness
+        if deltas:
+            row["cpu_stat_delta"] = deltas
+        public_rows.append(row)
+    complete_rows = len(public_rows) == len(before_rows) and all(
+        row.get("cpu_max_kind") in {"max", "quota"}
+        and row.get("cpu_stat_completeness") == "complete"
+        and isinstance(row.get("cpu_stat_delta"), dict)
+        and set(row["cpu_stat_delta"]) == set(CLIENT_CGROUP_STAT_KEYS)
+        for row in public_rows
+    )
+    status = "complete" if complete_rows and not (reasons - {"trusted_host_root_unproven"}) else "incomplete"
+    return {
+        "schema": 1,
+        "status": status,
+        "visible_evidence_status": status,
+        "quota_completeness": "unknown",
+        "namespace_identity_stable": namespace_stable,
+        "membership_stable": membership_stable,
+        "mount_identity_stable": mount_stable,
+        "visible_mount_root_is_global": bool(after["mount_root_is_global"]),
+        "reasons": sorted(reasons),
+        "visible_ancestor_count": len(public_rows),
+        "visible_ancestors": public_rows,
+    }
+
+
 class _ProcessCpuSampler:
     """Bounded low-frequency CPU samples for this external load worker."""
 
@@ -265,6 +689,12 @@ class _ProcessCpuSampler:
         self._last_timestamp: str | None = None
         self._error_class: str | None = None
         self._truncated = False
+        try:
+            self._cgroup_snapshot_before = _read_cgroup_diagnostic_snapshot()
+            self._cgroup_snapshot_before_error: str | None = None
+        except _CgroupDiagnosticError as exc:
+            self._cgroup_snapshot_before = None
+            self._cgroup_snapshot_before_error = exc.reason
         try:
             affinity = os.sched_getaffinity(0)
             self.affinity_cpu_count: int | None = len(affinity) or None
@@ -339,6 +769,12 @@ class _ProcessCpuSampler:
 
     def stop(self) -> dict[str, Any]:
         self._stop.set()
+        try:
+            cgroup_snapshot_after = _read_cgroup_diagnostic_snapshot()
+            cgroup_snapshot_after_error: str | None = None
+        except _CgroupDiagnosticError as exc:
+            cgroup_snapshot_after = None
+            cgroup_snapshot_after_error = exc.reason
         thread = self._thread
         if thread is not None:
             thread.join(CLIENT_CPU_SAMPLE_JOIN_SECONDS)
@@ -367,6 +803,12 @@ class _ProcessCpuSampler:
             ),
             "sample_count": len(samples),
             "samples": samples,
+            "cgroup_diagnostics": _cgroup_diagnostic_report(
+                self._cgroup_snapshot_before,
+                cgroup_snapshot_after,
+                before_error=self._cgroup_snapshot_before_error,
+                after_error=cgroup_snapshot_after_error,
+            ),
         }
 
 

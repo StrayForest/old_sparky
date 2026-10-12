@@ -2792,6 +2792,9 @@ def _project_client_resource_usage(
         if capacity_status == "known" or capacity_reason == "known":
             capacity_reason = "unknown"
     output["cpu_capacity_reason"] = capacity_reason
+    cgroup_diagnostics = _project_cgroup_diagnostics(source.get("cgroup_diagnostics"))
+    if cgroup_diagnostics is not None:
+        output["cgroup_diagnostics"] = cgroup_diagnostics
     raw_rows = source.get("samples")
     expected = _copy_int(source, "sample_count")
     if not isinstance(raw_rows, list):
@@ -2862,6 +2865,240 @@ def _project_client_resource_usage(
     output["samples"] = projected_rows
     if not projected_rows and status == "complete":
         output["status"] = "incomplete"
+    return output
+
+
+def _project_cgroup_diagnostics(value: Any) -> dict[str, Any] | None:
+    """Project bounded path-free generator cgroup evidence through a closed schema."""
+
+    source = _mapping(value)
+    if not source:
+        return None
+    allowed_reasons = {
+        "cgroup_record_unavailable",
+        "cgroup_record_invalid",
+        "cgroup2_mount_missing",
+        "cgroup2_mount_ambiguous",
+        "mountinfo_unavailable",
+        "mountinfo_invalid",
+        "cgroup_mount_mapping_invalid",
+        "namespace_identity_unavailable",
+        "cpu_max_unavailable",
+        "cpu_max_invalid",
+        "cpu_stat_unavailable",
+        "cpu_stat_invalid",
+        "cpu_stat_partial",
+        "cpu_stat_keys_changed",
+        "visible_ancestor_limit",
+        "namespace_identity_changed",
+        "membership_changed",
+        "mount_identity_changed",
+        "cpu_max_changed",
+        "cpu_stat_reset",
+        "trusted_host_root_unproven",
+        "diagnostics_invalid",
+    }
+    raw_reasons = source.get("reasons")
+    reasons: list[str] = []
+    malformed = False
+    if "reasons" in source and not isinstance(raw_reasons, list):
+        malformed = True
+    if isinstance(raw_reasons, list):
+        if len(raw_reasons) > 16:
+            malformed = True
+        for reason in raw_reasons[:16]:
+            if not isinstance(reason, str):
+                malformed = True
+                continue
+            if reason not in allowed_reasons:
+                malformed = True
+            elif reason not in reasons:
+                reasons.append(reason)
+    if "trusted_host_root_unproven" not in reasons:
+        reasons.append("trusted_host_root_unproven")
+    raw_status = source.get("status")
+    visible_status = source.get("visible_evidence_status")
+    valid_statuses = {"complete", "incomplete", "unavailable"}
+    if (
+        "status" not in source
+        or not isinstance(raw_status, str)
+        or raw_status not in valid_statuses
+    ):
+        malformed = True
+    if (
+        not isinstance(visible_status, str)
+        or visible_status not in valid_statuses
+    ):
+        malformed = True
+    if (
+        isinstance(raw_status, str)
+        and raw_status in valid_statuses
+        and isinstance(visible_status, str)
+        and visible_status in valid_statuses
+        and raw_status != visible_status
+    ):
+        malformed = True
+    requested_status = (
+        visible_status
+        if isinstance(visible_status, str) and visible_status in valid_statuses
+        else "unavailable"
+    )
+    incomplete_reasons = allowed_reasons - {"trusted_host_root_unproven"}
+    if requested_status == "complete" and any(
+        reason in incomplete_reasons for reason in reasons
+    ):
+        malformed = True
+    if malformed:
+        requested_status = "incomplete"
+    output: dict[str, Any] = {
+        "schema": 1,
+        "status": requested_status,
+        "quota_completeness": "unknown",
+        "reasons": sorted(reasons),
+    }
+    for key in (
+        "namespace_identity_stable",
+        "membership_stable",
+        "mount_identity_stable",
+        "visible_mount_root_is_global",
+    ):
+        value_bool = _copy_bool(source, key)
+        if value_bool is not None:
+            output[key] = value_bool
+    raw_rows = source.get("visible_ancestors")
+    declared_count = safe_int(source.get("visible_ancestor_count"), maximum=32)
+    rows: list[dict[str, Any]] = []
+    malformed = malformed or not isinstance(raw_rows, list) or len(raw_rows) > 32
+    if isinstance(raw_rows, list) and len(raw_rows) <= 32:
+        for raw_row in raw_rows:
+            row = _mapping(raw_row)
+            kind = row.get("cpu_max_kind")
+            period = safe_int(row.get("cpu_max_period_us"), maximum=10**15)
+            if (
+                not isinstance(kind, str)
+                or kind not in {"max", "quota", "unavailable"}
+            ):
+                malformed = True
+                break
+            projected_row: dict[str, Any] = {"cpu_max_kind": kind}
+            counter_completeness = row.get("cpu_stat_completeness")
+            if not isinstance(counter_completeness, str) or counter_completeness not in {
+                "complete",
+                "partial",
+                "unavailable",
+            }:
+                malformed = True
+                break
+            projected_row["cpu_stat_completeness"] = counter_completeness
+            if kind in {"max", "quota"}:
+                if period is None or period <= 0:
+                    malformed = True
+                    break
+                projected_row["cpu_max_period_us"] = period
+            elif "cpu_max_period_us" in row or "cpu_max_quota_us" in row:
+                malformed = True
+                break
+            if kind == "quota":
+                quota = safe_int(row.get("cpu_max_quota_us"), maximum=10**15)
+                if quota is None or quota <= 0:
+                    malformed = True
+                    break
+                projected_row["cpu_max_quota_us"] = quota
+            elif "cpu_max_quota_us" in row:
+                malformed = True
+                break
+            raw_delta = row.get("cpu_stat_delta")
+            if raw_delta is not None:
+                delta = _mapping(raw_delta)
+                expected_keys = {
+                    "usage_usec",
+                    "user_usec",
+                    "system_usec",
+                    "nr_periods",
+                    "nr_throttled",
+                    "throttled_usec",
+                }
+                projected_delta: dict[str, int] = {}
+                if not delta or not set(delta).issubset(expected_keys):
+                    malformed = True
+                    break
+                for key in sorted(delta):
+                    number = safe_int(delta.get(key), maximum=10**15)
+                    if number is None:
+                        malformed = True
+                        break
+                    projected_delta[key] = number
+                if malformed:
+                    break
+                if counter_completeness == "unavailable" or (
+                    counter_completeness == "complete"
+                    and set(projected_delta) != expected_keys
+                ) or (
+                    counter_completeness == "partial"
+                    and set(projected_delta)
+                    != {"usage_usec", "user_usec", "system_usec"}
+                ):
+                    malformed = True
+                    break
+                projected_row["cpu_stat_delta"] = projected_delta
+            elif counter_completeness != "unavailable":
+                malformed = True
+                break
+            rows.append(projected_row)
+    if declared_count is None or declared_count != len(rows):
+        malformed = True
+    if requested_status == "complete":
+        identity_flags = (
+            "namespace_identity_stable",
+            "membership_stable",
+            "mount_identity_stable",
+        )
+        if (
+            not rows
+            or any(row.get("cpu_max_kind") not in {"max", "quota"} for row in rows)
+            or any(output.get(key) is not True for key in identity_flags)
+            or any(
+                not isinstance(row.get("cpu_stat_delta"), dict)
+                or row.get("cpu_stat_completeness") != "complete"
+                or set(row["cpu_stat_delta"])
+                != {
+                    "usage_usec",
+                    "user_usec",
+                    "system_usec",
+                    "nr_periods",
+                    "nr_throttled",
+                    "throttled_usec",
+                }
+                for row in rows
+            )
+        ):
+            malformed = True
+    identities_stable = all(
+        output.get(key) is True
+        for key in (
+            "namespace_identity_stable",
+            "membership_stable",
+            "mount_identity_stable",
+        )
+    )
+    unsafe_partial_reasons = {
+        "namespace_identity_changed",
+        "membership_changed",
+        "mount_identity_changed",
+        "cpu_stat_reset",
+        "diagnostics_invalid",
+    }
+    if malformed:
+        output["status"] = "incomplete"
+        if "diagnostics_invalid" not in output["reasons"]:
+            output["reasons"] = sorted([*output["reasons"], "diagnostics_invalid"])
+        rows = []
+    elif requested_status == "unavailable" or not identities_stable or any(
+        reason in unsafe_partial_reasons for reason in output["reasons"]
+    ):
+        rows = []
+    output["visible_ancestor_count"] = len(rows)
+    output["visible_ancestors"] = rows
     return output
 
 
