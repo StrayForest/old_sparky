@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
@@ -15,11 +16,13 @@ import re
 import selectors
 import secrets
 import shlex
+import signal
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from typing import Any, BinaryIO, Callable
@@ -102,6 +105,45 @@ class RestoreGuardStop(RuntimeError):
             "required_free_bytes": self.required_free_bytes,
         }
         return value if valid_backup_disk_diagnostic(value) else None
+
+
+class BackupOperationInterrupted(RuntimeError):
+    """A termination signal converted for rollback-safe backup CLI cleanup."""
+
+    def __init__(self, signum: int) -> None:
+        label = {
+            signal.SIGHUP: "SIGHUP",
+            signal.SIGINT: "SIGINT",
+            signal.SIGTERM: "SIGTERM",
+        }.get(signum, "signal")
+        super().__init__(f"Backup operation interrupted by {label}.")
+
+
+@contextlib.contextmanager
+def _termination_signal_scope():
+    """Turn CLI termination into rollback-safe exceptions for one operation."""
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("Backup operation signal cleanup requires the main thread.")
+    previous_handlers = {
+        signum: signal.getsignal(signum)
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+    }
+
+    def interrupt_operation(signum: int, _frame: Any) -> None:
+        # Ignore reentrant termination until rollback, unit stop/reap, and
+        # inode-pinned cleanup finish. The owning context restores prior handlers.
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise BackupOperationInterrupted(signum)
+
+    for signum in previous_handlers:
+        signal.signal(signum, interrupt_operation)
+    try:
+        yield
+    finally:
+        for signum, previous_handler in previous_handlers.items():
+            signal.signal(signum, previous_handler)
 
 
 _RESTORE_GUARD_MESSAGES = {
@@ -2209,18 +2251,6 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
         token = secrets.token_hex(12)
         mountpoint = pathlib.Path(f"/run/oldsparky-backup-restore-{token}")
         unit_name = f"oldsparky-backup-restore-{token}.service"
-        os.mkdir(mountpoint, 0o700)
-        mountpoint_stat = mountpoint.lstat()
-        mountpoint_identity = (mountpoint_stat.st_dev, mountpoint_stat.st_ino)
-        if (
-            not stat.S_ISDIR(mountpoint_stat.st_mode)
-            or mountpoint_stat.st_uid != 0
-            or mountpoint_stat.st_gid != 0
-            or stat.S_IMODE(mountpoint_stat.st_mode) != 0o700
-            or _scratch_mountpoint_is_mounted(mountpoint)
-        ):
-            mountpoint.rmdir()
-            raise RuntimeError("Scratch restore mountpoint identity is unsafe.")
         command = _scratch_unit_command(
             mountpoint=mountpoint,
             archive_path=archive_path,
@@ -2245,19 +2275,49 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
         last_tick = time.monotonic()
         deadline = last_tick + SCRATCH_RUNTIME_SECONDS + 30
         worker_result: dict[str, Any] | None = None
+        blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+        setup_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
         try:
+            os.mkdir(mountpoint, 0o700)
+            mountpoint_stat = mountpoint.lstat()
+            mountpoint_identity = (mountpoint_stat.st_dev, mountpoint_stat.st_ino)
+            if (
+                not stat.S_ISDIR(mountpoint_stat.st_mode)
+                or mountpoint_stat.st_uid != 0
+                or mountpoint_stat.st_gid != 0
+                or stat.S_IMODE(mountpoint_stat.st_mode) != 0o700
+                or _scratch_mountpoint_is_mounted(mountpoint)
+            ):
+                mountpoint.rmdir()
+                raise RuntimeError("Scratch restore mountpoint identity is unsafe.")
+        except BaseException:
+            signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
+            raise
+        try:
+            # A pending TERM/INT is delivered only after the exact host
+            # mountpoint identity is ready for the normal cleanup path.
+            signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
             _scratch_host_guard()
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=environment,
-                cwd="/",
-                close_fds=True,
-                bufsize=0,
-            )
-            launch_started = True
+            # Do not let a termination signal land after the client process
+            # starts but before its handle and unit-cleanup state are recorded.
+            previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+            try:
+                # Treat the unit as potentially started once its launcher is
+                # invoked, even if Popen itself raises after systemd accepted
+                # the transient unit request.
+                launch_started = True
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                    cwd="/",
+                    close_fds=True,
+                    bufsize=0,
+                )
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
             selector = selectors.DefaultSelector()
             assert process.stdout is not None and process.stderr is not None
             os.set_blocking(process.stdout.fileno(), False)
@@ -2327,35 +2387,68 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
             ):
                 raise RuntimeError("Isolated PostgreSQL backup restore result failed validation.")
             worker_result = decoded
-        except BaseException:
-            if launch_started:
-                _scratch_stop_unit(unit_name)
-            if process is not None and process.poll() is None:
-                try:
-                    process.wait(timeout=6)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
+        except BaseException as operation_error:
+            # Cleanup must not be interrupted by a second TERM/INT. The unit
+            # itself also remains bounded by its systemd RuntimeMaxSec.
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            cleanup_errors: list[BaseException] = []
+            try:
+                if launch_started:
+                    _scratch_stop_unit(unit_name)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            finally:
+                # A failed systemd stop must not skip reaping the exact
+                # launcher process. The final unit-state check below still
+                # fails closed if stopping the service was not confirmed.
+                if process is not None:
+                    try:
+                        process.wait(timeout=6)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            process.kill()
+                            process.wait(timeout=5)
+                        except BaseException as cleanup_error:
+                            cleanup_errors.append(cleanup_error)
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+            for cleanup_error in cleanup_errors:
+                if hasattr(operation_error, "add_note"):
+                    operation_error.add_note(
+                        f"Scratch restore cleanup also failed: {type(cleanup_error).__name__}."
+                    )
             raise
         finally:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            final_cleanup_errors: list[BaseException] = []
+            service_stopped = not launch_started
             if launch_started:
-                final_snapshot = _scratch_service_snapshot(unit_name)
-                final_props = final_snapshot["properties"]
-                if final_props.get("ActiveState") not in {"inactive", "failed"}:
-                    _scratch_stop_unit(unit_name)
+                try:
                     final_snapshot = _scratch_service_snapshot(unit_name)
                     final_props = final_snapshot["properties"]
-                service_stopped = (
-                    final_props.get("LoadState") == "not-found"
-                    or (
-                        final_props.get("ActiveState") in {"inactive", "failed"}
-                        and final_props.get("ExecMainPID", "0") in {"", "0"}
-                        and final_props.get("ControlGroup", "") == ""
+                    if final_props.get("ActiveState") not in {"inactive", "failed"}:
+                        _scratch_stop_unit(unit_name)
+                        final_snapshot = _scratch_service_snapshot(unit_name)
+                        final_props = final_snapshot["properties"]
+                    service_stopped = (
+                        final_props.get("LoadState") == "not-found"
+                        or (
+                            final_props.get("ActiveState") in {"inactive", "failed"}
+                            and final_props.get("ExecMainPID", "0") in {"", "0"}
+                            and final_props.get("ControlGroup", "") == ""
+                        )
                     )
-                )
-            else:
-                service_stopped = True
-            mount_absent = not _scratch_mountpoint_is_mounted(mountpoint)
+                except BaseException as cleanup_error:
+                    final_cleanup_errors.append(cleanup_error)
+            try:
+                mount_absent = not _scratch_mountpoint_is_mounted(mountpoint)
+            except BaseException as cleanup_error:
+                mount_absent = False
+                final_cleanup_errors.append(cleanup_error)
             try:
                 current_mountpoint = mountpoint.lstat()
                 mountpoint_stable = (
@@ -2372,14 +2465,36 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                     mountpoint_removed = False
             except FileNotFoundError:
                 mountpoint_removed = False
+            except BaseException as cleanup_error:
+                mountpoint_removed = False
+                final_cleanup_errors.append(cleanup_error)
             if selector is not None:
-                selector.close()
+                try:
+                    selector.close()
+                except BaseException as cleanup_error:
+                    final_cleanup_errors.append(cleanup_error)
             if process is not None:
                 for stream in (process.stdout, process.stderr):
                     if stream is not None:
-                        stream.close()
+                        try:
+                            stream.close()
+                        except BaseException as cleanup_error:
+                            final_cleanup_errors.append(cleanup_error)
             if not service_stopped or not mount_absent or not mountpoint_removed:
-                raise RuntimeError("Scratch restore unit or mount cleanup could not be confirmed.")
+                final_cleanup_errors.append(
+                    RuntimeError("Scratch restore unit or mount cleanup could not be confirmed.")
+                )
+            if final_cleanup_errors:
+                active_error = sys.exc_info()[1]
+                if active_error is not None and hasattr(active_error, "add_note"):
+                    for cleanup_error in final_cleanup_errors:
+                        active_error.add_note(
+                            f"Scratch restore final cleanup failed: {type(cleanup_error).__name__}."
+                        )
+                else:
+                    raise RuntimeError(
+                        "Scratch restore unit or mount cleanup could not be confirmed."
+                    ) from final_cleanup_errors[0]
         archive_after = os.fstat(archive_descriptor)
         current_path = archive_path.lstat()
         if (
@@ -2716,19 +2831,21 @@ def main() -> int:
                 "--dump-only, --check-latest, --verify-latest-existing, and --verify-dump "
                 "are mutually exclusive."
             )
-        if args.verify_dump is not None:
-            result = verify_existing_dump(args)
-        elif getattr(args, "verify_latest_existing", False):
-            result = verify_latest_existing_backup(
-                pathlib.Path(args.output_dir),
-                pathlib.Path(args.env_file),
-                max_age_hours=args.max_age_hours,
-                admin_database_url=args.admin_database_url,
-            )
-        elif args.check_latest:
+        if args.check_latest:
             result = check_latest_backup(pathlib.Path(args.output_dir), max_age_hours=args.max_age_hours)
         else:
-            result = create_backup(args)
+            with _termination_signal_scope():
+                if args.verify_dump is not None:
+                    result = verify_existing_dump(args)
+                elif getattr(args, "verify_latest_existing", False):
+                    result = verify_latest_existing_backup(
+                        pathlib.Path(args.output_dir),
+                        pathlib.Path(args.env_file),
+                        max_age_hours=args.max_age_hours,
+                        admin_database_url=args.admin_database_url,
+                    )
+                else:
+                    result = create_backup(args)
         print_result(result, as_json=args.as_json)
         return 0
     except Exception as exc:

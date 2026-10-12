@@ -193,6 +193,141 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertFalse(any("PGPASSWORD" in item or "PLATFORM_DATABASE_URL" in item for item in command))
 
         self._assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db()
+        self._assert_scratch_sigterm_stops_and_reaps_launched_unit()
+
+    def _assert_scratch_sigterm_stops_and_reaps_launched_unit(self) -> None:
+        class LauncherProcess:
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.wait_calls = 0
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, *, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                if self.returncode is None:
+                    raise subprocess.TimeoutExpired(["systemd-run"], timeout)
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -signal.SIGKILL
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            archive_path.chmod(0o600)
+            launcher = LauncherProcess()
+            prior_handlers = {
+                signum: signal.getsignal(signum)
+                for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+            }
+
+            def launch(*_args, **_kwargs):
+                # The implementation blocks these signals until it has stored
+                # the Popen handle and marked the unique unit as possibly live.
+                signal.raise_signal(signal.SIGTERM)
+                return launcher
+
+            unit_command = mock.Mock(return_value=["systemd-run"])
+
+            def stop_unit(_unit_name: str) -> None:
+                launcher.returncode = 0
+
+            with (
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill, "_scratch_host_guard"),
+                mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_service_snapshot",
+                    return_value={
+                        "properties": {
+                            "LoadState": "not-found",
+                            "ActiveState": "inactive",
+                            "ExecMainPID": "0",
+                            "ControlGroup": "",
+                        }
+                    },
+                ),
+                mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit) as stop,
+                mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch) as popen,
+            ):
+                with backup_drill._termination_signal_scope():
+                    with self.assertRaisesRegex(backup_drill.BackupOperationInterrupted, "SIGTERM"):
+                        backup_drill._run_isolated_restore_drill(
+                            archive_path,
+                            timestamp_slug="20261012T010203Z",
+                        )
+
+            self.assertEqual(popen.call_count, 1)
+            self.assertEqual(stop.call_count, 1)
+            self.assertEqual(launcher.wait_calls, 1)
+            mountpoint = unit_command.call_args.kwargs["mountpoint"]
+            self.assertFalse(mountpoint.exists())
+            self.assertEqual(
+                {signum: signal.getsignal(signum) for signum in prior_handlers},
+                prior_handlers,
+            )
+
+            # A stop failure must not bypass the independent launcher reap.
+            failed_stop_launcher = LauncherProcess()
+
+            def launch_then_term(*_args, **_kwargs):
+                signal.raise_signal(signal.SIGHUP)
+                return failed_stop_launcher
+
+            with (
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill, "_scratch_host_guard"),
+                mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_service_snapshot",
+                    return_value={
+                        "properties": {
+                            "LoadState": "loaded",
+                            "ActiveState": "active",
+                            "ExecMainPID": "123",
+                            "ControlGroup": "/synthetic/scratch.service",
+                        }
+                    },
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_stop_unit",
+                    side_effect=RuntimeError("synthetic stop failure"),
+                ),
+                mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch_then_term),
+            ):
+                with backup_drill._termination_signal_scope():
+                    with self.assertRaisesRegex(
+                        backup_drill.BackupOperationInterrupted, "SIGHUP"
+                    ) as interrupted:
+                        backup_drill._run_isolated_restore_drill(
+                            archive_path,
+                            timestamp_slug="20261012T010204Z",
+                        )
+            self.assertEqual(failed_stop_launcher.wait_calls, 2)
+            self.assertIsNotNone(failed_stop_launcher.returncode)
+            self.assertTrue(
+                any("RuntimeError" in note for note in interrupted.exception.__notes__)
+            )
+            self.assertEqual(
+                {signum: signal.getsignal(signum) for signum in prior_handlers},
+                prior_handlers,
+            )
+            failed_mountpoint = unit_command.call_args.kwargs["mountpoint"]
+            self.assertTrue(failed_mountpoint.exists())
+            mountpoint_stat = failed_mountpoint.lstat()
+            self.assertEqual(mountpoint_stat.st_mode & 0o777, 0o700)
+            self.assertEqual((mountpoint_stat.st_uid, mountpoint_stat.st_gid), (0, 0))
+            self.assertEqual(list(failed_mountpoint.iterdir()), [])
+            failed_mountpoint.rmdir()
 
     def _assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db(self) -> None:
         target = backup_drill.DatabaseTarget(
@@ -1144,6 +1279,46 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 metadata = path.lstat()
                 self.assertEqual((path.read_bytes(), metadata.st_mode, metadata.st_ino), expected)
 
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    {
+                        "PLATFORM_DATABASE_URL": (
+                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
+                        )
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "load_env",
+                    return_value={
+                        "PLATFORM_DATABASE_URL": (
+                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
+                        )
+                    },
+                ),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
+                mock.patch.object(
+                    backup_drill,
+                    "_run_isolated_restore_drill",
+                    side_effect=backup_drill.BackupOperationInterrupted(signal.SIGTERM),
+                ),
+            ):
+                with self.assertRaises(backup_drill.BackupOperationInterrupted):
+                    backup_drill.create_backup(args)
+            self.assertEqual(backup_drill.backup_inventory(output_dir), initial_inventory)
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                {path.name for path in old_entries},
+            )
+
             self._assert_postpublication_inventory_failure_rolls_back_only_new_pair()
             self._assert_directory_fsync_failure_rolls_back_only_new_pair()
 
@@ -1262,6 +1437,59 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     backup_drill.create_backup(args)
 
             self.assertEqual(fsync_calls, 2)
+            self.assertEqual(backup_drill.backup_inventory(output_dir), initial_inventory)
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                {path.name for path in old_entries},
+            )
+
+            fsync_calls = 0
+
+            def interrupt_after_publication(path: pathlib.Path) -> None:
+                nonlocal fsync_calls
+                fsync_calls += 1
+                if fsync_calls == 1:
+                    signal.raise_signal(signal.SIGTERM)
+                real_fsync_directory(path)
+
+            cli_args = argparse.Namespace(
+                check_latest=False,
+                verify_latest_existing=False,
+                dump_only=True,
+                verify_dump=None,
+                output_dir=str(output_dir),
+                env_file=str(output_dir / ".env.platform"),
+                max_age_hours=24,
+                admin_database_url=None,
+                keep=14,
+                rotate_existing=False,
+                as_json=True,
+            )
+            signal_output = io.StringIO()
+
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    {"PLATFORM_DATABASE_URL": "postgresql://platform_user@localhost/platformdb"},
+                ),
+                mock.patch.object(backup_drill, "load_env", return_value={}),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
+                mock.patch.object(
+                    backup_drill, "_fsync_directory", side_effect=interrupt_after_publication
+                ),
+                mock.patch.object(backup_drill, "parse_args", return_value=cli_args),
+                mock.patch.object(backup_drill.sys, "stdout", signal_output),
+            ):
+                self.assertEqual(backup_drill.main(), 1)
+
+            self.assertGreaterEqual(fsync_calls, 2)
+            self.assertIn("Backup operation interrupted by SIGTERM.", signal_output.getvalue())
             self.assertEqual(backup_drill.backup_inventory(output_dir), initial_inventory)
             self.assertEqual(
                 {path.name for path in output_dir.iterdir()},
