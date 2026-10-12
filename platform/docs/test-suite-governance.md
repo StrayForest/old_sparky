@@ -114,13 +114,12 @@ these five catalog contours:
 | Catalog contour | Timeout | Shared-resource execution | Ownership boundary |
 | --- | ---: | --- | --- |
 | `backend-unit` | 300s | not serial-resource constrained | unit/domain/backend tests with no external operator contour |
-| `backend-tool-contract` | 600s | not serial-resource constrained | repository tool and contract tests that are hermetic and do not require root-owned host metadata; privacy-safe sampling projections (`test_platform_evidence_privacy`) |
+| `backend-tool-contract` | 600s | not serial-resource constrained | hermetic repository tools, backup restore diagnostics and privacy-safe sampling projections (`test_platform_evidence_privacy`) without root-owned host metadata |
 | `backend-integration` | 1200s | serial | PostgreSQL/Redis integration tests and real workflow races |
 | `backend-privileged` | 1200s | serial | root/service-identity, media, Redis DB 15 purge, release/install/systemd, root-owned artifact metadata and privileged wrapper tests |
 | `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts, including request sampling (`test_platform_request_performance`) and production-QA summary (`test_platform_production_qa_write_burst_profile`) |
 | `backend` (aggregate) | 3600s | serial orchestration | disjoint union of the five contours |
 
-The timeout values are the catalog's executable contract, not a moving test count or an estimate derived from the current number of methods. The catalog rejects unknown, duplicate, overlapping or unowned IDs and detects snapshot drift through `verification-contract`; add tests by updating the executable catalog and its self-test, never by hard-coding a count or editing a workflow filename list. The stable gate and command registry remains the [canonical verifier](../tools/platform_verify.py), which delegates `backend` and each sub-contour to the guarded runner.
 
 `test_platform_external_load` (performance-contract) covers bounded HTTP body failures, phase accounting, client CPU sampler lifecycle and cgroup-capacity reason parsing; `test_platform_evidence_privacy` (backend-tool-contract) owns whole-series run-window, production observer-row mapping, observer-timeline and identity-stripping projections. `test_platform_live_qa_runtime_install` (backend-privileged) exercises the copied dispatcher against its installed release validator, including missing/tampered refusal.
 The SSR admission-shed parser remains in `test_platform_ssr_observability` (performance-contract), public projection privacy in `test_platform_evidence_privacy` (backend-tool-contract), and the bounded web scheduler in the existing `frontend-audit-regressions.spec.ts` smoke owner; no test IDs or gate-ownership entries are added.

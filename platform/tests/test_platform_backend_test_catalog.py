@@ -18,6 +18,18 @@ class PlatformBackendTestCatalogTests(unittest.TestCase):
         for field, expected in catalog.EXPECTED_SNAPSHOT.items():
             if field in snapshot:
                 self.assertEqual(snapshot[field], expected)
+        tool_contract_ids = {
+            case.test_id
+            for case in catalog.cases_for_contour("backend-tool-contract", self.cases)
+        }
+        self.assertIn(
+            "tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_run_disk_guarded_command_captures_only_opted_in_failure_output",
+            tool_contract_ids,
+        )
+        self.assertIn(
+            "tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_run_disk_guarded_command_preserves_primary_when_reap_fails",
+            tool_contract_ids,
+        )
 
     def test_declared_module_owners_are_disjoint(self) -> None:
         declared = (
