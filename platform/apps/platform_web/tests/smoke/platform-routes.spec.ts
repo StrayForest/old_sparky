@@ -134,6 +134,8 @@ async function startTurnstileRouteSwitchWhileSdkIsInFlight(
         renderCallsCapped: boolean;
         renderActions: string[];
         renderActionsCapped: boolean;
+        tokenCallbacks: number;
+        deliverToken?: () => void;
       };
       __firstTurnstileWidget?: Element | null;
       __firstTurnstileScript?: Element | null;
@@ -143,7 +145,8 @@ async function startTurnstileRouteSwitchWhileSdkIsInFlight(
       renderCalls: 0,
       renderCallsCapped: false,
       renderActions: [],
-      renderActionsCapped: false
+      renderActionsCapped: false,
+      tokenCallbacks: 0
     };
   });
 
@@ -191,7 +194,12 @@ async function startTurnstileRouteSwitchWhileSdkIsInFlight(
           }
           container.dataset.turnstileAction = options.action;
           container.dataset.turnstileAppearance = options.appearance;
-          setTimeout(() => options.callback("inflight-turnstile-token"), 25);
+          if (probe) {
+            probe.deliverToken = () => {
+              probe.tokenCallbacks += 1;
+              options.callback("inflight-turnstile-token");
+            };
+          }
           return "inflight-widget";
         },
         remove() {},
@@ -923,7 +931,7 @@ test("non-admin authenticated principal is denied operations access", async ({ p
   await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
   await expect(page.getByTestId("admin-console")).toHaveCount(0);
   await expectRobotsTag(page, /^noindex$/u);
-  await expectRawRobots(page, "/platform-ops", 404, /^noindex$/u);
+  await expectRawRobotsResponse(navigation, 404, /^noindex$/u);
 });
 
 test("notFound routes keep a real 404 during a held slow navigation", async ({ page }) => {
@@ -3423,13 +3431,36 @@ test("an in-flight Turnstile script readies a second auth-route widget", async (
 
   const loadedProbe = await page.evaluate(() => {
     const probeWindow = window as Window & {
-      __turnstileLifecycleProbe?: { scriptStubExecuted: boolean; renderCalls: number; renderActions: string[] };
+      __turnstileLifecycleProbe?: {
+        scriptStubExecuted: boolean;
+        renderCalls: number;
+        renderActions: string[];
+        tokenCallbacks: number;
+        deliverToken?: () => void;
+      };
     };
-    return probeWindow.__turnstileLifecycleProbe ?? null;
+    const probe = probeWindow.__turnstileLifecycleProbe;
+    return {
+      scriptStubExecuted: probe?.scriptStubExecuted ?? false,
+      renderCalls: probe?.renderCalls ?? 0,
+      renderActions: probe?.renderActions ?? [],
+      tokenCallbacks: probe?.tokenCallbacks ?? 0,
+      canDeliverToken: typeof probe?.deliverToken === "function"
+    };
   });
-  expect(loadedProbe?.scriptStubExecuted).toBe(true);
-  expect(loadedProbe?.renderCalls).toBe(1);
-  expect(loadedProbe?.renderActions).toEqual(["login"]);
+  expect(loadedProbe.scriptStubExecuted).toBe(true);
+  expect(loadedProbe.renderCalls).toBe(1);
+  expect(loadedProbe.renderActions).toEqual(["login"]);
+  expect(loadedProbe.tokenCallbacks).toBe(0);
+  expect(loadedProbe.canDeliverToken).toBe(true);
+
+  await page.evaluate(() => {
+    const probeWindow = window as Window & {
+      __turnstileLifecycleProbe?: { deliverToken?: () => void };
+    };
+    probeWindow.__turnstileLifecycleProbe?.deliverToken?.();
+  });
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
 
   const submitButton = page.getByRole("button", { name: "Войти", exact: true });
   await expect(submitButton).toBeEnabled();
