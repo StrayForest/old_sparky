@@ -20,6 +20,7 @@ import time
 import types
 import unittest
 import uuid
+from typing import Any
 from unittest import mock
 
 
@@ -33,6 +34,13 @@ SPEC.loader.exec_module(backup_drill)
 
 
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._proc_start_time_patch = mock.patch.object(
+            backup_drill, "_scratch_process_start_time", return_value="123456"
+        )
+        self._proc_start_time_patch.start()
+        self.addCleanup(self._proc_start_time_patch.stop)
+
     @staticmethod
     def _write_backup_pair(
         output_dir: pathlib.Path,
@@ -87,6 +95,56 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill.parse_database_url(
                 "postgresql+asyncpg://platform_user:secret@127.0.0.1:5432/sparkydb"
             )
+
+    def test_scratch_terminal_diagnostic_schema_is_closed_and_keeps_initial_state(self) -> None:
+        initial_snapshot = {
+            "properties": {
+                "ActiveState": "active",
+                "SubState": "running",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            }
+        }
+        terminal_snapshot = {
+            "load_state": "not-found",
+            "active_state": "inactive",
+            "sub_state": "dead",
+            "result": "success",
+            "exec_main_status": 0,
+            "start_token_sent": False,
+            "completion_token_sent": False,
+        }
+        diagnostic = backup_drill._scratch_unit_diagnostic(
+            initial_snapshot,
+            launcher_exit_status=1,
+            stdout_prefix=b"",
+            stdout_observed=0,
+            stdout_complete=True,
+            stderr_prefix=b"",
+            stderr_observed=0,
+            stderr_complete=True,
+            phase="confinement_verification_failed",
+            verification_error="os_error",
+            verification_errno=2,
+            terminal_snapshot=terminal_snapshot,
+        )
+        self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(diagnostic))
+        assert diagnostic is not None
+        self.assertEqual(diagnostic["schema"], 2)
+        self.assertEqual(diagnostic["active_state"], "active")
+        self.assertEqual(diagnostic["terminal_snapshot"]["active_state"], "inactive")
+
+        schema1 = dict(diagnostic)
+        schema1["schema"] = 1
+        del schema1["terminal_snapshot"]
+        self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(schema1))
+        for malformed_terminal in (
+            {**terminal_snapshot, "private_path": "/root/private"},
+            {**terminal_snapshot, "start_token_sent": 1},
+            {**terminal_snapshot, "active_state": "unknown-secret-state"},
+        ):
+            malformed = {**diagnostic, "terminal_snapshot": malformed_terminal}
+            self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
 
     def _assert_scratch_unit_diagnostic_caps_and_private_envelope(self) -> None:
         required_memory = backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES
@@ -351,6 +409,44 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             verification_errno=2,
         )
         self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(verification_failure))
+        terminal = {
+            "load_state": "loaded",
+            "active_state": "inactive",
+            "sub_state": "dead",
+            "result": "success",
+            "exec_main_status": 0,
+            "start_token_sent": False,
+            "completion_token_sent": False,
+        }
+        schema2 = backup_drill._scratch_unit_diagnostic(
+            {
+                "properties": {
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                }
+            },
+            launcher_exit_status=1,
+            stdout_prefix=b"",
+            stdout_observed=0,
+            stdout_complete=True,
+            stderr_prefix=b"",
+            stderr_observed=0,
+            stderr_complete=True,
+            phase="confinement_verification_failed",
+            verification_error="os_error",
+            verification_errno=2,
+            terminal_snapshot=terminal,
+        )
+        self.assertIsNotNone(schema2)
+        assert schema2 is not None
+        self.assertEqual(schema2["schema"], 2)
+        self.assertEqual(schema2["active_state"], "active")
+        self.assertEqual(schema2["terminal_snapshot"], terminal)
+        malformed = dict(schema2)
+        malformed["terminal_snapshot"] = {**terminal, "private_path": "/secret"}
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
         malformed = dict(verification_failure)
         malformed["verification_errno"] = True
         self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
@@ -585,6 +681,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         "SubState": "running",
                         "Result": "success",
                         "ExecMainPID": "424242",
+                        "InvocationID": "0123456789abcdef0123456789abcdef",
                         "ExecMainStatus": "0",
                         "ControlGroup": "/system.slice/scratch-identity-race.service",
                     }
@@ -651,6 +748,100 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             mountpoint = pathlib.Path(unit_command.call_args.kwargs["mountpoint"])
             self.assertFalse(mountpoint.exists())
 
+    def _assert_scratch_identity_replacement_cannot_receive_authorization(self) -> None:
+        for replacement in ("pid", "invocation"):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as temporary_dir:
+                archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+                archive_path.write_bytes(b"PGDMPsynthetic archive")
+                archive_path.chmod(0o600)
+                command = [
+                    sys.executable,
+                    "-c",
+                    "import sys; "
+                    f"token={backup_drill.SCRATCH_START_TOKEN!r}; "
+                    "ack=sys.stdin.buffer.read(len(token)); "
+                    "assert ack == token; print('authorized',flush=True)",
+                ]
+                unit_command = mock.Mock(return_value=command)
+                first_properties = {
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "Result": "success",
+                    "ExecMainPID": "424242",
+                    "InvocationID": "0123456789abcdef0123456789abcdef",
+                    "ExecMainStatus": "0",
+                    "ControlGroup": "/system.slice/scratch-identity-barrier.service",
+                }
+                second_properties = dict(first_properties)
+                if replacement == "pid":
+                    second_properties["ExecMainPID"] = "424243"
+                else:
+                    second_properties["InvocationID"] = "1123456789abcdef0123456789abcdef"
+                terminal = {
+                    "properties": {
+                        "LoadState": "not-found",
+                        "ActiveState": "inactive",
+                        "SubState": "dead",
+                        "Result": "success",
+                        "ExecMainPID": "0",
+                        "ExecMainStatus": "0",
+                        "ControlGroup": "",
+                    }
+                }
+                snapshots = [
+                    {"properties": first_properties},
+                    {"properties": second_properties},
+                    terminal,
+                    terminal,
+                ]
+                real_popen = subprocess.Popen
+                launched = []
+
+                def launch(*args, **kwargs):
+                    process = real_popen(*args, **kwargs)
+                    launched.append(process)
+                    return process
+
+                with (
+                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(backup_drill, "_scratch_host_guard"),
+                    mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                    mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                    mock.patch.object(
+                        backup_drill,
+                        "_scratch_service_snapshot",
+                        side_effect=lambda _name: snapshots.pop(0) if snapshots else terminal,
+                    ),
+                    mock.patch.object(
+                        backup_drill,
+                        "_scratch_expected_properties",
+                        return_value="/system.slice/scratch-identity-barrier.service",
+                    ) as expected_properties,
+                    mock.patch.object(backup_drill, "_scratch_control_group_snapshot", return_value={}),
+                    mock.patch.object(backup_drill, "_scratch_authorize_worker") as authorize,
+                    mock.patch.object(backup_drill, "_scratch_stop_unit"),
+                    mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
+                    mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "identity changed before authorization") as failure:
+                        backup_drill._run_isolated_restore_drill(
+                            archive_path,
+                            timestamp_slug="20261012T010209Z",
+                            private_scratch_diagnostics=True,
+                        )
+
+                authorize.assert_not_called()
+                self.assertEqual(expected_properties.call_count, 1)
+                self.assertEqual(launched[0].stdout.read(), b"")
+                diagnostic = failure.exception.scratch_unit_diagnostic
+                self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(diagnostic))
+                self.assertEqual(diagnostic["phase"], "confinement_verification_failed")
+                self.assertEqual(diagnostic["active_state"], "active")
+                self.assertFalse(diagnostic["terminal_snapshot"]["start_token_sent"])
+                self.assertFalse(diagnostic["terminal_snapshot"]["completion_token_sent"])
+                self.assertNotIn("ExecMainPID", json.dumps(diagnostic))
+
     def _assert_scratch_after_confinement_failure_preserves_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
@@ -673,6 +864,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "SubState": "running",
                     "Result": "success",
                     "ExecMainPID": "424242",
+                    "InvocationID": "0123456789abcdef0123456789abcdef",
                     "ExecMainStatus": "0",
                     "ControlGroup": "/system.slice/scratch-after-confinement.service",
                 }
@@ -781,6 +973,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "SubState": "running",
                     "Result": "success",
                     "ExecMainPID": "424242",
+                    "InvocationID": "0123456789abcdef0123456789abcdef",
                     "ExecMainStatus": "0",
                     "ControlGroup": "/system.slice/scratch-collected.service",
                 }
@@ -834,6 +1027,31 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 self.assertFalse(pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists())
             stdout_reader.close()
             stderr_reader.close()
+
+    def _assert_worker_authorization_barrier(self) -> None:
+        args = argparse.Namespace(
+            _scratch_root="/run/oldsparky-backup-restore-0123456789abcdef01234567",
+        )
+        for payload in (
+            b"",
+            backup_drill.SCRATCH_START_TOKEN[:-1],
+            backup_drill.SCRATCH_START_TOKEN + b"x",
+        ):
+            with (
+                mock.patch.object(
+                    backup_drill.sys,
+                    "stdin",
+                    types.SimpleNamespace(buffer=io.BytesIO(payload)),
+                ),
+                mock.patch.object(backup_drill, "_scratch_mount_snapshot") as mount_snapshot,
+                mock.patch.object(backup_drill, "_open_verified_scratch_archive") as open_archive,
+                mock.patch.object(backup_drill, "run_command") as run_command,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "authorization was not received"):
+                    backup_drill._scratch_worker_main(args)
+            mount_snapshot.assert_not_called()
+            open_archive.assert_not_called()
+            run_command.assert_not_called()
 
     def _assert_scratch_worker_forwards_output_only_when_private(self) -> None:
         class BinaryTextCapture:
@@ -902,6 +1120,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     mock.patch.object(backup_drill, "_scratch_create_application_role"),
                     mock.patch.object(
                         backup_drill, "perform_restore_drill", side_effect=worker_failure
+                    ),
+                    mock.patch.object(
+                        backup_drill.sys,
+                        "stdin",
+                        types.SimpleNamespace(buffer=io.BytesIO(backup_drill.SCRATCH_START_TOKEN + backup_drill.SCRATCH_DONE_TOKEN)),
                     ),
                     mock.patch.object(backup_drill.sys, "stdout", stdout_capture),
                     mock.patch.object(backup_drill.sys, "stderr", stderr_capture),
@@ -1024,7 +1247,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             command = [
                 sys.executable,
                 "-c",
-                "import json,time; print(json.dumps({'ok':True,'restored_table_count':1}),flush=True); time.sleep(0.6)",
+                "import json,sys; "
+                f"start={backup_drill.SCRATCH_START_TOKEN!r}; "
+                f"done={backup_drill.SCRATCH_DONE_TOKEN!r}; "
+                "ack=sys.stdin.buffer.read(len(start)); assert ack == start; "
+                "sys.stdout.write(json.dumps({'ok':True,'restored_table_count':1})+'\\n'); sys.stdout.flush(); "
+                "assert sys.stdin.buffer.read(len(done)) == done",
             ]
             unit_command = mock.Mock(return_value=command)
             real_popen = subprocess.Popen
@@ -1066,6 +1294,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                             "LoadState": "loaded",
                             "ActiveState": "active",
                             "ExecMainPID": "123",
+                            "InvocationID": "0123456789abcdef0123456789abcdef",
                             "ControlGroup": "/system.slice/scratch-startup-race.service",
                         }
                     }
@@ -1104,6 +1333,215 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertFalse(launched[0].poll() is None)
             mountpoint = pathlib.Path(unit_command.call_args.kwargs["mountpoint"])
             self.assertFalse(mountpoint.exists())
+
+    def _assert_scratch_final_identity_loss_blocks_done(self) -> None:
+        for replacement in (
+            "pid", "invocation", "starttime", "cgroup", "missing", "late_start", "late_done"
+        ):
+            with self.subTest(final_identity=replacement), tempfile.TemporaryDirectory() as temporary_dir:
+                archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+                archive_path.write_bytes(b"PGDMPsynthetic archive")
+                archive_path.chmod(0o600)
+                command = [
+                    sys.executable,
+                    "-c",
+                    "import sys; "
+                    f"start={backup_drill.SCRATCH_START_TOKEN!r}; "
+                    f"done={backup_drill.SCRATCH_DONE_TOKEN!r}; "
+                    "assert sys.stdin.buffer.read(len(start)) == start; "
+                    "sys.stdout.write('{\\\"ok\\\":true,\\\"restored_table_count\\\":1}\\n'); sys.stdout.flush(); "
+                    "assert sys.stdin.buffer.read(len(done)) == done; "
+                    "sys.stderr.write('DONE-RECEIVED'); sys.stderr.flush()",
+                ]
+                launched: list[subprocess.Popen[bytes]] = []
+                real_popen = subprocess.Popen
+
+                def launch(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+                    process = real_popen(*args, **kwargs)
+                    launched.append(process)
+                    return process
+
+                snapshots_seen = 0
+                base_properties = {
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "Result": "success",
+                    "ExecMainPID": "424242",
+                    "InvocationID": "0123456789abcdef0123456789abcdef",
+                    "ExecMainStatus": "0",
+                    "ControlGroup": "/system.slice/scratch-final-identity.service",
+                }
+
+                def service_snapshot(_unit_name: str) -> dict[str, Any]:
+                    nonlocal snapshots_seen
+                    snapshots_seen += 1
+                    if snapshots_seen == 1:
+                        return {"properties": {**base_properties, "LoadState": "not-found", "ActiveState": "inactive", "ExecMainPID": "0", "ControlGroup": ""}}
+                    if snapshots_seen == 2:
+                        return {"properties": {**base_properties, "ActiveState": "inactive", "ExecMainPID": "0", "ControlGroup": ""}}
+                    if snapshots_seen == 5 and replacement == "missing":
+                        raise FileNotFoundError("synthetic final unit snapshot loss")
+                    properties = dict(base_properties)
+                    if snapshots_seen == 5:
+                        if replacement == "pid":
+                            properties["ExecMainPID"] = "424243"
+                        elif replacement == "invocation":
+                            properties["InvocationID"] = "1123456789abcdef0123456789abcdef"
+                    if snapshots_seen >= 6:
+                        properties.update({"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "ExecMainPID": "0", "ControlGroup": ""})
+                    return {"properties": properties}
+
+                expected_properties_calls = 0
+
+                def expected_properties(snapshot: dict[str, Any], **_kwargs: Any) -> str:
+                    nonlocal expected_properties_calls
+                    expected_properties_calls += 1
+                    if replacement == "cgroup" and expected_properties_calls == 3:
+                        return "/system.slice/replaced-cgroup.service"
+                    return snapshot["properties"]["ControlGroup"]
+
+                start_tokens: list[bytes] = []
+                send_token = backup_drill._scratch_send_worker_token
+
+                def capture_token(process: subprocess.Popen[bytes], *, token: bytes, deadline: float, close_after: bool) -> None:
+                    start_tokens.append(token)
+                    send_token(process, token=token, deadline=deadline, close_after=close_after)
+                    if replacement == "late_start" and token == backup_drill.SCRATCH_START_TOKEN:
+                        raise backup_drill._ScratchTokenDeliveryError(
+                            "synthetic deadline after complete START write", complete=True
+                        )
+                    if replacement == "late_done" and token == backup_drill.SCRATCH_DONE_TOKEN:
+                        raise backup_drill._ScratchTokenDeliveryError(
+                            "synthetic deadline after complete DONE write", complete=True
+                        )
+
+                def stop_unit(_unit_name: str) -> None:
+                    if launched and launched[0].poll() is None:
+                        launched[0].kill()
+                        launched[0].wait(timeout=2)
+
+                unit_command = mock.Mock(return_value=command)
+                with (
+                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(backup_drill, "_scratch_host_guard"),
+                    mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                    mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                    mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=service_snapshot),
+                    mock.patch.object(backup_drill, "_scratch_expected_properties", side_effect=expected_properties),
+                    mock.patch.object(backup_drill, "_scratch_control_group_snapshot", return_value={}),
+                    mock.patch.object(backup_drill, "_scratch_process_start_time", side_effect=("123456", "123456", "999999" if replacement == "starttime" else "123456")),
+                    mock.patch.object(backup_drill, "_scratch_send_worker_token", side_effect=capture_token),
+                    mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit),
+                    mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
+                    mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
+                ):
+                    with self.assertRaises(Exception) as failure:
+                        backup_drill._run_isolated_restore_drill(
+                            archive_path,
+                            timestamp_slug="20261012T010206Z",
+                            private_scratch_diagnostics=True,
+                        )
+                self.assertEqual(
+                    start_tokens,
+                    [backup_drill.SCRATCH_START_TOKEN]
+                    + ([backup_drill.SCRATCH_DONE_TOKEN] if replacement == "late_done" else []),
+                )
+                self.assertTrue(launched)
+                self.assertIsNotNone(launched[0].returncode)
+                self.assertEqual(
+                    getattr(failure.exception, "scratch_unit_diagnostic", {}).get("phase"),
+                    "authorization_failed",
+                )
+                self.assertEqual(
+                    getattr(failure.exception, "scratch_unit_diagnostic", {}).get("terminal_snapshot", {}).get(
+                        "completion_token_sent", False
+                    ),
+                    replacement == "late_done",
+                )
+                self.assertFalse(pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists())
+
+    def _assert_worker_token_deadline_delivery_is_truthful(self) -> None:
+        class WritableSelector:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+            def register(self, *_args: Any, **_kwargs: Any) -> None:
+                return None
+
+            def select(self, timeout: float | None = None) -> list[object]:
+                return [object()]
+
+        for token, close_after in (
+            (backup_drill.SCRATCH_START_TOKEN, False),
+            (backup_drill.SCRATCH_DONE_TOKEN, True),
+        ):
+            read_fd, write_fd = os.pipe()
+            stream = os.fdopen(write_fd, "wb", buffering=0)
+            process = types.SimpleNamespace(stdin=stream, poll=lambda: None)
+            clock = [9.0]
+            original_write = os.write
+
+            def write_then_cross_deadline(fd: int, data: bytes | memoryview) -> int:
+                written = original_write(fd, data)
+                clock[0] = 11.0
+                return written
+
+            try:
+                with (
+                    mock.patch.object(backup_drill.selectors, "DefaultSelector", return_value=WritableSelector()),
+                    mock.patch.object(backup_drill.time, "monotonic", side_effect=lambda: clock[0]),
+                    mock.patch.object(backup_drill.os, "write", side_effect=write_then_cross_deadline),
+                ):
+                    with self.assertRaises(backup_drill._ScratchTokenDeliveryError) as failure:
+                        backup_drill._scratch_send_worker_token(
+                            process,
+                            token=token,
+                            deadline=10.0,
+                            close_after=close_after,
+                        )
+                self.assertTrue(failure.exception.complete)
+                self.assertEqual(os.read(read_fd, len(token)), token)
+            finally:
+                if not stream.closed:
+                    stream.close()
+                os.close(read_fd)
+
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(write_fd, "wb", buffering=0)
+        process = types.SimpleNamespace(stdin=stream, poll=lambda: None)
+        original_write = os.write
+        write_count = 0
+
+        def partial_then_fail(fd: int, data: bytes | memoryview) -> int:
+            nonlocal write_count
+            write_count += 1
+            if write_count == 1:
+                return original_write(fd, data[:1])
+            raise BrokenPipeError("synthetic partial token channel failure")
+
+        try:
+            with (
+                mock.patch.object(backup_drill.selectors, "DefaultSelector", return_value=WritableSelector()),
+                mock.patch.object(backup_drill.time, "monotonic", return_value=9.0),
+                mock.patch.object(backup_drill.os, "write", side_effect=partial_then_fail),
+            ):
+                with self.assertRaises(backup_drill._ScratchTokenDeliveryError) as failure:
+                    backup_drill._scratch_send_worker_token(
+                        process,
+                        token=backup_drill.SCRATCH_START_TOKEN,
+                        deadline=10.0,
+                        close_after=False,
+                    )
+            self.assertFalse(failure.exception.complete)
+            self.assertEqual(os.read(read_fd, 1), backup_drill.SCRATCH_START_TOKEN[:1])
+        finally:
+            if not stream.closed:
+                stream.close()
+            os.close(read_fd)
 
     def _assert_scratch_fast_launcher_cannot_skip_active_confinement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -1324,12 +1762,16 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._assert_scratch_unit_diagnostic_caps_and_private_envelope()
         self._assert_scratch_early_exit_output_is_drained()
         self._assert_scratch_live_identity_failure_preserves_output()
+        self._assert_scratch_identity_replacement_cannot_receive_authorization()
         self._assert_scratch_startup_inactive_race_is_handled()
+        self._assert_scratch_final_identity_loss_blocks_done()
+        self._assert_worker_token_deadline_delivery_is_truthful()
         self._assert_scratch_fast_launcher_cannot_skip_active_confinement()
         self._assert_scratch_absent_unit_has_bounded_startup_deadline()
         self._assert_scratch_after_confinement_failure_preserves_output()
         self._assert_collected_unit_without_properties_preserves_output()
         self._assert_scratch_worker_forwards_output_only_when_private()
+        self._assert_worker_authorization_barrier()
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             scratch_root = pathlib.Path(temporary_dir) / "scratch"
@@ -1429,6 +1871,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
                 mock.patch.object(backup_drill, "_scratch_create_application_role") as create_role,
                 mock.patch.object(backup_drill, "perform_restore_drill", side_effect=fake_restore),
+                mock.patch.object(
+                    backup_drill.sys,
+                    "stdin",
+                    types.SimpleNamespace(buffer=io.BytesIO(backup_drill.SCRATCH_START_TOKEN + backup_drill.SCRATCH_DONE_TOKEN)),
+                ),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
             ):
                 self.assertEqual(backup_drill._scratch_worker_main(args), 0)
@@ -1557,6 +2004,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                             "LoadState": "loaded",
                             "ActiveState": "active",
                             "ExecMainPID": "123",
+                            "InvocationID": "0123456789abcdef0123456789abcdef",
                             "ControlGroup": "/synthetic/scratch.service",
                         }
                     },

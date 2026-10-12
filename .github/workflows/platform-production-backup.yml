@@ -1285,22 +1285,59 @@ jobs:
                               "stderr_sha256", "stderr_truncated", "verification_error",
                               "verification_errno",
                           }
+                          scratch_schema = scratch_unit.get("schema") if isinstance(scratch_unit, dict) else None
+                          scratch_terminal = scratch_unit.get("terminal_snapshot") if isinstance(scratch_unit, dict) else None
+                          scratch_terminal_valid = (type(scratch_schema) is int and scratch_schema == 1) or (
+                              isinstance(scratch_terminal, dict)
+                              and set(scratch_terminal) == {
+                                  "load_state", "active_state", "sub_state", "result",
+                                  "exec_main_status", "start_token_sent", "completion_token_sent",
+                              }
+                              and type(scratch_terminal.get("load_state")) is str
+                              and scratch_terminal["load_state"] in {"loaded", "not-found", "other"}
+                              and type(scratch_terminal.get("active_state")) is str
+                              and scratch_terminal["active_state"] in {
+                                  "active", "activating", "deactivating", "inactive", "failed", "reloading", "other",
+                              }
+                              and type(scratch_terminal.get("sub_state")) is str
+                              and scratch_terminal["sub_state"] in scratch_substates
+                              and type(scratch_terminal.get("result")) is str
+                              and scratch_terminal["result"] in scratch_results
+                              and (
+                                  scratch_terminal.get("exec_main_status") is None
+                                  or (
+                                      type(scratch_terminal["exec_main_status"]) is int
+                                      and 0 <= scratch_terminal["exec_main_status"] <= 255
+                                  )
+                              )
+                              and type(scratch_terminal.get("start_token_sent")) is bool
+                              and type(scratch_terminal.get("completion_token_sent")) is bool
+                          )
+                          if scratch_schema == 2:
+                              scratch_expected = scratch_expected | {"terminal_snapshot"}
                           valid_scratch = (
                               isinstance(scratch_unit, dict)
                               and set(scratch_unit) == scratch_expected
                               and type(scratch_unit.get("schema")) is int
-                              and scratch_unit["schema"] == 1
+                              and scratch_unit["schema"] in {1, 2}
                               and type(scratch_unit.get("phase")) is str
                               and scratch_unit["phase"] in {
                                   "unit_exited_before_confinement",
                                   "confinement_verification_failed",
+                                  "authorization_failed",
                                   "unit_exited_after_confinement",
                               }
+                              and (
+                                  scratch_unit["phase"] != "authorization_failed"
+                                  or scratch_unit.get("schema") == 2
+                              )
                               and type(scratch_unit.get("active_state")) is str
                               and (
                                   (scratch_unit["phase"] == "unit_exited_before_confinement"
                                    and scratch_unit["active_state"] in {"failed", "inactive"})
                                   or (scratch_unit["phase"] == "confinement_verification_failed"
+                                      and scratch_unit["active_state"] == "active")
+                                  or (scratch_unit["phase"] == "authorization_failed"
                                       and scratch_unit["active_state"] == "active")
                                   or (scratch_unit["phase"] == "unit_exited_after_confinement"
                                       and scratch_unit["active_state"] in {"failed", "inactive"})
@@ -1333,6 +1370,7 @@ jobs:
                               and re.fullmatch(r"[0-9a-f]{64}", scratch_unit["stderr_sha256"]) is not None
                               and type(scratch_unit.get("stdout_truncated")) is bool
                               and type(scratch_unit.get("stderr_truncated")) is bool
+                              and scratch_terminal_valid
                               and (
                                   scratch_unit.get("verification_error") == "none"
                                   or (
@@ -1352,6 +1390,10 @@ jobs:
                                    and scratch_unit["verification_error"] == "none"
                                    and scratch_unit["verification_errno"] is None)
                                   or (scratch_unit["phase"] == "confinement_verification_failed"
+                                      and scratch_unit["verification_error"] in {"os_error", "policy_error", "other"}
+                                      and (scratch_unit["verification_error"] == "os_error"
+                                           or scratch_unit["verification_errno"] is None))
+                                  or (scratch_unit["phase"] == "authorization_failed"
                                       and scratch_unit["verification_error"] in {"os_error", "policy_error", "other"}
                                       and (scratch_unit["verification_error"] == "os_error"
                                            or scratch_unit["verification_errno"] is None))

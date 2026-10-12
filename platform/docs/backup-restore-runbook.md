@@ -69,6 +69,26 @@ launcher exit fails closed. If
 confinement verification fails after the unit starts, the private diagnostic
 records only closed error and errno fields plus bounded output hashes; raw
 launcher output stays in the root-only workflow capture.
+The worker waits on its stdin pipe before inspecting the scratch mount, archive,
+resource state or PostgreSQL. The parent releases the fixed `START` token only
+after two consecutive checks bind the same active unit invocation, PID, process
+start time, cgroup, pinned interpreter inode and cgroup limits. After restore,
+Alembic and table checks, the worker flushes one bounded result frame and waits
+for `DONE` without touching scratch resources. The parent accepts only that
+complete strict frame, repeats the full live identity and resource checks, then
+sends `DONE` under the existing runtime deadline. It requires the launcher to
+exit successfully and the final stdout bytes to match the authorized frame
+exactly. Any identity change, malformed/extra output, missing token, early
+launcher exit or timeout stops and reaps the exact unit without accepting a
+result. The private schema-2 diagnostic may include a closed lifecycle-only
+snapshot taken before unit stop; it preserves the original failure snapshot
+and never affects success classification. In schema 2, the START/DONE token
+booleans mean the complete fixed token was written to the private pipe; they
+do not mean the worker received or accepted it. `false` means a complete write
+was not confirmed and does not assert that no prefix byte arrived. A late
+complete write is recorded truthfully but still fails the deadline and cannot
+authorize result acceptance. Existing schema-1 diagnostics remain valid under
+their original closed schema.
 If the unit reaches verified confinement and the restore command then exits
 unsuccessfully, the failure report records a separate closed
 `unit_exited_after_confinement` phase with the final unit state and bounded

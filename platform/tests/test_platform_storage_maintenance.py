@@ -3421,7 +3421,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "required_free_bytes": 20,
                         },
                         "scratch_unit_diagnostic": {
-                            "schema": 1,
+                            "schema": 2,
                             "phase": "confinement_verification_failed",
                             "active_state": "active",
                             "sub_state": "running",
@@ -3436,6 +3436,15 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "stderr_truncated": False,
                             "verification_error": "os_error",
                             "verification_errno": 3,
+                            "terminal_snapshot": {
+                                "load_state": "loaded",
+                                "active_state": "active",
+                                "sub_state": "running",
+                                "result": "success",
+                                "exec_main_status": 0,
+                                "start_token_sent": False,
+                                "completion_token_sent": False,
+                            },
                         },
                         "scratch_admission_diagnostic": {
                             "schema": 1,
@@ -3507,7 +3516,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(
                 typed_receipt["scratch_unit_diagnostic"],
                 {
-                    "schema": 1,
+                    "schema": 2,
                     "phase": "confinement_verification_failed",
                     "active_state": "active",
                     "sub_state": "running",
@@ -3522,6 +3531,15 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "stderr_truncated": False,
                     "verification_error": "os_error",
                     "verification_errno": 3,
+                    "terminal_snapshot": {
+                        "load_state": "loaded",
+                        "active_state": "active",
+                        "sub_state": "running",
+                        "result": "success",
+                        "exec_main_status": 0,
+                        "start_token_sent": False,
+                        "completion_token_sent": False,
+                    },
                 },
             )
             self.assertEqual(

@@ -79,6 +79,8 @@ SCRATCH_EARLY_EXIT_DRAIN_SECONDS = 2.0
 SCRATCH_EARLY_EXIT_DRAIN_BYTES = 1024 * 1024
 SCRATCH_PG_PORT = 55432
 SCRATCH_WORKER_MODE = "--_scratch-restore-worker"
+SCRATCH_START_TOKEN = b"OLDSPARKY_SCRATCH_RESTORE_START_V1\n"
+SCRATCH_DONE_TOKEN = b"OLDSPARKY_SCRATCH_RESTORE_DONE_V1\n"
 SCRATCH_APP_ROLE = "platform_user"
 SCRATCH_PRIVATE_OUTPUT_MARKER = b"SCRATCH_UNIT_PRIVATE_OUTPUT_V1\n"
 SCRATCH_PRIVATE_STDOUT_BYTES = 2 * 1024
@@ -295,23 +297,29 @@ _SCRATCH_UNIT_RESULTS = {
 
 def valid_scratch_unit_diagnostic(value: Any) -> bool:
     """Validate the closed, non-sensitive summary of an early scratch-unit exit."""
-    keys = {
+    base_keys = {
         "schema", "phase", "active_state", "sub_state", "result",
         "exec_main_status", "launcher_exit_status", "stdout_bytes",
         "stdout_sha256", "stdout_truncated", "stderr_bytes", "stderr_sha256",
         "stderr_truncated", "verification_error", "verification_errno",
     }
-    if not isinstance(value, dict) or set(value) != keys:
+    if not isinstance(value, dict) or type(value.get("schema")) is not int:
+        return False
+    schema = value["schema"]
+    expected_keys = base_keys if schema == 1 else base_keys | {"terminal_snapshot"}
+    phases = {
+        "unit_exited_before_confinement",
+        "confinement_verification_failed",
+        "unit_exited_after_confinement",
+    }
+    if schema == 2:
+        phases.add("authorization_failed")
+    if schema not in {1, 2} or set(value) != expected_keys:
         return False
     if (
         type(value.get("schema")) is not int
-        or value["schema"] != 1
         or type(value.get("phase")) is not str
-        or value.get("phase") not in {
-            "unit_exited_before_confinement",
-            "confinement_verification_failed",
-            "unit_exited_after_confinement",
-        }
+        or value.get("phase") not in phases
         or type(value.get("active_state")) is not str
         or value.get("active_state") not in {"failed", "inactive", "active"}
         or type(value.get("sub_state")) is not str
@@ -347,7 +355,7 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         )
     ):
         return False
-    if value["phase"] == "confinement_verification_failed":
+    if value["phase"] in {"confinement_verification_failed", "authorization_failed"}:
         if value["active_state"] != "active" or value["verification_error"] == "none":
             return False
     elif value["phase"] == "unit_exited_after_confinement":
@@ -365,7 +373,63 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         return False
     if value["verification_error"] != "os_error" and value["verification_errno"] is not None:
         return False
+    if schema == 2 and not valid_scratch_terminal_snapshot(value.get("terminal_snapshot")):
+        return False
     return True
+
+
+_SCRATCH_UNIT_LOAD_STATES = {"loaded", "not-found", "other"}
+_SCRATCH_UNIT_ACTIVE_STATES = {"active", "activating", "deactivating", "inactive", "failed", "reloading", "other"}
+
+
+def valid_scratch_terminal_snapshot(value: Any) -> bool:
+    """Validate the bounded lifecycle-only snapshot captured before unit stop."""
+    keys = {
+        "load_state", "active_state", "sub_state", "result", "exec_main_status",
+        "start_token_sent", "completion_token_sent",
+    }
+    return (
+        isinstance(value, dict)
+        and set(value) == keys
+        and type(value.get("load_state")) is str
+        and value["load_state"] in _SCRATCH_UNIT_LOAD_STATES
+        and type(value.get("active_state")) is str
+        and value["active_state"] in _SCRATCH_UNIT_ACTIVE_STATES
+        and type(value.get("sub_state")) is str
+        and value["sub_state"] in _SCRATCH_UNIT_SUBSTATES
+        and type(value.get("result")) is str
+        and value["result"] in _SCRATCH_UNIT_RESULTS
+        and (
+            value.get("exec_main_status") is None
+            or (type(value["exec_main_status"]) is int and 0 <= value["exec_main_status"] <= 255)
+        )
+        and type(value.get("start_token_sent")) is bool
+        and type(value.get("completion_token_sent")) is bool
+    )
+
+
+def _scratch_terminal_snapshot(
+    snapshot: dict[str, Any], *, start_token_sent: bool, completion_token_sent: bool
+) -> dict[str, Any] | None:
+    properties = snapshot.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    exec_status_raw = properties.get("ExecMainStatus")
+    exec_status = (
+        int(exec_status_raw)
+        if isinstance(exec_status_raw, str) and re.fullmatch(r"[0-9]{1,3}", exec_status_raw)
+        else None
+    )
+    value = {
+        "load_state": properties.get("LoadState") if properties.get("LoadState") in _SCRATCH_UNIT_LOAD_STATES else "other",
+        "active_state": properties.get("ActiveState") if properties.get("ActiveState") in _SCRATCH_UNIT_ACTIVE_STATES else "other",
+        "sub_state": properties.get("SubState") if properties.get("SubState") in _SCRATCH_UNIT_SUBSTATES else "other",
+        "result": properties.get("Result") if properties.get("Result") in _SCRATCH_UNIT_RESULTS else "other",
+        "exec_main_status": exec_status,
+        "start_token_sent": start_token_sent,
+        "completion_token_sent": completion_token_sent,
+    }
+    return value if valid_scratch_terminal_snapshot(value) else None
 
 
 def _scratch_private_output_envelope(stdout: bytes, stderr: bytes) -> bytes:
@@ -396,6 +460,7 @@ def _scratch_unit_diagnostic(
     phase: str = "unit_exited_before_confinement",
     verification_error: str = "none",
     verification_errno: int | None = None,
+    terminal_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     properties = snapshot.get("properties", {})
     if not isinstance(properties, dict):
@@ -409,7 +474,7 @@ def _scratch_unit_diagnostic(
     stdout_prefix = stdout_prefix[:SCRATCH_PRIVATE_STDOUT_BYTES]
     stderr_prefix = stderr_prefix[:SCRATCH_PRIVATE_STDERR_BYTES]
     diagnostic = {
-        "schema": 1,
+        "schema": 2 if valid_scratch_terminal_snapshot(terminal_snapshot) else 1,
         "phase": phase,
         "active_state": properties.get("ActiveState"),
         "sub_state": properties.get("SubState"),
@@ -425,6 +490,8 @@ def _scratch_unit_diagnostic(
         "verification_error": verification_error,
         "verification_errno": verification_errno,
     }
+    if diagnostic["schema"] == 2:
+        diagnostic["terminal_snapshot"] = terminal_snapshot
     return diagnostic if valid_scratch_unit_diagnostic(diagnostic) else None
 
 
@@ -2259,6 +2326,12 @@ def _open_verified_scratch_archive(args: argparse.Namespace) -> BinaryIO:
 
 
 def _scratch_worker_main(args: argparse.Namespace) -> int:
+    try:
+        authorization = sys.stdin.buffer.read(len(SCRATCH_START_TOKEN))
+    except (OSError, AttributeError) as exc:
+        raise RuntimeError("Scratch restore authorization was not received.") from exc
+    if authorization != SCRATCH_START_TOKEN:
+        raise RuntimeError("Scratch restore authorization was not received.")
     for name in tuple(os.environ):
         if name.startswith("PG"):
             os.environ.pop(name, None)
@@ -2461,7 +2534,19 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         raise primary_error
     if table_count is None or (pgdata / "postmaster.pid").exists():
         raise RuntimeError("Scratch restore server teardown was not confirmed.")
-    print(json.dumps({"ok": True, "restored_table_count": table_count}, separators=(",", ":")))
+    result_stream = getattr(sys.stdout, "buffer", None)
+    if result_stream is None:
+        raise RuntimeError("Scratch restore result channel is unavailable.")
+    result_stream.write(
+        (json.dumps({"ok": True, "restored_table_count": table_count}, separators=(",", ":")) + "\n").encode("ascii")
+    )
+    result_stream.flush()
+    try:
+        completion = sys.stdin.buffer.read(len(SCRATCH_DONE_TOKEN))
+    except (OSError, AttributeError) as exc:
+        raise RuntimeError("Scratch restore completion was not acknowledged.") from exc
+    if completion != SCRATCH_DONE_TOKEN:
+        raise RuntimeError("Scratch restore completion was not acknowledged.")
     return 0
 
 
@@ -2689,6 +2774,7 @@ def _scratch_service_snapshot(unit_name: str) -> dict[str, Any]:
         "SubState",
         "ControlGroup",
         "ExecMainPID",
+        "InvocationID",
         "ExecMainStatus",
         "Result",
         "TemporaryFileSystem",
@@ -2724,6 +2810,118 @@ def _scratch_service_snapshot(unit_name: str) -> dict[str, Any]:
         line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
     )
     return {"properties": properties, "load_state": properties.get("LoadState")}
+
+
+def _scratch_process_start_time(pid_text: str) -> str:
+    """Read the kernel start-time field to distinguish PID reuse during authorization."""
+    if not pid_text.isdecimal() or len(pid_text) > 10:
+        raise RuntimeError("Scratch restore worker process identity is unavailable.")
+    with pathlib.Path(f"/proc/{pid_text}/stat").open("rb") as source:
+        data = source.read(8193)
+    if len(data) > 8192:
+        raise RuntimeError("Scratch restore worker process identity is malformed.")
+    closing = data.rfind(b")")
+    if closing < 0:
+        raise RuntimeError("Scratch restore worker process identity is malformed.")
+    fields = data[closing + 1 :].split()
+    # The tail begins at stat field 3 (state); starttime is field 22.
+    if len(fields) <= 19 or not fields[19].isdecimal():
+        raise RuntimeError("Scratch restore worker process identity is malformed.")
+    return fields[19].decode("ascii")
+
+
+class _ScratchTokenDeliveryError(RuntimeError):
+    """A failed token write with a truthful complete-pipe-write marker."""
+
+    def __init__(self, message: str, *, complete: bool) -> None:
+        super().__init__(message)
+        self.complete = complete
+
+
+def _scratch_send_worker_token(
+    process: subprocess.Popen[bytes], *, token: bytes, deadline: float, close_after: bool
+) -> None:
+    """Write one fixed protocol token through a bounded nonblocking pipe."""
+    stream = process.stdin
+    if stream is None:
+        raise _ScratchTokenDeliveryError(
+            "Scratch restore authorization channel is unavailable.", complete=False
+        )
+    fd = stream.fileno()
+    os.set_blocking(fd, False)
+    remaining = memoryview(token)
+    write_error: BaseException | None = None
+    try:
+        with selectors.DefaultSelector() as authorization_selector:
+            authorization_selector.register(stream, selectors.EVENT_WRITE)
+            while remaining:
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise _ScratchTokenDeliveryError(
+                        "Scratch restore authorization did not complete before its startup deadline.",
+                        complete=False,
+                    )
+                ready = authorization_selector.select(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
+                if not ready:
+                    continue
+                try:
+                    written = os.write(fd, remaining)
+                except BlockingIOError:
+                    continue
+                if written <= 0:
+                    raise _ScratchTokenDeliveryError(
+                        "Scratch restore authorization channel closed before acknowledgement.",
+                        complete=False,
+                    )
+                remaining = remaining[written:]
+                if not remaining:
+                    completed_at = time.monotonic()
+                    if completed_at >= deadline:
+                        raise _ScratchTokenDeliveryError(
+                            "Scratch restore authorization completed after its startup deadline.",
+                            complete=True,
+                        )
+    except BaseException as exc:
+        write_error = exc
+        if isinstance(exc, _ScratchTokenDeliveryError):
+            raise
+        raise _ScratchTokenDeliveryError(
+            "Scratch restore authorization channel failed before a complete write.",
+            complete=not remaining,
+        ) from exc
+    finally:
+        if close_after and not stream.closed:
+            try:
+                stream.close()
+            except OSError:
+                if write_error is None:
+                    raise _ScratchTokenDeliveryError(
+                        "Scratch restore authorization channel could not be closed.",
+                        complete=not remaining,
+                    )
+
+
+def _scratch_worker_candidate(stdout: bytes) -> dict[str, Any] | None:
+    """Parse only one complete, bounded worker result frame before DONE."""
+    if not stdout or len(stdout) > 4096:
+        return None
+    if not stdout.endswith(b"\n"):
+        return None
+    payload = stdout[:-1]
+    if not payload or b"\n" in payload or b"\r" in payload:
+        raise RuntimeError("Scratch restore worker result framing is invalid.")
+    try:
+        decoded = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Scratch restore worker returned an invalid result candidate.") from exc
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != {"ok", "restored_table_count"}
+        or decoded.get("ok") is not True
+        or type(decoded.get("restored_table_count")) is not int
+        or decoded["restored_table_count"] <= 0
+    ):
+        raise RuntimeError("Scratch restore worker result candidate failed validation.")
+    return decoded
 
 
 def _scratch_expected_properties(
@@ -2941,6 +3139,12 @@ def _run_isolated_restore_drill(
         verification_errno: int | None = None
         active_control_group: str | None = None
         active_snapshot: dict[str, Any] | None = None
+        active_identity: tuple[str, str, str] | None = None
+        start_token_sent = False
+        completion_token_sent = False
+        candidate_output: bytes | None = None
+        identity_checks_passed = False
+        terminal_snapshot: dict[str, Any] | None = None
         selector: selectors.BaseSelector | None = None
         launch_started = False
         last_tick = time.monotonic()
@@ -2980,7 +3184,7 @@ def _run_isolated_restore_drill(
                 startup_deadline = time.monotonic() + SCRATCH_STARTUP_SECONDS
                 process = subprocess.Popen(
                     command,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=environment,
@@ -2996,7 +3200,7 @@ def _run_isolated_restore_drill(
             os.set_blocking(process.stderr.fileno(), False)
             selector.register(process.stdout, selectors.EVENT_READ, "stdout")
             selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-            while process.poll() is None:
+            while process.poll() is None and not completion_token_sent:
                 now = time.monotonic()
                 if now >= deadline or now - last_tick > SCRATCH_RUNTIME_SAMPLE_SECONDS * 8:
                     raise RuntimeError("Scratch restore monitor exceeded its bounded runtime or sample interval.")
@@ -3025,7 +3229,7 @@ def _run_isolated_restore_drill(
                     # output must reach the existing private diagnostic path.
                     early_exit_snapshot = snapshot
                     try:
-                        active_control_group = _scratch_expected_properties(
+                        verified_control_group = _scratch_expected_properties(
                             snapshot,
                             unit_name=unit_name,
                             mountpoint=mountpoint,
@@ -3033,10 +3237,66 @@ def _run_isolated_restore_drill(
                                 getattr(sys, "_base_executable", sys.executable)
                             ).resolve(strict=True),
                         )
-                        _scratch_control_group_snapshot(active_control_group)
-                        active_snapshot = snapshot
+                        _scratch_control_group_snapshot(verified_control_group)
+                        invocation_id = properties.get("InvocationID", "")
+                        if re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None:
+                            raise RuntimeError("Scratch restore unit invocation identity is unavailable.")
+                        process_start_time = _scratch_process_start_time(pid_text)
+                        observed_identity = (pid_text, invocation_id, process_start_time)
+                        if active_identity is not None and observed_identity != active_identity:
+                            raise RuntimeError("Scratch restore worker identity changed during verification.")
+                        if active_identity is None:
+                            if time.monotonic() >= startup_deadline or process.poll() is not None:
+                                raise RuntimeError("Scratch restore worker exited before authorization.")
+                            second_snapshot = _scratch_service_snapshot(unit_name)
+                            second_properties = second_snapshot.get("properties", {})
+                            if (
+                                second_properties.get("LoadState") != "loaded"
+                                or second_properties.get("ActiveState") != "active"
+                                or second_properties.get("ExecMainPID") != pid_text
+                                or second_properties.get("InvocationID") != invocation_id
+                            ):
+                                raise RuntimeError("Scratch restore unit identity changed before authorization.")
+                            second_control_group = _scratch_expected_properties(
+                                second_snapshot,
+                                unit_name=unit_name,
+                                mountpoint=mountpoint,
+                                python_binary=pathlib.Path(
+                                    getattr(sys, "_base_executable", sys.executable)
+                                ).resolve(strict=True),
+                            )
+                            _scratch_control_group_snapshot(second_control_group)
+                            if (
+                                second_control_group != verified_control_group
+                                or _scratch_process_start_time(pid_text) != process_start_time
+                                or time.monotonic() >= startup_deadline
+                                or process.poll() is not None
+                            ):
+                                raise RuntimeError("Scratch restore worker identity changed before authorization.")
+                            identity_checks_passed = True
+                            active_identity = observed_identity
+                            active_control_group = verified_control_group
+                            active_snapshot = second_snapshot
+                            try:
+                                _scratch_send_worker_token(
+                                    process,
+                                    token=SCRATCH_START_TOKEN,
+                                    deadline=startup_deadline,
+                                    close_after=False,
+                                )
+                            except _ScratchTokenDeliveryError as delivery_error:
+                                start_token_sent = delivery_error.complete
+                                raise
+                            start_token_sent = True
+                        else:
+                            identity_checks_passed = True
                     except BaseException as verification_exception:
-                        early_exit_phase = "confinement_verification_failed"
+                        if identity_checks_passed and not completion_token_sent:
+                            early_exit_phase = "authorization_failed"
+                        elif active_control_group is not None:
+                            early_exit_phase = "unit_exited_after_confinement"
+                        else:
+                            early_exit_phase = "confinement_verification_failed"
                         verification_error, verification_errno = (
                             _scratch_verification_error_details(verification_exception)
                         )
@@ -3082,6 +3342,55 @@ def _run_isolated_restore_drill(
                             stderr_buffer.extend(data[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
                         if stderr_size > 65536:
                             raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
+                if start_token_sent and not completion_token_sent and stdout_buffer:
+                    candidate = _scratch_worker_candidate(bytes(stdout_buffer))
+                    if candidate is not None:
+                        if active_identity is None or active_control_group is None:
+                            raise RuntimeError("Scratch restore worker identity was not retained through completion.")
+                        final_snapshot = _scratch_service_snapshot(unit_name)
+                        final_properties = final_snapshot.get("properties", {})
+                        final_pid = final_properties.get("ExecMainPID", "0")
+                        final_invocation = final_properties.get("InvocationID", "")
+                        if (
+                            final_properties.get("LoadState") != "loaded"
+                            or final_properties.get("ActiveState") != "active"
+                            or (final_pid, final_invocation) != active_identity[:2]
+                            or time.monotonic() >= deadline
+                        ):
+                            raise RuntimeError("Scratch restore worker identity changed before completion acknowledgement.")
+                        final_control_group = _scratch_expected_properties(
+                            final_snapshot,
+                            unit_name=unit_name,
+                            mountpoint=mountpoint,
+                            python_binary=pathlib.Path(
+                                getattr(sys, "_base_executable", sys.executable)
+                            ).resolve(strict=True),
+                        )
+                        _scratch_control_group_snapshot(final_control_group)
+                        if (
+                            final_control_group != active_control_group
+                            or _scratch_process_start_time(final_pid) != active_identity[2]
+                        ):
+                            raise RuntimeError("Scratch restore worker identity changed before completion acknowledgement.")
+                        candidate_output = bytes(stdout_buffer)
+                        worker_result = candidate
+                        early_exit_snapshot = final_snapshot
+                        early_exit_phase = "authorization_failed"
+                        verification_error = "other"
+                        try:
+                            _scratch_send_worker_token(
+                                process,
+                                token=SCRATCH_DONE_TOKEN,
+                                deadline=deadline,
+                                close_after=True,
+                            )
+                        except _ScratchTokenDeliveryError as delivery_error:
+                            completion_token_sent = delivery_error.complete
+                            raise
+                        completion_token_sent = True
+                        # DONE releases the already-verified worker to exit;
+                        # do not race that intentional exit with another /proc probe.
+                        break
             if active_control_group is None:
                 # A very short-lived launcher may finish before the monitor
                 # observes an active unit. Never accept its worker result
@@ -3090,6 +3399,10 @@ def _run_isolated_restore_drill(
                 raise RuntimeError(
                     "Scratch restore service exited before its confinement was verified."
                 )
+            if not completion_token_sent or candidate_output is None or bytes(stdout_buffer) != candidate_output:
+                early_exit_snapshot = _scratch_service_snapshot(unit_name)
+                early_exit_phase = "unit_exited_after_confinement"
+                raise RuntimeError("Scratch restore worker completion was not fully authorized and verified.")
             return_code = process.wait(timeout=5)
             for stream in (process.stdout, process.stderr):
                 if stream:
@@ -3109,8 +3422,8 @@ def _run_isolated_restore_drill(
                             stderr_size += len(data)
                             if len(stderr_buffer) < SCRATCH_PRIVATE_STDERR_BYTES:
                                 stderr_buffer.extend(data[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
-                            if stderr_size > 65536:
-                                raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
+                        if stderr_size > 65536:
+                            raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
             if return_code != 0 or stderr_size != 0:
                 try:
                     final_snapshot = _scratch_service_snapshot(unit_name)
@@ -3143,14 +3456,40 @@ def _run_isolated_restore_drill(
                 early_exit_snapshot = _scratch_service_snapshot(unit_name)
                 early_exit_phase = "unit_exited_after_confinement"
                 raise RuntimeError("Isolated PostgreSQL backup restore result failed validation.")
+            if decoded != worker_result:
+                early_exit_snapshot = _scratch_service_snapshot(unit_name)
+                early_exit_phase = "unit_exited_after_confinement"
+                raise RuntimeError("Scratch restore worker result changed after completion authorization.")
             worker_result = decoded
         except BaseException as operation_error:
+            if start_token_sent and not completion_token_sent and active_snapshot is not None:
+                # The unit is still held at the worker barrier. Preserve the
+                # live proof and classify this as an authorization-stage failure.
+                early_exit_snapshot = active_snapshot
+                early_exit_phase = "authorization_failed"
+                if verification_error == "none":
+                    verification_error = "other"
             # Cleanup must not be interrupted by a second TERM/INT. The unit
             # itself also remains bounded by its systemd RuntimeMaxSec.
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             cleanup_errors: list[BaseException] = []
+            if launch_started:
+                try:
+                    terminal_snapshot = _scratch_terminal_snapshot(
+                        _scratch_service_snapshot(unit_name),
+                        start_token_sent=start_token_sent,
+                        completion_token_sent=completion_token_sent,
+                    )
+                except BaseException:
+                    terminal_snapshot = None
+            authorization_stream = getattr(process, "stdin", None) if process is not None else None
+            if authorization_stream is not None and not authorization_stream.closed:
+                try:
+                    authorization_stream.close()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
             try:
                 if launch_started:
                     _scratch_stop_unit(unit_name)
@@ -3197,6 +3536,7 @@ def _run_isolated_restore_drill(
                     phase=early_exit_phase,
                     verification_error=verification_error,
                     verification_errno=verification_errno,
+                    terminal_snapshot=terminal_snapshot,
                 )
                 if diagnostic is not None:
                     setattr(operation_error, "scratch_unit_diagnostic", diagnostic)
