@@ -351,6 +351,155 @@ def _workflow_step_blocks(job_block: str) -> tuple[str, ...]:
     )
 
 
+def _validated_scratch_diagnostic_filtered_workflow(
+    workflow_text: str,
+) -> tuple[str, list[str]]:
+    """Exclude only the validated diagnostic and upload steps from gate checks."""
+
+    issues: list[str] = []
+    job_block = _workflow_job_block(workflow_text, "backend-privileged")
+    if not job_block:
+        return workflow_text, ["backend-privileged is missing for scratch diagnostic"]
+
+    steps = _workflow_step_blocks(job_block)
+
+    def named_steps(name: str) -> list[tuple[int, str]]:
+        return [
+            (index, step)
+            for index, step in enumerate(steps)
+            if re.match(rf"^      - name: {re.escape(name)}[ \t]*(?:\r?\n|$)", step)
+        ]
+
+    diagnostic_name = "Run focused scratch restore diagnostic without gate credit"
+    upload_name = "Upload focused scratch restore diagnostic"
+    contour_name = "Run serial privileged catalog contour exactly once as root"
+    finalizer_name = "Require focused scratch restore diagnostic success"
+    diagnostic_matches = named_steps(diagnostic_name)
+    upload_matches = named_steps(upload_name)
+    contour_matches = named_steps(contour_name)
+    finalizer_matches = named_steps(finalizer_name)
+    for name, matches in (
+        (diagnostic_name, diagnostic_matches),
+        (upload_name, upload_matches),
+        (contour_name, contour_matches),
+        (finalizer_name, finalizer_matches),
+    ):
+        if len(matches) != 1:
+            issues.append(f"backend-privileged must contain exactly one {name} step")
+    if issues:
+        return workflow_text, issues
+
+    diagnostic_index, diagnostic_step = diagnostic_matches[0]
+    upload_index, upload_step = upload_matches[0]
+    contour_index, _ = contour_matches[0]
+    finalizer_index, finalizer_step = finalizer_matches[0]
+    if not diagnostic_index < upload_index < contour_index < finalizer_index:
+        issues.append("focused scratch diagnostic, upload, full contour and finalizer are out of order")
+
+    test_case = next(
+        (
+            case
+            for case in discover_test_cases()
+            if case.module == "test_platform_backup_restore_drill"
+            and case.method_name == "test_isolated_restore_signal_cleanup_under_root"
+        ),
+        None,
+    )
+    if test_case is None or test_case.contour != "backend-privileged":
+        issues.append("focused scratch diagnostic test is not owned by backend-privileged")
+    normalized_diagnostic = re.sub(r"\\\s*\n\s*", " ", diagnostic_step)
+    normalized_diagnostic = re.sub(r"\s+", " ", normalized_diagnostic)
+    if test_case is not None:
+        command_start = normalized_diagnostic.find('bash -lc "')
+        command_end = normalized_diagnostic.find('" >> "$diagnostic"', command_start + 1)
+        actual_command = (
+            normalized_diagnostic[command_start + len('bash -lc "') : command_end]
+            if command_start >= 0 and command_end >= 0
+            else ""
+        )
+        expected_command = (
+            "cd '$GITHUB_WORKSPACE/platform' && .venv_platform/bin/python "
+            "tools/platform_verify.py backend-privileged --focused "
+            f"{test_case.test_id}"
+        )
+        if actual_command != expected_command:
+            issues.append("focused scratch diagnostic must use the exact catalog-owned verifier selector")
+    if diagnostic_step.count("tools/platform_verify.py") != 1:
+        issues.append("focused scratch diagnostic must invoke the canonical verifier exactly once")
+    if "platform_run_tests.sh" in diagnostic_step:
+        issues.append("focused scratch diagnostic must not call the test runner directly")
+    if re.search(r"--(?:manifest|summary)\b", diagnostic_step):
+        issues.append("focused scratch diagnostic must not emit a gate manifest or summary")
+    if not re.search(r"(?m)^\s+id: scratch_restore_diagnostic$", diagnostic_step):
+        issues.append("focused scratch diagnostic must have its unique outcome id")
+    if len(re.findall(r"(?m)^\s+id: scratch_restore_diagnostic$", job_block)) != 1:
+        issues.append("backend-privileged must define the scratch diagnostic outcome id exactly once")
+    if not re.search(r"(?m)^\s+id: scratch_diagnostic_upload$", upload_step):
+        issues.append("focused scratch diagnostic upload must have its unique outcome id")
+    if len(re.findall(r"(?m)^\s+id: scratch_diagnostic_upload$", job_block)) != 1:
+        issues.append("backend-privileged must define the diagnostic upload outcome id exactly once")
+    if len(re.findall(r"(?m)^\s+continue-on-error:", diagnostic_step)) != 1 or not re.search(
+        r"(?m)^\s+continue-on-error: true$", diagnostic_step
+    ):
+        issues.append("focused scratch diagnostic must continue only to run the full contour")
+    for required in (
+        "umask 077",
+        'source_sha=%s\\nrun_id=%s\\nrun_attempt=%s',
+        '"$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
+        'diagnostic="$RUNNER_TEMP/platform-backup-scratch-diagnostic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"',
+        'chmod 600 "$diagnostic"',
+        '>> "$diagnostic" 2>&1',
+    ):
+        if required not in diagnostic_step:
+            issues.append(f"focused scratch diagnostic is missing private/source-bound capture: {required}")
+
+    if not re.search(r"(?m)^\s+if: \$\{\{ always\(\) \}\}$", upload_step):
+        issues.append("focused scratch diagnostic upload must run always")
+    if len(re.findall(r"(?m)^\s+continue-on-error:", upload_step)) != 1 or not re.search(
+        r"(?m)^\s+continue-on-error: true$", upload_step
+    ):
+        issues.append("focused scratch diagnostic upload must not prevent the full contour")
+    if "actions/upload-artifact@" not in upload_step:
+        issues.append("focused scratch diagnostic must use the pinned artifact uploader")
+    if "platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}" not in upload_step:
+        issues.append("focused scratch diagnostic artifact name must bind the workflow attempt")
+    if "${{ runner.temp }}/platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}.log" not in upload_step:
+        issues.append("focused scratch diagnostic upload path must bind the private attempt log")
+    if "if-no-files-found: error" not in upload_step:
+        issues.append("focused scratch diagnostic upload must fail when its log is absent")
+    if "retention-days: 14" not in upload_step:
+        issues.append("focused scratch diagnostic artifact retention must remain bounded")
+    if not re.search(r"(?m)^\s+if: \$\{\{ always\(\) \}\}$", finalizer_step):
+        issues.append("focused scratch diagnostic finalizer must run always")
+    expected_finalizer_env = (
+        "SCRATCH_DIAGNOSTIC_OUTCOME: ${{ steps.scratch_restore_diagnostic.outcome }}",
+        "SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME: ${{ steps.scratch_diagnostic_upload.outcome }}",
+    )
+    for value in expected_finalizer_env:
+        if value not in finalizer_step:
+            issues.append(f"focused scratch diagnostic finalizer must bind {value.split(':', 1)[0]}")
+    normalized_finalizer = re.sub(r"\s+", " ", finalizer_step)
+    expected_failure_branch = (
+        'if [[ "$SCRATCH_DIAGNOSTIC_OUTCOME" != "success" || '
+        '"$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success" ]]; then '
+        'echo "Focused scratch restore diagnostic or artifact upload failed; full contour still ran, but this job cannot pass." >&2 '
+        "exit 1 fi"
+    )
+    if expected_failure_branch not in normalized_finalizer or finalizer_step.count("exit 1") != 1:
+        issues.append("focused scratch diagnostic finalizer must fail inside the exact unsuccessful-outcome branch")
+    for outcome in (
+        "steps.scratch_restore_diagnostic.outcome",
+        "steps.scratch_diagnostic_upload.outcome",
+    ):
+        if outcome not in finalizer_step:
+            issues.append(f"focused scratch diagnostic finalizer must check {outcome}")
+    if issues:
+        return workflow_text, issues
+    filtered_workflow = workflow_text.replace(diagnostic_step, "", 1)
+    filtered_workflow = filtered_workflow.replace(upload_step, "", 1)
+    return filtered_workflow, []
+
+
 def host_tools_candidate_artifact_zip_curl_blocks(workflow_text: str) -> tuple[str, ...]:
     """Find every artifact ZIP download curl command in the candidate workflow.
 
@@ -1407,13 +1556,20 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
     """Check the backend DAG without executing any CI jobs."""
 
     issues: list[str] = []
+    execution_text, diagnostic_issues = _validated_scratch_diagnostic_filtered_workflow(
+        security_text
+    )
+    issues.extend(diagnostic_issues)
     expected_jobs = {
         "backend-static": ("backend-unit", "backend-tool-contract", "performance-contract"),
         "backend-integration": ("backend-integration",),
         "backend-privileged": ("backend-privileged",),
         "backend": (),
     }
-    blocks = {job_id: _workflow_job_block(security_text, job_id) for job_id in expected_jobs}
+    blocks = {
+        job_id: _workflow_job_block(execution_text, job_id)
+        for job_id in expected_jobs
+    }
     for job_id, contours in expected_jobs.items():
         block = blocks[job_id]
         if not block:
@@ -1964,7 +2120,8 @@ def collect_issues() -> list[str]:
         issues.append("platform-security.yml must publish a machine-readable summary")
     issues.extend(_checkout_credential_issues("platform-security.yml", security_text))
     issues.extend(_ci_dependency_issues(security_text))
-    invocations = extract_gate_invocations(security_text)
+    gate_contract_text, _ = _validated_scratch_diagnostic_filtered_workflow(security_text)
+    invocations = extract_gate_invocations(gate_contract_text)
     missing = sorted(set(CI_GATE_IDS) - set(invocations))
     if missing:
         issues.append(f"CI does not invoke required canonical gates: {', '.join(missing)}")
@@ -1993,8 +2150,12 @@ def collect_issues() -> list[str]:
     )
     unknown = sorted(
         gate_id
-        for path, text in _workflow_texts()
-        for gate_id in extract_gate_invocations(text)
+    for path, text in _workflow_texts()
+        for gate_id in extract_gate_invocations(
+            _validated_scratch_diagnostic_filtered_workflow(text)[0]
+            if path == SECURITY_WORKFLOW
+            else text
+        )
         if gate_id not in GATES_BY_ID
         and gate_id not in (*BACKEND_CONTOURS, BACKEND_AGGREGATE, VERIFICATION_CONTOUR)
         and gate_id != "ci"

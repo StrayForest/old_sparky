@@ -92,6 +92,7 @@ from tools.platform_verify_contract import (
     SECURITY_WORKFLOW,
     _production_secret_scope_issues,
     _backend_workflow_issues,
+    _validated_scratch_diagnostic_filtered_workflow,
     action_pin_issues,
     collect_issues,
     _ci_dependency_issues,
@@ -1240,7 +1241,6 @@ class PlatformVerificationContractTests(unittest.TestCase):
             privileged_body[diagnostic_start:diagnostic_upload],
             r"(?m)^\s+continue-on-error: true$",
         )
-        self.assertIn("--contour backend-privileged", privileged_body)
         diagnostic_test = next(
             case
             for case in discover_test_cases()
@@ -1249,7 +1249,15 @@ class PlatformVerificationContractTests(unittest.TestCase):
         )
         self.assertEqual(diagnostic_test.contour, "backend-privileged")
         self.assertIn(f"--focused {diagnostic_test.test_id}", privileged_body)
-        self.assertIn("tools/platform_verify.py backend-privileged", diagnostic_script)
+        normalized_diagnostic_script = re.sub(
+            r"\s+",
+            " ",
+            re.sub(r"\\\s*\n\s*", " ", diagnostic_script),
+        )
+        self.assertIn(
+            f"tools/platform_verify.py backend-privileged --focused {diagnostic_test.test_id}",
+            normalized_diagnostic_script,
+        )
         self.assertNotIn("platform_run_tests.sh", diagnostic_script)
         self.assertIn("focused_exit=%s", privileged_body)
         self.assertIn("(no gate credit)", privileged_body)
@@ -1270,6 +1278,155 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertIn("SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME", finalizer_contract)
         self.assertIn('"$SCRATCH_DIAGNOSTIC_OUTCOME" != "success"', finalizer_contract)
         self.assertIn('"$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success"', finalizer_contract)
+
+        filtered_workflow, diagnostic_issues = _validated_scratch_diagnostic_filtered_workflow(
+            workflow
+        )
+        self.assertEqual(diagnostic_issues, [])
+        self.assertEqual(
+            extract_gate_invocations(filtered_workflow).count("backend-privileged"),
+            1,
+        )
+        diagnostic_step = workflow[
+            workflow.index("      - name: Run focused scratch restore diagnostic without gate credit") :
+            workflow.index("      - name: Upload focused scratch restore diagnostic")
+        ]
+        missing_diagnostic = workflow.replace(diagnostic_step, "", 1)
+        _, missing_issues = _validated_scratch_diagnostic_filtered_workflow(
+            missing_diagnostic
+        )
+        self.assertTrue(any("exactly one Run focused scratch restore diagnostic" in issue for issue in missing_issues))
+        duplicate_diagnostic = workflow.replace(
+            diagnostic_step, diagnostic_step + diagnostic_step, 1
+        )
+        _, duplicate_issues = _validated_scratch_diagnostic_filtered_workflow(
+            duplicate_diagnostic
+        )
+        self.assertTrue(any("exactly one Run focused scratch restore diagnostic" in issue for issue in duplicate_issues))
+        duplicate_diagnostic_retry = workflow.replace(
+            "        continue-on-error: true\n        run: |\n          set -euo pipefail\n          umask 077",
+            "        continue-on-error: true\n        continue-on-error: true\n        run: |\n          set -euo pipefail\n          umask 077",
+            1,
+        )
+        _, duplicate_retry_issues = _validated_scratch_diagnostic_filtered_workflow(
+            duplicate_diagnostic_retry
+        )
+        self.assertTrue(any("diagnostic must continue only" in issue for issue in duplicate_retry_issues))
+        malformed_selector = workflow.replace(
+            f"--focused {diagnostic_test.test_id}",
+            "--focused tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_missing_case",
+            1,
+        )
+        unfiltered_malformed, malformed_issues = _validated_scratch_diagnostic_filtered_workflow(
+            malformed_selector
+        )
+        self.assertEqual(unfiltered_malformed, malformed_selector)
+        self.assertTrue(any("exact catalog-owned verifier selector" in issue for issue in malformed_issues))
+        malformed_extra_arg = workflow.replace(
+            f"--focused {diagnostic_test.test_id}\"",
+            f"--focused {diagnostic_test.test_id} --quiet\"",
+            1,
+        )
+        unfiltered_extra_arg, extra_arg_issues = _validated_scratch_diagnostic_filtered_workflow(
+            malformed_extra_arg
+        )
+        self.assertEqual(unfiltered_extra_arg, malformed_extra_arg)
+        self.assertTrue(any("exact catalog-owned verifier selector" in issue for issue in extra_arg_issues))
+        malformed_source_binding = workflow.replace(
+            '"$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
+            '"$GITHUB_SHA" "$GITHUB_RUN_ID" "0"',
+            1,
+        )
+        _, source_binding_issues = _validated_scratch_diagnostic_filtered_workflow(
+            malformed_source_binding
+        )
+        self.assertTrue(any("private/source-bound capture" in issue for issue in source_binding_issues))
+        malformed_finalizer = workflow.replace(
+            '"$SCRATCH_DIAGNOSTIC_OUTCOME" != "success" || '
+            '"$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success"',
+            '"$SCRATCH_DIAGNOSTIC_OUTCOME" != "success" && '
+            '"$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success"',
+            1,
+        )
+        unfiltered_finalizer, finalizer_condition_issues = _validated_scratch_diagnostic_filtered_workflow(
+            malformed_finalizer
+        )
+        self.assertEqual(unfiltered_finalizer, malformed_finalizer)
+        self.assertTrue(any("inside the exact unsuccessful-outcome branch" in issue for issue in finalizer_condition_issues))
+        finalizer_start = workflow.index(
+            "      - name: Require focused scratch restore diagnostic success"
+        )
+        finalizer_end = workflow.index("\n  backend:", finalizer_start)
+        workflow_before_finalizer = workflow[:finalizer_start]
+        finalizer_step_block = workflow[finalizer_start:finalizer_end]
+        workflow_after_finalizer = workflow[finalizer_end:]
+        self.assertEqual(finalizer_step_block.count('            exit 1\n          fi'), 1)
+        malformed_finalizer_exit = workflow_before_finalizer + finalizer_step_block.replace(
+            '            exit 1\n          fi',
+            '          fi\n          exit 1',
+            1,
+        ) + workflow_after_finalizer
+        self.assertNotEqual(malformed_finalizer_exit, workflow)
+        unfiltered_finalizer_exit, finalizer_exit_issues = _validated_scratch_diagnostic_filtered_workflow(
+            malformed_finalizer_exit
+        )
+        self.assertEqual(unfiltered_finalizer_exit, malformed_finalizer_exit)
+        self.assertTrue(any("inside the exact unsuccessful-outcome branch" in issue for issue in finalizer_exit_issues))
+        missing_upload = workflow.replace(
+            workflow[
+                workflow.index("      - name: Upload focused scratch restore diagnostic") :
+                workflow.index("      - name: Run serial privileged catalog contour exactly once as root")
+            ],
+            "",
+            1,
+        )
+        _, upload_issues = _validated_scratch_diagnostic_filtered_workflow(missing_upload)
+        self.assertTrue(any("exactly one Upload focused scratch restore diagnostic" in issue for issue in upload_issues))
+        upload_step = workflow[
+            workflow.index("      - name: Upload focused scratch restore diagnostic") :
+            workflow.index("      - name: Run serial privileged catalog contour exactly once as root")
+        ]
+        duplicate_upload = workflow.replace(upload_step, upload_step + upload_step, 1)
+        _, duplicate_upload_issues = _validated_scratch_diagnostic_filtered_workflow(
+            duplicate_upload
+        )
+        self.assertTrue(any("exactly one Upload focused scratch restore diagnostic" in issue for issue in duplicate_upload_issues))
+        missing_finalizer = workflow.replace(
+            workflow[
+                workflow.index("      - name: Require focused scratch restore diagnostic success") :
+                workflow.index("\n  backend:", workflow.index("      - name: Require focused scratch restore diagnostic success"))
+            ],
+            "",
+            1,
+        )
+        _, finalizer_issues = _validated_scratch_diagnostic_filtered_workflow(
+            missing_finalizer
+        )
+        self.assertTrue(any("exactly one Require focused scratch restore diagnostic success" in issue for issue in finalizer_issues))
+        duplicate_full_gate = workflow.replace(
+            "          .venv_platform/bin/python tools/platform_verify.py backend-privileged\n",
+            "          .venv_platform/bin/python tools/platform_verify.py backend-privileged\n"
+            "          .venv_platform/bin/python tools/platform_verify.py backend-privileged\n",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "backend job backend-privileged must invoke backend-privileged exactly once" in issue
+                for issue in _backend_workflow_issues(duplicate_full_gate)
+            )
+        )
+        resumable_full_gate = workflow.replace(
+            "      - name: Run serial privileged catalog contour exactly once as root\n",
+            "      - name: Run serial privileged catalog contour exactly once as root\n"
+            "        continue-on-error: true\n",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "backend job backend-privileged must not continue on error" in issue
+                for issue in _backend_workflow_issues(resumable_full_gate)
+            )
+        )
         safe_environment = {
             "PLATFORM_ENVIRONMENT": "test",
             "PLATFORM_DB_SCHEMA": "platform",
@@ -2179,7 +2336,7 @@ except lock.VerificationLockError as exc:
         self.assertNotIn("RUNNER_TEMP/platform-verification-runtime", workflow)
         self.assertNotIn("PLATFORM_VERIFICATION_RUNTIME_DIR", workflow)
         self.assertNotIn("sudo install -d", workflow)
-        self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 4)
+        self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 5)
         verification_block = re.search(
             r"^  verification-contract:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
             workflow,
