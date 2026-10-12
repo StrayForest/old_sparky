@@ -53,6 +53,16 @@ inode-pinned new pair and leaves the existing backup inventory unchanged. If
 exact rollback cannot be confirmed, the operation reports a closed
 backup-integrity status and does not claim preservation.
 
+The transient restore unit must reach an active state with its process and
+control group verified within 30 seconds. While the launcher is running,
+`loaded`/`not-found` units may remain `inactive` only without a process
+identity; an `activating` unit may expose a preliminary identity, which is not
+accepted until the active-state checks complete. A failed unit result or
+launcher exit fails closed. If
+confinement verification fails after the unit starts, the private diagnostic
+records only closed error and errno fields plus bounded output hashes; raw
+launcher output stays in the root-only workflow capture.
+
 Keep this backup budget separate from the release installer budget. The
 release coexistence reserve covers release staging and is not backup capacity.
 Backup creation writes a temporary dump on the backup filesystem. Unless

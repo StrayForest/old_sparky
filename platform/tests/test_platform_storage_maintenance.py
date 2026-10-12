@@ -885,6 +885,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "stderr_bytes": 0,
             "stderr_sha256": hashlib.sha256(b"").hexdigest(),
             "stderr_truncated": False,
+            "verification_error": "none",
+            "verification_errno": None,
         }
         failure = subprocess.CompletedProcess(
             [],
@@ -3259,11 +3261,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         },
                         "scratch_unit_diagnostic": {
                             "schema": 1,
-                            "phase": "unit_exited_before_confinement",
-                            "active_state": "failed",
-                            "sub_state": "failed",
-                            "result": "exit-code",
-                            "exec_main_status": 1,
+                            "phase": "confinement_verification_failed",
+                            "active_state": "active",
+                            "sub_state": "running",
+                            "result": "success",
+                            "exec_main_status": 0,
                             "launcher_exit_status": 1,
                             "stdout_bytes": 2048,
                             "stdout_sha256": "a" * 64,
@@ -3271,6 +3273,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "stderr_bytes": 32768,
                             "stderr_sha256": "b" * 64,
                             "stderr_truncated": False,
+                            "verification_error": "os_error",
+                            "verification_errno": 3,
                         },
                     }
                 ),
@@ -3330,11 +3334,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 typed_receipt["scratch_unit_diagnostic"],
                 {
                     "schema": 1,
-                    "phase": "unit_exited_before_confinement",
-                    "active_state": "failed",
-                    "sub_state": "failed",
-                    "result": "exit-code",
-                    "exec_main_status": 1,
+                    "phase": "confinement_verification_failed",
+                    "active_state": "active",
+                    "sub_state": "running",
+                    "result": "success",
+                    "exec_main_status": 0,
                     "launcher_exit_status": 1,
                     "stdout_bytes": 2048,
                     "stdout_sha256": "a" * 64,
@@ -3342,6 +3346,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "stderr_bytes": 32768,
                     "stderr_sha256": "b" * 64,
                     "stderr_truncated": False,
+                    "verification_error": "os_error",
+                    "verification_errno": 3,
                 },
             )
             self.assertNotIn(
@@ -3379,10 +3385,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         },
                         "scratch_unit_diagnostic": {
                             "schema": 1,
-                            "phase": "unit_exited_before_confinement",
-                            "active_state": ["failed"],
-                            "sub_state": "failed",
-                            "result": "exit-code",
+                            "phase": "confinement_verification_failed",
+                            "active_state": "active",
+                            "sub_state": "running",
+                            "result": "success",
                             "exec_main_status": 1,
                             "launcher_exit_status": 1,
                             "stdout_bytes": 32,
@@ -3391,6 +3397,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "stderr_bytes": 128,
                             "stderr_sha256": "b" * 64,
                             "stderr_truncated": False,
+                            "verification_error": "policy_error",
+                            "verification_errno": 2,
                         },
                     }
                 ),
@@ -3458,6 +3466,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "stderr_bytes": 32768,
                             "stderr_sha256": "b" * 64,
                             "stderr_truncated": False,
+                            "verification_error": "none",
+                            "verification_errno": None,
                         },
                     }
                 ),

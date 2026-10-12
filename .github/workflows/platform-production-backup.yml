@@ -1229,7 +1229,8 @@ jobs:
                               "schema", "phase", "active_state", "sub_state", "result",
                               "exec_main_status", "launcher_exit_status", "stdout_bytes",
                               "stdout_sha256", "stdout_truncated", "stderr_bytes",
-                              "stderr_sha256", "stderr_truncated",
+                              "stderr_sha256", "stderr_truncated", "verification_error",
+                              "verification_errno",
                           }
                           valid_scratch = (
                               isinstance(scratch_unit, dict)
@@ -1237,9 +1238,17 @@ jobs:
                               and type(scratch_unit.get("schema")) is int
                               and scratch_unit["schema"] == 1
                               and type(scratch_unit.get("phase")) is str
-                              and scratch_unit["phase"] == "unit_exited_before_confinement"
+                              and scratch_unit["phase"] in {
+                                  "unit_exited_before_confinement",
+                                  "confinement_verification_failed",
+                              }
                               and type(scratch_unit.get("active_state")) is str
-                              and scratch_unit["active_state"] in {"failed", "inactive"}
+                              and (
+                                  (scratch_unit["phase"] == "unit_exited_before_confinement"
+                                   and scratch_unit["active_state"] in {"failed", "inactive"})
+                                  or (scratch_unit["phase"] == "confinement_verification_failed"
+                                      and scratch_unit["active_state"] == "active")
+                              )
                               and type(scratch_unit.get("sub_state")) is str
                               and scratch_unit["sub_state"] in scratch_substates
                               and type(scratch_unit.get("result")) is str
@@ -1268,6 +1277,29 @@ jobs:
                               and re.fullmatch(r"[0-9a-f]{64}", scratch_unit["stderr_sha256"]) is not None
                               and type(scratch_unit.get("stdout_truncated")) is bool
                               and type(scratch_unit.get("stderr_truncated")) is bool
+                              and (
+                                  scratch_unit.get("verification_error") == "none"
+                                  or (
+                                      type(scratch_unit["verification_error"]) is str
+                                      and scratch_unit["verification_error"] in {"os_error", "policy_error", "other"}
+                                  )
+                              )
+                              and (
+                                  scratch_unit.get("verification_errno") is None
+                                  or (
+                                      type(scratch_unit["verification_errno"]) is int
+                                      and 1 <= scratch_unit["verification_errno"] <= 4095
+                                  )
+                              )
+                              and (
+                                  (scratch_unit["phase"] == "unit_exited_before_confinement"
+                                   and scratch_unit["verification_error"] == "none"
+                                   and scratch_unit["verification_errno"] is None)
+                                  or (scratch_unit["phase"] == "confinement_verification_failed"
+                                      and scratch_unit["verification_error"] in {"os_error", "policy_error", "other"}
+                                      and (scratch_unit["verification_error"] == "os_error"
+                                           or scratch_unit["verification_errno"] is None))
+                              )
                           )
                           if valid_scratch:
                               scratch_unit_diagnostic = scratch_unit
