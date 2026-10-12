@@ -248,7 +248,7 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         "schema", "phase", "active_state", "sub_state", "result",
         "exec_main_status", "launcher_exit_status", "stdout_bytes",
         "stdout_sha256", "stdout_truncated", "stderr_bytes", "stderr_sha256",
-        "stderr_truncated",
+        "stderr_truncated", "verification_error", "verification_errno",
     }
     if not isinstance(value, dict) or set(value) != keys:
         return False
@@ -256,9 +256,12 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         type(value.get("schema")) is not int
         or value["schema"] != 1
         or type(value.get("phase")) is not str
-        or value.get("phase") != "unit_exited_before_confinement"
+        or value.get("phase") not in {
+            "unit_exited_before_confinement",
+            "confinement_verification_failed",
+        }
         or type(value.get("active_state")) is not str
-        or value.get("active_state") not in {"failed", "inactive"}
+        or value.get("active_state") not in {"failed", "inactive", "active"}
         or type(value.get("sub_state")) is not str
         or value.get("sub_state") not in _SCRATCH_UNIT_SUBSTATES
         or type(value.get("result")) is not str
@@ -281,7 +284,27 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         or re.fullmatch(r"[0-9a-f]{64}", value["stdout_sha256"]) is None
         or type(value.get("stderr_sha256")) is not str
         or re.fullmatch(r"[0-9a-f]{64}", value["stderr_sha256"]) is None
+        or type(value.get("verification_error")) is not str
+        or value.get("verification_error") not in {"none", "os_error", "policy_error", "other"}
+        or (
+            value.get("verification_errno") is not None
+            and (
+                type(value["verification_errno"]) is not int
+                or not 1 <= value["verification_errno"] <= 4095
+            )
+        )
     ):
+        return False
+    if value["phase"] == "confinement_verification_failed":
+        if value["active_state"] != "active" or value["verification_error"] == "none":
+            return False
+    elif (
+        value["active_state"] not in {"failed", "inactive"}
+        or value["verification_error"] != "none"
+        or value["verification_errno"] is not None
+    ):
+        return False
+    if value["verification_error"] != "os_error" and value["verification_errno"] is not None:
         return False
     return True
 
@@ -311,6 +334,9 @@ def _scratch_unit_diagnostic(
     stderr_prefix: bytes,
     stderr_observed: int,
     stderr_complete: bool,
+    phase: str = "unit_exited_before_confinement",
+    verification_error: str = "none",
+    verification_errno: int | None = None,
 ) -> dict[str, Any] | None:
     properties = snapshot.get("properties", {})
     if not isinstance(properties, dict):
@@ -325,7 +351,7 @@ def _scratch_unit_diagnostic(
     stderr_prefix = stderr_prefix[:SCRATCH_PRIVATE_STDERR_BYTES]
     diagnostic = {
         "schema": 1,
-        "phase": "unit_exited_before_confinement",
+        "phase": phase,
         "active_state": properties.get("ActiveState"),
         "sub_state": properties.get("SubState"),
         "result": properties.get("Result"),
@@ -337,8 +363,28 @@ def _scratch_unit_diagnostic(
         "stderr_bytes": len(stderr_prefix),
         "stderr_sha256": hashlib.sha256(stderr_prefix).hexdigest(),
         "stderr_truncated": stderr_observed > len(stderr_prefix) or not stderr_complete,
+        "verification_error": verification_error,
+        "verification_errno": verification_errno,
     }
     return diagnostic if valid_scratch_unit_diagnostic(diagnostic) else None
+
+
+def _scratch_verification_error_details(error: BaseException) -> tuple[str, int | None]:
+    """Return closed diagnostic fields without serializing exception text."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        if isinstance(current, OSError):
+            code = current.errno
+            safe_code = code if type(code) is int and 1 <= code <= 4095 else None
+            return "os_error", safe_code
+        current = current.__cause__ or current.__context__
+    if isinstance(error, RuntimeError):
+        return "policy_error", None
+    return "other", None
 
 
 def _valid_restore_diagnostic(value: Any) -> bool:
@@ -2500,6 +2546,9 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
         stdout_observed = 0
         stderr_size = 0
         early_exit_snapshot: dict[str, Any] | None = None
+        early_exit_phase = "unit_exited_before_confinement"
+        verification_error = "none"
+        verification_errno: int | None = None
         active_control_group: str | None = None
         selector: selectors.BaseSelector | None = None
         launch_started = False
@@ -2572,15 +2621,28 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                     early_exit_snapshot = snapshot
                     raise RuntimeError("Scratch restore service failed before its confinement was verified.")
                 if active_state == "active" and pid_text not in {"", "0"} and control_group:
-                    active_control_group = _scratch_expected_properties(
-                        snapshot,
-                        unit_name=unit_name,
-                        mountpoint=mountpoint,
-                        python_binary=pathlib.Path(
-                            getattr(sys, "_base_executable", sys.executable)
-                        ).resolve(strict=True),
-                    )
-                    _scratch_control_group_snapshot(active_control_group)
+                    # Preserve the exact live snapshot before any identity or
+                    # cgroup verification can raise. A disappearing /proc PID
+                    # is still a failed verification, but its bounded worker
+                    # output must reach the existing private diagnostic path.
+                    early_exit_snapshot = snapshot
+                    try:
+                        active_control_group = _scratch_expected_properties(
+                            snapshot,
+                            unit_name=unit_name,
+                            mountpoint=mountpoint,
+                            python_binary=pathlib.Path(
+                                getattr(sys, "_base_executable", sys.executable)
+                            ).resolve(strict=True),
+                        )
+                        _scratch_control_group_snapshot(active_control_group)
+                    except BaseException as verification_exception:
+                        early_exit_phase = "confinement_verification_failed"
+                        verification_error, verification_errno = (
+                            _scratch_verification_error_details(verification_exception)
+                        )
+                        raise
+                    early_exit_snapshot = None
                 elif (
                     active_state in {"inactive", "activating", "active"}
                     and load_state in {"loaded", "not-found"}
@@ -2715,6 +2777,9 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                     stderr_prefix=stderr_prefix,
                     stderr_observed=stderr_size,
                     stderr_complete=drain_complete["stderr"],
+                    phase=early_exit_phase,
+                    verification_error=verification_error,
+                    verification_errno=verification_errno,
                 )
                 if diagnostic is not None:
                     setattr(operation_error, "scratch_unit_diagnostic", diagnostic)

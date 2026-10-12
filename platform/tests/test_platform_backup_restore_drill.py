@@ -174,6 +174,23 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         malformed = dict(diagnostic)
         malformed["stdout_truncated"] = 1
         self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
+        verification_failure = dict(diagnostic)
+        verification_failure.update(
+            phase="confinement_verification_failed",
+            active_state="active",
+            verification_error="os_error",
+            verification_errno=2,
+        )
+        self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(verification_failure))
+        malformed = dict(verification_failure)
+        malformed["verification_errno"] = True
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
+        malformed = dict(verification_failure)
+        malformed["verification_error"] = "other"
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
+        malformed = dict(verification_failure)
+        malformed["active_state"] = "failed"
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
 
         private_failure = RuntimeError("fixed backup failure")
         private_failure.scratch_unit_diagnostic = diagnostic
@@ -332,6 +349,97 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 stderr_reader.close()
                 stdout_writer.join(timeout=2)
                 stderr_writer.join(timeout=2)
+
+    def _assert_scratch_live_identity_failure_preserves_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            archive_path.chmod(0o600)
+            expected_stdout = b"worker reached restore preflight\n"
+            expected_stderr = b"worker failure detail\n"
+            child_code = (
+                "import sys,time; "
+                f"sys.stdout.buffer.write({expected_stdout!r}); sys.stdout.flush(); "
+                f"sys.stderr.buffer.write({expected_stderr!r}); sys.stderr.flush(); "
+                "time.sleep(10)"
+            )
+            command = [sys.executable, "-c", child_code]
+            unit_command = mock.Mock(return_value=command)
+            real_popen = subprocess.Popen
+            launched: list[subprocess.Popen[bytes]] = []
+            snapshots = [
+                {
+                    "properties": {
+                        "LoadState": "loaded",
+                        "ActiveState": "active",
+                        "SubState": "running",
+                        "Result": "success",
+                        "ExecMainPID": "424242",
+                        "ExecMainStatus": "0",
+                        "ControlGroup": "/system.slice/scratch-identity-race.service",
+                    }
+                },
+                {
+                    "properties": {
+                        "LoadState": "not-found",
+                        "ActiveState": "inactive",
+                        "SubState": "dead",
+                        "Result": "success",
+                        "ExecMainPID": "0",
+                        "ControlGroup": "",
+                    }
+                },
+            ]
+
+            def launch(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                launched.append(process)
+                return process
+
+            def snapshot(_unit_name):
+                return snapshots.pop(0)
+
+            def stop_unit(_unit_name):
+                if launched and launched[0].poll() is None:
+                    launched[0].terminate()
+                    launched[0].wait(timeout=2)
+
+            vanished = FileNotFoundError(
+                2, "synthetic worker executable disappeared", "/proc/424242/exe"
+            )
+            with (
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill, "_scratch_host_guard"),
+                mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=snapshot),
+                mock.patch.object(backup_drill, "_scratch_expected_properties", side_effect=vanished),
+                mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit) as stop,
+                mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
+                mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
+            ):
+                with self.assertRaises(FileNotFoundError) as failure:
+                    backup_drill._run_isolated_restore_drill(
+                        archive_path,
+                        timestamp_slug="20261012T010206Z",
+                    )
+
+            self.assertIs(failure.exception, vanished)
+            self.assertEqual(failure.exception.errno, 2)
+            stop.assert_called_once()
+            self.assertEqual(len(launched), 1)
+            self.assertIsNotNone(launched[0].returncode)
+            diagnostic = failure.exception.scratch_unit_diagnostic
+            self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(diagnostic))
+            self.assertEqual(diagnostic["phase"], "confinement_verification_failed")
+            self.assertEqual(diagnostic["active_state"], "active")
+            self.assertEqual(diagnostic["verification_error"], "os_error")
+            self.assertEqual(diagnostic["verification_errno"], 2)
+            captured_stdout, captured_stderr = failure.exception.scratch_unit_private_output
+            self.assertEqual(captured_stdout, expected_stdout)
+            self.assertEqual(captured_stderr, expected_stderr)
+            mountpoint = pathlib.Path(unit_command.call_args.kwargs["mountpoint"])
+            self.assertFalse(mountpoint.exists())
 
     def _assert_scratch_startup_inactive_race_is_handled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -640,6 +748,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._assert_scratch_worker_uses_pinned_archive_fd()
         self._assert_scratch_unit_diagnostic_caps_and_private_envelope()
         self._assert_scratch_early_exit_output_is_drained()
+        self._assert_scratch_live_identity_failure_preserves_output()
         self._assert_scratch_startup_inactive_race_is_handled()
         self._assert_scratch_fast_launcher_cannot_skip_active_confinement()
         self._assert_scratch_absent_unit_has_bounded_startup_deadline()
