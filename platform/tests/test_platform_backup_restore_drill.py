@@ -695,6 +695,16 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         "ControlGroup": "",
                     }
                 },
+                {
+                    "properties": {
+                        "LoadState": "not-found",
+                        "ActiveState": "inactive",
+                        "SubState": "dead",
+                        "Result": "success",
+                        "ExecMainPID": "0",
+                        "ControlGroup": "",
+                    }
+                },
             ]
 
             def launch(*args, **kwargs):
