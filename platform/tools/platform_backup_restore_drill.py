@@ -1626,6 +1626,54 @@ def _publish_noclobber(temporary_path: pathlib.Path, target_path: pathlib.Path) 
     return published
 
 
+def _fsync_backup_dump(
+    path: pathlib.Path,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Durably flush one exact private dump inode before restore or publish."""
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        before = os.fstat(descriptor)
+        path_before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or (before.st_dev, before.st_ino) != expected_identity
+            or (path_before.st_dev, path_before.st_ino)
+            != (before.st_dev, before.st_ino)
+        ):
+            raise RuntimeError("Temporary backup archive identity is unsafe before fsync.")
+
+        # Do not catch this error: a failed flush must stop restore and publish.
+        os.fsync(descriptor)
+
+        after = os.fstat(descriptor)
+        path_after = path.lstat()
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_uid != 0
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or after.st_nlink != 1
+            or (after.st_dev, after.st_ino) != expected_identity
+            or (path_after.st_dev, path_after.st_ino)
+            != (after.st_dev, after.st_ino)
+            or (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            != (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        ):
+            raise RuntimeError("Temporary backup archive changed while being fsynced.")
+    finally:
+        os.close(descriptor)
+
+
 def _unlink_if_same_inode(path: pathlib.Path, identity: tuple[int, int] | None) -> None:
     if path is None or identity is None:
         return
@@ -3345,6 +3393,10 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             temporary_dump_identity.st_ino,
         ):
             raise RuntimeError("Temporary backup archive identity changed.")
+        _fsync_backup_dump(
+            temporary_dump_path,
+            expected_identity=(temporary_dump_identity.st_dev, temporary_dump_identity.st_ino),
+        )
         if not args.dump_only:
             restored_table_count = _run_isolated_restore_drill(
                 temporary_dump_path,

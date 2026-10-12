@@ -2481,6 +2481,19 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             }
 
             initial_inventory = backup_drill.backup_inventory(output_dir)
+            fixed_backup_time = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)
+            operation_order: list[str] = []
+            real_fsync_dump = backup_drill._fsync_backup_dump
+
+            def record_dump_fsync(path: pathlib.Path, *, expected_identity: tuple[int, int]) -> None:
+                operation_order.append("dump_fsync")
+                real_fsync_dump(path, expected_identity=expected_identity)
+
+            def fail_restore_after_fsync(*_args: object, **_kwargs: object) -> int:
+                operation_order.append("restore")
+                self.assertEqual(operation_order, ["dump_fsync", "restore"])
+                raise RuntimeError("restore failed")
+
             with (
                 mock.patch.dict(
                     backup_drill.os.environ,
@@ -2500,21 +2513,28 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         )
                     },
                 ),
+                mock.patch.object(backup_drill, "utc_now", return_value=fixed_backup_time),
                 mock.patch.object(backup_drill, "require_commands"),
                 mock.patch.object(
                     backup_drill,
                     "run_disk_guarded_command",
                     side_effect=self._fake_guarded_dump,
                 ),
+                mock.patch.object(
+                    backup_drill,
+                    "_fsync_backup_dump",
+                    side_effect=record_dump_fsync,
+                ),
                 mock.patch.object(backup_drill, "require_restore_headroom"),
                 mock.patch.object(
                     backup_drill,
                     "_run_isolated_restore_drill",
-                    side_effect=RuntimeError("restore failed"),
+                    side_effect=fail_restore_after_fsync,
                 ),
             ):
                 with self.assertRaisesRegex(RuntimeError, "restore failed") as raised:
                     backup_drill.create_backup(args)
+            self.assertEqual(operation_order, ["dump_fsync", "restore"])
             output = io.StringIO()
             main_args = argparse.Namespace(
                 check_latest=False,
@@ -2543,6 +2563,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 metadata = path.lstat()
                 self.assertEqual((path.read_bytes(), metadata.st_mode, metadata.st_ino), expected)
 
+            restore_after_fsync_failure = mock.Mock()
             with (
                 mock.patch.dict(
                     backup_drill.os.environ,
@@ -2561,6 +2582,129 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                             "postgresql://platform_user@127.0.0.1:5432/platformdb"
                         )
                     },
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "utc_now",
+                    return_value=fixed_backup_time + dt.timedelta(seconds=1),
+                ),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
+                mock.patch.object(
+                    backup_drill, "_run_isolated_restore_drill", restore_after_fsync_failure
+                ),
+                mock.patch.object(
+                    backup_drill.os, "fsync", side_effect=OSError("synthetic dump fsync failure")
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "synthetic dump fsync failure"):
+                    backup_drill.create_backup(args)
+
+            restore_after_fsync_failure.assert_not_called()
+            self.assertEqual(backup_drill.backup_inventory(output_dir), initial_inventory)
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                {path.name for path in old_entries},
+            )
+
+            dump_only_args = argparse.Namespace(
+                env_file=str(output_dir / ".env.platform"),
+                output_dir=str(output_dir),
+                keep=1,
+                admin_database_url=None,
+                dump_only=True,
+                rotate_existing=False,
+            )
+            dump_only_events: list[str] = []
+
+            def record_dump_only_fsync(
+                path: pathlib.Path, *, expected_identity: tuple[int, int]
+            ) -> None:
+                dump_only_events.append("dump_fsync")
+                real_fsync_dump(path, expected_identity=expected_identity)
+
+            dump_only_restore = mock.Mock()
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    {
+                        "PLATFORM_DATABASE_URL": (
+                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
+                        )
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "load_env",
+                    return_value={
+                        "PLATFORM_DATABASE_URL": (
+                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
+                        )
+                    },
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "utc_now",
+                    side_effect=[
+                        fixed_backup_time + dt.timedelta(seconds=2),
+                        fixed_backup_time + dt.timedelta(seconds=3),
+                        fixed_backup_time + dt.timedelta(seconds=4),
+                    ],
+                ),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "_fsync_backup_dump",
+                    side_effect=record_dump_only_fsync,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
+                mock.patch.object(
+                    backup_drill, "_run_isolated_restore_drill", dump_only_restore
+                ),
+            ):
+                dump_only_result = backup_drill.create_backup(dump_only_args)
+
+            self.assertEqual(dump_only_events, ["dump_fsync"])
+            dump_only_restore.assert_not_called()
+            self.assertTrue(dump_only_result["ok"])
+            self.assertIs(dump_only_result["restore_verified"], False)
+            initial_inventory = backup_drill.backup_inventory(output_dir)
+            old_entries = list(output_dir.iterdir())
+
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    {
+                        "PLATFORM_DATABASE_URL": (
+                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
+                        )
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "load_env",
+                    return_value={
+                        "PLATFORM_DATABASE_URL": (
+                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
+                        )
+                    },
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "utc_now",
+                    return_value=fixed_backup_time + dt.timedelta(seconds=5),
                 ),
                 mock.patch.object(backup_drill, "require_commands"),
                 mock.patch.object(
