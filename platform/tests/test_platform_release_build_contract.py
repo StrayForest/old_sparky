@@ -2183,7 +2183,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "subjects[0][\"digest\"].get(\"sha256\") == digest",
         ):
             self.assertIn(binding, verify_step)
-        self.assertIn('expected.add("platform-backup-verifier/manifest.json")', verify_step)
+        self.assertIn('expected_paths.add("platform-backup-verifier/manifest.json")', verify_step)
         self.assertIn("len(infos) != len(expected_paths)", verify_step)
         self.assertIn('"files"}', verify_step)
         self.assertIn('hashlib.sha256(data).hexdigest() != row["sha256"]', verify_step)

@@ -213,7 +213,9 @@ backup run attempt, production-job start time, artifact API digest and closed
 receipt all agree. The backup workflow and production job must have started
 while that source Security run was still in progress, proving that the backup
 reserved the shared production slot before the automatic child. The receipt
-is uploaded only after the remote operation, cleanup and final acceptance
+upload step additionally requires the named SSH cleanup step to finish
+successfully; job-level success alone is not sufficient. The receipt is
+uploaded only after the remote operation, cleanup and final acceptance
 succeed. Missing, expired, duplicate, stale, malformed or mismatched evidence,
 an API/ZIP digest mismatch, or a polling deadline causes the auto-deploy job to
 fail before its only deployment-dispatch request. The existing age-limited

@@ -735,6 +735,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
     def test_backup_command_verifies_freshness_before_returning(self) -> None:
         create_result = {
             "ok": True,
+            "dump_file": "platformdb-20261012T120000Z.dump",
+            "format_version": 2,
             "size_bytes": 123,
             "duration_seconds": 4.5,
             "restore_verified": True,
@@ -1936,6 +1938,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             2,
         )
         self.assertIn("BACKUP_SUCCESS schema=1 run_id=", workflow)
+        self.assertIn(
+            "if: ${{ success() && inputs.operation == 'create' && steps.cleanup_ssh.outcome == 'success' }}",
+            workflow,
+        )
         self.assertIn("storage_helper_sha256=", workflow)
         self.assertIn("backup_drill_sha256=", workflow)
         self.assertIn("remote success marker source/run binding is invalid", workflow)
@@ -2368,6 +2374,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 }
                 for name in names
             ]
+            manifest_rows_by_name = {
+                row["path"].removeprefix("platform/tools/"): row
+                for row in manifest_rows
+            }
             valid_manifest = {
                 "schema": 1,
                 "repository": "StrayForest/old_sparky",
@@ -2484,11 +2494,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(valid_zip.returncode, 0, valid_zip.stderr)
             manifest_output = (fixture_root / "manifest-output.env").read_text()
             self.assertIn(
-                f"storage_helper_sha256={manifest_rows[-1]['sha256']}\n",
+                "storage_helper_sha256="
+                f"{manifest_rows_by_name['platform_storage_maintenance.py']['sha256']}\n",
                 manifest_output,
             )
             self.assertIn(
-                f"backup_drill_sha256={manifest_rows[0]['sha256']}\n",
+                "backup_drill_sha256="
+                f"{manifest_rows_by_name['platform_backup_restore_drill.py']['sha256']}\n",
                 manifest_output,
             )
             for kwargs, reason in (

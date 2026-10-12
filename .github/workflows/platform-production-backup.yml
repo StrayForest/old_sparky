@@ -2635,7 +2635,7 @@ jobs:
           test -z "${SSH_DIR:-}"
 
       - name: Publish source-bound backup success receipt
-        if: ${{ success() && inputs.operation == 'create' }}
+        if: ${{ success() && inputs.operation == 'create' && steps.cleanup_ssh.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-backup-success-${{ github.run_id }}-${{ github.run_attempt }}
