@@ -84,13 +84,13 @@ or the host-memory reserve is unavailable, verification fails without
 publishing a pair.
 
 After `pg_dump` succeeds, the drill opens the temporary dump without following
-symlinks, verifies its recorded inode and root-owned mode-`0600` regular-file
-identity, and fsyncs that file before restore admission or publication. It
-rechecks the open file and path identity after the sync. This also applies to
-approved dump-only creation. An open, identity or fsync failure aborts the
-operation; cleanup removes only the exact unpublished temporary inode. The
-later backup-directory fsync protects the published names and does not replace
-the dump-file sync.
+symlinks, verifies its recorded inode and effective-UID-owned mode-`0600`
+regular-file identity (root in production), and fsyncs that file before
+restore admission or publication. It rechecks the open file and path identity
+after the sync. This also applies to approved dump-only creation. An open,
+identity or fsync failure aborts the operation; cleanup removes only the exact
+unpublished temporary inode. The later backup-directory fsync protects the
+published names and does not replace the dump-file sync.
 
 After publishing both the dump and metadata entries, the drill fsyncs the
 backup directory before rotation or success. If that directory sync fails, it

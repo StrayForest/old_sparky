@@ -1630,8 +1630,11 @@ def _fsync_backup_dump(
     path: pathlib.Path,
     *,
     expected_identity: tuple[int, int],
+    expected_uid: int,
 ) -> None:
     """Durably flush one exact private dump inode before restore or publish."""
+    if type(expected_uid) is not int or expected_uid < 0:
+        raise RuntimeError("Temporary backup archive owner is invalid.")
     descriptor = os.open(
         path,
         os.O_RDONLY
@@ -1643,7 +1646,7 @@ def _fsync_backup_dump(
         path_before = path.lstat()
         if (
             not stat.S_ISREG(before.st_mode)
-            or before.st_uid != 0
+            or before.st_uid != expected_uid
             or stat.S_IMODE(before.st_mode) != 0o600
             or before.st_nlink != 1
             or before.st_size <= 0
@@ -1660,7 +1663,7 @@ def _fsync_backup_dump(
         path_after = path.lstat()
         if (
             not stat.S_ISREG(after.st_mode)
-            or after.st_uid != 0
+            or after.st_uid != expected_uid
             or stat.S_IMODE(after.st_mode) != 0o600
             or after.st_nlink != 1
             or (after.st_dev, after.st_ino) != expected_identity
@@ -3396,6 +3399,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         _fsync_backup_dump(
             temporary_dump_path,
             expected_identity=(temporary_dump_identity.st_dev, temporary_dump_identity.st_ino),
+            expected_uid=temporary_dump_identity.st_uid,
         )
         if not args.dump_only:
             restored_table_count = _run_isolated_restore_drill(

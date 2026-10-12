@@ -2480,14 +2480,45 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 for path in old_entries
             }
 
+            with tempfile.TemporaryDirectory() as owner_dir:
+                owner_probe = pathlib.Path(owner_dir) / "owner-probe.dump"
+                owner_probe.write_bytes(b"bounded owner check")
+                owner_probe.chmod(0o600)
+                owner_probe_stat = owner_probe.lstat()
+                owner_identity = (owner_probe_stat.st_dev, owner_probe_stat.st_ino)
+                backup_drill._fsync_backup_dump(
+                    owner_probe,
+                    expected_identity=owner_identity,
+                    expected_uid=os.geteuid(),
+                )
+                with (
+                    mock.patch.object(backup_drill.os, "fsync") as rejected_fsync,
+                    self.assertRaisesRegex(
+                        RuntimeError, "Temporary backup archive identity is unsafe before fsync"
+                    ),
+                ):
+                    backup_drill._fsync_backup_dump(
+                        owner_probe,
+                        expected_identity=owner_identity,
+                        expected_uid=os.geteuid() + 1,
+                    )
+                rejected_fsync.assert_not_called()
+
             initial_inventory = backup_drill.backup_inventory(output_dir)
             fixed_backup_time = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)
             operation_order: list[str] = []
             real_fsync_dump = backup_drill._fsync_backup_dump
 
-            def record_dump_fsync(path: pathlib.Path, *, expected_identity: tuple[int, int]) -> None:
+            def record_dump_fsync(
+                path: pathlib.Path,
+                *,
+                expected_identity: tuple[int, int],
+                expected_uid: int,
+            ) -> None:
                 operation_order.append("dump_fsync")
-                real_fsync_dump(path, expected_identity=expected_identity)
+                real_fsync_dump(
+                    path, expected_identity=expected_identity, expected_uid=expected_uid
+                )
 
             def fail_restore_after_fsync(*_args: object, **_kwargs: object) -> int:
                 operation_order.append("restore")
@@ -2623,10 +2654,15 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             dump_only_events: list[str] = []
 
             def record_dump_only_fsync(
-                path: pathlib.Path, *, expected_identity: tuple[int, int]
+                path: pathlib.Path,
+                *,
+                expected_identity: tuple[int, int],
+                expected_uid: int,
             ) -> None:
                 dump_only_events.append("dump_fsync")
-                real_fsync_dump(path, expected_identity=expected_identity)
+                real_fsync_dump(
+                    path, expected_identity=expected_identity, expected_uid=expected_uid
+                )
 
             dump_only_restore = mock.Mock()
             with (
