@@ -12,16 +12,16 @@ on:
           - verify-existing
         default: create
       security_run_id:
-        description: "Exact successful Platform security and build run ID for verify-existing"
-        required: false
+        description: "Exact Platform security and build push run ID for this dev SHA"
+        required: true
         type: string
       security_run_attempt:
-        description: "Exact attempt for that security run"
-        required: false
+        description: "Exact attempt for that security run; never substituted"
+        required: true
         type: string
       source_sha:
-        description: "Exact successful dev source SHA for the helper bundle"
-        required: false
+        description: "Exact dev SHA for the helper bundle and workflow dispatch"
+        required: true
         type: string
       evict_build_node_cache:
         description: "Explicitly remove the pinned disposable build-Node cache before verifying the newest backup"
@@ -64,7 +64,7 @@ jobs:
   backup:
     name: Create restore-verified backup
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     environment: production
     steps:
       - name: Require the reviewed dev ref
@@ -75,7 +75,7 @@ jobs:
             || { echo "Production backup must run from the reviewed dev ref" >&2; exit 1; }
 
       - name: Download and verify exact-source backup helper bundle
-        if: ${{ inputs.operation == 'verify-existing' }}
+        if: ${{ inputs.operation == 'create' || inputs.operation == 'verify-existing' }}
         id: backup-helper
         shell: bash
         env:
@@ -93,16 +93,98 @@ jobs:
           [[ "$SECURITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SOURCE_SHA" = "$DISPATCH_SHA" ]]
+          job_deadline_ns="$(/usr/bin/python3 -I -B -c 'import time; print(time.monotonic_ns() + 6_900_000_000_000)')"
+          printf 'job_deadline_monotonic_ns=%s\n' "$job_deadline_ns" >>"$GITHUB_OUTPUT"
           artifact_dir="$RUNNER_TEMP/platform-backup-verifier-input"
           install -d -m 700 "$artifact_dir"
           test "$(stat -c '%F:%a:%h' "$artifact_dir")" = "directory:700:2"
           api="$GITHUB_API_URL/repos/$REPOSITORY"
-          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
-            --max-filesize 1048576 \
+          run_ready=0
+          poll_deadline_ns="$(/usr/bin/python3 -I -B -c 'import time; print(time.monotonic_ns() + 1_800_000_000_000)')"
+          poll_remaining_seconds() {
+            /usr/bin/python3 -I -B - "$poll_deadline_ns" "$1" <<'PY'
+          import sys
+          import time
+
+          remaining = (int(sys.argv[1]) - time.monotonic_ns()) / 1_000_000_000
+          if remaining <= 0:
+              raise SystemExit(1)
+          print(f"{min(float(sys.argv[2]), remaining):.6f}")
+          PY
+          }
+          for poll in $(seq 1 360); do
+            request_timeout="$(poll_remaining_seconds 5)" || break
+            poll_path="$artifact_dir/run-poll-$poll.json"
+            test ! -e "$poll_path" && test ! -L "$poll_path"
+            curl --fail-with-body --silent --show-error --connect-timeout "$request_timeout" --max-time "$request_timeout" \
+              --max-filesize 1048576 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "$api/actions/runs/$SECURITY_RUN_ID" --output "$poll_path"
+            poll_state="$(/usr/bin/python3 -I -B - "$poll_path" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" "$SOURCE_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          path, expected_run_id, expected_attempt, expected_sha = sys.argv[1:]
+          run = json.loads(Path(path).read_text(encoding="utf-8"))
+          if (
+              not isinstance(run, dict)
+              or type(run.get("id")) is not int
+              or run.get("id") != int(expected_run_id)
+              or type(run.get("run_attempt")) is not int
+              or run.get("run_attempt") != int(expected_attempt)
+              or run.get("path") != ".github/workflows/platform-security.yml"
+              or run.get("event") != "push"
+              or run.get("head_branch") != "dev"
+              or run.get("head_sha") != expected_sha
+          ):
+              raise SystemExit("exact security run identity changed or does not match")
+          if run.get("status") != "completed":
+              if run.get("status") not in {"queued", "in_progress", "pending", "requested", "waiting"}:
+                  raise SystemExit("exact security run has an unexpected status")
+              print("pending")
+          elif run.get("conclusion") == "success":
+              print("success")
+          else:
+              raise SystemExit("exact security run did not complete successfully")
+          PY
+            )"
+            if [[ "$poll_state" = success ]]; then
+              poll_remaining_seconds 0.001 >/dev/null || break
+              mv -- "$poll_path" "$artifact_dir/run.json"
+              run_ready=1
+              break
+            fi
+            rm -f -- "$poll_path"
+            sleep_seconds="$(poll_remaining_seconds 5)" || break
+            sleep "$sleep_seconds"
+          done
+          test "$run_ready" = 1 || {
+            echo "Exact security run did not finish successfully within the bounded wait" >&2
+            exit 1
+          }
+          curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 10 \
+            --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "$api/actions/runs/$SECURITY_RUN_ID" --output "$artifact_dir/run.json"
+            "$api/git/ref/heads/dev" --output "$artifact_dir/dev-ref.json"
+          /usr/bin/python3 -I -B - "$artifact_dir/dev-ref.json" "$SOURCE_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          ref = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              not isinstance(ref, dict)
+              or ref.get("ref") != "refs/heads/dev"
+              or not isinstance(ref.get("object"), dict)
+              or ref["object"].get("sha") != sys.argv[2]
+          ):
+              raise SystemExit("dev moved away from the exact backup source SHA")
+          PY
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --max-filesize 1048576 \
             --header "Authorization: Bearer $GH_TOKEN" \
@@ -267,7 +349,7 @@ jobs:
           before="$(stat -c '%d:%i:%h:%s:%u:%g:%a' "$bundle_path")"
           bundle_sha="$(sha256sum "$bundle_path" | awk '{print $1}')"
           test "$bundle_sha" = "$(awk -F= '$1 == "bundle_sha256" {print $2}' "$GITHUB_OUTPUT")"
-          gh attestation verify "$bundle_path" \
+          timeout --signal=TERM --kill-after=15s 600s gh attestation verify "$bundle_path" \
             --repo "$REPOSITORY" \
             --signer-workflow StrayForest/old_sparky/.github/workflows/platform-security.yml \
             --source-ref refs/heads/dev \
@@ -316,7 +398,7 @@ jobs:
           else:
               raise SystemExit("backup verifier attestation policy failed")
           PY
-          /usr/bin/python3 -I -B - "$bundle_path" "$SOURCE_SHA" <<'PY'
+          /usr/bin/python3 -I -B - "$bundle_path" "$SOURCE_SHA" "$GITHUB_OUTPUT" <<'PY'
           import hashlib
           import json
           from pathlib import Path
@@ -327,6 +409,7 @@ jobs:
 
           bundle_path = Path(sys.argv[1])
           source_sha = sys.argv[2]
+          output = Path(sys.argv[3])
           expected_names = (
               "platform_backup_restore_drill.py",
               "platform_disk_policy.py",
@@ -376,6 +459,21 @@ jobs:
                       raise SystemExit("backup verifier member bytes or mode differ from manifest")
           if seen != set(expected_names):
               raise SystemExit("backup verifier member set differs from manifest")
+          with zipfile.ZipFile(bundle_path) as archive:
+              manifest = json.loads(
+                  archive.read("platform-backup-verifier/manifest.json").decode("ascii")
+              )
+          member_sha = {
+              row["path"].removeprefix("platform/tools/"): row["sha256"]
+              for row in manifest["files"]
+          }
+          with output.open("a", encoding="ascii") as stream:
+              stream.write(
+                  f"storage_helper_sha256={member_sha['platform_storage_maintenance.py']}\n"
+              )
+              stream.write(
+                  f"backup_drill_sha256={member_sha['platform_backup_restore_drill.py']}\n"
+              )
           PY
 
       - name: Validate production SSH inputs
@@ -422,9 +520,13 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Stage the verified helper bundle on the production host
-        if: ${{ inputs.operation == 'verify-existing' }}
+        if: ${{ inputs.operation == 'create' || inputs.operation == 'verify-existing' }}
+        id: stage-backup-helper
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           BUNDLE_PATH: ${{ steps.backup-helper.outputs.bundle_path }}
@@ -435,6 +537,29 @@ jobs:
           [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ "$BUNDLE_PATH" = "$RUNNER_TEMP/platform-backup-verifier-input/platform-backup-verifier.zip" ]]
           [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$REPOSITORY" = "StrayForest/old_sparky" ]]
+          [[ "$SOURCE_SHA" = "$GITHUB_SHA" ]]
+          ref_path="$RUNNER_TEMP/platform-backup-verifier-input/current-dev-ref.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 10 \
+            --max-filesize 65536 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${GITHUB_API_URL}/repos/${REPOSITORY}/git/ref/heads/dev" --output "$ref_path"
+          /usr/bin/python3 -I -B - "$ref_path" "$SOURCE_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          ref = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              not isinstance(ref, dict)
+              or ref.get("ref") != "refs/heads/dev"
+              or not isinstance(ref.get("object"), dict)
+              or ref["object"].get("sha") != sys.argv[2]
+          ):
+              raise SystemExit("dev moved before the source-bound helper was staged")
+          PY
           test "$(stat -c '%F:%a:%h' "$BUNDLE_PATH")" = "regular file:600:1"
           test "$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')" = "$BUNDLE_SHA256"
           stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -443,12 +568,14 @@ jobs:
             exit_code=$?
             trap - EXIT
             if (( exit_code != 0 )) && [[ "$stage_identity" =~ ^[0-9]+:[0-9]+$ ]]; then
-              ssh \
+              timeout --foreground --signal=TERM --kill-after=5s 60s ssh \
                 -F /dev/null \
                 -o BatchMode=yes \
                 -o IdentitiesOnly=yes \
                 -o StrictHostKeyChecking=yes \
                 -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+                -o ServerAliveInterval=10 \
+                -o ServerAliveCountMax=3 \
                 -o ConnectTimeout=10 \
                 -i "$SSH_DIR/id_ed25519" \
                 "$PROD_SSH_USER@$PROD_SSH_HOST" \
@@ -461,6 +588,32 @@ jobs:
           [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]]
           test "$(id -u)" -eq 0
+          prepare_stage_lock() {
+            local lock_parent=/run/lock
+            local lock_dir=$lock_parent/oldsparky-backup-verifier-stage
+            local lock_file="$lock_dir/operation.lock"
+            test ! -L "$lock_parent"
+            test -d "$lock_parent"
+            test "$(stat -c '%u:%g:%a' "$lock_parent")" = "0:0:1777"
+            if [[ ! -e "$lock_dir" && ! -L "$lock_dir" ]]; then
+              mkdir -m 755 -- "$lock_dir" 2>/dev/null && chmod 755 -- "$lock_dir" || :
+            fi
+            test ! -L "$lock_dir"
+            test "$(stat -c '%F:%u:%g:%a:%h' "$lock_dir")" = "directory:0:0:755:2"
+            if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then
+              (umask 022; set -o noclobber; : >"$lock_file") 2>/dev/null || :
+            fi
+            test ! -L "$lock_file"
+            test -f "$lock_file"
+            test "$(stat -c '%u:%g:%a:%h' "$lock_file")" = "0:0:644:1"
+            local lock_identity
+            lock_identity="$(stat -c '%d:%i:%u:%g:%a:%h' "$lock_file")"
+            exec 7>>"$lock_file"
+            test "$(stat -Lc '%d:%i:%u:%g:%a:%h' "/proc/$$/fd/7")" = "$lock_identity"
+            test "$(stat -c '%d:%i:%u:%g:%a:%h' "$lock_file")" = "$lock_identity"
+            flock -w 45 7
+          }
+          prepare_stage_lock
           stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
           /usr/bin/python3 -I -B - "$stage" "$expected_identity" <<'PY'
           import os
@@ -500,7 +653,7 @@ jobs:
             exit "$exit_code"
           }
           trap cleanup_failed_transfer EXIT
-          stage_identity="$(ssh \
+          stage_identity="$(timeout --foreground --signal=TERM --kill-after=5s 60s ssh \
             -F /dev/null \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -511,67 +664,57 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT" <<'REMOTE'
-          set -Eeuo pipefail
-          run_id="${1:-}"
-          run_attempt="${2:-}"
-          [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
-          [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
-          test "$(id -u)" -eq 0
-          stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
-          [[ ! -e "$stage" && ! -L "$stage" ]]
-          mkdir -m 700 -- "$stage"
-          test "$(stat -c '%F:%u:%g:%a:%h' "$stage")" = "directory:0:0:700:2"
-          stat -c '%d:%i' "$stage"
-          REMOTE
-          )"
+            "bash -c 'set -Eeuo pipefail
+          run_id=\$1
+          run_attempt=\$2
+          bundle_sha=\$3
+          [[ \"\$run_id\" =~ ^[1-9][0-9]{0,19}\$ ]]
+          [[ \"\$run_attempt\" =~ ^[1-9][0-9]{0,5}\$ ]]
+          [[ \"\$bundle_sha\" =~ ^[0-9a-f]{64}\$ ]]
+          test \"\$(id -u)\" -eq 0
+          prepare_stage_lock() {
+            local lock_parent=/run/lock
+            local lock_dir=$lock_parent/oldsparky-backup-verifier-stage
+            local lock_file=$lock_dir/operation.lock
+            test ! -L $lock_parent
+            test -d $lock_parent
+            test $(stat -c %u:%g:%a $lock_parent) = 0:0:1777
+            if [[ ! -e $lock_dir && ! -L $lock_dir ]]; then mkdir -m 755 -- $lock_dir 2>/dev/null && chmod 755 -- $lock_dir || :; fi
+            test ! -L $lock_dir
+            test -d $lock_dir
+            test $(stat -c %u:%g:%a:%h $lock_dir) = 0:0:755:2
+            if [[ ! -e $lock_file && ! -L $lock_file ]]; then (umask 022; set -o noclobber; : >$lock_file) 2>/dev/null || :; fi
+            test ! -L $lock_file
+            test -f $lock_file
+            test -f $lock_file
+            test $(stat -c %u:%g:%a:%h $lock_file) = 0:0:644:1
+            local lock_identity
+            lock_identity=$(stat -c %d:%i:%u:%g:%a:%h $lock_file)
+            exec 7>>$lock_file
+            test $(stat -Lc %d:%i:%u:%g:%a:%h /proc/$$/fd/7) = $lock_identity
+            test $(stat -c %d:%i:%u:%g:%a:%h $lock_file) = $lock_identity
+            flock -w 45 7
+          }
+          prepare_stage_lock
+          stage=\"/tmp/oldsparky-backup-verifier-\$run_id-\$run_attempt\"
+          [[ ! -e \"\$stage\" && ! -L \"\$stage\" ]]
+          mkdir -m 700 -- \"\$stage\"
+          test \"\$(stat -c \"%F:%u:%g:%a:%h\" \"\$stage\")\" = \"directory:0:0:700:2\"
+          cat >\"\$stage/bundle.zip\"
+          chmod 600 -- \"\$stage/bundle.zip\"
+          test \"\$(stat -c \"%F:%u:%g:%a:%h\" \"\$stage/bundle.zip\")\" = \"regular file:0:0:600:1\"
+          test \"\$(sha256sum \"\$stage/bundle.zip\" | awk \"{print \\\$1}\")\" = \"\$bundle_sha\"
+          stat -c \"%d:%i\" \"\$stage\"
+          ' -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BUNDLE_SHA256" <"$BUNDLE_PATH")"
           [[ "$stage_identity" =~ ^[0-9]+:[0-9]+$ ]]
-          scp \
-            -F /dev/null \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=3 \
-            -o ConnectTimeout=10 \
-            -i "$SSH_DIR/id_ed25519" \
-            "$BUNDLE_PATH" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST:$stage/bundle.zip"
-          ssh \
-            -F /dev/null \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=3 \
-            -o ConnectTimeout=10 \
-            -i "$SSH_DIR/id_ed25519" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BUNDLE_SHA256 $stage_identity" <<'REMOTE'
-          set -Eeuo pipefail
-          run_id="${1:-}"
-          run_attempt="${2:-}"
-          bundle_sha="${3:-}"
-          expected_identity="${4:-}"
-          [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
-          [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
-          [[ "$bundle_sha" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]]
-          stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
-          test "$(id -u)" -eq 0
-          test "$(stat -c '%F:%u:%g:%a:%h' "$stage")" = "directory:0:0:700:2"
-          test "$(stat -c '%d:%i' "$stage")" = "$expected_identity"
-          test "$(stat -c '%F:%u:%g:%a:%h' "$stage/bundle.zip")" = "regular file:0:0:600:1"
-          test "$(sha256sum "$stage/bundle.zip" | awk '{print $1}')" = "$bundle_sha"
-          printf 'Verified backup helper bundle staged for run %s attempt %s\n' "$run_id" "$run_attempt"
-          REMOTE
           trap - EXIT
+          printf 'stage_identity=%s\n' "$stage_identity" >>"$GITHUB_OUTPUT"
 
       - name: Create and verify the production backup
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           BACKUP_OPERATION: ${{ inputs.operation }}
@@ -583,6 +726,10 @@ jobs:
           RESUME_COMPACTION_BUNDLE_SHA256: ${{ inputs.resume_compaction_bundle_sha256 }}
           SOURCE_SHA: ${{ inputs.source_sha }}
           BUNDLE_SHA256: ${{ steps.backup-helper.outputs.bundle_sha256 }}
+          EXPECTED_STORAGE_HELPER_SHA256: ${{ steps.backup-helper.outputs.storage_helper_sha256 }}
+          EXPECTED_BACKUP_DRILL_SHA256: ${{ steps.backup-helper.outputs.backup_drill_sha256 }}
+          JOB_DEADLINE_MONOTONIC_NS: ${{ steps.backup-helper.outputs.job_deadline_monotonic_ns }}
+          STAGED_HELPER_IDENTITY: ${{ steps.stage-backup-helper.outputs.stage_identity }}
         run: |
           set -euo pipefail
           umask 077
@@ -590,9 +737,13 @@ jobs:
           [[ "$EVICT_BUILD_NODE_CACHE" = true || "$EVICT_BUILD_NODE_CACHE" = false ]]
           [[ "$COMPACT_FALLBACK_RUNTIME_CACHE" = true || "$COMPACT_FALLBACK_RUNTIME_CACHE" = false ]]
           [[ "$RESUME_FALLBACK_CACHE_COMPACTION" = true || "$RESUME_FALLBACK_CACHE_COMPACTION" = false ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_STORAGE_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_BACKUP_DRILL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$REPOSITORY" = "StrayForest/old_sparky" ]]
+          [[ "$SOURCE_SHA" = "$GITHUB_SHA" ]]
           if [[ "$BACKUP_OPERATION" = verify-existing ]]; then
-            [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-            [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
             if [[ "$COMPACT_FALLBACK_RUNTIME_CACHE" = true ]]; then
               [[ "$EVICT_BUILD_NODE_CACHE" = false ]]
             fi
@@ -604,20 +755,144 @@ jobs:
             else
               [[ -z "$RESUME_COMPACTION_RUN_ID$RESUME_COMPACTION_RUN_ATTEMPT$RESUME_COMPACTION_BUNDLE_SHA256" ]]
             fi
-            bundle_stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BACKUP_OPERATION $SOURCE_SHA $BUNDLE_SHA256 $EVICT_BUILD_NODE_CACHE $COMPACT_FALLBACK_RUNTIME_CACHE $RESUME_FALLBACK_CACHE_COMPACTION ${RESUME_COMPACTION_RUN_ID:-none} ${RESUME_COMPACTION_RUN_ATTEMPT:-none} ${RESUME_COMPACTION_BUNDLE_SHA256:-none}"
           else
             [[ "$EVICT_BUILD_NODE_CACHE" = false ]]
             [[ "$COMPACT_FALLBACK_RUNTIME_CACHE" = false ]]
             [[ "$RESUME_FALLBACK_CACHE_COMPACTION" = false ]]
             [[ -z "$RESUME_COMPACTION_RUN_ID$RESUME_COMPACTION_RUN_ATTEMPT$RESUME_COMPACTION_BUNDLE_SHA256" ]]
-            bundle_stage=none
-            remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT create none none false false false none none none"
+          fi
+          bundle_stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BACKUP_OPERATION $SOURCE_SHA $BUNDLE_SHA256 $EVICT_BUILD_NODE_CACHE $COMPACT_FALLBACK_RUNTIME_CACHE $RESUME_FALLBACK_CACHE_COMPACTION ${RESUME_COMPACTION_RUN_ID:-none} ${RESUME_COMPACTION_RUN_ATTEMPT:-none} ${RESUME_COMPACTION_BUNDLE_SHA256:-none}"
+          cleanup_staged_helper_before_operation() {
+            [[ "$STAGED_HELPER_IDENTITY" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+            timeout --foreground --signal=TERM --kill-after=5s 60s ssh \
+              -F /dev/null \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+              -o ServerAliveInterval=10 \
+              -o ServerAliveCountMax=3 \
+              -o ConnectTimeout=10 \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              "bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $STAGED_HELPER_IDENTITY $BUNDLE_SHA256" <<'REMOTE'
+          set -Eeuo pipefail
+          run_id="${1:-}"
+          run_attempt="${2:-}"
+          expected_identity="${3:-}"
+          expected_sha="${4:-}"
+          [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]]
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+          test "$(id -u)" -eq 0
+          prepare_stage_lock() {
+            local lock_parent=/run/lock
+            local lock_dir=$lock_parent/oldsparky-backup-verifier-stage
+            local lock_file="$lock_dir/operation.lock"
+            test ! -L "$lock_parent"
+            test -d "$lock_parent"
+            test "$(stat -c '%u:%g:%a' "$lock_parent")" = "0:0:1777"
+            if [[ ! -e "$lock_dir" && ! -L "$lock_dir" ]]; then mkdir -m 755 -- "$lock_dir" 2>/dev/null && chmod 755 -- "$lock_dir" || :; fi
+            test ! -L "$lock_dir"
+            test "$(stat -c '%F:%u:%g:%a:%h' "$lock_dir")" = "directory:0:0:755:2"
+            if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then (umask 022; set -o noclobber; : >"$lock_file") 2>/dev/null || :; fi
+            test ! -L "$lock_file"
+            test -f "$lock_file"
+            test "$(stat -c '%u:%g:%a:%h' "$lock_file")" = "0:0:644:1"
+            local lock_identity
+            lock_identity="$(stat -c '%d:%i:%u:%g:%a:%h' "$lock_file")"
+            exec 7>>"$lock_file"
+            test "$(stat -Lc '%d:%i:%u:%g:%a:%h' "/proc/$$/fd/7")" = "$lock_identity"
+            test "$(stat -c '%d:%i:%u:%g:%a:%h' "$lock_file")" = "$lock_identity"
+            flock -w 45 7
+          }
+          prepare_stage_lock
+          stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
+          /usr/bin/python3 -I -B - "$stage" "$expected_identity" "$expected_sha" <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          path = Path(sys.argv[1])
+          expected = tuple(int(item) for item in sys.argv[2].split(":"))
+          expected_sha = sys.argv[3]
+          try:
+              before = path.lstat()
+          except FileNotFoundError:
+              raise SystemExit(0)
+          if not stat.S_ISDIR(before.st_mode) or (before.st_dev, before.st_ino) != expected or before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) != 0o700 or before.st_nlink != 2:
+              raise SystemExit(1)
+          entries = list(path.iterdir())
+          if len(entries) != 1 or entries[0].name != "bundle.zip":
+              raise SystemExit(1)
+          bundle = entries[0]
+          item = bundle.lstat()
+          if not stat.S_ISREG(item.st_mode) or item.st_uid != 0 or item.st_gid != 0 or item.st_nlink != 1 or stat.S_IMODE(item.st_mode) != 0o600:
+              raise SystemExit(1)
+          if hashlib.sha256(bundle.read_bytes()).hexdigest() != expected_sha:
+              raise SystemExit(1)
+          bundle.unlink()
+          current = path.lstat()
+          if (current.st_dev, current.st_ino) != expected or list(path.iterdir()):
+              raise SystemExit(1)
+          path.rmdir()
+          directory_fd = os.open("/tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+          try:
+              os.fsync(directory_fd)
+          finally:
+              os.close(directory_fd)
+          PY
+          REMOTE
+          }
+          ref_path="$RUNNER_TEMP/platform-backup-verifier-input/current-dev-ref-before-create.json"
+          if ! curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 10 \
+            --max-filesize 65536 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${GITHUB_API_URL}/repos/${REPOSITORY}/git/ref/heads/dev" --output "$ref_path"; then
+            cleanup_staged_helper_before_operation || echo "Source helper stage cleanup failed after ref query failure" >&2
+            exit 1
+          fi
+          if ! /usr/bin/python3 -I -B - "$ref_path" "$SOURCE_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          ref = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              not isinstance(ref, dict)
+              or ref.get("ref") != "refs/heads/dev"
+              or not isinstance(ref.get("object"), dict)
+              or ref["object"].get("sha") != sys.argv[2]
+          ):
+              raise SystemExit("dev moved before the backup operation")
+          PY
+          then
+            cleanup_staged_helper_before_operation || echo "Source helper stage cleanup failed after ref mismatch" >&2
+            exit 1
           fi
           remote_report="$RUNNER_TEMP/platform-production-backup-report.log"
           remote_error="$RUNNER_TEMP/platform-production-backup-ssh-error.log"
           [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ "$JOB_DEADLINE_MONOTONIC_NS" =~ ^[1-9][0-9]{0,19}$ ]]
+          if ! /usr/bin/python3 -I -B - "$JOB_DEADLINE_MONOTONIC_NS" <<'PY'
+          import sys
+          import time
+
+          remaining_ns = int(sys.argv[1]) - time.monotonic_ns()
+          if remaining_ns < 3_600_000_000_000:
+              raise SystemExit("less than 60 minutes remain for the bounded backup operation")
+          PY
+          then
+            cleanup_staged_helper_before_operation || echo "Source helper stage cleanup failed after deadline guard" >&2
+            exit 1
+          fi
           : >"$remote_report"
           : >"$remote_error"
           chmod 600 "$remote_report" "$remote_error"
@@ -650,7 +925,30 @@ jobs:
           [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ "$operation" = create || "$operation" = verify-existing ]]
-          if [[ "$operation" = verify-existing ]]; then
+          test "$(id -u)" -eq 0 || { echo "Production backup must run as root" >&2; exit 1; }
+          prepare_stage_lock() {
+            local lock_parent=/run/lock
+            local lock_dir=$lock_parent/oldsparky-backup-verifier-stage
+            local lock_file="$lock_dir/operation.lock"
+            test ! -L "$lock_parent"
+            test -d "$lock_parent"
+            test "$(stat -c '%u:%g:%a' "$lock_parent")" = "0:0:1777"
+            if [[ ! -e "$lock_dir" && ! -L "$lock_dir" ]]; then mkdir -m 755 -- "$lock_dir" 2>/dev/null && chmod 755 -- "$lock_dir" || :; fi
+            test ! -L "$lock_dir"
+            test "$(stat -c '%F:%u:%g:%a:%h' "$lock_dir")" = "directory:0:0:755:2"
+            if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then (umask 022; set -o noclobber; : >"$lock_file") 2>/dev/null || :; fi
+            test ! -L "$lock_file"
+            test -f "$lock_file"
+            test "$(stat -c '%u:%g:%a:%h' "$lock_file")" = "0:0:644:1"
+            local lock_identity
+            lock_identity="$(stat -c '%d:%i:%u:%g:%a:%h' "$lock_file")"
+            exec 7>>"$lock_file"
+            test "$(stat -Lc '%d:%i:%u:%g:%a:%h' "/proc/$$/fd/7")" = "$lock_identity"
+            test "$(stat -c '%d:%i:%u:%g:%a:%h' "$lock_file")" = "$lock_identity"
+            flock -w 45 7
+          }
+          prepare_stage_lock
+          if [[ "$operation" = verify-existing || "$operation" = create ]]; then
             [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
             [[ "$bundle_sha" =~ ^[0-9a-f]{64}$ ]]
             [[ "$evict_build_node_cache" = true || "$evict_build_node_cache" = false ]]
@@ -667,9 +965,6 @@ jobs:
             else
               [[ "$resume_compaction_run_id" = none && "$resume_compaction_run_attempt" = none && "$resume_compaction_bundle_sha256" = none ]]
             fi
-          else
-            [[ "$source_sha" = none && "$bundle_sha" = none && "$evict_build_node_cache" = false && "$compact_fallback_runtime_cache" = false && "$resume_compaction" = false ]]
-            [[ "$resume_compaction_run_id" = none && "$resume_compaction_run_attempt" = none && "$resume_compaction_bundle_sha256" = none ]]
           fi
           failure_stage=preflight
           public_summary_error=none
@@ -1007,7 +1302,7 @@ jobs:
               os.close(shared_fd)
           PY
             fi
-            if [[ "$operation" = verify-existing && -n "$helper_stage" && -n "$helper_stage_identity" ]]; then
+            if [[ ( "$operation" = verify-existing || "$operation" = create ) && -n "$helper_stage" && -n "$helper_stage_identity" ]]; then
               if /usr/bin/python3 -I -B - "$helper_stage" "$helper_stage_identity" "$bundle_sha" "$source_sha" <<'PY'
           import hashlib
           import json
@@ -1125,14 +1420,14 @@ jobs:
           maintenance_tool="$current/tools/platform_storage_maintenance.py"
           summary_tool="$current/tools/platform_storage_evidence_summary.py"
           helper_stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
-          if [[ "$operation" = verify-existing ]]; then
+          if [[ "$operation" = verify-existing || "$operation" = create ]]; then
             failure_stage=helper_bundle_validation
             test "$(stat -c '%F:%u:%g:%a:%h' "$helper_stage")" = "directory:0:0:700:2"
             helper_stage_identity="$(stat -c '%d:%i' "$helper_stage")"
             test "$(stat -c '%F:%u:%g:%a:%h' "$helper_stage/bundle.zip")" = "regular file:0:0:600:1"
             test "$(sha256sum "$helper_stage/bundle.zip" | awk '{print $1}')" = "$bundle_sha"
             helper_dir="$helper_stage/tools"
-            /usr/bin/python3 -I -B - "$helper_stage/bundle.zip" "$bundle_sha" "$source_sha" "$helper_dir" <<'PY'
+            /usr/bin/python3 -I -B - "$helper_stage/bundle.zip" "$bundle_sha" "$source_sha" "$helper_dir" 7>&7 <<'PY'
           import hashlib
           import json
           import os
@@ -1237,6 +1532,13 @@ jobs:
           test -f "$runtime/shared/.env.platform" || { echo "Platform env file is missing" >&2; exit 1; }
           test -f "$maintenance_tool" && test ! -L "$maintenance_tool" \
             || { echo "Storage maintenance tool is missing" >&2; exit 1; }
+          backup_drill_tool="$helper_stage/tools/platform_backup_restore_drill.py"
+          test -f "$backup_drill_tool" && test ! -L "$backup_drill_tool" \
+            || { echo "Source-bound backup restore helper is missing" >&2; exit 1; }
+          storage_helper_sha256="$(sha256sum -- "$maintenance_tool" | awk '{print $1}')"
+          backup_drill_sha256="$(sha256sum -- "$backup_drill_tool" | awk '{print $1}')"
+          [[ "$storage_helper_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$backup_drill_sha256" =~ ^[0-9a-f]{64}$ ]]
           test -f "$summary_tool" && test ! -L "$summary_tool" \
             || { echo "Storage evidence summary helper is missing or unsafe" >&2; exit 1; }
 
@@ -1250,7 +1552,7 @@ jobs:
             "$evict_build_node_cache" "$compact_fallback_runtime_cache" \
             "$resume_compaction" "$resume_compaction_run_id" \
             "$resume_compaction_run_attempt" "$resume_compaction_bundle_sha256" \
-            "$source_sha" "$bundle_sha" <<'PY'
+            "$source_sha" "$bundle_sha" 7>&7 <<'PY'
           import os
           from pathlib import Path
           import re
@@ -1718,6 +2020,9 @@ jobs:
               os.close(directory_fd)
           PY
           failure_stage=complete
+          printf 'BACKUP_SUCCESS schema=1 run_id=%s attempt=%s operation=%s source_sha=%s bundle_sha256=%s storage_helper_sha256=%s backup_drill_sha256=%s\n' \
+            "$run_id" "$run_attempt" "$operation" "$source_sha" "$bundle_sha" \
+            "$storage_helper_sha256" "$backup_drill_sha256"
           printf '%s\n' "$public_report"
           REMOTE
           then
@@ -1747,7 +2052,240 @@ jobs:
             fi
             exit 1
           fi
+          success_marker="$(/usr/bin/python3 -I - "$remote_report" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$BACKUP_OPERATION" "$SOURCE_SHA" "$BUNDLE_SHA256" "$EXPECTED_STORAGE_HELPER_SHA256" "$EXPECTED_BACKUP_DRILL_SHA256" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+          if len(lines) != 2:
+              raise SystemExit("remote success output is not the closed two-line receipt")
+          match = re.fullmatch(
+              r"BACKUP_SUCCESS schema=1 run_id=([1-9][0-9]{0,19}) attempt=([1-9][0-9]{0,5}) operation=(create|verify-existing) source_sha=([0-9a-f]{40}) bundle_sha256=([0-9a-f]{64}) storage_helper_sha256=([0-9a-f]{64}) backup_drill_sha256=([0-9a-f]{64})",
+              lines[0],
+          )
+          if (
+              match is None
+              or match.groups()[:5] != tuple(sys.argv[2:7])
+              or match.groups()[5:] != tuple(sys.argv[7:9])
+          ):
+              raise SystemExit("remote success marker source/run binding is invalid")
+          summary = json.loads(lines[1])
+          expected_mode = "backup-only" if sys.argv[4] == "create" else "verify-existing-backup-only"
+          if not isinstance(summary, dict) or summary.get("mode") != expected_mode:
+              raise SystemExit("remote success summary does not match operation")
+          print(lines[0])
+          PY
+          )"
+          printf '%s\n' "$success_marker"
           rm -f -- "$remote_report" "$remote_error"
+
+      - name: Remove staged helper bundle from production host
+        if: ${{ always() && steps.stage-backup-helper.outcome != 'skipped' && steps.backup-helper.outputs.bundle_sha256 != '' }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          STAGED_HELPER_IDENTITY: ${{ steps.stage-backup-helper.outputs.stage_identity }}
+          BUNDLE_SHA256: ${{ steps.backup-helper.outputs.bundle_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ -z "$STAGED_HELPER_IDENTITY" || "$STAGED_HELPER_IDENTITY" =~ ^[0-9]+:[0-9]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          ssh_dir="$RUNNER_TEMP/platform-production-backup-ssh"
+          if [[ ! -e "$ssh_dir" && ! -L "$ssh_dir" ]]; then
+            exit 0
+          fi
+          test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          timeout --foreground --signal=TERM --kill-after=5s 60s ssh \
+            -F /dev/null \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+            -o ServerAliveInterval=10 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i "$ssh_dir/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $STAGED_HELPER_IDENTITY $BUNDLE_SHA256 $SOURCE_SHA" <<'REMOTE'
+          set -Eeuo pipefail
+          run_id="${1:-}"
+          run_attempt="${2:-}"
+          expected_identity="${3:-}"
+          expected_sha="${4:-}"
+          source_sha="${5:-}"
+          [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ -z "$expected_identity" || "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]]
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+          test "$(id -u)" -eq 0
+          # Wait for any transfer or operation session to release the stage first.
+          prepare_stage_lock() {
+            local lock_parent=/run/lock
+            local lock_dir=$lock_parent/oldsparky-backup-verifier-stage
+            local lock_file="$lock_dir/operation.lock"
+            test ! -L "$lock_parent"
+            test -d "$lock_parent"
+            test "$(stat -c '%u:%g:%a' "$lock_parent")" = "0:0:1777"
+            if [[ ! -e "$lock_dir" && ! -L "$lock_dir" ]]; then mkdir -m 755 -- "$lock_dir" 2>/dev/null && chmod 755 -- "$lock_dir" || :; fi
+            test ! -L "$lock_dir"
+            test "$(stat -c '%F:%u:%g:%a:%h' "$lock_dir")" = "directory:0:0:755:2"
+            if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then (umask 022; set -o noclobber; : >"$lock_file") 2>/dev/null || :; fi
+            test ! -L "$lock_file"
+            test -f "$lock_file"
+            test "$(stat -c '%u:%g:%a:%h' "$lock_file")" = "0:0:644:1"
+            local lock_identity
+            lock_identity="$(stat -c '%d:%i:%u:%g:%a:%h' "$lock_file")"
+            exec 7>>"$lock_file"
+            test "$(stat -Lc '%d:%i:%u:%g:%a:%h' "/proc/$$/fd/7")" = "$lock_identity"
+            test "$(stat -c '%d:%i:%u:%g:%a:%h' "$lock_file")" = "$lock_identity"
+            flock -w 45 7
+          }
+          prepare_stage_lock || exit 75
+          # The backup remote then owns these canonical locks until its command stops.
+          exec 9>/run/lock/oldsparky-platform-release.lock
+          exec 8>/run/lock/oldsparky-retained-load-matrix.lock
+          lock_deadline=$((SECONDS + 45))
+          until flock -n 9 && flock -n 8; do
+            (( SECONDS < lock_deadline )) || exit 75
+            sleep 1
+          done
+          stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
+          /usr/bin/python3 -I -B - "$stage" "$expected_identity" "$expected_sha" "$source_sha" <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          import json
+          import zipfile
+
+          path = Path(sys.argv[1])
+          expected = tuple(int(item) for item in sys.argv[2].split(":")) if sys.argv[2] else None
+          expected_sha = sys.argv[3]
+          source_sha = sys.argv[4]
+          helper_names = {
+              "platform_backup_restore_drill.py",
+              "platform_disk_policy.py",
+              "platform_live_qa_guard.py",
+              "platform_release_retention.py",
+              "platform_build_node_cache.py",
+              "platform_storage_maintenance.py",
+          }
+          try:
+              before = path.lstat()
+          except FileNotFoundError:
+              raise SystemExit(0)
+          if (
+              not stat.S_ISDIR(before.st_mode)
+              or before.st_uid != 0
+              or before.st_gid != 0
+              or stat.S_IMODE(before.st_mode) != 0o700
+              or before.st_nlink not in {2, 3}
+          ):
+              raise SystemExit(1)
+          if expected is not None and (before.st_dev, before.st_ino) != expected:
+              raise SystemExit(1)
+          entries = list(path.iterdir())
+          names = {entry.name for entry in entries}
+          if names not in (set(), {"bundle.zip"}, {"bundle.zip", "tools"}):
+              raise SystemExit(1)
+          if "tools" in names and "bundle.zip" not in names:
+              raise SystemExit(1)
+          bundle = path / "bundle.zip"
+          item = None
+          if "bundle.zip" in names:
+              item = bundle.lstat()
+              if (
+                  not stat.S_ISREG(item.st_mode)
+                  or item.st_uid != 0
+                  or item.st_gid != 0
+                  or item.st_nlink != 1
+                  or stat.S_IMODE(item.st_mode) != 0o600
+              ):
+                  raise SystemExit(1)
+              digest = hashlib.sha256()
+              with bundle.open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              current_bundle = bundle.lstat()
+              if (
+                  digest.hexdigest() != expected_sha
+                  or (current_bundle.st_dev, current_bundle.st_ino, current_bundle.st_size,
+                      current_bundle.st_mtime_ns, current_bundle.st_ctime_ns)
+                  != (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+              ):
+                  raise SystemExit(1)
+          if "tools" in names:
+              tools = path / "tools"
+              tools_stat = tools.lstat()
+              if (
+                  not stat.S_ISDIR(tools_stat.st_mode)
+                  or tools_stat.st_uid != 0
+                  or tools_stat.st_gid != 0
+                  or tools_stat.st_nlink != 2
+                  or stat.S_IMODE(tools_stat.st_mode) != 0o555
+                  or {child.name for child in tools.iterdir()} != helper_names
+              ):
+                  raise SystemExit(1)
+              with zipfile.ZipFile(bundle) as archive:
+                  manifest = json.loads(
+                      archive.read("platform-backup-verifier/manifest.json").decode("ascii")
+                  )
+              if manifest.get("source_sha") != source_sha:
+                  raise SystemExit(1)
+              rows = {
+                  row.get("path", "").removeprefix("platform/tools/"): row
+                  for row in manifest.get("files", [])
+                  if isinstance(row, dict)
+              }
+              if set(rows) != helper_names:
+                  raise SystemExit(1)
+              for name in helper_names:
+                  helper = tools / name
+                  helper_stat = helper.lstat()
+                  row = rows[name]
+                  if (
+                      not stat.S_ISREG(helper_stat.st_mode)
+                      or helper_stat.st_uid != 0
+                      or helper_stat.st_gid != 0
+                      or helper_stat.st_nlink != 1
+                      or stat.S_IMODE(helper_stat.st_mode) != 0o444
+                      or helper_stat.st_size != row.get("size")
+                      or hashlib.sha256(helper.read_bytes()).hexdigest() != row.get("sha256")
+                  ):
+                      raise SystemExit(1)
+              tools.chmod(0o700)
+              for name in helper_names:
+                  (tools / name).unlink()
+              tools.rmdir()
+          if item is not None:
+              current_bundle = bundle.lstat()
+              if (current_bundle.st_dev, current_bundle.st_ino) != (item.st_dev, item.st_ino):
+                  raise SystemExit(1)
+              bundle.unlink()
+          current = path.lstat()
+          if (
+              (expected is not None and (current.st_dev, current.st_ino) != expected)
+              or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+              or list(path.iterdir())
+          ):
+              raise SystemExit(1)
+          path.rmdir()
+          directory_fd = os.open("/tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+          try:
+              os.fsync(directory_fd)
+          finally:
+              os.close(directory_fd)
+          PY
+          REMOTE
 
       - name: Remove production SSH material
         id: cleanup_ssh

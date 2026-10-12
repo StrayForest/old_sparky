@@ -82,22 +82,72 @@ rotation. The low-level backup CLI retains its historical rotation default;
 the lock-aware backup-only caller explicitly selects preservation.
 
 For a reviewed `dev` release, an operator may run the same guarded backup
-through GitHub Actions without opening a direct production shell:
+through GitHub Actions without opening a direct production shell. The backup
+workflow requires the exact `Platform security and build` run ID, attempt, and
+source SHA for the current `dev` head. Dispatch it while that exact CI run is
+still running, after confirming that no production deployment currently owns
+the shared production workflow slot. The backup workflow waits on that one run
+for at most 30 minutes of monotonic wall time within its 120-minute job
+deadline. The attestation verifier is capped at 10 minutes; before SSH starts,
+the workflow requires at least 60 minutes to remain, allowing a 45-minute
+backup/restore budget plus 15 minutes for completion and cleanup. Each API
+request and sleep is capped by the remaining poll deadline. It never substitutes another run or a newer `dev`
+head. It validates the exact successful verification job, artifact digest,
+attestation, and six-file helper manifest before staging anything on the host.
+It runs those staged, source-bound helper bytes for both create and
+verify-existing. If the run fails, times out, the source moves, or any bundle
+check fails, it stops without running a production backup or falling back to
+the installed helper. The normal deploy's freshness check is unchanged.
+
+After staging, an `always()` finalizer removes any leftover run-specific helper
+bundle before deleting the SSH material. Transfer, the remote backup operation,
+and cleanup serialize on a dedicated helper-stage lock. The finalizer waits for
+that lock before acquiring the canonical release and retained-load lock prefix,
+then validates the exact run/attempt path, root-owned directory identity, and
+any staged bundle/helper manifest before removal. The stage lock remains held
+through bundle streaming and by the operation wrapper until its child exits, so
+cleanup cannot race a live transfer or helper process after SSH cancellation.
+An already-absent stage is a successful cleanup. The finalizer has a 60-second
+SSH wall-clock limit and keepalives. If a lock remains busy or any stage
+identity/content differs, cleanup fails closed and leaves the unexpected stage
+for investigation rather than unlinking it.
+
+The isolated restore helper converts SIGINT and SIGTERM into its rollback and
+unit-reap path, including a bounded attempt to stop and reap the systemd
+launcher before removing the private mountpoint. SIGKILL or a host/kernel crash
+cannot run Python cleanup; the transient unit's runtime cap bounds the scratch
+cluster, and any remaining mountpoint requires operator inspection before a
+later attempt.
+
+Example, with values copied from the exact security run on the current `dev`
+SHA:
 
 ```bash
+SECURITY_RUN_ID=EXACT_SECURITY_RUN_ID
+SECURITY_RUN_ATTEMPT=EXACT_RUN_ATTEMPT
+SOURCE_SHA=EXACT_40_HEX_DEV_SHA
 gh workflow run platform-production-backup.yml \
   --repo StrayForest/old_sparky \
-  --ref dev
+  --ref dev \
+  -f operation=create \
+  -f security_run_id="$SECURITY_RUN_ID" \
+  -f security_run_attempt="$SECURITY_RUN_ATTEMPT" \
+  -f source_sha="$SOURCE_SHA"
 ```
 
-Wait for the `Platform production backup` workflow to pass before observing
-or repeating the automatic production deployment. It invokes the same
+Wait for that exact `Platform production backup` run to pass before treating
+the queued automatic deployment as eligible to proceed. The backup run and
+deploy child share the production concurrency group, so dispatch the backup
+early enough that it starts while the exact security run is still active; do
+not dispatch another production operation in between. It invokes the
 lock-aware backup-only mode and acquires locks in the fixed order
 release -> retained-load -> build -> live-QA. Backup-only does not apply
 production-release, source-artifact, transient-browser or live-QA retention.
 The workflow verifies that the pre-existing archive inventory is unchanged
 and that the new archive is restore/Alembic/checksum/freshness verified. Its
-bounded public receipt contains counts, byte totals and inventory digests;
+fixed success marker records the exact workflow source SHA, attested bundle
+digest, and hashes of the staged storage-maintenance and backup-drill helpers.
+Its bounded public receipt contains counts, byte totals and inventory digests;
 failure diagnostics stay in a root-private file and are not copied to the
 public artifact. No backup-only branch rotates or removes existing archives.
 Full storage maintenance owns the separate archive-rotation path and applies

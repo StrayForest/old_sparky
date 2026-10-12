@@ -1660,6 +1660,69 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         workflow_path = REPO_ROOT / ".github/workflows/platform-production-backup.yml"
         workflow = workflow_path.read_text(encoding="utf-8")
         self.assertIn("platform_storage_maintenance.py", workflow)
+        workflow_document = yaml.safe_load(workflow)
+        inputs = workflow_document.get(True, workflow_document).get("workflow_dispatch", {}).get("inputs", {})
+        self.assertTrue(inputs["security_run_id"]["required"])
+        self.assertTrue(inputs["security_run_attempt"]["required"])
+        self.assertTrue(inputs["source_sha"]["required"])
+        self.assertIn("for poll in $(seq 1 360)", workflow)
+        self.assertIn("time.monotonic_ns() + 1_800_000_000_000", workflow)
+        self.assertIn('--max-time "$request_timeout"', workflow)
+        self.assertIn('sleep "$sleep_seconds"', workflow)
+        self.assertIn("time.monotonic_ns() + 6_900_000_000_000", workflow)
+        self.assertIn("remaining_ns < 3_600_000_000_000", workflow)
+        self.assertIn("timeout --signal=TERM --kill-after=15s 600s gh attestation verify", workflow)
+        timeout_seconds = workflow_document["jobs"]["backup"]["timeout-minutes"] * 60
+        total_job_budget_seconds = 120 * 60
+        poll_seconds = 30 * 60
+        backup_operation_budget_seconds = 45 * 60
+        preflight_and_cleanup_budget_seconds = 15 * 60
+        operation_reserve_seconds = 60 * 60
+        self.assertEqual(timeout_seconds, total_job_budget_seconds)
+        self.assertGreaterEqual(
+            total_job_budget_seconds,
+            poll_seconds + preflight_and_cleanup_budget_seconds + operation_reserve_seconds,
+        )
+        self.assertIn('run.get("head_sha") != expected_sha', workflow)
+        self.assertIn('ref.get("ref") != "refs/heads/dev"', workflow)
+        self.assertIn('ref["object"].get("sha") != sys.argv[2]', workflow)
+        remote_runner = workflow.split(
+            'name: Create and verify the production backup', 1
+        )[1]
+        source_binding = remote_runner.index('[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]')
+        operation_branch = remote_runner.index(
+            'if [[ "$BACKUP_OPERATION" = verify-existing ]]; then'
+        )
+        shared_bundle_stage = remote_runner.index(
+            'bundle_stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"'
+        )
+        remote_arguments = remote_runner.index(
+            'remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BACKUP_OPERATION $SOURCE_SHA $BUNDLE_SHA256'
+        )
+        self.assertLess(source_binding, operation_branch)
+        self.assertLess(operation_branch, shared_bundle_stage)
+        self.assertLess(operation_branch, remote_arguments)
+        self.assertNotIn('bundle_stage=none', remote_runner)
+        self.assertNotIn('create none none false false false', remote_runner)
+        self.assertIn(
+            'if [[ "$operation" = verify-existing || "$operation" = create ]]; then',
+            workflow,
+        )
+        self.assertIn(
+            'maintenance_tool="$helper_dir/platform_storage_maintenance.py"',
+            workflow,
+        )
+        self._assert_backup_source_runner_branches(workflow_document)
+        self._assert_backup_remote_executes_staged_helper(workflow_document)
+        self._assert_backup_stage_finalizer_is_bounded_and_identity_pinned(workflow_document)
+        self.assertEqual(
+            workflow.count("if: ${{ inputs.operation == 'create' || inputs.operation == 'verify-existing' }}"),
+            2,
+        )
+        self.assertIn("BACKUP_SUCCESS schema=1 run_id=", workflow)
+        self.assertIn("storage_helper_sha256=", workflow)
+        self.assertIn("backup_drill_sha256=", workflow)
+        self.assertIn("remote success marker source/run binding is invalid", workflow)
         self.assertIn("--backup-only", workflow)
         self.assertIn('"--backup-max-age-hours", "24"', workflow)
         self.assertNotIn("--backup-keep 14", workflow)
@@ -1725,6 +1788,78 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 check=False,
                 timeout=10,
             )
+
+        poll_script = workflow_python(
+            'poll_state="$(/usr/bin/python3 -I -B - "$poll_path"'
+        )
+        success_marker_script = workflow_python(
+            'success_marker="$(/usr/bin/python3 -I - "$remote_report"'
+        )
+        with tempfile.TemporaryDirectory() as binding_dir_name:
+            binding_path = Path(binding_dir_name) / "receipt.json"
+            run_record = {
+                "id": 123456,
+                "run_attempt": 2,
+                "path": ".github/workflows/platform-security.yml",
+                "event": "push",
+                "head_branch": "dev",
+                "head_sha": "a" * 40,
+                "status": "in_progress",
+            }
+            binding_path.write_text(json.dumps(run_record), encoding="ascii")
+            pending = run_inline(
+                poll_script, str(binding_path), "123456", "2", "a" * 40
+            )
+            self.assertEqual(pending.returncode, 0, pending.stderr)
+            self.assertEqual(pending.stdout, "pending\n")
+            run_record.update(status="completed", conclusion="success")
+            binding_path.write_text(json.dumps(run_record), encoding="ascii")
+            completed = run_inline(
+                poll_script, str(binding_path), "123456", "2", "a" * 40
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, "success\n")
+            run_record["head_sha"] = "c" * 40
+            binding_path.write_text(json.dumps(run_record), encoding="ascii")
+            moved_head = run_inline(
+                poll_script, str(binding_path), "123456", "2", "a" * 40
+            )
+            self.assertNotEqual(moved_head.returncode, 0)
+
+            marker = (
+                "BACKUP_SUCCESS schema=1 run_id=123456 attempt=2 operation=create "
+                f"source_sha={'a' * 40} bundle_sha256={'b' * 64} "
+                f"storage_helper_sha256={'c' * 64} backup_drill_sha256={'d' * 64}"
+            )
+            binding_path.write_text(
+                marker + "\n" + json.dumps({"mode": "backup-only"}) + "\n",
+                encoding="ascii",
+            )
+            bound_success = run_inline(
+                success_marker_script,
+                str(binding_path),
+                "123456",
+                "2",
+                "create",
+                "a" * 40,
+                "b" * 64,
+                "c" * 64,
+                "d" * 64,
+            )
+            self.assertEqual(bound_success.returncode, 0, bound_success.stderr)
+            self.assertEqual(bound_success.stdout, marker + "\n")
+            wrong_bundle = run_inline(
+                success_marker_script,
+                str(binding_path),
+                "123456",
+                "2",
+                "create",
+                "a" * 40,
+                "e" * 64,
+                "c" * 64,
+                "d" * 64,
+            )
+            self.assertNotEqual(wrong_bundle.returncode, 0)
 
         summary_validation_script = workflow_python(
             '/usr/bin/python3 -I - "$backup_report_file" "$operation" '
@@ -1983,7 +2118,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         name,
                     )
             producer_bundle_valid = run_inline(
-                bundle_validation_script, str(producer_archive), source_sha
+                bundle_validation_script,
+                str(producer_archive),
+                source_sha,
+                str(fixture_root / "producer-manifest-output.env"),
             )
             self.assertEqual(
                 producer_bundle_valid.returncode, 0, producer_bundle_valid.stderr
@@ -2120,9 +2258,21 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertFalse(attestations_pass(broken_subject), "multiple subjects")
 
             valid_zip = run_inline(
-                bundle_validation_script, str(bundle_path), source_sha
+                bundle_validation_script,
+                str(bundle_path),
+                source_sha,
+                str(fixture_root / "manifest-output.env"),
             )
             self.assertEqual(valid_zip.returncode, 0, valid_zip.stderr)
+            manifest_output = (fixture_root / "manifest-output.env").read_text()
+            self.assertIn(
+                f"storage_helper_sha256={manifest_rows[-1]['sha256']}\n",
+                manifest_output,
+            )
+            self.assertIn(
+                f"backup_drill_sha256={manifest_rows[0]['sha256']}\n",
+                manifest_output,
+            )
             for kwargs, reason in (
                 (
                     {"manifest": {**valid_manifest, "source_sha": "d" * 40}},
@@ -2158,7 +2308,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             ):
                 write_bundle(**kwargs)
                 rejected = run_inline(
-                    bundle_validation_script, str(bundle_path), source_sha
+                    bundle_validation_script,
+                    str(bundle_path),
+                    source_sha,
+                    str(fixture_root / "rejected-manifest-output.env"),
                 )
                 self.assertNotEqual(rejected.returncode, 0, reason)
 
@@ -2228,6 +2381,521 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self._assert_backup_child_group_is_terminated(workflow_path)
         self._assert_backup_wrapper_bounds_private_stderr(workflow_path)
 
+    def _assert_backup_stage_finalizer_is_bounded_and_identity_pinned(
+        self, workflow_document: dict
+    ) -> None:
+        steps = workflow_document["jobs"]["backup"]["steps"]
+        cleanup = next(
+            step
+            for step in steps
+            if step.get("name") == "Remove staged helper bundle from production host"
+        )
+        self.assertIn("always()", cleanup["if"])
+        self.assertIn("steps.stage-backup-helper.outcome != 'skipped'", cleanup["if"])
+        operation_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("name") == "Create and verify the production backup"
+        )
+        self.assertLess(operation_index, steps.index(cleanup))
+        self.assertLess(
+            steps.index(cleanup),
+            next(
+                index
+                for index, step in enumerate(steps)
+                if step.get("name") == "Remove production SSH material"
+            ),
+        )
+        run = cleanup["run"]
+        self.assertIn("timeout --foreground --signal=TERM --kill-after=5s 60s ssh", run)
+        self.assertIn("ServerAliveInterval=10", run)
+        self.assertIn("ServerAliveCountMax=3", run)
+        stage_lock = "oldsparky-backup-verifier-stage"
+        self.assertIn(stage_lock, run)
+        self.assertLess(run.index(stage_lock), run.index("oldsparky-platform-release.lock"))
+        self.assertIn("flock -n 9 && flock -n 8", run)
+        self.assertIn("except FileNotFoundError:", run)
+
+        stage_step = next(
+            step for step in steps if step.get("name") == "Stage the verified helper bundle on the production host"
+        )["run"]
+        self.assertIn(stage_lock, stage_step)
+        self.assertIn("cat >\\\"\\$stage/bundle.zip\\\"", stage_step)
+        self.assertNotIn("\n          scp \\", stage_step)
+        self.assertLess(stage_step.index(stage_lock), stage_step.index('mkdir -m 700 --'))
+
+        remote = run.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE", 1)[0]
+        self.assertIn(stage_lock, remote)
+        self.assertLess(remote.index(stage_lock), remote.index('stage="/tmp/oldsparky-backup-verifier-'))
+        operation_run = next(
+            step["run"]
+            for step in steps
+            if step.get("name") == "Create and verify the production backup"
+        )
+        operation_remote = operation_run.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
+        lock_start = operation_remote.index("prepare_stage_lock() {")
+        lock_end = operation_remote.index("\n}\nprepare_stage_lock", lock_start)
+        lock_function = operation_remote[lock_start : lock_end + len("\n}")]
+        self.assertIn('test ! -L "$lock_dir"', lock_function)
+        self.assertIn("test ! -L \"$lock_parent\"", lock_function)
+        self.assertIn("1777", lock_function)
+        self.assertIn('test ! -L "$lock_file"', lock_function)
+        self.assertIn("/proc/$$/fd/7", lock_function)
+        self.assertIn('test -f "$lock_file"', lock_function)
+        lock_function = lock_function.replace(
+            "/run/lock",
+            "__TEST_LOCK_PARENT__",
+        )
+        lock_function = lock_function.replace(
+            '= "0:0:1777"', f'= "{os.geteuid()}:{os.getegid()}:1777"'
+        ).replace('= "0:0:755:2"', f'= "{os.geteuid()}:{os.getegid()}:755:2"')
+        lock_function = lock_function.replace('= "0:0:644:1"', f'= "{os.geteuid()}:{os.getegid()}:644:1"')
+
+        def run_lock_fixture(lock_parent: Path) -> subprocess.CompletedProcess[str]:
+            script = lock_function.replace("__TEST_LOCK_PARENT__", str(lock_parent))
+            return subprocess.run(
+                ["bash", "-c", f"set -euo pipefail\n{script}\nprepare_stage_lock\n"],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            attack_root = Path(temporary_dir)
+            safe_parent = attack_root / "safe-parent"
+            safe_parent.mkdir(mode=0o755)
+            safe_parent.chmod(0o1777)
+            accepted = run_lock_fixture(safe_parent)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            lock_file = safe_parent / "oldsparky-backup-verifier-stage" / "operation.lock"
+            lock_stat = lock_file.lstat()
+            self.assertEqual((lock_stat.st_uid, lock_stat.st_gid), (os.geteuid(), os.getegid()))
+            self.assertEqual((stat.S_IMODE(lock_stat.st_mode), lock_stat.st_nlink), (0o644, 1))
+
+            target = attack_root / "untouched-target"
+            target.write_bytes(b"keep this target unchanged")
+            symlink_parent = attack_root / "symlink-parent"
+            symlink_parent.symlink_to(attack_root, target_is_directory=True)
+            rejected_parent = run_lock_fixture(symlink_parent)
+            self.assertNotEqual(rejected_parent.returncode, 0)
+            wrong_parent = attack_root / "wrong-parent-mode"
+            wrong_parent.mkdir(mode=0o755)
+            wrong_parent.chmod(0o755)
+            rejected_parent_mode = run_lock_fixture(wrong_parent)
+            self.assertNotEqual(rejected_parent_mode.returncode, 0)
+            symlink_lock_parent = attack_root / "symlink-lock-parent"
+            symlink_lock_parent.mkdir(mode=0o755)
+            symlink_lock_parent.chmod(0o1777)
+            (symlink_lock_parent / "oldsparky-backup-verifier-stage").symlink_to(
+                attack_root, target_is_directory=True
+            )
+            rejected_dir = run_lock_fixture(symlink_lock_parent)
+            self.assertNotEqual(rejected_dir.returncode, 0)
+            symlink_file_parent = attack_root / "symlink-lock-file-parent"
+            symlink_file_parent.mkdir(mode=0o755)
+            symlink_file_parent.chmod(0o1777)
+            symlink_file_dir = symlink_file_parent / "oldsparky-backup-verifier-stage"
+            symlink_file_dir.mkdir(mode=0o755)
+            (symlink_file_dir / "operation.lock").symlink_to(target)
+            rejected_file = run_lock_fixture(symlink_file_parent)
+            self.assertNotEqual(rejected_file.returncode, 0)
+            wrong_mode_parent = attack_root / "wrong-mode-parent"
+            wrong_mode_parent.mkdir(mode=0o755)
+            wrong_mode_parent.chmod(0o1777)
+            wrong_mode_dir = wrong_mode_parent / "oldsparky-backup-verifier-stage"
+            wrong_mode_dir.mkdir(mode=0o777)
+            wrong_mode_dir.chmod(0o777)
+            rejected_mode = run_lock_fixture(wrong_mode_parent)
+            self.assertNotEqual(rejected_mode.returncode, 0)
+            hardlink_parent = attack_root / "hardlink-lock-parent"
+            hardlink_parent.mkdir(mode=0o755)
+            hardlink_parent.chmod(0o1777)
+            hardlink_dir = hardlink_parent / "oldsparky-backup-verifier-stage"
+            hardlink_dir.mkdir(mode=0o755)
+            (hardlink_dir / "operation.lock").hardlink_to(target)
+            rejected_link = run_lock_fixture(hardlink_parent)
+            self.assertNotEqual(rejected_link.returncode, 0)
+            self.assertEqual(target.read_bytes(), b"keep this target unchanged")
+        python_source = remote.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            stage = Path(temporary_dir) / "stage"
+            stage.mkdir(mode=0o700)
+            bundle = stage / "bundle.zip"
+            data = b"closed source-bound helper bundle fixture"
+            bundle.write_bytes(data)
+            bundle.chmod(0o600)
+            identity = f"{stage.stat().st_dev}:{stage.stat().st_ino}"
+            digest = hashlib.sha256(data).hexdigest()
+
+            def run_cleanup(
+                stage_path: Path,
+                wanted_identity: str,
+                wanted_sha: str,
+                wanted_source: str = "a" * 40,
+            ):
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-",
+                        str(stage_path),
+                        wanted_identity,
+                        wanted_sha,
+                        wanted_source,
+                    ],
+                    input=python_source,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            cleaned = run_cleanup(stage, identity, digest)
+            self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+            self.assertFalse(stage.exists())
+            absent = run_cleanup(stage, identity, digest)
+            self.assertEqual(absent.returncode, 0, absent.stderr)
+
+            stage.mkdir(mode=0o700)
+            discovered_identity = run_cleanup(stage, "", digest)
+            self.assertEqual(discovered_identity.returncode, 0, discovered_identity.stderr)
+            self.assertFalse(stage.exists())
+
+            stage.mkdir(mode=0o700)
+            tools = stage / "tools"
+            tools.mkdir(mode=0o700)
+            helper_names = {
+                "platform_backup_restore_drill.py",
+                "platform_disk_policy.py",
+                "platform_live_qa_guard.py",
+                "platform_release_retention.py",
+                "platform_build_node_cache.py",
+                "platform_storage_maintenance.py",
+            }
+            source_sha = "a" * 40
+            members = {name: f"# helper {name}\n".encode() for name in helper_names}
+            rows = [
+                {
+                    "path": f"platform/tools/{name}",
+                    "sha256": hashlib.sha256(contents).hexdigest(),
+                    "size": len(contents),
+                }
+                for name, contents in members.items()
+            ]
+            manifest = {
+                "schema": 1,
+                "repository": "StrayForest/old_sparky",
+                "source_sha": source_sha,
+                "files": rows,
+            }
+            bundle = stage / "bundle.zip"
+            with zipfile.ZipFile(bundle, "w") as archive:
+                archive.writestr(
+                    "platform-backup-verifier/manifest.json",
+                    json.dumps(manifest, sort_keys=True),
+                )
+            bundle.chmod(0o600)
+            for name, contents in members.items():
+                helper = tools / name
+                helper.write_bytes(contents)
+                helper.chmod(0o444)
+            tools.chmod(0o555)
+            stage_identity = f"{stage.stat().st_dev}:{stage.stat().st_ino}"
+            staged_digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+            extracted = subprocess.run(
+                [sys.executable, "-I", "-B", "-", str(stage), stage_identity,
+                 staged_digest, source_sha],
+                input=python_source,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(extracted.returncode, 0, extracted.stderr)
+            self.assertFalse(stage.exists())
+
+            stage.mkdir(mode=0o700)
+            bundle = stage / "bundle.zip"
+            bundle.write_bytes(data)
+            bundle.chmod(0o600)
+            mismatch = run_cleanup(stage, identity, "0" * 64)
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertEqual(bundle.read_bytes(), data)
+
+            mismatch_identity = run_cleanup(stage, "0:0", digest)
+            self.assertNotEqual(mismatch_identity.returncode, 0)
+            self.assertEqual(bundle.read_bytes(), data)
+
+    def _assert_backup_source_runner_branches(self, workflow_document: dict) -> None:
+        run_script = next(
+            step["run"]
+            for step in workflow_document["jobs"]["backup"]["steps"]
+            if step.get("name") == "Create and verify the production backup"
+        )
+        branch_start = run_script.index(
+            '[[ "$BACKUP_OPERATION" = create || "$BACKUP_OPERATION" = verify-existing ]]'
+        )
+        branch_end = run_script.index('remote_report=', branch_start)
+        branch_script = "set -euo pipefail\n" + run_script[branch_start:branch_end]
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            temp = Path(temporary_dir)
+            bin_dir = temp / "bin"
+            bin_dir.mkdir(mode=0o700)
+            (temp / "platform-backup-verifier-input").mkdir(mode=0o700)
+            fake_curl = bin_dir / "curl"
+            fake_curl.write_text(
+                "#!/bin/sh\n"
+                "out=\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  if [ \"$1\" = --output ]; then shift; out=$1; fi\n"
+                "  shift\n"
+                "done\n"
+                "test -n \"$out\" || exit 2\n"
+                "printf '{\"ref\":\"refs/heads/dev\",\"object\":{\"sha\":\"%s\"}}' \"$SOURCE_SHA\" > \"$out\"\n",
+                encoding="ascii",
+            )
+            fake_curl.chmod(0o700)
+            outputs = {}
+            for operation in ("create", "verify-existing"):
+                result = subprocess.run(
+                    ["bash", "-c", branch_script + '\nprintf "%s\\n%s\\n" "$bundle_stage" "$remote_arguments"\n'],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                    env={
+                        **os.environ,
+                        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                        "BACKUP_OPERATION": operation,
+                        "EVICT_BUILD_NODE_CACHE": "false",
+                        "COMPACT_FALLBACK_RUNTIME_CACHE": "false",
+                        "RESUME_FALLBACK_CACHE_COMPACTION": "false",
+                        "RESUME_COMPACTION_RUN_ID": "",
+                        "RESUME_COMPACTION_RUN_ATTEMPT": "",
+                        "RESUME_COMPACTION_BUNDLE_SHA256": "",
+                        "SOURCE_SHA": "a" * 40,
+                        "BUNDLE_SHA256": "b" * 64,
+                        "EXPECTED_STORAGE_HELPER_SHA256": "c" * 64,
+                        "EXPECTED_BACKUP_DRILL_SHA256": "d" * 64,
+                        "REPOSITORY": "StrayForest/old_sparky",
+                        "GITHUB_SHA": "a" * 40,
+                        "GITHUB_RUN_ID": "123456",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                        "GITHUB_API_URL": "https://api.github.com",
+                        "RUNNER_TEMP": str(temp),
+                        "GH_TOKEN": "fixture-token",
+                    },
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines[0], "/tmp/oldsparky-backup-verifier-123456-1")
+                self.assertEqual(
+                    lines[1],
+                    f"123456 1 {operation} {'a' * 40} {'b' * 64} false false false none none none",
+                )
+                outputs[operation] = lines
+            for operation in ("create", "verify-existing"):
+                invalid_env = {
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                    "BACKUP_OPERATION": operation,
+                    "EVICT_BUILD_NODE_CACHE": "false",
+                    "COMPACT_FALLBACK_RUNTIME_CACHE": "false",
+                    "RESUME_FALLBACK_CACHE_COMPACTION": "false",
+                    "RESUME_COMPACTION_RUN_ID": "",
+                    "RESUME_COMPACTION_RUN_ATTEMPT": "",
+                    "RESUME_COMPACTION_BUNDLE_SHA256": "",
+                    "SOURCE_SHA": "a" * 40,
+                    "BUNDLE_SHA256": "",
+                    "EXPECTED_STORAGE_HELPER_SHA256": "c" * 64,
+                    "EXPECTED_BACKUP_DRILL_SHA256": "d" * 64,
+                    "REPOSITORY": "StrayForest/old_sparky",
+                    "GITHUB_SHA": "a" * 40,
+                    "GITHUB_RUN_ID": "123456",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_API_URL": "https://api.github.com",
+                    "RUNNER_TEMP": str(temp),
+                    "GH_TOKEN": "fixture-token",
+                }
+                invalid = subprocess.run(
+                    ["bash", "-c", branch_script],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                    env=invalid_env,
+                )
+                self.assertNotEqual(invalid.returncode, 0, operation)
+
+    def _assert_backup_remote_executes_staged_helper(self, workflow_document: dict) -> None:
+        run_script = next(
+            step["run"]
+            for step in workflow_document["jobs"]["backup"]["steps"]
+            if step.get("name") == "Create and verify the production backup"
+        )
+        remote_script = run_script.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
+        stop_at = remote_script.index("failure_stage=summary_validation\n")
+        remote_script = remote_script[:stop_at]
+        remote_script = remote_script.replace(
+            'runtime=/opt/oldsparky/platform', 'runtime=__TEST_RUNTIME__'
+        )
+        remote_script = remote_script.replace(
+            'helper_stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"',
+            'helper_stage=__TEST_STAGE__',
+        )
+        remote_script += (
+            'printf "SELECTED_HELPER=%s\\nHELPER_SHA=%s\\n" '
+            '"$maintenance_tool" "$storage_helper_sha256"\nexit 0\n'
+        )
+        helper_names = (
+            "platform_backup_restore_drill.py",
+            "platform_disk_policy.py",
+            "platform_live_qa_guard.py",
+            "platform_release_retention.py",
+            "platform_build_node_cache.py",
+            "platform_storage_maintenance.py",
+        )
+        helper_modes = {
+            "platform_backup_restore_drill.py": 0o755,
+            "platform_disk_policy.py": 0o644,
+            "platform_live_qa_guard.py": 0o755,
+            "platform_release_retention.py": 0o755,
+            "platform_build_node_cache.py": 0o644,
+            "platform_storage_maintenance.py": 0o755,
+        }
+        source_sha = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            stage_lock = root / "stage-lock"
+            runtime = root / "platform"
+            release = runtime / "release"
+            shared = runtime / "shared"
+            tools = release / "tools"
+            tools.mkdir(parents=True, mode=0o755)
+            shared.mkdir(mode=0o755)
+            (shared / ".env.platform").write_text("fixture=1\n", encoding="ascii")
+            (runtime / "current").symlink_to(release, target_is_directory=True)
+            (tools / "platform_storage_maintenance.py").write_text(
+                "raise SystemExit('installed helper must not execute')\n", encoding="ascii"
+            )
+            (tools / "platform_storage_evidence_summary.py").write_text(
+                "raise SystemExit('summary is outside this fixture')\n", encoding="ascii"
+            )
+            python_bin = shared / "venv" / "bin" / "python"
+            python_bin.parent.mkdir(parents=True, mode=0o755)
+            python_bin.symlink_to(sys.executable)
+            stage = root / "stage"
+            stage.mkdir(mode=0o700)
+            archive_path = stage / "bundle.zip"
+            archive_path.touch(mode=0o600)
+            members = {}
+            for name in helper_names:
+                if name == "platform_storage_maintenance.py":
+                    content = (
+                        "import json, os, sys\n"
+                        "from pathlib import Path\n"
+                        "sys.path.insert(0, str(Path(sys.argv[0]).parent))\n"
+                        "import platform_backup_restore_drill as drill\n"
+                        "Path(os.environ['BACKUP_HELPER_INVOCATION']).write_text("
+                        "json.dumps({'script': sys.argv[0], 'argv': sys.argv[1:], "
+                        "'drill': drill.__file__}), encoding='ascii')\n"
+                        "print('{}')\n"
+                    ).encode("ascii")
+                elif name == "platform_backup_restore_drill.py":
+                    content = b"SOURCE_BUNDLE_FIXTURE = True\n"
+                else:
+                    content = f"# signed fixture member {name}\\n".encode("ascii")
+                members[name] = content
+            manifest = {
+                "schema": 1,
+                "repository": "StrayForest/old_sparky",
+                "source_sha": source_sha,
+                "files": [
+                    {
+                        "path": f"platform/tools/{name}",
+                        "source_mode": helper_modes[name],
+                        "size": len(content),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    }
+                    for name, content in members.items()
+                ],
+            }
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for name, content in members.items():
+                    info = zipfile.ZipInfo(f"platform-backup-verifier/{name}")
+                    info.external_attr = (stat.S_IFREG | 0o444) << 16
+                    archive.writestr(info, content)
+                info = zipfile.ZipInfo("platform-backup-verifier/manifest.json")
+                info.external_attr = (stat.S_IFREG | 0o444) << 16
+                archive.writestr(info, json.dumps(manifest, separators=(",", ":")))
+            archive_sha = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            invocation_log = root / "helper-invocation.json"
+            for operation in ("create", "verify-existing"):
+                run_id = str(100_000_000 + uuid.uuid4().int % 800_000_000)
+                operation_stage = root / f"stage-{operation}"
+                operation_stage.mkdir(mode=0o700)
+                staged_zip = operation_stage / "bundle.zip"
+                shutil.copyfile(archive_path, staged_zip)
+                staged_zip.chmod(0o600)
+                script = remote_script.replace(
+                    "runtime=__TEST_RUNTIME__", f"runtime={runtime}"
+                ).replace("helper_stage=__TEST_STAGE__", f"helper_stage={operation_stage}")
+                script = script.replace(
+                    "/run/lock/oldsparky-backup-verifier-stage", str(stage_lock)
+                )
+                script = script.replace(" >/dev/null 2>&1 || :", " >&2 || :")
+                script = "set -x\n" + script
+                completed = subprocess.run(
+                    [
+                        "bash", "-s", "--", run_id, "1", operation, source_sha,
+                        archive_sha, "false", "false", "false", "none", "none", "none",
+                    ],
+                    input=script,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=15,
+                    env={
+                        **os.environ,
+                        "BACKUP_HELPER_INVOCATION": str(invocation_log),
+                    },
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                expected_helper = operation_stage / "tools/platform_storage_maintenance.py"
+                expected_hash = hashlib.sha256(members["platform_storage_maintenance.py"]).hexdigest()
+                self.assertIn(f"SELECTED_HELPER={expected_helper}", completed.stdout)
+                self.assertIn(f"HELPER_SHA={expected_hash}", completed.stdout)
+                invocation = json.loads(invocation_log.read_text(encoding="ascii"))
+                self.assertEqual(invocation["script"], str(expected_helper))
+                self.assertEqual(
+                    invocation["drill"],
+                    str(operation_stage / "tools/platform_backup_restore_drill.py"),
+                )
+                self.assertIn(
+                    "--backup-only" if operation == "create" else "--verify-existing-backup-only",
+                    invocation["argv"],
+                )
+                self.assertFalse(operation_stage.exists())
+                invocation_log.unlink()
+
+            missing_stage = root / "missing-stage"
+            invalid = subprocess.run(
+                [
+                    "bash", "-s", "--", str(900_000_000 + uuid.uuid4().int % 90_000_000), "1", "create", "none", archive_sha,
+                    "false", "false", "false", "none", "none", "none",
+                ],
+                input=remote_script.replace(
+                    "runtime=__TEST_RUNTIME__", f"runtime={runtime}"
+                ).replace("helper_stage=__TEST_STAGE__", f"helper_stage={missing_stage}"),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+                env={**os.environ, "BACKUP_HELPER_INVOCATION": str(invocation_log)},
+            )
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertFalse(invocation_log.exists())
+
     def _assert_backup_failure_trap_executes(self, workflow_path: Path) -> None:
         workflow = yaml.safe_load(
             workflow_path.read_text()
@@ -2237,13 +2905,20 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             for step in workflow["jobs"]["backup"]["steps"]
             if step.get("name") == "Create and verify the production backup"
         )
-        remote_script = run_script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
+        remote_script = run_script.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
         remote_script = remote_script.replace(
             "runtime=/opt/oldsparky/platform", "runtime=__TEST_RUNTIME__"
         )
         remote_script = remote_script.replace(
             'test "$(id -u)" -eq 0 || { echo "Production backup must run as root" >&2; exit 1; }',
             ":",
+        )
+        bundle_gate = 'if [[ "$operation" = verify-existing || "$operation" = create ]]; then'
+        first_bundle_gate = remote_script.index(bundle_gate)
+        second_bundle_gate = remote_script.index(bundle_gate, first_bundle_gate + len(bundle_gate))
+        remote_script = (
+            remote_script[:second_bundle_gate]
+            + remote_script[second_bundle_gate:].replace(bundle_gate, "if false; then", 1)
         )
         with tempfile.TemporaryDirectory() as temporary_dir:
             test_root = Path(temporary_dir)
@@ -2267,8 +2942,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "123456",
                     "1",
                     "create",
-                    "none",
-                    "none",
+                    "a" * 40,
+                    "b" * 64,
                     "false",
                     "false",
                     "false",
@@ -2364,8 +3039,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "123457",
                     "1",
                     "create",
-                    "none",
-                    "none",
+                    "a" * 40,
+                    "b" * 64,
                     "false",
                     "false",
                     "false",
@@ -2444,8 +3119,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "123458",
                     "1",
                     "create",
-                    "none",
-                    "none",
+                    "a" * 40,
+                    "b" * 64,
                     "false",
                     "false",
                     "false",
@@ -2562,7 +3237,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             for step in workflow["jobs"]["backup"]["steps"]
             if step.get("name") == "Create and verify the production backup"
         )
-        remote_script = run_script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
+        remote_script = run_script.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
         wrapper_script = next(
             block
             for block in re.findall(r"<<'PY'\n(.*?)\n[ \t]*PY(?=\n)", remote_script, re.S)
@@ -2658,7 +3333,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             for step in workflow["jobs"]["backup"]["steps"]
             if step.get("name") == "Create and verify the production backup"
         )
-        remote_script = run_script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
+        remote_script = run_script.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
         wrapper_script = next(
             block
             for block in re.findall(r"<<'PY'\n(.*?)\n[ \t]*PY(?=\n)", remote_script, re.S)
@@ -2809,7 +3484,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     self.assertEqual(resume_argv[resume_argv.index(option) + 1], value)
 
             create_argv = invoke_wrapper(
-                operation="create", evict="false", source_sha="none", bundle_sha="none"
+                operation="create", evict="false", source_sha=source_sha, bundle_sha=bundle_sha
             )
             self.assertIn("--backup-only", create_argv)
             self.assertNotIn("--verify-existing-backup-only", create_argv)
