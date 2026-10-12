@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 import uuid
@@ -84,6 +85,240 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill.parse_database_url(
                 "postgresql+asyncpg://platform_user:secret@127.0.0.1:5432/sparkydb"
             )
+
+    def _assert_scratch_unit_diagnostic_caps_and_private_envelope(self) -> None:
+        stdout = b"o" * (backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES + 1)
+        stderr = b"e" * (backup_drill.SCRATCH_PRIVATE_STDERR_BYTES + 1)
+        diagnostic = backup_drill._scratch_unit_diagnostic(
+            {
+                "properties": {
+                    "ActiveState": "failed",
+                    "SubState": "failed",
+                    "Result": "exit-code",
+                    "ExecMainStatus": "203",
+                }
+            },
+            launcher_exit_status=1,
+            stdout_prefix=stdout,
+            stdout_observed=len(stdout),
+            stdout_complete=True,
+            stderr_prefix=stderr,
+            stderr_observed=len(stderr),
+            stderr_complete=True,
+        )
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(diagnostic))
+        self.assertEqual(diagnostic["stdout_bytes"], backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES)
+        self.assertEqual(diagnostic["stderr_bytes"], backup_drill.SCRATCH_PRIVATE_STDERR_BYTES)
+        self.assertTrue(diagnostic["stdout_truncated"])
+        self.assertTrue(diagnostic["stderr_truncated"])
+        self.assertEqual(
+            diagnostic["stdout_sha256"],
+            hashlib.sha256(stdout[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES]).hexdigest(),
+        )
+        envelope = backup_drill._scratch_private_output_envelope(
+            stdout[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES],
+            stderr[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES],
+        )
+        self.assertLessEqual(len(envelope), 48 * 1024)
+        self.assertLessEqual(len(envelope), 65536)
+        framed_payload_bytes = 2 + backup_drill.SCRATCH_PRIVATE_RAW_BYTES
+        self.assertEqual(
+            len(envelope),
+            len(backup_drill.SCRATCH_PRIVATE_OUTPUT_MARKER)
+            + 4 * ((framed_payload_bytes + 2) // 3)
+            + 1,
+        )
+        with self.assertRaisesRegex(ValueError, "closed envelope bound"):
+            backup_drill._scratch_private_output_envelope(
+                b"x" * (backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES + 1), b""
+            )
+        self.assertTrue(envelope.startswith(backup_drill.SCRATCH_PRIVATE_OUTPUT_MARKER))
+        encoded_line = envelope[len(backup_drill.SCRATCH_PRIVATE_OUTPUT_MARKER) :].rstrip(b"\n")
+        decoded = backup_drill.base64.b64decode(encoded_line, validate=True)
+        stdout_size = int.from_bytes(decoded[:2], "big")
+        self.assertEqual(stdout_size, backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES)
+        self.assertEqual(decoded[2 : 2 + stdout_size], stdout[:stdout_size])
+        self.assertEqual(decoded[2 + stdout_size :], stderr[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES])
+        overflow = backup_drill._scratch_unit_diagnostic(
+            {
+                "properties": {
+                    "ActiveState": "failed",
+                    "SubState": "failed",
+                    "Result": "exit-code",
+                    "ExecMainStatus": "203",
+                }
+            },
+            launcher_exit_status=1,
+            stdout_prefix=b"x" * backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES,
+            stdout_observed=backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES,
+            stdout_complete=False,
+            stderr_prefix=b"y" * 7,
+            stderr_observed=7,
+            stderr_complete=True,
+        )
+        self.assertIsNotNone(overflow)
+        assert overflow is not None
+        self.assertTrue(overflow["stdout_truncated"])
+        self.assertEqual(overflow["stdout_bytes"], backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES)
+
+        malformed = dict(diagnostic)
+        malformed["stdout_bytes"] = backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES + 1
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
+        malformed = dict(diagnostic)
+        malformed["active_state"] = []
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
+        malformed = dict(diagnostic)
+        malformed["stdout_truncated"] = 1
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
+
+        private_failure = RuntimeError("fixed backup failure")
+        private_failure.scratch_unit_diagnostic = diagnostic
+        private_failure.scratch_unit_private_output = (
+            stdout[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES],
+            stderr[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES],
+        )
+        cli_args = argparse.Namespace(
+            as_json=True,
+            private_scratch_diagnostics=True,
+            check_latest=False,
+            verify_latest_existing=False,
+            dump_only=False,
+            verify_dump=None,
+        )
+        private_stdout = io.StringIO()
+        private_stderr = io.StringIO()
+        with (
+            mock.patch.object(backup_drill, "parse_args", return_value=cli_args),
+            mock.patch.object(backup_drill, "create_backup", side_effect=private_failure),
+            mock.patch.object(backup_drill.sys, "stdout", private_stdout),
+            mock.patch.object(backup_drill.sys, "stderr", private_stderr),
+        ):
+            self.assertEqual(backup_drill.main(), 1)
+        private_report = json.loads(private_stdout.getvalue())
+        self.assertEqual(private_report["scratch_unit_diagnostic"], diagnostic)
+        self.assertNotIn(stdout[:32].decode("ascii"), private_stdout.getvalue())
+        self.assertEqual(
+            private_stderr.getvalue().encode("ascii"),
+            backup_drill._scratch_private_output_envelope(
+                stdout[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES],
+                stderr[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES],
+            ),
+        )
+
+        public_args = argparse.Namespace(**{**vars(cli_args), "private_scratch_diagnostics": False})
+        public_stdout = io.StringIO()
+        public_stderr = io.StringIO()
+        with (
+            mock.patch.object(backup_drill, "parse_args", return_value=public_args),
+            mock.patch.object(backup_drill, "create_backup", side_effect=private_failure),
+            mock.patch.object(backup_drill.sys, "stdout", public_stdout),
+            mock.patch.object(backup_drill.sys, "stderr", public_stderr),
+        ):
+            self.assertEqual(backup_drill.main(), 1)
+        self.assertNotIn("scratch_unit_diagnostic", public_stdout.getvalue())
+        self.assertEqual(public_stderr.getvalue(), "")
+
+    def _assert_scratch_early_exit_output_is_drained(self) -> None:
+        class LauncherProcess:
+            def __init__(self, stdout, stderr) -> None:
+                self.stdout = stdout
+                self.stderr = stderr
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, *, timeout=None):
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            archive_path.chmod(0o600)
+            stdout_read, stdout_write = os.pipe()
+            stderr_read, stderr_write = os.pipe()
+            stdout_reader = os.fdopen(stdout_read, "rb", buffering=0)
+            stderr_reader = os.fdopen(stderr_read, "rb", buffering=0)
+            stdout_payload = b"o" * (backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES + 1)
+            stderr_payload = b"reason:" + b"e" * backup_drill.SCRATCH_PRIVATE_STDERR_BYTES
+
+            def write_payload(fd, payload):
+                try:
+                    view = memoryview(payload)
+                    while view:
+                        view = view[os.write(fd, view) :]
+                finally:
+                    os.close(fd)
+
+            stdout_writer = threading.Thread(target=write_payload, args=(stdout_write, stdout_payload))
+            stderr_writer = threading.Thread(target=write_payload, args=(stderr_write, stderr_payload))
+            stdout_writer.start()
+            stderr_writer.start()
+            launcher = LauncherProcess(stdout_reader, stderr_reader)
+            snapshots = [
+                {
+                    "properties": {
+                        "LoadState": "loaded",
+                        "ActiveState": "failed",
+                        "SubState": "failed",
+                        "Result": "exit-code",
+                        "ExecMainPID": "0",
+                        "ExecMainStatus": "203",
+                        "ControlGroup": "/system.slice/scratch-test.service",
+                    }
+                },
+                {
+                    "properties": {
+                        "LoadState": "not-found",
+                        "ActiveState": "inactive",
+                        "ExecMainPID": "0",
+                        "ControlGroup": "",
+                    }
+                },
+            ]
+
+            def stop_unit(_unit_name):
+                launcher.returncode = 1
+
+            try:
+                with (
+                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(backup_drill, "_scratch_host_guard"),
+                    mock.patch.object(backup_drill, "_scratch_unit_command", return_value=["systemd-run"]),
+                    mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                    mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=snapshots),
+                    mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit),
+                    mock.patch.object(backup_drill.subprocess, "Popen", return_value=launcher),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "exited before its confinement was verified"
+                    ) as failure:
+                        backup_drill._run_isolated_restore_drill(
+                            archive_path,
+                            timestamp_slug="20261012T010203Z",
+                        )
+                stdout_writer.join(timeout=2)
+                stderr_writer.join(timeout=2)
+                self.assertFalse(stdout_writer.is_alive())
+                self.assertFalse(stderr_writer.is_alive())
+                diagnostic = failure.exception.scratch_unit_diagnostic
+                self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(diagnostic))
+                self.assertEqual(diagnostic["exec_main_status"], 203)
+                self.assertEqual(diagnostic["launcher_exit_status"], 1)
+                self.assertEqual(diagnostic["stdout_bytes"], backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES)
+                self.assertTrue(diagnostic["stdout_truncated"])
+                self.assertEqual(diagnostic["stderr_bytes"], backup_drill.SCRATCH_PRIVATE_STDERR_BYTES)
+                self.assertTrue(diagnostic["stderr_truncated"])
+                raw_stdout, raw_stderr = failure.exception.scratch_unit_private_output
+                self.assertEqual(raw_stdout, stdout_payload[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES])
+                self.assertEqual(raw_stderr, stderr_payload[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES])
+            finally:
+                stdout_reader.close()
+                stderr_reader.close()
+                stdout_writer.join(timeout=2)
+                stderr_writer.join(timeout=2)
 
     def test_local_admin_commands_use_postgres_os_user(self) -> None:
         target = backup_drill.DatabaseTarget("127.0.0.1", 5432, "platform_user", None, "platformdb")
@@ -194,6 +429,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db()
         self._assert_scratch_sigterm_stops_and_reaps_launched_unit()
         self._assert_scratch_worker_uses_pinned_archive_fd()
+        self._assert_scratch_unit_diagnostic_caps_and_private_envelope()
+        self._assert_scratch_early_exit_output_is_drained()
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             scratch_root = pathlib.Path(temporary_dir) / "scratch"

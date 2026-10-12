@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import dataclasses
 import datetime as dt
@@ -19,6 +20,7 @@ import shlex
 import signal
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -73,6 +75,11 @@ SCRATCH_RUNTIME_SAMPLE_SECONDS = 0.25
 SCRATCH_PG_PORT = 55432
 SCRATCH_WORKER_MODE = "--_scratch-restore-worker"
 SCRATCH_APP_ROLE = "platform_user"
+SCRATCH_PRIVATE_OUTPUT_MARKER = b"SCRATCH_UNIT_PRIVATE_OUTPUT_V1\n"
+SCRATCH_PRIVATE_STDOUT_BYTES = 2 * 1024
+SCRATCH_PRIVATE_STDERR_BYTES = 32 * 1024
+SCRATCH_PRIVATE_RAW_BYTES = SCRATCH_PRIVATE_STDOUT_BYTES + SCRATCH_PRIVATE_STDERR_BYTES
+SCRATCH_PRIVATE_ENVELOPE_BYTES = 48 * 1024
 
 
 class RestoreGuardStop(RuntimeError):
@@ -220,6 +227,117 @@ def valid_backup_disk_diagnostic(value: Any) -> bool:
     return True
 
 
+_SCRATCH_UNIT_SUBSTATES = {
+    "dead", "failed", "exited", "start", "start-pre", "start-post",
+    "running", "stop", "stop-sigterm", "stop-sigkill", "final-sigterm",
+    "final-sigkill", "auto-restart", "condition", "assert", "other",
+}
+_SCRATCH_UNIT_RESULTS = {
+    "success", "resources", "timeout", "exit-code", "signal", "core-dump",
+    "watchdog", "start-limit-hit", "protocol", "exec-condition", "condition",
+    "assert", "oom-kill", "other",
+}
+
+
+def valid_scratch_unit_diagnostic(value: Any) -> bool:
+    """Validate the closed, non-sensitive summary of an early scratch-unit exit."""
+    keys = {
+        "schema", "phase", "active_state", "sub_state", "result",
+        "exec_main_status", "launcher_exit_status", "stdout_bytes",
+        "stdout_sha256", "stdout_truncated", "stderr_bytes", "stderr_sha256",
+        "stderr_truncated",
+    }
+    if not isinstance(value, dict) or set(value) != keys:
+        return False
+    if (
+        type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or type(value.get("phase")) is not str
+        or value.get("phase") != "unit_exited_before_confinement"
+        or type(value.get("active_state")) is not str
+        or value.get("active_state") not in {"failed", "inactive"}
+        or type(value.get("sub_state")) is not str
+        or value.get("sub_state") not in _SCRATCH_UNIT_SUBSTATES
+        or type(value.get("result")) is not str
+        or value.get("result") not in _SCRATCH_UNIT_RESULTS
+        or (
+            value.get("exec_main_status") is not None
+            and (type(value["exec_main_status"]) is not int or not 0 <= value["exec_main_status"] <= 255)
+        )
+        or (
+            value.get("launcher_exit_status") is not None
+            and (type(value["launcher_exit_status"]) is not int or not -255 <= value["launcher_exit_status"] <= 255)
+        )
+        or type(value.get("stdout_bytes")) is not int
+        or not 0 <= value["stdout_bytes"] <= SCRATCH_PRIVATE_STDOUT_BYTES
+        or type(value.get("stderr_bytes")) is not int
+        or not 0 <= value["stderr_bytes"] <= SCRATCH_PRIVATE_STDERR_BYTES
+        or type(value.get("stdout_truncated")) is not bool
+        or type(value.get("stderr_truncated")) is not bool
+        or type(value.get("stdout_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["stdout_sha256"]) is None
+        or type(value.get("stderr_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["stderr_sha256"]) is None
+    ):
+        return False
+    return True
+
+
+def _scratch_private_output_envelope(stdout: bytes, stderr: bytes) -> bytes:
+    """Frame bounded raw launcher output for the existing private stderr capture."""
+    if (
+        len(stdout) > SCRATCH_PRIVATE_STDOUT_BYTES
+        or len(stderr) > SCRATCH_PRIVATE_STDERR_BYTES
+        or len(stdout) + len(stderr) > SCRATCH_PRIVATE_RAW_BYTES
+    ):
+        raise ValueError("scratch private output exceeded its closed envelope bound")
+    payload = struct.pack(">H", len(stdout)) + stdout + stderr
+    envelope = SCRATCH_PRIVATE_OUTPUT_MARKER + base64.b64encode(payload) + b"\n"
+    if len(envelope) > SCRATCH_PRIVATE_ENVELOPE_BYTES:
+        raise ValueError("scratch private output envelope exceeded its closed bound")
+    return envelope
+
+
+def _scratch_unit_diagnostic(
+    snapshot: dict[str, Any],
+    *,
+    launcher_exit_status: int | None,
+    stdout_prefix: bytes,
+    stdout_observed: int,
+    stdout_complete: bool,
+    stderr_prefix: bytes,
+    stderr_observed: int,
+    stderr_complete: bool,
+) -> dict[str, Any] | None:
+    properties = snapshot.get("properties", {})
+    if not isinstance(properties, dict):
+        return None
+    exec_status_raw = properties.get("ExecMainStatus")
+    exec_status = (
+        int(exec_status_raw)
+        if isinstance(exec_status_raw, str) and re.fullmatch(r"[0-9]{1,3}", exec_status_raw)
+        else None
+    )
+    stdout_prefix = stdout_prefix[:SCRATCH_PRIVATE_STDOUT_BYTES]
+    stderr_prefix = stderr_prefix[:SCRATCH_PRIVATE_STDERR_BYTES]
+    diagnostic = {
+        "schema": 1,
+        "phase": "unit_exited_before_confinement",
+        "active_state": properties.get("ActiveState"),
+        "sub_state": properties.get("SubState"),
+        "result": properties.get("Result"),
+        "exec_main_status": exec_status,
+        "launcher_exit_status": launcher_exit_status,
+        "stdout_bytes": len(stdout_prefix),
+        "stdout_sha256": hashlib.sha256(stdout_prefix).hexdigest(),
+        "stdout_truncated": stdout_observed > len(stdout_prefix) or not stdout_complete,
+        "stderr_bytes": len(stderr_prefix),
+        "stderr_sha256": hashlib.sha256(stderr_prefix).hexdigest(),
+        "stderr_truncated": stderr_observed > len(stderr_prefix) or not stderr_complete,
+    }
+    return diagnostic if valid_scratch_unit_diagnostic(diagnostic) else None
+
+
 def _valid_restore_diagnostic(value: Any) -> bool:
     if not isinstance(value, dict) or set(value) != {
         "schema",
@@ -358,6 +476,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-age-hours", type=float, default=24.0)
     parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument(
+        "--private-scratch-diagnostics",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(SCRATCH_WORKER_MODE, action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-root", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-archive", default=None, help=argparse.SUPPRESS)
@@ -366,7 +489,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--_scratch-archive-size", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-archive-sha256", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-timestamp-slug", default=None, help=argparse.SUPPRESS)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.private_scratch_diagnostics and not args.as_json:
+        parser.error("--private-scratch-diagnostics requires --json")
+    return args
 
 
 def load_env(path: pathlib.Path) -> dict[str, str]:
@@ -2268,7 +2394,10 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
         }
         process: subprocess.Popen[bytes] | None = None
         stdout_buffer = bytearray()
+        stderr_buffer = bytearray()
+        stdout_observed = 0
         stderr_size = 0
+        early_exit_snapshot: dict[str, Any] | None = None
         active_control_group: str | None = None
         selector: selectors.BaseSelector | None = None
         launch_started = False
@@ -2337,6 +2466,7 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                     )
                     _scratch_control_group_snapshot(active_control_group)
                 elif properties.get("ActiveState") in {"failed", "inactive"}:
+                    early_exit_snapshot = snapshot
                     raise RuntimeError("Scratch restore service exited before its confinement was verified.")
                 last_tick = now
                 for key, _ in selector.select(timeout=SCRATCH_RUNTIME_SAMPLE_SECONDS):
@@ -2347,11 +2477,14 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                     if not data:
                         selector.unregister(key.fileobj)
                     elif key.data == "stdout":
+                        stdout_observed += len(data)
                         stdout_buffer.extend(data)
                         if len(stdout_buffer) > 4096:
                             raise RuntimeError("Scratch restore worker output exceeded its closed bound.")
                     else:
                         stderr_size += len(data)
+                        if len(stderr_buffer) < SCRATCH_PRIVATE_STDERR_BYTES:
+                            stderr_buffer.extend(data[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
                         if stderr_size > 65536:
                             raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
             return_code = process.wait(timeout=5)
@@ -2365,11 +2498,14 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                         if not data:
                             break
                         if stream is process.stdout:
+                            stdout_observed += len(data)
                             stdout_buffer.extend(data)
                             if len(stdout_buffer) > 4096:
                                 raise RuntimeError("Scratch restore worker output exceeded its closed bound.")
                         else:
                             stderr_size += len(data)
+                            if len(stderr_buffer) < SCRATCH_PRIVATE_STDERR_BYTES:
+                                stderr_buffer.extend(data[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
                             if stderr_size > 65536:
                                 raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
             if return_code != 0 or stderr_size != 0:
@@ -2414,6 +2550,48 @@ def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str)
                             cleanup_errors.append(cleanup_error)
                     except BaseException as cleanup_error:
                         cleanup_errors.append(cleanup_error)
+            if early_exit_snapshot is not None:
+                drain_complete = {"stdout": False, "stderr": False}
+                for name, stream, prefix, cap in (
+                    ("stdout", process.stdout if process is not None else None, stdout_buffer, SCRATCH_PRIVATE_STDOUT_BYTES),
+                    ("stderr", process.stderr if process is not None else None, stderr_buffer, SCRATCH_PRIVATE_STDERR_BYTES),
+                ):
+                    if stream is None:
+                        drain_complete[name] = True
+                        continue
+                    drained = 0
+                    while drained <= 1024 * 1024:
+                        try:
+                            data = os.read(stream.fileno(), min(65536, 1024 * 1024 + 1 - drained))
+                        except BlockingIOError:
+                            break
+                        except OSError:
+                            break
+                        if not data:
+                            drain_complete[name] = True
+                            break
+                        drained += len(data)
+                        if name == "stdout":
+                            stdout_observed += len(data)
+                        else:
+                            stderr_size += len(data)
+                        if len(prefix) < cap:
+                            prefix.extend(data[: cap - len(prefix)])
+                stdout_prefix = bytes(stdout_buffer[:SCRATCH_PRIVATE_STDOUT_BYTES])
+                stderr_prefix = bytes(stderr_buffer[:SCRATCH_PRIVATE_STDERR_BYTES])
+                diagnostic = _scratch_unit_diagnostic(
+                    early_exit_snapshot,
+                    launcher_exit_status=process.returncode if process is not None else None,
+                    stdout_prefix=stdout_prefix,
+                    stdout_observed=stdout_observed,
+                    stdout_complete=drain_complete["stdout"],
+                    stderr_prefix=stderr_prefix,
+                    stderr_observed=stderr_size,
+                    stderr_complete=drain_complete["stderr"],
+                )
+                if diagnostic is not None:
+                    setattr(operation_error, "scratch_unit_diagnostic", diagnostic)
+                    setattr(operation_error, "scratch_unit_private_output", (stdout_prefix, stderr_prefix))
             for cleanup_error in cleanup_errors:
                 if hasattr(operation_error, "add_note"):
                     operation_error.add_note(
@@ -2868,7 +3046,21 @@ def main() -> int:
             )
             if valid_backup_disk_diagnostic(backup_disk_diagnostic):
                 report["backup_disk_diagnostic"] = backup_disk_diagnostic
+            scratch_diagnostic = getattr(exc, "scratch_unit_diagnostic", None)
+            private_scratch_diagnostics = getattr(args, "private_scratch_diagnostics", False)
+            if private_scratch_diagnostics and valid_scratch_unit_diagnostic(scratch_diagnostic):
+                report["scratch_unit_diagnostic"] = scratch_diagnostic
             print(json.dumps(report, ensure_ascii=False, indent=2))
+            if private_scratch_diagnostics and valid_scratch_unit_diagnostic(scratch_diagnostic):
+                private_output = getattr(exc, "scratch_unit_private_output", None)
+                if (
+                    isinstance(private_output, tuple)
+                    and len(private_output) == 2
+                    and all(type(part) is bytes for part in private_output)
+                ):
+                    sys.stderr.write(
+                        _scratch_private_output_envelope(*private_output).decode("ascii")
+                    )
         else:
             print(f"[FAIL] {error_message}", file=sys.stderr)
         return 1

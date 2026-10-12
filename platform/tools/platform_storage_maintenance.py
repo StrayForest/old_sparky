@@ -63,7 +63,10 @@ except ImportError:  # Direct execution from the tools directory.
 try:
     from . import platform_live_qa_guard as live_qa_guard
     from . import platform_build_node_cache
-    from .platform_backup_restore_drill import valid_backup_disk_diagnostic
+    from .platform_backup_restore_drill import (
+        valid_backup_disk_diagnostic,
+        valid_scratch_unit_diagnostic,
+    )
     from .platform_release_retention import (
         RetentionPlan,
         apply_plan as apply_release_plan,
@@ -77,7 +80,10 @@ try:
 except ImportError:  # Direct execution from the tools directory.
     import platform_live_qa_guard as live_qa_guard
     import platform_build_node_cache
-    from platform_backup_restore_drill import valid_backup_disk_diagnostic
+    from platform_backup_restore_drill import (
+        valid_backup_disk_diagnostic,
+        valid_scratch_unit_diagnostic,
+    )
     from platform_release_retention import (
         RetentionPlan,
         apply_plan as apply_release_plan,
@@ -206,9 +212,11 @@ class BackupCommandFailure(RuntimeError):
         self,
         diagnostic: dict[str, Any] | None = None,
         backup_disk_diagnostic: dict[str, Any] | None = None,
+        scratch_unit_diagnostic: dict[str, Any] | None = None,
     ) -> None:
         self.restore_diagnostic = diagnostic
         self.backup_disk_diagnostic = backup_disk_diagnostic
+        self.scratch_unit_diagnostic = scratch_unit_diagnostic
         super().__init__("Platform backup failed.")
 
 
@@ -734,11 +742,20 @@ def _run_backup_command(
             if isinstance(result, dict)
             else None
         )
+        scratch_unit_diagnostic = (
+            result.get("scratch_unit_diagnostic") if isinstance(result, dict) else None
+        )
         raise BackupCommandFailure(
             diagnostic if _valid_restore_diagnostic(diagnostic) else None,
             (
                 backup_disk_diagnostic
                 if valid_backup_disk_diagnostic(backup_disk_diagnostic)
+                else None
+            ),
+            (
+                scratch_unit_diagnostic
+                if forward_failure_diagnostics
+                and valid_scratch_unit_diagnostic(scratch_unit_diagnostic)
                 else None
             ),
         )
@@ -770,6 +787,8 @@ def run_backup(
         "--rotate-existing" if rotate_existing else "--preserve-existing",
         "--json",
     ]
+    if private_failure_diagnostics:
+        create_command.append("--private-scratch-diagnostics")
     result = _run_backup_command(
         create_command,
         forward_failure_diagnostics=private_failure_diagnostics,
@@ -1014,6 +1033,7 @@ def verify_existing_backup(
             str(max_age_hours),
             "--preserve-existing",
             "--json",
+            *( ["--private-scratch-diagnostics"] if private_failure_diagnostics else [] ),
         ],
         forward_failure_diagnostics=private_failure_diagnostics,
     )
@@ -2576,6 +2596,12 @@ def main() -> int:
             )
             if valid_backup_disk_diagnostic(backup_disk_diagnostic):
                 result["backup_disk_diagnostic"] = backup_disk_diagnostic
+            scratch_unit_diagnostic = getattr(exc, "scratch_unit_diagnostic", None)
+            if (
+                getattr(args, "private_backup_diagnostics", False)
+                and valid_scratch_unit_diagnostic(scratch_unit_diagnostic)
+            ):
+                result["scratch_unit_diagnostic"] = scratch_unit_diagnostic
             print(
                 json.dumps(result, ensure_ascii=False, indent=2)
             )

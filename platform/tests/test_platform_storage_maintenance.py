@@ -804,6 +804,22 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         with mock.patch.object(
             maintenance.subprocess,
             "run",
+            side_effect=(
+                subprocess.CompletedProcess([], 0, json.dumps(create_result), ""),
+                subprocess.CompletedProcess([], 0, json.dumps(check_result), ""),
+            ),
+        ) as private_run:
+            maintenance.run_backup(
+                self.root / "runtime" / "platform",
+                keep=14,
+                private_failure_diagnostics=True,
+            )
+        self.assertIn("--private-scratch-diagnostics", private_run.call_args_list[0].args[0])
+        self.assertNotIn("--private-scratch-diagnostics", private_run.call_args_list[1].args[0])
+
+        with mock.patch.object(
+            maintenance.subprocess,
+            "run",
             return_value=subprocess.CompletedProcess([], 0, json.dumps({"ok": True}), ""),
         ) as verify_run:
             maintenance.verify_existing_backup(
@@ -812,6 +828,20 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         verify_command = verify_run.call_args.args[0]
         self.assertEqual(verify_command[:3], [sys.executable, "-B", backup_script])
         self.assertIn("--verify-latest-existing", verify_command)
+
+        with mock.patch.object(
+            maintenance.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, json.dumps({"ok": True}), ""),
+        ) as private_verify_run:
+            maintenance.verify_existing_backup(
+                self.root / "runtime" / "platform",
+                max_age_hours=24.0,
+                private_failure_diagnostics=True,
+            )
+        self.assertIn(
+            "--private-scratch-diagnostics", private_verify_run.call_args.args[0]
+        )
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             probe = Path(temporary_dir)
@@ -841,6 +871,21 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "archive_sha256": "a" * 64,
             "archive_size_bytes": 120,
         }
+        scratch_diagnostic = {
+            "schema": 1,
+            "phase": "unit_exited_before_confinement",
+            "active_state": "failed",
+            "sub_state": "failed",
+            "result": "exit-code",
+            "exec_main_status": 203,
+            "launcher_exit_status": 1,
+            "stdout_bytes": 0,
+            "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+            "stdout_truncated": False,
+            "stderr_bytes": 0,
+            "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+            "stderr_truncated": False,
+        }
         failure = subprocess.CompletedProcess(
             [],
             1,
@@ -856,9 +901,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         "free_bytes": 100,
                         "required_free_bytes": 200,
                     },
+                    "scratch_unit_diagnostic": scratch_diagnostic,
                 }
             ),
-            "child diagnostic",
+            "SCRATCH_UNIT_PRIVATE_OUTPUT_V1\nprivate framed bytes\n",
         )
         private_stderr = io.StringIO()
         with (
@@ -880,6 +926,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "required_free_bytes": 200,
             },
         )
+        self.assertEqual(failure_error.exception.scratch_unit_diagnostic, scratch_diagnostic)
         malformed_failure = subprocess.CompletedProcess(
             [],
             1,
@@ -894,6 +941,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         "required_free_bytes": 200,
                         "private_path": "/must-not-cross-the-boundary",
                     },
+                    "scratch_unit_diagnostic": {
+                        **scratch_diagnostic,
+                        "private_path": "/must-not-cross-the-boundary",
+                    },
                 }
             ),
             "",
@@ -906,15 +957,17 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         ):
             maintenance._run_backup_command(["fixed-backup-child"])
         self.assertIsNone(malformed_error.exception.backup_disk_diagnostic)
+        self.assertIsNone(malformed_error.exception.scratch_unit_diagnostic)
         self.assertIn("private failure detail", private_stderr.getvalue())
-        self.assertIn("child diagnostic", private_stderr.getvalue())
+        self.assertIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", private_stderr.getvalue())
         public_stderr = io.StringIO()
         with (
             mock.patch.object(maintenance.subprocess, "run", return_value=failure),
             mock.patch.object(maintenance.sys, "stderr", public_stderr),
         ):
-            with self.assertRaisesRegex(RuntimeError, "Platform backup failed"):
+            with self.assertRaisesRegex(RuntimeError, "Platform backup failed") as public_error:
                 maintenance._run_backup_command(["fixed-backup-child"])
+        self.assertIsNone(public_error.exception.scratch_unit_diagnostic)
         self.assertEqual(public_stderr.getvalue(), "")
 
     def test_backup_failure_prevents_retention_deletion(self) -> None:
