@@ -8,9 +8,20 @@
 
 `platform_backup_restore_drill.py` is the only DB-backup owner. It dumps
 `platformdb.platform` plus `public.alembic_version`, writes a private checksum
-manifest, restores into a new temporary database, validates tables,
-extensions/Alembic and drops the drill database. Daily maintenance retains 14
-verified copies.
+manifest, and verifies the dump by restoring it into a disposable PostgreSQL 16
+cluster. The cluster runs in a private 512 MiB tmpfs inside a transient
+systemd unit capped at 640 MiB memory with swap disabled. It has no network
+access, cannot see production PostgreSQL data/socket paths or shared
+credentials, and runs `pg_restore` as the `postgres` OS user. The root-owned
+archive is opened and hash-pinned, then exposed read-only; `pg_restore` reads
+that seekable file descriptor from standard input and restores tablespaces
+inside the private cluster. SQL restore and validation use a passwordless
+`platform_user` role created only in that disposable cluster; its separate
+`postgres` admin connection creates and drops the temporary database.
+Production PostgreSQL is never used as the restore target. The disposable
+cluster is stopped and its unit and mount are confirmed gone before a verified
+backup pair is published. Ordinary rotating maintenance retains 14 verified
+copies; backup-only preserve-existing mode keeps every complete pair.
 
 The low-level create/restore drill is invoked by storage maintenance; do not
 run its mutating mode directly on the production host because it does not
@@ -26,22 +37,31 @@ cd /opt/oldsparky/platform/current
   --backup-only --apply --json
 ```
 
-The drill checks disk availability before starting `pg_dump` and before each
-`pg_restore`, then samples the relevant filesystem while each child runs. Its
-stop threshold is the larger of 5 GiB or 15% of filesystem capacity, with a
-256 MiB lead margin; on a low-space result it terminates and reaps only that
-owned child before the existing `finally` path drops the exact temporary drill
-database. The monitor is sampled, so the lead is an early-stop margin rather
-than a guarantee against a single write burst. A failed or unavailable disk
-sample stops the drill; it does not rotate or remove any retained backup.
+The drill checks disk availability before starting `pg_dump` and monitors the
+root filesystem while dump and restore children run. Its stop threshold is the
+larger of 5 GiB or 15% of filesystem capacity, with a 256 MiB lead margin.
+During isolated restore it also checks that the effective tmpfs remains exactly
+512 MiB with at least 64 MiB free, the unit stays below its 640 MiB memory cap
+with at least 32 MiB headroom, swap remains disabled, and host `MemAvailable`
+stays at or above 1 GiB. It stops and reaps only the owned transient unit on a
+failed or unavailable sample. The monitor is sampled, so these margins are
+early-stop bounds rather than guarantees against a single allocation burst.
+A failed or unavailable disk, memory or mount sample stops the drill; it does
+not rotate or remove any retained backup. A failed isolated restore or
+preserve-existing post-publication check removes only the operation's
+inode-pinned new pair and leaves the existing backup inventory unchanged. If
+exact rollback cannot be confirmed, the operation reports a closed
+backup-integrity status and does not claim preservation.
 
 Keep this backup budget separate from the release installer budget. The
 release coexistence reserve covers release staging and is not backup capacity.
-Backup creation writes a temporary dump and, unless dump-only mode is
-explicitly selected by an approved workflow, restores it into a temporary
-database on its actual data filesystem. Forecast those operation-specific
-allocations against this backup guard before starting; if the temporary
-restore allocation is not bounded, available capacity remains unknown.
+Backup creation writes a temporary dump on the backup filesystem. Unless
+dump-only mode is explicitly selected by an approved workflow, it restores the
+dump in the bounded tmpfs cluster before publishing the archive and metadata.
+The restore does not allocate a second production database or copy the archive
+into tmpfs. The tmpfs and systemd cgroup are jointly bounded; if either limit
+or the host-memory reserve is unavailable, verification fails without
+publishing a pair.
 
 Backup-only preserves every complete archive/metadata pair that exists before
 the run; it does not apply the 14-copy rotation limit. Under the ordered
@@ -83,7 +103,7 @@ its configured keep count only after a successful restore drill.
 When the newest archive is present but its restore verification is missing or
 failed, use the workflow's `verify-existing` operation. It selects only the
 newest sidecar, validates that exact archive and metadata, and runs the same
-temporary-database restore/Alembic/table checks. It never falls back to an
+isolated-cluster restore/Alembic/table checks. It never falls back to an
 older pair, creates a dump, rotates pairs, or changes archive bytes. On success
 it updates only the selected sidecar's restore-verification fields; the
 original completion time remains the age reference. Failure leaves that pair
@@ -105,11 +125,11 @@ separate live-QA runtime cache.
 
 When an existing-backup restore stops, the root-private run receipt records a
 closed restore phase and guard reason, the observed free bytes and required
-threshold when available, whether the temporary database was created, and the
-drop outcome. It records catalog-confirmed absence only after the exact drill
-database is checked through the admin connection. Missing evidence stays
-unknown; the receipt never includes the database name, raw command output,
-exception text, or credentials.
+threshold when available, whether the temporary database was created in the
+disposable cluster, and the drop outcome. It records catalog-confirmed absence
+only after the exact drill database is checked through the scratch admin
+connection. Missing evidence stays unknown; the receipt never includes the
+database name, raw command output, exception text, or credentials.
 
 A failed backup creation can also stop at the disk-floor guard before or while
 `pg_dump` runs. Its root-private failure receipt records only a fixed phase,
@@ -210,7 +230,8 @@ A production restore is destructive and requires explicit operator approval.
    media reconciliation.
 8. Retain the pre-restore evidence and document any data-loss interval.
 
-Routine drills always use a new temporary database. Never downgrade migrations
+Routine drills always use a new temporary database in the disposable cluster.
+Never downgrade migrations
 automatically. Media mapping is in PostgreSQL; after restore use targeted R2
 HeadObject checks from DB rows, not a full bucket scan.
 

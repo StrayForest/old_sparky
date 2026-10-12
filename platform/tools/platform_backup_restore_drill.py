@@ -10,7 +10,11 @@ import json
 import math
 import os
 import pathlib
+import pwd
 import re
+import selectors
+import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -18,7 +22,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
-from typing import Any
+from typing import Any, BinaryIO, Callable
 
 
 def _load_staged_disk_policy() -> Any:
@@ -55,6 +59,17 @@ RESTORE_DISK_LEAD_BYTES = 256 * 1024**2
 RESTORE_DISK_SAMPLE_SECONDS = 0.25
 RESTORE_TERMINATE_TIMEOUT_SECONDS = 1.0
 RESTORE_DISK_MINIMUM_BYTES = minimum_free_bytes(DEFAULT_MIN_FREE_GIB)
+SCRATCH_TMPFS_BYTES = 512 * 1024**2
+SCRATCH_MEMORY_MAX_BYTES = 640 * 1024**2
+SCRATCH_MEMORY_RESERVE_BYTES = 384 * 1024**2
+SCRATCH_MEMORY_ADMISSION_BYTES = SCRATCH_MEMORY_MAX_BYTES + SCRATCH_MEMORY_RESERVE_BYTES
+SCRATCH_MEMORY_STOP_MARGIN_BYTES = 32 * 1024**2
+SCRATCH_TMPFS_STOP_BYTES = 64 * 1024**2
+SCRATCH_RUNTIME_SECONDS = 15 * 60
+SCRATCH_RUNTIME_SAMPLE_SECONDS = 0.25
+SCRATCH_PG_PORT = 55432
+SCRATCH_WORKER_MODE = "--_scratch-restore-worker"
+SCRATCH_APP_ROLE = "platform_user"
 
 
 class RestoreGuardStop(RuntimeError):
@@ -249,7 +264,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create an atomic custom-format backup of platformdb's platform schema "
-            "and verify it by restoring into an isolated temporary database."
+            "and verify it in a bounded isolated PostgreSQL cluster."
         )
     )
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE))
@@ -274,10 +289,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--admin-database-url",
         default=None,
-        help=(
-            "Optional PostgreSQL URL for creating/dropping the temporary database. "
-            "On a local root-run deployment, the script uses the postgres OS user."
-        ),
+        help="Accepted for CLI compatibility; isolated restore verification does not use this URL.",
     )
     parser.add_argument(
         "--dump-only",
@@ -300,10 +312,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verify-dump",
         default=None,
-        help="Restore and verify an existing custom-format platform backup, then remove the test DB.",
+        help="Restore an existing custom-format platform backup in an isolated cluster.",
     )
     parser.add_argument("--max-age-hours", type=float, default=24.0)
     parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument(SCRATCH_WORKER_MODE, action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--_scratch-root", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_scratch-archive", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_scratch-archive-dev", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_scratch-archive-ino", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_scratch-archive-size", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_scratch-archive-sha256", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_scratch-timestamp-slug", default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -370,12 +390,14 @@ def run_command(
     *,
     target: DatabaseTarget | None = None,
     capture_output: bool = False,
+    stdin_handle: BinaryIO | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
         check=True,
         text=True,
         capture_output=capture_output,
+        stdin=stdin_handle,
         env=command_env(target) if target is not None else None,
     )
 
@@ -446,6 +468,8 @@ def run_disk_guarded_command(
     target: DatabaseTarget,
     stage: str,
     disk_paths: tuple[pathlib.Path, ...] = (pathlib.Path("/"),),
+    stdin_handle: BinaryIO | None = None,
+    resource_guard: Callable[[], None] | None = None,
 ) -> None:
     """Run one owned dump/restore child under bounded disk monitoring."""
 
@@ -454,10 +478,12 @@ def run_disk_guarded_command(
     phase = f"{stage}_pre_spawn"
     backup_phase = phase if stage == "pg_dump" else None
     require_restore_headroom(*disk_paths, phase=backup_phase)
+    if resource_guard is not None:
+        resource_guard()
     try:
         process = subprocess.Popen(
             command,
-            stdin=subprocess.DEVNULL,
+            stdin=stdin_handle if stdin_handle is not None else subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=command_env(target),
@@ -471,6 +497,8 @@ def run_disk_guarded_command(
         phase = f"{stage}_post_start"
         backup_phase = phase if stage == "pg_dump" else None
         require_restore_headroom(*disk_paths, phase=backup_phase)
+        if resource_guard is not None:
+            resource_guard()
         while process.poll() is None:
             time.sleep(RESTORE_DISK_SAMPLE_SECONDS)
             if process.poll() is not None:
@@ -478,11 +506,15 @@ def run_disk_guarded_command(
             phase = f"{stage}_monitor"
             backup_phase = phase if stage == "pg_dump" else None
             require_restore_headroom(*disk_paths, phase=backup_phase)
+            if resource_guard is not None:
+                resource_guard()
         return_code = process.wait()
         # Catch a floor crossing between the final sample and child exit.
         phase = f"{stage}_post_exit"
         backup_phase = phase if stage == "pg_dump" else None
         require_restore_headroom(*disk_paths, phase=backup_phase)
+        if resource_guard is not None:
+            resource_guard()
     except BaseException:
         if process.poll() is None:
             _stop_owned_child(process, phase=backup_phase)
@@ -492,9 +524,19 @@ def run_disk_guarded_command(
 
 
 def run_restore_command(
-    command: list[str], *, target: DatabaseTarget
+    command: list[str],
+    *,
+    target: DatabaseTarget,
+    stdin_handle: BinaryIO | None = None,
+    resource_guard: Callable[[], None] | None = None,
 ) -> None:
-    run_disk_guarded_command(command, target=target, stage="pg_restore")
+    run_disk_guarded_command(
+        command,
+        target=target,
+        stage="pg_restore",
+        stdin_handle=stdin_handle,
+        resource_guard=resource_guard,
+    )
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -943,21 +985,10 @@ def verify_latest_existing_backup(
         archive_sha256,
         _,
     ) = _latest_pair_for_verification(output_dir, max_age_hours=max_age_hours)
-    file_env = load_env(env_file)
-    merged_env = {**file_env, **os.environ}
-    database_url = merged_env.get("PLATFORM_DATABASE_URL")
-    if not database_url:
-        raise RuntimeError("PLATFORM_DATABASE_URL is required to run a restore drill.")
-    app_target = parse_database_url(database_url)
-    admin_url = admin_database_url or merged_env.get("PLATFORM_BACKUP_ADMIN_URL")
-    admin_target = parse_database_url(admin_url, require_platformdb=False) if admin_url else None
-    require_commands("pg_restore", "createdb", "dropdb", "psql")
-    run_command(["pg_restore", "--list", str(dump_path)], capture_output=True)
+    require_commands("systemd-run", "systemctl")
     try:
-        table_count = perform_restore_drill(
+        table_count = _run_isolated_restore_drill(
             dump_path,
-            app_target=app_target,
-            admin_target=admin_target,
             timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
         )
     except Exception as exc:
@@ -1237,12 +1268,54 @@ def _unlink_if_same_inode(path: pathlib.Path, identity: tuple[int, int] | None) 
         path.unlink()
 
 
+def _fsync_directory(path: pathlib.Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _rollback_published_backup_pair(
+    dump_path: pathlib.Path,
+    dump_identity: tuple[int, int] | None,
+    metadata_path: pathlib.Path,
+    metadata_identity: tuple[int, int] | None,
+) -> None:
+    """Remove only this operation's exact published inodes after a failed create."""
+    removed = False
+    failures: list[str] = []
+    for path, identity in ((metadata_path, metadata_identity), (dump_path, dump_identity)):
+        if identity is None:
+            continue
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != identity:
+            failures.append(path.name)
+            continue
+        try:
+            path.unlink()
+            removed = True
+        except OSError:
+            failures.append(path.name)
+    if removed:
+        _fsync_directory(dump_path.parent)
+    if failures:
+        raise RuntimeError("Could not roll back the exact newly published backup pair.")
+
+
 def perform_restore_drill(
     dump_path: pathlib.Path,
     *,
     app_target: DatabaseTarget,
     admin_target: DatabaseTarget | None,
     timestamp_slug: str,
+    archive_stdin: BinaryIO | None = None,
+    restore_as_postgres: bool = False,
+    restore_no_tablespaces: bool = False,
+    resource_guard: Callable[[], None] | None = None,
 ) -> int:
     drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
     use_local_admin = (
@@ -1311,17 +1384,27 @@ def perform_restore_drill(
         ):
             if selector == ("--schema=public",):
                 failure_stage = "restore_public"
+            restore_command = [
+                "pg_restore",
+                "--exit-on-error",
+                "--no-owner",
+                "--no-acl",
+                *selector,
+                *connection_args(restore_target),
+            ]
+            if restore_no_tablespaces:
+                restore_command.append("--no-tablespaces")
+            if archive_stdin is None:
+                restore_command.append(str(dump_path))
+            else:
+                archive_stdin.seek(0)
+            if restore_as_postgres:
+                restore_command = ["runuser", "-u", "postgres", "--", *restore_command]
             run_restore_command(
-                [
-                    "pg_restore",
-                    "--exit-on-error",
-                    "--no-owner",
-                    "--no-acl",
-                    *selector,
-                    *connection_args(restore_target),
-                    str(dump_path),
-                ],
+                restore_command,
                 target=restore_target,
+                stdin_handle=archive_stdin,
+                resource_guard=resource_guard,
             )
         failure_stage = "validate_table_count"
         table_count_result = run_command(
@@ -1513,6 +1596,821 @@ def require_commands(*commands: str) -> None:
         raise RuntimeError(f"Missing required PostgreSQL command(s): {', '.join(missing)}")
 
 
+def _scratch_mount_snapshot(path: pathlib.Path) -> dict[str, int]:
+    target = str(path)
+    mount_row: tuple[list[str], list[str]] | None = None
+    for line in pathlib.Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines():
+        left, separator, right = line.partition(" - ")
+        if not separator:
+            continue
+        left_fields = left.split()
+        if len(left_fields) < 6 or left_fields[4].replace("\\040", " ") != target:
+            continue
+        mount_row = (left_fields, right.split())
+        break
+    if mount_row is None:
+        raise RuntimeError("Isolated restore filesystem is not mounted.")
+    left_fields, right_fields = mount_row
+    if len(right_fields) < 3 or right_fields[0] != "tmpfs" or left_fields[3] != "/":
+        raise RuntimeError("Isolated restore filesystem is not a private tmpfs mount.")
+    mount_stat = path.stat()
+    if (
+        mount_stat.st_uid not in {0, pwd.getpwnam("postgres").pw_uid}
+        or stat.S_IMODE(mount_stat.st_mode) != 0o700
+        or mount_stat.st_dev == pathlib.Path("/run").stat().st_dev
+    ):
+        raise RuntimeError("Isolated restore filesystem mount properties are unsafe.")
+    values = os.statvfs(path)
+    total = values.f_blocks * values.f_frsize
+    free = values.f_bavail * values.f_frsize
+    if total != SCRATCH_TMPFS_BYTES or free <= SCRATCH_TMPFS_STOP_BYTES:
+        raise RuntimeError("Isolated restore filesystem is below its bounded capacity.")
+    return {"total_bytes": total, "free_bytes": free}
+
+
+def _scratch_cgroup_snapshot() -> dict[str, int]:
+    cgroup_path: str | None = None
+    for row in pathlib.Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines():
+        fields = row.split(":", 2)
+        if len(fields) == 3 and fields[0] == "0":
+            cgroup_path = fields[2]
+            break
+    if cgroup_path is None or ".." in pathlib.PurePosixPath(cgroup_path).parts:
+        raise RuntimeError("Scratch restore cgroup could not be identified.")
+    root = pathlib.Path("/sys/fs/cgroup").resolve(strict=True)
+    directory = (root / cgroup_path.lstrip("/")).resolve(strict=True)
+    directory.relative_to(root)
+
+    def read_integer(name: str) -> int:
+        value = (directory / name).read_text(encoding="ascii").strip()
+        if not value.isdecimal():
+            raise RuntimeError("Scratch restore cgroup limit is unavailable.")
+        return int(value)
+
+    memory_max = read_integer("memory.max")
+    memory_current = read_integer("memory.current")
+    swap_max = read_integer("memory.swap.max")
+    swap_current = read_integer("memory.swap.current")
+    oom_group = read_integer("memory.oom.group")
+    if (
+        memory_max != SCRATCH_MEMORY_MAX_BYTES
+        or swap_max != 0
+        or swap_current != 0
+        or oom_group != 1
+        or memory_current >= memory_max - SCRATCH_MEMORY_STOP_MARGIN_BYTES
+    ):
+        raise RuntimeError("Scratch restore memory guard stopped the operation.")
+    return {
+        "memory_max_bytes": memory_max,
+        "memory_current_bytes": memory_current,
+        "swap_max_bytes": swap_max,
+        "swap_current_bytes": swap_current,
+        "oom_group": oom_group,
+    }
+
+
+def _scratch_mem_available_bytes() -> int:
+    for line in pathlib.Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+        if line.startswith("MemAvailable:"):
+            fields = line.split()
+            if len(fields) == 3 and fields[1].isdecimal() and fields[2] == "kB":
+                return int(fields[1]) * 1024
+    raise RuntimeError("Host memory availability could not be verified.")
+
+
+def _scratch_resource_guard(root: pathlib.Path) -> None:
+    require_restore_headroom(pathlib.Path("/"))
+    if _scratch_mem_available_bytes() < SCRATCH_MEMORY_ADMISSION_BYTES:
+        raise RuntimeError("Scratch restore stopped by the host-memory reserve guard.")
+    _scratch_cgroup_snapshot()
+    _scratch_mount_snapshot(root)
+
+
+def _open_verified_scratch_archive(args: argparse.Namespace) -> BinaryIO:
+    archive_path = pathlib.Path(args._scratch_archive)
+    expected_sha256 = args._scratch_archive_sha256
+    expected = (
+        args._scratch_archive_dev,
+        args._scratch_archive_ino,
+        args._scratch_archive_size,
+    )
+    if (
+        any(type(value) is not int or value < 0 for value in expected)
+        or not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+    ):
+        raise RuntimeError("Scratch restore archive identity is invalid.")
+    descriptor = os.open(
+        archive_path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or (before.st_dev, before.st_ino, before.st_size) != expected
+        ):
+            raise RuntimeError("Scratch restore archive identity changed.")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+        after = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or total != before.st_size
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise RuntimeError("Scratch restore archive content changed.")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        header = os.read(descriptor, 5)
+        if header != b"PGDMP":
+            raise RuntimeError("Scratch restore archive format is invalid.")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return os.fdopen(descriptor, "rb", closefd=True)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _scratch_worker_main(args: argparse.Namespace) -> int:
+    for name in tuple(os.environ):
+        if name.startswith("PG"):
+            os.environ.pop(name, None)
+    root = pathlib.Path(args._scratch_root)
+    if (
+        not re.fullmatch(r"/run/oldsparky-backup-restore-[0-9a-f]{24}", str(root))
+        or not root.is_dir()
+    ):
+        raise RuntimeError("Scratch restore root is invalid.")
+    mount = _scratch_mount_snapshot(root)
+    _scratch_cgroup_snapshot()
+    if _scratch_mem_available_bytes() < SCRATCH_MEMORY_ADMISSION_BYTES:
+        raise RuntimeError("Scratch restore admission memory reserve is unavailable.")
+    if os.geteuid() != 0:
+        raise RuntimeError("Scratch restore supervisor is not root.")
+    archive = _open_verified_scratch_archive(args)
+    archive_info = os.fstat(archive.fileno())
+    if (archive_info.st_dev, archive_info.st_ino) != (args._scratch_archive_dev, args._scratch_archive_ino):
+        archive.close()
+        raise RuntimeError("Scratch restore archive bind identity does not match.")
+
+    postgres = pwd.getpwnam("postgres")
+    os.chown(root, postgres.pw_uid, postgres.pw_gid)
+    pgdata = root / "data"
+    socket_dir = root / "socket"
+    pglog = root / "postgres.log"
+    pgdata.mkdir(mode=0o700)
+    socket_dir.mkdir(mode=0o700)
+    for path in (pgdata, socket_dir):
+        os.chown(path, postgres.pw_uid, postgres.pw_gid)
+        os.chmod(path, 0o700)
+
+    def as_postgres(command: list[str], *, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
+        return run_command(
+            ["runuser", "-u", "postgres", "--", *command],
+            capture_output=capture_output,
+        )
+
+    bindir_result = run_command(["pg_config", "--bindir"], capture_output=True)
+    bindir = pathlib.Path(bindir_result.stdout.strip())
+    version_result = run_command([str(bindir / "postgres"), "--version"], capture_output=True)
+    if re.search(r"\b16(?:\.|\s|$)", version_result.stdout) is None:
+        archive.close()
+        raise RuntimeError("Scratch restore requires PostgreSQL 16 binaries.")
+    require_commands("runuser")
+    pgctl = str(bindir / "pg_ctl")
+    initdb = str(bindir / "initdb")
+    as_postgres(
+        [
+            initdb,
+            "--pgdata",
+            str(pgdata),
+            "--username=postgres",
+            "--no-locale",
+            "--encoding=UTF8",
+            "--auth-local=trust",
+            "--auth-host=reject",
+        ],
+        capture_output=True,
+    )
+    started = False
+    primary_error: BaseException | None = None
+    table_count: int | None = None
+    try:
+        _scratch_resource_guard(root)
+        server_options = shlex.join(
+            [
+                "-c",
+                "listen_addresses=",
+                "-c",
+                f"unix_socket_directories={socket_dir}",
+                "-c",
+                f"port={SCRATCH_PG_PORT}",
+                "-c",
+                "fsync=on",
+                "-c",
+                "full_page_writes=on",
+                "-c",
+                "synchronous_commit=on",
+                "-c",
+                "dynamic_shared_memory_type=mmap",
+                "-c",
+                "shared_buffers=64MB",
+                "-c",
+                "work_mem=4MB",
+                "-c",
+                "maintenance_work_mem=32MB",
+                "-c",
+                "max_connections=10",
+            ]
+        )
+        as_postgres(
+            [pgctl, "--pgdata", str(pgdata), "--log", str(pglog), "--options", server_options,
+             "--wait", "--timeout=30", "start"],
+            capture_output=True,
+        )
+        started = True
+        _scratch_resource_guard(root)
+        admin_target = DatabaseTarget(
+            host=str(socket_dir),
+            port=SCRATCH_PG_PORT,
+            username="postgres",
+            password=None,
+            database="postgres",
+        )
+        _scratch_create_application_role(admin_target)
+        scratch_target = DatabaseTarget(
+            host=str(socket_dir),
+            port=SCRATCH_PG_PORT,
+            username=SCRATCH_APP_ROLE,
+            password=None,
+            database="postgres",
+        )
+        table_count = perform_restore_drill(
+            archive_path,
+            app_target=scratch_target,
+            admin_target=admin_target,
+            timestamp_slug=args._scratch_timestamp_slug,
+            archive_stdin=archive,
+            restore_as_postgres=True,
+            restore_no_tablespaces=True,
+            resource_guard=lambda: _scratch_resource_guard(root),
+        )
+        _scratch_resource_guard(root)
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        if started or (pgdata / "postmaster.pid").exists():
+            try:
+                as_postgres(
+                    [pgctl, "--pgdata", str(pgdata), "--mode=fast", "--wait", "--timeout=20", "stop"],
+                    capture_output=True,
+                )
+            except BaseException as stop_error:
+                if primary_error is None:
+                    primary_error = stop_error
+        archive.close()
+    if primary_error is not None:
+        raise primary_error
+    if table_count is None or (pgdata / "postmaster.pid").exists():
+        raise RuntimeError("Scratch restore server teardown was not confirmed.")
+    print(json.dumps({"ok": True, "restored_table_count": table_count}, separators=(",", ":")))
+    return 0
+
+
+def _scratch_create_application_role(admin_target: DatabaseTarget) -> None:
+    run_command(
+        [
+            "psql",
+            "--no-psqlrc",
+            *connection_args(admin_target),
+            "--command",
+            f"CREATE ROLE {SCRATCH_APP_ROLE} LOGIN;",
+        ],
+        target=admin_target,
+        capture_output=True,
+    )
+
+
+def _scratch_unit_command(
+    *,
+    mountpoint: pathlib.Path,
+    archive_path: pathlib.Path,
+    archive_stat: os.stat_result,
+    archive_sha256: str,
+    timestamp_slug: str,
+    unit_name: str,
+) -> list[str]:
+    source_script = pathlib.Path(__file__).resolve(strict=True)
+    source_policy = source_script.with_name("platform_disk_policy.py").resolve(strict=True)
+    python_binary = pathlib.Path(getattr(sys, "_base_executable", sys.executable)).resolve(strict=True)
+    archive_target = mountpoint / "archive.dump"
+    worker_target = mountpoint / "platform_backup_restore_drill.py"
+    policy_target = mountpoint / "platform_disk_policy.py"
+    python_target = mountpoint / "python3"
+    command = [
+        "systemd-run",
+        "--system",
+        "--quiet",
+        "--wait",
+        "--pipe",
+        "--collect",
+        f"--unit={unit_name}",
+        "--property=Type=exec",
+        f"--property=TemporaryFileSystem={mountpoint}:rw,size={SCRATCH_TMPFS_BYTES},mode=0700",
+        f"--property=BindReadOnlyPaths={archive_path}:{archive_target}",
+        f"--property=BindReadOnlyPaths={source_script}:{worker_target}",
+        f"--property=BindReadOnlyPaths={source_policy}:{policy_target}",
+        f"--property=BindReadOnlyPaths={python_binary}:{python_target}",
+        f"--property=MemoryMax={SCRATCH_MEMORY_MAX_BYTES}",
+        "--property=MemorySwapMax=0",
+        "--property=RuntimeMaxSec=900s",
+        "--property=TimeoutStopSec=5s",
+        "--property=KillMode=control-group",
+        "--property=OOMPolicy=kill",
+        "--property=PrivateNetwork=yes",
+        "--property=PrivateDevices=yes",
+        "--property=RestrictAddressFamilies=AF_UNIX",
+        "--property=SystemCallArchitectures=native",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=tmpfs",
+        "--property=NoNewPrivileges=yes",
+        "--property=CapabilityBoundingSet=CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE",
+        "--property=InaccessiblePaths=/opt/oldsparky/platform/shared",
+        "--property=InaccessiblePaths=/var/lib/postgresql",
+        "--property=InaccessiblePaths=/var/run/postgresql",
+        "--property=InaccessiblePaths=/run/postgresql",
+        "--property=InaccessiblePaths=/etc/postgresql",
+        "--property=InaccessiblePaths=/root",
+        "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--setenv=LANG=C.UTF-8",
+        "--setenv=LC_ALL=C.UTF-8",
+        "--setenv=SYSTEMD_COLORS=0",
+        "--setenv=SYSTEMD_PAGER=cat",
+        "--",
+        str(python_target),
+        "-I",
+        "-B",
+        str(worker_target),
+        SCRATCH_WORKER_MODE,
+        "--_scratch-root",
+        str(mountpoint),
+        "--_scratch-archive",
+        str(archive_target),
+        "--_scratch-archive-dev",
+        str(archive_stat.st_dev),
+        "--_scratch-archive-ino",
+        str(archive_stat.st_ino),
+        "--_scratch-archive-size",
+        str(archive_stat.st_size),
+        "--_scratch-archive-sha256",
+        archive_sha256,
+        "--_scratch-timestamp-slug",
+        timestamp_slug,
+    ]
+    if any("ReadWritePaths=" in part for part in command):
+        raise RuntimeError("Scratch unit must not override its private tmpfs mount.")
+    return command
+
+
+def _scratch_control_group_snapshot(control_group: str) -> dict[str, int]:
+    if not control_group.startswith("/system.slice/") or ".." in pathlib.PurePosixPath(control_group).parts:
+        raise RuntimeError("Scratch restore service cgroup is outside system.slice.")
+    root = pathlib.Path("/sys/fs/cgroup").resolve(strict=True)
+    directory = (root / control_group.lstrip("/")).resolve(strict=True)
+    directory.relative_to(root)
+
+    def read(name: str) -> str:
+        return (directory / name).read_text(encoding="ascii").strip()
+
+    values = {
+        "memory_max_bytes": int(read("memory.max")),
+        "memory_current_bytes": int(read("memory.current")),
+        "memory_swap_max_bytes": int(read("memory.swap.max")),
+        "memory_swap_current_bytes": int(read("memory.swap.current")),
+        "memory_oom_group": int(read("memory.oom.group")),
+    }
+    events = {}
+    for row in read("memory.events").splitlines():
+        fields = row.split()
+        if len(fields) == 2 and fields[0] in {"oom", "oom_kill", "high", "max"} and fields[1].isdecimal():
+            events[fields[0]] = int(fields[1])
+    values["oom_kill_events"] = events.get("oom_kill", 0)
+    if (
+        values["memory_max_bytes"] != SCRATCH_MEMORY_MAX_BYTES
+        or values["memory_swap_max_bytes"] != 0
+        or values["memory_swap_current_bytes"] != 0
+        or values["memory_oom_group"] != 1
+        or values["memory_current_bytes"] >= SCRATCH_MEMORY_MAX_BYTES - SCRATCH_MEMORY_STOP_MARGIN_BYTES
+        or values["oom_kill_events"] != 0
+    ):
+        raise RuntimeError("Scratch restore service exceeded its effective memory bounds.")
+    return values
+
+
+def _scratch_service_snapshot(unit_name: str) -> dict[str, Any]:
+    keys = (
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "ControlGroup",
+        "ExecMainPID",
+        "ExecMainStatus",
+        "Result",
+        "TemporaryFileSystem",
+        "BindReadOnlyPaths",
+        "InaccessiblePaths",
+        "RestrictAddressFamilies",
+        "MemoryMax",
+        "MemorySwapMax",
+        "OOMPolicy",
+        "PrivateNetwork",
+        "ProtectSystem",
+        "ProtectHome",
+        "NoNewPrivileges",
+        "ReadWritePaths",
+    )
+    completed = subprocess.run(
+        ["systemctl", "show", "--no-pager", *[f"--property={key}" for key in keys], unit_name],
+        check=False,
+        text=True,
+        capture_output=True,
+        env={
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "SYSTEMD_COLORS": "0",
+            "SYSTEMD_PAGER": "cat",
+        },
+        timeout=2,
+    )
+    if completed.returncode != 0 or completed.stderr:
+        raise RuntimeError("Scratch restore service properties could not be verified.")
+    properties = dict(
+        line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
+    )
+    return {"properties": properties, "load_state": properties.get("LoadState")}
+
+
+def _scratch_expected_properties(snapshot: dict[str, Any], *, unit_name: str, mountpoint: pathlib.Path) -> str:
+    properties = snapshot.get("properties")
+    if not isinstance(properties, dict):
+        raise RuntimeError("Scratch restore service properties are malformed.")
+    expected = {
+        "MemoryMax": str(SCRATCH_MEMORY_MAX_BYTES),
+        "MemorySwapMax": "0",
+        "OOMPolicy": "kill",
+        "PrivateNetwork": "yes",
+        "RestrictAddressFamilies": "AF_UNIX",
+        "ProtectSystem": "strict",
+        "ProtectHome": "tmpfs",
+        "NoNewPrivileges": "yes",
+    }
+    if any(properties.get(key, "").lower() != value.lower() for key, value in expected.items()):
+        raise RuntimeError("Scratch restore service properties do not match the closed policy.")
+    if properties.get("ReadWritePaths") not in {None, ""}:
+        raise RuntimeError("Scratch restore service has an unexpected writable-path override.")
+    if properties.get("LoadState") != "loaded" or properties.get("ActiveState") != "active":
+        raise RuntimeError("Scratch restore service is not active while it is being checked.")
+    control_group = properties.get("ControlGroup", "")
+    if not control_group.startswith("/system.slice/") or ".." in pathlib.PurePosixPath(control_group).parts:
+        raise RuntimeError("Scratch restore service cgroup is invalid.")
+    if control_group != f"/system.slice/{unit_name}":
+        raise RuntimeError("Scratch restore service cgroup does not match its unique unit.")
+    pid_text = properties.get("ExecMainPID", "0")
+    if pid_text in {"", "0"} or not pid_text.isdecimal():
+        raise RuntimeError("Scratch restore worker process identity is unavailable.")
+    try:
+        process_cgroup = None
+        for row in pathlib.Path(f"/proc/{pid_text}/cgroup").read_text(encoding="ascii").splitlines():
+            fields = row.split(":", 2)
+            if len(fields) == 3 and fields[0] == "0":
+                process_cgroup = fields[2]
+                break
+    except OSError as exc:
+        raise RuntimeError("Scratch restore worker process identity disappeared during verification.") from exc
+    if process_cgroup != control_group:
+        raise RuntimeError("Scratch restore worker is outside its reviewed systemd cgroup.")
+    tmpfs = properties.get("TemporaryFileSystem", "")
+    if str(mountpoint) not in tmpfs:
+        raise RuntimeError("Scratch restore tmpfs request is not present in the active unit.")
+    inaccessible = properties.get("InaccessiblePaths", "")
+    for required in (
+        "/opt/oldsparky/platform/shared",
+        "/var/lib/postgresql",
+        "/var/run/postgresql",
+        "/run/postgresql",
+        "/etc/postgresql",
+        "/root",
+    ):
+        if required not in inaccessible:
+            raise RuntimeError("Scratch restore service can see an out-of-scope credential or cluster path.")
+    bind_paths = properties.get("BindReadOnlyPaths", "")
+    for required in (
+        str(mountpoint / "archive.dump"),
+        str(mountpoint / "platform_backup_restore_drill.py"),
+        str(mountpoint / "platform_disk_policy.py"),
+        str(mountpoint / "python3"),
+    ):
+        if required not in bind_paths:
+            raise RuntimeError("Scratch restore service is missing a required read-only input bind.")
+    return control_group
+
+
+def _scratch_host_guard() -> None:
+    require_restore_headroom(pathlib.Path("/"))
+    if _scratch_mem_available_bytes() < SCRATCH_MEMORY_ADMISSION_BYTES:
+        raise RuntimeError("Scratch restore admission memory reserve is unavailable.")
+
+
+def _scratch_mountpoint_is_mounted(path: pathlib.Path) -> bool:
+    target = str(path)
+    for line in pathlib.Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines():
+        left, separator, _ = line.partition(" - ")
+        fields = left.split()
+        if separator and len(fields) >= 5 and fields[4].replace("\\040", " ") == target:
+            return True
+    return False
+
+
+def _scratch_stop_unit(unit_name: str) -> None:
+    try:
+        subprocess.run(
+            ["systemctl", "stop", unit_name],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "SYSTEMD_PAGER": "cat"},
+            timeout=6,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Scratch restore service could not be confirmed stopped.") from exc
+
+
+def _run_isolated_restore_drill(dump_path: pathlib.Path, *, timestamp_slug: str) -> int:
+    """Restore into a capped, disposable PostgreSQL cluster isolated from production."""
+    if os.geteuid() != 0:
+        raise RuntimeError("Isolated backup verification requires the root maintenance owner.")
+    if re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", timestamp_slug) is None:
+        raise ValueError("Scratch restore timestamp identity is invalid.")
+    require_commands("systemd-run", "systemctl", "pg_config", "runuser")
+    _scratch_host_guard()
+    archive_path = dump_path.absolute()
+    archive_descriptor = os.open(
+        archive_path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        archive_before = os.fstat(archive_descriptor)
+        path_before = archive_path.lstat()
+        if (
+            not stat.S_ISREG(archive_before.st_mode)
+            or archive_before.st_uid != 0
+            or stat.S_IMODE(archive_before.st_mode) != 0o600
+            or archive_before.st_nlink != 1
+            or (archive_before.st_dev, archive_before.st_ino)
+            != (path_before.st_dev, path_before.st_ino)
+            or archive_before.st_size <= 5
+        ):
+            raise RuntimeError("Scratch restore archive identity is unsafe.")
+        archive_hash = hashlib.sha256()
+        total_bytes = 0
+        while True:
+            chunk = os.read(archive_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            archive_hash.update(chunk)
+            total_bytes += len(chunk)
+        archive_after = os.fstat(archive_descriptor)
+        if (
+            total_bytes != archive_before.st_size
+            or os.pread(archive_descriptor, 5, 0) != b"PGDMP"
+            or (archive_before.st_dev, archive_before.st_ino, archive_before.st_size,
+                archive_before.st_mtime_ns, archive_before.st_ctime_ns)
+            != (archive_after.st_dev, archive_after.st_ino, archive_after.st_size,
+                archive_after.st_mtime_ns, archive_after.st_ctime_ns)
+        ):
+            raise RuntimeError("Scratch restore archive content or identity is invalid.")
+        archive_sha256 = archive_hash.hexdigest()
+        os.lseek(archive_descriptor, 0, os.SEEK_SET)
+        host_run_stat = pathlib.Path("/run").stat()
+        if not stat.S_ISDIR(host_run_stat.st_mode) or host_run_stat.st_uid != 0:
+            raise RuntimeError("Scratch restore mount parent is not the trusted root-owned /run directory.")
+        token = secrets.token_hex(12)
+        mountpoint = pathlib.Path(f"/run/oldsparky-backup-restore-{token}")
+        unit_name = f"oldsparky-backup-restore-{token}.service"
+        os.mkdir(mountpoint, 0o700)
+        mountpoint_stat = mountpoint.lstat()
+        mountpoint_identity = (mountpoint_stat.st_dev, mountpoint_stat.st_ino)
+        if (
+            not stat.S_ISDIR(mountpoint_stat.st_mode)
+            or mountpoint_stat.st_uid != 0
+            or mountpoint_stat.st_gid != 0
+            or stat.S_IMODE(mountpoint_stat.st_mode) != 0o700
+            or _scratch_mountpoint_is_mounted(mountpoint)
+        ):
+            mountpoint.rmdir()
+            raise RuntimeError("Scratch restore mountpoint identity is unsafe.")
+        command = _scratch_unit_command(
+            mountpoint=mountpoint,
+            archive_path=archive_path,
+            archive_stat=archive_before,
+            archive_sha256=archive_sha256,
+            timestamp_slug=timestamp_slug,
+            unit_name=unit_name,
+        )
+        environment = {
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "SYSTEMD_COLORS": "0",
+            "SYSTEMD_PAGER": "cat",
+        }
+        process: subprocess.Popen[bytes] | None = None
+        stdout_buffer = bytearray()
+        stderr_size = 0
+        active_control_group: str | None = None
+        selector: selectors.BaseSelector | None = None
+        launch_started = False
+        last_tick = time.monotonic()
+        deadline = last_tick + SCRATCH_RUNTIME_SECONDS + 30
+        worker_result: dict[str, Any] | None = None
+        try:
+            _scratch_host_guard()
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                cwd="/",
+                close_fds=True,
+                bufsize=0,
+            )
+            launch_started = True
+            selector = selectors.DefaultSelector()
+            assert process.stdout is not None and process.stderr is not None
+            os.set_blocking(process.stdout.fileno(), False)
+            os.set_blocking(process.stderr.fileno(), False)
+            selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+            while process.poll() is None:
+                now = time.monotonic()
+                if now >= deadline or now - last_tick > SCRATCH_RUNTIME_SAMPLE_SECONDS * 8:
+                    raise RuntimeError("Scratch restore monitor exceeded its bounded runtime or sample interval.")
+                _scratch_host_guard()
+                snapshot = _scratch_service_snapshot(unit_name)
+                properties = snapshot.get("properties", {})
+                if properties.get("ActiveState") == "active" and properties.get("ExecMainPID", "0") not in {"", "0"}:
+                    active_control_group = _scratch_expected_properties(
+                        snapshot, unit_name=unit_name, mountpoint=mountpoint
+                    )
+                    _scratch_control_group_snapshot(active_control_group)
+                elif properties.get("ActiveState") in {"failed", "inactive"}:
+                    raise RuntimeError("Scratch restore service exited before its confinement was verified.")
+                last_tick = now
+                for key, _ in selector.select(timeout=SCRATCH_RUNTIME_SAMPLE_SECONDS):
+                    try:
+                        data = os.read(key.fileobj.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    if not data:
+                        selector.unregister(key.fileobj)
+                    elif key.data == "stdout":
+                        stdout_buffer.extend(data)
+                        if len(stdout_buffer) > 4096:
+                            raise RuntimeError("Scratch restore worker output exceeded its closed bound.")
+                    else:
+                        stderr_size += len(data)
+                        if stderr_size > 65536:
+                            raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
+            return_code = process.wait(timeout=5)
+            for stream in (process.stdout, process.stderr):
+                if stream:
+                    while True:
+                        try:
+                            data = os.read(stream.fileno(), 65536)
+                        except BlockingIOError:
+                            break
+                        if not data:
+                            break
+                        if stream is process.stdout:
+                            stdout_buffer.extend(data)
+                            if len(stdout_buffer) > 4096:
+                                raise RuntimeError("Scratch restore worker output exceeded its closed bound.")
+                        else:
+                            stderr_size += len(data)
+                            if stderr_size > 65536:
+                                raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
+            if return_code != 0 or stderr_size != 0:
+                raise RuntimeError("Isolated PostgreSQL backup restore did not complete successfully.")
+            try:
+                decoded = json.loads(stdout_buffer.decode("ascii"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Isolated PostgreSQL backup restore returned an invalid result.") from exc
+            if (
+                not isinstance(decoded, dict)
+                or set(decoded) != {"ok", "restored_table_count"}
+                or decoded.get("ok") is not True
+                or type(decoded.get("restored_table_count")) is not int
+                or decoded["restored_table_count"] <= 0
+            ):
+                raise RuntimeError("Isolated PostgreSQL backup restore result failed validation.")
+            worker_result = decoded
+        except BaseException:
+            if launch_started:
+                _scratch_stop_unit(unit_name)
+            if process is not None and process.poll() is None:
+                try:
+                    process.wait(timeout=6)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            raise
+        finally:
+            if launch_started:
+                final_snapshot = _scratch_service_snapshot(unit_name)
+                final_props = final_snapshot["properties"]
+                if final_props.get("ActiveState") not in {"inactive", "failed"}:
+                    _scratch_stop_unit(unit_name)
+                    final_snapshot = _scratch_service_snapshot(unit_name)
+                    final_props = final_snapshot["properties"]
+                service_stopped = (
+                    final_props.get("LoadState") == "not-found"
+                    or (
+                        final_props.get("ActiveState") in {"inactive", "failed"}
+                        and final_props.get("ExecMainPID", "0") in {"", "0"}
+                        and final_props.get("ControlGroup", "") == ""
+                    )
+                )
+            else:
+                service_stopped = True
+            mount_absent = not _scratch_mountpoint_is_mounted(mountpoint)
+            try:
+                current_mountpoint = mountpoint.lstat()
+                mountpoint_stable = (
+                    (current_mountpoint.st_dev, current_mountpoint.st_ino) == mountpoint_identity
+                    and stat.S_ISDIR(current_mountpoint.st_mode)
+                    and current_mountpoint.st_uid == 0
+                    and stat.S_IMODE(current_mountpoint.st_mode) == 0o700
+                    and not any(mountpoint.iterdir())
+                )
+                if service_stopped and mount_absent and mountpoint_stable:
+                    mountpoint.rmdir()
+                    mountpoint_removed = True
+                else:
+                    mountpoint_removed = False
+            except FileNotFoundError:
+                mountpoint_removed = False
+            if selector is not None:
+                selector.close()
+            if process is not None:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+            if not service_stopped or not mount_absent or not mountpoint_removed:
+                raise RuntimeError("Scratch restore unit or mount cleanup could not be confirmed.")
+        archive_after = os.fstat(archive_descriptor)
+        current_path = archive_path.lstat()
+        if (
+            (archive_after.st_dev, archive_after.st_ino, archive_after.st_size,
+             archive_after.st_mtime_ns, archive_after.st_ctime_ns)
+            != (archive_before.st_dev, archive_before.st_ino, archive_before.st_size,
+                archive_before.st_mtime_ns, archive_before.st_ctime_ns)
+            or (current_path.st_dev, current_path.st_ino) != (archive_before.st_dev, archive_before.st_ino)
+        ):
+            raise RuntimeError("Scratch restore archive changed while it was being verified.")
+        if worker_result is None:
+            raise RuntimeError("Scratch restore completed without a verified worker result.")
+        _scratch_host_guard()
+        return worker_result["restored_table_count"]
+    finally:
+        os.close(archive_descriptor)
+
+
+def _validate_custom_archive_header(path: pathlib.Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 5 or os.read(descriptor, 5) != b"PGDMP":
+            raise RuntimeError("Backup archive is not a valid custom-format PostgreSQL dump.")
+    finally:
+        os.close(descriptor)
+
+
 def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     env_file = pathlib.Path(args.env_file)
     output_dir = pathlib.Path(args.output_dir)
@@ -1523,8 +2421,6 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"PLATFORM_DATABASE_URL is missing from environment and {env_file}.")
 
     app_target = parse_database_url(database_url)
-    admin_url = args.admin_database_url or merged_env.get("PLATFORM_BACKUP_ADMIN_URL")
-    admin_target = parse_database_url(admin_url, require_platformdb=False) if admin_url else None
     output_dir.mkdir(parents=True, exist_ok=True)
     rotate_existing = bool(getattr(args, "rotate_existing", True))
     preserve_existing = not rotate_existing
@@ -1545,10 +2441,9 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         pathlib.Path("/"), output_dir, phase="backup_admission"
     )
 
-    required = ["pg_dump", "pg_restore"]
+    require_commands("pg_dump")
     if not args.dump_only:
-        required.extend(["createdb", "dropdb", "psql"])
-    require_commands(*required)
+        require_commands("systemd-run", "systemctl")
 
     dump_fd, dump_tmp_name = tempfile.mkstemp(
         prefix=f".{dump_path.name}.", suffix=".tmp", dir=output_dir
@@ -1563,7 +2458,6 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     started_at = utc_now()
     restore_verified = False
     restored_table_count: int | None = None
-    restore_error: str | None = None
 
     try:
         run_disk_guarded_command(
@@ -1590,19 +2484,14 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             temporary_dump_identity.st_ino,
         ):
             raise RuntimeError("Temporary backup archive identity changed.")
-        run_command(["pg_restore", "--list", str(temporary_dump_path)], capture_output=True)
-
         if not args.dump_only:
-            try:
-                restored_table_count = perform_restore_drill(
-                    temporary_dump_path,
-                    app_target=app_target,
-                    admin_target=admin_target,
-                    timestamp_slug=timestamp_slug,
-                )
-                restore_verified = True
-            except Exception as exc:
-                restore_error = str(exc)
+            restored_table_count = _run_isolated_restore_drill(
+                temporary_dump_path,
+                timestamp_slug=timestamp_slug,
+            )
+            restore_verified = True
+        else:
+            _validate_custom_archive_header(temporary_dump_path)
 
         completed_at = utc_now()
         metadata: dict[str, Any] = {
@@ -1619,7 +2508,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             "restore_verified": restore_verified,
             "alembic_revision_verified": restore_verified,
             "restored_table_count": restored_table_count,
-            "restore_error": restore_error,
+            "restore_error": None,
         }
         if preserve_existing:
             before_publish_inventory = backup_inventory(output_dir)
@@ -1660,14 +2549,9 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("Temporary backup metadata identity changed.")
         published_dump = _publish_noclobber(temporary_dump_path, dump_path)
         published_dump_identity = (published_dump.st_dev, published_dump.st_ino)
-        try:
-            published_metadata = _publish_noclobber(temporary_metadata_path, metadata_path)
-            published_metadata_identity = (published_metadata.st_dev, published_metadata.st_ino)
-            temporary_metadata_path = None
-        except Exception:
-            _unlink_if_same_inode(dump_path, published_dump_identity)
-            published_dump_identity = None
-            raise
+        published_metadata = _publish_noclobber(temporary_metadata_path, metadata_path)
+        published_metadata_identity = (published_metadata.st_dev, published_metadata.st_ino)
+        temporary_metadata_path = None
 
         removed: list[str] = []
         if restore_verified and rotate_existing:
@@ -1686,15 +2570,13 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             if postexisting_archive_count != expected_archive_count:
                 raise RuntimeError("Preserve mode did not retain exactly one new complete backup pair.")
         result = {
-            "ok": restore_error is None,
+            "ok": True,
             **metadata,
             "rotation_mode": "rotate-existing" if rotate_existing else "preserve-existing",
             "metadata_file": str(metadata_path),
             "removed": removed,
             "postexisting_archive_count": postexisting_archive_count,
         }
-        if restore_error is not None:
-            raise RuntimeError(f"Platform backup was created but restore verification failed: {restore_error}")
         return result
     finally:
         active_exception = sys.exception()
@@ -1704,6 +2586,21 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         )
         _unlink_if_same_inode(temporary_metadata_path, temporary_metadata_identity)
         if preserve_existing:
+            if active_exception is not None:
+                try:
+                    _rollback_published_backup_pair(
+                        dump_path,
+                        published_dump_identity,
+                        metadata_path,
+                        published_metadata_identity,
+                    )
+                except Exception as rollback_error:
+                    setattr(
+                        active_exception,
+                        "_backup_preservation_integrity",
+                        "new_pair_rollback_failed",
+                    )
+                    active_exception.add_note(str(rollback_error))
             try:
                 current_inventory = backup_inventory(output_dir)
                 validate_complete_backup_pairs(output_dir, current_inventory)
@@ -1718,16 +2615,38 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                     raise RuntimeError("Pre-existing backup inventory changed during preserve mode.")
             except Exception as integrity_error:
                 if active_exception is None:
+                    try:
+                        _rollback_published_backup_pair(
+                            dump_path,
+                            published_dump_identity,
+                            metadata_path,
+                            published_metadata_identity,
+                        )
+                    except Exception as rollback_error:
+                        setattr(
+                            integrity_error,
+                            "_backup_preservation_integrity",
+                            "new_pair_rollback_failed",
+                        )
+                        integrity_error.add_note(str(rollback_error))
                     setattr(
                         integrity_error,
                         "_backup_preservation_integrity",
-                        "preexisting_inventory_changed",
+                        getattr(
+                            integrity_error,
+                            "_backup_preservation_integrity",
+                            "preexisting_inventory_changed",
+                        ),
                     )
                     raise
                 setattr(
                     active_exception,
                     "_backup_preservation_integrity",
-                    "preexisting_inventory_changed",
+                    getattr(
+                        active_exception,
+                        "_backup_preservation_integrity",
+                        "preexisting_inventory_changed",
+                    ),
                 )
 
 
@@ -1749,20 +2668,9 @@ def verify_existing_dump(args: argparse.Namespace) -> dict[str, Any]:
     dump_path = pathlib.Path(args.verify_dump).resolve()
     if not dump_path.is_file() or dump_path.suffix != ".dump":
         raise RuntimeError("--verify-dump must reference an existing .dump archive.")
-    file_env = load_env(pathlib.Path(args.env_file))
-    merged_env = {**file_env, **os.environ}
-    database_url = merged_env.get("PLATFORM_DATABASE_URL")
-    if not database_url:
-        raise RuntimeError("PLATFORM_DATABASE_URL is required to run a restore drill.")
-    app_target = parse_database_url(database_url)
-    admin_url = args.admin_database_url or merged_env.get("PLATFORM_BACKUP_ADMIN_URL")
-    admin_target = parse_database_url(admin_url, require_platformdb=False) if admin_url else None
-    require_commands("pg_restore", "createdb", "dropdb", "psql")
-    run_command(["pg_restore", "--list", str(dump_path)], capture_output=True)
-    table_count = perform_restore_drill(
+    require_commands("systemd-run", "systemctl")
+    table_count = _run_isolated_restore_drill(
         dump_path,
-        app_target=app_target,
-        admin_target=admin_target,
         timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
     )
     return {
@@ -1778,6 +2686,19 @@ def verify_existing_dump(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> int:
     args = parse_args()
     try:
+        if getattr(args, "_scratch_restore_worker", False):
+            required_worker_values = (
+                args._scratch_root,
+                args._scratch_archive,
+                args._scratch_archive_dev,
+                args._scratch_archive_ino,
+                args._scratch_archive_size,
+                args._scratch_archive_sha256,
+                args._scratch_timestamp_slug,
+            )
+            if any(value is None for value in required_worker_values):
+                raise ValueError("Scratch restore worker input is incomplete.")
+            return _scratch_worker_main(args)
         selected_modes = (
             int(args.check_latest)
             + int(getattr(args, "verify_latest_existing", False))
@@ -1806,11 +2727,12 @@ def main() -> int:
         return 0
     except Exception as exc:
         error_message = str(exc)
-        if (
-            getattr(exc, "_backup_preservation_integrity", None)
-            == "preexisting_inventory_changed"
-        ):
-            error_message += " [backup_integrity=preexisting_inventory_changed]"
+        integrity_status = getattr(exc, "_backup_preservation_integrity", None)
+        if integrity_status in {
+            "preexisting_inventory_changed",
+            "new_pair_rollback_failed",
+        }:
+            error_message += f" [backup_integrity={integrity_status}]"
         if args.as_json:
             report: dict[str, Any] = {"ok": False, "error": error_message}
             diagnostic = getattr(exc, "restore_diagnostic", None)

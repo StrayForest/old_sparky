@@ -102,6 +102,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         target = backup_drill.DatabaseTarget(
             "127.0.0.1", 5432, "platform_user", "secret", "platformdb"
         )
+        admin_target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "postgres", None, "postgres"
+        )
         responses = [
             subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 0, "CREATE EXTENSION\n", ""),
@@ -114,6 +117,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "0\n", ""),
         ]
 
+        archive = io.BytesIO(b"PGDMPsynthetic archive")
+        resource_guard = mock.Mock()
         with tempfile.TemporaryDirectory() as temporary_dir, mock.patch.object(
             backup_drill, "run_command", side_effect=responses
         ) as run_command, mock.patch.object(
@@ -124,17 +129,68 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             table_count = backup_drill.perform_restore_drill(
                 pathlib.Path(temporary_dir) / "backup.dump",
                 app_target=target,
-                admin_target=None,
+                admin_target=admin_target,
                 timestamp_slug="20260720T120000Z",
+                archive_stdin=archive,
+                restore_as_postgres=True,
+                restore_no_tablespaces=True,
+                resource_guard=resource_guard,
             )
 
         self.assertEqual(table_count, 22)
+        self.assertEqual(run_command.call_args_list[0].kwargs["target"], admin_target)
+        self.assertIn("--owner", run_command.call_args_list[0].args[0])
+        self.assertIn("platform_user", run_command.call_args_list[0].args[0])
+        for index in (1, 2, 3, 4, 5, 6):
+            self.assertEqual(run_command.call_args_list[index].kwargs["target"].username, "platform_user")
+        self.assertEqual(run_command.call_args_list[7].kwargs["target"], admin_target)
+        self.assertIn("postgres", run_command.call_args_list[7].args[0])
         self.assertTrue(run_command.call_args_list[1].kwargs["capture_output"])
         self.assertTrue(run_command.call_args_list[2].kwargs["capture_output"])
         self.assertIn("CREATE SCHEMA platform", run_command.call_args_list[2].args[0][-1])
         self.assertEqual(run_restore_command.call_count, 2)
-        self.assertIn("--schema=platform", run_restore_command.call_args_list[0].args[0])
-        self.assertIn("--schema=public", run_restore_command.call_args_list[1].args[0])
+        for index, schema in enumerate(("--schema=platform", "--schema=public")):
+            command = run_restore_command.call_args_list[index].args[0]
+            self.assertEqual(command[:4], ["runuser", "-u", "postgres", "--"])
+            self.assertEqual(run_restore_command.call_args_list[index].kwargs["target"].username, "platform_user")
+            self.assertIn(["--username", "platform_user"], [command[i : i + 2] for i in range(len(command) - 1)])
+            self.assertIn(schema, command)
+            self.assertIn("--no-tablespaces", command)
+            self.assertNotIn(str(pathlib.Path(temporary_dir) / "backup.dump"), command)
+            self.assertIs(run_restore_command.call_args_list[index].kwargs["stdin_handle"], archive)
+            self.assertIs(run_restore_command.call_args_list[index].kwargs["resource_guard"], resource_guard)
+        self.assertEqual(archive.tell(), 0)
+
+        with mock.patch.object(backup_drill, "run_command") as role_command:
+            backup_drill._scratch_create_application_role(admin_target)
+        self.assertEqual(role_command.call_args.kwargs["target"], admin_target)
+        self.assertEqual(
+            role_command.call_args.args[0][-1],
+            "CREATE ROLE platform_user LOGIN;",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            scratch_root = pathlib.Path(temporary_dir) / "scratch"
+            scratch_root.mkdir(mode=0o700)
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            command = backup_drill._scratch_unit_command(
+                mountpoint=scratch_root,
+                archive_path=archive_path,
+                archive_stat=archive_path.stat(),
+                archive_sha256=hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+                timestamp_slug="20261012T000000Z",
+                unit_name="oldsparky-backup-restore-0123456789abcdef01234567.service",
+            )
+        self.assertIn("--property=MemoryMax=671088640", command)
+        self.assertIn("--property=MemorySwapMax=0", command)
+        self.assertIn("--property=RestrictAddressFamilies=AF_UNIX", command)
+        self.assertIn("--property=PrivateNetwork=yes", command)
+        self.assertIn("--property=OOMPolicy=kill", command)
+        self.assertIn("--property=TemporaryFileSystem=" + str(scratch_root) + ":rw,size=536870912,mode=0700", command)
+        self.assertTrue(any(item.startswith("--property=BindReadOnlyPaths=") and str(archive_path) in item for item in command))
+        self.assertFalse(any("ReadWritePaths=" in item for item in command))
+        self.assertFalse(any("PGPASSWORD" in item or "PLATFORM_DATABASE_URL" in item for item in command))
 
         self._assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db()
 
@@ -557,7 +613,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 encoding="utf-8",
             )
             dump_path = output_dir / "platformdb-20260714T120000Z.dump"
-            dump_path.write_bytes(b"custom-format-backup")
+            dump_path.write_bytes(b"PGDMPcustom-format-backup")
             dump_path.chmod(0o600)
             metadata_path = dump_path.with_suffix(".json")
             original_created_at = dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
@@ -591,7 +647,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "run_command",
                 return_value=subprocess.CompletedProcess([], 0, "", ""),
             ) as run_command, mock.patch.object(
-                backup_drill, "perform_restore_drill", return_value=31
+                backup_drill, "_run_isolated_restore_drill", return_value=31
             ) as perform_restore:
                 result = backup_drill.verify_latest_existing_backup(
                     output_dir, env_file, max_age_hours=24
@@ -599,7 +655,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["restored_table_count"], 31)
-            self.assertEqual(run_command.call_args.args[0][:2], ["pg_restore", "--list"])
+            run_command.assert_not_called()
             perform_restore.assert_called_once()
             updated = json.loads(metadata_path.read_text(encoding="utf-8"))
             self.assertEqual(updated["completed_at_utc"], original_created_at)
@@ -609,9 +665,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertIsInstance(updated["restore_verified_at_utc"], str)
             self.assertEqual(
                 backup_drill.check_latest_backup(output_dir, max_age_hours=24)["sha256"],
-                hashlib.sha256(b"custom-format-backup").hexdigest(),
+                hashlib.sha256(b"PGDMPcustom-format-backup").hexdigest(),
             )
-            self.assertEqual(dump_path.read_bytes(), b"custom-format-backup")
+            self.assertEqual(dump_path.read_bytes(), b"PGDMPcustom-format-backup")
             self.assertEqual(
                 (dump_path.stat().st_ino, dump_path.stat().st_mtime_ns),
                 (original_dump_stat.st_ino, original_dump_stat.st_mtime_ns),
@@ -627,7 +683,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 return_value=subprocess.CompletedProcess([], 0, "", ""),
             ), mock.patch.object(
                 backup_drill,
-                "perform_restore_drill",
+                "_run_isolated_restore_drill",
                 side_effect=backup_drill.RestoreGuardStop("command_failed"),
             ):
                 with self.assertRaises(backup_drill.RestoreGuardStop):
@@ -635,33 +691,22 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         output_dir, env_file, max_age_hours=24
                     )
             self.assertEqual(metadata_path.read_bytes(), updated_sidecar_bytes)
-            self.assertEqual(dump_path.read_bytes(), b"custom-format-backup")
+            self.assertEqual(dump_path.read_bytes(), b"PGDMPcustom-format-backup")
 
-            command_results = [
-                subprocess.CompletedProcess([], 0, "", ""),
-                subprocess.CompletedProcess([], 0, "", ""),
-                subprocess.CompletedProcess([], 0, "CREATE EXTENSION\n", ""),
-                subprocess.CompletedProcess([], 0, "CREATE SCHEMA\n", ""),
-                subprocess.CompletedProcess([], 0, "31\n", ""),
-                subprocess.CompletedProcess([], 0, "1\n", ""),
-                subprocess.CompletedProcess([], 0, "20260801_0036\n", ""),
-                subprocess.CompletedProcess([], 0, "1\n", ""),
-                subprocess.CalledProcessError(1, ["dropdb"]),
-            ]
             with mock.patch.dict(
                 backup_drill.os.environ,
                 {"PLATFORM_DATABASE_URL": "postgresql://platform_user:synthetic@127.0.0.1/platformdb"},
             ), mock.patch.object(backup_drill, "require_commands"), mock.patch.object(
-                backup_drill, "run_command", side_effect=command_results
-            ), mock.patch.object(backup_drill, "run_restore_command"), mock.patch.object(
-                backup_drill, "require_restore_headroom"
+                backup_drill,
+                "_run_isolated_restore_drill",
+                side_effect=subprocess.CalledProcessError(1, ["systemd-run"]),
             ):
                 with self.assertRaises(subprocess.CalledProcessError):
                     backup_drill.verify_latest_existing_backup(
                         output_dir, env_file, max_age_hours=24
                     )
             self.assertEqual(metadata_path.read_bytes(), updated_sidecar_bytes)
-            self.assertEqual(dump_path.read_bytes(), b"custom-format-backup")
+            self.assertEqual(dump_path.read_bytes(), b"PGDMPcustom-format-backup")
 
             crossing = dict(updated)
             start_now = dt.datetime.now(dt.UTC)
@@ -679,7 +724,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "run_command",
                 return_value=subprocess.CompletedProcess([], 0, "", ""),
             ), mock.patch.object(
-                backup_drill, "perform_restore_drill", return_value=31
+                backup_drill, "_run_isolated_restore_drill", return_value=31
             ), mock.patch.object(
                 backup_drill,
                 "utc_now",
@@ -690,7 +735,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         output_dir, env_file, max_age_hours=24
                     )
             self.assertEqual(metadata_path.read_bytes(), crossing_bytes)
-            self.assertEqual(dump_path.read_bytes(), b"custom-format-backup")
+            self.assertEqual(dump_path.read_bytes(), b"PGDMPcustom-format-backup")
 
             # A directory-fsync failure after rename must restore the exact old sidecar.
             stable_bytes = metadata_path.read_bytes()
@@ -702,7 +747,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "run_command",
                 return_value=subprocess.CompletedProcess([], 0, "", ""),
             ), mock.patch.object(
-                backup_drill, "perform_restore_drill", return_value=31
+                backup_drill, "_run_isolated_restore_drill", return_value=31
             ), mock.patch.object(
                 backup_drill.os,
                 "fsync",
@@ -713,7 +758,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         output_dir, env_file, max_age_hours=24
                     )
             self.assertEqual(metadata_path.read_bytes(), stable_bytes)
-            self.assertEqual(dump_path.read_bytes(), b"custom-format-backup")
+            self.assertEqual(dump_path.read_bytes(), b"PGDMPcustom-format-backup")
 
             def write_metadata(value: dict[str, object]) -> None:
                 metadata_path.write_text(json.dumps(value), encoding="utf-8")
@@ -732,7 +777,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "run_command",
                     return_value=subprocess.CompletedProcess([], 0, "", ""),
                 ), mock.patch.object(
-                    backup_drill, "perform_restore_drill", side_effect=callback
+                backup_drill, "_run_isolated_restore_drill", side_effect=callback
                 ):
                     return backup_drill.verify_latest_existing_backup(
                         output_dir, env_file, max_age_hours=24
@@ -934,7 +979,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
             dump_path = output_dir / "platformdb-20260714T120000Z.dump"
-            dump_path.write_bytes(b"custom-format-backup")
+            dump_path.write_bytes(b"PGDMPcustom-format-backup")
             dump_path.with_suffix(".json").write_text(
                 json.dumps(
                     {
@@ -1036,31 +1081,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 for path in old_entries
             }
 
-            def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-                if command[0] == "pg_dump":
-                    dump_path = pathlib.Path(command[command.index("--file") + 1])
-                    dump_path.write_bytes(b"new-backup")
-                    return subprocess.CompletedProcess(command, 0, "", "")
-                if command[0] == "pg_restore":
-                    return subprocess.CompletedProcess(command, 0, "", "")
-                raise RuntimeError("restore failed")
-
             initial_inventory = backup_drill.backup_inventory(output_dir)
-            real_backup_inventory = backup_drill.backup_inventory
-            inventory_calls = 0
-
-            def mutate_final_inventory(path: pathlib.Path):
-                nonlocal inventory_calls
-                inventory_calls += 1
-                current = real_backup_inventory(path)
-                if inventory_calls == 4:
-                    return tuple(
-                        (*entry[:6], entry[6] + 1, *entry[7:])
-                        if entry[0] == initial_inventory[0][0]
-                        else entry
-                        for entry in current
-                    )
-                return current
             with (
                 mock.patch.dict(
                     backup_drill.os.environ,
@@ -1083,32 +1104,18 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(backup_drill, "require_commands"),
                 mock.patch.object(
                     backup_drill,
-                    "run_command",
-                    side_effect=fake_run_command,
-                ),
-                mock.patch.object(
-                    backup_drill,
                     "run_disk_guarded_command",
                     side_effect=self._fake_guarded_dump,
                 ),
                 mock.patch.object(backup_drill, "require_restore_headroom"),
                 mock.patch.object(
                     backup_drill,
-                    "run_restore_command",
+                    "_run_isolated_restore_drill",
                     side_effect=RuntimeError("restore failed"),
                 ),
-                mock.patch.object(
-                    backup_drill,
-                    "backup_inventory",
-                    side_effect=mutate_final_inventory,
-                ),
             ):
-                with self.assertRaisesRegex(RuntimeError, "restore verification failed") as raised:
+                with self.assertRaisesRegex(RuntimeError, "restore failed") as raised:
                     backup_drill.create_backup(args)
-            self.assertEqual(
-                getattr(raised.exception, "_backup_preservation_integrity", None),
-                "preexisting_inventory_changed",
-            )
             output = io.StringIO()
             main_args = argparse.Namespace(
                 check_latest=False,
@@ -1124,20 +1131,84 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(backup_drill.sys, "stdout", output),
             ):
                 self.assertEqual(backup_drill.main(), 1)
-            self.assertIn(
-                "[backup_integrity=preexisting_inventory_changed]",
-                json.loads(output.getvalue())["error"],
-            )
+            self.assertEqual(json.loads(output.getvalue())["error"], "restore failed")
 
             self.assertTrue(old_dump.exists())
             self.assertTrue(old_metadata.exists())
+            self.assertEqual(backup_drill.backup_inventory(output_dir), initial_inventory)
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                {path.name for path in old_entries},
+            )
             for path, expected in before.items():
                 metadata = path.lstat()
                 self.assertEqual((path.read_bytes(), metadata.st_mode, metadata.st_ino), expected)
 
+            self._assert_postpublication_inventory_failure_rolls_back_only_new_pair()
+
             self._assert_preserve_existing_keeps_all_archives_after_success()
             self._assert_destination_collision_fails_before_dump_and_preserves_sidecar()
             self._assert_explicit_rotation_retains_keep_policy()
+
+    def _assert_postpublication_inventory_failure_rolls_back_only_new_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            old_dump, old_metadata = self._write_backup_pair(
+                output_dir, "platformdb-old.dump", b"old-backup"
+            )
+            before = {
+                path: (path.read_bytes(), path.lstat().st_mode, path.lstat().st_ino)
+                for path in (old_dump, old_metadata)
+            }
+            initial_inventory = backup_drill.backup_inventory(output_dir)
+            args = argparse.Namespace(
+                env_file=str(output_dir / ".env.platform"),
+                output_dir=str(output_dir),
+                keep=14,
+                admin_database_url=None,
+                dump_only=False,
+                rotate_existing=False,
+            )
+            real_inventory = backup_drill.backup_inventory
+            inventory_calls = 0
+
+            def fail_after_publication(path: pathlib.Path) -> tuple[object, ...]:
+                nonlocal inventory_calls
+                inventory_calls += 1
+                if inventory_calls == 3:
+                    raise RuntimeError("synthetic post-publication inventory failure")
+                return real_inventory(path)
+
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    {"PLATFORM_DATABASE_URL": "postgresql://platform_user@localhost/platformdb"},
+                ),
+                mock.patch.object(backup_drill, "load_env", return_value={}),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
+                mock.patch.object(backup_drill, "_run_isolated_restore_drill", return_value=1),
+                mock.patch.object(backup_drill, "backup_inventory", side_effect=fail_after_publication),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "synthetic post-publication inventory failure"
+                ):
+                    backup_drill.create_backup(args)
+
+            self.assertEqual(inventory_calls, 4)
+            self.assertEqual(backup_drill.backup_inventory(output_dir), initial_inventory)
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                {old_dump.name, old_metadata.name},
+            )
+            for path, expected in before.items():
+                metadata = path.lstat()
+                self.assertEqual((path.read_bytes(), metadata.st_mode, metadata.st_ino), expected)
 
     def _assert_preserve_existing_keeps_all_archives_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -1192,7 +1263,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     side_effect=self._fake_guarded_dump,
                 ),
                 mock.patch.object(backup_drill, "require_restore_headroom"),
-                mock.patch.object(backup_drill, "perform_restore_drill", return_value=16),
+                mock.patch.object(backup_drill, "_run_isolated_restore_drill", return_value=16),
                 mock.patch.object(
                     backup_drill,
                     "utc_now",
@@ -1305,7 +1376,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
                 mock.patch.object(backup_drill, "run_disk_guarded_command", side_effect=self._fake_guarded_dump),
                 mock.patch.object(backup_drill, "require_restore_headroom"),
-                mock.patch.object(backup_drill, "perform_restore_drill", side_effect=mutate_existing_archive),
+                mock.patch.object(backup_drill, "_run_isolated_restore_drill", side_effect=mutate_existing_archive),
                 mock.patch.object(
                     backup_drill,
                     "utc_now",
@@ -1505,7 +1576,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     side_effect=self._fake_guarded_dump,
                 ),
                 mock.patch.object(backup_drill, "require_restore_headroom"),
-                mock.patch.object(backup_drill, "perform_restore_drill", return_value=20),
+                mock.patch.object(backup_drill, "_run_isolated_restore_drill", return_value=20),
             ):
                 result = backup_drill.create_backup(args)
 
@@ -1530,7 +1601,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         if stage != "pg_dump":
             raise AssertionError("unexpected guarded command in backup unit test")
         dump_path = pathlib.Path(command[command.index("--file") + 1])
-        dump_path.write_bytes(b"new-archive")
+        dump_path.write_bytes(b"PGDMPnew-archive")
 
 
 if __name__ == "__main__":
