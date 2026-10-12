@@ -3607,6 +3607,52 @@ def verify_existing_dump(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def failure_report_for_exception(
+    exc: Exception, *, private_scratch_diagnostics: bool
+) -> dict[str, Any]:
+    """Build the closed failure report shared by CLI and in-process callers."""
+    error_message = str(exc)
+    integrity_status = getattr(exc, "_backup_preservation_integrity", None)
+    if integrity_status in {
+        "preexisting_inventory_changed",
+        "new_pair_rollback_failed",
+    }:
+        error_message += f" [backup_integrity={integrity_status}]"
+    report: dict[str, Any] = {"ok": False, "error": error_message}
+    diagnostic = getattr(exc, "restore_diagnostic", None)
+    if _valid_restore_diagnostic(diagnostic):
+        report["restore_diagnostic"] = diagnostic
+    backup_disk_diagnostic = (
+        exc.private_backup_disk_diagnostic()
+        if isinstance(exc, RestoreGuardStop)
+        else None
+    )
+    if valid_backup_disk_diagnostic(backup_disk_diagnostic):
+        report["backup_disk_diagnostic"] = backup_disk_diagnostic
+    scratch_diagnostic = getattr(exc, "scratch_unit_diagnostic", None)
+    if private_scratch_diagnostics and valid_scratch_unit_diagnostic(scratch_diagnostic):
+        report["scratch_unit_diagnostic"] = scratch_diagnostic
+    admission_diagnostic = getattr(exc, "scratch_admission_diagnostic", None)
+    if private_scratch_diagnostics and valid_scratch_admission_diagnostic(admission_diagnostic):
+        report["scratch_admission_diagnostic"] = admission_diagnostic
+    return report
+
+
+def private_failure_frame_for_exception(
+    exc: Exception, *, enabled: bool
+) -> str | None:
+    """Return the existing bounded private frame, never raw text by default."""
+    private_output = getattr(exc, "scratch_unit_private_output", None)
+    if (
+        not enabled
+        or not isinstance(private_output, tuple)
+        or len(private_output) != 2
+        or not all(type(part) is bytes for part in private_output)
+    ):
+        return None
+    return _scratch_private_output_envelope(*private_output).decode("ascii")
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -3653,43 +3699,18 @@ def main() -> int:
         print_result(result, as_json=args.as_json)
         return 0
     except Exception as exc:
-        error_message = str(exc)
-        integrity_status = getattr(exc, "_backup_preservation_integrity", None)
-        if integrity_status in {
-            "preexisting_inventory_changed",
-            "new_pair_rollback_failed",
-        }:
-            error_message += f" [backup_integrity={integrity_status}]"
+        private_scratch_diagnostics = getattr(args, "private_scratch_diagnostics", False)
+        report = failure_report_for_exception(
+            exc, private_scratch_diagnostics=private_scratch_diagnostics
+        )
+        error_message = report["error"]
         if args.as_json:
-            report: dict[str, Any] = {"ok": False, "error": error_message}
-            diagnostic = getattr(exc, "restore_diagnostic", None)
-            if _valid_restore_diagnostic(diagnostic):
-                report["restore_diagnostic"] = diagnostic
-            backup_disk_diagnostic = (
-                exc.private_backup_disk_diagnostic()
-                if isinstance(exc, RestoreGuardStop)
-                else None
-            )
-            if valid_backup_disk_diagnostic(backup_disk_diagnostic):
-                report["backup_disk_diagnostic"] = backup_disk_diagnostic
-            scratch_diagnostic = getattr(exc, "scratch_unit_diagnostic", None)
-            private_scratch_diagnostics = getattr(args, "private_scratch_diagnostics", False)
-            if private_scratch_diagnostics and valid_scratch_unit_diagnostic(scratch_diagnostic):
-                report["scratch_unit_diagnostic"] = scratch_diagnostic
-            admission_diagnostic = getattr(exc, "scratch_admission_diagnostic", None)
-            if private_scratch_diagnostics and valid_scratch_admission_diagnostic(admission_diagnostic):
-                report["scratch_admission_diagnostic"] = admission_diagnostic
             print(json.dumps(report, ensure_ascii=False, indent=2))
-            if private_scratch_diagnostics:
-                private_output = getattr(exc, "scratch_unit_private_output", None)
-                if (
-                    isinstance(private_output, tuple)
-                    and len(private_output) == 2
-                    and all(type(part) is bytes for part in private_output)
-                ):
-                    sys.stderr.write(
-                        _scratch_private_output_envelope(*private_output).decode("ascii")
-                    )
+            private_frame = private_failure_frame_for_exception(
+                exc, enabled=private_scratch_diagnostics
+            )
+            if private_frame is not None:
+                sys.stderr.write(private_frame)
         else:
             print(f"[FAIL] {error_message}", file=sys.stderr)
         return 1

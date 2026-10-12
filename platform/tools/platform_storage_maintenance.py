@@ -61,6 +61,7 @@ except ImportError:  # Direct execution from the tools directory.
     disk_snapshot_for_path = _disk_policy.snapshot_for_path
 
 try:
+    from . import platform_backup_restore_drill as backup_restore_drill
     from . import platform_live_qa_guard as live_qa_guard
     from . import platform_build_node_cache
     from .platform_backup_restore_drill import (
@@ -79,6 +80,7 @@ try:
         resolved_release_target,
     )
 except ImportError:  # Direct execution from the tools directory.
+    import platform_backup_restore_drill as backup_restore_drill
     import platform_live_qa_guard as live_qa_guard
     import platform_build_node_cache
     from platform_backup_restore_drill import (
@@ -787,43 +789,64 @@ def run_backup(
 ) -> dict[str, Any]:
     if not math.isfinite(max_age_hours) or max_age_hours <= 0:
         raise ValueError("backup max age must be finite and positive")
-    script = Path(__file__).with_name("platform_backup_restore_drill.py")
     shared_dir = app_dir / "shared"
-    create_command = [
-        sys.executable,
-        "-B",
-        str(script),
-        "--env-file",
-        str(shared_dir / ".env.platform"),
-        "--output-dir",
-        str(shared_dir / "backups"),
-        "--keep",
-        str(keep),
-        "--rotate-existing" if rotate_existing else "--preserve-existing",
-        "--json",
-    ]
-    if private_failure_diagnostics:
-        create_command.append("--private-scratch-diagnostics")
-    result = _run_backup_command(
-        create_command,
-        forward_failure_diagnostics=private_failure_diagnostics,
+    backup_args = argparse.Namespace(
+        env_file=shared_dir / ".env.platform",
+        output_dir=shared_dir / "backups",
+        keep=keep,
+        dump_only=False,
+        rotate_existing=rotate_existing,
+        private_scratch_diagnostics=private_failure_diagnostics,
     )
-    check_result = _run_backup_command(
-        [
-            sys.executable,
-            "-B",
-            str(script),
-            "--env-file",
-            str(shared_dir / ".env.platform"),
-            "--output-dir",
-            str(shared_dir / "backups"),
-            "--check-latest",
-            "--max-age-hours",
-            str(max_age_hours),
-            "--json",
-        ],
-        forward_failure_diagnostics=private_failure_diagnostics,
-    )
+
+    def raise_command_failure(exc: Exception) -> None:
+        report = backup_restore_drill.failure_report_for_exception(
+            exc, private_scratch_diagnostics=private_failure_diagnostics
+        )
+        private_frame = backup_restore_drill.private_failure_frame_for_exception(
+            exc, enabled=private_failure_diagnostics
+        )
+        if private_failure_diagnostics:
+            forwarded = ""
+            if private_frame is not None:
+                forwarded = private_frame[:65536]
+            error_text = report["error"][: max(0, 65536 - len(forwarded))]
+            if error_text:
+                forwarded += error_text
+                if not error_text.endswith("\n"):
+                    forwarded = forwarded[:65535] + "\n"
+            if forwarded:
+                sys.stderr.write(forwarded)
+        raise BackupCommandFailure(
+            report.get("restore_diagnostic")
+            if _valid_restore_diagnostic(report.get("restore_diagnostic"))
+            else None,
+            report.get("backup_disk_diagnostic")
+            if valid_backup_disk_diagnostic(report.get("backup_disk_diagnostic"))
+            else None,
+            report.get("scratch_unit_diagnostic")
+            if valid_scratch_unit_diagnostic(report.get("scratch_unit_diagnostic"))
+            else None,
+            report.get("scratch_admission_diagnostic")
+            if valid_scratch_admission_diagnostic(report.get("scratch_admission_diagnostic"))
+            else None,
+        ) from exc
+
+    try:
+        with backup_restore_drill._termination_signal_scope():
+            result = backup_restore_drill.create_backup(backup_args)
+    except Exception as exc:
+        raise_command_failure(exc)
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise BackupCommandFailure()
+    try:
+        check_result = backup_restore_drill.check_latest_backup(
+            shared_dir / "backups", max_age_hours=max_age_hours
+        )
+    except Exception as exc:
+        raise_command_failure(exc)
+    if not isinstance(check_result, dict) or check_result.get("ok") is not True:
+        raise BackupCommandFailure()
     if result.get("restore_verified") is not True or check_result.get("restore_verified") is not True:
         raise RuntimeError("Platform backup was not restore-verified.")
     return {

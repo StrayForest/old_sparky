@@ -759,16 +759,23 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "restore_verified": True,
             "age_hours": 0.25,
         }
-        with mock.patch.object(
-            maintenance.subprocess,
-            "run",
-            side_effect=(
-                subprocess.CompletedProcess([], 0, json.dumps(create_result), ""),
-                subprocess.CompletedProcess([], 0, json.dumps(check_result), ""),
-                subprocess.CompletedProcess([], 0, json.dumps(preserve_result), ""),
-                subprocess.CompletedProcess([], 0, json.dumps(check_result), ""),
+        with (
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "create_backup",
+                side_effect=(create_result, preserve_result),
+            ) as create_backup,
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "check_latest_backup",
+                side_effect=(check_result, check_result),
+            ) as check_latest,
+            mock.patch.object(
+                maintenance.subprocess,
+                "run",
+                side_effect=AssertionError("run_backup must not start a helper subprocess"),
             ),
-        ) as run:
+        ):
             result = maintenance.run_backup(
                 self.root / "runtime" / "platform",
                 keep=14,
@@ -781,17 +788,25 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 rotate_existing=False,
             )
 
-        self.assertEqual(run.call_count, 4)
-        backup_script = str(REPO_ROOT / "platform" / "tools" / "platform_backup_restore_drill.py")
-        for call in run.call_args_list:
-            self.assertEqual(call.args[0][:3], [sys.executable, "-B", backup_script])
-        self.assertIn("--keep", run.call_args_list[0].args[0])
-        self.assertIn("14", run.call_args_list[0].args[0])
-        self.assertIn("--rotate-existing", run.call_args_list[0].args[0])
-        self.assertIn("--check-latest", run.call_args_list[1].args[0])
-        self.assertIn("24.0", run.call_args_list[1].args[0])
-        self.assertIn("--preserve-existing", run.call_args_list[2].args[0])
-        self.assertNotIn("--rotate-existing", run.call_args_list[2].args[0])
+        self.assertEqual(create_backup.call_count, 2)
+        self.assertEqual(check_latest.call_count, 2)
+        create_args = create_backup.call_args_list[0].args[0]
+        self.assertEqual(
+            create_args.env_file,
+            self.root / "runtime" / "platform" / "shared" / ".env.platform",
+        )
+        self.assertEqual(
+            create_args.output_dir,
+            self.root / "runtime" / "platform" / "shared" / "backups",
+        )
+        self.assertEqual(create_args.keep, 14)
+        self.assertIs(create_args.dump_only, False)
+        self.assertIs(create_args.rotate_existing, True)
+        self.assertIs(create_args.private_scratch_diagnostics, False)
+        self.assertEqual(check_latest.call_args_list[0].args[0], create_args.output_dir)
+        self.assertEqual(check_latest.call_args_list[0].kwargs, {"max_age_hours": 24.0})
+        preserve_args = create_backup.call_args_list[1].args[0]
+        self.assertIs(preserve_args.rotate_existing, False)
         self.assertTrue(result["restore_verified"])
         self.assertTrue(result["alembic_revision_verified"])
         self.assertTrue(result["checksum_present"])
@@ -801,22 +816,105 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(preserved_result["preexisting_archive_count"], 9)
         self.assertEqual(preserved_result["postexisting_archive_count"], 10)
 
-        with mock.patch.object(
-            maintenance.subprocess,
-            "run",
-            side_effect=(
-                subprocess.CompletedProcess([], 0, json.dumps(create_result), ""),
-                subprocess.CompletedProcess([], 0, json.dumps(check_result), ""),
+        with (
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "create_backup",
+                return_value=create_result,
+            ) as private_create,
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "check_latest_backup",
+                return_value=check_result,
             ),
-        ) as private_run:
+            mock.patch.object(
+                maintenance.subprocess,
+                "run",
+                side_effect=AssertionError("run_backup must not start a helper subprocess"),
+            ),
+        ):
             maintenance.run_backup(
                 self.root / "runtime" / "platform",
                 keep=14,
                 private_failure_diagnostics=True,
             )
-        self.assertIn("--private-scratch-diagnostics", private_run.call_args_list[0].args[0])
-        self.assertNotIn("--private-scratch-diagnostics", private_run.call_args_list[1].args[0])
+        private_args = private_create.call_args.args[0]
+        self.assertIs(private_args.private_scratch_diagnostics, True)
+        self.assertIs(private_args.rotate_existing, True)
 
+        admission_diagnostic = {
+            "schema": 1,
+            "phase": "pre_create_admission",
+            "guard_reason": "memory_reserve",
+            "available_bytes": 988_966_912,
+            "required_bytes": 1_073_741_824,
+            "helper_rss_bytes": 27_893_760,
+            "direct_parent_rss_bytes": 41_349_120,
+            "observed_pair_rss_bytes": 69_242_880,
+            "observed_process_count": 2,
+        }
+        create_failure = RuntimeError("scratch admission failed")
+        create_failure.scratch_admission_diagnostic = admission_diagnostic
+        create_failure.scratch_unit_private_output = (b"worker stdout", b"worker stderr")
+        not_checked_after_failure = mock.Mock()
+        public_stderr = io.StringIO()
+        signal_scope = mock.MagicMock()
+        with (
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "create_backup",
+                side_effect=create_failure,
+            ),
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "check_latest_backup",
+                not_checked_after_failure,
+            ),
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "_termination_signal_scope",
+                return_value=signal_scope,
+            ) as termination_scope,
+            mock.patch.object(maintenance.sys, "stderr", public_stderr),
+        ):
+            with self.assertRaises(maintenance.BackupCommandFailure) as public_error:
+                maintenance.run_backup(self.root / "runtime" / "platform", keep=14)
+        termination_scope.assert_called_once_with()
+        signal_scope.__enter__.assert_called_once_with()
+        signal_scope.__exit__.assert_called_once()
+        not_checked_after_failure.assert_not_called()
+        self.assertIsNone(public_error.exception.scratch_admission_diagnostic)
+        self.assertEqual(public_stderr.getvalue(), "")
+
+        private_stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "create_backup",
+                side_effect=create_failure,
+            ),
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "check_latest_backup",
+                not_checked_after_failure,
+            ),
+            mock.patch.object(maintenance.sys, "stderr", private_stderr),
+        ):
+            with self.assertRaises(maintenance.BackupCommandFailure) as private_error:
+                maintenance.run_backup(
+                    self.root / "runtime" / "platform",
+                    keep=14,
+                    private_failure_diagnostics=True,
+                )
+        not_checked_after_failure.assert_not_called()
+        self.assertEqual(
+            private_error.exception.scratch_admission_diagnostic, admission_diagnostic
+        )
+        self.assertIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", private_stderr.getvalue())
+        self.assertIn("scratch admission failed", private_stderr.getvalue())
+        self.assertNotIn("worker stderr", private_stderr.getvalue())
+
+        backup_script = str(REPO_ROOT / "platform" / "tools" / "platform_backup_restore_drill.py")
         with mock.patch.object(
             maintenance.subprocess,
             "run",
