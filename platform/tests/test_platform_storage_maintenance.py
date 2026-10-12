@@ -3157,7 +3157,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 {
                     "schema", "event", "run_id", "attempt", "operation", "source_sha",
                     "bundle_sha256", "stage", "public_summary_error", "exit_code", "report_state",
-                    "report_error_class", "restore_diagnostic", "report_bytes",
+                    "report_error_class", "restore_diagnostic", "scratch_unit_diagnostic", "report_bytes",
                     "backup_disk_diagnostic",
                     "report_sha256", "stderr_state",
                     "stderr_exception_class", "stderr_bytes", "stderr_sha256",
@@ -3168,6 +3168,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(receipt["public_summary_error"], "none")
             self.assertEqual(receipt["exit_code"], completed.returncode)
             self.assertEqual(receipt["report_error_class"], "none")
+            self.assertIsNone(receipt["scratch_unit_diagnostic"])
             self.assertEqual(receipt["stderr_exception_class"], "none")
             self.assertNotIn("Current release symlink is missing", receipt_path.read_text())
             self.assertFalse(report_path.exists())
@@ -3202,6 +3203,21 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "guard_reason": "disk_floor",
                             "free_bytes": 10,
                             "required_free_bytes": 20,
+                        },
+                        "scratch_unit_diagnostic": {
+                            "schema": 1,
+                            "phase": "unit_exited_before_confinement",
+                            "active_state": "failed",
+                            "sub_state": "failed",
+                            "result": "exit-code",
+                            "exec_main_status": 1,
+                            "launcher_exit_status": 1,
+                            "stdout_bytes": 2048,
+                            "stdout_sha256": "a" * 64,
+                            "stdout_truncated": False,
+                            "stderr_bytes": 32768,
+                            "stderr_sha256": "b" * 64,
+                            "stderr_truncated": False,
                         },
                     }
                 ),
@@ -3257,10 +3273,29 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "required_free_bytes": 20,
                 },
             )
+            self.assertEqual(
+                typed_receipt["scratch_unit_diagnostic"],
+                {
+                    "schema": 1,
+                    "phase": "unit_exited_before_confinement",
+                    "active_state": "failed",
+                    "sub_state": "failed",
+                    "result": "exit-code",
+                    "exec_main_status": 1,
+                    "launcher_exit_status": 1,
+                    "stdout_bytes": 2048,
+                    "stdout_sha256": "a" * 64,
+                    "stdout_truncated": False,
+                    "stderr_bytes": 32768,
+                    "stderr_sha256": "b" * 64,
+                    "stderr_truncated": False,
+                },
+            )
             self.assertNotIn(
                 "fixture-private detail",
                 typed_receipt_path.read_text(encoding="ascii"),
             )
+            self.assertNotIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", typed_receipt_path.read_text(encoding="ascii"))
             self.assertFalse(typed_report.exists())
 
             typed_report.write_text(
@@ -3288,6 +3323,21 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "free_bytes": 10,
                             "required_free_bytes": 20,
                             "unexpected": "must not be retained",
+                        },
+                        "scratch_unit_diagnostic": {
+                            "schema": 1,
+                            "phase": "unit_exited_before_confinement",
+                            "active_state": ["failed"],
+                            "sub_state": "failed",
+                            "result": "exit-code",
+                            "exec_main_status": 1,
+                            "launcher_exit_status": 1,
+                            "stdout_bytes": 32,
+                            "stdout_sha256": "a" * 64,
+                            "stdout_truncated": False,
+                            "stderr_bytes": 128,
+                            "stderr_sha256": "b" * 64,
+                            "stderr_truncated": False,
                         },
                     }
                 ),
@@ -3321,7 +3371,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             uncertain_receipt = json.loads(
                 uncertain_receipt_path.read_text(encoding="ascii")
             )
-            self.assertEqual(uncertain_receipt["report_state"], "typed_failure")
+            self.assertEqual(uncertain_receipt["report_state"], "unclassified_json")
             self.assertIsNone(
                 uncertain_receipt["restore_diagnostic"]["temporary_database_created"]
             )
@@ -3330,7 +3380,60 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "create_database",
             )
             self.assertIsNone(uncertain_receipt["backup_disk_diagnostic"])
+            self.assertIsNone(uncertain_receipt["scratch_unit_diagnostic"])
+            self.assertEqual(uncertain_receipt["report_state"], "unclassified_json")
             self.assertFalse(typed_report.exists())
+
+            overflow_report = test_root / "overflow-report.json"
+            overflow_report.write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status": "failed",
+                        "error_class": "backup",
+                        "scratch_unit_diagnostic": {
+                            "schema": 1,
+                            "phase": "unit_exited_before_confinement",
+                            "active_state": "failed",
+                            "sub_state": "failed",
+                            "result": "exit-code",
+                            "exec_main_status": 1,
+                            "launcher_exit_status": 1,
+                            "stdout_bytes": 2049,
+                            "stdout_sha256": "a" * 64,
+                            "stdout_truncated": True,
+                            "stderr_bytes": 32768,
+                            "stderr_sha256": "b" * 64,
+                            "stderr_truncated": False,
+                        },
+                    }
+                ),
+                encoding="ascii",
+            )
+            overflow_report.chmod(0o600)
+            overflow_script = remote_script.replace(
+                f"runtime={runtime}", f"runtime={typed_runtime}"
+            ).replace(
+                f'backup_report_file="$(mktemp {report_path}.XXXXXX)"',
+                f'backup_report_file="{overflow_report}"',
+            )
+            overflow_completed = subprocess.run(
+                [
+                    "bash", "-s", "--", "123459", "1", "create", "a" * 40,
+                    "b" * 64, "false", "false", "false", "none", "none", "none",
+                ],
+                input=overflow_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(overflow_completed.returncode, 0)
+            overflow_receipt = json.loads(
+                (typed_shared / "backup-failure-123459-1.json").read_text(encoding="ascii")
+            )
+            self.assertEqual(overflow_receipt["report_state"], "unclassified_json")
+            self.assertIsNone(overflow_receipt["scratch_unit_diagnostic"])
+            self.assertFalse(overflow_report.exists())
 
             trap_start = remote_script.index(
                 "import hashlib\n", remote_script.index("backup_failure_marker() {")

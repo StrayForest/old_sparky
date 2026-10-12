@@ -153,6 +153,14 @@ public artifact. No backup-only branch rotates or removes existing archives.
 Full storage maintenance owns the separate archive-rotation path and applies
 its configured keep count only after a successful restore drill.
 
+When the source-bound scratch restore service exits before its confinement can
+be verified, the explicit private-diagnostics path records only a closed unit
+phase/state/result/status summary and bounded stream byte counts and hashes in
+the private report. Bounded launcher output is retained with the run-bound
+private failure capture so the exact startup failure can be diagnosed; it is
+never copied into the shared marker or public workflow artifact. Invalid or
+oversized diagnostic data fails closed and cannot make a failed restore pass.
+
 ### Re-verify the newest existing backup
 
 When the newest archive is present but its restore verification is missing or
