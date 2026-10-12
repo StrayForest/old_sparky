@@ -83,6 +83,78 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "process identity is malformed"):
                         self._original_proc_start_time("123")
 
+    def test_scratch_postgres_directory_setup_without_cap_fowner(self) -> None:
+        self.assertEqual(os.geteuid(), 0)
+        setpriv = shutil.which("setpriv")
+        self.assertIsNotNone(setpriv)
+        postgres = backup_drill.pwd.getpwnam("postgres")
+        with tempfile.TemporaryDirectory(prefix="backup-scratch-mode-") as temporary_dir:
+            scratch_root = pathlib.Path(temporary_dir) / "scratch"
+            scratch_root.mkdir(mode=0o700)
+            setup_prefix = "\n".join(
+                (
+                    "import importlib.util, json, os, pathlib, sys",
+                    "source, root, uid, gid = sys.argv[1:]",
+                    "uid, gid = int(uid), int(gid)",
+                    "status = pathlib.Path('/proc/self/status').read_text()",
+                    "effective = int(next(line.split()[1] for line in status.splitlines() if line.startswith('CapEff:')), 16)",
+                    "assert effective == 0xC3, 'worker capability set differs from the reviewed four-capability boundary'",
+                    "root = pathlib.Path(root)",
+                    "os.chown(root, uid, gid)",
+                )
+            )
+            old_order_script = setup_prefix + "\n" + "\n".join(
+                (
+                    "data = root / 'data'",
+                    "data.mkdir(mode=0o700)",
+                    "os.chown(data, uid, gid)",
+                    "try:",
+                    "    os.chmod(data, 0o700)",
+                    "except OSError as exc:",
+                    "    print(json.dumps({'stage': 'chmod', 'errno': exc.errno}))",
+                    "else:",
+                    "    raise AssertionError('old chown-before-chmod order unexpectedly passed')",
+                )
+            )
+            old_order = subprocess.run(
+                [str(setpriv), "--bounding-set=-all,+chown,+setuid,+setgid,+dac_override", "--", sys.executable,
+                 "-c", old_order_script, str(SCRIPT_PATH), str(scratch_root),
+                 str(postgres.pw_uid), str(postgres.pw_gid)],
+                check=False, capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(old_order.returncode, 0, old_order.stderr)
+            self.assertEqual(
+                json.loads(old_order.stdout),
+                {"stage": "chmod", "errno": 1},
+            )
+
+            scratch_root = pathlib.Path(temporary_dir) / "scratch-fixed"
+            scratch_root.mkdir(mode=0o700)
+            fixed_order_script = setup_prefix + "\n" + "\n".join(
+                (
+                    "spec = importlib.util.spec_from_file_location('backup_drill', source)",
+                    "module = importlib.util.module_from_spec(spec)",
+                    "sys.modules[spec.name] = module",
+                    "spec.loader.exec_module(module)",
+                    "for name in ('data', 'socket'):",
+                    "    module._scratch_prepare_postgres_directory(root / name, uid=uid, gid=gid)",
+                )
+            )
+            fixed_order = subprocess.run(
+                [str(setpriv), "--bounding-set=-all,+chown,+setuid,+setgid,+dac_override", "--", sys.executable,
+                 "-c", fixed_order_script, str(SCRIPT_PATH), str(scratch_root),
+                 str(postgres.pw_uid), str(postgres.pw_gid)],
+                check=False, capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(fixed_order.returncode, 0, fixed_order.stderr)
+            for name in ("data", "socket"):
+                target = scratch_root / name
+                target_stat = target.stat()
+                with self.subTest(path=name):
+                    self.assertEqual(target_stat.st_uid, postgres.pw_uid)
+                    self.assertEqual(target_stat.st_gid, postgres.pw_gid)
+                    self.assertEqual(target_stat.st_mode & 0o777, 0o700)
+
     @staticmethod
     def _write_backup_pair(
         output_dir: pathlib.Path,

@@ -2167,6 +2167,15 @@ def _scratch_mem_available_bytes() -> int:
     raise RuntimeError("Host memory availability could not be verified.")
 
 
+def _scratch_prepare_postgres_directory(
+    path: pathlib.Path, *, uid: int, gid: int
+) -> None:
+    """Create and fix mode before handing the directory to PostgreSQL."""
+    path.mkdir(mode=0o700)
+    os.chmod(path, 0o700)
+    os.chown(path, uid, gid)
+
+
 def _scratch_proc_status_sample(pid: int) -> tuple[int, int, int] | None:
     """Return (pid, ppid, VmRSS bytes) for a bounded, stable root process sample."""
     if type(pid) is not int or pid <= 1:
@@ -2459,11 +2468,10 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     pgdata = root / "data"
     socket_dir = root / "socket"
     pglog = root / "postgres.log"
-    pgdata.mkdir(mode=0o700)
-    socket_dir.mkdir(mode=0o700)
     for path in (pgdata, socket_dir):
-        os.chown(path, postgres.pw_uid, postgres.pw_gid)
-        os.chmod(path, 0o700)
+        _scratch_prepare_postgres_directory(
+            path, uid=postgres.pw_uid, gid=postgres.pw_gid
+        )
 
     def as_postgres(command: list[str], *, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
         return run_command(

@@ -465,6 +465,11 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
     (
         "test_platform_backup_restore_drill",
         "PlatformBackupRestoreDrillTests",
+        "test_scratch_postgres_directory_setup_without_cap_fowner",
+    ): "backend-privileged",
+    (
+        "test_platform_backup_restore_drill",
+        "PlatformBackupRestoreDrillTests",
         "test_isolated_restore_signal_cleanup_under_root",
     ): "backend-privileged",
     (
@@ -480,10 +485,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 166,
     "module_digest": "d95f05e241ec8dc79d681f306e40207e11bccc4c6f354384703879335ccf1967",
-    "test_count": 1879,
-    "test_id_digest": "9ece8e4b3329d264fd18364f0d1718c05b0485927c25042351bf97bd67739677",
-    "backend_test_count": 1807,
-    "backend_test_id_digest": "ccab2d6afef75aa5316238e2ccc0ed7946a19b94433628a27319f36ebf773209",
+    "test_count": 1880,
+    "test_id_digest": "ba3997b219c989a3def2ce80f9bb3264b6de87a3195b1f9b0fb150253989bcbf",
+    "backend_test_count": 1808,
+    "backend_test_id_digest": "55bdaf8fcf69f7fdef05426d9d83654000598462f3b3f686bfb7f57092d854e5",
     "verification_test_count": 72,
     "verification_test_id_digest": "3c52523e15a19be1b10831e2a505af8e7a711e7b9d667246e1198598c947a7c0",
     "verification_classifier_test_count": 38,
@@ -524,8 +529,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 26,
         "module_digest": "210efce670a082b8360377da86457b71db79310b02abffc0d3849445b073748a",
-        "test_count": 592,
-        "test_id_digest": "511f1a2f3547880dea691c0c2bb43031d5791e694be0f63d74c69214d53b8dc3",
+        "test_count": 593,
+        "test_id_digest": "a1c8e93402e402268b3f2f517239253bca63a9f7d76b99b2faf3652e53160ca3",
     },
     "performance-contract": {
         "module_count": 11,

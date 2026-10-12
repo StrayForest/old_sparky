@@ -69,6 +69,10 @@ launcher exit fails closed. If
 confinement verification fails after the unit starts, the private diagnostic
 records only closed error and errno fields plus bounded output hashes; raw
 launcher output stays in the root-only workflow capture.
+The worker creates each PostgreSQL data/socket directory, fixes its `0700`
+mode while it still owns the path, then transfers ownership to PostgreSQL.
+This keeps the unit's narrow capability set and avoids requiring
+`CAP_FOWNER` after ownership changes.
 The worker waits on its stdin pipe before inspecting the scratch mount, archive,
 resource state or PostgreSQL. The parent releases the fixed `START` token only
 after two consecutive checks bind the same active unit invocation, PID, process
