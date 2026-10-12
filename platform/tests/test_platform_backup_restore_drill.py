@@ -32,6 +32,22 @@ sys.modules[SPEC.name] = backup_drill
 SPEC.loader.exec_module(backup_drill)
 
 
+class StagedWorkerInput:
+    """Expose START first and DONE only after the worker emits its candidate."""
+
+    def __init__(self) -> None:
+        self._reads = [backup_drill.SCRATCH_START_TOKEN, backup_drill.SCRATCH_DONE_TOKEN]
+
+    def read(self, size: int = -1) -> bytes:
+        if not self._reads:
+            return b""
+        value = self._reads.pop(0)
+        if size >= 0 and len(value) > size:
+            self._reads.insert(0, value[size:])
+            return value[:size]
+        return value
+
+
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def setUp(self) -> None:
         self._proc_start_time_patch = mock.patch.object(
@@ -860,7 +876,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
                 authorize.assert_not_called()
                 self.assertEqual(expected_properties.call_count, 1)
-                self.assertEqual(launched[0].stdout.read(), b"")
+                captured_stdout, _captured_stderr = failure.exception.scratch_unit_private_output
+                self.assertEqual(captured_stdout, b"")
                 diagnostic = failure.exception.scratch_unit_diagnostic
                 self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(diagnostic))
                 self.assertEqual(diagnostic["phase"], "confinement_verification_failed")
@@ -1090,29 +1107,157 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             stderr_reader.close()
 
     def _assert_worker_authorization_barrier(self) -> None:
-        args = argparse.Namespace(
-            _scratch_root="/run/oldsparky-backup-restore-0123456789abcdef01234567",
-        )
-        for payload in (
-            b"",
-            backup_drill.SCRATCH_START_TOKEN[:-1],
-            backup_drill.SCRATCH_START_TOKEN + b"x",
-        ):
-            with (
-                mock.patch.object(
-                    backup_drill.sys,
-                    "stdin",
-                    types.SimpleNamespace(buffer=io.BytesIO(payload)),
-                ),
-                mock.patch.object(backup_drill, "_scratch_mount_snapshot") as mount_snapshot,
-                mock.patch.object(backup_drill, "_open_verified_scratch_archive") as open_archive,
-                mock.patch.object(backup_drill, "run_command") as run_command,
+        scratch_root = pathlib.Path("/run") / f"oldsparky-backup-restore-{uuid.uuid4().hex[:24]}"
+        scratch_root.mkdir(mode=0o700)
+        args = argparse.Namespace(_scratch_root=str(scratch_root))
+        try:
+            for payload in (
+                b"",
+                backup_drill.SCRATCH_START_TOKEN[:-1],
+                backup_drill.SCRATCH_START_TOKEN,
+                backup_drill.SCRATCH_START_TOKEN + b"x",
             ):
-                with self.assertRaisesRegex(RuntimeError, "authorization was not received"):
-                    backup_drill._scratch_worker_main(args)
-            mount_snapshot.assert_not_called()
-            open_archive.assert_not_called()
-            run_command.assert_not_called()
+                read_fd, write_fd = os.pipe()
+                try:
+                    if payload:
+                        os.write(write_fd, payload)
+                    os.close(write_fd)
+                    stdin_stream = types.SimpleNamespace(
+                        fileno=lambda: read_fd,
+                        buffer=io.BytesIO(payload),
+                    )
+                    with (
+                        mock.patch.dict(backup_drill.os.environ, {"PG_START_BARRIER_SENTINEL": "preserve"}),
+                        mock.patch.object(backup_drill.sys, "stdin", stdin_stream),
+                        mock.patch.object(backup_drill, "_scratch_mount_snapshot") as mount_snapshot,
+                        mock.patch.object(backup_drill, "_scratch_cgroup_snapshot") as cgroup_snapshot,
+                        mock.patch.object(backup_drill, "_scratch_mem_available_bytes") as memory_snapshot,
+                        mock.patch.object(backup_drill, "_open_verified_scratch_archive") as open_archive,
+                        mock.patch.object(backup_drill, "_scratch_create_application_role") as create_role,
+                        mock.patch.object(backup_drill, "run_command") as run_command,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "authorization was not received"):
+                            backup_drill._scratch_worker_main(args)
+                        self.assertEqual(os.environ.get("PG_START_BARRIER_SENTINEL"), "preserve")
+                    mount_snapshot.assert_not_called()
+                    cgroup_snapshot.assert_not_called()
+                    memory_snapshot.assert_not_called()
+                    open_archive.assert_not_called()
+                    create_role.assert_not_called()
+                    run_command.assert_not_called()
+                finally:
+                    os.close(read_fd)
+        finally:
+            scratch_root.rmdir()
+
+    def _assert_worker_token_raw_pipe_framing(self) -> None:
+        cases = (
+            (backup_drill.SCRATCH_START_TOKEN, False, True),
+            (b"wrong", False, False),
+            (b"X" * len(backup_drill.SCRATCH_START_TOKEN), False, False),
+            (backup_drill.SCRATCH_START_TOKEN[:-1], False, False),
+            (backup_drill.SCRATCH_START_TOKEN + b"x", False, False),
+            (backup_drill.SCRATCH_DONE_TOKEN, True, True),
+            (b"", True, False),
+            (b"wrong", True, False),
+            (b"X" * len(backup_drill.SCRATCH_DONE_TOKEN), True, False),
+            (backup_drill.SCRATCH_DONE_TOKEN + b"x", True, False),
+            (backup_drill.SCRATCH_DONE_TOKEN[:-1], True, False),
+        )
+        for payload, require_eof, succeeds in cases:
+            with self.subTest(require_eof=require_eof, payload_suffix=payload[-3:]):
+                read_fd, write_fd = os.pipe()
+                reader = os.fdopen(read_fd, "rb", buffering=0)
+                try:
+                    os.write(write_fd, payload)
+                    if require_eof or not succeeds:
+                        os.close(write_fd)
+                        write_fd = -1
+                    expected = (
+                        backup_drill.SCRATCH_DONE_TOKEN
+                        if require_eof
+                        else backup_drill.SCRATCH_START_TOKEN
+                    )
+                    if succeeds:
+                        self.assertEqual(
+                            backup_drill._scratch_read_worker_token(
+                                reader,
+                                expected,
+                                require_eof=require_eof,
+                                deadline=time.monotonic() + (
+                                    backup_drill.SCRATCH_RUNTIME_SECONDS
+                                    if require_eof
+                                    else backup_drill.SCRATCH_STARTUP_SECONDS
+                                ),
+                            ),
+                            expected,
+                        )
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "authorization|completion"):
+                            backup_drill._scratch_read_worker_token(
+                                reader,
+                                expected,
+                                require_eof=require_eof,
+                                deadline=time.monotonic() + (
+                                    backup_drill.SCRATCH_RUNTIME_SECONDS
+                                    if require_eof
+                                    else backup_drill.SCRATCH_STARTUP_SECONDS
+                                ),
+                            )
+                    self.assertTrue(os.get_blocking(reader.fileno()))
+                finally:
+                    reader.close()
+                    if write_fd >= 0:
+                        os.close(write_fd)
+
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "rb", buffering=0)
+        try:
+            os.write(write_fd, backup_drill.SCRATCH_START_TOKEN)
+            os.close(write_fd)
+            with self.assertRaisesRegex(RuntimeError, "authorization was not received"):
+                backup_drill._scratch_read_worker_token(
+                    reader,
+                    backup_drill.SCRATCH_START_TOKEN,
+                    require_eof=False,
+                    deadline=time.monotonic() + backup_drill.SCRATCH_STARTUP_SECONDS,
+                )
+        finally:
+            reader.close()
+
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "rb", buffering=0)
+        try:
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_STARTUP_SECONDS", 0.02),
+                self.assertRaisesRegex(RuntimeError, "authorization was not received"),
+            ):
+                backup_drill._scratch_read_worker_token(
+                    reader,
+                    backup_drill.SCRATCH_START_TOKEN,
+                    require_eof=False,
+                    deadline=time.monotonic() + backup_drill.SCRATCH_STARTUP_SECONDS,
+                )
+        finally:
+            reader.close()
+            os.close(write_fd)
+
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "rb", buffering=0)
+        try:
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_RUNTIME_SECONDS", 0.02),
+                self.assertRaisesRegex(RuntimeError, "completion was not acknowledged"),
+            ):
+                backup_drill._scratch_read_worker_token(
+                    reader,
+                    backup_drill.SCRATCH_DONE_TOKEN,
+                    require_eof=True,
+                    deadline=time.monotonic() + backup_drill.SCRATCH_RUNTIME_SECONDS,
+                )
+        finally:
+            reader.close()
+            os.close(write_fd)
 
     def _assert_scratch_worker_forwards_output_only_when_private(self) -> None:
         class BinaryTextCapture:
@@ -1185,7 +1330,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     mock.patch.object(
                         backup_drill.sys,
                         "stdin",
-                        types.SimpleNamespace(buffer=io.BytesIO(backup_drill.SCRATCH_START_TOKEN + backup_drill.SCRATCH_DONE_TOKEN)),
+                        types.SimpleNamespace(buffer=StagedWorkerInput()),
                     ),
                     mock.patch.object(backup_drill.sys, "stdout", stdout_capture),
                     mock.patch.object(backup_drill.sys, "stderr", stderr_capture),
@@ -1833,6 +1978,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._assert_collected_unit_without_properties_preserves_output()
         self._assert_scratch_worker_forwards_output_only_when_private()
         self._assert_worker_authorization_barrier()
+        self._assert_worker_token_raw_pipe_framing()
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             scratch_root = pathlib.Path(temporary_dir) / "scratch"
@@ -1937,7 +2083,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(
                     backup_drill.sys,
                     "stdin",
-                    types.SimpleNamespace(buffer=io.BytesIO(backup_drill.SCRATCH_START_TOKEN + backup_drill.SCRATCH_DONE_TOKEN)),
+                    types.SimpleNamespace(buffer=StagedWorkerInput()),
                 ),
                 mock.patch.object(backup_drill.sys, "stdout", stdout),
             ):

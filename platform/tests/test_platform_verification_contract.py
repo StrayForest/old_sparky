@@ -1220,6 +1220,50 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertIn("image: redis:7", privileged_job.group("body"))
         self.assertIn("- 6379:6379", privileged_job.group("body"))
         self.assertIn('--health-cmd="redis-cli ping"', privileged_job.group("body"))
+        privileged_body = privileged_job.group("body")
+        diagnostic_start = privileged_body.index(
+            "Run focused scratch restore diagnostic without gate credit"
+        )
+        diagnostic_upload = privileged_body.index("Upload focused scratch restore diagnostic")
+        full_contour = privileged_body.index("Run serial privileged catalog contour exactly once as root")
+        diagnostic_finalizer = privileged_body.index(
+            "Require focused scratch restore diagnostic success"
+        )
+        upload_start = diagnostic_upload
+        upload_end = full_contour
+        finalizer_start = diagnostic_finalizer
+        self.assertLess(diagnostic_start, diagnostic_upload)
+        self.assertLess(diagnostic_upload, full_contour)
+        self.assertLess(full_contour, diagnostic_finalizer)
+        self.assertRegex(
+            privileged_body[diagnostic_start:diagnostic_upload],
+            r"(?m)^\s+continue-on-error: true$",
+        )
+        self.assertIn("--contour backend-privileged", privileged_body)
+        self.assertIn(
+            "test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_isolated_restore_signal_cleanup_under_root",
+            privileged_body,
+        )
+        self.assertIn("focused_exit=%s", privileged_body)
+        self.assertIn("(no gate credit)", privileged_body)
+        self.assertIn("platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}", privileged_body)
+        self.assertIn("steps.scratch_restore_diagnostic.outcome", privileged_body)
+        self.assertIn("steps.scratch_diagnostic_upload.outcome", privileged_body)
+        self.assertIn("this job cannot pass", privileged_body)
+        diagnostic_script = privileged_body[diagnostic_start:diagnostic_upload]
+        upload_contract = privileged_body[upload_start:upload_end]
+        finalizer_contract = privileged_body[finalizer_start:]
+        self.assertIn("source_sha=%s\\nrun_id=%s\\nrun_attempt=%s", diagnostic_script)
+        self.assertIn('"$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"', diagnostic_script)
+        self.assertIn("umask 077", diagnostic_script)
+        self.assertIn("chmod 600", diagnostic_script)
+        self.assertIn("if: ${{ always() }}", upload_contract)
+        self.assertIn("continue-on-error: true", upload_contract)
+        self.assertIn("retention-days: 14", upload_contract)
+        self.assertIn("if: ${{ always() }}", finalizer_contract)
+        self.assertIn("SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME", finalizer_contract)
+        self.assertIn('"$SCRATCH_DIAGNOSTIC_OUTCOME" != "success"', finalizer_contract)
+        self.assertIn('"$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success"', finalizer_contract)
         safe_environment = {
             "PLATFORM_ENVIRONMENT": "test",
             "PLATFORM_DB_SCHEMA": "platform",

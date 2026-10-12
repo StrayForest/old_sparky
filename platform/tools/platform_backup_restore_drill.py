@@ -2325,9 +2325,110 @@ def _open_verified_scratch_archive(args: argparse.Namespace) -> BinaryIO:
         raise
 
 
-def _scratch_worker_main(args: argparse.Namespace) -> int:
+def _scratch_read_worker_token(
+    stream: Any,
+    expected: bytes,
+    *,
+    require_eof: bool,
+    deadline: float,
+) -> bytes:
+    """Read one framed worker token without buffering bytes from the next phase."""
+    failure_message = (
+        "Scratch restore completion was not acknowledged."
+        if require_eof
+        else "Scratch restore authorization was not received."
+    )
     try:
-        authorization = sys.stdin.buffer.read(len(SCRATCH_START_TOKEN))
+        raw_fd = stream.fileno()
+    except (AttributeError, OSError):
+        # In-memory streams are used by contract tests; production stdin is a pipe.
+        try:
+            value = stream.buffer.read(len(expected) + 1)
+            if value == expected and require_eof:
+                value += stream.buffer.read(1)
+        except (AttributeError, OSError) as exc:
+            raise RuntimeError(failure_message) from exc
+        if value != expected or time.monotonic() >= deadline:
+            raise RuntimeError(failure_message)
+        return expected
+
+    was_blocking: bool | None = None
+    selector: selectors.BaseSelector | None = None
+    try:
+        was_blocking = os.get_blocking(raw_fd)
+        os.set_blocking(raw_fd, False)
+        selector = selectors.DefaultSelector()
+        selector.register(raw_fd, selectors.EVENT_READ)
+        received = bytearray()
+        while len(received) < len(expected):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise RuntimeError(failure_message)
+            try:
+                chunk = os.read(
+                    raw_fd,
+                    min(len(expected) - len(received), len(expected) + 1 - len(received)),
+                )
+            except BlockingIOError:
+                continue
+            if not chunk:
+                raise RuntimeError(failure_message)
+            received.extend(chunk)
+            if not expected.startswith(received):
+                raise RuntimeError(failure_message)
+
+        # Before DONE, EOF is invalid because the parent must keep the pipe open
+        # until the candidate result has been checked. After DONE, EOF is the
+        # framing terminator because the parent closes stdin with that token.
+        if time.monotonic() >= deadline:
+            raise RuntimeError(failure_message)
+        if require_eof:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise RuntimeError("Scratch restore completion was not acknowledged.")
+                try:
+                    probe = os.read(raw_fd, 1)
+                except BlockingIOError:
+                    continue
+                if probe:
+                    raise RuntimeError("Scratch restore completion was not acknowledged.")
+                break
+        elif selector.select(0):
+            try:
+                probe = os.read(raw_fd, 1)
+            except BlockingIOError:
+                probe = None
+            if probe is not None:
+                raise RuntimeError(failure_message)
+        if time.monotonic() >= deadline:
+            raise RuntimeError(failure_message)
+        return bytes(received)
+    except OSError as exc:
+        raise RuntimeError(failure_message) from exc
+    finally:
+        if selector is not None:
+            selector.close()
+        if was_blocking is not None:
+            try:
+                os.set_blocking(raw_fd, was_blocking)
+            except OSError:
+                pass
+
+
+def _scratch_worker_main(args: argparse.Namespace) -> int:
+    worker_deadline = time.monotonic() + SCRATCH_RUNTIME_SECONDS
+    startup_deadline = min(
+        worker_deadline,
+        time.monotonic() + SCRATCH_STARTUP_SECONDS,
+    )
+    try:
+        authorization = _scratch_read_worker_token(
+            sys.stdin,
+            SCRATCH_START_TOKEN,
+            require_eof=False,
+            deadline=startup_deadline,
+        )
     except (OSError, AttributeError) as exc:
         raise RuntimeError("Scratch restore authorization was not received.") from exc
     if authorization != SCRATCH_START_TOKEN:
@@ -2542,7 +2643,12 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     )
     result_stream.flush()
     try:
-        completion = sys.stdin.buffer.read(len(SCRATCH_DONE_TOKEN))
+        completion = _scratch_read_worker_token(
+            sys.stdin,
+            SCRATCH_DONE_TOKEN,
+            require_eof=True,
+            deadline=worker_deadline,
+        )
     except (OSError, AttributeError) as exc:
         raise RuntimeError("Scratch restore completion was not acknowledged.") from exc
     if completion != SCRATCH_DONE_TOKEN:

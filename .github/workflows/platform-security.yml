@@ -706,6 +706,42 @@ jobs:
           sudo usermod -a -G oldsparky-media oldsparky-api
           sudo usermod -a -G oldsparky-media oldsparky-worker
           getent group oldsparky-media
+      - name: Run focused scratch restore diagnostic without gate credit
+        id: scratch_restore_diagnostic
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          umask 077
+          diagnostic="$RUNNER_TEMP/platform-backup-scratch-diagnostic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
+          if ! {
+            printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' \
+              "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          } > "$diagnostic"; then
+            echo "Unable to create the private scratch diagnostic log." >&2
+            exit 1
+          fi
+          if sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' && \
+            tools/platform_run_tests.sh --contour backend-privileged \
+            --focused test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_isolated_restore_signal_cleanup_under_root \
+            --quiet" >> "$diagnostic" 2>&1; then
+            result=0
+          else
+            result=$?
+          fi
+          printf 'focused_exit=%s\n' "$result" >> "$diagnostic"
+          chmod 600 "$diagnostic"
+          printf 'Focused scratch diagnostic exit=%s (no gate credit).\n' "$result"
+          exit "$result"
+      - name: Upload focused scratch restore diagnostic
+        id: scratch_diagnostic_upload
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}.log
+          if-no-files-found: error
+          retention-days: 14
       - name: Run serial privileged catalog contour exactly once as root
         run: >-
           sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
@@ -720,6 +756,17 @@ jobs:
           path: platform/ci-backend
           if-no-files-found: error
           retention-days: 14
+      - name: Require focused scratch restore diagnostic success
+        if: ${{ always() }}
+        env:
+          SCRATCH_DIAGNOSTIC_OUTCOME: ${{ steps.scratch_restore_diagnostic.outcome }}
+          SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME: ${{ steps.scratch_diagnostic_upload.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$SCRATCH_DIAGNOSTIC_OUTCOME" != "success" || "$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success" ]]; then
+            echo "Focused scratch restore diagnostic or artifact upload failed; full contour still ran, but this job cannot pass." >&2
+            exit 1
+          fi
 
   backend:
     name: Backend aggregate
