@@ -846,7 +846,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         return_value="/system.slice/scratch-identity-barrier.service",
                     ) as expected_properties,
                     mock.patch.object(backup_drill, "_scratch_control_group_snapshot", return_value={}),
-                    mock.patch.object(backup_drill, "_scratch_authorize_worker") as authorize,
+                    mock.patch.object(backup_drill, "_scratch_send_worker_token") as authorize,
                     mock.patch.object(backup_drill, "_scratch_stop_unit"),
                     mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
                     mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
