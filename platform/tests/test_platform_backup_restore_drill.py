@@ -239,6 +239,29 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ),
         )
 
+        # A collected transient unit can have no typed systemd properties.
+        # Its bounded output still travels only through the private frame.
+        private_failure.scratch_unit_diagnostic = None
+        missing_state_stdout = io.StringIO()
+        missing_state_stderr = io.StringIO()
+        with (
+            mock.patch.object(backup_drill, "parse_args", return_value=cli_args),
+            mock.patch.object(backup_drill, "create_backup", side_effect=private_failure),
+            mock.patch.object(backup_drill.sys, "stdout", missing_state_stdout),
+            mock.patch.object(backup_drill.sys, "stderr", missing_state_stderr),
+        ):
+            self.assertEqual(backup_drill.main(), 1)
+        missing_state_report = json.loads(missing_state_stdout.getvalue())
+        self.assertNotIn("scratch_unit_diagnostic", missing_state_report)
+        self.assertNotIn(stdout[:32].decode("ascii"), missing_state_stdout.getvalue())
+        self.assertEqual(
+            missing_state_stderr.getvalue().encode("ascii"),
+            backup_drill._scratch_private_output_envelope(
+                stdout[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES],
+                stderr[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES],
+            ),
+        )
+
         public_args = argparse.Namespace(**{**vars(cli_args), "private_scratch_diagnostics": False})
         public_stdout = io.StringIO()
         public_stderr = io.StringIO()
@@ -538,7 +561,105 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertTrue(diagnostic["stdout_truncated"])
             self.assertTrue(diagnostic["stderr_truncated"])
             self.assertTrue(unit_command.call_args.kwargs["private_scratch_diagnostics"])
-            self.assertFalse(pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists())
+            self.assertFalse(
+                pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists(),
+                str(unit_command.call_args.kwargs["mountpoint"]),
+            )
+
+    def _assert_collected_unit_without_properties_preserves_output(self) -> None:
+        class LauncherProcess:
+            def __init__(self, stdout, stderr) -> None:
+                self.stdout = stdout
+                self.stderr = stderr
+                self.returncode = None
+                self.wait_calls = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, *, timeout=None):
+                self.wait_calls += 1
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            archive_path.chmod(0o600)
+            stdout_payload = b"restore completed with failure"
+            stderr_payload = b"nested pg_restore failure detail"
+            stdout_read, stdout_write = os.pipe()
+            stderr_read, stderr_write = os.pipe()
+            for write_fd, payload in (
+                (stdout_write, stdout_payload),
+                (stderr_write, stderr_payload),
+            ):
+                os.write(write_fd, payload)
+                os.close(write_fd)
+            stdout_reader = os.fdopen(stdout_read, "rb", buffering=0)
+            stderr_reader = os.fdopen(stderr_read, "rb", buffering=0)
+            launcher = LauncherProcess(stdout_reader, stderr_reader)
+            command = ["systemd-run"]
+            unit_command = mock.Mock(return_value=command)
+            active = {
+                "properties": {
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "Result": "success",
+                    "ExecMainPID": "424242",
+                    "ExecMainStatus": "0",
+                    "ControlGroup": "/system.slice/scratch-collected.service",
+                }
+            }
+            collected = {"properties": {"LoadState": "not-found"}}
+            snapshots = [active, collected]
+
+            def snapshot(_unit_name: str) -> dict[str, object]:
+                value = snapshots.pop(0) if snapshots else collected
+                if value is active:
+                    # The launcher exits after the monitor has observed the
+                    # live unit, but before its final properties are read.
+                    launcher.returncode = 17
+                return value
+
+            with (
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill, "_scratch_host_guard"),
+                mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=snapshot),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_expected_properties",
+                    return_value="/system.slice/scratch-collected.service",
+                ),
+                mock.patch.object(backup_drill, "_scratch_control_group_snapshot", return_value={}),
+                mock.patch.object(backup_drill, "_scratch_stop_unit") as stop_unit,
+                mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
+                mock.patch.object(backup_drill.subprocess, "Popen", return_value=launcher),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "did not complete successfully"
+                ) as failure:
+                    backup_drill._run_isolated_restore_drill(
+                        archive_path,
+                        timestamp_slug="20261012T010208Z",
+                        private_scratch_diagnostics=True,
+                    )
+                self.assertIsNone(getattr(failure.exception, "scratch_unit_diagnostic", None))
+                self.assertEqual(
+                    failure.exception.scratch_unit_private_output,
+                    (stdout_payload, stderr_payload),
+                )
+                self.assertGreaterEqual(stop_unit.call_count, 1)
+                self.assertTrue(
+                    all(len(call.args) == 1 and call.args[0] for call in stop_unit.call_args_list)
+                )
+                self.assertGreater(launcher.wait_calls, 0)
+                self.assertEqual(launcher.returncode, 17)
+                self.assertFalse(pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists())
+            stdout_reader.close()
+            stderr_reader.close()
 
     def _assert_scratch_worker_forwards_output_only_when_private(self) -> None:
         class BinaryTextCapture:
@@ -1033,6 +1154,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._assert_scratch_fast_launcher_cannot_skip_active_confinement()
         self._assert_scratch_absent_unit_has_bounded_startup_deadline()
         self._assert_scratch_after_confinement_failure_preserves_output()
+        self._assert_collected_unit_without_properties_preserves_output()
         self._assert_scratch_worker_forwards_output_only_when_private()
 
         with tempfile.TemporaryDirectory() as temporary_dir:

@@ -2983,7 +2983,16 @@ def _run_isolated_restore_drill(
                 )
                 if diagnostic is not None:
                     setattr(operation_error, "scratch_unit_diagnostic", diagnostic)
-                    setattr(operation_error, "scratch_unit_private_output", (stdout_prefix, stderr_prefix))
+                # The transient unit may already have been collected when its
+                # final properties are queried. In that case the closed
+                # systemd summary is intentionally omitted, but bounded worker
+                # output still remains useful private failure evidence.
+                if diagnostic is not None or private_scratch_diagnostics:
+                    setattr(
+                        operation_error,
+                        "scratch_unit_private_output",
+                        (stdout_prefix, stderr_prefix),
+                    )
             for cleanup_error in cleanup_errors:
                 if hasattr(operation_error, "add_note"):
                     operation_error.add_note(
@@ -3446,7 +3455,7 @@ def main() -> int:
             if private_scratch_diagnostics and valid_scratch_unit_diagnostic(scratch_diagnostic):
                 report["scratch_unit_diagnostic"] = scratch_diagnostic
             print(json.dumps(report, ensure_ascii=False, indent=2))
-            if private_scratch_diagnostics and valid_scratch_unit_diagnostic(scratch_diagnostic):
+            if private_scratch_diagnostics:
                 private_output = getattr(exc, "scratch_unit_private_output", None)
                 if (
                     isinstance(private_output, tuple)
