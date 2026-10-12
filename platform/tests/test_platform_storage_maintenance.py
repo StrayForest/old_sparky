@@ -1716,6 +1716,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self._assert_backup_source_runner_branches(workflow_document)
         self._assert_backup_remote_executes_staged_helper(workflow_document)
         self._assert_backup_stage_finalizer_is_bounded_and_identity_pinned(workflow_document)
+        self._assert_backup_stage_and_empty_identity_shell_paths(workflow_document)
         self.assertEqual(
             workflow.count("if: ${{ inputs.operation == 'create' || inputs.operation == 'verify-existing' }}"),
             2,
@@ -2560,8 +2561,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
             stage.mkdir(mode=0o700)
             discovered_identity = run_cleanup(stage, "", digest)
-            self.assertEqual(discovered_identity.returncode, 0, discovered_identity.stderr)
-            self.assertFalse(stage.exists())
+            self.assertNotEqual(discovered_identity.returncode, 0)
+            self.assertTrue(stage.is_dir())
+            stage.rmdir()
 
             stage.mkdir(mode=0o700)
             tools = stage / "tools"
@@ -2626,6 +2628,186 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             mismatch_identity = run_cleanup(stage, "0:0", digest)
             self.assertNotEqual(mismatch_identity.returncode, 0)
             self.assertEqual(bundle.read_bytes(), data)
+
+    def _assert_backup_stage_and_empty_identity_shell_paths(
+        self, workflow_document: dict
+    ) -> None:
+        """Execute the local stage/cleanup shell with fake SSH, never a host connection."""
+        steps = workflow_document["jobs"]["backup"]["steps"]
+        stage_script = next(
+            step["run"]
+            for step in steps
+            if step.get("name") == "Stage the verified helper bundle on the production host"
+        )
+        cleanup_script = next(
+            step["run"]
+            for step in steps
+            if step.get("name") == "Remove staged helper bundle from production host"
+        )
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            bin_dir = root / "bin"
+            bin_dir.mkdir(mode=0o700)
+            runner_temp = root / "runner"
+            bundle_dir = runner_temp / "platform-backup-verifier-input"
+            bundle_dir.mkdir(parents=True, mode=0o700)
+            bundle = bundle_dir / "platform-backup-verifier.zip"
+            bundle_bytes = b"workflow stage fixture bytes"
+            bundle.write_bytes(bundle_bytes)
+            bundle.chmod(0o600)
+            ssh_dir = runner_temp / "platform-production-backup-ssh"
+            ssh_dir.mkdir(mode=0o700)
+            (ssh_dir / "known_hosts").write_text("fixture\n", encoding="ascii")
+            (ssh_dir / "id_ed25519").write_text("fixture-only\n", encoding="ascii")
+            (ssh_dir / "known_hosts").chmod(0o600)
+            (ssh_dir / "id_ed25519").chmod(0o600)
+            ssh_record = root / "ssh-command"
+            ssh_stdin = root / "ssh-stdin"
+            timeout_stub = bin_dir / "timeout"
+            timeout_stub.write_text(
+                "#!/bin/sh\n"
+                "while [ $# -gt 0 ] && [ \"$1\" != ssh ]; do shift; done\n"
+                "test \"${1:-}\" = ssh || exit 91\n"
+                "exec \"$@\"\n",
+                encoding="ascii",
+            )
+            timeout_stub.chmod(0o700)
+            ssh_stub = bin_dir / "ssh"
+            ssh_stub.write_text(
+                "#!/bin/bash\n"
+                "set -euo pipefail\n"
+                "command=\"${!#}\"\n"
+                "printf '%s' \"$command\" >\"$FAKE_SSH_RECORD\"\n"
+                "bash -n -c \"$command\" || { cat \"$FAKE_SSH_RECORD\" >&2; exit 92; }\n"
+                "cat >\"$FAKE_SSH_STDIN\"\n"
+                "printf '2049:987654\\n'\n",
+                encoding="ascii",
+            )
+            ssh_stub.chmod(0o700)
+            github_output = root / "github-output"
+            env = {
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_RUN_ID": "38199374511",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_SHA": "a" * 40,
+                "GITHUB_API_URL": "https://api.github.test",
+                "GITHUB_OUTPUT": str(github_output),
+                "GH_TOKEN": "test-only-placeholder",
+                "REPOSITORY": "StrayForest/old_sparky",
+                "SOURCE_SHA": "a" * 40,
+                "PROD_SSH_HOST": "production.example.invalid",
+                "PROD_SSH_USER": "root",
+                "BUNDLE_PATH": str(bundle),
+                "BUNDLE_SHA256": hashlib.sha256(bundle_bytes).hexdigest(),
+                "SSH_DIR": str(ssh_dir),
+                "FAKE_SSH_RECORD": str(ssh_record),
+                "FAKE_SSH_STDIN": str(ssh_stdin),
+            }
+            env.pop("BASH_ENV", None)
+            env.pop("ENV", None)
+            (bundle_dir / "current-dev-ref.json").write_text(
+                json.dumps({"ref": "refs/heads/dev", "object": {"sha": "a" * 40}}),
+                encoding="ascii",
+            )
+            curl = bin_dir / "curl"
+            curl.write_text(
+                "#!/bin/sh\n"
+                "out=\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  if [ \"$1\" = --output ]; then shift; out=$1; fi\n"
+                "  shift\n"
+                "done\n"
+                "test -n \"$out\" || exit 2\n"
+                "printf '{\"ref\":\"refs/heads/dev\",\"object\":{\"sha\":\"%s\"}}' \"$SOURCE_SHA\" >\"$out\"\n",
+                encoding="ascii",
+            )
+            curl.chmod(0o700)
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", textwrap.dedent(stage_script)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(ssh_stdin.read_bytes(), bundle_bytes)
+            self.assertIn("local lock_dir=$lock_parent/oldsparky-backup-verifier-stage", ssh_record.read_text())
+            self.assertIn('lock_identity=$(stat -c %d:%i:%u:%g:%a:%h "$lock_file")', ssh_record.read_text())
+            self.assertIn('stage="/tmp/oldsparky-backup-verifier-$run_id-$run_attempt"', ssh_record.read_text())
+            self.assertEqual(github_output.read_text(encoding="ascii"), "stage_identity=2049:987654\n")
+
+            # A bad local source binding fails before SSH is invoked. The trap
+            # has no stage identity and therefore performs no remote cleanup.
+            ssh_record.unlink()
+            failed_env = {**env, "SOURCE_SHA": "b" * 40}
+            failed = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", textwrap.dedent(stage_script)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+                env=failed_env,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertFalse(ssh_record.exists())
+
+            # An empty identity must stay a positional argument through the
+            # cleanup SSH command; otherwise SHA/source fields shift left.
+            ssh_stub.write_text(
+                "#!/bin/bash\n"
+                "set -euo pipefail\n"
+                "printf '%s\\n' \"$@\" >\"$FAKE_SSH_RECORD\"\n"
+                "cat >\"$FAKE_SSH_STDIN\"\n",
+                encoding="ascii",
+            )
+            cleanup_env = {
+                **env,
+                "STAGED_HELPER_IDENTITY": "",
+                "SOURCE_SHA": "a" * 40,
+            }
+            cleanup = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", textwrap.dedent(cleanup_script)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+                env=cleanup_env,
+            )
+            self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+            cleanup_argv = ssh_record.read_text(encoding="ascii").splitlines()
+            remote_command = cleanup_argv[-1]
+            self.assertIn(
+                "bash -s -- 38199374511 1 none "
+                f"{hashlib.sha256(bundle_bytes).hexdigest()} {'a' * 40}",
+                remote_command,
+            )
+            cleanup_remote = ssh_stdin.read_text(encoding="ascii")
+            cleanup_python = cleanup_remote.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+            absent_path = root / "remote-stage-absent"
+            absent_result = subprocess.run(
+                [sys.executable, "-I", "-B", "-", str(absent_path), "", "b" * 64, "a" * 40],
+                input=cleanup_python,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(absent_result.returncode, 0, absent_result.stderr)
+            existing_path = root / "remote-stage-existing"
+            existing_path.mkdir(mode=0o700)
+            rejected_missing_identity = subprocess.run(
+                [sys.executable, "-I", "-B", "-", str(existing_path), "", "b" * 64, "a" * 40],
+                input=cleanup_python,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertNotEqual(rejected_missing_identity.returncode, 0)
+            self.assertTrue(existing_path.is_dir())
 
     def _assert_backup_source_runner_branches(self, workflow_document: dict) -> None:
         run_script = next(

@@ -674,25 +674,24 @@ jobs:
           test \"\$(id -u)\" -eq 0
           prepare_stage_lock() {
             local lock_parent=/run/lock
-            local lock_dir=$lock_parent/oldsparky-backup-verifier-stage
-            local lock_file=$lock_dir/operation.lock
-            test ! -L $lock_parent
-            test -d $lock_parent
-            test $(stat -c %u:%g:%a $lock_parent) = 0:0:1777
-            if [[ ! -e $lock_dir && ! -L $lock_dir ]]; then mkdir -m 755 -- $lock_dir 2>/dev/null && chmod 755 -- $lock_dir || :; fi
-            test ! -L $lock_dir
-            test -d $lock_dir
-            test $(stat -c %u:%g:%a:%h $lock_dir) = 0:0:755:2
-            if [[ ! -e $lock_file && ! -L $lock_file ]]; then (umask 022; set -o noclobber; : >$lock_file) 2>/dev/null || :; fi
-            test ! -L $lock_file
-            test -f $lock_file
-            test -f $lock_file
-            test $(stat -c %u:%g:%a:%h $lock_file) = 0:0:644:1
+            local lock_dir=\$lock_parent/oldsparky-backup-verifier-stage
+            local lock_file=\"\$lock_dir/operation.lock\"
+            test ! -L "\$lock_parent"
+            test -d "\$lock_parent"
+            test \"\$(stat -c %u:%g:%a \"\$lock_parent\")\" = 0:0:1777
+            if [[ ! -e "\$lock_dir" && ! -L "\$lock_dir" ]]; then mkdir -m 755 -- "\$lock_dir" 2>/dev/null && chmod 755 -- "\$lock_dir" || :; fi
+            test ! -L "\$lock_dir"
+            test -d "\$lock_dir"
+            test \"\$(stat -c %u:%g:%a:%h \"\$lock_dir\")\" = 0:0:755:2
+            if [[ ! -e "\$lock_file" && ! -L "\$lock_file" ]]; then (umask 022; set -o noclobber; : >"\$lock_file") 2>/dev/null || :; fi
+            test ! -L "\$lock_file"
+            test -f "\$lock_file"
+            test \"\$(stat -c %u:%g:%a:%h \"\$lock_file\")\" = 0:0:644:1
             local lock_identity
-            lock_identity=$(stat -c %d:%i:%u:%g:%a:%h $lock_file)
-            exec 7>>$lock_file
-            test $(stat -Lc %d:%i:%u:%g:%a:%h /proc/$$/fd/7) = $lock_identity
-            test $(stat -c %d:%i:%u:%g:%a:%h $lock_file) = $lock_identity
+            lock_identity=\$(stat -c %d:%i:%u:%g:%a:%h \"\$lock_file\")
+            exec 7>>\"\$lock_file\"
+            test \"\$(stat -Lc %d:%i:%u:%g:%a:%h /proc/\$\$/fd/7)\" = \"\$lock_identity\"
+            test \"\$(stat -c %d:%i:%u:%g:%a:%h \"\$lock_file\")\" = "\$lock_identity"
             flock -w 45 7
           }
           prepare_stage_lock
@@ -2113,13 +2112,14 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$ssh_dir/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $STAGED_HELPER_IDENTITY $BUNDLE_SHA256 $SOURCE_SHA" <<'REMOTE'
+            "bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT ${STAGED_HELPER_IDENTITY:-none} $BUNDLE_SHA256 $SOURCE_SHA" <<'REMOTE'
           set -Eeuo pipefail
           run_id="${1:-}"
           run_attempt="${2:-}"
           expected_identity="${3:-}"
           expected_sha="${4:-}"
           source_sha="${5:-}"
+          if [[ "$expected_identity" = none ]]; then expected_identity=""; fi
           [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ -z "$expected_identity" || "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]]
@@ -2183,6 +2183,8 @@ jobs:
               before = path.lstat()
           except FileNotFoundError:
               raise SystemExit(0)
+          if expected is None:
+              raise SystemExit(1)
           if (
               not stat.S_ISDIR(before.st_mode)
               or before.st_uid != 0
