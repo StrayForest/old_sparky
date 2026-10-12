@@ -50,11 +50,38 @@ class StagedWorkerInput:
 
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._original_proc_start_time = backup_drill._scratch_process_start_time
         self._proc_start_time_patch = mock.patch.object(
             backup_drill, "_scratch_process_start_time", return_value="123456"
         )
         self._proc_start_time_patch.start()
         self.addCleanup(self._proc_start_time_patch.stop)
+
+    def test_scratch_process_start_time_parses_binary_proc_stat_safely(self) -> None:
+        actual = self._original_proc_start_time(str(os.getpid()))
+        self.assertRegex(actual, r"^[0-9]+$")
+
+        tail = [b"S", *([b"0"] * 18), b"987654"]
+        fixture = b"123 (comm with ) paren) " + b" ".join(tail) + b"\n"
+        with mock.patch.object(
+            pathlib.Path, "open", return_value=io.BytesIO(fixture)
+        ):
+            self.assertEqual(self._original_proc_start_time("123"), "987654")
+
+        malformed = (
+            b"123 (comm) S 1 2\n",
+            b"123 (comm) " + b" ".join([b"S", *([b"0"] * 18), b"12x"]) + b"\n",
+            b"123 (comm) " + b" ".join([b"S", *([b"0"] * 18), b"\xff"]) + b"\n",
+            b"123 comm S " + b"0 " * 20,
+            b"x" * 8193,
+        )
+        for payload in malformed:
+            with self.subTest(size=len(payload)):
+                with mock.patch.object(
+                    pathlib.Path, "open", return_value=io.BytesIO(payload)
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "process identity is malformed"):
+                        self._original_proc_start_time("123")
 
     @staticmethod
     def _write_backup_pair(

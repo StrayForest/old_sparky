@@ -2931,7 +2931,9 @@ def _scratch_process_start_time(pid_text: str) -> str:
         raise RuntimeError("Scratch restore worker process identity is malformed.")
     fields = data[closing + 1 :].split()
     # The tail begins at stat field 3 (state); starttime is field 22.
-    if len(fields) <= 19 or not fields[19].isdecimal():
+    # /proc/<pid>/stat is opened in binary mode, so validate its ASCII decimal
+    # field as bytes before decoding it.  bytes.isdigit() accepts only 0-9.
+    if len(fields) <= 19 or not fields[19].isdigit():
         raise RuntimeError("Scratch restore worker process identity is malformed.")
     return fields[19].decode("ascii")
 
