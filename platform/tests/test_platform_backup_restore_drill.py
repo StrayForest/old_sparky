@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import datetime as dt
 import fcntl
 import hashlib
@@ -1846,6 +1845,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         observed: dict[str, object] = {}
+        stdout_buffer = io.BytesIO()
+        stdout = types.SimpleNamespace(buffer=stdout_buffer)
 
         def fake_restore(dump_path, **kwargs):
             observed["dump_path"] = dump_path
@@ -1876,12 +1877,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "stdin",
                     types.SimpleNamespace(buffer=io.BytesIO(backup_drill.SCRATCH_START_TOKEN + backup_drill.SCRATCH_DONE_TOKEN)),
                 ),
-                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                mock.patch.object(backup_drill.sys, "stdout", stdout),
             ):
                 self.assertEqual(backup_drill._scratch_worker_main(args), 0)
 
             self.assertEqual(
-                json.loads(stdout.getvalue()),
+                json.loads(stdout_buffer.getvalue().decode("ascii")),
                 {"ok": True, "restored_table_count": 7},
             )
             self.assertEqual(observed["dump_path"], scratch_root / "archive.dump")
