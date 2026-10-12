@@ -722,7 +722,7 @@ jobs:
           fi
           if sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' && \
             tools/platform_run_tests.sh --contour backend-privileged \
-            --focused test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_isolated_restore_signal_cleanup_under_root \
+            --focused tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_isolated_restore_signal_cleanup_under_root \
             --quiet" >> "$diagnostic" 2>&1; then
             result=0
           else

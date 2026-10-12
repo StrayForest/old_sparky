@@ -1240,10 +1240,14 @@ class PlatformVerificationContractTests(unittest.TestCase):
             r"(?m)^\s+continue-on-error: true$",
         )
         self.assertIn("--contour backend-privileged", privileged_body)
-        self.assertIn(
-            "test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_isolated_restore_signal_cleanup_under_root",
-            privileged_body,
+        diagnostic_test = next(
+            case
+            for case in discover_test_cases()
+            if case.module == "test_platform_backup_restore_drill"
+            and case.method_name == "test_isolated_restore_signal_cleanup_under_root"
         )
+        self.assertEqual(diagnostic_test.contour, "backend-privileged")
+        self.assertIn(f"--focused {diagnostic_test.test_id}", privileged_body)
         self.assertIn("focused_exit=%s", privileged_body)
         self.assertIn("(no gate credit)", privileged_body)
         self.assertIn("platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}", privileged_body)
