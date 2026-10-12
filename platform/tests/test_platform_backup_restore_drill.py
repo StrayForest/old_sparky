@@ -603,6 +603,20 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "properties": {
                         "LoadState": "not-found",
                         "ActiveState": "inactive",
+                        "SubState": "dead",
+                        "Result": "success",
+                        "ExecMainStatus": "0",
+                        "ExecMainPID": "0",
+                        "ControlGroup": "",
+                    }
+                },
+                {
+                    "properties": {
+                        "LoadState": "not-found",
+                        "ActiveState": "inactive",
+                        "SubState": "dead",
+                        "Result": "success",
+                        "ExecMainStatus": "0",
                         "ExecMainPID": "0",
                         "ControlGroup": "",
                     }
@@ -616,11 +630,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             def stop_unit(_unit_name):
                 launcher.returncode = 1
 
+            unit_command = mock.Mock(return_value=["systemd-run"])
             try:
                 with (
                     mock.patch.object(backup_drill, "require_commands"),
                     mock.patch.object(backup_drill, "_scratch_host_guard"),
-                    mock.patch.object(backup_drill, "_scratch_unit_command", return_value=["systemd-run"]),
+                    mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
                     mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
                     mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=snapshot),
                     mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit),
@@ -649,6 +664,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 raw_stdout, raw_stderr = failure.exception.scratch_unit_private_output
                 self.assertEqual(raw_stdout, stdout_payload[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES])
                 self.assertEqual(raw_stderr, stderr_payload[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES])
+                self.assertEqual(diagnostic["terminal_snapshot"]["load_state"], "not-found")
+                mountpoint = pathlib.Path(unit_command.call_args.kwargs["mountpoint"])
+                self.assertFalse(mountpoint.exists())
             finally:
                 stdout_reader.close()
                 stderr_reader.close()
@@ -860,6 +878,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             stderr_payload = b"pg_restore detail:" + b"e" * 40000
             child_code = (
                 "import sys,time; "
+                f"start={backup_drill.SCRATCH_START_TOKEN!r}; "
+                "assert sys.stdin.buffer.read(len(start)) == start; "
                 f"sys.stdout.buffer.write({stdout_payload!r}); sys.stdout.flush(); "
                 f"sys.stderr.buffer.write({stderr_payload!r}); sys.stderr.flush(); "
                 "time.sleep(0.35); sys.exit(17)"
@@ -889,16 +909,29 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "ControlGroup": "",
                 }
             }
-            snapshots = [active, final, final]
+            snapshots = [active, active]
+            launched: list[subprocess.Popen[bytes]] = []
+
+            def service_snapshot(_unit_name: str) -> dict[str, object]:
+                if snapshots:
+                    return snapshots.pop(0)
+                if launched and launched[0].poll() is None:
+                    return active
+                return final
+
+            real_popen = subprocess.Popen
+
+            def launch(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                launched.append(process)
+                return process
 
             with (
                 mock.patch.object(backup_drill, "require_commands"),
                 mock.patch.object(backup_drill, "_scratch_host_guard"),
                 mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
                 mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
-                mock.patch.object(
-                    backup_drill, "_scratch_service_snapshot", side_effect=lambda _name: snapshots.pop(0)
-                ),
+                mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=service_snapshot),
                 mock.patch.object(
                     backup_drill,
                     "_scratch_expected_properties",
@@ -906,10 +939,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 ),
                 mock.patch.object(backup_drill, "_scratch_control_group_snapshot", return_value={}),
                 mock.patch.object(backup_drill, "_scratch_stop_unit"),
+                mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
                 mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
             ):
                 with self.assertRaisesRegex(
-                    RuntimeError, "failed after its confinement was verified"
+                    RuntimeError, "completion was not fully authorized and verified"
                 ) as failure:
                     backup_drill._run_isolated_restore_drill(
                         archive_path,
@@ -919,12 +953,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
             diagnostic = failure.exception.scratch_unit_diagnostic
             self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(diagnostic))
-            self.assertEqual(diagnostic["phase"], "unit_exited_after_confinement")
-            self.assertEqual(diagnostic["active_state"], "failed")
-            self.assertEqual(diagnostic["result"], "exit-code")
-            self.assertEqual(diagnostic["exec_main_status"], 17)
+            self.assertEqual(diagnostic["phase"], "authorization_failed")
+            self.assertEqual(diagnostic["active_state"], "active")
+            self.assertEqual(diagnostic["terminal_snapshot"]["load_state"], "not-found")
+            self.assertTrue(diagnostic["terminal_snapshot"]["start_token_sent"])
+            self.assertFalse(diagnostic["terminal_snapshot"]["completion_token_sent"])
             self.assertEqual(diagnostic["launcher_exit_status"], 17)
-            self.assertEqual(diagnostic["verification_error"], "none")
+            self.assertEqual(diagnostic["verification_error"], "other")
             self.assertIsNone(diagnostic["verification_errno"])
             self.assertEqual(
                 failure.exception.scratch_unit_private_output,
@@ -943,7 +978,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
     def _assert_collected_unit_without_properties_preserves_output(self) -> None:
         class LauncherProcess:
-            def __init__(self, stdout, stderr) -> None:
+            def __init__(self, stdin, stdout, stderr) -> None:
+                self.stdin = stdin
                 self.stdout = stdout
                 self.stderr = stderr
                 self.returncode = None
@@ -970,9 +1006,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ):
                 os.write(write_fd, payload)
                 os.close(write_fd)
+            stdin_read, stdin_write = os.pipe()
+            stdin_reader = os.fdopen(stdin_read, "rb", buffering=0)
+            stdin_writer = os.fdopen(stdin_write, "wb", buffering=0)
             stdout_reader = os.fdopen(stdout_read, "rb", buffering=0)
             stderr_reader = os.fdopen(stderr_read, "rb", buffering=0)
-            launcher = LauncherProcess(stdout_reader, stderr_reader)
+            launcher = LauncherProcess(stdin_writer, stdout_reader, stderr_reader)
             command = ["systemd-run"]
             unit_command = mock.Mock(return_value=command)
             active = {
@@ -988,15 +1027,21 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 }
             }
             collected = {"properties": {"LoadState": "not-found"}}
-            snapshots = [active, collected]
+            snapshots = [active, active]
+            snapshot_count = 0
 
             def snapshot(_unit_name: str) -> dict[str, object]:
-                value = snapshots.pop(0) if snapshots else collected
-                if value is active:
-                    # The launcher exits after the monitor has observed the
-                    # live unit, but before its final properties are read.
+                nonlocal snapshot_count
+                snapshot_count += 1
+                if snapshots:
+                    return snapshots.pop(0)
+                if snapshot_count == 3:
+                    # START has been sent after two matching identity checks;
+                    # now model the launcher exiting before unit properties
+                    # can be collected by the completion monitor.
                     launcher.returncode = 17
-                return value
+                    return active
+                return collected
 
             with (
                 mock.patch.object(backup_drill, "require_commands"),
@@ -1015,18 +1060,24 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(backup_drill.subprocess, "Popen", return_value=launcher),
             ):
                 with self.assertRaisesRegex(
-                    RuntimeError, "did not complete successfully"
+                    RuntimeError, "completion was not fully authorized and verified"
                 ) as failure:
                     backup_drill._run_isolated_restore_drill(
                         archive_path,
                         timestamp_slug="20261012T010208Z",
                         private_scratch_diagnostics=True,
                     )
-                self.assertIsNone(getattr(failure.exception, "scratch_unit_diagnostic", None))
+                diagnostic = failure.exception.scratch_unit_diagnostic
+                self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(diagnostic))
+                self.assertEqual(diagnostic["phase"], "authorization_failed")
+                self.assertEqual(diagnostic["terminal_snapshot"]["load_state"], "not-found")
+                self.assertTrue(diagnostic["terminal_snapshot"]["start_token_sent"])
+                self.assertFalse(diagnostic["terminal_snapshot"]["completion_token_sent"])
                 self.assertEqual(
                     failure.exception.scratch_unit_private_output,
                     (stdout_payload, stderr_payload),
                 )
+                self.assertEqual(stdin_reader.read(len(backup_drill.SCRATCH_START_TOKEN)), backup_drill.SCRATCH_START_TOKEN)
                 self.assertGreaterEqual(stop_unit.call_count, 1)
                 self.assertTrue(
                     all(len(call.args) == 1 and call.args[0] for call in stop_unit.call_args_list)
@@ -1034,6 +1085,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 self.assertGreater(launcher.wait_calls, 0)
                 self.assertEqual(launcher.returncode, 17)
                 self.assertFalse(pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists())
+            stdin_reader.close()
             stdout_reader.close()
             stderr_reader.close()
 
