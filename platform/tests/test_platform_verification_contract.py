@@ -1229,6 +1229,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
         diagnostic_finalizer = privileged_body.index(
             "Require focused scratch restore diagnostic success"
         )
+        diagnostic_script = privileged_body[diagnostic_start:diagnostic_upload]
         upload_start = diagnostic_upload
         upload_end = full_contour
         finalizer_start = diagnostic_finalizer
@@ -1248,13 +1249,14 @@ class PlatformVerificationContractTests(unittest.TestCase):
         )
         self.assertEqual(diagnostic_test.contour, "backend-privileged")
         self.assertIn(f"--focused {diagnostic_test.test_id}", privileged_body)
+        self.assertIn("tools/platform_verify.py backend-privileged", diagnostic_script)
+        self.assertNotIn("platform_run_tests.sh", diagnostic_script)
         self.assertIn("focused_exit=%s", privileged_body)
         self.assertIn("(no gate credit)", privileged_body)
         self.assertIn("platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}", privileged_body)
         self.assertIn("steps.scratch_restore_diagnostic.outcome", privileged_body)
         self.assertIn("steps.scratch_diagnostic_upload.outcome", privileged_body)
         self.assertIn("this job cannot pass", privileged_body)
-        diagnostic_script = privileged_body[diagnostic_start:diagnostic_upload]
         upload_contract = privileged_body[upload_start:upload_end]
         finalizer_contract = privileged_body[finalizer_start:]
         self.assertIn("source_sha=%s\\nrun_id=%s\\nrun_attempt=%s", diagnostic_script)
