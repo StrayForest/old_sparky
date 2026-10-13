@@ -2808,8 +2808,18 @@ def main() -> int:
             first_fault = getattr(exc, "scratch_first_fault", None)
             if _valid_scratch_first_fault(first_fault):
                 result["first_fault"] = first_fault
+            host_guard = getattr(exc, "scratch_host_guard_diagnostic", None)
+            if valid_scratch_host_guard_diagnostic(host_guard):
+                result["scratch_host_guard_diagnostic"] = host_guard
             if args.as_json:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
+                frames = (
+                    backup_restore_drill._scratch_host_guard_frame(host_guard),
+                    backup_restore_drill._scratch_first_fault_frame(first_fault),
+                )
+                private_frames = b"".join(frame for frame in frames if frame is not None)
+                if private_frames:
+                    sys.stderr.write(private_frames.decode("ascii"))
             else:
                 print("[FAIL] Authorization probe failed.", file=sys.stderr)
             return 1

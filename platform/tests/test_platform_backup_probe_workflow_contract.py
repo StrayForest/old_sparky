@@ -29,6 +29,13 @@ FAULT = {
     "exception_kind": "permission",
     "errno": 13,
 }
+HOST_GUARD = {
+    "schema": 2,
+    "guard_site": "parent_before_authorization_probe",
+    "guard_reason": "memory_reserve",
+    "available_bytes": 900_000_000,
+    "required_bytes": 1_073_741_824,
+}
 
 
 def _heredoc_after(source: str, anchor: str) -> str:
@@ -112,6 +119,7 @@ class _FaultOS:
         self.regular_fsyncs = 0
         self.directory_fsyncs = 0
         self.writes = 0
+        self.last_regular_kind = None
         self.final_stat_calls = 0
         self.final_receipt_open_calls = 0
         self.short_read_fds = set()
@@ -130,7 +138,7 @@ class _FaultOS:
             and path.endswith(".pending.json")
         ):
             return _StatView(value, inode_delta=1)
-        if isinstance(path, str) and path.startswith("authorization-probe-") and path.endswith(".json") and not path.endswith(".pending.json"):
+        if path == f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json":
             self.final_stat_calls += 1
             if self.fault == "identity_swap" and self.final_stat_calls == 1:
                 return _StatView(value, inode_delta=1)
@@ -138,10 +146,7 @@ class _FaultOS:
 
     def open(self, path, flags, *args, **kwargs):
         is_final_receipt = (
-            isinstance(path, str)
-            and path.startswith("authorization-probe-")
-            and path.endswith(".json")
-            and not path.endswith(".pending.json")
+            path == f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json"
             and flags & (os.O_WRONLY | os.O_RDWR) == 0
         )
         if is_final_receipt:
@@ -184,20 +189,27 @@ class _FaultOS:
     def fsync(self, descriptor):
         value = os.fstat(descriptor)
         if stat.S_ISREG(value.st_mode):
-            self.regular_fsyncs += 1
-            if self.fault == "pending_fsync" and self.regular_fsyncs == 1:
-                raise OSError("injected pending projection fsync failure")
-            if self.fault == "final_fsync" and self.regular_fsyncs == 2:
-                raise OSError("injected final receipt fsync failure")
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+            if target.endswith(f"authorization-probe-diagnostic-{RUN_ID}-{RUN_ATTEMPT}.json"):
+                self.last_regular_kind = "diagnostic"
+                if self.fault == "diagnostic_fsync":
+                    raise OSError("injected diagnostic fsync failure")
+            elif target.endswith(f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.pending.json"):
+                self.last_regular_kind = "pending"
+                if self.fault == "pending_fsync":
+                    raise OSError("injected pending projection fsync failure")
+            elif target.endswith(f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json"):
+                self.last_regular_kind = "final"
+                if self.fault == "final_fsync":
+                    raise OSError("injected final receipt fsync failure")
         else:
             target = os.readlink(f"/proc/self/fd/{descriptor}")
             if target.endswith("/shared"):
-                self.directory_fsyncs += 1
-                if self.fault == "pending_parent_fsync" and self.directory_fsyncs == 1:
+                if self.fault == "pending_parent_fsync" and self.last_regular_kind == "pending":
                     raise OSError("injected pending parent fsync failure")
-                if self.fault == "final_parent_fsync" and self.directory_fsyncs == 2:
+                if self.fault == "final_parent_fsync" and self.last_regular_kind == "final":
                     raise OSError("injected final parent fsync failure")
-                if self.fault in {"final_content_mutation", "final_binding_mutation"} and self.directory_fsyncs == 2:
+                if self.fault in {"final_content_mutation", "final_binding_mutation"} and self.last_regular_kind == "final":
                     name = f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json"
                     target_fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW, dir_fd=descriptor)
                     try:
@@ -230,14 +242,16 @@ class _FaultOS:
         return os.read(descriptor, size)
 
     def write(self, descriptor, payload):
-        self.writes += 1
-        if self.fault == "pending_write" and self.writes == 1:
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+        if self.fault == "diagnostic_write" and target.endswith(f"authorization-probe-diagnostic-{RUN_ID}-{RUN_ATTEMPT}.json"):
+            raise OSError("injected diagnostic write failure")
+        if self.fault == "pending_write" and target.endswith(f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.pending.json"):
             raise OSError("injected pending projection write failure")
-        if self.fault == "pending_short_write" and self.writes == 1:
+        if self.fault == "pending_short_write" and target.endswith(f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.pending.json"):
             return 0
-        if self.fault == "final_write" and self.writes == 2:
+        if self.fault == "final_write" and target.endswith(f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json"):
             raise OSError("injected final receipt write failure")
-        if self.fault == "final_short_write" and self.writes == 2:
+        if self.fault == "final_short_write" and target.endswith(f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json"):
             return 0
         return os.write(descriptor, payload)
 
@@ -264,7 +278,9 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         legacy_tree = ast.parse(legacy_handler)
         cls.backup_first_fault_sites = _literal_set_assignment(legacy_tree, "first_fault_sites")
         cls.backup_host_guard_sites = _literal_set_assignment(legacy_tree, "host_guard_sites")
-        cls.probe_first_fault_sites = _literal_set_assignment(ast.parse(handler), "sites")
+        probe_tree = ast.parse(handler)
+        cls.probe_first_fault_sites = _literal_set_assignment(probe_tree, "sites")
+        cls.probe_host_guard_sites = _literal_set_assignment(probe_tree, "host_guard_sites")
         validator_names = {"first_fault_sites", "first_fault_kinds", "valid_first_fault"}
         validator_assignments = sorted(
             (
@@ -291,7 +307,7 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         exec(self.legacy_fault_validator, namespace)
         return namespace["valid_first_fault"]
 
-    def _report(self, status: str = "completed", *, first_fault=None, extra: dict | None = None) -> bytes:
+    def _report(self, status: str = "completed", *, first_fault=None, host_guard=None, extra: dict | None = None) -> bytes:
         if status == "completed":
             report = {
                 "schema": 1,
@@ -308,6 +324,8 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             }
             if first_fault is not None:
                 report["first_fault"] = first_fault
+            if host_guard is not None:
+                report["scratch_host_guard_diagnostic"] = host_guard
         if extra:
             report.update(extra)
         return (json.dumps(report, separators=(",", ":")) + "\n").encode("utf-8")
@@ -319,7 +337,12 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             encoded = json.dumps(value, sort_keys=True)
         return b"SCRATCH_FIRST_FAULT_V1\n" + encoded.encode("ascii") + b"\n"
 
-    def _fixture(self, *, status="completed", first_fault=None, fault_os=None):
+    @staticmethod
+    def _host_guard_frame(value=HOST_GUARD) -> bytes:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return b"OLDS_PG_SCRATCH_HOST_GUARD_V1:" + encoded.encode("ascii") + b"\n"
+
+    def _fixture(self, *, status="completed", first_fault=None, host_guard=None, fault_os=None):
         temp = tempfile.TemporaryDirectory()
         root = Path(temp.name)
         temporary = root / "tmp"
@@ -330,8 +353,11 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         shared.chmod(0o755)
         report = temporary / "oldsparky-production-backup-report.ABC123"
         capture = temporary / f"oldsparky-production-backup-{RUN_ID}-{RUN_ATTEMPT}.stderr"
-        report.write_bytes(self._report(status, first_fault=first_fault))
-        capture.write_bytes(self._frame(first_fault) if first_fault is not None else b"")
+        report.write_bytes(self._report(status, first_fault=first_fault, host_guard=host_guard))
+        capture.write_bytes(
+            (self._host_guard_frame(host_guard) if host_guard is not None else b"")
+            + (self._frame(first_fault) if first_fault is not None else b"")
+        )
         report.chmod(0o600)
         capture.chmod(0o600)
         self.handler["os"] = fault_os or _FaultOS()
@@ -579,9 +605,45 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
 
     def test_probe_envelopes_require_verified_cleanup_and_reject_extra_fields(self) -> None:
         parse = self.handler["parse_probe_report"]
-        self.assertEqual(parse(self._report(), b"", "0"), ("completed", "confirmed", None))
+        self.assertEqual(parse(self._report(), b"", "0"), ("completed", "confirmed", None, None))
         failed = self._report("failed", first_fault=FAULT)
-        self.assertEqual(parse(failed, self._frame(), "1"), ("failed", "confirmed", FAULT))
+        self.assertEqual(parse(failed, self._frame(), "1"), ("failed", "confirmed", FAULT, None))
+        guarded_fault = dict(FAULT, origin="controller", site="controller_host_guard")
+        guarded = self._report("failed", first_fault=guarded_fault, host_guard=HOST_GUARD)
+        self.assertEqual(
+            parse(guarded, self._host_guard_frame() + self._frame(guarded_fault), "1"),
+            ("failed", "confirmed", guarded_fault, HOST_GUARD),
+        )
+        invalid_guard_values = (
+            dict(HOST_GUARD, schema=True),
+            dict(HOST_GUARD, schema=2.0),
+            dict(HOST_GUARD, available_bytes=True),
+            dict(HOST_GUARD, available_bytes=900_000_000.0),
+            dict(HOST_GUARD, required_bytes=1_073_741_823),
+            dict(HOST_GUARD, raw="forbidden"),
+        )
+        for invalid_guard in invalid_guard_values:
+            with self.subTest(host_guard=invalid_guard):
+                raw = self._report("failed", first_fault=guarded_fault, host_guard=invalid_guard)
+                with self.assertRaises((ValueError, json.JSONDecodeError, TypeError)):
+                    parse(raw, self._host_guard_frame(invalid_guard) + self._frame(guarded_fault), "1")
+        with self.assertRaises((ValueError, json.JSONDecodeError, TypeError)):
+            parse(guarded, self._frame(guarded_fault), "1")
+        with self.assertRaises((ValueError, json.JSONDecodeError, TypeError)):
+            parse(
+                guarded,
+                self._host_guard_frame() + self._host_guard_frame() + self._frame(guarded_fault),
+                "1",
+            )
+        with self.assertRaises((ValueError, json.JSONDecodeError, TypeError)):
+            parse(guarded, self._host_guard_frame() + self._frame(), "1")
+        mismatched_guard = dict(HOST_GUARD, available_bytes=800_000_000)
+        with self.assertRaises((ValueError, json.JSONDecodeError, TypeError)):
+            parse(
+                guarded,
+                self._host_guard_frame(mismatched_guard) + self._frame(guarded_fault),
+                "1",
+            )
         controller_fault = {
             "schema": 1,
             "origin": "controller",
@@ -590,7 +652,10 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             "errno": 13,
         }
         controller_report = self._report("failed", first_fault=controller_fault)
-        self.assertEqual(parse(controller_report, self._frame(controller_fault), "1"), ("failed", "confirmed", controller_fault))
+        self.assertEqual(
+            parse(controller_report, self._frame(controller_fault), "1"),
+            ("failed", "confirmed", controller_fault, None),
+        )
         wrong_pair = dict(FAULT, origin="controller")
         with self.assertRaises((ValueError, json.JSONDecodeError, TypeError)):
             parse(self._report("failed", first_fault=wrong_pair), self._frame(wrong_pair), "1")
@@ -613,6 +678,7 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             self._report(extra={"ok": True}),
             self._report(extra={"error": "text"}),
             self._report(extra={"backup": {}}),
+            self._report(extra={"scratch_host_guard_diagnostic": HOST_GUARD}),
             self._report("failed", extra={"unexpected": 1}),
             self._report(extra={"schema": True}),
             self._report(extra={"schema": 1.0}),
@@ -634,7 +700,7 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             with self.subTest(report=raw[:48]):
                 with self.assertRaises((ValueError, json.JSONDecodeError)):
                     parse(raw, b"", "0")
-        for child_status in ("1", "2", "not-an-exit"):
+        for child_status in ("1", "2", "not-an-exit", "01", "256"):
             with self.subTest(child_status=child_status):
                 with self.assertRaises((ValueError, json.JSONDecodeError)):
                     parse(self._report(), b"", child_status)
@@ -678,6 +744,9 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                 "cleanup_status": "confirmed",
             })
             self.assertFalse((shared / f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.pending.json").exists())
+            self.assertFalse(
+                (shared / f"authorization-probe-diagnostic-{RUN_ID}-{RUN_ATTEMPT}.json").exists()
+            )
             self.assertFalse(paths[3].exists())
             self.assertFalse(paths[4].exists())
 
@@ -710,6 +779,11 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             self.source,
             re.compile(r"Publish source-bound backup success receipt\n\s+if: \$\{\{ success\(\) && inputs\.operation == 'create'"),
         )
+        upload_start = self.source.index("- name: Publish source-bound backup success receipt")
+        upload_end = self.source.find("\n      - name:", upload_start)
+        upload_step = self.source[upload_start:upload_end]
+        self.assertIn("path: ${{ runner.temp }}/platform-backup-success-receipt.json", upload_step)
+        self.assertNotIn("authorization-probe-diagnostic", upload_step)
         self.assertNotIn("platform-authorization-probe-success", self.source)
         self._assert_probe_receipt_failure_keeps_only_pending_projection()
 
@@ -740,24 +814,112 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertEqual(self.backup_first_fault_sites, worker_sites | controller_sites)
         self.assertEqual(self.probe_first_fault_sites, worker_sites | controller_sites)
         self.assertEqual(self.backup_host_guard_sites, expected_host_guard_sites)
+        self.assertEqual(self.probe_host_guard_sites, expected_host_guard_sites)
         paths = self._fixture(status="failed", first_fault=FAULT)
         try:
             code, marker = self._process(paths, status="failed")
             self.assertEqual(code, 1)
             self.assertIn("status=failed cleanup_status=confirmed receipt=written", marker)
             receipt = json.loads((paths[2] / f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json").read_text())
+            diagnostic = json.loads(
+                (paths[2] / f"authorization-probe-diagnostic-{RUN_ID}-{RUN_ATTEMPT}.json").read_text()
+            )
             self.assertEqual(receipt["first_fault"], FAULT)
+            self.assertIsNone(receipt.get("scratch_host_guard_diagnostic"))
             self.assertEqual(set(receipt), {
                 "schema", "kind", "status", "workflow_run_id", "workflow_run_attempt",
                 "security_run_id", "security_run_attempt", "source_sha", "helper_bundle_sha256",
                 "cleanup_status", "first_fault",
             })
+            self.assertEqual(diagnostic, {
+                "schema": 1,
+                "kind": "authorization_probe_diagnostic",
+                "status": "failed",
+                "workflow_run_id": RUN_ID,
+                "workflow_run_attempt": RUN_ATTEMPT,
+                "security_run_id": SECURITY_ID,
+                "security_run_attempt": SECURITY_ATTEMPT,
+                "source_sha": SOURCE_SHA,
+                "helper_bundle_sha256": BUNDLE_SHA,
+                "stage": "validated_failure",
+                "cleanup_status": "confirmed",
+                "probe_operation_exit_code": 1,
+                "helper_exit_code": None,
+                "ssh_exit_code": None,
+                "first_fault": FAULT,
+                "scratch_host_guard_diagnostic": None,
+            })
             self.assertFalse(any(field in receipt for field in ("stderr", "message", "path", "argv", "env", "pid")))
+            self.assertFalse(any(field in diagnostic for field in ("stderr", "message", "path", "argv", "env", "pid")))
         finally:
             paths[0].cleanup()
 
+        controller_fault = dict(FAULT, origin="controller", site="controller_host_guard")
+        guarded_paths = self._fixture(
+            status="failed", first_fault=controller_fault, host_guard=HOST_GUARD
+        )
+        try:
+            code, marker = self._process(guarded_paths, status="failed")
+            self.assertEqual(code, 1)
+            self.assertIn("status=failed cleanup_status=confirmed", marker)
+            diagnostic = json.loads(
+                (guarded_paths[2] / f"authorization-probe-diagnostic-{RUN_ID}-{RUN_ATTEMPT}.json").read_text()
+            )
+            self.assertEqual(diagnostic["first_fault"], controller_fault)
+            self.assertEqual(diagnostic["scratch_host_guard_diagnostic"], HOST_GUARD)
+            authorization_receipt = json.loads(
+                (guarded_paths[2] / f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json").read_text()
+            )
+            self.assertEqual(authorization_receipt["first_fault"], controller_fault)
+            self.assertNotIn("scratch_host_guard_diagnostic", authorization_receipt)
+        finally:
+            guarded_paths[0].cleanup()
+
+        # A rejected frame leaves no typed diagnostic projection and keeps the
+        # original private captures for triage; the durable record says UNKNOWN.
+        invalid_paths = self._fixture(status="failed", first_fault=FAULT)
+        invalid_paths[4].write_bytes(self._host_guard_frame(HOST_GUARD))
+        invalid_paths[4].chmod(0o600)
+        try:
+            code, marker = self._process(invalid_paths, status="failed")
+            self.assertEqual(code, 1)
+            self.assertIn("status=unknown", marker)
+            diagnostic = json.loads(
+                (invalid_paths[2] / f"authorization-probe-diagnostic-{RUN_ID}-{RUN_ATTEMPT}.json").read_text()
+            )
+            self.assertEqual(diagnostic["status"], "unknown")
+            self.assertEqual(diagnostic["stage"], "report_frame_validation")
+            self.assertIsNone(diagnostic["first_fault"])
+            self.assertIsNone(diagnostic["scratch_host_guard_diagnostic"])
+            self.assertTrue(invalid_paths[3].exists())
+            self.assertTrue(invalid_paths[4].exists())
+            self.assertFalse((invalid_paths[2] / f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json").exists())
+        finally:
+            invalid_paths[0].cleanup()
+
+        for fault in ("diagnostic_collision", "diagnostic_write", "diagnostic_fsync"):
+            with self.subTest(diagnostic_failure=fault):
+                paths = self._fixture(status="failed", first_fault=FAULT, fault_os=_FaultOS(fault))
+                diag_path = paths[2] / f"authorization-probe-diagnostic-{RUN_ID}-{RUN_ATTEMPT}.json"
+                if fault == "diagnostic_collision":
+                    diag_path.write_text("preserve-existing", encoding="ascii")
+                try:
+                    code, marker = self._process(paths, status="failed")
+                    self.assertEqual(code, 1)
+                    self.assertIn("status=unknown", marker)
+                    self.assertTrue(paths[3].exists())
+                    self.assertTrue(paths[4].exists())
+                    self.assertFalse((paths[2] / f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.pending.json").exists())
+                    self.assertFalse((paths[2] / f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json").exists())
+                    if fault == "diagnostic_collision":
+                        self.assertEqual(diag_path.read_text(encoding="ascii"), "preserve-existing")
+                finally:
+                    paths[0].cleanup()
+
         public_summary = self.source.split('public_report="$({', 1)[-1].split("failure_stage=private_capture_cleanup", 1)[0]
         self.assertNotIn("first_fault", public_summary)
+        self.assertNotIn("scratch_host_guard_diagnostic", public_summary)
+        self.assertNotIn("authorization_probe_diagnostic", public_summary)
         self.assertNotIn("SCRATCH_FIRST_FAULT_V1", public_summary)
         self.assertIn('"scratch_first_fault": scratch_first_fault', self.source)
         self.assertIn('first_fault.get("site", "").startswith(first_fault.get("origin", "") + "_")', self.source)

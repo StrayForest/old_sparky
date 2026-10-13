@@ -2261,7 +2261,52 @@ jobs:
                   return error_number is None or type(error_number) is int
               return error_number is None
 
+          host_guard_sites = {
+              "parent_before_archive_open", "parent_before_authorization_probe",
+              "parent_before_unit_launch", "parent_active_poll", "parent_after_worker_cleanup",
+              "worker_after_start_before_archive_open", "worker_after_start_before_authorization_probe",
+              "worker_after_initdb_before_postgres_start", "worker_after_postgres_start",
+              "worker_pg_restore_resource_guard", "worker_after_restore_before_postgres_stop",
+          }
+          host_guard_marker = b"OLDS_PG_SCRATCH_HOST_GUARD_V1:"
+
+          def valid_host_guard(value):
+              return (
+                  isinstance(value, dict)
+                  and set(value) == {"schema", "guard_site", "guard_reason", "available_bytes", "required_bytes"}
+                  and type(value.get("schema")) is int
+                  and value["schema"] == 2
+                  and type(value.get("guard_site")) is str
+                  and value["guard_site"] in host_guard_sites
+                  and type(value.get("guard_reason")) is str
+                  and value["guard_reason"] == "memory_reserve"
+                  and type(value.get("available_bytes")) is int
+                  and 0 <= value["available_bytes"] < 1073741824
+                  and type(value.get("required_bytes")) is int
+                  and value["required_bytes"] == 1073741824
+              )
+
+          def parse_canonical_frame(capture_bytes, marker, expected):
+              if capture_bytes.count(marker) != 1:
+                  raise ValueError
+              start = capture_bytes.index(marker) + len(marker)
+              end = capture_bytes.find(b"\n", start)
+              frame_bytes = capture_bytes[start:end] if end >= 0 else b""
+              if (
+                  not frame_bytes
+                  or len(frame_bytes) > 512
+                  or json.loads(frame_bytes.decode("ascii"), object_pairs_hook=reject_duplicate_keys) != expected
+                  or frame_bytes != json.dumps(expected, separators=(",", ":"), sort_keys=True).encode("ascii")
+              ):
+                  raise ValueError
+
           def parse_probe_report(report_bytes, capture_bytes, child_status):
+              if (
+                  type(child_status) is not str
+                  or re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", child_status) is None
+                  or int(child_status) > 255
+              ):
+                  raise ValueError
               report = json.loads(report_bytes.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
               if (
                   not isinstance(report, dict)
@@ -2284,10 +2329,13 @@ jobs:
                   status = "completed"
                   cleanup_status = "confirmed"
                   first_fault = None
+                  host_guard = None
               elif report.get("status") == "failed":
                   expected = {"schema", "kind", "status", "cleanup_status"}
                   if "first_fault" in report:
                       expected.add("first_fault")
+                  if "scratch_host_guard_diagnostic" in report:
+                      expected.add("scratch_host_guard_diagnostic")
                   if set(report) != expected or int(child_status) != 1:
                       raise ValueError
                   cleanup_status = report.get("cleanup_status")
@@ -2297,6 +2345,9 @@ jobs:
                   first_fault = report.get("first_fault")
                   if "first_fault" in report and not valid_first_fault(first_fault):
                       raise ValueError
+                  host_guard = report.get("scratch_host_guard_diagnostic")
+                  if "scratch_host_guard_diagnostic" in report and not valid_host_guard(host_guard):
+                      raise ValueError
               else:
                   raise ValueError
               marker = b"SCRATCH_FIRST_FAULT_V1\n"
@@ -2305,21 +2356,21 @@ jobs:
                   if marker_count:
                       raise ValueError
               else:
-                  if marker_count != 1:
+                  parse_canonical_frame(capture_bytes, marker, first_fault)
+              guard_marker_count = capture_bytes.count(host_guard_marker)
+              if host_guard is None:
+                  if guard_marker_count:
                       raise ValueError
-                  start = capture_bytes.index(marker) + len(marker)
-                  end = capture_bytes.find(b"\n", start)
-                  frame_bytes = capture_bytes[start:end] if end >= 0 else b""
-                  if (
-                      not frame_bytes
-                      or len(frame_bytes) > 512
-                      or json.loads(frame_bytes.decode("ascii"), object_pairs_hook=reject_duplicate_keys) != first_fault
-                      or frame_bytes != json.dumps(first_fault, separators=(",", ":"), sort_keys=True).encode("ascii")
-                  ):
+              else:
+                  if first_fault is None:
                       raise ValueError
+                  expected_origin = "worker" if host_guard["guard_site"].startswith("worker_") else "controller"
+                  if first_fault["origin"] != expected_origin:
+                      raise ValueError
+                  parse_canonical_frame(capture_bytes, host_guard_marker, host_guard)
               if status == "completed" and cleanup_status != "confirmed":
                   raise ValueError
-              return status, cleanup_status, first_fault
+              return status, cleanup_status, first_fault, host_guard
 
           def verify_shared_parent(shared_path):
               shared_fd = os.open(shared_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -2508,6 +2559,104 @@ jobs:
                   raise ValueError
               return encoded
 
+          def read_back_owned_diagnostic(shared_fd, filename, identity, expected_bytes, expected_diagnostic):
+              before = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+              if (
+                  not stat.S_ISREG(before.st_mode)
+                  or before.st_uid != 0
+                  or before.st_gid != 0
+                  or stat.S_IMODE(before.st_mode) != 0o600
+                  or before.st_nlink != 1
+                  or before.st_size != len(expected_bytes)
+                  or (before.st_dev, before.st_ino) != identity
+              ):
+                  raise OSError
+              descriptor = os.open(filename, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=shared_fd)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(opened.st_mode)
+                      or opened.st_uid != 0
+                      or opened.st_gid != 0
+                      or stat.S_IMODE(opened.st_mode) != 0o600
+                      or opened.st_nlink != 1
+                      or (opened.st_dev, opened.st_ino, opened.st_size)
+                      != (identity[0], identity[1], len(expected_bytes))
+                  ):
+                      raise OSError
+                  payload = bytearray()
+                  while len(payload) <= len(expected_bytes):
+                      block = os.read(descriptor, min(4096, len(expected_bytes) + 1 - len(payload)))
+                      if not block:
+                          break
+                      payload.extend(block)
+                  finished = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              after = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+              fields = lambda value: (
+                  value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+                  value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+              )
+              if (
+                  bytes(payload) != expected_bytes
+                  or fields(finished) != fields(before)
+                  or fields(after) != fields(before)
+                  or json.loads(bytes(payload).decode("ascii"), object_pairs_hook=reject_duplicate_keys) != expected_diagnostic
+              ):
+                  raise OSError
+
+          def persist_probe_diagnostic(shared_path, run_id, run_attempt, security_id, security_attempt,
+                                       source_sha, bundle_sha, stage, cleanup_status, operation_exit,
+                                       first_fault, host_guard):
+              if (
+                  re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None
+                  or re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt) is None
+                  or re.fullmatch(r"[1-9][0-9]{0,19}", security_id) is None
+                  or re.fullmatch(r"[1-9][0-9]{0,5}", security_attempt) is None
+                  or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+                  or re.fullmatch(r"[0-9a-f]{64}", bundle_sha) is None
+                  or stage not in {"validated_failure", "report_frame_validation", "authorization_receipt_custody"}
+                  or cleanup_status not in {"confirmed", "failed", "unknown"}
+                  or (operation_exit is not None and (type(operation_exit) is not int or not 0 <= operation_exit <= 255))
+                  or (first_fault is not None and not valid_first_fault(first_fault))
+                  or (host_guard is not None and not valid_host_guard(host_guard))
+              ):
+                  raise ValueError
+              diagnostic = {
+                  "schema": 1,
+                  "kind": "authorization_probe_diagnostic",
+                  "status": "failed" if stage == "validated_failure" else "unknown",
+                  "workflow_run_id": run_id,
+                  "workflow_run_attempt": run_attempt,
+                  "security_run_id": security_id,
+                  "security_run_attempt": security_attempt,
+                  "source_sha": source_sha,
+                  "helper_bundle_sha256": bundle_sha,
+                  "stage": stage,
+                  "cleanup_status": cleanup_status,
+                  "probe_operation_exit_code": operation_exit,
+                  "helper_exit_code": None,
+                  "ssh_exit_code": None,
+                  "first_fault": first_fault,
+                  "scratch_host_guard_diagnostic": host_guard,
+              }
+              encoded = (json.dumps(diagnostic, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+              if len(encoded) > 4096:
+                  raise ValueError
+              shared_fd, shared_identity = verify_shared_parent(shared_path)
+              try:
+                  filename = f"authorization-probe-diagnostic-{run_id}-{run_attempt}.json"
+                  identity = write_closed_file(shared_fd, filename, encoded)
+                  os.fsync(shared_fd)
+                  verify_shared_parent_identity(shared_fd, shared_path, shared_identity)
+                  verify_owned_entry(shared_fd, filename, identity, len(encoded))
+                  read_back_owned_diagnostic(shared_fd, filename, identity, encoded, diagnostic)
+                  verify_shared_parent_identity(shared_fd, shared_path, shared_identity)
+              finally:
+                  os.close(shared_fd)
+              return diagnostic
+
           def unlink_temporary_capture(capture_path, temporary_path, cap):
               if str(Path(capture_path).parent) != temporary_path:
                   raise OSError
@@ -2562,6 +2711,10 @@ jobs:
                             security_id, security_attempt, source_sha, bundle_sha, temporary_path="/tmp"):
               status = "unknown"
               cleanup_status = "unknown"
+              first_fault = None
+              host_guard = None
+              stage = "report_frame_validation"
+              diagnostic_attempted = False
               shared_fd = None
               pending_name = None
               pending_identity = None
@@ -2583,7 +2736,25 @@ jobs:
                       raise ValueError
                   report_bytes = read_private(report_path, 16384)
                   capture_bytes = read_private(capture_path, 65536)
-                  status, cleanup_status, first_fault = parse_probe_report(report_bytes, capture_bytes, child_status)
+                  status, cleanup_status, first_fault, host_guard = parse_probe_report(
+                      report_bytes, capture_bytes, child_status
+                  )
+                  operation_exit = (
+                      int(child_status)
+                      if re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", str(child_status))
+                      and int(child_status) <= 255
+                      else None
+                  )
+                  if status == "failed":
+                      stage = "validated_failure"
+                      diagnostic_attempted = True
+                      persist_probe_diagnostic(
+                          shared_path, run_id, run_attempt, security_id, security_attempt,
+                          source_sha, bundle_sha, stage, cleanup_status, operation_exit,
+                          first_fault, host_guard,
+                      )
+                  else:
+                      stage = "authorization_receipt_custody"
                   receipt = {
                       "schema": 1,
                       "kind": "authorization_probe_receipt",
@@ -2639,7 +2810,23 @@ jobs:
                   f"bundle_sha256={bundle_sha} status={status} cleanup_status={cleanup_status} receipt=written custody=committed"
                   )
                   return status_code, marker
-              except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+              except Exception:
+                  if not diagnostic_attempted:
+                      diagnostic_attempted = True
+                      operation_exit = (
+                          int(child_status)
+                          if re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", str(child_status))
+                          and int(child_status) <= 255
+                          else None
+                      )
+                      try:
+                          persist_probe_diagnostic(
+                              shared_path, run_id, run_attempt, security_id, security_attempt,
+                              source_sha, bundle_sha, stage, cleanup_status, operation_exit,
+                              first_fault, host_guard,
+                          )
+                      except Exception:
+                          pass
                   if shared_fd is not None and pending_name is not None and pending_identity is not None and pending_size is not None:
                       try:
                           # Keep the pending projection after any final receipt failure.

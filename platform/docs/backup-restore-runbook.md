@@ -273,6 +273,17 @@ uploaded as a workflow artifact. A collision, unsafe directory, failed
 cleanup, or receipt write/sync failure cannot produce a successful probe.
 The probe does not prune or rotate receipts.
 
+Every failed or unclassified probe also attempts a separate root-private
+`authorization_probe_diagnostic` record, bound to the same workflow, Security,
+source and helper-bundle identities. It retains only a fixed stage, wrapper
+exit status when observed, cleanup status, and first-fault/host-memory values
+after their JSON and canonical stderr frames validate together. This record is
+diagnostic only; it is not a completed probe, backup, restore or deployment
+receipt. The workflow commits it before deleting temporary captures. If that
+commit cannot be verified, the operation remains `UNKNOWN` and temporary
+evidence is retained where custody permits. No raw report or stderr is stored
+in either shared receipt or uploaded as an artifact.
+
 Dispatch it from reviewed `dev` with the exact Security run ID/attempt and
 source SHA:
 

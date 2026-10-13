@@ -331,6 +331,14 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "exception_kind": "permission",
             "errno": 1,
         }
+        failed.scratch_authorization_probe = True
+        failed.scratch_host_guard_diagnostic = {
+            "schema": 2,
+            "guard_site": "worker_after_start_before_authorization_probe",
+            "guard_reason": "memory_reserve",
+            "available_bytes": 900_000_000,
+            "required_bytes": 1_073_741_824,
+        }
         self.assertTrue(maintenance._valid_scratch_first_fault(failed.scratch_first_fault))
         self.assertTrue(
             maintenance.backup_restore_drill.valid_scratch_first_fault(
@@ -387,15 +395,112 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         failure_report = json.loads(stdout.getvalue())
         self.assertEqual(
             set(failure_report),
-            {"schema", "kind", "status", "cleanup_status", "first_fault"},
+            {
+                "schema", "kind", "status", "cleanup_status", "first_fault",
+                "scratch_host_guard_diagnostic",
+            },
         )
         self.assertEqual(failure_report["kind"], "authorization_probe")
         self.assertEqual(failure_report["status"], "failed")
         self.assertEqual(failure_report["cleanup_status"], "failed")
         self.assertEqual(failure_report["first_fault"], failed.scratch_first_fault)
+        self.assertEqual(
+            failure_report["scratch_host_guard_diagnostic"],
+            failed.scratch_host_guard_diagnostic,
+        )
+        expected_private_frames = b"".join(
+            frame
+            for frame in (
+                maintenance.backup_restore_drill._scratch_host_guard_frame(
+                    failed.scratch_host_guard_diagnostic
+                ),
+                maintenance.backup_restore_drill._scratch_first_fault_frame(
+                    failed.scratch_first_fault
+                ),
+            )
+            if frame is not None
+        ).decode("ascii")
+        self.assertEqual(stderr.getvalue(), expected_private_frames)
         self.assertNotIn("private failure text", stdout.getvalue())
         self.assertNotIn("private failure text", stderr.getvalue())
         self.assertNotIn("ok", failure_report)
+
+        # Exercise the actual controller host-guard producer through the
+        # in-process probe CLI, then feed those exact bytes to the checked-in
+        # workflow parser. No unit or host operation can start: the guard trips
+        # before the Popen boundary under controlled memory input.
+        drill = maintenance.backup_restore_drill
+        workflow_path = REPO_ROOT / ".github/workflows/platform-production-backup.yml"
+        workflow_source = workflow_path.read_text(encoding="utf-8")
+        parser_anchor = 'if probe_marker="$(/usr/bin/python3 -I - "$backup_report_file"'
+        parser_start = workflow_source.index(parser_anchor)
+        parser_heredoc = workflow_source.index("<<'PY'\n", parser_start) + len("<<'PY'\n")
+        parser_end = workflow_source.index("\n          PY", parser_heredoc)
+        parser_source = textwrap.dedent(workflow_source[parser_heredoc:parser_end])
+        workflow_parser: dict[str, object] = {"__name__": "probe_parser_contract"}
+        exec(compile(parser_source, str(workflow_path), "exec"), workflow_parser)
+
+        def run_actual_probe(_args: object) -> dict[str, object]:
+            return drill.run_scratch_authorization_probe()
+
+        actual_stdout = io.StringIO()
+        actual_stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                maintenance.sys,
+                "argv",
+                [
+                    "platform_storage_maintenance.py",
+                    "--authorization-probe-only",
+                    "--private-backup-diagnostics",
+                    "--apply",
+                    "--json",
+                ],
+            ),
+            mock.patch.object(drill.os, "geteuid", return_value=0),
+            mock.patch.object(drill, "require_commands"),
+            mock.patch.object(drill, "require_restore_headroom") as disk_guard,
+            mock.patch.object(
+                drill, "_scratch_mem_available_bytes", return_value=900_000_000
+            ) as memory_read,
+            mock.patch.object(
+                drill.subprocess,
+                "Popen",
+                side_effect=AssertionError("host guard must stop before unit launch"),
+            ) as unit_launch,
+            mock.patch.object(maintenance, "run_maintenance", side_effect=run_actual_probe),
+            mock.patch.object(maintenance.sys, "stdout", actual_stdout),
+            mock.patch.object(maintenance.sys, "stderr", actual_stderr),
+        ):
+            self.assertEqual(maintenance.main(), 1)
+        disk_guard.assert_called_once()
+        memory_read.assert_called_once()
+        unit_launch.assert_not_called()
+        actual_report = json.loads(actual_stdout.getvalue())
+        self.assertEqual(actual_report["status"], "failed")
+        self.assertEqual(actual_report["cleanup_status"], "unknown")
+        self.assertEqual(actual_report["scratch_host_guard_diagnostic"], {
+            "schema": 2,
+            "guard_site": "parent_before_authorization_probe",
+            "guard_reason": "memory_reserve",
+            "available_bytes": 900_000_000,
+            "required_bytes": 1_073_741_824,
+        })
+        self.assertEqual(actual_report["scratch_first_fault"]["origin"], "controller")
+        self.assertNotIn("private failure text", actual_stdout.getvalue())
+        self.assertEqual(
+            workflow_parser["parse_probe_report"](
+                actual_stdout.getvalue().encode("utf-8"),
+                actual_stderr.getvalue().encode("ascii"),
+                "1",
+            ),
+            (
+                "failed",
+                "unknown",
+                actual_report["first_fault"],
+                actual_report["scratch_host_guard_diagnostic"],
+            ),
+        )
 
     def test_preserve_existing_backups_is_full_apply_only(self) -> None:
         with mock.patch.object(
