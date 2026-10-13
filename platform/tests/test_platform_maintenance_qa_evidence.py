@@ -103,7 +103,7 @@ def _loaded_unit_properties(argv: tuple[str, ...] | None = None) -> str:
         + selected_argv[0]
         + " ; argv[]="
         + " ".join(selected_argv)
-        + " ; ignore_errors=no ; start_time=[not set] ; stop_time=[not set]"
+        + " ; ignore_errors=no ; start_time= ; stop_time="
         + " ; pid=0 ; code=(null) ; status=0/0 }"
     )
     properties = {
@@ -375,6 +375,30 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             ("unknown-property", _loaded_unit_properties() + "Unknown=value\n"),
             ("duplicate-property", _loaded_unit_properties() + "MemoryMax=536870912\n"),
             ("missing-property", _loaded_unit_properties().replace("SubState=dead\n", "")),
+            (
+                "empty-exec-path",
+                _loaded_unit_properties().replace(
+                    "{ path=/opt/oldsparky/platform/shared/venv/bin/python",
+                    "{ path=",
+                    1,
+                ),
+            ),
+            (
+                "empty-exec-argv",
+                _loaded_unit_properties().replace(
+                    "argv[]=" + " ".join(evidence.EXPECTED_MAINTENANCE_ARGV),
+                    "argv[]=",
+                    1,
+                ),
+            ),
+            (
+                "empty-exec-status",
+                _loaded_unit_properties().replace("status=0/0", "status=", 1),
+            ),
+            (
+                "malformed-exec-fields",
+                _loaded_unit_properties().replace(" ; pid=0 ;", " ; pid= ;", 1),
+            ),
         )
         for case, output in invalid_outputs:
             with self.subTest(case=case), self.assertRaises(evidence.EvidenceError):

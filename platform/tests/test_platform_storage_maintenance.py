@@ -4848,6 +4848,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "PROD_SSH_USER": "operator",
                 "EXPECTED_SHA": "a" * 40,
                 "CONFIRMATION": "APPLY-PRODUCTION-STORAGE-MAINTENANCE",
+                "ENABLE_MAINTENANCE_TIMER": "false",
                 "FIXTURE_REMOTE_STDOUT": fixture,
                 "FIXTURE_REMOTE_STDERR": private_stderr,
                 "FIXTURE_SSH_STATUS": "23",

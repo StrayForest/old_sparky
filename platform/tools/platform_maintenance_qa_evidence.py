@@ -233,7 +233,12 @@ def _parse_systemd_exec_start(value: object) -> dict[str, str]:
     fields: dict[str, str] = {}
     for item in value[2:-2].split(" ; "):
         key, separator, field_value = item.partition("=")
-        if not separator or key not in EXEC_START_FIELDS or key in fields or not field_value:
+        if (
+            not separator
+            or key not in EXEC_START_FIELDS
+            or key in fields
+            or (not field_value and key not in {"start_time", "stop_time"})
+        ):
             _fail()
         fields[key] = field_value
     if tuple(fields) != EXEC_START_FIELDS:
