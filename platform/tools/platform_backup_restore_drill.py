@@ -83,10 +83,223 @@ SCRATCH_START_TOKEN = b"OLDSPARKY_SCRATCH_RESTORE_START_V1\n"
 SCRATCH_DONE_TOKEN = b"OLDSPARKY_SCRATCH_RESTORE_DONE_V1\n"
 SCRATCH_APP_ROLE = "platform_user"
 SCRATCH_PRIVATE_OUTPUT_MARKER = b"SCRATCH_UNIT_PRIVATE_OUTPUT_V1\n"
+SCRATCH_FIRST_FAULT_MARKER = b"SCRATCH_FIRST_FAULT_V1\n"
 SCRATCH_PRIVATE_STDOUT_BYTES = 2 * 1024
 SCRATCH_PRIVATE_STDERR_BYTES = 32 * 1024
 SCRATCH_PRIVATE_RAW_BYTES = SCRATCH_PRIVATE_STDOUT_BYTES + SCRATCH_PRIVATE_STDERR_BYTES
 SCRATCH_PRIVATE_ENVELOPE_BYTES = 48 * 1024
+SCRATCH_AUTHORIZATION_PROBE_FRAME = (
+    b'{"kind":"authorization_probe","schema":1,"status":"completed"}\n'
+)
+
+_SCRATCH_FIRST_FAULT_ORIGINS = frozenset({"controller", "worker"})
+_SCRATCH_FIRST_FAULT_SITES = frozenset(
+    {
+        "controller_entry",
+        "controller_archive_identity",
+        "controller_unit_setup",
+        "controller_host_guard",
+        "controller_launch",
+        "controller_unit_snapshot",
+        "controller_identity",
+        "controller_start_token",
+        "controller_active_poll",
+        "controller_worker_frame",
+        "controller_completion_snapshot",
+        "controller_done_token",
+        "controller_final_snapshot",
+        "controller_cleanup",
+        "worker_entry",
+        "worker_start_token",
+        "worker_root_identity",
+        "worker_mount_snapshot",
+        "worker_cgroup_snapshot",
+        "worker_host_reserve",
+        "worker_archive_open",
+        "worker_directory_setup",
+        "worker_postgres_tools",
+        "worker_initdb",
+        "worker_after_initdb_guard",
+        "worker_postgres_start",
+        "worker_after_postgres_start_guard",
+        "worker_role_setup",
+        "worker_pg_restore_resource_guard",
+        "worker_restore",
+        "worker_after_restore_guard",
+        "worker_postgres_stop",
+        "worker_result_frame",
+        "worker_done_token",
+    }
+)
+_SCRATCH_FIRST_FAULT_KINDS = frozenset(
+    {
+        "permission",
+        "os_error",
+        "timeout",
+        "subprocess",
+        "json_decode",
+        "unicode",
+        "attribute",
+        "index",
+        "name",
+        "type",
+        "key",
+        "value",
+        "restore_guard_stop",
+        "backup_interrupted",
+        "scratch_token_delivery",
+        "runtime",
+        "other",
+    }
+)
+
+
+def valid_scratch_first_fault(value: Any) -> bool:
+    """Validate a closed first-fault projection without accepting raw details."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "origin", "site", "exception_kind", "errno"
+    }:
+        return False
+    if (
+        type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or type(value.get("origin")) is not str
+        or value["origin"] not in _SCRATCH_FIRST_FAULT_ORIGINS
+        or type(value.get("site")) is not str
+        or value["site"] not in _SCRATCH_FIRST_FAULT_SITES
+        or type(value.get("exception_kind")) is not str
+        or value["exception_kind"] not in _SCRATCH_FIRST_FAULT_KINDS
+        or (
+            value.get("errno") is not None
+            and (type(value["errno"]) is not int or not 1 <= value["errno"] <= 4095)
+        )
+    ):
+        return False
+    expected_origin = (
+        "controller" if value["site"].startswith("controller_")
+        else "worker" if value["site"].startswith("worker_")
+        else None
+    )
+    if value["origin"] != expected_origin:
+        return False
+    if value["exception_kind"] in {"permission", "os_error"}:
+        return value["errno"] is None or type(value["errno"]) is int
+    return value["errno"] is None
+
+
+def _scratch_exception_projection(error: BaseException) -> tuple[str, int | None]:
+    """Map exception chains to fixed kinds; never return class or message text."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    candidates: list[BaseException] = []
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        candidates.append(current)
+        current = current.__cause__ or current.__context__
+
+    def kind(item: BaseException) -> str:
+        if isinstance(item, RestoreGuardStop):
+            return "restore_guard_stop"
+        if isinstance(item, BackupOperationInterrupted):
+            return "backup_interrupted"
+        if isinstance(item, _ScratchTokenDeliveryError):
+            return "scratch_token_delivery"
+        if isinstance(item, PermissionError):
+            return "permission"
+        if isinstance(item, OSError):
+            return "os_error"
+        if isinstance(item, subprocess.TimeoutExpired):
+            return "timeout"
+        if isinstance(item, subprocess.SubprocessError):
+            return "subprocess"
+        if isinstance(item, json.JSONDecodeError):
+            return "json_decode"
+        if isinstance(item, UnicodeError):
+            return "unicode"
+        if isinstance(item, AttributeError):
+            return "attribute"
+        if isinstance(item, IndexError):
+            return "index"
+        if isinstance(item, NameError):
+            return "name"
+        if isinstance(item, TypeError):
+            return "type"
+        if isinstance(item, KeyError):
+            return "key"
+        if isinstance(item, ValueError):
+            return "value"
+        if isinstance(item, RuntimeError):
+            return "runtime"
+        return "other"
+
+    for candidate in candidates:
+        selected = kind(candidate)
+        if selected not in {"runtime", "other"}:
+            errno = candidate.errno if isinstance(candidate, OSError) else None
+            return selected, errno if type(errno) is int and 1 <= errno <= 4095 else None
+    selected = kind(error)
+    errno = error.errno if isinstance(error, OSError) else None
+    return selected, errno if type(errno) is int and 1 <= errno <= 4095 else None
+
+
+def _scratch_first_fault(error: BaseException, *, origin: str, site: str) -> dict[str, Any] | None:
+    exception_kind, errno = _scratch_exception_projection(error)
+    value = {
+        "schema": 1,
+        "origin": origin,
+        "site": site,
+        "exception_kind": exception_kind,
+        "errno": errno if exception_kind in {"permission", "os_error"} else None,
+    }
+    return value if valid_scratch_first_fault(value) else None
+
+
+def _retain_first_scratch_fault(error: BaseException, *, origin: str, site: str) -> None:
+    if getattr(error, "scratch_first_fault", None) is not None:
+        return
+    diagnostic = _scratch_first_fault(error, origin=origin, site=site)
+    if diagnostic is not None:
+        setattr(error, "scratch_first_fault", diagnostic)
+
+
+def _scratch_cleanup_failure(
+    primary_error: BaseException | None,
+    cleanup_errors: list[BaseException],
+    *,
+    authorization_probe: bool,
+) -> BaseException | None:
+    """Keep cleanup status separate and never replace an existing first fault."""
+    if not cleanup_errors:
+        if primary_error is not None and authorization_probe:
+            setattr(primary_error, "scratch_cleanup_status", "confirmed")
+        return None
+    if primary_error is not None:
+        if authorization_probe:
+            setattr(primary_error, "scratch_cleanup_status", "failed")
+        if hasattr(primary_error, "add_note"):
+            primary_error.add_note("Scratch restore final cleanup also failed.")
+        return None
+    cleanup_error = RuntimeError(
+        "Scratch restore unit or mount cleanup could not be confirmed."
+    )
+    if authorization_probe:
+        setattr(cleanup_error, "scratch_authorization_probe", True)
+        setattr(cleanup_error, "scratch_cleanup_status", "failed")
+    _retain_first_scratch_fault(
+        cleanup_error,
+        origin="controller",
+        site="controller_cleanup",
+    )
+    return cleanup_error
+
+
+def _scratch_first_fault_frame(value: Any) -> bytes | None:
+    if not valid_scratch_first_fault(value):
+        return None
+    payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("ascii")
+    return SCRATCH_FIRST_FAULT_MARKER + payload + b"\n"
 
 
 class RestoreGuardStop(RuntimeError):
@@ -286,10 +499,12 @@ def valid_scratch_admission_diagnostic(value: Any) -> bool:
 _SCRATCH_HOST_GUARD_SITES = frozenset(
     {
         "parent_before_archive_open",
+        "parent_before_authorization_probe",
         "parent_before_unit_launch",
         "parent_active_poll",
         "parent_after_worker_cleanup",
         "worker_after_start_before_archive_open",
+        "worker_after_start_before_authorization_probe",
         "worker_after_initdb_before_postgres_start",
         "worker_after_postgres_start",
         "worker_pg_restore_resource_guard",
@@ -437,6 +652,51 @@ def _parse_bound_scratch_host_guard_diagnostic(
     )
     frame = parse_scratch_host_guard_frame(stderr, truncated=stderr_truncated)
     return report if report is not None and report == frame else None
+
+
+def _parse_bound_scratch_first_fault(
+    stdout: bytes,
+    stderr: bytes,
+    *,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> dict[str, Any] | None:
+    """Promote a worker first-fault only when its closed report and frame agree."""
+    if stdout_truncated or stderr_truncated or not stdout or not stderr:
+        return None
+    marker_count = stderr.count(SCRATCH_FIRST_FAULT_MARKER)
+    if marker_count != 1:
+        return None
+    marker_start = stderr.index(SCRATCH_FIRST_FAULT_MARKER) + len(SCRATCH_FIRST_FAULT_MARKER)
+    marker_end = stderr.find(b"\n", marker_start)
+    if marker_end < 0:
+        return None
+    frame_bytes = stderr[marker_start:marker_end]
+    if not frame_bytes or len(frame_bytes) > 512:
+        return None
+    try:
+        frame = json.loads(frame_bytes.decode("ascii"))
+        report = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(report, dict)
+        or report.get("ok") is not False
+        or not isinstance(report.get("error"), str)
+        or set(report) - {
+            "ok", "error", "restore_diagnostic", "backup_disk_diagnostic",
+            "scratch_unit_diagnostic", "scratch_admission_diagnostic",
+            "scratch_host_guard_diagnostic", "scratch_first_fault",
+        }
+    ):
+        return None
+    value = report.get("scratch_first_fault")
+    if not valid_scratch_first_fault(value) or frame != value:
+        return None
+    canonical_report = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    if stdout != canonical_report:
+        return None
+    return value
 
 
 def _scratch_host_guard_frame(value: Any) -> bytes | None:
@@ -829,6 +1089,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--_scratch-archive-size", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-archive-sha256", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-timestamp-slug", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_scratch-authorization-probe", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.private_scratch_diagnostics and not args.as_json:
         parser.error("--private-scratch-diagnostics requires --json")
@@ -2645,6 +2906,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         time.monotonic() + SCRATCH_STARTUP_SECONDS,
     )
     try:
+        args._scratch_fault_site = "worker_start_token"
         authorization = _scratch_read_worker_token(
             sys.stdin,
             SCRATCH_START_TOKEN,
@@ -2659,19 +2921,58 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         if name.startswith("PG"):
             os.environ.pop(name, None)
     root = pathlib.Path(args._scratch_root)
+    args._scratch_fault_site = "worker_root_identity"
     if (
         not re.fullmatch(r"/run/oldsparky-backup-restore-[0-9a-f]{24}", str(root))
         or not root.is_dir()
     ):
         raise RuntimeError("Scratch restore root is invalid.")
+    args._scratch_fault_site = "worker_mount_snapshot"
     _scratch_mount_snapshot(root)
+    args._scratch_fault_site = "worker_cgroup_snapshot"
     _scratch_cgroup_snapshot()
-    _raise_scratch_host_memory_reserve(
-        "worker_after_start_before_archive_open",
-        message="Scratch restore admission memory reserve is unavailable.",
-    )
+    args._scratch_fault_site = "worker_host_reserve"
+    if getattr(args, "_scratch_authorization_probe", False):
+        _raise_scratch_host_memory_reserve(
+            "worker_after_start_before_authorization_probe",
+            message="Scratch restore admission memory reserve is unavailable.",
+        )
+    else:
+        _raise_scratch_host_memory_reserve(
+            "worker_after_start_before_archive_open",
+            message="Scratch restore admission memory reserve is unavailable.",
+        )
     if os.geteuid() != 0:
         raise RuntimeError("Scratch restore supervisor is not root.")
+    if getattr(args, "_scratch_authorization_probe", False):
+        if any(
+            getattr(args, name, None) is not None
+            for name in (
+                "_scratch_archive", "_scratch_archive_dev", "_scratch_archive_ino",
+                "_scratch_archive_size", "_scratch_archive_sha256",
+            )
+        ):
+            raise RuntimeError("Authorization probe must not receive archive identity.")
+        args._scratch_fault_site = "worker_result_frame"
+        result_stream = getattr(sys.stdout, "buffer", None)
+        if result_stream is None:
+            raise RuntimeError("Scratch authorization probe result channel is unavailable.")
+        result_stream.write(SCRATCH_AUTHORIZATION_PROBE_FRAME)
+        result_stream.flush()
+        try:
+            args._scratch_fault_site = "worker_done_token"
+            completion = _scratch_read_worker_token(
+                sys.stdin,
+                SCRATCH_DONE_TOKEN,
+                require_eof=True,
+                deadline=worker_deadline,
+            )
+        except (OSError, AttributeError) as exc:
+            raise RuntimeError("Scratch authorization probe completion was not acknowledged.") from exc
+        if completion != SCRATCH_DONE_TOKEN:
+            raise RuntimeError("Scratch authorization probe completion was not acknowledged.")
+        return 0
+    args._scratch_fault_site = "worker_archive_open"
     archive = _open_verified_scratch_archive(args)
     archive_info = os.fstat(archive.fileno())
     if (archive_info.st_dev, archive_info.st_ino) != (args._scratch_archive_dev, args._scratch_archive_ino):
@@ -2679,6 +2980,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         raise RuntimeError("Scratch restore archive bind identity does not match.")
 
     postgres = pwd.getpwnam("postgres")
+    args._scratch_fault_site = "worker_directory_setup"
     os.chown(root, postgres.pw_uid, postgres.pw_gid)
     pgdata = root / "data"
     socket_dir = root / "socket"
@@ -2694,6 +2996,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
             capture_output=capture_output,
         )
 
+    args._scratch_fault_site = "worker_postgres_tools"
     bindir_result = run_command(["pg_config", "--bindir"], capture_output=True)
     bindir = pathlib.Path(bindir_result.stdout.strip())
     version_result = run_command([str(bindir / "postgres"), "--version"], capture_output=True)
@@ -2703,6 +3006,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     require_commands("runuser")
     pgctl = str(bindir / "pg_ctl")
     initdb = str(bindir / "initdb")
+    args._scratch_fault_site = "worker_initdb"
     as_postgres(
         [
             initdb,
@@ -2720,6 +3024,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     primary_error: BaseException | None = None
     table_count: int | None = None
     try:
+        args._scratch_fault_site = "worker_after_initdb_guard"
         _scratch_resource_guard(
             root, guard_site="worker_after_initdb_before_postgres_start"
         )
@@ -2749,13 +3054,16 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
                 "max_connections=10",
             ]
         )
+        args._scratch_fault_site = "worker_postgres_start"
         as_postgres(
             [pgctl, "--pgdata", str(pgdata), "--log", str(pglog), "--options", server_options,
              "--wait", "--timeout=30", "start"],
             capture_output=True,
         )
         started = True
+        args._scratch_fault_site = "worker_after_postgres_start_guard"
         _scratch_resource_guard(root, guard_site="worker_after_postgres_start")
+        args._scratch_fault_site = "worker_role_setup"
         admin_target = DatabaseTarget(
             host=str(socket_dir),
             port=SCRATCH_PG_PORT,
@@ -2771,6 +3079,12 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
             password=None,
             database="postgres",
         )
+        args._scratch_fault_site = "worker_restore"
+
+        def pg_restore_resource_guard() -> None:
+            args._scratch_fault_site = "worker_pg_restore_resource_guard"
+            _scratch_resource_guard(root, guard_site="worker_pg_restore_resource_guard")
+
         table_count = perform_restore_drill(
             root / "archive.dump",
             app_target=scratch_target,
@@ -2779,15 +3093,20 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
             archive_stdin=archive,
             restore_as_postgres=True,
             restore_no_tablespaces=True,
-            resource_guard=lambda: _scratch_resource_guard(
-                root, guard_site="worker_pg_restore_resource_guard"
-            ),
+            resource_guard=pg_restore_resource_guard,
             capture_private_output=getattr(args, "private_scratch_diagnostics", False),
         )
+        args._scratch_fault_site = "worker_after_restore_guard"
         _scratch_resource_guard(
             root, guard_site="worker_after_restore_before_postgres_stop"
         )
     except BaseException as exc:
+        if getattr(args, "private_scratch_diagnostics", False):
+            _retain_first_scratch_fault(
+                exc,
+                origin="worker",
+                site=getattr(args, "_scratch_fault_site", "worker_entry"),
+            )
         primary_error = exc
         if getattr(args, "private_scratch_diagnostics", False) and not hasattr(
             exc, "scratch_worker_private_output"
@@ -2829,6 +3148,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
                 )
     finally:
         if started or (pgdata / "postmaster.pid").exists():
+            args._scratch_fault_site = "worker_postgres_stop"
             try:
                 as_postgres(
                     [pgctl, "--pgdata", str(pgdata), "--mode=fast", "--wait", "--timeout=20", "stop"],
@@ -2860,6 +3180,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     if table_count is None or (pgdata / "postmaster.pid").exists():
         raise RuntimeError("Scratch restore server teardown was not confirmed.")
     result_stream = getattr(sys.stdout, "buffer", None)
+    args._scratch_fault_site = "worker_result_frame"
     if result_stream is None:
         raise RuntimeError("Scratch restore result channel is unavailable.")
     result_stream.write(
@@ -2867,6 +3188,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     )
     result_stream.flush()
     try:
+        args._scratch_fault_site = "worker_done_token"
         completion = _scratch_read_worker_token(
             sys.stdin,
             SCRATCH_DONE_TOKEN,
@@ -2897,12 +3219,13 @@ def _scratch_create_application_role(admin_target: DatabaseTarget) -> None:
 def _scratch_unit_command(
     *,
     mountpoint: pathlib.Path,
-    archive_path: pathlib.Path,
-    archive_stat: os.stat_result,
-    archive_sha256: str,
+    archive_path: pathlib.Path | None,
+    archive_stat: os.stat_result | None,
+    archive_sha256: str | None,
     timestamp_slug: str,
     unit_name: str,
     private_scratch_diagnostics: bool = False,
+    authorization_probe: bool = False,
 ) -> list[str]:
     source_script = pathlib.Path(__file__).resolve(strict=True)
     source_policy = source_script.with_name("platform_disk_policy.py").resolve(strict=True)
@@ -2920,7 +3243,6 @@ def _scratch_unit_command(
         f"--unit={unit_name}",
         "--property=Type=exec",
         f"--property=TemporaryFileSystem={mountpoint}:rw,size={SCRATCH_TMPFS_BYTES},mode=0700",
-        f"--property=BindReadOnlyPaths={archive_path}:{archive_target}",
         f"--property=BindReadOnlyPaths={source_script}:{worker_target}",
         f"--property=BindReadOnlyPaths={source_policy}:{policy_target}",
         f"--property=MemoryMax={SCRATCH_MEMORY_MAX_BYTES}",
@@ -2961,19 +3283,29 @@ def _scratch_unit_command(
         SCRATCH_WORKER_MODE,
         "--_scratch-root",
         str(mountpoint),
-        "--_scratch-archive",
-        str(archive_target),
-        "--_scratch-archive-dev",
-        str(archive_stat.st_dev),
-        "--_scratch-archive-ino",
-        str(archive_stat.st_ino),
-        "--_scratch-archive-size",
-        str(archive_stat.st_size),
-        "--_scratch-archive-sha256",
-        archive_sha256,
         "--_scratch-timestamp-slug",
         timestamp_slug,
     ]
+    if authorization_probe:
+        if archive_path is not None or archive_stat is not None or archive_sha256 is not None:
+            raise ValueError("Authorization probe cannot bind archive inputs.")
+        command.append("--_scratch-authorization-probe")
+    else:
+        if archive_path is None or archive_stat is None or archive_sha256 is None:
+            raise ValueError("Scratch restore requires a complete archive identity.")
+        command.insert(
+            command.index(f"--property=BindReadOnlyPaths={source_script}:{worker_target}"),
+            f"--property=BindReadOnlyPaths={archive_path}:{archive_target}",
+        )
+        command.extend(
+            (
+                "--_scratch-archive", str(archive_target),
+                "--_scratch-archive-dev", str(archive_stat.st_dev),
+                "--_scratch-archive-ino", str(archive_stat.st_ino),
+                "--_scratch-archive-size", str(archive_stat.st_size),
+                "--_scratch-archive-sha256", archive_sha256,
+            )
+        )
     if private_scratch_diagnostics:
         command.extend(("--json", "--private-scratch-diagnostics"))
     if any("ReadWritePaths=" in part for part in command):
@@ -3256,12 +3588,30 @@ def _scratch_worker_candidate(stdout: bytes) -> dict[str, Any] | None:
     return decoded
 
 
+def _scratch_authorization_probe_candidate(stdout: bytes) -> dict[str, Any] | None:
+    """Accept only the probe-only result frame, never a restore receipt."""
+    if stdout != SCRATCH_AUTHORIZATION_PROBE_FRAME:
+        return None
+    try:
+        candidate = json.loads(stdout.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if candidate != {
+        "kind": "authorization_probe",
+        "schema": 1,
+        "status": "completed",
+    }:
+        return None
+    return candidate
+
+
 def _scratch_expected_properties(
     snapshot: dict[str, Any],
     *,
     unit_name: str,
     mountpoint: pathlib.Path,
     python_binary: pathlib.Path,
+    authorization_probe: bool = False,
 ) -> str:
     properties = snapshot.get("properties")
     if not isinstance(properties, dict):
@@ -3326,19 +3676,21 @@ def _scratch_expected_properties(
         if required not in inaccessible:
             raise RuntimeError("Scratch restore service can see an out-of-scope credential or cluster path.")
     bind_paths = properties.get("BindReadOnlyPaths", "")
-    for required in (
-        str(mountpoint / "archive.dump"),
+    required_binds = [
         str(mountpoint / "platform_backup_restore_drill.py"),
         str(mountpoint / "platform_disk_policy.py"),
-    ):
+    ]
+    if not authorization_probe:
+        required_binds.insert(0, str(mountpoint / "archive.dump"))
+    for required in required_binds:
         if required not in bind_paths:
             raise RuntimeError("Scratch restore service is missing a required read-only input bind.")
+    if authorization_probe and str(mountpoint / "archive.dump") in bind_paths:
+        raise RuntimeError("Scratch authorization probe has an unexpected archive bind.")
     return control_group
 
 
-def _scratch_host_guard(
-    guard_site: str = "parent_before_archive_open",
-) -> None:
+def _scratch_host_guard(guard_site: str = "parent_before_archive_open") -> None:
     require_restore_headroom(pathlib.Path("/"))
     _raise_scratch_host_memory_reserve(
         guard_site,
@@ -3372,62 +3724,92 @@ def _scratch_stop_unit(unit_name: str) -> None:
 
 
 def _run_isolated_restore_drill(
-    dump_path: pathlib.Path,
+    dump_path: pathlib.Path | None,
     *,
     timestamp_slug: str,
     private_scratch_diagnostics: bool = False,
+    authorization_probe: bool = False,
 ) -> int:
-    """Restore into a capped, disposable PostgreSQL cluster isolated from production."""
-    if os.geteuid() != 0:
-        raise RuntimeError("Isolated backup verification requires the root maintenance owner.")
-    if re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", timestamp_slug) is None:
-        raise ValueError("Scratch restore timestamp identity is invalid.")
-    require_commands("systemd-run", "systemctl", "pg_config", "runuser")
-    _scratch_host_guard("parent_before_archive_open")
-    archive_path = dump_path.absolute()
-    archive_descriptor = os.open(
-        archive_path,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-    )
+    """Run a restore drill or the distinct no-archive authorization protocol."""
+    fault_site = "controller_entry"
     try:
-        archive_before = os.fstat(archive_descriptor)
-        path_before = archive_path.lstat()
-        if (
-            not stat.S_ISREG(archive_before.st_mode)
-            or archive_before.st_uid != 0
-            or stat.S_IMODE(archive_before.st_mode) != 0o600
-            or archive_before.st_nlink != 1
-            or (archive_before.st_dev, archive_before.st_ino)
-            != (path_before.st_dev, path_before.st_ino)
-            or archive_before.st_size <= 5
-        ):
-            raise RuntimeError("Scratch restore archive identity is unsafe.")
-        archive_hash = hashlib.sha256()
-        total_bytes = 0
-        while True:
-            chunk = os.read(archive_descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            archive_hash.update(chunk)
-            total_bytes += len(chunk)
-        archive_after = os.fstat(archive_descriptor)
-        if (
-            total_bytes != archive_before.st_size
-            or os.pread(archive_descriptor, 5, 0) != b"PGDMP"
-            or (archive_before.st_dev, archive_before.st_ino, archive_before.st_size,
-                archive_before.st_mtime_ns, archive_before.st_ctime_ns)
-            != (archive_after.st_dev, archive_after.st_ino, archive_after.st_size,
-                archive_after.st_mtime_ns, archive_after.st_ctime_ns)
-        ):
-            raise RuntimeError("Scratch restore archive content or identity is invalid.")
-        archive_sha256 = archive_hash.hexdigest()
-        os.lseek(archive_descriptor, 0, os.SEEK_SET)
+        if os.geteuid() != 0:
+            raise RuntimeError("Isolated backup verification requires the root maintenance owner.")
+        if re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", timestamp_slug) is None:
+            raise ValueError("Scratch restore timestamp identity is invalid.")
+        fault_site = "controller_entry"
+        if authorization_probe:
+            if dump_path is not None:
+                raise ValueError("Authorization probe must not receive an archive path.")
+            require_commands("systemd-run", "systemctl")
+        else:
+            if dump_path is None:
+                raise ValueError("Scratch restore requires an archive path.")
+            require_commands("systemd-run", "systemctl", "pg_config", "runuser")
+        fault_site = "controller_host_guard"
+        if authorization_probe:
+            _scratch_host_guard("parent_before_authorization_probe")
+        else:
+            _scratch_host_guard("parent_before_archive_open")
+    except BaseException as exc:
+        if authorization_probe:
+            setattr(exc, "scratch_authorization_probe", True)
+        _retain_first_scratch_fault(exc, origin="controller", site=fault_site)
+        raise
+    archive_path: pathlib.Path | None = None
+    archive_descriptor: int | None = None
+    archive_before: os.stat_result | None = None
+    archive_sha256: str | None = None
+    if not authorization_probe:
+        assert dump_path is not None
+        fault_site = "controller_archive_identity"
+        archive_path = dump_path.absolute()
+    try:
+        if not authorization_probe:
+            assert archive_descriptor is not None and archive_path is not None
+            archive_descriptor = os.open(
+                archive_path,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            archive_before = os.fstat(archive_descriptor)
+            path_before = archive_path.lstat()
+            if (
+                not stat.S_ISREG(archive_before.st_mode)
+                or archive_before.st_uid != 0
+                or stat.S_IMODE(archive_before.st_mode) != 0o600
+                or archive_before.st_nlink != 1
+                or (archive_before.st_dev, archive_before.st_ino)
+                != (path_before.st_dev, path_before.st_ino)
+                or archive_before.st_size <= 5
+            ):
+                raise RuntimeError("Scratch restore archive identity is unsafe.")
+            archive_hash = hashlib.sha256()
+            total_bytes = 0
+            while True:
+                chunk = os.read(archive_descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                archive_hash.update(chunk)
+                total_bytes += len(chunk)
+            archive_after = os.fstat(archive_descriptor)
+            if (
+                total_bytes != archive_before.st_size
+                or os.pread(archive_descriptor, 5, 0) != b"PGDMP"
+                or (archive_before.st_dev, archive_before.st_ino, archive_before.st_size,
+                    archive_before.st_mtime_ns, archive_before.st_ctime_ns)
+                != (archive_after.st_dev, archive_after.st_ino, archive_after.st_size,
+                    archive_after.st_mtime_ns, archive_after.st_ctime_ns)
+            ):
+                raise RuntimeError("Scratch restore archive content or identity is invalid.")
+            archive_sha256 = archive_hash.hexdigest()
+            os.lseek(archive_descriptor, 0, os.SEEK_SET)
         host_run_stat = pathlib.Path("/run").stat()
         if not stat.S_ISDIR(host_run_stat.st_mode) or host_run_stat.st_uid != 0:
             raise RuntimeError("Scratch restore mount parent is not the trusted root-owned /run directory.")
         token = secrets.token_hex(12)
         mountpoint = pathlib.Path(f"/run/oldsparky-backup-restore-{token}")
         unit_name = f"oldsparky-backup-restore-{token}.service"
+        fault_site = "controller_unit_setup"
         command = _scratch_unit_command(
             mountpoint=mountpoint,
             archive_path=archive_path,
@@ -3436,6 +3818,7 @@ def _run_isolated_restore_drill(
             timestamp_slug=timestamp_slug,
             unit_name=unit_name,
             private_scratch_diagnostics=private_scratch_diagnostics,
+            authorization_probe=authorization_probe,
         )
         environment = {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -3488,6 +3871,7 @@ def _run_isolated_restore_drill(
             # A pending TERM/INT is delivered only after the exact host
             # mountpoint identity is ready for the normal cleanup path.
             signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
+            fault_site = "controller_host_guard"
             _scratch_host_guard("parent_before_unit_launch")
             # Do not let a termination signal land after the client process
             # starts but before its handle and unit-cleanup state are recorded.
@@ -3497,6 +3881,7 @@ def _run_isolated_restore_drill(
                 # invoked, even if Popen itself raises after systemd accepted
                 # the transient unit request.
                 launch_started = True
+                fault_site = "controller_launch"
                 startup_deadline = time.monotonic() + SCRATCH_STARTUP_SECONDS
                 process = subprocess.Popen(
                     command,
@@ -3520,7 +3905,9 @@ def _run_isolated_restore_drill(
                 now = time.monotonic()
                 if now >= deadline or now - last_tick > SCRATCH_RUNTIME_SAMPLE_SECONDS * 8:
                     raise RuntimeError("Scratch restore monitor exceeded its bounded runtime or sample interval.")
+                fault_site = "controller_active_poll"
                 _scratch_host_guard("parent_active_poll")
+                fault_site = "controller_unit_snapshot"
                 snapshot = _scratch_service_snapshot(unit_name)
                 properties = snapshot.get("properties", {})
                 active_state = properties.get("ActiveState")
@@ -3545,6 +3932,7 @@ def _run_isolated_restore_drill(
                     # output must reach the existing private diagnostic path.
                     early_exit_snapshot = snapshot
                     try:
+                        fault_site = "controller_identity"
                         verified_control_group = _scratch_expected_properties(
                             snapshot,
                             unit_name=unit_name,
@@ -3552,6 +3940,7 @@ def _run_isolated_restore_drill(
                             python_binary=pathlib.Path(
                                 getattr(sys, "_base_executable", sys.executable)
                             ).resolve(strict=True),
+                            authorization_probe=authorization_probe,
                         )
                         _scratch_control_group_snapshot(verified_control_group)
                         invocation_id = properties.get("InvocationID", "")
@@ -3564,6 +3953,7 @@ def _run_isolated_restore_drill(
                         if active_identity is None:
                             if time.monotonic() >= startup_deadline or process.poll() is not None:
                                 raise RuntimeError("Scratch restore worker exited before authorization.")
+                            fault_site = "controller_identity"
                             second_snapshot = _scratch_service_snapshot(unit_name)
                             second_properties = second_snapshot.get("properties", {})
                             if (
@@ -3580,6 +3970,7 @@ def _run_isolated_restore_drill(
                                 python_binary=pathlib.Path(
                                     getattr(sys, "_base_executable", sys.executable)
                                 ).resolve(strict=True),
+                                authorization_probe=authorization_probe,
                             )
                             _scratch_control_group_snapshot(second_control_group)
                             if (
@@ -3594,6 +3985,7 @@ def _run_isolated_restore_drill(
                             active_control_group = verified_control_group
                             active_snapshot = second_snapshot
                             try:
+                                fault_site = "controller_start_token"
                                 _scratch_send_worker_token(
                                     process,
                                     token=SCRATCH_START_TOKEN,
@@ -3659,10 +4051,16 @@ def _run_isolated_restore_drill(
                         if stderr_size > 65536:
                             raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
                 if start_token_sent and not completion_token_sent and stdout_buffer:
-                    candidate = _scratch_worker_candidate(bytes(stdout_buffer))
+                    fault_site = "controller_worker_frame"
+                    candidate = (
+                        _scratch_authorization_probe_candidate(bytes(stdout_buffer))
+                        if authorization_probe
+                        else _scratch_worker_candidate(bytes(stdout_buffer))
+                    )
                     if candidate is not None:
                         if active_identity is None or active_control_group is None:
                             raise RuntimeError("Scratch restore worker identity was not retained through completion.")
+                        fault_site = "controller_completion_snapshot"
                         final_snapshot = _scratch_service_snapshot(unit_name)
                         final_properties = final_snapshot.get("properties", {})
                         final_pid = final_properties.get("ExecMainPID", "0")
@@ -3681,6 +4079,7 @@ def _run_isolated_restore_drill(
                             python_binary=pathlib.Path(
                                 getattr(sys, "_base_executable", sys.executable)
                             ).resolve(strict=True),
+                            authorization_probe=authorization_probe,
                         )
                         _scratch_control_group_snapshot(final_control_group)
                         if (
@@ -3694,6 +4093,7 @@ def _run_isolated_restore_drill(
                         early_exit_phase = "authorization_failed"
                         verification_error = "other"
                         try:
+                            fault_site = "controller_done_token"
                             _scratch_send_worker_token(
                                 process,
                                 token=SCRATCH_DONE_TOKEN,
@@ -3719,6 +4119,7 @@ def _run_isolated_restore_drill(
                 early_exit_snapshot = _scratch_service_snapshot(unit_name)
                 early_exit_phase = "unit_exited_after_confinement"
                 raise RuntimeError("Scratch restore worker completion was not fully authorized and verified.")
+            fault_site = "controller_final_snapshot"
             return_code = process.wait(timeout=5)
             for stream in (process.stdout, process.stderr):
                 if stream:
@@ -3756,28 +4157,41 @@ def _run_isolated_restore_drill(
                 early_exit_snapshot = final_snapshot
                 early_exit_phase = "unit_exited_after_confinement"
                 raise RuntimeError("Isolated PostgreSQL backup restore did not complete successfully.")
-            try:
-                decoded = json.loads(stdout_buffer.decode("ascii"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                early_exit_snapshot = _scratch_service_snapshot(unit_name)
-                early_exit_phase = "unit_exited_after_confinement"
-                raise RuntimeError("Isolated PostgreSQL backup restore returned an invalid result.") from exc
-            if (
-                not isinstance(decoded, dict)
-                or set(decoded) != {"ok", "restored_table_count"}
-                or decoded.get("ok") is not True
-                or type(decoded.get("restored_table_count")) is not int
-                or decoded["restored_table_count"] <= 0
-            ):
-                early_exit_snapshot = _scratch_service_snapshot(unit_name)
-                early_exit_phase = "unit_exited_after_confinement"
-                raise RuntimeError("Isolated PostgreSQL backup restore result failed validation.")
+            if authorization_probe:
+                decoded = _scratch_authorization_probe_candidate(bytes(stdout_buffer))
+                if decoded is None:
+                    early_exit_snapshot = _scratch_service_snapshot(unit_name)
+                    early_exit_phase = "unit_exited_after_confinement"
+                    raise RuntimeError("Scratch authorization probe result failed validation.")
+            else:
+                try:
+                    decoded = json.loads(stdout_buffer.decode("ascii"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    early_exit_snapshot = _scratch_service_snapshot(unit_name)
+                    early_exit_phase = "unit_exited_after_confinement"
+                    raise RuntimeError("Isolated PostgreSQL backup restore returned an invalid result.") from exc
+                if (
+                    not isinstance(decoded, dict)
+                    or set(decoded) != {"ok", "restored_table_count"}
+                    or decoded.get("ok") is not True
+                    or type(decoded.get("restored_table_count")) is not int
+                    or decoded["restored_table_count"] <= 0
+                ):
+                    early_exit_snapshot = _scratch_service_snapshot(unit_name)
+                    early_exit_phase = "unit_exited_after_confinement"
+                    raise RuntimeError("Isolated PostgreSQL backup restore result failed validation.")
             if decoded != worker_result:
                 early_exit_snapshot = _scratch_service_snapshot(unit_name)
                 early_exit_phase = "unit_exited_after_confinement"
                 raise RuntimeError("Scratch restore worker result changed after completion authorization.")
             worker_result = decoded
         except BaseException as operation_error:
+            # Record the first controller-side failure before any teardown can
+            # raise or replace it. A separately validated worker frame, if
+            # present, is more precise about the original child failure.
+            controller_first_fault = _scratch_first_fault(
+                operation_error, origin="controller", site=fault_site
+            )
             if start_token_sent and not completion_token_sent and active_snapshot is not None:
                 # The unit is still held at the worker barrier. Preserve the
                 # live proof and classify this as an authorization-stage failure.
@@ -3827,21 +4241,41 @@ def _run_isolated_restore_drill(
                     except BaseException as cleanup_error:
                         cleanup_errors.append(cleanup_error)
             if early_exit_snapshot is not None:
-                assert process is not None and selector is not None
-                drain_complete, stdout_observed, stderr_size = (
-                    _scratch_drain_early_exit_output(
-                        selector,
-                        process,
-                        stdout_buffer,
-                        stderr_buffer,
-                        stdout_observed,
-                        stderr_size,
+                fault_site = "controller_cleanup"
+                try:
+                    assert process is not None and selector is not None
+                    drain_complete, stdout_observed, stderr_size = (
+                        _scratch_drain_early_exit_output(
+                            selector,
+                            process,
+                            stdout_buffer,
+                            stderr_buffer,
+                            stdout_observed,
+                            stderr_size,
+                        )
                     )
-                )
-                stdout_prefix = bytes(stdout_buffer[:SCRATCH_PRIVATE_STDOUT_BYTES])
-                stderr_prefix = bytes(stderr_buffer[:SCRATCH_PRIVATE_STDERR_BYTES])
-                if private_scratch_diagnostics:
-                    bound_diagnostic = _parse_bound_scratch_host_guard_diagnostic(
+                    stdout_prefix = bytes(stdout_buffer[:SCRATCH_PRIVATE_STDOUT_BYTES])
+                    stderr_prefix = bytes(stderr_buffer[:SCRATCH_PRIVATE_STDERR_BYTES])
+                    if private_scratch_diagnostics:
+                        bound_diagnostic = _parse_bound_scratch_host_guard_diagnostic(
+                            stdout_prefix,
+                            stderr_prefix,
+                            stdout_truncated=(
+                                stdout_observed > len(stdout_prefix)
+                                or not drain_complete["stdout"]
+                            ),
+                            stderr_truncated=(
+                                stderr_size > len(stderr_prefix)
+                                or not drain_complete["stderr"]
+                            ),
+                        )
+                        if bound_diagnostic is not None:
+                            setattr(
+                                operation_error,
+                                "scratch_host_guard_diagnostic",
+                                bound_diagnostic,
+                            )
+                    first_fault = _parse_bound_scratch_first_fault(
                         stdout_prefix,
                         stderr_prefix,
                         stdout_truncated=(
@@ -3853,43 +4287,47 @@ def _run_isolated_restore_drill(
                             or not drain_complete["stderr"]
                         ),
                     )
-                    if bound_diagnostic is not None:
+                    if first_fault is not None:
+                        setattr(operation_error, "scratch_first_fault", first_fault)
+                    diagnostic = _scratch_unit_diagnostic(
+                        early_exit_snapshot,
+                        launcher_exit_status=process.returncode if process is not None else None,
+                        stdout_prefix=stdout_prefix,
+                        stdout_observed=stdout_observed,
+                        stdout_complete=drain_complete["stdout"],
+                        stderr_prefix=stderr_prefix,
+                        stderr_observed=stderr_size,
+                        stderr_complete=drain_complete["stderr"],
+                        phase=early_exit_phase,
+                        verification_error=verification_error,
+                        verification_errno=verification_errno,
+                        terminal_snapshot=terminal_snapshot,
+                    )
+                    if diagnostic is not None:
+                        setattr(operation_error, "scratch_unit_diagnostic", diagnostic)
+                    # The transient unit may already have been collected when its
+                    # final properties are queried. In that case the closed
+                    # systemd summary is intentionally omitted, but bounded worker
+                    # output still remains useful private failure evidence.
+                    if diagnostic is not None or private_scratch_diagnostics:
                         setattr(
                             operation_error,
-                            "scratch_host_guard_diagnostic",
-                            bound_diagnostic,
+                            "scratch_unit_private_output",
+                            (stdout_prefix, stderr_prefix),
                         )
-                diagnostic = _scratch_unit_diagnostic(
-                    early_exit_snapshot,
-                    launcher_exit_status=process.returncode if process is not None else None,
-                    stdout_prefix=stdout_prefix,
-                    stdout_observed=stdout_observed,
-                    stdout_complete=drain_complete["stdout"],
-                    stderr_prefix=stderr_prefix,
-                    stderr_observed=stderr_size,
-                    stderr_complete=drain_complete["stderr"],
-                    phase=early_exit_phase,
-                    verification_error=verification_error,
-                    verification_errno=verification_errno,
-                    terminal_snapshot=terminal_snapshot,
-                )
-                if diagnostic is not None:
-                    setattr(operation_error, "scratch_unit_diagnostic", diagnostic)
-                # The transient unit may already have been collected when its
-                # final properties are queried. In that case the closed
-                # systemd summary is intentionally omitted, but bounded worker
-                # output still remains useful private failure evidence.
-                if diagnostic is not None or private_scratch_diagnostics:
-                    setattr(
-                        operation_error,
-                        "scratch_unit_private_output",
-                        (stdout_prefix, stderr_prefix),
-                    )
+                except BaseException:
+                    # Failure-only projection is secondary evidence. A broken
+                    # drain/parser must not replace the first operation error;
+                    # the controller projection captured above remains usable.
+                    pass
             for cleanup_error in cleanup_errors:
                 if hasattr(operation_error, "add_note"):
                     operation_error.add_note(
                         f"Scratch restore cleanup also failed: {type(cleanup_error).__name__}."
                     )
+            if getattr(operation_error, "scratch_first_fault", None) is None:
+                if controller_first_fault is not None:
+                    setattr(operation_error, "scratch_first_fault", controller_first_fault)
             raise
         finally:
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
@@ -3955,17 +4393,26 @@ def _run_isolated_restore_drill(
                 final_cleanup_errors.append(
                     RuntimeError("Scratch restore unit or mount cleanup could not be confirmed.")
                 )
-            if final_cleanup_errors:
-                active_error = sys.exc_info()[1]
-                if active_error is not None and hasattr(active_error, "add_note"):
-                    for cleanup_error in final_cleanup_errors:
-                        active_error.add_note(
-                            f"Scratch restore final cleanup failed: {type(cleanup_error).__name__}."
-                        )
-                else:
-                    raise RuntimeError(
-                        "Scratch restore unit or mount cleanup could not be confirmed."
-                    ) from final_cleanup_errors[0]
+            cleanup_failure = _scratch_cleanup_failure(
+                sys.exc_info()[1],
+                final_cleanup_errors,
+                authorization_probe=authorization_probe,
+            )
+            if cleanup_failure is not None:
+                raise cleanup_failure from final_cleanup_errors[0]
+        if worker_result is None:
+            raise RuntimeError("Scratch restore completed without a verified worker result.")
+        if authorization_probe:
+            if worker_result != {
+                "kind": "authorization_probe",
+                "schema": 1,
+                "status": "completed",
+            }:
+                raise RuntimeError("Scratch authorization probe returned an invalid result.")
+            fault_site = "controller_host_guard"
+            _scratch_host_guard("parent_after_worker_cleanup")
+            return 0
+        assert archive_descriptor is not None and archive_path is not None and archive_before is not None
         archive_after = os.fstat(archive_descriptor)
         current_path = archive_path.lstat()
         if (
@@ -3976,12 +4423,17 @@ def _run_isolated_restore_drill(
             or (current_path.st_dev, current_path.st_ino) != (archive_before.st_dev, archive_before.st_ino)
         ):
             raise RuntimeError("Scratch restore archive changed while it was being verified.")
-        if worker_result is None:
-            raise RuntimeError("Scratch restore completed without a verified worker result.")
+        fault_site = "controller_host_guard"
         _scratch_host_guard("parent_after_worker_cleanup")
         return worker_result["restored_table_count"]
+    except BaseException as exc:
+        if authorization_probe:
+            setattr(exc, "scratch_authorization_probe", True)
+        _retain_first_scratch_fault(exc, origin="controller", site=fault_site)
+        raise
     finally:
-        os.close(archive_descriptor)
+        if archive_descriptor is not None:
+            os.close(archive_descriptor)
 
 
 def _validate_custom_archive_header(path: pathlib.Path) -> None:
@@ -4282,6 +4734,17 @@ def verify_existing_dump(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def run_scratch_authorization_probe() -> dict[str, Any]:
+    """Exercise only the staged helper's pre-archive authorization protocol."""
+    _run_isolated_restore_drill(
+        None,
+        timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
+        private_scratch_diagnostics=True,
+        authorization_probe=True,
+    )
+    return {"schema": 1, "status": "completed"}
+
+
 def failure_report_for_exception(
     exc: Exception, *, private_scratch_diagnostics: bool
 ) -> dict[str, Any]:
@@ -4313,6 +4776,9 @@ def failure_report_for_exception(
     host_guard_diagnostic = getattr(exc, "scratch_host_guard_diagnostic", None)
     if private_scratch_diagnostics and valid_scratch_host_guard_diagnostic(host_guard_diagnostic):
         report["scratch_host_guard_diagnostic"] = host_guard_diagnostic
+    first_fault = getattr(exc, "scratch_first_fault", None)
+    if private_scratch_diagnostics and valid_scratch_first_fault(first_fault):
+        report["scratch_first_fault"] = first_fault
     return report
 
 
@@ -4322,7 +4788,11 @@ def private_failure_frame_for_exception(
     """Return the existing bounded private frame, never raw text by default."""
     if not enabled:
         return None
-    private_output = getattr(exc, "scratch_unit_private_output", None)
+    private_output = (
+        None
+        if getattr(exc, "scratch_authorization_probe", False)
+        else getattr(exc, "scratch_unit_private_output", None)
+    )
     frames: list[bytes] = []
     if (
         isinstance(private_output, tuple)
@@ -4335,6 +4805,11 @@ def private_failure_frame_for_exception(
     )
     if host_guard_frame is not None:
         frames.append(host_guard_frame)
+    first_fault_frame = _scratch_first_fault_frame(
+        getattr(exc, "scratch_first_fault", None)
+    )
+    if first_fault_frame is not None:
+        frames.append(first_fault_frame)
     return b"".join(frames).decode("ascii") if frames else None
 
 
@@ -4344,16 +4819,27 @@ def main() -> int:
         if getattr(args, "_scratch_restore_worker", False):
             required_worker_values = (
                 args._scratch_root,
-                args._scratch_archive,
-                args._scratch_archive_dev,
-                args._scratch_archive_ino,
-                args._scratch_archive_size,
-                args._scratch_archive_sha256,
                 args._scratch_timestamp_slug,
             )
+            if not getattr(args, "_scratch_authorization_probe", False):
+                required_worker_values += (
+                    args._scratch_archive,
+                    args._scratch_archive_dev,
+                    args._scratch_archive_ino,
+                    args._scratch_archive_size,
+                    args._scratch_archive_sha256,
+                )
             if any(value is None for value in required_worker_values):
                 raise ValueError("Scratch restore worker input is incomplete.")
-            return _scratch_worker_main(args)
+            try:
+                return _scratch_worker_main(args)
+            except BaseException as exc:
+                _retain_first_scratch_fault(
+                    exc,
+                    origin="worker",
+                    site=getattr(args, "_scratch_fault_site", "worker_entry"),
+                )
+                raise
         selected_modes = (
             int(args.check_latest)
             + int(getattr(args, "verify_latest_existing", False))

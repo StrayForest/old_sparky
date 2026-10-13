@@ -1,0 +1,869 @@
+"""Behavior contracts for the production authorization-probe workflow."""
+
+from __future__ import annotations
+
+import ast
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import tempfile
+import textwrap
+import unittest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-backup.yml"
+RUN_ID = "12345"
+RUN_ATTEMPT = "2"
+SECURITY_ID = "67890"
+SECURITY_ATTEMPT = "1"
+SOURCE_SHA = "a" * 40
+BUNDLE_SHA = "b" * 64
+FAULT = {
+    "schema": 1,
+    "origin": "worker",
+    "site": "worker_role_setup",
+    "exception_kind": "permission",
+    "errno": 13,
+}
+
+
+def _heredoc_after(source: str, anchor: str) -> str:
+    start = source.index(anchor)
+    heredoc = source.index("<<'PY'\n", start) + len("<<'PY'\n")
+    end = source.index("\n          PY", heredoc)
+    return textwrap.dedent(source[heredoc:end])
+
+
+def _heredoc_with_suffix_after(source: str, anchor: str) -> str:
+    start = source.index(anchor)
+    match = re.search(r"<<'PY'[^\n]*\n", source[start:])
+    if match is None:
+        raise AssertionError(f"no Python heredoc after {anchor!r}")
+    heredoc = start + match.end()
+    end = source.index("\n          PY", heredoc)
+    return textwrap.dedent(source[heredoc:end])
+
+
+def _workflow_run_scalar(source: str, step_name: str) -> str:
+    step_start = source.index(f"- name: {step_name}")
+    run_start = source.index("\n        run: |\n", step_start) + len("\n        run: |\n")
+    next_step = source.find("\n      - name:", run_start)
+    if next_step < 0:
+        next_step = len(source)
+    return textwrap.dedent(source[run_start:next_step])
+
+
+def _heredocs(source: str, delimiter: str) -> list[str]:
+    lines = source.splitlines()
+    bodies = []
+    index = 0
+    while index < len(lines):
+        if f"<<'{delimiter}'" not in lines[index]:
+            index += 1
+            continue
+        index += 1
+        body = []
+        while index < len(lines) and lines[index] != delimiter:
+            body.append(lines[index])
+            index += 1
+        if index == len(lines):
+            raise AssertionError(f"unterminated {delimiter} heredoc")
+        bodies.append("\n".join(body) + "\n")
+        index += 1
+    return bodies
+
+
+class _StatView:
+    def __init__(self, value: os.stat_result, *, fake_root: bool = True, inode_delta: int = 0):
+        for field in (
+            "st_mode", "st_nlink", "st_size", "st_dev", "st_ino",
+            "st_mtime_ns", "st_ctime_ns",
+        ):
+            setattr(self, field, getattr(value, field))
+        self.st_ino += inode_delta
+        self.st_uid = 0 if fake_root else value.st_uid
+        self.st_gid = 0 if fake_root else value.st_gid
+
+
+class _FaultOS:
+    """Delegate real filesystem operations while injecting narrow syscall faults."""
+
+    def __init__(self, fault: str | None = None):
+        self.fault = fault
+        self.regular_fsyncs = 0
+        self.directory_fsyncs = 0
+        self.writes = 0
+        self.final_stat_calls = 0
+        self.final_receipt_open_calls = 0
+        self.short_read_fds = set()
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def fstat(self, descriptor):
+        return _StatView(os.fstat(descriptor))
+
+    def stat(self, path, *args, **kwargs):
+        value = os.stat(path, *args, **kwargs)
+        if (
+            self.fault == "pending_identity"
+            and isinstance(path, str)
+            and path.endswith(".pending.json")
+        ):
+            return _StatView(value, inode_delta=1)
+        if isinstance(path, str) and path.startswith("authorization-probe-") and path.endswith(".json") and not path.endswith(".pending.json"):
+            self.final_stat_calls += 1
+            if self.fault == "identity_swap" and self.final_stat_calls == 1:
+                return _StatView(value, inode_delta=1)
+        return _StatView(value)
+
+    def open(self, path, flags, *args, **kwargs):
+        is_final_receipt = (
+            isinstance(path, str)
+            and path.startswith("authorization-probe-")
+            and path.endswith(".json")
+            and not path.endswith(".pending.json")
+            and flags & (os.O_WRONLY | os.O_RDWR) == 0
+        )
+        if is_final_receipt:
+            self.final_receipt_open_calls += 1
+            if self.fault == "final_inode_swap" and self.final_receipt_open_calls == 2:
+                directory_fd = kwargs["dir_fd"]
+                displaced = path + ".displaced"
+                old_descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    content = bytearray()
+                    while True:
+                        block = os.read(old_descriptor, 4096)
+                        if not block:
+                            break
+                        content.extend(block)
+                finally:
+                    os.close(old_descriptor)
+                os.rename(path, displaced, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                replacement = os.open(
+                    path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    view = memoryview(content)
+                    while view:
+                        view = view[os.write(replacement, view):]
+                    os.fsync(replacement)
+                finally:
+                    os.close(replacement)
+                os.unlink(displaced, dir_fd=directory_fd)
+        return os.open(path, flags, *args, **kwargs)
+
+    def lstat(self, path):
+        return _StatView(os.lstat(path))
+
+    def fchown(self, descriptor, uid, gid):
+        if (uid, gid) != (0, 0):
+            raise AssertionError("workflow owner must remain root:root")
+
+    def fsync(self, descriptor):
+        value = os.fstat(descriptor)
+        if stat.S_ISREG(value.st_mode):
+            self.regular_fsyncs += 1
+            if self.fault == "pending_fsync" and self.regular_fsyncs == 1:
+                raise OSError("injected pending projection fsync failure")
+            if self.fault == "final_fsync" and self.regular_fsyncs == 2:
+                raise OSError("injected final receipt fsync failure")
+        else:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+            if target.endswith("/shared"):
+                self.directory_fsyncs += 1
+                if self.fault == "pending_parent_fsync" and self.directory_fsyncs == 1:
+                    raise OSError("injected pending parent fsync failure")
+                if self.fault == "final_parent_fsync" and self.directory_fsyncs == 2:
+                    raise OSError("injected final parent fsync failure")
+                if self.fault in {"final_content_mutation", "final_binding_mutation"} and self.directory_fsyncs == 2:
+                    name = f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json"
+                    target_fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW, dir_fd=descriptor)
+                    try:
+                        content = os.pread(target_fd, 4096, 0)
+                        if self.fault == "final_content_mutation":
+                            mutated = b"2" + content[1:]
+                        else:
+                            original = f'"workflow_run_id":"{RUN_ID}"'.encode("ascii")
+                            replacement = b'"workflow_run_id":"99999"'
+                            if len(original) != len(replacement) or original not in content:
+                                raise AssertionError("receipt mutation fixture did not match expected binding")
+                            mutated = content.replace(original, replacement, 1)
+                        if len(mutated) != len(content):
+                            raise AssertionError("receipt mutation fixture changed content size")
+                        os.pwrite(target_fd, mutated, 0)
+                    finally:
+                        os.close(target_fd)
+        return os.fsync(descriptor)
+
+    def read(self, descriptor, size):
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+        if target.endswith(f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json"):
+            if self.fault == "final_read_error":
+                raise OSError("injected final receipt read failure")
+            if self.fault == "final_read_truncation":
+                if descriptor not in self.short_read_fds:
+                    self.short_read_fds.add(descriptor)
+                    return os.read(descriptor, max(1, size // 2))
+                return b""
+        return os.read(descriptor, size)
+
+    def write(self, descriptor, payload):
+        self.writes += 1
+        if self.fault == "pending_write" and self.writes == 1:
+            raise OSError("injected pending projection write failure")
+        if self.fault == "pending_short_write" and self.writes == 1:
+            return 0
+        if self.fault == "final_write" and self.writes == 2:
+            raise OSError("injected final receipt write failure")
+        if self.fault == "final_short_write" and self.writes == 2:
+            return 0
+        return os.write(descriptor, payload)
+
+    def unlink(self, path, *args, **kwargs):
+        if self.fault == "pending_cleanup" and str(path).endswith(".pending.json"):
+            raise OSError("injected pending cleanup failure")
+        return os.unlink(path, *args, **kwargs)
+
+
+class BackupProbeWorkflowContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = WORKFLOW.read_text(encoding="utf-8")
+        handler = _heredoc_after(cls.source, 'if probe_marker="$(/usr/bin/python3 -I - "$backup_report_file"')
+        cls.handler = {"__name__": "probe_contract"}
+        exec(compile(handler, str(WORKFLOW), "exec"), cls.handler)
+        marker_parser = _heredoc_after(
+            cls.source,
+            'success_marker="$(/usr/bin/python3 -I - "$remote_report" "$GITHUB_RUN_ID"',
+        )
+        cls.marker_parser = {"__name__": "probe_marker_contract"}
+        exec(compile(marker_parser, str(WORKFLOW), "exec"), cls.marker_parser)
+        legacy_handler = _heredoc_with_suffix_after(cls.source, "backup_failure_marker() {")
+        legacy_tree = ast.parse(legacy_handler)
+        validator_names = {"first_fault_sites", "first_fault_kinds", "valid_first_fault"}
+        validator_assignments = sorted(
+            (
+                node
+                for node in ast.walk(legacy_tree)
+                if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id in validator_names for target in node.targets)
+            ),
+            key=lambda node: node.lineno,
+        )
+        assigned_names = {
+            target.id
+            for node in validator_assignments
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        if assigned_names != validator_names:
+            raise AssertionError("could not isolate the exact backup first-fault validator")
+        validator_module = ast.Module(body=validator_assignments, type_ignores=[])
+        cls.legacy_fault_validator = compile(ast.fix_missing_locations(validator_module), str(WORKFLOW), "exec")
+
+    def _legacy_first_fault_valid(self, value) -> bool:
+        namespace = {"first_fault": value}
+        exec(self.legacy_fault_validator, namespace)
+        return namespace["valid_first_fault"]
+
+    def _report(self, status: str = "completed", *, first_fault=None, extra: dict | None = None) -> bytes:
+        if status == "completed":
+            report = {
+                "schema": 1,
+                "kind": "authorization_probe",
+                "status": "completed",
+                "authorization_probe": {"schema": 1, "status": "completed"},
+            }
+        else:
+            report = {
+                "schema": 1,
+                "kind": "authorization_probe",
+                "status": "failed",
+                "cleanup_status": "confirmed",
+            }
+            if first_fault is not None:
+                report["first_fault"] = first_fault
+        if extra:
+            report.update(extra)
+        return (json.dumps(report, separators=(",", ":")) + "\n").encode("utf-8")
+
+    @staticmethod
+    def _frame(value=FAULT, *, canonical=True) -> bytes:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        if not canonical:
+            encoded = json.dumps(value, sort_keys=True)
+        return b"SCRATCH_FIRST_FAULT_V1\n" + encoded.encode("ascii") + b"\n"
+
+    def _fixture(self, *, status="completed", first_fault=None, fault_os=None):
+        temp = tempfile.TemporaryDirectory()
+        root = Path(temp.name)
+        temporary = root / "tmp"
+        temporary.mkdir(mode=0o1777)
+        temporary.chmod(0o1777)
+        shared = root / "shared"
+        shared.mkdir(mode=0o755)
+        shared.chmod(0o755)
+        report = temporary / "oldsparky-production-backup-report.ABC123"
+        capture = temporary / f"oldsparky-production-backup-{RUN_ID}-{RUN_ATTEMPT}.stderr"
+        report.write_bytes(self._report(status, first_fault=first_fault))
+        capture.write_bytes(self._frame(first_fault) if first_fault is not None else b"")
+        report.chmod(0o600)
+        capture.chmod(0o600)
+        self.handler["os"] = fault_os or _FaultOS()
+        return temp, temporary, shared, report, capture
+
+    def _process(self, paths, *, status="completed", child_status=None, bindings=None):
+        temp, temporary, shared, report, capture = paths
+        values = bindings or (RUN_ID, RUN_ATTEMPT, SECURITY_ID, SECURITY_ATTEMPT, SOURCE_SHA, BUNDLE_SHA)
+        if child_status is None:
+            child_status = "0" if status == "completed" else "1"
+        return self.handler["process_probe"](
+            str(report), str(capture), child_status, str(shared), *values, str(temporary)
+        )
+
+    def _dispatch_with_probe_marker(self, marker: str):
+        expected = (RUN_ID, RUN_ATTEMPT, SECURITY_ID, SECURITY_ATTEMPT, SOURCE_SHA, BUNDLE_SHA)
+        try:
+            self.marker_parser["validate_probe_success_marker"](marker.encode("ascii") + b"\n", expected)
+        except ValueError:
+            accepted = False
+        else:
+            accepted = True
+        guard_start = self.source.index(
+            'if [[ "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true && "$BACKUP_OPERATION" != create ]]; then'
+        )
+        guard_end = self.source.index("\n          fi", guard_start) + len("\n          fi")
+        dispatch_start = self.source.index(
+            'if [[ "$BACKUP_OPERATION" = create && "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true ]]; then',
+            guard_end,
+        )
+        dispatch_end = self.source.index("\n          fi", dispatch_start) + len("\n          fi")
+        script = "\n".join((
+            "set -euo pipefail",
+            textwrap.dedent(self.source[guard_start:guard_end]),
+            "run_remote_operation() {",
+            "  printf '%s %s\\n' \"$1\" \"$2\"",
+            "  if [[ \"$1\" = authorization-probe && \"$PROBE_ACCEPTED\" != true ]]; then return 1; fi",
+            "}",
+            textwrap.dedent(self.source[dispatch_start:dispatch_end]),
+        ))
+        environment = os.environ.copy()
+        environment.update({
+            "BACKUP_OPERATION": "create",
+            "AUTHORIZATION_PROBE_BEFORE_CREATE": "true",
+            "PROBE_ACCEPTED": "true" if accepted else "false",
+        })
+        dispatched = subprocess.run(
+            ["bash", "-c", script],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return accepted, dispatched
+
+    def test_probe_is_opt_in_and_uses_exact_source_helper_gates(self) -> None:
+        operation_shell = _workflow_run_scalar(self.source, "Create/verify backup or run authorization probe")
+        shell_sources = [operation_shell, *_heredocs(operation_shell, "REMOTE")]
+        for source in shell_sources:
+            syntax = subprocess.run(
+                ["bash", "-n"], input=source, check=False, capture_output=True, text=True
+            )
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        self.assertIn("- authorization-probe", self.source)
+        self.assertIn(
+            "inputs.operation == 'create' || inputs.operation == 'verify-existing' || inputs.operation == 'authorization-probe'",
+            self.source,
+        )
+        self.assertIn('[[ "$operation" = create || "$operation" = verify-existing || "$operation" = authorization-probe ]]', self.source)
+        self.assertIn('command.insert(-3, "--authorization-probe-only")', self.source)
+        self.assertIn('"--private-backup-diagnostics"', self.source)
+        self.assertIn('probe_custody_status=unavailable', self.source)
+        self.assertIn('"$operation" != authorization-probe || "$probe_custody_status" = committed', self.source)
+        self.assertIn("authorization_probe_before_create:", self.source)
+        self.assertIn("type: boolean\n        default: false", self.source)
+        self.assertIn('group: platform-production-deploy\n  cancel-in-progress: false', self.source)
+
+        gate_start = self.source.index(
+            'if [[ "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true && "$BACKUP_OPERATION" != create ]]; then'
+        )
+        gate_end = self.source.index("\n          fi", gate_start) + len("\n          fi")
+        policy_guard = textwrap.dedent(self.source[gate_start:gate_end])
+        dispatch_start = self.source.index(
+            'if [[ "$BACKUP_OPERATION" = create && "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true ]]; then',
+            gate_end,
+        )
+        dispatch_end = self.source.index("\n          fi", dispatch_start) + len("\n          fi")
+        dispatch = textwrap.dedent(self.source[dispatch_start:dispatch_end])
+        self.assertLess(dispatch.index("run_remote_operation authorization-probe true"), dispatch.index("run_remote_operation create false"))
+        self.assertIn('"$REMOTE_OPERATION" = authorization-probe', self.source)
+        self.assertLess(
+            self.source.index("validate_probe_success_marker(raw, expected)"),
+            self.source.index("return 0", self.source.index("validate_probe_success_marker(raw, expected)")),
+        )
+
+        security_gate = self.source.index('run.get("conclusion") != "success"')
+        ssh_setup_step = self.source.index("- name: Configure SSH")
+        stage_step = self.source.index("- name: Stage the verified helper bundle on the production host")
+        operation_step = self.source.index("- name: Create/verify backup or run authorization probe")
+        self.assertLess(security_gate, ssh_setup_step)
+        self.assertLess(ssh_setup_step, stage_step)
+        self.assertLess(security_gate, stage_step)
+        self.assertLess(stage_step, operation_step)
+        self.assertIn('if [[ "$poll_state" = success ]]; then', self.source)
+        self.assertIn('run.get("status") != "completed"', self.source)
+        self.assertIn('run.get("conclusion") != "success"', self.source)
+        wrapper_start = self.source.index("run_remote_operation() {")
+        ssh_invocation = self.source.index("if ssh \\", wrapper_start)
+        self.assertLess(self.source.index("verify_current_dev_source", wrapper_start), ssh_invocation)
+        self.assertGreater(self.source.index('"bash -s -- $remote_arguments"', ssh_invocation), ssh_invocation)
+        remote_arguments_assignment = next(
+            line.strip()
+            for line in self.source.splitlines()
+            if line.strip().startswith('remote_arguments="$GITHUB_RUN_ID')
+        )
+        self.assertIn('[[ "$#" = 14 ]]', self.source)
+        self.assertIn('security_run_id="${12:-}"', self.source)
+        self.assertIn('security_run_attempt="${13:-}"', self.source)
+        self.assertIn('retain_helper_stage="${14:-false}"', self.source)
+        self.assertIn('root / "bundle.zip"', self.source)
+        self.assertIn('root / "tools"', self.source)
+
+        def exercise_dispatch(operation: str, before_create: bool, probe_accepted: bool = True):
+            script = "\n".join((
+                "set -euo pipefail",
+                policy_guard,
+                "run_remote_operation() {",
+                "  local REMOTE_OPERATION=\"$1\"",
+                "  local retain_helper_stage=\"$2\"",
+                f"  {remote_arguments_assignment}",
+                "  local -a transported_args",
+                "  read -r -a transported_args <<<\"$remote_arguments\"",
+                "  [[ \"${#transported_args[@]}\" = 14 ]]",
+                "  printf '%s\\n' \"${transported_args[@]}\"",
+                "  if [[ \"$1\" = authorization-probe && \"$PROBE_ACCEPTED\" != true ]]; then return 1; fi",
+                "}",
+                dispatch,
+            ))
+            environment = os.environ.copy()
+            environment.update({
+                "BACKUP_OPERATION": operation,
+                "AUTHORIZATION_PROBE_BEFORE_CREATE": "true" if before_create else "false",
+                "PROBE_ACCEPTED": "true" if probe_accepted else "false",
+                "GITHUB_RUN_ID": RUN_ID,
+                "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
+                "SOURCE_SHA": SOURCE_SHA,
+                "BUNDLE_SHA256": BUNDLE_SHA,
+                "EVICT_BUILD_NODE_CACHE": "false",
+                "COMPACT_FALLBACK_RUNTIME_CACHE": "false",
+                "RESUME_FALLBACK_CACHE_COMPACTION": "false",
+                "RESUME_COMPACTION_RUN_ID": "none",
+                "RESUME_COMPACTION_RUN_ATTEMPT": "none",
+                "RESUME_COMPACTION_BUNDLE_SHA256": "none",
+                "SECURITY_RUN_ID": SECURITY_ID,
+                "SECURITY_RUN_ATTEMPT": SECURITY_ATTEMPT,
+            })
+            return subprocess.run(
+                ["bash", "-c", script],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        def expected_transport(operation: str, retain: str) -> str:
+            return "\n".join((
+                RUN_ID, RUN_ATTEMPT, operation, SOURCE_SHA, BUNDLE_SHA,
+                "false", "false", "false", "none", "none", "none",
+                SECURITY_ID, SECURITY_ATTEMPT, retain, "",
+            ))
+
+        default_create = exercise_dispatch("create", False)
+        self.assertEqual((default_create.returncode, default_create.stdout), (0, expected_transport("create", "false")))
+        standalone_probe = exercise_dispatch("authorization-probe", False)
+        self.assertEqual((standalone_probe.returncode, standalone_probe.stdout), (0, expected_transport("authorization-probe", "false")))
+        rejected_operation = exercise_dispatch("verify-existing", True)
+        self.assertNotEqual(rejected_operation.returncode, 0)
+        self.assertEqual(rejected_operation.stdout, "")
+
+        success_marker = (
+            f"AUTHORIZATION_PROBE_RESULT schema=1 run_id={RUN_ID} attempt={RUN_ATTEMPT} "
+            f"security_run_id={SECURITY_ID} security_run_attempt={SECURITY_ATTEMPT} source_sha={SOURCE_SHA} "
+            f"bundle_sha256={BUNDLE_SHA} status=completed cleanup_status=confirmed receipt=written custody=committed\n"
+        ).encode("ascii")
+        self.marker_parser["validate_probe_success_marker"](
+            success_marker,
+            (RUN_ID, RUN_ATTEMPT, SECURITY_ID, SECURITY_ATTEMPT, SOURCE_SHA, BUNDLE_SHA),
+        )
+        expected_binding = (RUN_ID, RUN_ATTEMPT, SECURITY_ID, SECURITY_ATTEMPT, SOURCE_SHA, BUNDLE_SHA)
+
+        def marker_is_accepted(raw: bytes) -> bool:
+            try:
+                self.marker_parser["validate_probe_success_marker"](raw, expected_binding)
+            except ValueError:
+                return False
+            return True
+
+        accepted_create = exercise_dispatch("create", True, probe_accepted=marker_is_accepted(success_marker))
+        self.assertEqual(
+            (accepted_create.returncode, accepted_create.stdout),
+            (0, expected_transport("authorization-probe", "true") + expected_transport("create", "false")),
+        )
+        rejected_markers = (
+            ("failed", success_marker.replace(b"status=completed", b"status=failed")),
+            ("unknown", success_marker.replace(b"status=completed", b"status=unknown")),
+            ("cleanup_incomplete", success_marker.replace(b"cleanup_status=confirmed", b"cleanup_status=unknown")),
+            ("missing_receipt", success_marker.replace(b"receipt=written", b"receipt=unavailable")),
+            ("uncommitted_receipt", success_marker.replace(b"custody=committed", b"custody=pending")),
+            ("missing_marker", b""),
+            ("mismatched_binding", success_marker.replace(f"run_id={RUN_ID}".encode(), b"run_id=99999")),
+            ("receipt_collision", success_marker.replace(b"receipt=written", b"receipt=unavailable")),
+        )
+        for failure_case, invalid_marker in rejected_markers:
+            with self.subTest(probe_before_create=failure_case):
+                accepted = marker_is_accepted(invalid_marker)
+                self.assertFalse(accepted)
+                rejected_create = exercise_dispatch("create", True, probe_accepted=accepted)
+                self.assertNotEqual(rejected_create.returncode, 0)
+                self.assertEqual(rejected_create.stdout, expected_transport("authorization-probe", "true"))
+
+        self.assertIn('if: ${{ inputs.operation == \'create\' || inputs.operation == \'verify-existing\' || inputs.operation == \'authorization-probe\' }}', self.source)
+        self.assertIn('if: ${{ success() && inputs.operation == \'create\' && steps.cleanup_ssh.outcome == \'success\' }}', self.source)
+        self.assertNotIn("platform-authorization-probe-success", self.source)
+        autodeploy = (REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml").read_text(encoding="utf-8")
+        backup_guard = autodeploy.index("- name: Verify exact source-bound restore-verified backup")
+        child_dispatch = autodeploy.index("- name: Dispatch production deployment or baseline reconciliation")
+        self.assertLess(backup_guard, child_dispatch)
+        self.assertIn("SOURCE_SECURITY_RUN_ID: ${{ github.event.workflow_run.id }}", autodeploy)
+        self.assertIn("SOURCE_SECURITY_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}", autodeploy)
+        self.assertIn("BACKUP_GUARD_TOOL: ${{ github.workspace }}/platform/tools/platform_backup_success_guard.py", autodeploy)
+        self.assertIn("github.event.workflow_run.status == 'completed'", autodeploy)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", autodeploy)
+
+    def test_probe_skips_database_env_and_backup_summary_paths(self) -> None:
+        self.assertIn('if [[ "$operation" != authorization-probe ]]; then\n            test -f "$runtime/shared/.env.platform"', self.source)
+        self.assertIn('if [[ "$operation" != authorization-probe ]]; then\n            test -f "$summary_tool"', self.source)
+        probe_start = self.source.index('if [[ "$operation" = authorization-probe ]]; then\n            failure_stage=authorization_probe_receipt')
+        probe_end = self.source.index('if (( operation_status != 0 )); then', probe_start)
+        probe_branch = self.source[probe_start:probe_end]
+        self.assertNotIn("--backup-only", probe_branch)
+        self.assertNotIn("--verify-existing-backup-only", probe_branch)
+        self.assertNotIn("--archive", probe_branch)
+        self.assertNotIn(".env.platform", probe_branch)
+        self.assertNotIn("platform_storage_evidence_summary.py", probe_branch)
+
+    def test_probe_envelopes_require_verified_cleanup_and_reject_extra_fields(self) -> None:
+        parse = self.handler["parse_probe_report"]
+        self.assertEqual(parse(self._report(), b"", "0"), ("completed", "confirmed", None))
+        failed = self._report("failed", first_fault=FAULT)
+        self.assertEqual(parse(failed, self._frame(), "1"), ("failed", "confirmed", FAULT))
+        controller_fault = {
+            "schema": 1,
+            "origin": "controller",
+            "site": "controller_entry",
+            "exception_kind": "permission",
+            "errno": 13,
+        }
+        controller_report = self._report("failed", first_fault=controller_fault)
+        self.assertEqual(parse(controller_report, self._frame(controller_fault), "1"), ("failed", "confirmed", controller_fault))
+        wrong_pair = dict(FAULT, origin="controller")
+        with self.assertRaises((ValueError, json.JSONDecodeError, TypeError)):
+            parse(self._report("failed", first_fault=wrong_pair), self._frame(wrong_pair), "1")
+        for field, invalid_value in (
+            ("schema", True),
+            ("schema", 1.0),
+            ("errno", True),
+            ("errno", 13.0),
+            ("exception_kind", 7),
+        ):
+            malformed_fault = dict(FAULT, **{field: invalid_value})
+            with self.subTest(first_fault_field=field, invalid_value=invalid_value):
+                with self.assertRaises((ValueError, json.JSONDecodeError, TypeError)):
+                    parse(
+                        self._report("failed", first_fault=malformed_fault),
+                        self._frame(malformed_fault),
+                        "1",
+                    )
+        invalid_reports = (
+            self._report(extra={"ok": True}),
+            self._report(extra={"error": "text"}),
+            self._report(extra={"backup": {}}),
+            self._report("failed", extra={"unexpected": 1}),
+            self._report(extra={"schema": True}),
+            self._report(extra={"schema": 1.0}),
+            json.dumps({
+                "schema": 1,
+                "kind": "authorization_probe",
+                "status": "completed",
+                "authorization_probe": {"schema": True, "status": "completed"},
+            }, separators=(",", ":")).encode("ascii"),
+            json.dumps({
+                "schema": 1,
+                "kind": "authorization_probe",
+                "status": "completed",
+                "authorization_probe": {"schema": 1.0, "status": "completed"},
+            }, separators=(",", ":")).encode("ascii"),
+            b'{"schema":1,"schema":1,"kind":"authorization_probe","status":"completed","authorization_probe":{"schema":1,"status":"completed"}}',
+        )
+        for raw in invalid_reports:
+            with self.subTest(report=raw[:48]):
+                with self.assertRaises((ValueError, json.JSONDecodeError)):
+                    parse(raw, b"", "0")
+        for child_status in ("1", "2", "not-an-exit"):
+            with self.subTest(child_status=child_status):
+                with self.assertRaises((ValueError, json.JSONDecodeError)):
+                    parse(self._report(), b"", child_status)
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            parse(self._report("failed"), b"", "0")
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            parse(failed, self._frame(FAULT, canonical=False), "1")
+        mismatched_fault = dict(FAULT, errno=1)
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            parse(failed, self._frame(mismatched_fault), "1")
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            parse(failed, self._frame()[:-1], "1")
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            parse(failed, self._frame() + self._frame(), "1")
+        extra_fault = dict(FAULT, raw="must-not-pass")
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            parse(self._report("failed", first_fault=extra_fault), self._frame(extra_fault), "1")
+        duplicate_fault = b'{"schema":1,"origin":"worker","site":"worker_role_setup","exception_kind":"permission","errno":13,"errno":13}'
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            parse(self._report("failed", first_fault=FAULT), b"SCRATCH_FIRST_FAULT_V1\n" + duplicate_fault + b"\n", "1")
+
+    def test_private_receipt_is_bound_no_overwrite_and_never_uploaded(self) -> None:
+        paths = self._fixture()
+        try:
+            status, marker = self._process(paths)
+            self.assertEqual(status, 0)
+            self.assertIn("status=completed cleanup_status=confirmed receipt=written", marker)
+            self.assertIn("custody=committed", marker)
+            shared = paths[2]
+            receipt = json.loads((shared / f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json").read_text())
+            self.assertEqual(receipt, {
+                "schema": 1,
+                "kind": "authorization_probe_receipt",
+                "status": "completed",
+                "workflow_run_id": RUN_ID,
+                "workflow_run_attempt": RUN_ATTEMPT,
+                "security_run_id": SECURITY_ID,
+                "security_run_attempt": SECURITY_ATTEMPT,
+                "source_sha": SOURCE_SHA,
+                "helper_bundle_sha256": BUNDLE_SHA,
+                "cleanup_status": "confirmed",
+            })
+            self.assertFalse((shared / f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.pending.json").exists())
+            self.assertFalse(paths[3].exists())
+            self.assertFalse(paths[4].exists())
+
+            expected = (RUN_ID, RUN_ATTEMPT, SECURITY_ID, SECURITY_ATTEMPT, SOURCE_SHA, BUNDLE_SHA)
+            encoded_marker = (marker + "\n").encode("ascii")
+            self.assertEqual(
+                self.marker_parser["validate_probe_success_marker"](encoded_marker, expected),
+                marker + "\n",
+            )
+            for index, replacement in (
+                (0, "99999"), (1, "3"), (2, "99998"), (3, "2"),
+                (4, "c" * 40), (5, "d" * 64),
+            ):
+                mismatched = list(expected)
+                mismatched[index] = replacement
+                with self.subTest(binding_index=index):
+                    with self.assertRaises(ValueError):
+                        self.marker_parser["validate_probe_success_marker"](encoded_marker, tuple(mismatched))
+            with self.assertRaises(ValueError):
+                self.marker_parser["validate_probe_success_marker"](encoded_marker + b"extra", expected)
+            for encoded_attempt in (b"attempt=true", b"attempt=2.0"):
+                malformed_marker = encoded_marker.replace(b"attempt=2 ", encoded_attempt + b" ")
+                with self.subTest(encoded_attempt=encoded_attempt):
+                    with self.assertRaises(ValueError):
+                        self.marker_parser["validate_probe_success_marker"](malformed_marker, expected)
+        finally:
+            paths[0].cleanup()
+
+        self.assertRegex(
+            self.source,
+            re.compile(r"Publish source-bound backup success receipt\n\s+if: \$\{\{ success\(\) && inputs\.operation == 'create'"),
+        )
+        self.assertNotIn("platform-authorization-probe-success", self.source)
+        self._assert_probe_receipt_failure_keeps_only_pending_projection()
+
+    def test_first_fault_is_closed_frame_bound_private_data(self) -> None:
+        sites = (
+            "worker_after_initdb_guard",
+            "worker_after_postgres_start_guard",
+            "worker_role_setup",
+            "worker_pg_restore_resource_guard",
+            "worker_after_restore_guard",
+        )
+        for site in sites:
+            self.assertEqual(self.source.count(f'"{site}"'), 2, site)
+        paths = self._fixture(status="failed", first_fault=FAULT)
+        try:
+            code, marker = self._process(paths, status="failed")
+            self.assertEqual(code, 1)
+            self.assertIn("status=failed cleanup_status=confirmed receipt=written", marker)
+            receipt = json.loads((paths[2] / f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json").read_text())
+            self.assertEqual(receipt["first_fault"], FAULT)
+            self.assertEqual(set(receipt), {
+                "schema", "kind", "status", "workflow_run_id", "workflow_run_attempt",
+                "security_run_id", "security_run_attempt", "source_sha", "helper_bundle_sha256",
+                "cleanup_status", "first_fault",
+            })
+            self.assertFalse(any(field in receipt for field in ("stderr", "message", "path", "argv", "env", "pid")))
+        finally:
+            paths[0].cleanup()
+
+        public_summary = self.source.split('public_report="$({', 1)[-1].split("failure_stage=private_capture_cleanup", 1)[0]
+        self.assertNotIn("first_fault", public_summary)
+        self.assertNotIn("SCRATCH_FIRST_FAULT_V1", public_summary)
+        self.assertIn('"scratch_first_fault": scratch_first_fault', self.source)
+        self.assertIn('first_fault.get("site", "").startswith(first_fault.get("origin", "") + "_")', self.source)
+        self.assertIn('value["site"].startswith("worker_")', self.source)
+        controller_fault = {
+            "schema": 1,
+            "origin": "controller",
+            "site": "controller_entry",
+            "exception_kind": "permission",
+            "errno": 13,
+        }
+        for fault, expected in (
+            (FAULT, True),
+            (controller_fault, True),
+            (dict(FAULT, schema=True), False),
+            (dict(FAULT, schema=1.0), False),
+            (dict(FAULT, errno=True), False),
+            (dict(FAULT, errno=13.0), False),
+            (dict(FAULT, exception_kind=7), False),
+            (dict(FAULT, origin="controller"), False),
+        ):
+            with self.subTest(legacy_first_fault=fault):
+                self.assertIs(self._legacy_first_fault_valid(fault), expected)
+
+    def _assert_probe_receipt_failure_keeps_only_pending_projection(self) -> None:
+        scenarios = (
+            "pending_collision", "pending_write", "pending_short_write", "pending_fsync",
+            "pending_parent_fsync", "pending_identity", "final_collision", "final_write",
+            "final_short_write", "final_fsync", "final_parent_fsync", "identity_swap",
+            "pending_cleanup", "unsafe_parent", "final_content_mutation", "final_binding_mutation",
+            "final_read_error", "final_read_truncation", "final_inode_swap",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                fault_os = _FaultOS(scenario)
+                precommit = scenario in {
+                    "pending_collision", "pending_write", "pending_short_write", "pending_fsync",
+                    "pending_parent_fsync", "pending_identity", "unsafe_parent",
+                }
+                operation_status = "failed" if precommit or scenario == "final_write" else "completed"
+                paths = self._fixture(
+                    status=operation_status,
+                    first_fault=FAULT if operation_status == "failed" else None,
+                    fault_os=fault_os,
+                )
+                temp, temporary, shared, report, capture = paths
+                pending_name = f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.pending.json"
+                final_name = f"authorization-probe-{RUN_ID}-{RUN_ATTEMPT}.json"
+                target_shared = shared
+                if scenario == "unsafe_parent":
+                    target_shared = Path(temp.name) / "shared-link"
+                    target_shared.symlink_to(shared, target_is_directory=True)
+                elif scenario == "pending_collision":
+                    (shared / pending_name).write_text("preserve-existing", encoding="ascii")
+                elif scenario == "final_collision":
+                    (shared / final_name).write_text("preserve-existing", encoding="ascii")
+                try:
+                    result, marker = self.handler["process_probe"](
+                        str(report), str(capture), "1" if operation_status == "failed" else "0", str(target_shared),
+                        RUN_ID, RUN_ATTEMPT, SECURITY_ID, SECURITY_ATTEMPT, SOURCE_SHA, BUNDLE_SHA,
+                        str(temporary),
+                    )
+                    self.assertEqual(result, 1)
+                    self.assertIn("AUTHORIZATION_PROBE_EVIDENCE_UNAVAILABLE", marker)
+                    self.assertIn("status=unknown", marker)
+                    accepted, dispatched = self._dispatch_with_probe_marker(marker)
+                    self.assertFalse(accepted)
+                    self.assertNotEqual(dispatched.returncode, 0)
+                    self.assertEqual(dispatched.stdout, "authorization-probe true\n")
+                    if precommit:
+                        self.assertIn("custody=unavailable", marker)
+                        self.assertTrue(report.exists())
+                        self.assertTrue(capture.exists())
+                        self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o600)
+                        self.assertEqual(stat.S_IMODE(capture.stat().st_mode), 0o600)
+                    else:
+                        self.assertFalse(report.exists())
+                        self.assertFalse(capture.exists())
+                        self.assertIn("custody=pending", marker)
+                    if scenario == "pending_collision":
+                        self.assertEqual((shared / pending_name).read_text(encoding="ascii"), "preserve-existing")
+                    elif scenario == "final_collision":
+                        self.assertEqual((shared / final_name).read_text(encoding="ascii"), "preserve-existing")
+                        pending = json.loads((shared / pending_name).read_text(encoding="ascii"))
+                        self.assertEqual(pending["kind"], "authorization_probe_pending")
+                        self.assertEqual(pending["status"], "pending")
+                        self.assertEqual(pending["probe_status"], operation_status)
+                        expected_pending_fields = {
+                            "schema", "kind", "status", "probe_status", "workflow_run_id",
+                            "workflow_run_attempt", "security_run_id", "security_run_attempt",
+                            "source_sha", "helper_bundle_sha256", "cleanup_status",
+                        }
+                        if operation_status == "failed":
+                            expected_pending_fields.add("first_fault")
+                        self.assertEqual(set(pending), expected_pending_fields)
+                        self.assertEqual(pending["workflow_run_id"], RUN_ID)
+                        self.assertEqual(pending["security_run_id"], SECURITY_ID)
+                        self.assertEqual(pending["source_sha"], SOURCE_SHA)
+                        self.assertEqual(pending["helper_bundle_sha256"], BUNDLE_SHA)
+                        if operation_status == "failed":
+                            self.assertEqual(pending["first_fault"], FAULT)
+                            self.assertIn("first_fault", pending)
+                    elif scenario in {
+                        "final_write", "final_short_write", "final_fsync", "final_parent_fsync",
+                        "identity_swap", "pending_cleanup", "final_content_mutation",
+                        "final_binding_mutation", "final_read_error", "final_read_truncation",
+                        "final_inode_swap",
+                    }:
+                        pending = json.loads((shared / pending_name).read_text(encoding="ascii"))
+                        self.assertEqual(pending["kind"], "authorization_probe_pending")
+                        self.assertEqual(pending["status"], "pending")
+                        self.assertEqual(pending["probe_status"], operation_status)
+                        self.assertEqual(pending["workflow_run_id"], RUN_ID)
+                        self.assertEqual(pending["security_run_id"], SECURITY_ID)
+                        self.assertEqual(pending["source_sha"], SOURCE_SHA)
+                        self.assertEqual(pending["helper_bundle_sha256"], BUNDLE_SHA)
+                        if operation_status == "failed":
+                            self.assertEqual(pending["first_fault"], FAULT)
+                        if scenario == "pending_cleanup":
+                            final = json.loads((shared / final_name).read_text(encoding="ascii"))
+                            self.assertEqual(final["kind"], "authorization_probe_receipt")
+                        else:
+                            # A partial or even complete O_EXCL entry is never promoted
+                            # to workflow success after any write/identity/fsync error.
+                            self.assertTrue((shared / final_name).exists())
+                finally:
+                    temp.cleanup()
+
+        for invalid in (
+            ("00123", RUN_ATTEMPT, SECURITY_ID, SECURITY_ATTEMPT, SOURCE_SHA, BUNDLE_SHA),
+            (RUN_ID, RUN_ATTEMPT, SECURITY_ID, SECURITY_ATTEMPT, "x" * 40, BUNDLE_SHA),
+        ):
+            paths = self._fixture()
+            try:
+                result, marker = self._process(paths, bindings=invalid)
+                self.assertEqual(result, 1)
+                self.assertIn("status=unknown", marker)
+                self.assertFalse(list(paths[2].glob("authorization-probe-*.json")))
+            finally:
+                paths[0].cleanup()
+
+
+if __name__ == "__main__":
+    unittest.main()

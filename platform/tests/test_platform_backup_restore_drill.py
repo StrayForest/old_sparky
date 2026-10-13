@@ -264,10 +264,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
         required_bytes = backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES
         guard_sites = (
+            "parent_before_authorization_probe",
             "parent_before_archive_open",
             "parent_before_unit_launch",
             "parent_active_poll",
             "parent_after_worker_cleanup",
+            "worker_after_start_before_authorization_probe",
             "worker_after_start_before_archive_open",
             "worker_after_initdb_before_postgres_start",
             "worker_after_postgres_start",
@@ -527,9 +529,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 backup_drill._run_isolated_restore_drill, "_scratch_host_guard"
             ),
             [
+                "parent_before_authorization_probe",
                 "parent_before_archive_open",
                 "parent_before_unit_launch",
                 "parent_active_poll",
+                # Probe and full-restore success use separate return paths,
+                # each with the same final parent reserve check.
+                "parent_after_worker_cleanup",
                 "parent_after_worker_cleanup",
             ],
         )
@@ -538,7 +544,10 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 backup_drill._scratch_worker_main,
                 "_raise_scratch_host_memory_reserve",
             ),
-            ["worker_after_start_before_archive_open"],
+            [
+                "worker_after_start_before_authorization_probe",
+                "worker_after_start_before_archive_open",
+            ],
         )
         self.assertEqual(
             call_site_constants(backup_drill._scratch_worker_main, "_scratch_resource_guard"),
@@ -553,6 +562,228 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill._scratch_host_guard_frame({**valid_host_guard, "guard_site": "unknown"}),
             None,
         )
+
+    def test_scratch_first_fault_projection_is_closed_and_preserves_original(self) -> None:
+        first = PermissionError(1, "private path must not escape")
+        backup_drill._retain_first_scratch_fault(
+            first, origin="worker", site="worker_directory_setup"
+        )
+        expected = {
+            "schema": 1,
+            "origin": "worker",
+            "site": "worker_directory_setup",
+            "exception_kind": "permission",
+            "errno": 1,
+        }
+        self.assertEqual(first.scratch_first_fault, expected)
+
+        # A cleanup failure cannot replace the first diagnostic.
+        backup_drill._retain_first_scratch_fault(
+            first, origin="controller", site="controller_cleanup"
+        )
+        self.assertEqual(first.scratch_first_fault, expected)
+        cleanup = RuntimeError("secondary private cleanup detail")
+        self.assertIsNone(
+            backup_drill._scratch_cleanup_failure(
+                first, [cleanup], authorization_probe=True
+            )
+        )
+        self.assertEqual(first.scratch_first_fault, expected)
+        self.assertEqual(first.scratch_cleanup_status, "failed")
+        self.assertNotIn(
+            "secondary private cleanup detail",
+            " ".join(getattr(first, "__notes__", [])),
+        )
+        confirmed = RuntimeError("primary error")
+        backup_drill._scratch_cleanup_failure(
+            confirmed, [], authorization_probe=True
+        )
+        self.assertEqual(confirmed.scratch_cleanup_status, "confirmed")
+        self.assertEqual(
+            backup_drill._scratch_exception_projection(
+                AttributeError("private detail")
+            ),
+            ("attribute", None),
+        )
+        self.assertEqual(
+            backup_drill._scratch_exception_projection(
+                IndexError("private detail")
+            ),
+            ("index", None),
+        )
+        self.assertEqual(
+            backup_drill._scratch_exception_projection(
+                KeyError("private detail")
+            ),
+            ("key", None),
+        )
+        for site in (
+            "worker_after_initdb_guard",
+            "worker_after_postgres_start_guard",
+            "worker_role_setup",
+            "worker_pg_restore_resource_guard",
+            "worker_after_restore_guard",
+        ):
+            self.assertTrue(
+                backup_drill.valid_scratch_first_fault(
+                    {**expected, "site": site}
+                )
+            )
+        self.assertFalse(
+            backup_drill.valid_scratch_first_fault(
+                {**expected, "origin": "controller"}
+            )
+        )
+        controller_fault = {
+            **expected,
+            "origin": "controller",
+            "site": "controller_cleanup",
+        }
+        self.assertTrue(backup_drill.valid_scratch_first_fault(controller_fault))
+        self.assertFalse(
+            backup_drill.valid_scratch_first_fault(
+                {**controller_fault, "site": "worker_role_setup"}
+            )
+        )
+
+        frame = backup_drill._scratch_first_fault_frame(expected)
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        report = {
+            "ok": False,
+            "error": "fixed private failure marker",
+            "scratch_first_fault": expected,
+        }
+        stdout = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        self.assertEqual(
+            backup_drill._parse_bound_scratch_first_fault(
+                stdout,
+                frame,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            ),
+            expected,
+        )
+        probe_failure = RuntimeError("synthetic private failure text")
+        probe_failure.scratch_authorization_probe = True
+        probe_failure.scratch_unit_private_output = (b"raw stdout", b"raw stderr")
+        probe_failure.scratch_first_fault = expected
+        probe_frame = backup_drill.private_failure_frame_for_exception(
+            probe_failure, enabled=True
+        )
+        self.assertIsNotNone(probe_frame)
+        assert probe_frame is not None
+        self.assertIn("SCRATCH_FIRST_FAULT_V1", probe_frame)
+        self.assertNotIn("raw stdout", probe_frame)
+        self.assertNotIn("raw stderr", probe_frame)
+        self.assertNotIn("synthetic private failure text", probe_frame)
+        for malformed in (
+            {**expected, "private_path": "/not-allowed"},
+            {**expected, "errno": True},
+            {**expected, "schema": 1.0},
+            {**expected, "errno": 13.0},
+            {**expected, "exception_kind": "PermissionError"},
+            {**expected, "exception_kind": 7},
+            {**expected, "site": "private-path"},
+        ):
+            self.assertFalse(backup_drill.valid_scratch_first_fault(malformed))
+        self.assertIsNone(
+            backup_drill._parse_bound_scratch_first_fault(
+                stdout,
+                frame + frame,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+        )
+
+    def test_authorization_probe_worker_has_no_archive_or_database_effects(self) -> None:
+        root = "/run/oldsparky-backup-restore-" + ("a" * 24)
+        args = argparse.Namespace(
+            _scratch_root=root,
+            _scratch_timestamp_slug="20261013T010203Z",
+            _scratch_authorization_probe=True,
+            _scratch_archive=None,
+            _scratch_archive_dev=None,
+            _scratch_archive_ino=None,
+            _scratch_archive_size=None,
+            _scratch_archive_sha256=None,
+            private_scratch_diagnostics=True,
+        )
+        stdout = io.BytesIO()
+        stdin = types.SimpleNamespace(buffer=StagedWorkerInput())
+        real_is_dir = pathlib.Path.is_dir
+
+        def probe_is_dir(path: pathlib.Path) -> bool:
+            if str(path) == root:
+                return True
+            return real_is_dir(path)
+
+        with (
+            mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+            mock.patch.object(backup_drill.os, "environ", {}),
+            mock.patch.object(pathlib.Path, "is_dir", probe_is_dir),
+            mock.patch.object(backup_drill, "_scratch_mount_snapshot") as mount_snapshot,
+            mock.patch.object(backup_drill, "_scratch_cgroup_snapshot") as cgroup_snapshot,
+            mock.patch.object(
+                backup_drill,
+                "_raise_scratch_host_memory_reserve",
+            ) as memory_guard,
+            mock.patch.object(backup_drill, "_open_verified_scratch_archive") as archive_open,
+            mock.patch.object(backup_drill, "require_commands") as require_commands,
+            mock.patch.object(backup_drill, "run_command") as run_command,
+            mock.patch.object(backup_drill, "perform_restore_drill") as restore,
+            mock.patch.object(backup_drill, "_scratch_create_application_role") as role,
+            mock.patch.object(backup_drill.sys, "stdin", stdin),
+            mock.patch.object(backup_drill.sys, "stdout", types.SimpleNamespace(buffer=stdout)),
+        ):
+            self.assertEqual(backup_drill._scratch_worker_main(args), 0)
+
+        self.assertEqual(
+            json.loads(stdout.getvalue().decode("ascii")),
+            {"kind": "authorization_probe", "schema": 1, "status": "completed"},
+        )
+        mount_snapshot.assert_called_once_with(pathlib.Path(root))
+        cgroup_snapshot.assert_called_once_with()
+        memory_guard.assert_called_once_with(
+            "worker_after_start_before_authorization_probe",
+            message="Scratch restore admission memory reserve is unavailable.",
+        )
+        require_commands.assert_not_called()
+        archive_open.assert_not_called()
+        run_command.assert_not_called()
+        restore.assert_not_called()
+        role.assert_not_called()
+
+    def test_authorization_probe_command_retains_confinement_without_archive(self) -> None:
+        mountpoint = pathlib.Path(
+            "/run/oldsparky-backup-restore-" + ("b" * 24)
+        )
+        command = backup_drill._scratch_unit_command(
+            mountpoint=mountpoint,
+            archive_path=None,
+            archive_stat=None,
+            archive_sha256=None,
+            timestamp_slug="20261013T010203Z",
+            unit_name="oldsparky-backup-restore-" + ("b" * 24) + ".service",
+            private_scratch_diagnostics=True,
+            authorization_probe=True,
+        )
+        self.assertIn("--_scratch-authorization-probe", command)
+        self.assertNotIn("--_scratch-archive", command)
+        self.assertFalse(any("archive.dump" in item for item in command))
+        for required in (
+            "--property=MemoryMax=" + str(backup_drill.SCRATCH_MEMORY_MAX_BYTES),
+            "--property=MemorySwapMax=0",
+            "--property=RuntimeMaxSec=900s",
+            "--property=TimeoutStopSec=5s",
+            "--property=KillMode=control-group",
+            "--property=OOMPolicy=kill",
+            "--property=PrivateNetwork=yes",
+            "--property=ProtectSystem=strict",
+            "--property=NoNewPrivileges=yes",
+            "--property=CapabilityBoundingSet=CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE",
+        ):
+            self.assertIn(required, command)
 
     def _assert_scratch_unit_diagnostic_caps_and_private_envelope(self) -> None:
         required_memory = backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES
@@ -1081,6 +1312,91 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 stderr_reader.close()
                 stdout_writer.join(timeout=2)
                 stderr_writer.join(timeout=2)
+
+        # A secondary failure while collecting diagnostics must not replace
+        # the original controller failure or its first-fault projection.
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            archive_path.chmod(0o600)
+            failed = {
+                "properties": {
+                    "LoadState": "loaded",
+                    "ActiveState": "failed",
+                    "SubState": "failed",
+                    "Result": "exit-code",
+                    "ExecMainPID": "0",
+                    "ExecMainStatus": "203",
+                    "ControlGroup": "/system.slice/scratch-diagnostic-failure.service",
+                }
+            }
+            absent = {
+                "properties": {
+                    "LoadState": "not-found",
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                    "ExecMainPID": "0",
+                    "ControlGroup": "",
+                }
+            }
+            snapshots = [failed, absent, absent, absent]
+            launched: list[subprocess.Popen[bytes]] = []
+            real_popen = subprocess.Popen
+
+            def launch(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                launched.append(process)
+                return process
+
+            def stop_unit(_unit_name: str) -> None:
+                if launched and launched[0].poll() is None:
+                    launched[0].terminate()
+                    launched[0].wait(timeout=2)
+
+            def snapshot(_unit_name: str) -> dict[str, Any]:
+                return snapshots.pop(0)
+
+            command = [sys.executable, "-c", "import time; time.sleep(10)"]
+            unit_command = mock.Mock(return_value=command)
+            with (
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill, "_scratch_host_guard"),
+                mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=snapshot),
+                mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_drain_early_exit_output",
+                    side_effect=ValueError("diagnostic-only failure"),
+                ),
+                mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
+                mock.patch.object(backup_drill.secrets, "token_hex", return_value="d" * 24),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "failed before its confinement was verified",
+                ) as failure:
+                    backup_drill._run_isolated_restore_drill(
+                        archive_path,
+                        timestamp_slug="20261013T010204Z",
+                        private_scratch_diagnostics=True,
+                    )
+            self.assertEqual(len(launched), 1)
+            self.assertIsNotNone(launched[0].returncode)
+            self.assertEqual(
+                failure.exception.scratch_first_fault,
+                {
+                    "schema": 1,
+                    "origin": "controller",
+                    "site": "controller_unit_snapshot",
+                    "exception_kind": "runtime",
+                    "errno": None,
+                },
+            )
+            self.assertFalse(pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists())
 
     def _assert_scratch_live_identity_failure_preserves_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

@@ -221,13 +221,61 @@ class BackupCommandFailure(RuntimeError):
         scratch_unit_diagnostic: dict[str, Any] | None = None,
         scratch_admission_diagnostic: dict[str, Any] | None = None,
         scratch_host_guard_diagnostic: dict[str, Any] | None = None,
+        scratch_first_fault: dict[str, Any] | None = None,
     ) -> None:
         self.restore_diagnostic = diagnostic
         self.backup_disk_diagnostic = backup_disk_diagnostic
         self.scratch_unit_diagnostic = scratch_unit_diagnostic
         self.scratch_admission_diagnostic = scratch_admission_diagnostic
         self.scratch_host_guard_diagnostic = scratch_host_guard_diagnostic
+        self.scratch_first_fault = scratch_first_fault
         super().__init__("Platform backup failed.")
+
+
+def _valid_scratch_first_fault(value: Any) -> bool:
+    origins = {"controller", "worker"}
+    sites = {
+        "controller_entry", "controller_archive_identity", "controller_unit_setup",
+        "controller_host_guard", "controller_launch", "controller_unit_snapshot",
+        "controller_identity", "controller_start_token", "controller_active_poll",
+        "controller_worker_frame", "controller_completion_snapshot", "controller_done_token",
+        "controller_final_snapshot", "controller_cleanup", "worker_entry",
+        "worker_start_token", "worker_root_identity", "worker_mount_snapshot",
+        "worker_cgroup_snapshot", "worker_host_reserve", "worker_archive_open",
+        "worker_directory_setup", "worker_postgres_tools", "worker_initdb",
+        "worker_after_initdb_guard", "worker_postgres_start",
+        "worker_after_postgres_start_guard", "worker_role_setup",
+        "worker_pg_restore_resource_guard", "worker_restore",
+        "worker_after_restore_guard", "worker_postgres_stop", "worker_result_frame",
+        "worker_done_token",
+    }
+    kinds = {
+        "permission", "os_error", "timeout", "subprocess", "json_decode", "unicode",
+        "attribute", "index", "name", "type", "key", "value", "restore_guard_stop",
+        "backup_interrupted", "scratch_token_delivery", "runtime", "other",
+    }
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "origin", "site", "exception_kind", "errno"
+    }:
+        return False
+    if (
+        type(value.get("schema")) is not int or value["schema"] != 1
+        or type(value.get("origin")) is not str or value["origin"] not in origins
+        or type(value.get("site")) is not str or value["site"] not in sites
+        or type(value.get("exception_kind")) is not str or value["exception_kind"] not in kinds
+    ):
+        return False
+    expected_origin = (
+        "controller" if value["site"].startswith("controller_")
+        else "worker" if value["site"].startswith("worker_")
+        else None
+    )
+    if value["origin"] != expected_origin:
+        return False
+    errno = value.get("errno")
+    if errno is not None and (type(errno) is not int or not 1 <= errno <= 4095):
+        return False
+    return value["exception_kind"] in {"permission", "os_error"} or errno is None
 
 
 def _safe_release_id(value: Any) -> str | None:
@@ -319,6 +367,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--authorization-probe-only",
+        action="store_true",
+        help=(
+            "Run only the source-bound scratch restore authorization protocol; "
+            "this mode never opens or verifies an archive."
+        ),
+    )
+    parser.add_argument(
         "--purge-profile-access-cache-after-restore",
         action="store_true",
         help=(
@@ -391,6 +447,14 @@ def parse_args() -> argparse.Namespace:
         )
     if args.backup_only and args.verify_existing_backup_only:
         parser.error("backup-only modes are mutually exclusive")
+    if args.authorization_probe_only and (
+        args.backup_only or args.verify_existing_backup_only or args.skip_backup
+        or args.preserve_existing_backups
+        or args.purge_profile_access_cache_after_restore
+        or args.evict_pinned_build_node_cache or args.compact_legacy_fallback_runtime_cache
+        or args.resume_legacy_fallback_runtime_cache_compaction
+    ):
+        parser.error("authorization probe is an exclusive maintenance operation")
     if args.verify_existing_backup_only and args.skip_backup:
         parser.error("--verify-existing-backup-only cannot be combined with --skip-backup")
     if args.purge_profile_access_cache_after_restore:
@@ -479,7 +543,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("--backup-only requires --apply")
     if args.verify_existing_backup_only and not args.apply:
         parser.error("--verify-existing-backup-only requires --apply")
-    if args.private_backup_diagnostics and not (args.backup_only or args.verify_existing_backup_only):
+    if args.authorization_probe_only and not args.apply:
+        parser.error("authorization probe requires --apply")
+    if args.authorization_probe_only and not args.as_json:
+        parser.error("authorization probe requires --json")
+    if args.authorization_probe_only and not args.private_backup_diagnostics:
+        parser.error("authorization probe requires private closed diagnostics")
+    if args.private_backup_diagnostics and not (
+        args.backup_only or args.verify_existing_backup_only or args.authorization_probe_only
+    ):
         parser.error("--private-backup-diagnostics requires a backup-only mode")
     if args.report_keep < 1:
         parser.error("--report-keep must be at least 1")
@@ -807,6 +879,12 @@ def _run_backup_command(
                 and valid_scratch_host_guard_diagnostic(scratch_host_guard_diagnostic)
                 else None
             ),
+            (
+                result.get("scratch_first_fault")
+                if forward_failure_diagnostics
+                and _valid_scratch_first_fault(result.get("scratch_first_fault"))
+                else None
+            ),
         )
     return result
 
@@ -864,6 +942,10 @@ def run_backup(
             else None,
             report.get("scratch_host_guard_diagnostic")
             if valid_scratch_host_guard_diagnostic(report.get("scratch_host_guard_diagnostic"))
+            else None,
+            report.get("scratch_first_fault")
+            if private_failure_diagnostics
+            and _valid_scratch_first_fault(report.get("scratch_first_fault"))
             else None,
         ) from exc
 
@@ -2281,6 +2363,41 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
         # only the first; deploy takes the first two; builds take only the
         # third; standalone live-QA retention takes first then the fourth.
         with maintenance_lock_scope(args, app_dir=app_dir) as source_release_dir:
+            if getattr(args, "authorization_probe_only", False):
+                try:
+                    canonical_app_dir = DEFAULT_APP_DIR.resolve(strict=True)
+                    canonical_build_dir = DEFAULT_SOURCE_RELEASE_DIR.resolve(strict=True)
+                    releases_dir = (canonical_app_dir / "releases").resolve(strict=True)
+                    current_release = resolved_release_target(
+                        canonical_app_dir, "current", releases_dir
+                    )
+                    previous_release = resolved_release_target(
+                        canonical_app_dir, "previous", releases_dir
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        "canonical authorization probe preflight is unavailable"
+                    ) from exc
+                if (
+                    app_dir != canonical_app_dir
+                    or source_release_dir is None
+                    or source_release_dir != canonical_build_dir
+                    or not current_release.is_dir()
+                    or not previous_release.is_dir()
+                ):
+                    raise RuntimeError(
+                        "canonical release/build roots are required for authorization probe"
+                    )
+                with live_qa_machine_lock():
+                    probe = backup_restore_drill.run_scratch_authorization_probe()
+                if probe != {"schema": 1, "status": "completed"}:
+                    raise RuntimeError("authorization probe did not produce its closed result")
+                return {
+                    "schema": 1,
+                    "kind": "authorization_probe",
+                    "status": "completed",
+                    "authorization_probe": probe,
+                }
             if getattr(args, "purge_profile_access_cache_after_restore", False):
                 try:
                     canonical_app_dir = DEFAULT_APP_DIR.resolve(strict=True)
@@ -2648,6 +2765,20 @@ def main() -> int:
     args = parse_args()
     try:
         report = run_maintenance(args)
+        if getattr(args, "authorization_probe_only", False):
+            expected_probe = {
+                "schema": 1,
+                "kind": "authorization_probe",
+                "status": "completed",
+                "authorization_probe": {"schema": 1, "status": "completed"},
+            }
+            if report != expected_probe:
+                raise RuntimeError("authorization probe did not produce its closed result")
+            if args.as_json:
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            else:
+                print("[OK] Authorization probe completed.")
+            return 0
         if args.apply and not getattr(
             args, "purge_profile_access_cache_after_restore", False
         ):
@@ -2662,6 +2793,26 @@ def main() -> int:
             print_summary(report)
         return 0 if report["ok"] else 1
     except Exception as exc:
+        if getattr(args, "authorization_probe_only", False):
+            result: dict[str, Any] = {
+                "schema": 1,
+                "kind": "authorization_probe",
+                "status": "failed",
+                "cleanup_status": (
+                    getattr(exc, "scratch_cleanup_status", "unknown")
+                    if getattr(exc, "scratch_cleanup_status", "unknown")
+                    in {"confirmed", "failed", "unknown"}
+                    else "unknown"
+                ),
+            }
+            first_fault = getattr(exc, "scratch_first_fault", None)
+            if _valid_scratch_first_fault(first_fault):
+                result["first_fault"] = first_fault
+            if args.as_json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print("[FAIL] Authorization probe failed.", file=sys.stderr)
+            return 1
         message = str(exc).lower()
         if "backup" in message or "restore" in message:
             error_class = "backup"
@@ -2709,6 +2860,15 @@ def main() -> int:
                 and valid_scratch_host_guard_diagnostic(scratch_host_guard_diagnostic)
             ):
                 result["scratch_host_guard_diagnostic"] = scratch_host_guard_diagnostic
+            scratch_first_fault = getattr(exc, "scratch_first_fault", None)
+            if (
+                (
+                    getattr(args, "private_backup_diagnostics", False)
+                    or getattr(args, "authorization_probe_only", False)
+                )
+                and _valid_scratch_first_fault(scratch_first_fault)
+            ):
+                result["scratch_first_fault"] = scratch_first_fault
             print(
                 json.dumps(result, ensure_ascii=False, indent=2)
             )

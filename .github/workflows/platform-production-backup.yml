@@ -1,17 +1,23 @@
 name: Platform production backup
-run-name: "Platform backup ${{ inputs.operation }} s${{ inputs.security_run_id }}.${{ inputs.security_run_attempt }} ${{ inputs.source_sha }}"
+run-name: "Platform backup/probe ${{ inputs.operation }} s${{ inputs.security_run_id }}.${{ inputs.security_run_attempt }} ${{ inputs.source_sha }}"
 
 on:
   workflow_dispatch:
     inputs:
       operation:
-        description: "Create a new backup or restore-verify only the latest existing pair"
+        description: "Create/verify a backup or run the isolated scratch authorization probe"
         required: true
         type: choice
         options:
           - create
           - verify-existing
+          - authorization-probe
         default: create
+      authorization_probe_before_create:
+        description: "Run and verify a source-bound scratch authorization probe before create (create only)"
+        required: false
+        type: boolean
+        default: false
       security_run_id:
         description: "Exact Platform security and build push run ID for this dev SHA"
         required: true
@@ -70,13 +76,21 @@ jobs:
     steps:
       - name: Require the reviewed dev ref
         shell: bash
+        env:
+          BACKUP_OPERATION: ${{ inputs.operation }}
+          AUTHORIZATION_PROBE_BEFORE_CREATE: ${{ inputs.authorization_probe_before_create }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production backup must run from the reviewed dev ref" >&2; exit 1; }
+          [[ "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true || "$AUTHORIZATION_PROBE_BEFORE_CREATE" = false ]]
+          if [[ "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true && "$BACKUP_OPERATION" != create ]]; then
+            echo "authorization_probe_before_create is only valid for create" >&2
+            exit 1
+          fi
 
       - name: Download and verify exact-source backup helper bundle
-        if: ${{ inputs.operation == 'create' || inputs.operation == 'verify-existing' }}
+        if: ${{ inputs.operation == 'create' || inputs.operation == 'verify-existing' || inputs.operation == 'authorization-probe' }}
         id: backup-helper
         shell: bash
         env:
@@ -523,7 +537,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Stage the verified helper bundle on the production host
-        if: ${{ inputs.operation == 'create' || inputs.operation == 'verify-existing' }}
+        if: ${{ inputs.operation == 'create' || inputs.operation == 'verify-existing' || inputs.operation == 'authorization-probe' }}
         id: stage-backup-helper
         shell: bash
         env:
@@ -712,7 +726,7 @@ jobs:
           trap - EXIT
           printf 'stage_identity=%s\n' "$stage_identity" >>"$GITHUB_OUTPUT"
 
-      - name: Create and verify the production backup
+      - name: Create/verify backup or run authorization probe
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -720,6 +734,7 @@ jobs:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           BACKUP_OPERATION: ${{ inputs.operation }}
+          AUTHORIZATION_PROBE_BEFORE_CREATE: ${{ inputs.authorization_probe_before_create }}
           EVICT_BUILD_NODE_CACHE: ${{ inputs.evict_build_node_cache }}
           COMPACT_FALLBACK_RUNTIME_CACHE: ${{ inputs.compact_fallback_runtime_cache }}
           RESUME_FALLBACK_CACHE_COMPACTION: ${{ inputs.resume_fallback_cache_compaction }}
@@ -737,7 +752,12 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          [[ "$BACKUP_OPERATION" = create || "$BACKUP_OPERATION" = verify-existing ]]
+          [[ "$BACKUP_OPERATION" = create || "$BACKUP_OPERATION" = verify-existing || "$BACKUP_OPERATION" = authorization-probe ]]
+          [[ "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true || "$AUTHORIZATION_PROBE_BEFORE_CREATE" = false ]]
+          if [[ "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true && "$BACKUP_OPERATION" != create ]]; then
+            echo "authorization_probe_before_create is only valid for create" >&2
+            exit 1
+          fi
           [[ "$EVICT_BUILD_NODE_CACHE" = true || "$EVICT_BUILD_NODE_CACHE" = false ]]
           [[ "$COMPACT_FALLBACK_RUNTIME_CACHE" = true || "$COMPACT_FALLBACK_RUNTIME_CACHE" = false ]]
           [[ "$RESUME_FALLBACK_CACHE_COMPACTION" = true || "$RESUME_FALLBACK_CACHE_COMPACTION" = false ]]
@@ -759,6 +779,11 @@ jobs:
             else
               [[ -z "$RESUME_COMPACTION_RUN_ID$RESUME_COMPACTION_RUN_ATTEMPT$RESUME_COMPACTION_BUNDLE_SHA256" ]]
             fi
+          elif [[ "$BACKUP_OPERATION" = create ]]; then
+            [[ "$EVICT_BUILD_NODE_CACHE" = false ]]
+            [[ "$COMPACT_FALLBACK_RUNTIME_CACHE" = false ]]
+            [[ "$RESUME_FALLBACK_CACHE_COMPACTION" = false ]]
+            [[ -z "$RESUME_COMPACTION_RUN_ID$RESUME_COMPACTION_RUN_ATTEMPT$RESUME_COMPACTION_BUNDLE_SHA256" ]]
           else
             [[ "$EVICT_BUILD_NODE_CACHE" = false ]]
             [[ "$COMPACT_FALLBACK_RUNTIME_CACHE" = false ]]
@@ -766,7 +791,6 @@ jobs:
             [[ -z "$RESUME_COMPACTION_RUN_ID$RESUME_COMPACTION_RUN_ATTEMPT$RESUME_COMPACTION_BUNDLE_SHA256" ]]
           fi
           bundle_stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BACKUP_OPERATION $SOURCE_SHA $BUNDLE_SHA256 $EVICT_BUILD_NODE_CACHE $COMPACT_FALLBACK_RUNTIME_CACHE $RESUME_FALLBACK_CACHE_COMPACTION ${RESUME_COMPACTION_RUN_ID:-none} ${RESUME_COMPACTION_RUN_ATTEMPT:-none} ${RESUME_COMPACTION_BUNDLE_SHA256:-none}"
           cleanup_staged_helper_before_operation() {
             [[ "$STAGED_HELPER_IDENTITY" =~ ^[0-9]+:[0-9]+$ ]] || return 1
             timeout --foreground --signal=TERM --kill-after=5s 60s ssh \
@@ -853,6 +877,7 @@ jobs:
           REMOTE
           }
           ref_path="$RUNNER_TEMP/platform-backup-verifier-input/current-dev-ref-before-create.json"
+          verify_current_dev_source() {
           if ! curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 10 \
             --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
@@ -880,11 +905,18 @@ jobs:
             cleanup_staged_helper_before_operation || echo "Source helper stage cleanup failed after ref mismatch" >&2
             exit 1
           fi
+          }
           remote_report="$RUNNER_TEMP/platform-production-backup-report.log"
           remote_error="$RUNNER_TEMP/platform-production-backup-ssh-error.log"
           [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ "$JOB_DEADLINE_MONOTONIC_NS" =~ ^[1-9][0-9]{0,19}$ ]]
+          run_remote_operation() {
+          local REMOTE_OPERATION="$1"
+          local retain_helper_stage="$2"
+          [[ "$REMOTE_OPERATION" = create || "$REMOTE_OPERATION" = verify-existing || "$REMOTE_OPERATION" = authorization-probe ]]
+          [[ "$retain_helper_stage" = true || "$retain_helper_stage" = false ]]
+          verify_current_dev_source
           if ! /usr/bin/python3 -I -B - "$JOB_DEADLINE_MONOTONIC_NS" <<'PY'
           import sys
           import time
@@ -897,6 +929,7 @@ jobs:
             cleanup_staged_helper_before_operation || echo "Source helper stage cleanup failed after deadline guard" >&2
             exit 1
           fi
+          remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $REMOTE_OPERATION $SOURCE_SHA $BUNDLE_SHA256 $EVICT_BUILD_NODE_CACHE $COMPACT_FALLBACK_RUNTIME_CACHE $RESUME_FALLBACK_CACHE_COMPACTION ${RESUME_COMPACTION_RUN_ID:-none} ${RESUME_COMPACTION_RUN_ATTEMPT:-none} ${RESUME_COMPACTION_BUNDLE_SHA256:-none} $SECURITY_RUN_ID $SECURITY_RUN_ATTEMPT $retain_helper_stage"
           : >"$remote_report"
           : >"$remote_error"
           chmod 600 "$remote_report" "$remote_error"
@@ -914,7 +947,7 @@ jobs:
             "bash -s -- $remote_arguments" >"$remote_report" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
 
-          [[ "$#" = 11 ]]
+          [[ "$#" = 14 ]]
           run_id="${1:-}"
           run_attempt="${2:-}"
           operation="${3:-}"
@@ -926,9 +959,15 @@ jobs:
           resume_compaction_run_id="${9:-none}"
           resume_compaction_run_attempt="${10:-none}"
           resume_compaction_bundle_sha256="${11:-none}"
+          security_run_id="${12:-}"
+          security_run_attempt="${13:-}"
+          retain_helper_stage="${14:-false}"
           [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
-          [[ "$operation" = create || "$operation" = verify-existing ]]
+          [[ "$operation" = create || "$operation" = verify-existing || "$operation" = authorization-probe ]]
+          [[ "$security_run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$security_run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ "$retain_helper_stage" = true || "$retain_helper_stage" = false ]]
           test "$(id -u)" -eq 0 || { echo "Production backup must run as root" >&2; exit 1; }
           prepare_stage_lock() {
             local lock_parent=/run/lock
@@ -952,7 +991,7 @@ jobs:
             flock -w 45 7
           }
           prepare_stage_lock
-          if [[ "$operation" = verify-existing || "$operation" = create ]]; then
+          if [[ "$operation" = verify-existing || "$operation" = create || "$operation" = authorization-probe ]]; then
             [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
             [[ "$bundle_sha" =~ ^[0-9a-f]{64}$ ]]
             [[ "$evict_build_node_cache" = true || "$evict_build_node_cache" = false ]]
@@ -976,10 +1015,14 @@ jobs:
           helper_stage=""
           helper_stage_identity=""
           backup_capture_file="/tmp/oldsparky-production-backup-${run_id}-${run_attempt}.stderr"
+          probe_marker_emitted=false
+          probe_operation_status=unknown
+          probe_cleanup_status=unknown
+          probe_custody_status=unavailable
           backup_failure_marker() {
             exit_code=$?
             trap - EXIT
-            if (( exit_code != 0 )); then
+            if (( exit_code != 0 )) && [[ "$operation" != authorization-probe ]]; then
               /usr/bin/python3 -I -B - "$runtime/shared" "$run_id" "$run_attempt" \
                 "$operation" "$source_sha" "$bundle_sha" "$failure_stage" "$exit_code" \
                 "$backup_report_file" "$backup_capture_file" "$public_summary_error" <<'PY' >/dev/null 2>&1 || :
@@ -1073,6 +1116,7 @@ jobs:
           scratch_unit_diagnostic = None
           scratch_admission_diagnostic = None
           backup_disk_diagnostic = None
+          scratch_first_fault = None
           if report_state == "read":
               try:
                   report = json.loads(
@@ -1090,6 +1134,72 @@ jobs:
                       scratch_unit = report.get("scratch_unit_diagnostic")
                       scratch_admission = report.get("scratch_admission_diagnostic")
                       backup_disk = report.get("backup_disk_diagnostic")
+                      first_fault = report.get("scratch_first_fault")
+                      fault_marker = b"SCRATCH_FIRST_FAULT_V1\n"
+                      fault_marker_count = stderr_bytes.count(fault_marker) if stderr_state == "read" else 0
+                      first_fault_sites = {
+                          "controller_entry", "controller_archive_identity", "controller_unit_setup",
+                          "controller_host_guard", "controller_launch", "controller_unit_snapshot",
+                          "controller_identity", "controller_start_token", "controller_active_poll",
+                          "controller_worker_frame", "controller_completion_snapshot", "controller_done_token",
+                          "controller_final_snapshot", "controller_cleanup", "worker_entry",
+                          "worker_start_token", "worker_root_identity", "worker_mount_snapshot",
+                          "worker_cgroup_snapshot", "worker_host_reserve", "worker_archive_open",
+                          "worker_directory_setup", "worker_postgres_tools", "worker_initdb",
+                          "worker_after_initdb_guard", "worker_role_setup", "worker_postgres_start",
+                          "worker_after_postgres_start_guard", "worker_pg_restore_resource_guard",
+                          "worker_restore", "worker_after_restore_guard", "worker_postgres_stop",
+                          "worker_result_frame", "worker_done_token",
+                      }
+                      first_fault_kinds = {
+                          "permission", "os_error", "timeout", "subprocess", "json_decode", "unicode",
+                          "attribute", "index", "name", "type", "key", "value", "restore_guard_stop",
+                          "backup_interrupted", "scratch_token_delivery", "runtime", "other",
+                      }
+                      valid_first_fault = (
+                          isinstance(first_fault, dict)
+                          and set(first_fault) == {"schema", "origin", "site", "exception_kind", "errno"}
+                          and type(first_fault.get("schema")) is int
+                          and first_fault.get("schema") == 1
+                          and type(first_fault.get("origin")) is str
+                          and first_fault.get("origin") in {"controller", "worker"}
+                          and type(first_fault.get("site")) is str
+                          and first_fault.get("site") in first_fault_sites
+                          and first_fault.get("site", "").startswith(first_fault.get("origin", "") + "_")
+                          and type(first_fault.get("exception_kind")) is str
+                          and first_fault.get("exception_kind") in first_fault_kinds
+                          and (
+                              first_fault.get("errno") is None
+                              or (type(first_fault["errno"]) is int and 1 <= first_fault["errno"] <= 4095)
+                          )
+                          and (
+                              first_fault.get("exception_kind") in {"permission", "os_error"}
+                              or first_fault.get("errno") is None
+                          )
+                      )
+                      if "scratch_first_fault" in report and first_fault is None:
+                          report_state = "unclassified_json"
+                      elif first_fault is not None:
+                          if valid_first_fault and fault_marker_count == 1:
+                              marker_start = stderr_bytes.index(fault_marker) + len(fault_marker)
+                              marker_end = stderr_bytes.find(b"\n", marker_start)
+                              frame_bytes = stderr_bytes[marker_start:marker_end] if marker_end >= 0 else b""
+                              try:
+                                  frame = json.loads(
+                                      frame_bytes.decode("ascii"),
+                                      object_pairs_hook=reject_duplicate_keys,
+                                  )
+                              except (UnicodeDecodeError, json.JSONDecodeError):
+                                  frame = None
+                              canonical_frame = json.dumps(first_fault, sort_keys=True, separators=(",", ":")).encode("ascii")
+                              if frame == first_fault and frame_bytes == canonical_frame and len(frame_bytes) <= 512:
+                                  scratch_first_fault = first_fault
+                              else:
+                                  report_state = "unclassified_json"
+                          else:
+                              report_state = "unclassified_json"
+                      elif fault_marker_count:
+                          report_state = "unclassified_json"
                       valid_backup_disk = False
                       backup_disk_phases = {
                           "backup_admission", "pg_dump_pre_spawn", "pg_dump_post_start",
@@ -1455,6 +1565,7 @@ jobs:
                   "scratch_unit_diagnostic": scratch_unit_diagnostic,
                   "scratch_admission_diagnostic": scratch_admission_diagnostic,
                   "backup_disk_diagnostic": backup_disk_diagnostic,
+                  "scratch_first_fault": scratch_first_fault,
                   "report_bytes": len(report_bytes),
                   "report_sha256": hashlib.sha256(report_bytes).hexdigest() if report_bytes else None,
                   "stderr_state": stderr_state,
@@ -1502,8 +1613,8 @@ jobs:
               os.close(shared_fd)
           PY
             fi
-            if [[ ( "$operation" = verify-existing || "$operation" = create ) && -n "$helper_stage" && -n "$helper_stage_identity" ]]; then
-              if /usr/bin/python3 -I -B - "$helper_stage" "$helper_stage_identity" "$bundle_sha" "$source_sha" <<'PY'
+          if [[ ( "$operation" = verify-existing || "$operation" = create || "$operation" = authorization-probe ) && -n "$helper_stage" && -n "$helper_stage_identity" ]]; then
+              if /usr/bin/python3 -I -B - "$helper_stage" "$helper_stage_identity" "$bundle_sha" "$source_sha" "$retain_helper_stage" <<'PY'
           import hashlib
           import json
           import os
@@ -1514,7 +1625,9 @@ jobs:
 
           root = Path(sys.argv[1])
           expected_identity = tuple(int(value) for value in sys.argv[2].split(":"))
-          expected_bundle_sha, source_sha = sys.argv[3:]
+          expected_bundle_sha, source_sha, retain_helper_stage = sys.argv[3:]
+          if retain_helper_stage not in {"true", "false"}:
+              raise SystemExit(1)
           names = (
               "platform_backup_restore_drill.py",
               "platform_disk_policy.py",
@@ -1536,7 +1649,7 @@ jobs:
           try:
               root_st = root.lstat()
           except FileNotFoundError:
-              raise SystemExit(0)
+              raise SystemExit(1 if retain_helper_stage == "true" else 0)
           if (
               not stat.S_ISDIR(root_st.st_mode)
               or (root_st.st_dev, root_st.st_ino) != expected_identity
@@ -1575,20 +1688,44 @@ jobs:
               for name in names:
                   (tools / name).unlink()
               tools.rmdir()
-          if (root / "bundle.zip").exists():
+          if retain_helper_stage == "true":
+              current_root = root.lstat()
+              if (
+                  (current_root.st_dev, current_root.st_ino) != expected_identity
+                  or current_root.st_uid != 0
+                  or current_root.st_gid != 0
+                  or stat.S_IMODE(current_root.st_mode) != 0o700
+                  or {entry.name for entry in root.iterdir()} != {"bundle.zip"}
+              ):
+                  raise SystemExit(1)
+              root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              try:
+                  opened_root = os.fstat(root_fd)
+                  if (opened_root.st_dev, opened_root.st_ino) != expected_identity:
+                      raise SystemExit(1)
+                  os.fsync(root_fd)
+              finally:
+                  os.close(root_fd)
+              directory_fd = os.open("/tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              try:
+                  os.fsync(directory_fd)
+              finally:
+                  os.close(directory_fd)
+          if retain_helper_stage != "true" and (root / "bundle.zip").exists():
               current = bundle.lstat()
               if (current.st_dev, current.st_ino) != (bundle_st.st_dev, bundle_st.st_ino):
                   raise SystemExit(1)
               bundle.unlink()
-          current_root = root.lstat()
-          if (current_root.st_dev, current_root.st_ino) != expected_identity or {entry.name for entry in root.iterdir()}:
-              raise SystemExit(1)
-          root.rmdir()
-          directory_fd = os.open("/tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-          try:
-              os.fsync(directory_fd)
-          finally:
-              os.close(directory_fd)
+          if retain_helper_stage != "true":
+              current_root = root.lstat()
+              if (current_root.st_dev, current_root.st_ino) != expected_identity or {entry.name for entry in root.iterdir()}:
+                  raise SystemExit(1)
+              root.rmdir()
+              directory_fd = os.open("/tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              try:
+                  os.fsync(directory_fd)
+              finally:
+                  os.close(directory_fd)
           PY
               then
                 :
@@ -1597,7 +1734,7 @@ jobs:
                 failure_stage=helper_cleanup
               fi
             fi
-            if [[ -n "$backup_report_file" ]]; then
+            if [[ -n "$backup_report_file" && ( "$operation" != authorization-probe || "$probe_custody_status" = committed ) ]]; then
               if rm -f -- "$backup_report_file"; then
                 :
               else
@@ -1607,6 +1744,14 @@ jobs:
                   failure_stage=report_cleanup
                 fi
               fi
+            fi
+            if [[ "$operation" = authorization-probe ]]; then
+              if [[ "$probe_marker_emitted" != true ]]; then
+                printf 'AUTHORIZATION_PROBE_EVIDENCE_UNAVAILABLE schema=1 run_id=%s attempt=%s status=%s cleanup_status=%s receipt=unavailable custody=%s\n' \
+                  "$run_id" "$run_attempt" "$probe_operation_status" "$probe_cleanup_status" "$probe_custody_status"
+                if (( exit_code == 0 )); then exit_code=1; fi
+              fi
+              exit "$exit_code"
             fi
             if (( exit_code != 0 )); then
               printf 'BACKUP_FAILURE schema=1 stage=%s exit_code=%s\n' \
@@ -1622,7 +1767,7 @@ jobs:
           maintenance_tool="$current/tools/platform_storage_maintenance.py"
           summary_tool=""
           helper_stage="/tmp/oldsparky-backup-verifier-${run_id}-${run_attempt}"
-          if [[ "$operation" = verify-existing || "$operation" = create ]]; then
+          if [[ "$operation" = verify-existing || "$operation" = create || "$operation" = authorization-probe ]]; then
             failure_stage=helper_bundle_validation
             test "$(stat -c '%F:%u:%g:%a:%h' "$helper_stage")" = "directory:0:0:700:2"
             helper_stage_identity="$(stat -c '%d:%i' "$helper_stage")"
@@ -1734,9 +1879,11 @@ jobs:
           test "$(id -u)" -eq 0 || { echo "Production backup must run as root" >&2; exit 1; }
           test -L "$current" || { echo "Current release symlink is missing" >&2; exit 1; }
           test -x "$python_bin" || { echo "Shared Python runtime is missing" >&2; exit 1; }
-          test -f "$runtime/shared/.env.platform" || { echo "Platform env file is missing" >&2; exit 1; }
-          test -f "$maintenance_tool" && test ! -L "$maintenance_tool" \
-            || { echo "Storage maintenance tool is missing" >&2; exit 1; }
+          if [[ "$operation" != authorization-probe ]]; then
+            test -f "$runtime/shared/.env.platform" || { echo "Platform env file is missing" >&2; exit 1; }
+            test -f "$maintenance_tool" && test ! -L "$maintenance_tool" \
+              || { echo "Storage maintenance tool is missing" >&2; exit 1; }
+          fi
           backup_drill_tool="$helper_stage/tools/platform_backup_restore_drill.py"
           test -f "$backup_drill_tool" && test ! -L "$backup_drill_tool" \
             || { echo "Source-bound backup restore helper is missing" >&2; exit 1; }
@@ -1744,15 +1891,19 @@ jobs:
           backup_drill_sha256="$(sha256sum -- "$backup_drill_tool" | awk '{print $1}')"
           [[ "$storage_helper_sha256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$backup_drill_sha256" =~ ^[0-9a-f]{64}$ ]]
-          test -f "$summary_tool" && test ! -L "$summary_tool" \
-            || { echo "Storage evidence summary helper is missing or unsafe" >&2; exit 1; }
+          if [[ "$operation" != authorization-probe ]]; then
+            test -f "$summary_tool" && test ! -L "$summary_tool" \
+              || { echo "Storage evidence summary helper is missing or unsafe" >&2; exit 1; }
+          fi
 
           if [[ "$operation" = verify-existing ]]; then
             failure_stage=backup_verify_existing
-          else
+          elif [[ "$operation" = create ]]; then
             failure_stage=backup_create
+          else
+            failure_stage=authorization_probe
           fi
-          /usr/bin/python3 -I - "$python_bin" "$maintenance_tool" \
+          if /usr/bin/python3 -I - "$python_bin" "$maintenance_tool" \
             "$runtime" "$run_id" "$run_attempt" "$backup_report_file" "$operation" \
             "$evict_build_node_cache" "$compact_fallback_runtime_cache" \
             "$resume_compaction" "$resume_compaction_run_id" \
@@ -1868,6 +2019,8 @@ jobs:
                           "--resume-compaction-source-sha", source_sha,
                           "--resume-compaction-bundle-sha256", resume_compaction_bundle_sha256,
                       ))
+          elif operation == "authorization-probe":
+              command.insert(-3, "--authorization-probe-only")
           else:
               raise SystemExit(125)
           def stop_child_group(process):
@@ -1928,6 +2081,562 @@ jobs:
                   raise
           raise SystemExit(status)
           PY
+          then
+            operation_status=0
+          else
+            operation_status=$?
+          fi
+          if [[ "$operation" = authorization-probe ]]; then
+            failure_stage=authorization_probe_receipt
+            probe_operation_status=unknown
+            probe_cleanup_status=unknown
+            if probe_marker="$(/usr/bin/python3 -I - "$backup_report_file" "$backup_capture_file" "$operation_status" "$runtime/shared" "$run_id" "$run_attempt" "$security_run_id" "$security_run_attempt" "$source_sha" "$bundle_sha" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          def reject_duplicate_keys(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError
+                  result[key] = value
+              return result
+
+          def read_private(path, cap):
+              before = os.lstat(path)
+              if (
+                  not stat.S_ISREG(before.st_mode)
+                  or before.st_uid != 0
+                  or before.st_gid != 0
+                  or stat.S_IMODE(before.st_mode) != 0o600
+                  or before.st_nlink != 1
+                  or before.st_size < 0
+                  or before.st_size > cap
+              ):
+                  raise ValueError
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                      raise ValueError
+                  payload = bytearray()
+                  while len(payload) <= cap:
+                      block = os.read(descriptor, min(8192, cap + 1 - len(payload)))
+                      if not block:
+                          break
+                      payload.extend(block)
+                  finished = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              after = os.lstat(path)
+              if (
+                  len(payload) > cap
+                  or (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns, finished.st_ctime_ns)
+                  != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                  or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                  != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+              ):
+                  raise ValueError
+              return bytes(payload)
+
+          def valid_first_fault(value):
+              origins = {"controller", "worker"}
+              sites = {
+                  "controller_entry", "controller_archive_identity", "controller_unit_setup",
+                  "controller_host_guard", "controller_launch", "controller_unit_snapshot",
+                  "controller_identity", "controller_start_token", "controller_active_poll",
+                  "controller_worker_frame", "controller_completion_snapshot", "controller_done_token",
+                  "controller_final_snapshot", "controller_cleanup", "worker_entry",
+                  "worker_start_token", "worker_root_identity", "worker_mount_snapshot",
+                  "worker_cgroup_snapshot", "worker_host_reserve", "worker_archive_open",
+                  "worker_directory_setup", "worker_postgres_tools", "worker_initdb",
+                  "worker_after_initdb_guard", "worker_role_setup", "worker_postgres_start",
+                  "worker_after_postgres_start_guard", "worker_pg_restore_resource_guard",
+                  "worker_restore", "worker_after_restore_guard", "worker_postgres_stop",
+                  "worker_result_frame", "worker_done_token",
+              }
+              kinds = {
+                  "permission", "os_error", "timeout", "subprocess", "json_decode", "unicode",
+                  "attribute", "index", "name", "type", "key", "value", "restore_guard_stop",
+                  "backup_interrupted", "scratch_token_delivery", "runtime", "other",
+              }
+              if (
+                  not isinstance(value, dict)
+                  or set(value) != {"schema", "origin", "site", "exception_kind", "errno"}
+                  or type(value.get("schema")) is not int
+                  or value["schema"] != 1
+                  or type(value.get("origin")) is not str
+                  or value.get("origin") not in origins
+                  or type(value.get("site")) is not str
+                  or value.get("site") not in sites
+                  or value.get("exception_kind") not in kinds
+                  or not (
+                      (value.get("origin") == "controller" and isinstance(value.get("site"), str) and value["site"].startswith("controller_"))
+                      or (value.get("origin") == "worker" and isinstance(value.get("site"), str) and value["site"].startswith("worker_"))
+                  )
+              ):
+                  return False
+              error_number = value.get("errno")
+              if error_number is not None and (type(error_number) is not int or not 1 <= error_number <= 4095):
+                  return False
+              if value["exception_kind"] in {"permission", "os_error"}:
+                  return error_number is None or type(error_number) is int
+              return error_number is None
+
+          def parse_probe_report(report_bytes, capture_bytes, child_status):
+              report = json.loads(report_bytes.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+              if (
+                  not isinstance(report, dict)
+                  or type(report.get("schema")) is not int
+                  or report.get("schema") != 1
+                  or report.get("kind") != "authorization_probe"
+              ):
+                  raise ValueError
+              if report.get("status") == "completed":
+                  if (
+                      set(report) != {"schema", "kind", "status", "authorization_probe"}
+                      or not isinstance(report.get("authorization_probe"), dict)
+                      or set(report["authorization_probe"]) != {"schema", "status"}
+                      or type(report["authorization_probe"].get("schema")) is not int
+                      or report["authorization_probe"].get("schema") != 1
+                      or report["authorization_probe"].get("status") != "completed"
+                      or int(child_status) != 0
+                  ):
+                      raise ValueError
+                  status = "completed"
+                  cleanup_status = "confirmed"
+                  first_fault = None
+              elif report.get("status") == "failed":
+                  expected = {"schema", "kind", "status", "cleanup_status"}
+                  if "first_fault" in report:
+                      expected.add("first_fault")
+                  if set(report) != expected or int(child_status) != 1:
+                      raise ValueError
+                  cleanup_status = report.get("cleanup_status")
+                  if cleanup_status not in {"confirmed", "failed", "unknown"}:
+                      raise ValueError
+                  status = "failed"
+                  first_fault = report.get("first_fault")
+                  if "first_fault" in report and not valid_first_fault(first_fault):
+                      raise ValueError
+              else:
+                  raise ValueError
+              marker = b"SCRATCH_FIRST_FAULT_V1\n"
+              marker_count = capture_bytes.count(marker)
+              if first_fault is None:
+                  if marker_count:
+                      raise ValueError
+              else:
+                  if marker_count != 1:
+                      raise ValueError
+                  start = capture_bytes.index(marker) + len(marker)
+                  end = capture_bytes.find(b"\n", start)
+                  frame_bytes = capture_bytes[start:end] if end >= 0 else b""
+                  if (
+                      not frame_bytes
+                      or len(frame_bytes) > 512
+                      or json.loads(frame_bytes.decode("ascii"), object_pairs_hook=reject_duplicate_keys) != first_fault
+                      or frame_bytes != json.dumps(first_fault, separators=(",", ":"), sort_keys=True).encode("ascii")
+                  ):
+                      raise ValueError
+              if status == "completed" and cleanup_status != "confirmed":
+                  raise ValueError
+              return status, cleanup_status, first_fault
+
+          def verify_shared_parent(shared_path):
+              shared_fd = os.open(shared_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  shared = os.fstat(shared_fd)
+                  named = os.lstat(shared_path)
+                  identity = (shared.st_dev, shared.st_ino, shared.st_mode, shared.st_uid, shared.st_gid, shared.st_nlink)
+                  if (
+                      not stat.S_ISDIR(shared.st_mode)
+                      or shared.st_uid != 0
+                      or shared.st_gid != 0
+                      or stat.S_IMODE(shared.st_mode) != 0o755
+                      or shared.st_nlink < 2
+                      or identity != (named.st_dev, named.st_ino, named.st_mode, named.st_uid, named.st_gid, named.st_nlink)
+                  ):
+                      raise OSError
+                  return shared_fd, identity
+              except BaseException:
+                  os.close(shared_fd)
+                  raise
+
+          def verify_shared_parent_identity(shared_fd, shared_path, identity):
+              shared = os.fstat(shared_fd)
+              named = os.lstat(shared_path)
+              if (
+                  (shared.st_dev, shared.st_ino, shared.st_mode, shared.st_uid, shared.st_gid, shared.st_nlink) != identity
+                  or (named.st_dev, named.st_ino, named.st_mode, named.st_uid, named.st_gid, named.st_nlink) != identity
+              ):
+                  raise OSError
+
+          def write_closed_file(shared_fd, filename, payload):
+              descriptor = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=shared_fd)
+              try:
+                  os.fchown(descriptor, 0, 0)
+                  os.fchmod(descriptor, 0o600)
+                  view = memoryview(payload)
+                  while view:
+                      written = os.write(descriptor, view)
+                      if written <= 0:
+                          raise OSError
+                      view = view[written:]
+                  os.fsync(descriptor)
+                  written_stat = os.fstat(descriptor)
+                  named_stat = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+                  if (
+                      not stat.S_ISREG(written_stat.st_mode)
+                      or written_stat.st_uid != 0
+                      or written_stat.st_gid != 0
+                      or stat.S_IMODE(written_stat.st_mode) != 0o600
+                      or written_stat.st_nlink != 1
+                      or written_stat.st_size != len(payload)
+                      or (written_stat.st_dev, written_stat.st_ino) != (named_stat.st_dev, named_stat.st_ino)
+                  ):
+                      raise OSError
+                  return written_stat.st_dev, written_stat.st_ino
+              finally:
+                  os.close(descriptor)
+
+          def unlink_owned_file(shared_fd, filename, identity, expected_size):
+              before = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+              if (
+                  not stat.S_ISREG(before.st_mode)
+                  or before.st_uid != 0
+                  or before.st_gid != 0
+                  or stat.S_IMODE(before.st_mode) != 0o600
+                  or before.st_nlink != 1
+                  or before.st_size != expected_size
+                  or (before.st_dev, before.st_ino) != identity
+              ):
+                  raise OSError
+              descriptor = os.open(filename, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=shared_fd)
+              try:
+                  opened = os.fstat(descriptor)
+                  named = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+                  if (
+                      (opened.st_dev, opened.st_ino) != identity
+                      or (named.st_dev, named.st_ino) != identity
+                      or (opened.st_size, opened.st_uid, opened.st_gid, opened.st_nlink, stat.S_IMODE(opened.st_mode))
+                      != (expected_size, 0, 0, 1, 0o600)
+                  ):
+                      raise OSError
+                  os.unlink(filename, dir_fd=shared_fd)
+              finally:
+                  os.close(descriptor)
+
+          def verify_owned_entry(shared_fd, filename, identity, expected_size):
+              named = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+              if (
+                  not stat.S_ISREG(named.st_mode)
+                  or named.st_uid != 0
+                  or named.st_gid != 0
+                  or stat.S_IMODE(named.st_mode) != 0o600
+                  or named.st_nlink != 1
+                  or named.st_size != expected_size
+                  or (named.st_dev, named.st_ino) != identity
+              ):
+                  raise OSError
+              descriptor = os.open(filename, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=shared_fd)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (
+                      (opened.st_dev, opened.st_ino) != identity
+                      or opened.st_size != expected_size
+                      or opened.st_uid != 0
+                      or opened.st_gid != 0
+                      or stat.S_IMODE(opened.st_mode) != 0o600
+                      or opened.st_nlink != 1
+                  ):
+                      raise OSError
+              finally:
+                  os.close(descriptor)
+
+          def read_back_owned_receipt(shared_fd, filename, identity, expected_size, expected_bytes, expected_receipt):
+              before = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+              if (
+                  not stat.S_ISREG(before.st_mode)
+                  or before.st_uid != 0
+                  or before.st_gid != 0
+                  or stat.S_IMODE(before.st_mode) != 0o600
+                  or before.st_nlink != 1
+                  or before.st_size != expected_size
+                  or (before.st_dev, before.st_ino) != identity
+              ):
+                  raise OSError
+              descriptor = os.open(filename, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=shared_fd)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(opened.st_mode)
+                      or opened.st_uid != 0
+                      or opened.st_gid != 0
+                      or stat.S_IMODE(opened.st_mode) != 0o600
+                      or opened.st_nlink != 1
+                      or opened.st_size != expected_size
+                      or (opened.st_dev, opened.st_ino) != identity
+                  ):
+                      raise OSError
+                  payload = bytearray()
+                  while len(payload) <= expected_size:
+                      block = os.read(descriptor, min(4096, expected_size + 1 - len(payload)))
+                      if not block:
+                          break
+                      payload.extend(block)
+                  finished = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              after = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+              identity_fields = lambda value: (
+                  value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+                  value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+              )
+              if (
+                  len(payload) != expected_size
+                  or identity_fields(finished) != identity_fields(before)
+                  or identity_fields(after) != identity_fields(before)
+              ):
+                  raise OSError
+              encoded = bytes(payload)
+              parsed = json.loads(encoded.decode("ascii"), object_pairs_hook=reject_duplicate_keys)
+              expected_fields = {
+                  "schema", "kind", "status", "workflow_run_id", "workflow_run_attempt",
+                  "security_run_id", "security_run_attempt", "source_sha", "helper_bundle_sha256",
+                  "cleanup_status",
+              }
+              if "first_fault" in expected_receipt:
+                  expected_fields.add("first_fault")
+              if (
+                  not isinstance(parsed, dict)
+                  or set(parsed) != expected_fields
+                  or type(parsed.get("schema")) is not int
+                  or parsed.get("schema") != 1
+                  or type(parsed.get("kind")) is not str
+                  or parsed.get("kind") != "authorization_probe_receipt"
+                  or type(parsed.get("status")) is not str
+                  or parsed.get("status") not in {"completed", "failed"}
+                  or type(parsed.get("cleanup_status")) is not str
+                  or parsed.get("cleanup_status") not in {"confirmed", "failed", "unknown"}
+                  or any(type(parsed.get(field)) is not str for field in (
+                      "workflow_run_id", "workflow_run_attempt", "security_run_id",
+                      "security_run_attempt", "source_sha", "helper_bundle_sha256",
+                  ))
+                  or ("first_fault" in parsed and not valid_first_fault(parsed["first_fault"]))
+                  or parsed != expected_receipt
+                  or encoded != expected_bytes
+              ):
+                  raise ValueError
+              return encoded
+
+          def unlink_temporary_capture(capture_path, temporary_path, cap):
+              if str(Path(capture_path).parent) != temporary_path:
+                  raise OSError
+              temporary_fd = os.open(temporary_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  temporary = os.fstat(temporary_fd)
+                  temporary_named = os.lstat(temporary_path)
+                  temporary_identity = (temporary.st_dev, temporary.st_ino, temporary.st_mode, temporary.st_uid, temporary.st_gid, temporary.st_nlink)
+                  if (
+                      not stat.S_ISDIR(temporary.st_mode)
+                      or temporary.st_uid != 0
+                      or not (temporary.st_mode & stat.S_ISVTX)
+                      or temporary_identity != (temporary_named.st_dev, temporary_named.st_ino, temporary_named.st_mode, temporary_named.st_uid, temporary_named.st_gid, temporary_named.st_nlink)
+                  ):
+                      raise OSError
+                  name = Path(capture_path).name
+                  before = os.stat(name, dir_fd=temporary_fd, follow_symlinks=False)
+                  if (
+                      not stat.S_ISREG(before.st_mode)
+                      or before.st_uid != 0
+                      or before.st_gid != 0
+                      or stat.S_IMODE(before.st_mode) != 0o600
+                      or before.st_nlink != 1
+                      or before.st_size > cap
+                  ):
+                      raise OSError
+                  descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=temporary_fd)
+                  try:
+                      opened = os.fstat(descriptor)
+                      named = os.stat(name, dir_fd=temporary_fd, follow_symlinks=False)
+                      if (
+                          (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mode, opened.st_uid, opened.st_gid, opened.st_nlink)
+                          != (before.st_dev, before.st_ino, before.st_size, before.st_mode, before.st_uid, before.st_gid, before.st_nlink)
+                          or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
+                      ):
+                          raise OSError
+                      os.unlink(name, dir_fd=temporary_fd)
+                  finally:
+                      os.close(descriptor)
+                  os.fsync(temporary_fd)
+                  temporary_after = os.fstat(temporary_fd)
+                  named_after = os.lstat(temporary_path)
+                  if (
+                      (temporary_after.st_dev, temporary_after.st_ino, temporary_after.st_mode, temporary_after.st_uid, temporary_after.st_gid, temporary_after.st_nlink) != temporary_identity
+                      or (named_after.st_dev, named_after.st_ino, named_after.st_mode, named_after.st_uid, named_after.st_gid, named_after.st_nlink) != temporary_identity
+                  ):
+                      raise OSError
+              finally:
+                  os.close(temporary_fd)
+
+          def process_probe(report_path, capture_path, child_status, shared_path, run_id, run_attempt,
+                            security_id, security_attempt, source_sha, bundle_sha, temporary_path="/tmp"):
+              status = "unknown"
+              cleanup_status = "unknown"
+              shared_fd = None
+              pending_name = None
+              pending_identity = None
+              pending_size = None
+              pending_committed = False
+              try:
+                  if (
+                      re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None
+                      or re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt) is None
+                      or re.fullmatch(r"[1-9][0-9]{0,19}", security_id) is None
+                      or re.fullmatch(r"[1-9][0-9]{0,5}", security_attempt) is None
+                      or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+                      or re.fullmatch(r"[0-9a-f]{64}", bundle_sha) is None
+                      or str(Path(capture_path).parent) != temporary_path
+                      or Path(capture_path).name != f"oldsparky-production-backup-{run_id}-{run_attempt}.stderr"
+                      or str(Path(report_path).parent) != temporary_path
+                      or re.fullmatch(r"oldsparky-production-backup-report\.[A-Za-z0-9]{6}", Path(report_path).name) is None
+                  ):
+                      raise ValueError
+                  report_bytes = read_private(report_path, 16384)
+                  capture_bytes = read_private(capture_path, 65536)
+                  status, cleanup_status, first_fault = parse_probe_report(report_bytes, capture_bytes, child_status)
+                  receipt = {
+                      "schema": 1,
+                      "kind": "authorization_probe_receipt",
+                      "status": status,
+                      "workflow_run_id": run_id,
+                      "workflow_run_attempt": run_attempt,
+                      "security_run_id": security_id,
+                      "security_run_attempt": security_attempt,
+                      "source_sha": source_sha,
+                      "helper_bundle_sha256": bundle_sha,
+                      "cleanup_status": cleanup_status,
+                  }
+                  if first_fault is not None:
+                      receipt["first_fault"] = first_fault
+                  pending = {
+                      "schema": 1,
+                      "kind": "authorization_probe_pending",
+                      "status": "pending",
+                      "probe_status": status,
+                      **{key: value for key, value in receipt.items() if key not in {"kind", "status"}},
+                  }
+                  receipt_bytes = (json.dumps(receipt, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+                  pending_bytes = (json.dumps(pending, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+                  if len(receipt_bytes) > 4096 or len(pending_bytes) > 4096:
+                      raise ValueError
+                  shared_fd, shared_identity = verify_shared_parent(shared_path)
+                  pending_name = f"authorization-probe-{run_id}-{run_attempt}.pending.json"
+                  pending_identity = write_closed_file(shared_fd, pending_name, pending_bytes)
+                  pending_size = len(pending_bytes)
+                  os.fsync(shared_fd)
+                  verify_shared_parent_identity(shared_fd, shared_path, shared_identity)
+                  verify_owned_entry(shared_fd, pending_name, pending_identity, pending_size)
+                  pending_committed = True
+                  unlink_temporary_capture(capture_path, temporary_path, 65536)
+                  unlink_temporary_capture(report_path, temporary_path, 16384)
+                  final_name = f"authorization-probe-{run_id}-{run_attempt}.json"
+                  final_identity = write_closed_file(shared_fd, final_name, receipt_bytes)
+                  os.fsync(shared_fd)
+                  verify_shared_parent_identity(shared_fd, shared_path, shared_identity)
+                  verify_owned_entry(shared_fd, final_name, final_identity, len(receipt_bytes))
+                  verify_shared_parent_identity(shared_fd, shared_path, shared_identity)
+                  read_back_owned_receipt(
+                      shared_fd, final_name, final_identity, len(receipt_bytes), receipt_bytes, receipt
+                  )
+                  verify_shared_parent_identity(shared_fd, shared_path, shared_identity)
+                  unlink_owned_file(shared_fd, pending_name, pending_identity, len(pending_bytes))
+                  os.fsync(shared_fd)
+                  verify_shared_parent_identity(shared_fd, shared_path, shared_identity)
+                  status_code = 0 if status == "completed" else 1
+                  marker = (
+                  f"AUTHORIZATION_PROBE_RESULT schema=1 run_id={run_id} attempt={run_attempt} "
+                  f"security_run_id={security_id} security_run_attempt={security_attempt} source_sha={source_sha} "
+                  f"bundle_sha256={bundle_sha} status={status} cleanup_status={cleanup_status} receipt=written custody=committed"
+                  )
+                  return status_code, marker
+              except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+                  if shared_fd is not None and pending_name is not None and pending_identity is not None and pending_size is not None:
+                      try:
+                          # Keep the pending projection after any final receipt failure.
+                          verify_shared_parent_identity(shared_fd, shared_path, shared_identity)
+                      except OSError:
+                          pass
+                  if pending_committed:
+                      cleanup_paths = []
+                      if (
+                          re.fullmatch(r"[1-9][0-9]{0,19}", run_id)
+                          and re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt)
+                          and str(Path(capture_path).parent) == temporary_path
+                          and Path(capture_path).name == f"oldsparky-production-backup-{run_id}-{run_attempt}.stderr"
+                      ):
+                          cleanup_paths.append((capture_path, 65536))
+                      if (
+                          str(Path(report_path).parent) == temporary_path
+                          and re.fullmatch(r"oldsparky-production-backup-report\.[A-Za-z0-9]{6}", Path(report_path).name)
+                      ):
+                          cleanup_paths.append((report_path, 16384))
+                      for path, cap in cleanup_paths:
+                          try:
+                              unlink_temporary_capture(path, temporary_path, cap)
+                          except OSError:
+                              pass
+                  safe_run_id = run_id if re.fullmatch(r"[1-9][0-9]{0,19}", run_id) else "0"
+                  safe_run_attempt = run_attempt if re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt) else "0"
+                  return 1, (
+                      f"AUTHORIZATION_PROBE_EVIDENCE_UNAVAILABLE schema=1 run_id={safe_run_id} attempt={safe_run_attempt} "
+                      f"status=unknown cleanup_status={cleanup_status} receipt=unavailable "
+                      f"custody={'pending' if pending_committed else 'unavailable'}"
+                  )
+              finally:
+                  if shared_fd is not None:
+                      os.close(shared_fd)
+
+          def main(argv=None):
+              if argv is None:
+                  argv = sys.argv[1:]
+              report_path, capture_path, child_status, shared_path, run_id, run_attempt, security_id, security_attempt, source_sha, bundle_sha = argv
+              status, marker = process_probe(
+                  report_path, capture_path, child_status, shared_path, run_id, run_attempt,
+                  security_id, security_attempt, source_sha, bundle_sha,
+              )
+              print(marker)
+              return status
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PY
+            )"; then
+              probe_exit_code=0
+            else
+              probe_exit_code=$?
+            fi
+            if [[ -n "$probe_marker" ]]; then
+              probe_marker_emitted=true
+              if [[ "$probe_marker" =~ status=(completed|failed|unknown)[[:space:]]cleanup_status=(confirmed|failed|unknown) ]]; then
+                probe_operation_status="${BASH_REMATCH[1]}"
+                probe_cleanup_status="${BASH_REMATCH[2]}"
+              fi
+              if [[ "$probe_marker" =~ custody=(committed|pending|unavailable)$ ]]; then
+                probe_custody_status="${BASH_REMATCH[1]}"
+              fi
+              printf '%s\n' "$probe_marker"
+            fi
+            exit "$probe_exit_code"
+          fi
+          if (( operation_status != 0 )); then
+            exit "$operation_status"
+          fi
           failure_stage=summary_validation
           public_summary_error=summary_tool_failed
           public_report="$({
@@ -2243,6 +2952,33 @@ jobs:
             :
           else
             ssh_exit_code=$?
+            if [[ "$REMOTE_OPERATION" = authorization-probe ]]; then
+              probe_failure_summary="$(/usr/bin/python3 -I - "$remote_report" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import re
+          import sys
+
+          try:
+              with open(sys.argv[1], "rb") as handle:
+                  raw = handle.read(2049)
+          except OSError:
+              raw = b""
+          match = re.fullmatch(
+              rb"AUTHORIZATION_PROBE_(?:RESULT|EVIDENCE_UNAVAILABLE) schema=1 run_id=([1-9][0-9]{0,19}) attempt=([1-9][0-9]{0,5})(?: security_run_id=[1-9][0-9]{0,19} security_run_attempt=[1-9][0-9]{0,5} source_sha=[0-9a-f]{40} bundle_sha256=[0-9a-f]{64})? status=(completed|failed|unknown) cleanup_status=(confirmed|failed|unknown) receipt=(written|unavailable) custody=(committed|pending|unavailable)\n",
+              raw,
+          )
+          if match is not None and match.groups()[:2] == tuple(value.encode("ascii") for value in sys.argv[2:]):
+              print(f"status={match.group(3).decode('ascii')} cleanup_status={match.group(4).decode('ascii')} receipt={match.group(5).decode('ascii')} custody={match.group(6).decode('ascii')}")
+          PY
+              )"
+              rm -f -- "$remote_report" "$remote_error"
+              if [[ -n "$probe_failure_summary" ]]; then
+                printf 'Production authorization probe did not pass (%s)\n' "$probe_failure_summary" >&2
+              else
+                printf 'Production authorization probe ended without a valid closed result (ssh_exit=%s)\n' \
+                  "$ssh_exit_code" >&2
+              fi
+              exit 1
+            fi
             failure_summary="$(/usr/bin/python3 -I - "$remote_report" <<'PY'
           import re
           import sys
@@ -2266,7 +3002,43 @@ jobs:
             fi
             exit 1
           fi
-          success_marker="$(/usr/bin/python3 -I - "$remote_report" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$BACKUP_OPERATION" "$SOURCE_SHA" "$BUNDLE_SHA256" "$EXPECTED_STORAGE_HELPER_SHA256" "$EXPECTED_BACKUP_DRILL_SHA256" <<'PY'
+          if [[ "$REMOTE_OPERATION" = authorization-probe ]]; then
+            success_marker="$(/usr/bin/python3 -I - "$remote_report" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" "$SOURCE_SHA" "$BUNDLE_SHA256" <<'PY'
+          import re
+          import sys
+
+          def validate_probe_success_marker(raw, expected):
+              match = re.fullmatch(
+              rb"AUTHORIZATION_PROBE_RESULT schema=1 run_id=([1-9][0-9]{0,19}) attempt=([1-9][0-9]{0,5}) security_run_id=([1-9][0-9]{0,19}) security_run_attempt=([1-9][0-9]{0,5}) source_sha=([0-9a-f]{40}) bundle_sha256=([0-9a-f]{64}) status=completed cleanup_status=confirmed receipt=written custody=committed\n",
+                  raw,
+              )
+              if match is None or match.groups() != tuple(value.encode("ascii") for value in expected):
+                  raise ValueError("remote probe success marker binding is invalid")
+              return raw.decode("ascii")
+
+          def main(argv=None):
+              if argv is None:
+                  argv = sys.argv[1:]
+              try:
+                  with open(argv[0], "rb") as handle:
+                      raw = handle.read(2049)
+              except OSError as exc:
+                  raise SystemExit("remote probe success marker is unavailable") from exc
+              try:
+                  result = validate_probe_success_marker(raw, argv[1:])
+              except ValueError as exc:
+                  raise SystemExit(str(exc)) from exc
+              print(result, end="")
+
+          if __name__ == "__main__":
+              main()
+          PY
+            )"
+            printf '%s' "$success_marker"
+            rm -f -- "$remote_report" "$remote_error"
+            return 0
+          fi
+          success_marker="$(/usr/bin/python3 -I - "$remote_report" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$REMOTE_OPERATION" "$SOURCE_SHA" "$BUNDLE_SHA256" "$EXPECTED_STORAGE_HELPER_SHA256" "$EXPECTED_BACKUP_DRILL_SHA256" <<'PY'
           import json
           from pathlib import Path
           import re
@@ -2292,7 +3064,7 @@ jobs:
           print(lines[0])
           PY
           )"
-          if [[ "$BACKUP_OPERATION" = create ]]; then
+          if [[ "$REMOTE_OPERATION" = create ]]; then
             receipt_path="$RUNNER_TEMP/platform-backup-success-receipt.json"
             test "$receipt_path" = "$RUNNER_TEMP/platform-backup-success-receipt.json"
             test ! -e "$receipt_path" && test ! -L "$receipt_path"
@@ -2384,6 +3156,13 @@ jobs:
           fi
           printf '%s\n' "$success_marker"
           rm -f -- "$remote_report" "$remote_error"
+          }
+          if [[ "$BACKUP_OPERATION" = create && "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true ]]; then
+            run_remote_operation authorization-probe true
+            run_remote_operation create false
+          else
+            run_remote_operation "$BACKUP_OPERATION" false
+          fi
 
       - name: Remove staged helper bundle from production host
         if: ${{ always() && steps.stage-backup-helper.outcome != 'skipped' && steps.backup-helper.outputs.bundle_sha256 != '' }}

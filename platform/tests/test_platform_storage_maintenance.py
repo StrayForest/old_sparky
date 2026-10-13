@@ -267,6 +267,136 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertFalse(args.evict_pinned_build_node_cache)
         self.assertIsNone(args.eviction_run_id)
 
+    def test_authorization_probe_mode_is_exclusive_and_requires_private_json(self) -> None:
+        valid = [
+            "platform_storage_maintenance.py",
+            "--authorization-probe-only",
+            "--private-backup-diagnostics",
+            "--apply",
+            "--json",
+        ]
+        with mock.patch.object(maintenance.sys, "argv", valid):
+            args = maintenance.parse_args()
+        self.assertTrue(args.authorization_probe_only)
+        self.assertTrue(args.private_backup_diagnostics)
+        self.assertTrue(args.apply)
+        self.assertTrue(args.as_json)
+
+        invalid = (
+            valid[:-2],
+            [*valid, "--backup-only"],
+            [*valid, "--purge-profile-access-cache-after-restore"],
+            [*valid, "--preserve-existing-backups"],
+        )
+        for argv in invalid:
+            with self.subTest(argv=argv), mock.patch.object(
+                maintenance.sys, "argv", argv
+            ), self.assertRaises(SystemExit):
+                maintenance.parse_args()
+
+    def test_authorization_probe_cli_uses_disjoint_closed_envelopes(self) -> None:
+        success_report = {
+            "schema": 1,
+            "kind": "authorization_probe",
+            "status": "completed",
+            "authorization_probe": {"schema": 1, "status": "completed"},
+        }
+        with (
+            mock.patch.object(
+                maintenance.sys,
+                "argv",
+                [
+                    "platform_storage_maintenance.py",
+                    "--authorization-probe-only",
+                    "--private-backup-diagnostics",
+                    "--apply",
+                    "--json",
+                ],
+            ),
+            mock.patch.object(maintenance, "run_maintenance", return_value=success_report),
+            mock.patch.object(maintenance, "write_report") as write_report,
+            mock.patch.object(maintenance.sys, "stdout", io.StringIO()) as stdout,
+        ):
+            self.assertEqual(maintenance.main(), 0)
+        write_report.assert_not_called()
+        self.assertEqual(json.loads(stdout.getvalue()), success_report)
+        self.assertNotIn("ok", success_report)
+
+        failed = RuntimeError("private failure text must not be emitted")
+        failed.scratch_cleanup_status = "failed"
+        failed.scratch_first_fault = {
+            "schema": 1,
+            "origin": "worker",
+            "site": "worker_mount_snapshot",
+            "exception_kind": "permission",
+            "errno": 1,
+        }
+        self.assertTrue(maintenance._valid_scratch_first_fault(failed.scratch_first_fault))
+        self.assertTrue(
+            maintenance.backup_restore_drill.valid_scratch_first_fault(
+                failed.scratch_first_fault
+            )
+        )
+        self.assertFalse(
+            maintenance._valid_scratch_first_fault(
+                {**failed.scratch_first_fault, "origin": "controller"}
+            )
+        )
+        self.assertFalse(
+            maintenance.backup_restore_drill.valid_scratch_first_fault(
+                {**failed.scratch_first_fault, "origin": "controller"}
+            )
+        )
+        controller_fault = {
+            **failed.scratch_first_fault,
+            "origin": "controller",
+            "site": "controller_cleanup",
+        }
+        self.assertTrue(maintenance._valid_scratch_first_fault(controller_fault))
+        self.assertFalse(
+            maintenance._valid_scratch_first_fault(
+                {**failed.scratch_first_fault, "raw_message": "not allowed"}
+            )
+        )
+        for malformed in (
+            {**failed.scratch_first_fault, "schema": 1.0},
+            {**failed.scratch_first_fault, "errno": True},
+            {**failed.scratch_first_fault, "errno": 13.0},
+            {**failed.scratch_first_fault, "exception_kind": 7},
+        ):
+            with self.subTest(first_fault=malformed):
+                self.assertFalse(maintenance._valid_scratch_first_fault(malformed))
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                maintenance.sys,
+                "argv",
+                [
+                    "platform_storage_maintenance.py",
+                    "--authorization-probe-only",
+                    "--private-backup-diagnostics",
+                    "--apply",
+                    "--json",
+                ],
+            ),
+            mock.patch.object(maintenance, "run_maintenance", side_effect=failed),
+            mock.patch.object(maintenance.sys, "stdout", io.StringIO()) as stdout,
+            mock.patch.object(maintenance.sys, "stderr", stderr),
+        ):
+            self.assertEqual(maintenance.main(), 1)
+        failure_report = json.loads(stdout.getvalue())
+        self.assertEqual(
+            set(failure_report),
+            {"schema", "kind", "status", "cleanup_status", "first_fault"},
+        )
+        self.assertEqual(failure_report["kind"], "authorization_probe")
+        self.assertEqual(failure_report["status"], "failed")
+        self.assertEqual(failure_report["cleanup_status"], "failed")
+        self.assertEqual(failure_report["first_fault"], failed.scratch_first_fault)
+        self.assertNotIn("private failure text", stdout.getvalue())
+        self.assertNotIn("private failure text", stderr.getvalue())
+        self.assertNotIn("ok", failure_report)
+
     def test_preserve_existing_backups_is_full_apply_only(self) -> None:
         with mock.patch.object(
             maintenance.sys,

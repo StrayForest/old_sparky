@@ -168,10 +168,11 @@ backup/restore budget plus 15 minutes for completion and cleanup. Each API
 request and sleep is capped by the remaining poll deadline. It never substitutes another run or a newer `dev`
 head. It validates the exact successful verification job, artifact digest,
 attestation, and seven-file helper manifest before staging anything on the host.
-It runs those staged, source-bound helper bytes for both create and
-verify-existing. If the run fails, times out, the source moves, or any bundle
-check fails, it stops without running a production backup or falling back to
-the installed helper. The normal deploy's freshness check is unchanged.
+It runs those staged, source-bound helper bytes for create, verify-existing
+and the opt-in authorization probe. If the run fails, times out, the source
+moves, or any bundle check fails, it stops without running a production backup
+or falling back to the installed helper. The normal deploy's freshness check
+is unchanged.
 
 After staging, an `always()` finalizer removes any leftover run-specific helper
 bundle before deleting the SSH material. Transfer, the remote backup operation,
@@ -230,6 +231,92 @@ or removes existing archives. Full maintenance still applies its non-backup
 release, source-artifact, transient and live-QA retention after the successful
 restore drill.
 
+### Pre-archive authorization probe
+
+Use the `authorization-probe` operation to exercise the source-bound scratch
+authorization boundary without creating or restore-verifying a backup. It
+requires the exact successful Security run ID, attempt and source SHA for the
+current `dev` head, and uses the same attested staged helper bundle. The probe
+takes the canonical lock order (release, retained-load, build-output,
+live-QA), applies the existing transient-unit limits and START/DONE identity
+checks, then checks the scratch mount, cgroup limits and the 1 GiB host-memory
+reserve.
+
+The helper exits before opening or binding an archive, loading the database
+environment, invoking PostgreSQL tools or `runuser`, creating a database,
+running Alembic, reading or writing backup metadata, changing pointers, or
+pruning files. It has no installed-helper fallback. Its separately typed
+`authorization_probe` result proves only that the pre-archive authorization
+path completed. It cannot satisfy backup, restore, freshness or deployment
+evidence, and the auto-deploy workflow does not accept it as a backup receipt.
+
+The workflow writes a closed root-private receipt named
+`authorization-probe-<workflow-run-id>-<attempt>.json` directly under the
+canonical shared directory. It binds the workflow and Security run IDs and
+attempts, source SHA, helper-bundle digest, probe status, cleanup status and an
+optional closed first-fault projection. The workflow uses the existing
+no-follow shared-directory identity check, creates the receipt without
+overwrite, verifies its root-owned mode-`0600` file identity, and syncs the
+file and directory. Before that final commit, it keeps only the same bound,
+closed projection in a distinct `authorization_probe_pending` file named
+`authorization-probe-<workflow-run-id>-<attempt>.pending.json`. That custody
+record carries `status=pending` and a separate `probe_status` outcome; it is not
+a completed probe receipt or backup/deployment proof. Raw helper report and
+stderr are removed only after the pending projection is verified;
+the pending file is removed by identity only after the final receipt is
+durable. If pending custody cannot be committed, the existing mode-`0600`
+temporary report and capture remain for immediate host triage; the operation
+fails with evidence `UNKNOWN`. If the final write fails, the pending
+projection remains for triage and the operation fails with evidence `UNKNOWN`.
+The final receipt is not
+uploaded as a workflow artifact. A collision, unsafe directory, failed
+cleanup, or receipt write/sync failure cannot produce a successful probe.
+The probe does not prune or rotate receipts.
+
+Dispatch it from reviewed `dev` with the exact Security run ID/attempt and
+source SHA:
+
+```bash
+SECURITY_RUN_ID=EXACT_SECURITY_RUN_ID
+SECURITY_RUN_ATTEMPT=EXACT_RUN_ATTEMPT
+SOURCE_SHA=EXACT_40_HEX_DEV_SHA
+gh workflow run platform-production-backup.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev \
+  -f operation=authorization-probe \
+  -f security_run_id="$SECURITY_RUN_ID" \
+  -f security_run_attempt="$SECURITY_RUN_ATTEMPT" \
+  -f source_sha="$SOURCE_SHA"
+```
+
+For a probe-gated backup, dispatch one canonical `create` run while that exact
+Security run is still in progress and set
+`authorization_probe_before_create=true`. The create run reserves the existing
+`platform-production-deploy` concurrency group while it waits for the exact
+Security attempt to complete successfully and validates its artifact,
+attestation and staged helper bundle. No production SSH or helper staging runs
+before those checks pass. The workflow then runs the isolated probe first and
+requires its durable, closed receipt to report `completed` with confirmed
+cleanup and matching workflow/Security/source/bundle bindings. Only after that
+receipt passes does the same reserved run start a second remote operation. It
+rechecks the current `dev` SHA, staged bundle identity, source and host guards,
+then reacquires the canonical locks before the normal create path. Probe
+failure, unknown status, incomplete cleanup, missing/mismatched receipt or a
+receipt collision stops the run before backup creation and before any
+source-bound backup success receipt can be emitted. The automatic deployment
+workflow still waits for this exact create run to finish and accepts only its
+create-only restore-verified receipt; the probe receipt never authorizes a
+deployment child.
+
+The option defaults to `false` and is valid only with `operation=create`.
+With it disabled, create and verify-existing retain their normal single-call
+behavior. A standalone `authorization-probe` remains diagnostic-only: it does
+not reserve a create run or provide a backup receipt for auto-deploy.
+
+A completed probe cannot diagnose or reclassify an earlier failed backup. If
+the retained evidence does not identify the cause or restore progress, that
+attempt remains `UNKNOWN`.
+
 The automatic deployment workflow waits for this exact create run before it
 dispatches a deployment child. It accepts one completed-success backup run
 whose workflow, source Security run ID and attempt, source SHA, `dev` ref,
@@ -251,9 +338,13 @@ When the source-bound scratch restore service exits before its confinement can
 be verified, the explicit private-diagnostics path records only a closed unit
 phase/state/result/status summary and bounded stream byte counts and hashes in
 the private report. Bounded launcher output is retained with the run-bound
-private failure capture so the exact startup failure can be diagnosed; it is
-never copied into the shared marker or public workflow artifact. Invalid or
-oversized diagnostic data fails closed and cannot make a failed restore pass.
+private failure capture. It may support later diagnosis but does not establish
+a cause on its own. The first-fault projection is retained only when the
+closed helper field exactly matches its bounded private frame; otherwise the
+cause remains unknown. Raw report, stderr, message, traceback, path, PID, argv,
+environment and archive details never enter the shared failure receipt or
+public workflow artifact. Invalid or oversized diagnostic data fails closed
+and cannot make a failed restore pass.
 
 After launch, the transient unit must reach `ActiveState=active` with a verified
 PID, executable, cgroup and confinement sample within 30 seconds. During that
