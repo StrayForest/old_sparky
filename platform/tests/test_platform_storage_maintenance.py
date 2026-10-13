@@ -2126,6 +2126,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn("platform_storage_maintenance.py", workflow)
         workflow_document = yaml.safe_load(workflow)
         inputs = workflow_document.get(True, workflow_document).get("workflow_dispatch", {}).get("inputs", {})
+        self.assertEqual(
+            set(inputs["operation"]["options"]),
+            {"create", "verify-existing", "authorization-probe"},
+        )
         self.assertTrue(inputs["security_run_id"]["required"])
         self.assertTrue(inputs["security_run_attempt"]["required"])
         self.assertTrue(inputs["source_sha"]["required"])
@@ -2168,10 +2172,43 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertLess(operation_branch, remote_arguments)
         self.assertNotIn('bundle_stage=none', remote_runner)
         self.assertNotIn('create none none false false false', remote_runner)
-        self.assertIn(
-            'if [[ "$operation" = verify-existing || "$operation" = create ]]; then',
-            workflow,
+        remote_script = remote_runner.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
+        remote_operation_allowlists = [
+            line.strip()
+            for line in remote_script.splitlines()
+            if line.strip().startswith('[[ "$operation" = ')
+            and '|| "$operation" =' in line
+            and line.strip().endswith(" ]]")
+        ]
+        parsed_remote_operation_sets = []
+        for allowlist in remote_operation_allowlists:
+            choices = re.findall(r'"\$operation" = ([a-z-]+)', allowlist)
+            if choices:
+                self.assertEqual(
+                    allowlist,
+                    "[[ " + " || ".join(f'"$operation" = {choice}' for choice in choices) + " ]]",
+                )
+                parsed_remote_operation_sets.append(choices)
+        self.assertEqual(
+            parsed_remote_operation_sets,
+            [["create", "verify-existing", "authorization-probe"]],
         )
+        helper_validation_marker = "failure_stage=helper_bundle_validation\n"
+        self.assertEqual(remote_script.count(helper_validation_marker), 1)
+        helper_validation_index = remote_script.index(helper_validation_marker)
+        helper_validation_gate_start = remote_script.rfind("if [[ ", 0, helper_validation_index)
+        helper_validation_gate = remote_script[helper_validation_gate_start:helper_validation_index]
+        self.assertEqual(
+            helper_validation_gate,
+            'if [[ "$operation" = verify-existing || "$operation" = create '
+            '|| "$operation" = authorization-probe ]]; then\n  ',
+        )
+        failure_cleanup_gate = (
+            'if [[ ( "$operation" = verify-existing || "$operation" = create '
+            '|| "$operation" = authorization-probe ) && -n "$helper_stage" '
+            '&& -n "$helper_stage_identity" ]]; then'
+        )
+        self.assertEqual(remote_script.count(failure_cleanup_gate), 1)
         self.assertIn(
             'maintenance_tool="$helper_dir/platform_storage_maintenance.py"',
             workflow,
@@ -2180,10 +2217,30 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self._assert_backup_remote_executes_staged_helper(workflow_document)
         self._assert_backup_stage_finalizer_is_bounded_and_identity_pinned(workflow_document)
         self._assert_backup_stage_and_empty_identity_shell_paths(workflow_document)
-        self.assertEqual(
-            workflow.count("if: ${{ inputs.operation == 'create' || inputs.operation == 'verify-existing' }}"),
-            2,
-        )
+        staged_helper_conditions = {
+            step.get("id"): step.get("if")
+            for step in workflow_document["jobs"]["backup"]["steps"]
+            if step.get("id") in {"backup-helper", "stage-backup-helper"}
+        }
+        self.assertEqual(set(staged_helper_conditions), {"backup-helper", "stage-backup-helper"})
+        for step_id, condition in staged_helper_conditions.items():
+            self.assertIsInstance(condition, str, step_id)
+            expression = condition.removeprefix("${{").removesuffix("}}").strip()
+            condition_operations = []
+            for clause in expression.split("||"):
+                match = re.fullmatch(
+                    r"inputs\.operation\s*==\s*'([a-z-]+)'", clause.strip()
+                )
+                self.assertIsNotNone(
+                    match,
+                    f"unsupported operation condition for {step_id}: {condition!r}",
+                )
+                condition_operations.append(match.group(1))
+            self.assertEqual(
+                set(condition_operations),
+                {"create", "verify-existing", "authorization-probe"},
+            )
+            self.assertEqual(len(condition_operations), 3)
         self.assertIn("BACKUP_SUCCESS schema=1 run_id=", workflow)
         self.assertIn(
             "if: ${{ success() && inputs.operation == 'create' && steps.cleanup_ssh.outcome == 'success' }}",
@@ -3284,8 +3341,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def _assert_backup_source_runner_branches(self, workflow_document: dict) -> None:
         run_script = self._backup_operation_run(workflow_document)
+        operation_gate = (
+            '[[ "$BACKUP_OPERATION" = create || "$BACKUP_OPERATION" = verify-existing '
+            '|| "$BACKUP_OPERATION" = authorization-probe ]]'
+        )
+        self.assertEqual(run_script.count(operation_gate), 1)
         branch_start = run_script.index(
-            '[[ "$BACKUP_OPERATION" = create || "$BACKUP_OPERATION" = verify-existing ]]'
+            operation_gate
         )
         branch_end = run_script.index('remote_report=', branch_start)
         branch_script = "set -euo pipefail\n" + run_script[branch_start:branch_end]
@@ -3303,71 +3365,59 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "  shift\n"
                 "done\n"
                 "test -n \"$out\" || exit 2\n"
-                "printf '{\"ref\":\"refs/heads/dev\",\"object\":{\"sha\":\"%s\"}}' \"$SOURCE_SHA\" > \"$out\"\n",
+                "printf '{\"ref\":\"%s\",\"object\":{\"sha\":\"%s\"}}' "
+                "\"${CURRENT_DEV_REF:-refs/heads/dev}\" "
+                "\"${CURRENT_DEV_SHA:-$SOURCE_SHA}\" > \"$out\"\n",
                 encoding="ascii",
             )
             fake_curl.chmod(0o700)
-            outputs = {}
-            for operation in ("create", "verify-existing"):
+            runner_env = {
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "AUTHORIZATION_PROBE_BEFORE_CREATE": "false",
+                "EVICT_BUILD_NODE_CACHE": "false",
+                "COMPACT_FALLBACK_RUNTIME_CACHE": "false",
+                "RESUME_FALLBACK_CACHE_COMPACTION": "false",
+                "RESUME_COMPACTION_RUN_ID": "",
+                "RESUME_COMPACTION_RUN_ATTEMPT": "",
+                "RESUME_COMPACTION_BUNDLE_SHA256": "",
+                "SOURCE_SHA": "a" * 40,
+                "CURRENT_DEV_REF": "refs/heads/dev",
+                "CURRENT_DEV_SHA": "a" * 40,
+                "BUNDLE_SHA256": "b" * 64,
+                "EXPECTED_STORAGE_HELPER_SHA256": "c" * 64,
+                "EXPECTED_BACKUP_DRILL_SHA256": "d" * 64,
+                "REPOSITORY": "StrayForest/old_sparky",
+                "GITHUB_SHA": "a" * 40,
+                "GITHUB_RUN_ID": "123456",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_API_URL": "https://api.github.com",
+                "RUNNER_TEMP": str(temp),
+                "GH_TOKEN": "fixture-token",
+                "STAGED_HELPER_IDENTITY": "",
+            }
+            for operation in ("create", "verify-existing", "authorization-probe"):
                 result = subprocess.run(
-                    ["bash", "-c", branch_script + '\nprintf "%s\\n%s\\n" "$bundle_stage" "$remote_arguments"\n'],
+                    [
+                        "bash",
+                        "-c",
+                        branch_script
+                        + '\nverify_current_dev_source\nprintf "%s\\n" "$bundle_stage"\n',
+                    ],
                     capture_output=True,
                     text=True,
                     check=False,
                     timeout=10,
-                    env={
-                        **os.environ,
-                        "PATH": f"{bin_dir}:{os.environ['PATH']}",
-                        "BACKUP_OPERATION": operation,
-                        "EVICT_BUILD_NODE_CACHE": "false",
-                        "COMPACT_FALLBACK_RUNTIME_CACHE": "false",
-                        "RESUME_FALLBACK_CACHE_COMPACTION": "false",
-                        "RESUME_COMPACTION_RUN_ID": "",
-                        "RESUME_COMPACTION_RUN_ATTEMPT": "",
-                        "RESUME_COMPACTION_BUNDLE_SHA256": "",
-                        "SOURCE_SHA": "a" * 40,
-                        "BUNDLE_SHA256": "b" * 64,
-                        "EXPECTED_STORAGE_HELPER_SHA256": "c" * 64,
-                        "EXPECTED_BACKUP_DRILL_SHA256": "d" * 64,
-                        "REPOSITORY": "StrayForest/old_sparky",
-                        "GITHUB_SHA": "a" * 40,
-                        "GITHUB_RUN_ID": "123456",
-                        "GITHUB_RUN_ATTEMPT": "1",
-                        "GITHUB_API_URL": "https://api.github.com",
-                        "RUNNER_TEMP": str(temp),
-                        "GH_TOKEN": "fixture-token",
-                    },
+                    env={**runner_env, "BACKUP_OPERATION": operation},
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 lines = result.stdout.splitlines()
-                self.assertEqual(lines[0], "/tmp/oldsparky-backup-verifier-123456-1")
-                self.assertEqual(
-                    lines[1],
-                    f"123456 1 {operation} {'a' * 40} {'b' * 64} false false false none none none",
-                )
-                outputs[operation] = lines
-            for operation in ("create", "verify-existing"):
+                self.assertEqual(lines, ["/tmp/oldsparky-backup-verifier-123456-1"])
+            for operation in ("create", "verify-existing", "authorization-probe"):
                 invalid_env = {
-                    **os.environ,
-                    "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                    **runner_env,
                     "BACKUP_OPERATION": operation,
-                    "EVICT_BUILD_NODE_CACHE": "false",
-                    "COMPACT_FALLBACK_RUNTIME_CACHE": "false",
-                    "RESUME_FALLBACK_CACHE_COMPACTION": "false",
-                    "RESUME_COMPACTION_RUN_ID": "",
-                    "RESUME_COMPACTION_RUN_ATTEMPT": "",
-                    "RESUME_COMPACTION_BUNDLE_SHA256": "",
-                    "SOURCE_SHA": "a" * 40,
                     "BUNDLE_SHA256": "",
-                    "EXPECTED_STORAGE_HELPER_SHA256": "c" * 64,
-                    "EXPECTED_BACKUP_DRILL_SHA256": "d" * 64,
-                    "REPOSITORY": "StrayForest/old_sparky",
-                    "GITHUB_SHA": "a" * 40,
-                    "GITHUB_RUN_ID": "123456",
-                    "GITHUB_RUN_ATTEMPT": "1",
-                    "GITHUB_API_URL": "https://api.github.com",
-                    "RUNNER_TEMP": str(temp),
-                    "GH_TOKEN": "fixture-token",
                 }
                 invalid = subprocess.run(
                     ["bash", "-c", branch_script],
@@ -3378,6 +3428,60 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     env=invalid_env,
                 )
                 self.assertNotEqual(invalid.returncode, 0, operation)
+            invalid_probe_precreate = {
+                **runner_env,
+                "BACKUP_OPERATION": "verify-existing",
+                "AUTHORIZATION_PROBE_BEFORE_CREATE": "true",
+            }
+            rejected_probe_precreate = subprocess.run(
+                ["bash", "-c", branch_script],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+                env=invalid_probe_precreate,
+            )
+            self.assertNotEqual(rejected_probe_precreate.returncode, 0)
+            rejected_unknown_operation = subprocess.run(
+                ["bash", "-c", branch_script],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+                env={**runner_env, "BACKUP_OPERATION": "delete"},
+            )
+            self.assertNotEqual(rejected_unknown_operation.returncode, 0)
+            rejected_source_sha = subprocess.run(
+                ["bash", "-c", branch_script],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+                env={**runner_env, "BACKUP_OPERATION": "create", "GITHUB_SHA": "e" * 40},
+            )
+            self.assertNotEqual(rejected_source_sha.returncode, 0)
+            for invalid_ref, invalid_sha in (
+                ("refs/heads/release", "a" * 40),
+                ("refs/heads/dev", "e" * 40),
+            ):
+                rejected_dev_ref = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        branch_script + "\nverify_current_dev_source\n",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                    env={
+                        **runner_env,
+                        "BACKUP_OPERATION": "create",
+                        "CURRENT_DEV_REF": invalid_ref,
+                        "CURRENT_DEV_SHA": invalid_sha,
+                    },
+                )
+                self.assertNotEqual(rejected_dev_ref.returncode, 0)
 
     def _assert_backup_remote_executes_staged_helper(self, workflow_document: dict) -> None:
         run_script = self._backup_operation_run(workflow_document)
@@ -3563,12 +3667,28 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             'test "$(id -u)" -eq 0 || { echo "Production backup must run as root" >&2; exit 1; }',
             ":",
         )
-        bundle_gate = 'if [[ "$operation" = verify-existing || "$operation" = create ]]; then'
-        first_bundle_gate = remote_script.index(bundle_gate)
-        second_bundle_gate = remote_script.index(bundle_gate, first_bundle_gate + len(bundle_gate))
+        helper_validation_marker = "failure_stage=helper_bundle_validation\n"
+        self.assertEqual(remote_script.count(helper_validation_marker), 1)
+        helper_validation_index = remote_script.index(helper_validation_marker)
+        helper_validation_gate_start = remote_script.rfind("if [[ ", 0, helper_validation_index)
+        helper_validation_gate_end = remote_script.index("then\n", helper_validation_gate_start) + len("then\n")
+        helper_validation_gate = remote_script[helper_validation_gate_start:helper_validation_gate_end]
+        self.assertEqual(
+            helper_validation_gate,
+            'if [[ "$operation" = verify-existing || "$operation" = create '
+            '|| "$operation" = authorization-probe ]]; then\n',
+        )
+        self.assertLess(helper_validation_gate_start, helper_validation_index)
+        failure_cleanup_gate = (
+            'if [[ ( "$operation" = verify-existing || "$operation" = create '
+            '|| "$operation" = authorization-probe ) && -n "$helper_stage" '
+            '&& -n "$helper_stage_identity" ]]; then'
+        )
+        self.assertEqual(remote_script.count(failure_cleanup_gate), 1)
         remote_script = (
-            remote_script[:second_bundle_gate]
-            + remote_script[second_bundle_gate:].replace(bundle_gate, "if false; then", 1)
+            remote_script[:helper_validation_gate_start]
+            + "if false; then\n"
+            + remote_script[helper_validation_gate_end:]
         )
         with tempfile.TemporaryDirectory() as temporary_dir:
             test_root = Path(temporary_dir)
