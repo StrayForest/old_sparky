@@ -2161,7 +2161,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             'bundle_stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"'
         )
         remote_arguments = remote_runner.index(
-            'remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BACKUP_OPERATION $SOURCE_SHA $BUNDLE_SHA256'
+            'remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $REMOTE_OPERATION $SOURCE_SHA $BUNDLE_SHA256'
         )
         self.assertLess(source_binding, operation_branch)
         self.assertLess(operation_branch, shared_bundle_stage)
@@ -3499,6 +3499,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     [
                         "bash", "-s", "--", run_id, "1", operation, source_sha,
                         archive_sha, "false", "false", "false", "none", "none", "none",
+                        "123456", "1", "false",
                     ],
                     input=script,
                     capture_output=True,
@@ -3533,8 +3534,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             missing_stage = root / "missing-stage"
             invalid = subprocess.run(
                 [
-                    "bash", "-s", "--", str(900_000_000 + uuid.uuid4().int % 90_000_000), "1", "create", "none", archive_sha,
+                    "bash", "-s", "--", str(900_000_000 + uuid.uuid4().int % 90_000_000), "1", "create", "a" * 40, archive_sha,
                     "false", "false", "false", "none", "none", "none",
+                    "123456", "1", "false",
                 ],
                 input=remote_script.replace(
                     "runtime=__TEST_RUNTIME__", f"runtime={runtime}"
@@ -3598,6 +3600,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "none",
                     "none",
                     "none",
+                    "123456",
+                    "1",
+                    "false",
                 ],
                 input=remote_script,
                 text=True,
@@ -3735,6 +3740,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "none",
                     "none",
                     "none",
+                    "123456",
+                    "1",
+                    "false",
                 ],
                 input=typed_script,
                 text=True,
@@ -3886,6 +3894,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 [
                     "bash", "-s", "--", "123460", "1", "create", "a" * 40,
                     "b" * 64, "false", "false", "false", "none", "none", "none",
+                    "123456", "1", "false",
                 ],
                 input=typed_script,
                 text=True,
@@ -3945,6 +3954,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 [
                     "bash", "-s", "--", "123461", "1", "create", "a" * 40,
                     "b" * 64, "false", "false", "false", "none", "none", "none",
+                    "123456", "1", "false",
                 ],
                 input=typed_script,
                 text=True,
@@ -4023,6 +4033,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "none",
                     "none",
                     "none",
+                    "123456",
+                    "1",
+                    "false",
                 ],
                 input=typed_script,
                 text=True,
@@ -4086,6 +4099,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 [
                     "bash", "-s", "--", "123459", "1", "create", "a" * 40,
                     "b" * 64, "false", "false", "false", "none", "none", "none",
+                    "123456", "1", "false",
                 ],
                 input=overflow_script,
                 text=True,
