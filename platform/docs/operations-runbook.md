@@ -209,6 +209,12 @@ introduce a cache/schema rewrite without retained evidence. If both VPS cores
 remain saturated after unnecessary work is removed, classify a capacity limit
 instead of hiding it with more local workers.
 
+Use the [tmpfs allocation diagnostic](../performance/README.md#host-tmpfs-allocation-diagnosis)
+only in an authorized window; require its documented `COMPLETE_METADATA`
+receipt criteria. Counters, names and totals do not prove ownership or permit
+cleanup; obtain separate owner/lease and dependency evidence first. It has no
+backup, retention, service, or deployment effects.
+
 ### Live production external load
 
 For public capacity testing use the external-runner workflow, not a generator

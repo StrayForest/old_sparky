@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import cProfile
+import io
 import json
 import marshal
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import stat
 import tempfile
 import time
 import unittest
@@ -47,6 +49,7 @@ from tools.platform_load import (
     _run_external_load_or_report,
     main as platform_load_main,
 )
+from tools import platform_tmpfs_allocation_audit as tmpfs_audit
 
 
 class PerformanceProfileContractTests(unittest.TestCase):
@@ -1601,6 +1604,230 @@ class PerformanceProfileContractTests(unittest.TestCase):
 
         with self.assertRaises(LoadProfileError):
             validate_profile(profile)
+
+
+class TmpfsAllocationAuditTests(unittest.TestCase):
+    def _fixture(self, root: Path) -> tuple[Path, int, int, list[int], int]:
+        shm = root / "synthetic-shm"
+        shm.mkdir(mode=0o700)
+        (shm / "tree").mkdir(mode=0o700)
+        (shm / "tree" / "data.bin").write_bytes(b"metadata-only fixture")
+        os.link(shm / "tree" / "data.bin", shm / "tree" / "hardlink.bin")
+        os.symlink("data.bin", shm / "tree" / "link")
+        fdinfo_chain, fdinfo_fd = tmpfs_audit._open_own_fdinfo()
+        shm_fd = os.open(shm, tmpfs_audit.DIR_FLAGS)
+        mount_id = tmpfs_audit._fd_mount_id(shm_fd, fdinfo_fd)
+        return shm, shm_fd, fdinfo_fd, fdinfo_chain, mount_id
+
+    def test_meminfo_parser_is_closed_and_converts_only_the_two_counters(self) -> None:
+        sample = tmpfs_audit.read_memory_snapshot(
+            b"MemTotal: 2048 kB\nMemAvailable: 1000 kB\nShmem: 250 kB\n"
+        )
+        self.assertEqual(sample["mem_available_bytes"], 1_024_000)
+        self.assertEqual(sample["shmem_bytes"], 256_000)
+        self.assertNotIn("MemTotal", sample)
+        for raw in (
+            b"MemAvailable: 1 kB\nMemAvailable: 2 kB\nShmem: 1 kB\n",
+            b"MemAvailable: 1 MB\nShmem: 1 kB\n",
+            b"MemAvailable: 1 kB\n",
+            b"MemAvailable: 1 kB\nShmem: 1 kB\n" + b"x" * tmpfs_audit.MAX_MEMINFO_BYTES,
+        ):
+            with self.subTest(raw=raw[:40]), self.assertRaises(tmpfs_audit.AuditError):
+                tmpfs_audit.read_memory_snapshot(raw)
+
+    def test_two_pass_scan_deduplicates_hardlinks_and_does_not_follow_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tmpfs-audit-test-") as temporary:
+            base = Path(temporary)
+            _, shm_fd, fdinfo_fd, fdinfo_chain, mount_id = self._fixture(base)
+            out = base / "out"
+            out.mkdir(mode=0o700)
+            out_fd = os.open(out, tmpfs_audit.DIR_FLAGS)
+            inventory_fd = tmpfs_audit._create_output_file(out_fd, "inventory.jsonl")
+            db = tmpfs_audit._private_sqlite(out_fd, tmpfs_audit.Limits())
+            try:
+                deadline = time.monotonic() + 10
+                first = tmpfs_audit._scan_pass(shm_fd, mount_id, fdinfo_fd, db, inventory_fd, 1, deadline)
+                os.fsync(inventory_fd)
+                second = tmpfs_audit._scan_pass(shm_fd, mount_id, fdinfo_fd, db, None, 2, deadline)
+                self.assertEqual((first["status"], second["status"]), ("COMPLETE", "COMPLETE"))
+                self.assertEqual(first["entries"], 4)
+                os.fsync(inventory_fd)
+                read_fd = os.open("inventory.jsonl", tmpfs_audit.READ_FLAGS, dir_fd=out_fd)
+                raw = bytearray()
+                try:
+                    while True:
+                        chunk = os.read(read_fd, 64 * 1024)
+                        if not chunk:
+                            break
+                        raw.extend(chunk)
+                finally:
+                    os.close(read_fd)
+                parsed = [json.loads(line) for line in bytes(raw).splitlines()]
+                self.assertEqual(sum(row["type"] == stat.S_IFLNK for row in parsed), 1)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM inodes").fetchone()[0], 3)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM links_pass2 WHERE occurrences=nlink").fetchone()[0], 1)
+            finally:
+                db.close()
+                os.close(inventory_fd)
+                os.close(out_fd)
+                os.close(shm_fd)
+                for fd in reversed(fdinfo_chain):
+                    os.close(fd)
+
+    def test_entry_cap_and_between_pass_drift_are_unknown(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tmpfs-audit-cap-") as temporary:
+            base = Path(temporary)
+            _, shm_fd, fdinfo_fd, fdinfo_chain, mount_id = self._fixture(base)
+            out = base / "out"
+            out.mkdir(mode=0o700)
+            out_fd = os.open(out, tmpfs_audit.DIR_FLAGS)
+            inventory_fd = tmpfs_audit._create_output_file(out_fd, "inventory.jsonl")
+            db = tmpfs_audit._private_sqlite(out_fd, tmpfs_audit.Limits())
+            try:
+                capped = tmpfs_audit._scan_pass(
+                    shm_fd, mount_id, fdinfo_fd, db, inventory_fd, 1,
+                    time.monotonic() + 10, tmpfs_audit.Limits(entries=1),
+                )
+                self.assertEqual(capped["status"], "UNKNOWN")
+                self.assertIn("entry_limit", {item["category"] for item in capped["errors"]})
+            finally:
+                db.close()
+                os.close(inventory_fd)
+                os.close(out_fd)
+                os.close(shm_fd)
+                for fd in reversed(fdinfo_chain):
+                    os.close(fd)
+
+        with tempfile.TemporaryDirectory(prefix="tmpfs-audit-drift-") as temporary:
+            base = Path(temporary)
+            _, shm_fd, fdinfo_fd, fdinfo_chain, mount_id = self._fixture(base)
+            out = base / "out"
+            out.mkdir(mode=0o700)
+            out_fd = os.open(out, tmpfs_audit.DIR_FLAGS)
+            inventory_fd = tmpfs_audit._create_output_file(out_fd, "inventory.jsonl")
+            db = tmpfs_audit._private_sqlite(out_fd, tmpfs_audit.Limits())
+            try:
+                first = tmpfs_audit._scan_pass(shm_fd, mount_id, fdinfo_fd, db, inventory_fd, 1, time.monotonic() + 10)
+                (base / "synthetic-shm" / "tree" / "data.bin").write_bytes(b"changed size and identity metadata")
+                second = tmpfs_audit._scan_pass(shm_fd, mount_id, fdinfo_fd, db, None, 2, time.monotonic() + 10)
+                self.assertEqual(first["status"], "COMPLETE")
+                self.assertEqual(second["status"], "UNKNOWN")
+                self.assertIn("pass_identity_drift", {item["category"] for item in second["errors"]})
+            finally:
+                db.close()
+                os.close(inventory_fd)
+                os.close(out_fd)
+                os.close(shm_fd)
+                for fd in reversed(fdinfo_chain):
+                    os.close(fd)
+
+    def test_full_scan_keeps_memory_samples_contextual_and_outputs_private_files(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tmpfs-audit-run-") as temporary:
+            base = Path(temporary)
+            shm = base / "empty-shm"
+            shm.mkdir(mode=0o700)
+            shm_fd = os.open(shm, tmpfs_audit.DIR_FLAGS)
+            fdinfo_chain, fdinfo_fd = tmpfs_audit._open_own_fdinfo()
+            mount_id = tmpfs_audit._fd_mount_id(shm_fd, fdinfo_fd)
+            out = base / "private-output"
+            out.mkdir(mode=0o700)
+            out_fd = os.open(out, tmpfs_audit.DIR_FLAGS)
+            meminfo = base / "meminfo"
+            meminfo.write_bytes(b"MemAvailable: 10 kB\nShmem: 2 kB\n")
+            try:
+                result = tmpfs_audit._run_scan(shm_fd, mount_id, fdinfo_fd, out_fd, meminfo_path=str(meminfo))
+                self.assertEqual(result["status"], "COMPLETE_METADATA")
+                self.assertEqual(result["memory_counters"]["before"]["mem_available_bytes"], 10 * 1024)
+                self.assertEqual(result["memory_counters"]["after"]["shmem_bytes"], 2 * 1024)
+                self.assertIn("not an admission decision", result["memory_counters_note"])
+                for name in ("inventory.jsonl", "inode-index.sqlite"):
+                    info = os.stat(out / name, follow_symlinks=False)
+                    self.assertTrue(stat.S_ISREG(info.st_mode))
+                    self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+                    self.assertEqual(info.st_nlink, 1)
+                _, summary_sha, summary_status = tmpfs_audit._write_summary(out_fd, result)
+                terminal_sha = tmpfs_audit._write_terminal(out_fd, result["status"], summary_sha, [], [])
+                self.assertEqual(len(summary_sha), 64)
+                self.assertEqual(len(terminal_sha), 64)
+                self.assertEqual(summary_status, "COMPLETE_METADATA")
+                for name in ("summary.json", "terminal.json"):
+                    info = os.stat(out / name, follow_symlinks=False)
+                    self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+                    self.assertEqual(info.st_nlink, 1)
+                self.assertEqual(
+                    tmpfs_audit.execution_disposition(0, "COMPLETE_METADATA", False),
+                    "COMPLETE_METADATA",
+                )
+                self.assertEqual(
+                    tmpfs_audit.execution_disposition(2, "COMPLETE_METADATA", True),
+                    "UNKNOWN",
+                )
+                tmpfs_audit._write_failure(out_fd, "final_directory_fsync", OSError(5, "synthetic"))
+                failure = json.loads((out / "failure.json").read_text(encoding="ascii"))
+                self.assertEqual(failure["status"], "UNKNOWN")
+                self.assertEqual(failure["stage"], "final_directory_fsync")
+                oversized_out = base / "oversized-output"
+                oversized_out.mkdir(mode=0o700)
+                oversized_fd = os.open(oversized_out, tmpfs_audit.DIR_FLAGS)
+                try:
+                    oversized = {"status": "COMPLETE_METADATA", "payload": "x" * (256 * 1024)}
+                    _, _, oversized_status = tmpfs_audit._write_summary(oversized_fd, oversized)
+                    self.assertEqual(oversized_status, "UNKNOWN")
+                    summary = json.loads((oversized_out / "summary.json").read_text(encoding="ascii"))
+                    self.assertEqual(summary["errors"][0]["category"], "summary_size_limit")
+                finally:
+                    os.close(oversized_fd)
+            finally:
+                os.close(out_fd)
+                os.close(shm_fd)
+                for fd in reversed(fdinfo_chain):
+                    os.close(fd)
+
+    def test_public_main_completes_full_synthetic_scan_and_receipt(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tmpfs-audit-main-") as temporary:
+            base = Path(temporary)
+            shm = base / "synthetic-shm"
+            shm.mkdir(mode=0o700)
+            (shm / "fixture.bin").write_bytes(b"synthetic metadata scan")
+            output = base / "private-output"
+            fixed_sample = {
+                "captured_at_utc": "2026-10-14T00:00:00Z",
+                "status": "OBSERVED",
+                "mem_available_kib": 1024,
+                "mem_available_bytes": 1_048_576,
+                "shmem_kib": 12,
+                "shmem_bytes": 12_288,
+                "source": "synthetic fixture",
+                "scope_note": "contextual counters only; no admission decision or ownership attribution",
+            }
+
+            def synthetic_shm_root() -> tuple[list[int], int, int]:
+                fd = os.open(shm, tmpfs_audit.DIR_FLAGS)
+                return [fd], fd, os.fstat(fd).st_dev
+
+            def synthetic_output_dir(path: Path) -> tuple[list[int], int]:
+                parent_fd = os.open(path.parent, tmpfs_audit.DIR_FLAGS)
+                os.mkdir(path.name, 0o700, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+                return [parent_fd], os.open(path.name, tmpfs_audit.DIR_FLAGS, dir_fd=parent_fd)
+
+            with (
+                patch.object(tmpfs_audit.resource, "setrlimit"),
+                patch.object(tmpfs_audit, "open_shm_root", side_effect=synthetic_shm_root),
+                patch.object(tmpfs_audit, "create_output_dir", side_effect=synthetic_output_dir),
+                patch.object(tmpfs_audit, "read_memory_sample", return_value=fixed_sample),
+                patch("sys.stdout", new=io.StringIO()),
+            ):
+                exit_code = tmpfs_audit.main(["--output-dir", str(output)])
+
+            self.assertEqual(exit_code, 0)
+            summary = json.loads((output / "summary.json").read_text(encoding="ascii"))
+            terminal = json.loads((output / "terminal.json").read_text(encoding="ascii"))
+            self.assertEqual(summary["status"], "COMPLETE_METADATA")
+            self.assertEqual(terminal["status"], "COMPLETE_METADATA")
+            self.assertFalse((output / "failure.json").exists())
+            self.assertEqual(summary["passes"][0]["status"], "COMPLETE")
+            self.assertEqual(summary["passes"][1]["status"], "COMPLETE")
 
 if __name__ == "__main__":
     unittest.main()
