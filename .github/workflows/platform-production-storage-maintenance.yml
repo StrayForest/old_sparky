@@ -46,11 +46,55 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify-live-qa:
+    name: Verify source-bound live QA evidence
+    if: ${{ inputs.enable_maintenance_timer }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    env:
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      LIVE_LAUNCH_RUN_ID: ${{ inputs.live_launch_run_id }}
+      LIVE_LAUNCH_RUN_ATTEMPT: ${{ inputs.live_launch_run_attempt }}
+      LIVE_USER_QA_RUN_ID: ${{ inputs.live_user_qa_run_id }}
+      LIVE_USER_QA_RUN_ATTEMPT: ${{ inputs.live_user_qa_run_attempt }}
+    steps:
+      - name: Checkout exact workflow source without persisted credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact live QA artifacts before timer activation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$EXPECTED_SHA" = "$GITHUB_SHA"
+          timeout --foreground 180s /usr/bin/python3 -I -B \
+            platform/tools/platform_maintenance_qa_evidence.py \
+            --target-sha "$EXPECTED_SHA" \
+            --live-launch-run-id "$LIVE_LAUNCH_RUN_ID" \
+            --live-launch-attempt "$LIVE_LAUNCH_RUN_ATTEMPT" \
+            --live-user-qa-run-id "$LIVE_USER_QA_RUN_ID" \
+            --live-user-qa-attempt "$LIVE_USER_QA_RUN_ATTEMPT"
+
   maintenance:
     name: Apply bounded production storage retention
+    needs: verify-live-qa
+    if: ${{ always() && !cancelled() && (needs.verify-live-qa.result == 'success' || (inputs.enable_maintenance_timer == false && needs.verify-live-qa.result == 'skipped')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: production
+    permissions:
+      actions: none
+      contents: none
     env:
       CONFIRMATION: ${{ inputs.confirmation }}
       EXPECTED_SHA: ${{ inputs.expected_sha }}
@@ -81,29 +125,6 @@ jobs:
             || -n "$LIVE_USER_QA_RUN_ID" || -n "$LIVE_USER_QA_RUN_ATTEMPT" ]]; then
             echo "QA run bindings are accepted only with timer activation." >&2; exit 1
           fi
-
-      - name: Checkout source-bound maintenance evidence verifier
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Verify exact live QA artifacts before timer activation
-        if: ${{ inputs.enable_maintenance_timer }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          timeout --foreground 180s /usr/bin/python3 -I -B \
-            platform/tools/platform_maintenance_qa_evidence.py \
-            --target-sha "$EXPECTED_SHA" \
-            --live-launch-run-id "$LIVE_LAUNCH_RUN_ID" \
-            --live-launch-attempt "$LIVE_LAUNCH_RUN_ATTEMPT" \
-            --live-user-qa-run-id "$LIVE_USER_QA_RUN_ID" \
-            --live-user-qa-attempt "$LIVE_USER_QA_RUN_ATTEMPT"
 
       - name: Validate production SSH inputs
         shell: bash

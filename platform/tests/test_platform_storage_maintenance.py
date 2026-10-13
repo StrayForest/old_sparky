@@ -4536,9 +4536,57 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             REPO_ROOT
             / ".github/workflows/platform-production-storage-maintenance.yml"
         ).read_text(encoding="utf-8")
+        workflow_payload = yaml.safe_load(workflow)
+        jobs = workflow_payload["jobs"]
+        verifier_job = jobs["verify-live-qa"]
+        maintenance_job = jobs["maintenance"]
         verifier = (
             REPO_ROOT / "platform/tools/platform_maintenance_qa_evidence.py"
         ).read_text(encoding="utf-8")
+        self.assertEqual(verifier_job["if"], "${{ inputs.enable_maintenance_timer }}")
+        self.assertEqual(
+            verifier_job["permissions"],
+            {"actions": "read", "contents": "read"},
+        )
+        self.assertNotIn("environment", verifier_job)
+        verifier_text = repr(verifier_job)
+        self.assertNotRegex(verifier_text, r"secrets\.PROD_SSH_|PROD_SSH_(?:HOST|USER|KEY)")
+        self.assertIn("GH_TOKEN", verifier_text)
+        checkout = next(
+            step
+            for step in verifier_job["steps"]
+            if step.get("uses", "").startswith("actions/checkout@")
+        )
+        self.assertEqual(
+            checkout["uses"],
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        )
+        self.assertEqual(checkout["with"]["ref"], "${{ github.sha }}")
+        self.assertIs(checkout["with"]["persist-credentials"], False)
+        proof_step = next(
+            step
+            for step in verifier_job["steps"]
+            if step.get("name") == "Verify exact live QA artifacts before timer activation"
+        )
+        self.assertEqual(proof_step["env"], {"GH_TOKEN": "${{ github.token }}"})
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', proof_step["run"])
+        self.assertIn('test "$(git rev-parse HEAD)" = "$GITHUB_SHA"', proof_step["run"])
+        self.assertIn('test "$EXPECTED_SHA" = "$GITHUB_SHA"', proof_step["run"])
+        self.assertIn("platform/tools/platform_maintenance_qa_evidence.py", proof_step["run"])
+        self.assertEqual(maintenance_job["needs"], "verify-live-qa")
+        self.assertEqual(
+            maintenance_job["if"],
+            "${{ always() && !cancelled() && (needs.verify-live-qa.result == 'success' || (inputs.enable_maintenance_timer == false && needs.verify-live-qa.result == 'skipped')) }}",
+        )
+        self.assertEqual(
+            maintenance_job["permissions"],
+            {"actions": "none", "contents": "none"},
+        )
+        maintenance_text = repr(maintenance_job)
+        self.assertNotIn("actions/checkout@", maintenance_text)
+        self.assertNotIn("platform/tools/", maintenance_text)
+        self.assertNotIn("GH_TOKEN", maintenance_text)
+        self.assertNotRegex(maintenance_text, r"secrets\.PROD_SSH_")
         self.assertIn("enable_maintenance_timer:", workflow)
         self.assertIn("default: false", workflow)
         self.assertIn("actions: read", workflow)
