@@ -2151,9 +2151,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn('run.get("head_sha") != expected_sha', workflow)
         self.assertIn('ref.get("ref") != "refs/heads/dev"', workflow)
         self.assertIn('ref["object"].get("sha") != sys.argv[2]', workflow)
-        remote_runner = workflow.split(
-            'name: Create and verify the production backup', 1
-        )[1]
+        operation_run = self._backup_operation_run(workflow_document)
+        remote_runner = operation_run
         source_binding = remote_runner.index('[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]')
         operation_branch = remote_runner.index(
             'if [[ "$BACKUP_OPERATION" = verify-existing ]]; then'
@@ -2870,10 +2869,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         )
         self.assertIn("always()", cleanup["if"])
         self.assertIn("steps.stage-backup-helper.outcome != 'skipped'", cleanup["if"])
+        operation_step = self._backup_operation_step(workflow_document)
         operation_index = next(
             index
             for index, step in enumerate(steps)
-            if step.get("name") == "Create and verify the production backup"
+            if step is operation_step
         )
         self.assertLess(operation_index, steps.index(cleanup))
         self.assertLess(
@@ -2905,11 +2905,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         remote = run.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE", 1)[0]
         self.assertIn(stage_lock, remote)
         self.assertLess(remote.index(stage_lock), remote.index('stage="/tmp/oldsparky-backup-verifier-'))
-        operation_run = next(
-            step["run"]
-            for step in steps
-            if step.get("name") == "Create and verify the production backup"
-        )
+        operation_run = self._backup_operation_run(workflow_document)
         operation_remote = operation_run.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
         lock_start = operation_remote.index("prepare_stage_lock() {")
         lock_end = operation_remote.index("\n}\nprepare_stage_lock", lock_start)
@@ -3287,11 +3283,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertTrue(existing_path.is_dir())
 
     def _assert_backup_source_runner_branches(self, workflow_document: dict) -> None:
-        run_script = next(
-            step["run"]
-            for step in workflow_document["jobs"]["backup"]["steps"]
-            if step.get("name") == "Create and verify the production backup"
-        )
+        run_script = self._backup_operation_run(workflow_document)
         branch_start = run_script.index(
             '[[ "$BACKUP_OPERATION" = create || "$BACKUP_OPERATION" = verify-existing ]]'
         )
@@ -3388,11 +3380,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 self.assertNotEqual(invalid.returncode, 0, operation)
 
     def _assert_backup_remote_executes_staged_helper(self, workflow_document: dict) -> None:
-        run_script = next(
-            step["run"]
-            for step in workflow_document["jobs"]["backup"]["steps"]
-            if step.get("name") == "Create and verify the production backup"
-        )
+        run_script = self._backup_operation_run(workflow_document)
         remote_script = run_script.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
         stop_at = remote_script.index("failure_stage=summary_validation\n")
         remote_script = remote_script[:stop_at]
@@ -3564,11 +3552,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         workflow = yaml.safe_load(
             workflow_path.read_text()
         )
-        run_script = next(
-            step["run"]
-            for step in workflow["jobs"]["backup"]["steps"]
-            if step.get("name") == "Create and verify the production backup"
-        )
+        run_script = self._backup_operation_run(workflow)
         remote_script = run_script.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
         remote_script = remote_script.replace(
             "runtime=/opt/oldsparky/platform", "runtime=__TEST_RUNTIME__"
@@ -4197,13 +4181,32 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 self.assertEqual(saved_path.lstat().st_nlink, 1)
                 self.assertNotIn("private detail", saved_path.read_text(encoding="ascii"))
 
+    def _backup_operation_step(self, workflow_document: dict) -> dict:
+        """Return the YAML step whose run scalar defines the remote operation."""
+        steps = workflow_document["jobs"]["backup"]["steps"]
+        matches = [
+            step
+            for step in steps
+            if isinstance(step.get("run"), str)
+            and "run_remote_operation() {" in step["run"]
+            and 'run_remote_operation "$BACKUP_OPERATION" false' in step["run"]
+        ]
+        self.assertEqual(len(matches), 1, "expected one backup operation run scalar")
+        return matches[0]
+
+    def _backup_operation_run(self, workflow_document: dict) -> str:
+        run_script = self._backup_operation_step(workflow_document)["run"]
+        self.assertIn("run_remote_operation() {", run_script)
+        self.assertIn("remote_arguments=", run_script)
+        self.assertIn(
+            "$SECURITY_RUN_ID $SECURITY_RUN_ATTEMPT $retain_helper_stage",
+            run_script,
+        )
+        return run_script
+
     def _assert_backup_child_group_is_terminated(self, workflow_path: Path) -> None:
         workflow = yaml.safe_load(workflow_path.read_text())
-        run_script = next(
-            step["run"]
-            for step in workflow["jobs"]["backup"]["steps"]
-            if step.get("name") == "Create and verify the production backup"
-        )
+        run_script = self._backup_operation_run(workflow)
         remote_script = run_script.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
         wrapper_script = next(
             block
@@ -4295,11 +4298,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def _assert_backup_wrapper_bounds_private_stderr(self, workflow_path: Path) -> None:
         workflow = yaml.safe_load(workflow_path.read_text())
-        run_script = next(
-            step["run"]
-            for step in workflow["jobs"]["backup"]["steps"]
-            if step.get("name") == "Create and verify the production backup"
-        )
+        run_script = self._backup_operation_run(workflow)
         remote_script = run_script.rsplit("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
         wrapper_script = next(
             block

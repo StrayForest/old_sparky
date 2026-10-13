@@ -3766,7 +3766,7 @@ def _run_isolated_restore_drill(
         archive_path = dump_path.absolute()
     try:
         if not authorization_probe:
-            assert archive_descriptor is not None and archive_path is not None
+            assert archive_path is not None
             archive_descriptor = os.open(
                 archive_path,
                 os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
