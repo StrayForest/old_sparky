@@ -499,23 +499,64 @@ def _validated_scratch_diagnostic_filtered_workflow(
     )
     if test_case is None or test_case.contour != "backend-privileged":
         issues.append("focused scratch diagnostic test is not owned by backend-privileged")
-    normalized_diagnostic = re.sub(r"\\\s*\n\s*", " ", diagnostic_step)
-    normalized_diagnostic = re.sub(r"\s+", " ", normalized_diagnostic)
     if test_case is not None:
-        command_start = normalized_diagnostic.find('bash -lc "')
-        command_end = normalized_diagnostic.find('" >> "$diagnostic"', command_start + 1)
-        actual_command = (
-            normalized_diagnostic[command_start + len('bash -lc "') : command_end]
-            if command_start >= 0 and command_end >= 0
-            else ""
+        expected_diagnostic_run = (
+            "set -euo pipefail\n"
+            "umask 077\n"
+            'diagnostic="$RUNNER_TEMP/platform-backup-scratch-diagnostic-'
+            '${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"\n'
+            "if ! {\n"
+            "  printf 'source_sha=%s\\nrun_id=%s\\nrun_attempt=%s\\n' \\\n"
+            '    "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"\n'
+            '} > "$diagnostic"; then\n'
+            '  echo "Unable to create the private scratch diagnostic log." >&2\n'
+            "  exit 1\n"
+            "fi\n"
+            "if sudo -n env -i \\\n"
+            "  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\\n"
+            "  HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1 \\\n"
+            '  GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS" \\\n'
+            '  RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \\\n'
+            "  PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform \\\n"
+            "  PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@"
+            "127.0.0.1:5432/platformdb_test \\\n"
+            "  PLATFORM_SECRET_KEY=ci-only-privileged-test-secret-with-no-production-credentials \\\n"
+            "  PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15 \\\n"
+            "  PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13 \\\n"
+            "  PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14 \\\n"
+            '  /bin/bash -c "cd \'$GITHUB_WORKSPACE/platform\' && \\\n'
+            "  .venv_platform/bin/python tools/platform_verify.py backend-privileged \\\n"
+            f'  --focused {test_case.test_id}" \\\n'
+            '  >> "$diagnostic" 2>&1; then\n'
+            "  result=0\n"
+            "else\n"
+            "  result=$?\n"
+            "fi\n"
+            "printf 'focused_exit=%s\\n' \"$result\" >> \"$diagnostic\"\n"
+            'chmod 600 "$diagnostic"\n'
+            'printf \'Focused scratch diagnostic exit=%s (no gate credit).\\n\' "$result"\n'
+            'exit "$result"\n'
         )
-        expected_command = (
-            "cd '$GITHUB_WORKSPACE/platform' && .venv_platform/bin/python "
-            "tools/platform_verify.py backend-privileged --focused "
-            f"{test_case.test_id}"
-        )
-        if actual_command != expected_command:
-            issues.append("focused scratch diagnostic must use the exact catalog-owned verifier selector")
+        try:
+            parsed_workflow = yaml.safe_load(workflow_text)
+        except yaml.YAMLError:
+            parsed_workflow = None
+        parsed_jobs = parsed_workflow.get("jobs") if isinstance(parsed_workflow, dict) else None
+        parsed_privileged = parsed_jobs.get("backend-privileged") if isinstance(parsed_jobs, dict) else None
+        parsed_steps = parsed_privileged.get("steps") if isinstance(parsed_privileged, dict) else None
+        parsed_diagnostic_steps = [
+            step
+            for step in parsed_steps or []
+            if isinstance(step, dict) and step.get("name") == diagnostic_name
+        ]
+        if (
+            len(parsed_diagnostic_steps) != 1
+            or parsed_diagnostic_steps[0].get("run") != expected_diagnostic_run
+        ):
+            issues.append(
+                "focused scratch diagnostic must match the exact closed script/env and "
+                "exact catalog-owned verifier selector"
+            )
     if diagnostic_step.count("tools/platform_verify.py") != 1:
         issues.append("focused scratch diagnostic must invoke the canonical verifier exactly once")
     if "platform_run_tests.sh" in diagnostic_step:

@@ -4538,6 +4538,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         workflow_payload = yaml.safe_load(workflow)
         jobs = workflow_payload["jobs"]
+        self.assertNotRegex(
+            repr(workflow_payload.get("env", {})), r"secrets\.PROD_SSH_"
+        )
+        for job in jobs.values():
+            self.assertNotRegex(repr(job.get("env", {})), r"secrets\.PROD_SSH_")
         verifier_job = jobs["verify-live-qa"]
         maintenance_job = jobs["maintenance"]
         verifier = (
@@ -4586,7 +4591,35 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertNotIn("actions/checkout@", maintenance_text)
         self.assertNotIn("platform/tools/", maintenance_text)
         self.assertNotIn("GH_TOKEN", maintenance_text)
-        self.assertNotRegex(maintenance_text, r"secrets\.PROD_SSH_")
+        ssh_secret_steps = {
+            "Validate production SSH inputs": {
+                "PROD_SSH_HOST": "${{ secrets.PROD_SSH_HOST }}",
+                "PROD_SSH_USER": "${{ secrets.PROD_SSH_USER }}",
+                "PROD_SSH_KEY": "${{ secrets.PROD_SSH_KEY }}",
+            },
+            "Configure pinned production SSH": {
+                "PROD_SSH_HOST": "${{ secrets.PROD_SSH_HOST }}",
+                "PROD_SSH_KEY": "${{ secrets.PROD_SSH_KEY }}",
+            },
+            "Run installed bounded maintenance service": {
+                "PROD_SSH_HOST": "${{ secrets.PROD_SSH_HOST }}",
+                "PROD_SSH_USER": "${{ secrets.PROD_SSH_USER }}",
+            },
+        }
+        observed_ssh_secret_steps = {}
+        for step in maintenance_job["steps"]:
+            name = step.get("name")
+            self.assertNotRegex(
+                repr({key: value for key, value in step.items() if key != "env"}),
+                r"secrets\.PROD_SSH_",
+            )
+            if name in ssh_secret_steps:
+                observed_ssh_secret_steps[name] = step.get("env")
+            else:
+                self.assertNotRegex(
+                    repr(step.get("env", {})), r"secrets\.PROD_SSH_"
+                )
+        self.assertEqual(observed_ssh_secret_steps, ssh_secret_steps)
         self.assertIn("enable_maintenance_timer:", workflow)
         self.assertIn("default: false", workflow)
         self.assertIn("actions: read", workflow)
@@ -4637,22 +4670,37 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             summary_path = Path(temporary) / "retention-summary.json"
-            summary_path.write_text(
-                json.dumps(
-                    {
-                        "mode": "apply",
-                        "ok": False,
-                        "backup": {"status": "completed", "restore_verified": True},
-                        "disk_after": {"free_bytes": 5_200_000_000, "used_percent": 86.96},
-                        "limits": {
-                            "minimum_free_bytes": 5 * BYTES_PER_GIB,
-                            "maximum_used_percent": 85,
-                        },
-                        "private": "PRIVATE_REPORT_CONTENT",
-                    }
-                ),
-                encoding="utf-8",
-            )
+            def report(ok: bool) -> dict[str, object]:
+                return {
+                    "mode": "apply",
+                    "ok": ok,
+                    "backup": {
+                        "status": "completed",
+                        "created": True,
+                        "restore_verified": True,
+                        "alembic_revision_verified": True,
+                        "rotation_mode": "preserve-existing",
+                        "preexisting_archives_preserved": True,
+                        "preexisting_archive_count": 0,
+                        "preexisting_sidecar_count": 0,
+                        "postexisting_archive_count": 1,
+                        "removed": [],
+                        "removed_count": 0,
+                        "preexisting_archive_inventory_sha256": "a" * 64,
+                        "postexisting_archive_inventory_sha256": "a" * 64,
+                    },
+                    "disk_after": {
+                        "free_bytes": 5_200_000_000,
+                        "used_percent": 86.96,
+                    },
+                    "limits": {
+                        "minimum_free_bytes": 5 * BYTES_PER_GIB,
+                        "maximum_used_percent": 85,
+                    },
+                    "private": "PRIVATE_REPORT_CONTENT",
+                }
+
+            summary_path.write_text(json.dumps(report(False)), encoding="utf-8")
             unhealthy = subprocess.run(
                 [sys.executable, "-I", "-", str(summary_path), "1"],
                 input=classifier,
@@ -4667,21 +4715,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(result["service_exit_code"], 1)
             self.assertNotIn("PRIVATE_REPORT_CONTENT", unhealthy.stdout)
 
-            summary_path.write_text(
-                json.dumps(
-                    {
-                        "mode": "apply",
-                        "ok": True,
-                        "backup": {"status": "completed", "restore_verified": True},
-                        "disk_after": {"free_bytes": 5_200_000_000, "used_percent": 86.96},
-                        "limits": {
-                            "minimum_free_bytes": 5 * BYTES_PER_GIB,
-                            "maximum_used_percent": 85,
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
+            summary_path.write_text(json.dumps(report(True)), encoding="utf-8")
             inconsistent = subprocess.run(
                 [sys.executable, "-I", "-", str(summary_path), "0"],
                 input=classifier,
@@ -4706,23 +4740,35 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 json.loads(inconsistent_service_exit.stdout)["service_exit_code"], 23
             )
 
+            exact_boundary_report = {
+                "mode": "apply",
+                "ok": True,
+                "backup": {
+                    "status": "completed",
+                    "created": True,
+                    "restore_verified": True,
+                    "alembic_revision_verified": True,
+                    "rotation_mode": "preserve-existing",
+                    "preexisting_archives_preserved": True,
+                    "preexisting_archive_count": 0,
+                    "preexisting_sidecar_count": 0,
+                    "postexisting_archive_count": 1,
+                    "removed": [],
+                    "removed_count": 0,
+                    "preexisting_archive_inventory_sha256": "a" * 64,
+                    "postexisting_archive_inventory_sha256": "a" * 64,
+                },
+                "disk_after": {
+                    "free_bytes": 5 * BYTES_PER_GIB,
+                    "used_percent": 85,
+                },
+                "limits": {
+                    "minimum_free_bytes": 5 * BYTES_PER_GIB,
+                    "maximum_used_percent": 85,
+                },
+            }
             summary_path.write_text(
-                json.dumps(
-                    {
-                        "mode": "apply",
-                        "ok": True,
-                        "backup": {"status": "completed", "restore_verified": True},
-                        "disk_after": {
-                            "free_bytes": 5 * BYTES_PER_GIB,
-                            "used_percent": 85,
-                        },
-                        "limits": {
-                            "minimum_free_bytes": 5 * BYTES_PER_GIB,
-                            "maximum_used_percent": 85,
-                        },
-                    }
-                ),
-                encoding="utf-8",
+                json.dumps(exact_boundary_report), encoding="utf-8"
             )
             exact_boundaries = subprocess.run(
                 [sys.executable, "-I", "-", str(summary_path), "0"],

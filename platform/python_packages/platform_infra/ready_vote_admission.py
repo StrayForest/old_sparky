@@ -22,6 +22,7 @@ from python_packages.platform_infra.performance import (
 )
 
 logger = logging.getLogger("platform.ready_vote_admission")
+_wait_for = asyncio.wait_for
 
 READY_VOTE_ADMISSION_NORMAL = "normal"
 READY_VOTE_ADMISSION_WATCH = "watch"
@@ -233,14 +234,29 @@ class ReadyVoteAdmissionController:
         self.start()
         started_at = perf_counter()
         deadline = started_at + max(0.0, self.config.wait_timeout_ms) / 1000
+        has_waited = False
 
         while True:
             async with self._state_lock:
+                now = perf_counter()
+                if has_waited and now >= deadline:
+                    self._shed_total += 1
+                    self._recompute_control_locked()
+                    self._refresh_capacity_event_locked()
+                    wait_ms = (now - started_at) * 1000
+                    snapshot = self._snapshot_locked()
+                    record_ready_vote_admission_start(
+                        snapshot=snapshot,
+                        wait_ms=wait_ms,
+                        admitted=False,
+                    )
+                    return None
+
                 if self._inflight < self._limit:
                     self._inflight += 1
                     self._admitted_total += 1
                     self._refresh_capacity_event_locked()
-                    wait_ms = (perf_counter() - started_at) * 1000
+                    wait_ms = (now - started_at) * 1000
                     snapshot = self._snapshot_locked()
                     record_ready_vote_admission_start(
                         snapshot=snapshot,
@@ -254,7 +270,7 @@ class ReadyVoteAdmissionController:
                         snapshot,
                     )
 
-                wait_remaining = deadline - perf_counter()
+                wait_remaining = deadline - now
                 if self.config.max_waiters <= self._waiters or wait_remaining <= 0:
                     self._shed_total += 1
                     self._recompute_control_locked()
@@ -268,33 +284,54 @@ class ReadyVoteAdmissionController:
                     )
                     return None
                 self._waiters += 1
+                waiter_registered = True
+                has_waited = True
+
+            async def unregister_waiter(*, shed: bool) -> None:
+                nonlocal waiter_registered
+                async with self._state_lock:
+                    did_unregister = False
+                    if waiter_registered:
+                        if self._waiters <= 0:
+                            raise RuntimeError("ready-vote waiter accounting underflow")
+                        self._waiters -= 1
+                        waiter_registered = False
+                        did_unregister = True
+                        if shed:
+                            self._shed_total += 1
+                    self._refresh_capacity_event_locked()
+                    if shed and did_unregister:
+                        wait_ms = (perf_counter() - started_at) * 1000
+                        snapshot = self._snapshot_locked()
+                        record_ready_vote_admission_start(
+                            snapshot=snapshot,
+                            wait_ms=wait_ms,
+                            admitted=False,
+                        )
 
             try:
-                await asyncio.wait_for(
+                await _wait_for(
                     self._capacity_event.wait(),
                     timeout=max(0.0, wait_remaining),
                 )
+                # Keep the post-wake lock reacquire in this try block. A task
+                # cancelled after the event wakes but before this lock is
+                # acquired still owns one waiter registration to release.
+                await unregister_waiter(shed=False)
             except asyncio.TimeoutError:
-                async with self._state_lock:
-                    self._waiters = max(0, self._waiters - 1)
-                    self._shed_total += 1
-                    self._refresh_capacity_event_locked()
-                    wait_ms = (perf_counter() - started_at) * 1000
-                    snapshot = self._snapshot_locked()
-                    record_ready_vote_admission_start(
-                        snapshot=snapshot,
-                        wait_ms=wait_ms,
-                        admitted=False,
-                    )
-                    return None
+                try:
+                    await unregister_waiter(shed=True)
+                except asyncio.CancelledError:
+                    # Cancellation while the timeout cleanup is waiting for
+                    # the state lock wins over timeout accounting. The first
+                    # cleanup has not mutated state unless it acquired the
+                    # lock; unregister_waiter is idempotent after that point.
+                    await unregister_waiter(shed=False)
+                    raise
+                return None
             except asyncio.CancelledError:
-                async with self._state_lock:
-                    self._waiters = max(0, self._waiters - 1)
-                    self._refresh_capacity_event_locked()
+                await unregister_waiter(shed=False)
                 raise
-            else:
-                async with self._state_lock:
-                    self._waiters = max(0, self._waiters - 1)
 
     async def release(
         self,

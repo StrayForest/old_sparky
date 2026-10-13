@@ -12,6 +12,7 @@ import re
 import shlex
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2482,6 +2483,14 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertEqual(invalid.returncode, 2)
 
     def test_storage_maintenance_expected_service_exit_reaches_report_binding(self) -> None:
+        # This fixture must exercise the real canonical-path unit validator.
+        # Never touch /etc on a local or non-Linux runner, even when running as
+        # root: the known privileged GitHub-hosted job is the only authorized
+        # environment for this exact-path contract test.
+        self.assertEqual(os.environ.get("GITHUB_ACTIONS"), "true")
+        self.assertEqual(os.environ.get("RUNNER_OS"), "Linux")
+        self.assertEqual(os.environ.get("RUNNER_ENVIRONMENT"), "github-hosted")
+
         workflow = (
             WORKFLOW_DIR / "platform-production-storage-maintenance.yml"
         ).read_text(encoding="utf-8")
@@ -2515,73 +2524,329 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             workflow[report_failure_start:report_failure_end]
         )
         summary_tool = TOOLS_DIR / "platform_storage_evidence_summary.py"
+        source_unit = SYSTEMD_DIR / "deadlock-maintenance.service"
+        unit_bytes = source_unit.read_bytes()
+        installed_unit_name = "deadlock-maintenance.service"
+        created_unit_identity: tuple[int, int, int, int, int] | None = None
+        created_unit_opened = False
+        systemd_fd: int | None = None
+        directory_fds: list[int] = []
+        cleanup_error: str | None = None
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            mock_bin = root / "bin"
-            mock_bin.mkdir()
-            calls = root / "invocation-count"
-            started = root / "service-started"
-            systemctl = mock_bin / "systemctl"
-            systemctl.write_text(
-                "#!/usr/bin/python3\n"
-                "import os, pathlib, sys\n"
-                "args = sys.argv[1:]\n"
-                "prop = next((item.split('=', 1)[1] for item in args "
-                "if item.startswith('--property=')), '')\n"
-                "if args[:1] == ['start']:\n"
-                f"    pathlib.Path({str(started)!r}).write_text('called')\n"
-                "    raise SystemExit(1)\n"
-                "if prop == 'ActiveState':\n"
-                "    print('inactive')\n"
-                "elif prop == 'InvocationID':\n"
-                f"    counter = pathlib.Path({str(calls)!r})\n"
-                "    value = int(counter.read_text()) if counter.exists() else 0\n"
-                "    counter.write_text(str(value + 1))\n"
-                "    print(('1' if value == 0 else '2') * 32)\n"
-                "elif prop == 'ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec':\n"
-                "    print('ActiveState=failed\\nSubState=dead\\nResult=exit-code\\nExecMainCode=exited\\nExecMainStatus=1\\nNRestarts=0\\nMemoryCurrent=0\\nMemoryPeak=0\\nMemoryMax=0\\nTasksCurrent=0\\nTasksMax=0\\nCPUUsageNSec=0')\n"
-                "else:\n"
-                "    raise SystemExit(2)\n",
-                encoding="utf-8",
+        def directory_is_trusted(fd: int) -> bool:
+            info = os.fstat(fd)
+            return (
+                stat.S_ISDIR(info.st_mode)
+                and info.st_uid == 0
+                and stat.S_IMODE(info.st_mode) & 0o022 == 0
             )
-            systemctl.chmod(0o755)
-            prefix = "\n".join(
-                (
-                    "set -Eeuo pipefail",
-                    "CURRENT_STAGE=identity",
-                    trap_line,
-                    failure_helpers,
-                    f"summary_tool={shlex.quote(str(summary_tool))}",
-                    "",
+
+        def read_unit_fd(fd: int) -> bytes:
+            chunks: list[bytes] = []
+            total = 0
+            while total <= 16 * 1024:
+                chunk = os.read(fd, min(4096, 16 * 1024 + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            if total > 16 * 1024:
+                raise AssertionError("canonical unit file exceeds fixture bound")
+            return b"".join(chunks)
+
+        def file_is_exact(fd: int, expected: bytes) -> tuple[int, int, int, int, int]:
+            before = os.fstat(fd)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != 0
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o644
+                or before.st_size != len(expected)
+            ):
+                raise AssertionError("canonical unit file metadata is unsafe")
+            os.lseek(fd, 0, os.SEEK_SET)
+            actual = read_unit_fd(fd)
+            after = os.fstat(fd)
+            identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_uid,
+                stat.S_IMODE(before.st_mode),
+                before.st_nlink,
+            )
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_uid,
+                stat.S_IMODE(after.st_mode),
+                after.st_nlink,
+            )
+            if actual != expected or identity != after_identity:
+                raise AssertionError("canonical unit file differs or changed")
+            return identity
+
+        root_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            root_fd = os.open("/", root_flags)
+            directory_fds.append(root_fd)
+            etc_fd = os.open("etc", root_flags, dir_fd=root_fd)
+            directory_fds.append(etc_fd)
+            if not directory_is_trusted(etc_fd):
+                self.fail("/etc is not a trusted root-owned directory")
+            systemd_fd = os.open("systemd", root_flags, dir_fd=etc_fd)
+            directory_fds.append(systemd_fd)
+            if not directory_is_trusted(systemd_fd):
+                self.fail("/etc/systemd is not a trusted root-owned directory")
+
+            file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            try:
+                existing_fd = os.open(
+                    installed_unit_name, file_flags, dir_fd=systemd_fd
                 )
-            )
-            trailer = (
-                "\nCURRENT_STAGE=report_binding\n"
-                "report_binding_status=2\n"
-                f"{report_failure}\n"
-            )
-            completed = subprocess.run(
-                ["bash", "-c", prefix + service_caller + trailer],
-                env={**os.environ, "PATH": f"{mock_bin}:/usr/bin:/bin"},
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(completed.returncode, 1, completed.stderr)
-            self.assertTrue(started.is_file())
-            records = [json.loads(line) for line in completed.stdout.splitlines()]
-            service_summary = next(
-                item for item in records if item.get("kind") == "service_state"
-            )
-            failure = next(
-                item for item in records if item.get("kind") == "collection_failure"
-            )
-            self.assertEqual(service_summary["service"], "maintenance")
-            self.assertEqual(service_summary["status"], "ok")
-            self.assertEqual(failure["stage"], "report_binding")
-            self.assertEqual(failure["outcome"], "report_unavailable")
-            self.assertEqual(failure["exit_code"], 1)
+            except FileNotFoundError:
+                create_flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW
+                )
+                created_fd = os.open(
+                    installed_unit_name,
+                    create_flags,
+                    0o644,
+                    dir_fd=systemd_fd,
+                )
+                created_unit_opened = True
+                try:
+                    created_info = os.fstat(created_fd)
+                    created_unit_identity = (
+                        created_info.st_dev,
+                        created_info.st_ino,
+                        created_info.st_uid,
+                        stat.S_IMODE(created_info.st_mode),
+                        created_info.st_nlink,
+                    )
+                    os.fchmod(created_fd, 0o644)
+                    chmod_info = os.fstat(created_fd)
+                    chmod_identity = (
+                        chmod_info.st_dev,
+                        chmod_info.st_ino,
+                        chmod_info.st_uid,
+                        stat.S_IMODE(chmod_info.st_mode),
+                        chmod_info.st_nlink,
+                    )
+                    if (
+                        chmod_identity[:3] != created_unit_identity[:3]
+                        or chmod_identity[4] != created_unit_identity[4]
+                        or chmod_identity[3] != 0o644
+                    ):
+                        raise AssertionError("canonical unit identity changed on chmod")
+                    created_unit_identity = chmod_identity
+                    view = memoryview(unit_bytes)
+                    while view:
+                        written = os.write(created_fd, view)
+                        if written <= 0:
+                            raise OSError("short write creating canonical unit")
+                        view = view[written:]
+                    os.fsync(created_fd)
+                finally:
+                    os.close(created_fd)
+                verify_fd = os.open(
+                    installed_unit_name,
+                    file_flags,
+                    dir_fd=systemd_fd,
+                )
+                try:
+                    if file_is_exact(verify_fd, unit_bytes) != created_unit_identity:
+                        raise AssertionError("created canonical unit identity changed")
+                finally:
+                    os.close(verify_fd)
+                os.fsync(systemd_fd)
+            else:
+                try:
+                    file_is_exact(existing_fd, unit_bytes)
+                finally:
+                    os.close(existing_fd)
+
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                runtime = root / "platform"
+                current_release = runtime / "releases" / "current-fixture"
+                previous_release = runtime / "releases" / "previous-fixture"
+                current_release_tools = current_release / "tools"
+                current_release_systemd = current_release / "deploy" / "systemd"
+                current_release_tools.mkdir(parents=True)
+                current_release_systemd.mkdir(parents=True)
+                previous_release.mkdir(parents=True)
+                shared = runtime / "shared"
+                report_dir = shared / "maintenance"
+                report_dir.mkdir(parents=True)
+                current_link = runtime / "current"
+                current_link.symlink_to(current_release)
+                (runtime / "previous").symlink_to(previous_release)
+                shutil.copyfile(
+                    source_unit,
+                    current_release_systemd / "deadlock-maintenance.service",
+                )
+                shutil.copyfile(
+                    TOOLS_DIR / "platform_maintenance_qa_evidence.py",
+                    current_release_tools / "platform_maintenance_qa_evidence.py",
+                )
+                shutil.copyfile(
+                    TOOLS_DIR / "platform_workflow_provenance.py",
+                    current_release_tools / "platform_workflow_provenance.py",
+                )
+                installed_summary_tool = current_release_tools / summary_tool.name
+                shutil.copyfile(summary_tool, installed_summary_tool)
+
+                mock_bin = root / "bin"
+                mock_bin.mkdir()
+                calls = root / "invocation-count"
+                started = root / "service-started"
+                systemctl = mock_bin / "systemctl"
+                unit_properties = "\n".join(
+                    (
+                        "FragmentPath=/etc/systemd/system/deadlock-maintenance.service",
+                        "DropInPaths=",
+                        "NeedDaemonReload=no",
+                        "ActiveState=inactive",
+                        "SubState=dead",
+                        "ExecStart={ path=/opt/oldsparky/platform/shared/venv/bin/python ; argv[]=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_storage_maintenance.py --apply --preserve-existing-backups --backup-keep 14 --release-keep 5 --test-artifact-max-age-days 7 --screenshot-max-age-days 30 --failed-build-max-age-days 1 --minimum-free-gib 5 --maximum-used-percent 85 ; ignore_errors=no ; start_time= ; stop_time= ; pid=0 ; code=(null) ; status=0/SUCCESS }",
+                        "CPUQuotaPerSecUSec=500ms",
+                        "MemoryMax=536870912",
+                        "TimeoutStartUSec=30min",
+                    )
+                )
+                systemctl.write_text(
+                    "#!/usr/bin/python3\n"
+                    "import pathlib, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "prop = next((item.split('=', 1)[1] for item in args if item.startswith('--property=')), '')\n"
+                    "if args[:1] == ['start']:\n"
+                    f"    pathlib.Path({str(started)!r}).write_text('called')\n"
+                    "    raise SystemExit(1)\n"
+                    "if prop == 'FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec':\n"
+                    f"    print({unit_properties!r})\n"
+                    "elif prop == 'ActiveState':\n"
+                    "    print('inactive')\n"
+                    "elif prop == 'InvocationID':\n"
+                    f"    counter = pathlib.Path({str(calls)!r})\n"
+                    "    value = int(counter.read_text()) if counter.exists() else 0\n"
+                    "    counter.write_text(str(value + 1))\n"
+                    "    print(('1' if value == 0 else '2') * 32)\n"
+                    "elif prop == 'ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec':\n"
+                    "    print('ActiveState=failed\\nSubState=dead\\nResult=exit-code\\nExecMainCode=exited\\nExecMainStatus=1\\nNRestarts=0\\nMemoryCurrent=0\\nMemoryPeak=0\\nMemoryMax=536870912\\nTasksCurrent=0\\nTasksMax=0\\nCPUUsageNSec=0')\n"
+                    "else:\n"
+                    "    raise SystemExit(2)\n",
+                    encoding="utf-8",
+                )
+                systemctl.chmod(0o755)
+                current_before = str(current_release)
+                previous_before = str(previous_release)
+                prefix = "\n".join(
+                    (
+                        "set -Eeuo pipefail",
+                        "CURRENT_STAGE=identity",
+                        trap_line,
+                        failure_helpers,
+                        f"runtime={shlex.quote(str(runtime))}",
+                        f"current={shlex.quote(str(current_link))}",
+                        f"shared={shlex.quote(str(shared))}",
+                        f"report_dir={shlex.quote(str(report_dir))}",
+                        f"current_before={shlex.quote(current_before)}",
+                        f"previous_before={shlex.quote(previous_before)}",
+                        "current_id=current-fixture",
+                        "previous_id=previous-fixture",
+                        "active_sha=0123456789abcdef0123456789abcdef01234567",
+                        f"summary_tool={shlex.quote(str(installed_summary_tool))}",
+                        "service_status=0",
+                        "",
+                    )
+                )
+                trailer = (
+                    "\nCURRENT_STAGE=report_binding\n"
+                    "report_binding_status=2\n"
+                    f"{report_failure}\n"
+                )
+                completed = subprocess.run(
+                    ["bash", "-c", prefix + service_caller + trailer],
+                    env={**os.environ, "PATH": f"{mock_bin}:/usr/bin:/bin"},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 1, completed.stderr)
+                self.assertTrue(started.is_file())
+                records = [json.loads(line) for line in completed.stdout.splitlines()]
+                service_summary = next(
+                    item for item in records if item.get("kind") == "service_state"
+                )
+                failure = next(
+                    item for item in records if item.get("kind") == "collection_failure"
+                )
+                self.assertEqual(service_summary["service"], "maintenance")
+                self.assertEqual(service_summary["status"], "ok")
+                self.assertEqual(failure["stage"], "report_binding")
+                self.assertEqual(failure["outcome"], "report_unavailable")
+                self.assertEqual(failure["exit_code"], 1)
+        finally:
+            if created_unit_opened and created_unit_identity is None:
+                cleanup_error = "created canonical unit identity could not be captured"
+            if systemd_fd is not None:
+                if created_unit_identity is not None:
+                    try:
+                        current_info = os.stat(
+                            installed_unit_name,
+                            dir_fd=systemd_fd,
+                            follow_symlinks=False,
+                        )
+                        current_identity = (
+                            current_info.st_dev,
+                            current_info.st_ino,
+                            current_info.st_uid,
+                            stat.S_IMODE(current_info.st_mode),
+                            current_info.st_nlink,
+                        )
+                        if (
+                            current_identity != created_unit_identity
+                            or not stat.S_ISREG(current_info.st_mode)
+                        ):
+                            cleanup_error = "created canonical unit identity changed"
+                        else:
+                            verify_fd = os.open(
+                                installed_unit_name,
+                                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                                dir_fd=systemd_fd,
+                            )
+                            try:
+                                opened_info = os.fstat(verify_fd)
+                                opened_identity = (
+                                    opened_info.st_dev,
+                                    opened_info.st_ino,
+                                    opened_info.st_uid,
+                                    stat.S_IMODE(opened_info.st_mode),
+                                    opened_info.st_nlink,
+                                )
+                                if (
+                                    opened_identity != created_unit_identity
+                                    or not stat.S_ISREG(opened_info.st_mode)
+                                ):
+                                    cleanup_error = "created canonical unit no longer matches"
+                            finally:
+                                os.close(verify_fd)
+                            if cleanup_error is None:
+                                os.unlink(installed_unit_name, dir_fd=systemd_fd)
+                                os.fsync(systemd_fd)
+                    except OSError as exc:
+                        cleanup_error = f"created canonical unit cleanup failed: {type(exc).__name__}"
+            for fd in reversed(directory_fds):
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    cleanup_error = cleanup_error or f"directory descriptor close failed: {type(exc).__name__}"
+            if cleanup_error is not None:
+                self.fail(cleanup_error)
 
     @unittest.skipUnless(os.geteuid() == 0, "lock metadata fixture requires root")
     def test_storage_diagnostic_lock_probe_is_nofollow_and_nonmutating(self) -> None:

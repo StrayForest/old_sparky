@@ -21,6 +21,8 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import yaml
+
 from tools.platform_test_catalog import (
     BACKEND_CONTOURS,
     CONTOUR_METADATA,
@@ -1333,6 +1335,49 @@ class PlatformVerificationContractTests(unittest.TestCase):
         )
         self.assertEqual(unfiltered_extra_arg, malformed_extra_arg)
         self.assertTrue(any("exact catalog-owned verifier selector" in issue for issue in extra_arg_issues))
+        login_shell_diagnostic = workflow.replace(
+            "/bin/bash -c \"cd '$GITHUB_WORKSPACE/platform'",
+            "/bin/bash -lc \"cd '$GITHUB_WORKSPACE/platform'",
+            1,
+        )
+        unfiltered_login_shell, login_shell_issues = _validated_scratch_diagnostic_filtered_workflow(
+            login_shell_diagnostic
+        )
+        self.assertEqual(unfiltered_login_shell, login_shell_diagnostic)
+        self.assertTrue(any("exact closed script/env" in issue for issue in login_shell_issues))
+        prepended_sudo = workflow.replace(
+            "          if sudo -n env -i \\\n",
+            "          sudo -E true\n          if sudo -n env -i \\\n",
+            1,
+        )
+        unfiltered_prepended_sudo, prepended_sudo_issues = (
+            _validated_scratch_diagnostic_filtered_workflow(prepended_sudo)
+        )
+        self.assertEqual(unfiltered_prepended_sudo, prepended_sudo)
+        self.assertTrue(any("exact closed script" in issue for issue in prepended_sudo_issues))
+        nested_sudo = workflow.replace(
+            "          if sudo -n env -i \\\n",
+            '          if /bin/bash -c "sudo -E true"; then :; fi\n'
+            "          if sudo -n env -i \\\n",
+            1,
+        )
+        unfiltered_nested_sudo, nested_sudo_issues = (
+            _validated_scratch_diagnostic_filtered_workflow(nested_sudo)
+        )
+        self.assertEqual(unfiltered_nested_sudo, nested_sudo)
+        self.assertTrue(any("exact closed script" in issue for issue in nested_sudo_issues))
+        inherited_environment = workflow.replace(
+            "sudo -n env -i \\\n",
+            "sudo -E env -i \\\n",
+            1,
+        )
+        unfiltered_inherited_environment, inherited_environment_issues = (
+            _validated_scratch_diagnostic_filtered_workflow(inherited_environment)
+        )
+        self.assertEqual(unfiltered_inherited_environment, inherited_environment)
+        self.assertTrue(
+            any("exact closed script/env" in issue for issue in inherited_environment_issues)
+        )
         malformed_source_binding = workflow.replace(
             '"$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
             '"$GITHUB_SHA" "$GITHUB_RUN_ID" "0"',
@@ -2337,7 +2382,39 @@ except lock.VerificationLockError as exc:
         self.assertNotIn("RUNNER_TEMP/platform-verification-runtime", workflow)
         self.assertNotIn("PLATFORM_VERIFICATION_RUNTIME_DIR", workflow)
         self.assertNotIn("sudo install -d", workflow)
-        self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 5)
+        self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 3)
+        workflow_data = yaml.safe_load(workflow)
+        privileged_job = workflow_data["jobs"]["backend-privileged"]
+        for step_name in (
+            "Run focused scratch restore diagnostic without gate credit",
+            "Run serial privileged catalog contour exactly once as root",
+        ):
+            step = next(
+                item
+                for item in privileged_job["steps"]
+                if item.get("name") == step_name
+            )
+            command = step["run"]
+            self.assertIn("sudo -n env -i", command)
+            self.assertIn("/bin/bash -c", command)
+            self.assertNotIn("sudo -E", command)
+            self.assertNotIn("bash -lc", command)
+            for identity in (
+                'GITHUB_ACTIONS="$GITHUB_ACTIONS"',
+                'RUNNER_OS="$RUNNER_OS"',
+                'RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"',
+            ):
+                self.assertIn(identity, command)
+            for fixed_value in (
+                "PLATFORM_ENVIRONMENT=test",
+                "PLATFORM_DB_SCHEMA=platform",
+                "PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
+                "PLATFORM_SECRET_KEY=ci-only-privileged-test-secret-with-no-production-credentials",
+                "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15",
+                "PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13",
+                "PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14",
+            ):
+                self.assertIn(fixed_value, command)
         verification_block = re.search(
             r"^  verification-contract:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
             workflow,

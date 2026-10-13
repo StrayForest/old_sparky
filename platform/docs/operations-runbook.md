@@ -422,6 +422,12 @@ the worker is below its current limit; the default admission wait budget is
 contains `code=READY_VOTE_OVERLOADED`, `retryable=true` and a bounded
 `retry_after_ms` hint.
 
+When a nonzero wait budget is configured, a waiter is admitted only if its
+capacity slot becomes available before the deadline. A delayed event-loop wake
+after the deadline sheds the request before it can acquire the slot or open a
+database session. Cancellation while waiting removes the waiter registration
+exactly once without counting the cancelled request as admitted or shed.
+
 The reviewed code defaults are per worker: minimum `4`, initial `8`, maximum
 `16`. Production is currently pinned by the runtime profile to static-8:
 minimum/initial/maximum `8/8/8`. The controller smooths CPU samples every

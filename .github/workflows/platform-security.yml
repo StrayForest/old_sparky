@@ -720,7 +720,18 @@ jobs:
             echo "Unable to create the private scratch diagnostic log." >&2
             exit 1
           fi
-          if sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' && \
+          if sudo -n env -i \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1 \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform \
+            PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test \
+            PLATFORM_SECRET_KEY=ci-only-privileged-test-secret-with-no-production-credentials \
+            PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15 \
+            PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13 \
+            PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14 \
+            /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' && \
             .venv_platform/bin/python tools/platform_verify.py backend-privileged \
             --focused tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_isolated_restore_signal_cleanup_under_root" \
             >> "$diagnostic" 2>&1; then
@@ -744,7 +755,18 @@ jobs:
           retention-days: 14
       - name: Run serial privileged catalog contour exactly once as root
         run: >-
-          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          sudo -n env -i
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
+          GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
+          PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+          PLATFORM_SECRET_KEY=ci-only-privileged-test-secret-with-no-production-credentials
+          PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
+          PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
+          PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+          /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' &&
           .venv_platform/bin/python tools/platform_verify.py backend-privileged
           --manifest ci-backend/backend-privileged/manifest.json
           --summary ci-backend/backend-privileged/summary.json --quiet"

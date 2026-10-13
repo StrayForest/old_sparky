@@ -529,6 +529,7 @@ jobs:
           maintenance_result="$(/usr/bin/python3 -I - \
             "$retention_summary_file" "$service_status" <<'PY'
           import json
+          import re
           from pathlib import Path
           import sys
 

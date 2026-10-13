@@ -10,6 +10,7 @@ from fastapi import Request
 
 from apps.platform_api.app.api.routes import tournaments
 from apps.platform_api.app.api.schemas import TournamentDeadlockReadyVoteRequest
+from python_packages.platform_infra import ready_vote_admission
 from python_packages.platform_infra.ready_vote_admission import (
     READY_VOTE_ADMISSION_SEVERE,
     ReadyVoteAdmissionConfig,
@@ -100,23 +101,196 @@ class ReadyVoteAdmissionControllerTests(PlatformIsolatedAsyncioTestCase):
             max_waiters=1,
             wait_timeout_ms=50.0,
         )
-        first = await controller.acquire()
-        self.assertIsNotNone(first)
-        first_held = first
-        wait_started = asyncio.Event()
-        original_wait = controller._capacity_event.wait
+        waiter: asyncio.Task | None = None
+        first_held = None
+        admitted_held = None
+        clock = [100.0]
+
+        async def controlled_wait_for(awaitable, timeout: float) -> None:
+            self.assertAlmostEqual(timeout, 0.05)
+            await awaitable
+
+        try:
+            # Control the controller clock and its private wait seam only;
+            # orchestration barriers below retain real bounded asyncio waits.
+            with (
+                patch.object(
+                    ready_vote_admission,
+                    "perf_counter",
+                    side_effect=lambda: clock[0],
+                ),
+                patch.object(
+                    ready_vote_admission,
+                    "_wait_for",
+                    new=controlled_wait_for,
+                ),
+            ):
+                first_held = await controller.acquire()
+                self.assertIsNotNone(first_held)
+                wait_started = asyncio.Event()
+                original_wait = controller._capacity_event.wait
+
+                async def observed_wait() -> None:
+                    wait_started.set()
+                    await original_wait()
+
+                with patch.object(controller._capacity_event, "wait", new=observed_wait):
+                    waiter = asyncio.create_task(controller.acquire())
+                    await asyncio.wait_for(
+                        wait_started.wait(),
+                        timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                    )
+                    self.assertEqual(controller.snapshot().waiters, 1)
+
+                    shed = await controller.acquire()
+                    self.assertIsNone(shed)
+                    self.assertEqual(controller.snapshot().shed_total, 1)
+
+                    clock[0] += 0.025
+                    await first_held.release(service_ms=20.0, pool_wait_ms=0.0)
+                    first_held = None
+                    admitted = await asyncio.wait_for(
+                        asyncio.shield(waiter),
+                        timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                    )
+                    waiter = None
+                    self.assertIsNotNone(admitted)
+                    assert admitted is not None
+                    admitted_held = admitted
+                    self.assertLessEqual(admitted.wait_ms, 50.0)
+                    await admitted_held.release(service_ms=20.0, pool_wait_ms=0.0)
+                    admitted_held = None
+                snapshot = controller.snapshot()
+                self.assertEqual(snapshot.inflight, 0)
+                self.assertEqual(snapshot.waiters, 0)
+                self.assertEqual(snapshot.shed_total, 1)
+        finally:
+            if waiter is not None:
+                await _cancel_and_reap(waiter)
+            if admitted_held is not None and not admitted_held.released:
+                await admitted_held.release(service_ms=20.0, pool_wait_ms=0.0)
+            if first_held is not None and not first_held.released:
+                await first_held.release(service_ms=20.0, pool_wait_ms=0.0)
+            self.assertEqual(controller.snapshot().inflight, 0)
+            self.assertEqual(controller.snapshot().waiters, 0)
+
+    async def test_capacity_wake_after_wait_deadline_is_shed(self) -> None:
+        controller = self.controller(
+            min_concurrency=1,
+            initial_concurrency=1,
+            max_concurrency=1,
+            max_waiters=1,
+            wait_timeout_ms=50.0,
+        )
+        waiter: asyncio.Task | None = None
+        first_held = None
+        clock = [100.0]
+
+        async def controlled_wait_for(awaitable, timeout: float) -> None:
+            self.assertAlmostEqual(timeout, 0.05)
+            await awaitable
 
         async def observed_wait() -> None:
             wait_started.set()
             await original_wait()
+            wait_returned.set()
 
-        waiter: asyncio.Task | None = None
-        admitted_held = None
         try:
-            with patch.object(
-                controller._capacity_event,
-                "wait",
-                side_effect=observed_wait,
+            with (
+                patch.object(
+                    ready_vote_admission,
+                    "perf_counter",
+                    side_effect=lambda: clock[0],
+                ),
+                patch.object(
+                    ready_vote_admission,
+                    "_wait_for",
+                    new=controlled_wait_for,
+                ),
+            ):
+                first_held = await controller.acquire()
+                self.assertIsNotNone(first_held)
+                wait_started = asyncio.Event()
+                wait_returned = asyncio.Event()
+                original_wait = controller._capacity_event.wait
+                with patch.object(
+                    controller._capacity_event,
+                    "wait",
+                    new=observed_wait,
+                ):
+                    waiter = asyncio.create_task(controller.acquire())
+                    await asyncio.wait_for(
+                        wait_started.wait(),
+                        timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                    )
+                    self.assertEqual(controller.snapshot().waiters, 1)
+
+                    # The capacity wake wins, but the controller clock has
+                    # crossed its deadline before the waiter can take the slot.
+                    clock[0] += 0.051
+                    await first_held.release(service_ms=20.0, pool_wait_ms=0.0)
+                    first_held = None
+                    expired = await asyncio.wait_for(
+                        asyncio.shield(waiter),
+                        timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                    )
+                    waiter = None
+
+                self.assertIsNone(expired)
+                snapshot = controller.snapshot()
+                self.assertEqual(snapshot.inflight, 0)
+                self.assertEqual(snapshot.waiters, 0)
+                self.assertEqual(snapshot.shed_total, 1)
+        finally:
+            if waiter is not None:
+                await _cancel_and_reap(waiter)
+            if first_held is not None and not first_held.released:
+                await first_held.release(service_ms=20.0, pool_wait_ms=0.0)
+            self.assertEqual(controller.snapshot().inflight, 0)
+            self.assertEqual(controller.snapshot().waiters, 0)
+
+    async def test_cancel_after_capacity_wake_unregisters_before_lock_reacquire(self) -> None:
+        controller = self.controller(
+            min_concurrency=1,
+            initial_concurrency=1,
+            max_concurrency=1,
+            max_waiters=1,
+            wait_timeout_ms=500.0,
+        )
+        waiter: asyncio.Task | None = None
+        first_held = None
+        lock_held = False
+        wait_started = asyncio.Event()
+        wait_returned = asyncio.Event()
+        reacquire_started = asyncio.Event()
+
+        class ReacquireObservedLock(asyncio.Lock):
+            observe_reacquire = False
+
+            async def acquire(self) -> bool:
+                if self.observe_reacquire:
+                    reacquire_started.set()
+                return await super().acquire()
+
+        controller._ensure_event_loop()
+        controlled_lock = ReacquireObservedLock()
+        controller._state_lock = controlled_lock
+        try:
+            first_held = await controller.acquire()
+            self.assertIsNotNone(first_held)
+            original_wait = controller._capacity_event.wait
+
+            async def observed_wait() -> None:
+                wait_started.set()
+                await original_wait()
+                wait_returned.set()
+
+            with (
+                patch.object(controller._capacity_event, "wait", new=observed_wait),
+                patch.object(
+                    ready_vote_admission,
+                    "record_ready_vote_admission_start",
+                ) as started,
             ):
                 waiter = asyncio.create_task(controller.acquire())
                 await asyncio.wait_for(
@@ -125,28 +299,203 @@ class ReadyVoteAdmissionControllerTests(PlatformIsolatedAsyncioTestCase):
                 )
                 self.assertEqual(controller.snapshot().waiters, 1)
 
-                shed = await controller.acquire()
-                self.assertIsNone(shed)
-                self.assertEqual(controller.snapshot().shed_total, 1)
+                await controlled_lock.acquire()
+                lock_held = True
+                controlled_lock.observe_reacquire = True
+                controller._capacity_event.set()
+                await asyncio.wait_for(
+                    wait_returned.wait(),
+                    timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                )
+                await asyncio.wait_for(
+                    reacquire_started.wait(),
+                    timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                )
+                waiter.cancel()
+                controlled_lock.release()
+                lock_held = False
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(
+                        waiter,
+                        timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                    )
+                waiter = None
 
-                assert first_held is not None
+                snapshot = controller.snapshot()
+                self.assertEqual(snapshot.waiters, 0)
+                self.assertEqual(snapshot.inflight, 1)
+                self.assertEqual(snapshot.shed_total, 0)
+                self.assertFalse(first_held.released)
+                self.assertFalse(controller._capacity_event.is_set())
+                started.assert_not_called()
+        finally:
+            if lock_held:
+                controlled_lock.release()
+            if waiter is not None:
+                await _cancel_and_reap(waiter)
+            if first_held is not None and not first_held.released:
                 await first_held.release(service_ms=20.0, pool_wait_ms=0.0)
-                first_held = None
-                admitted = await asyncio.wait_for(
+            self.assertEqual(controller.snapshot().inflight, 0)
+            self.assertEqual(controller.snapshot().waiters, 0)
+
+    async def test_cancel_during_timeout_cleanup_unregisters_without_shedding(self) -> None:
+        controller = self.controller(
+            min_concurrency=1,
+            initial_concurrency=1,
+            max_concurrency=1,
+            max_waiters=1,
+            wait_timeout_ms=50.0,
+        )
+        waiter: asyncio.Task | None = None
+        first_held = None
+        lock_held = False
+        wait_started = asyncio.Event()
+        fixture_ready = asyncio.Event()
+        cleanup_reacquire_started = asyncio.Event()
+
+        class CleanupObservedLock(asyncio.Lock):
+            observe_reacquire = False
+
+            async def acquire(self) -> bool:
+                if self.observe_reacquire:
+                    cleanup_reacquire_started.set()
+                return await super().acquire()
+
+        controller._ensure_event_loop()
+        controlled_lock = CleanupObservedLock()
+        controller._state_lock = controlled_lock
+        try:
+            first_held = await controller.acquire()
+            self.assertIsNotNone(first_held)
+            original_wait = controller._capacity_event.wait
+
+            async def observed_wait() -> None:
+                wait_started.set()
+                await original_wait()
+
+            async def timeout_after_fixture_ready(awaitable, timeout: float) -> None:
+                self.assertGreater(timeout, 0.0)
+                self.assertLessEqual(timeout, 0.05)
+                event_waiter = asyncio.ensure_future(awaitable)
+                try:
+                    await asyncio.wait_for(
+                        fixture_ready.wait(),
+                        timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                    )
+                finally:
+                    if not event_waiter.done():
+                        event_waiter.cancel()
+                    await asyncio.wait_for(
+                        asyncio.gather(event_waiter, return_exceptions=True),
+                        timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                    )
+                raise asyncio.TimeoutError
+
+            with (
+                patch.object(controller._capacity_event, "wait", new=observed_wait),
+                patch.object(
+                    ready_vote_admission,
+                    "_wait_for",
+                    new=timeout_after_fixture_ready,
+                ),
+                patch.object(
+                    ready_vote_admission,
+                    "record_ready_vote_admission_start",
+                ) as started,
+            ):
+                waiter = asyncio.create_task(controller.acquire())
+                await asyncio.wait_for(
+                    wait_started.wait(),
+                    timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                )
+                self.assertEqual(controller.snapshot().waiters, 1)
+
+                await controlled_lock.acquire()
+                lock_held = True
+                controlled_lock.observe_reacquire = True
+                fixture_ready.set()
+                await asyncio.wait_for(
+                    cleanup_reacquire_started.wait(),
+                    timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                )
+                waiter.cancel()
+                controlled_lock.release()
+                lock_held = False
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(
+                        waiter,
+                        timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                    )
+                waiter = None
+
+                snapshot = controller.snapshot()
+                self.assertEqual(snapshot.waiters, 0)
+                self.assertEqual(snapshot.inflight, 1)
+                self.assertEqual(snapshot.shed_total, 0)
+                self.assertFalse(first_held.released)
+                self.assertFalse(controller._capacity_event.is_set())
+                started.assert_not_called()
+        finally:
+            if lock_held:
+                controlled_lock.release()
+            if waiter is not None:
+                await _cancel_and_reap(waiter)
+            if first_held is not None and not first_held.released:
+                await first_held.release(service_ms=20.0, pool_wait_ms=0.0)
+            self.assertEqual(controller.snapshot().inflight, 0)
+            self.assertEqual(controller.snapshot().waiters, 0)
+
+    async def test_real_wait_timeout_sheds_once_without_capacity_wake(self) -> None:
+        controller = self.controller(
+            min_concurrency=1,
+            initial_concurrency=1,
+            max_concurrency=1,
+            max_waiters=1,
+            wait_timeout_ms=50.0,
+        )
+        waiter: asyncio.Task | None = None
+        first_held = None
+        wait_started = asyncio.Event()
+
+        try:
+            first_held = await controller.acquire()
+            self.assertIsNotNone(first_held)
+            original_wait = controller._capacity_event.wait
+
+            async def observed_wait() -> None:
+                wait_started.set()
+                await original_wait()
+
+            with (
+                patch.object(controller._capacity_event, "wait", new=observed_wait),
+                patch.object(
+                    ready_vote_admission,
+                    "record_ready_vote_admission_start",
+                ) as started,
+            ):
+                waiter = asyncio.create_task(controller.acquire())
+                await asyncio.wait_for(
+                    wait_started.wait(),
+                    timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                )
+                self.assertEqual(controller.snapshot().waiters, 1)
+                shed = await asyncio.wait_for(
                     asyncio.shield(waiter),
                     timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
                 )
-                self.assertIsNotNone(admitted)
-                assert admitted is not None
-                admitted_held = admitted
-                self.assertLessEqual(admitted.wait_ms, 50.0)
-                await admitted_held.release(service_ms=20.0, pool_wait_ms=0.0)
-                admitted_held = None
+                waiter = None
+
+                self.assertIsNone(shed)
+                snapshot = controller.snapshot()
+                self.assertEqual(snapshot.waiters, 0)
+                self.assertEqual(snapshot.inflight, 1)
+                self.assertEqual(snapshot.shed_total, 1)
+                self.assertFalse(controller._capacity_event.is_set())
+                started.assert_called_once()
+                self.assertIs(started.call_args.kwargs["admitted"], False)
         finally:
             if waiter is not None:
                 await _cancel_and_reap(waiter)
-            if admitted_held is not None and not admitted_held.released:
-                await admitted_held.release(service_ms=20.0, pool_wait_ms=0.0)
             if first_held is not None and not first_held.released:
                 await first_held.release(service_ms=20.0, pool_wait_ms=0.0)
             self.assertEqual(controller.snapshot().inflight, 0)
