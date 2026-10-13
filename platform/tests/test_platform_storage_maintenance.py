@@ -2298,6 +2298,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         )
 
         def workflow_python(marker: str, source: str = workflow) -> str:
+            self.assertEqual(
+                source.count(marker),
+                1,
+                f"expected one workflow Python heredoc marker, got {source.count(marker)}: {marker!r}",
+            )
             marker_start = source.index(marker)
             body_start = source.index("\n", marker_start) + 1
             body_end = source.index("\n          PY", body_start)
@@ -2319,7 +2324,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             'poll_state="$(/usr/bin/python3 -I -B - "$poll_path"'
         )
         success_marker_script = workflow_python(
-            'success_marker="$(/usr/bin/python3 -I - "$remote_report"'
+            'success_marker="$(/usr/bin/python3 -I - "$remote_report" "$GITHUB_RUN_ID" '
+            '"$GITHUB_RUN_ATTEMPT" "$REMOTE_OPERATION" "$SOURCE_SHA"'
+        )
+        probe_success_marker_script = workflow_python(
+            'success_marker="$(/usr/bin/python3 -I - "$remote_report" "$GITHUB_RUN_ID" '
+            '"$GITHUB_RUN_ATTEMPT" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" '
+            '"$SOURCE_SHA" "$BUNDLE_SHA256"'
         )
         with tempfile.TemporaryDirectory() as binding_dir_name:
             binding_path = Path(binding_dir_name) / "receipt.json"
@@ -2374,6 +2385,17 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
             self.assertEqual(bound_success.returncode, 0, bound_success.stderr)
             self.assertEqual(bound_success.stdout, marker + "\n")
+            probe_rejects_backup_success = run_inline(
+                probe_success_marker_script,
+                str(binding_path),
+                "123456",
+                "2",
+                "123456",
+                "2",
+                "a" * 40,
+                "b" * 64,
+            )
+            self.assertNotEqual(probe_rejects_backup_success.returncode, 0)
             wrong_bundle = run_inline(
                 success_marker_script,
                 str(binding_path),
