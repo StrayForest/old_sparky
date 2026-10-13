@@ -486,7 +486,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "available_bytes": 900_000_000,
             "required_bytes": 1_073_741_824,
         })
-        self.assertEqual(actual_report["scratch_first_fault"]["origin"], "controller")
+        self.assertEqual(actual_report["first_fault"]["origin"], "controller")
         self.assertNotIn("private failure text", actual_stdout.getvalue())
         self.assertEqual(
             workflow_parser["parse_probe_report"](
