@@ -341,10 +341,15 @@ the private report. Bounded launcher output is retained with the run-bound
 private failure capture. It may support later diagnosis but does not establish
 a cause on its own. The first-fault projection is retained only when the
 closed helper field exactly matches its bounded private frame; otherwise the
-cause remains unknown. Raw report, stderr, message, traceback, path, PID, argv,
-environment and archive details never enter the shared failure receipt or
-public workflow artifact. Invalid or oversized diagnostic data fails closed
-and cannot make a failed restore pass.
+cause remains unknown. The schema-2 host-memory guard summary is retained in
+the root-private failure receipt only when its closed report value and
+canonical stderr frame agree and its first-fault frame is valid. A malformed,
+missing, one-sided or mismatched guard report/frame makes the report
+unclassified and retains no typed diagnostic projections. This receipt is
+diagnostic only; it does not change the failed operation result. Raw report,
+stderr, message, traceback, path, PID, argv, environment and archive details
+never enter the shared failure receipt or public workflow artifact. Invalid or
+oversized diagnostic data fails closed and cannot make a failed restore pass.
 
 After launch, the transient unit must reach `ActiveState=active` with a verified
 PID, executable, cgroup and confinement sample within 30 seconds. During that

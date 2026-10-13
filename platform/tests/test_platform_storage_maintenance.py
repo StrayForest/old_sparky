@@ -3770,7 +3770,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "schema", "event", "run_id", "attempt", "operation", "source_sha",
                     "bundle_sha256", "stage", "public_summary_error", "exit_code", "report_state",
                     "report_error_class", "restore_diagnostic", "scratch_unit_diagnostic",
-                    "scratch_admission_diagnostic", "scratch_first_fault", "report_bytes",
+                    "scratch_admission_diagnostic", "scratch_host_guard_diagnostic",
+                    "scratch_first_fault", "report_bytes",
                     "backup_disk_diagnostic",
                     "report_sha256", "stderr_state",
                     "stderr_exception_class", "stderr_bytes", "stderr_sha256",
@@ -3783,6 +3784,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(receipt["report_error_class"], "none")
             self.assertIsNone(receipt["scratch_unit_diagnostic"])
             self.assertIsNone(receipt["scratch_admission_diagnostic"])
+            self.assertIsNone(receipt["scratch_host_guard_diagnostic"])
             self.assertIsNone(receipt["scratch_first_fault"])
             self.assertEqual(receipt["stderr_exception_class"], "none")
             self.assertNotIn("Current release symlink is missing", receipt_path.read_text())
@@ -4435,6 +4437,316 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
             self.assertEqual(mismatched_receipt["report_state"], "unclassified_json")
             self.assertIsNone(mismatched_receipt["scratch_first_fault"])
+
+            host_guard_shared = test_root / "host-guard-shared"
+            host_guard_shared.mkdir(mode=0o755)
+            host_guard_shared.chmod(0o755)
+            host_guard_fault = {
+                "schema": 1,
+                "origin": "controller",
+                "site": "controller_active_poll",
+                "exception_kind": "runtime",
+                "errno": None,
+            }
+            host_guard = {
+                "schema": 2,
+                "guard_site": "parent_active_poll",
+                "guard_reason": "memory_reserve",
+                "available_bytes": 900_000_000,
+                "required_bytes": 1_073_741_824,
+            }
+
+            def host_guard_capture(
+                fault: dict[str, object],
+                diagnostic: dict[str, object],
+                *,
+                include_guard_frame: bool = True,
+                frame_diagnostic: dict[str, object] | None = None,
+            ) -> bytes:
+                frames: list[bytes] = []
+                if include_guard_frame:
+                    guarded = diagnostic if frame_diagnostic is None else frame_diagnostic
+                    frames.append(
+                        b"OLDS_PG_SCRATCH_HOST_GUARD_V1:"
+                        + json.dumps(guarded, sort_keys=True, separators=(",", ":")).encode("ascii")
+                        + b"\n"
+                    )
+                frames.append(
+                    b"SCRATCH_FIRST_FAULT_V1\n"
+                    + json.dumps(fault, sort_keys=True, separators=(",", ":")).encode("ascii")
+                    + b"\n"
+                )
+                return b"".join(frames)
+
+            def run_host_guard_trap(
+                run_id: str,
+                capture: bytes,
+                *,
+                report_fault: dict[str, object] | None = None,
+                diagnostic: dict[str, object] | None = None,
+                report_bytes: bytes | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                report_file = test_root / f"host-guard-report-{run_id}.json"
+                capture_file = test_root / f"host-guard-stderr-{run_id}.log"
+                if report_bytes is None:
+                    report_bytes = json.dumps(
+                        {
+                            "ok": False,
+                            "status": "failed",
+                            "error_class": "backup",
+                            "scratch_first_fault": report_fault,
+                            "scratch_host_guard_diagnostic": diagnostic,
+                        }
+                    ).encode("ascii")
+                report_file.write_bytes(report_bytes)
+                report_file.chmod(0o600)
+                capture_file.write_bytes(capture)
+                capture_file.chmod(0o600)
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-",
+                        str(host_guard_shared),
+                        run_id,
+                        "1",
+                        "create",
+                        "a" * 40,
+                        "b" * 64,
+                        "backup_create",
+                        "1",
+                        str(report_file),
+                        str(capture_file),
+                        "none",
+                    ],
+                    input=failure_receipt_script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+
+            host_guard_result = run_host_guard_trap(
+                "123463",
+                host_guard_capture(host_guard_fault, host_guard),
+                report_fault=host_guard_fault,
+                diagnostic=host_guard,
+            )
+            self.assertEqual(host_guard_result.returncode, 0, host_guard_result.stderr)
+            self.assertEqual(host_guard_result.stdout, "")
+            host_guard_receipt_path = host_guard_shared / "backup-failure-123463-1.json"
+            host_guard_receipt = json.loads(host_guard_receipt_path.read_text(encoding="ascii"))
+            self.assertEqual(host_guard_receipt["report_state"], "typed_failure")
+            self.assertEqual(host_guard_receipt["scratch_first_fault"], host_guard_fault)
+            self.assertEqual(host_guard_receipt["scratch_host_guard_diagnostic"], host_guard)
+            self.assertNotIn("OLDS_PG_SCRATCH_HOST_GUARD_V1", host_guard_receipt_path.read_text(encoding="ascii"))
+            self.assertNotIn("900000000", host_guard_result.stdout)
+
+            bad_guard_cases = (
+                (
+                    "123464",
+                    host_guard,
+                    host_guard_capture(
+                        host_guard_fault,
+                        host_guard,
+                        frame_diagnostic=dict(host_guard, available_bytes=900_000_001),
+                    ),
+                ),
+                (
+                    "123465",
+                    dict(host_guard, schema=True),
+                    host_guard_capture(host_guard_fault, dict(host_guard, schema=True)),
+                ),
+                (
+                    "123468",
+                    dict(host_guard, available_bytes=True),
+                    host_guard_capture(
+                        host_guard_fault, dict(host_guard, available_bytes=True)
+                    ),
+                ),
+                (
+                    "123469",
+                    dict(host_guard, unexpected="reject"),
+                    host_guard_capture(
+                        host_guard_fault, dict(host_guard, unexpected="reject")
+                    ),
+                ),
+                (
+                    "123466",
+                    host_guard,
+                    host_guard_capture(host_guard_fault, host_guard, include_guard_frame=False),
+                ),
+                (
+                    "123470",
+                    host_guard,
+                    host_guard_capture(host_guard_fault, host_guard)
+                    + host_guard_capture(host_guard_fault, host_guard).split(
+                        b"SCRATCH_FIRST_FAULT_V1"
+                    )[0],
+                ),
+                (
+                    "123471",
+                    host_guard,
+                    host_guard_capture(host_guard_fault, host_guard).replace(
+                        b'"available_bytes":900000000',
+                        b'"available_bytes": 900000000',
+                        1,
+                    ),
+                ),
+                (
+                    "123472",
+                    host_guard,
+                    b"prefix" + host_guard_capture(host_guard_fault, host_guard),
+                ),
+            )
+            for run_id, diagnostic, capture in bad_guard_cases:
+                with self.subTest(run_id=run_id):
+                    rejected = run_host_guard_trap(
+                        run_id,
+                        capture,
+                        report_fault=host_guard_fault,
+                        diagnostic=diagnostic,
+                    )
+                    self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                    rejected_receipt = json.loads(
+                        (host_guard_shared / f"backup-failure-{run_id}-1.json").read_text(
+                            encoding="ascii"
+                        )
+                    )
+                    self.assertEqual(rejected_receipt["report_state"], "unclassified_json")
+                    self.assertIsNone(rejected_receipt["scratch_host_guard_diagnostic"])
+                    self.assertIsNone(rejected_receipt["scratch_first_fault"])
+
+            mixed_diagnostics = {
+                "ok": False,
+                "status": "failed",
+                "error_class": "backup",
+                "scratch_first_fault": host_guard_fault,
+                "scratch_host_guard_diagnostic": host_guard,
+                "backup_disk_diagnostic": {
+                    "schema": 1,
+                    "phase": "backup_admission",
+                    "guard_reason": "disk_floor",
+                    "free_bytes": 10,
+                    "required_free_bytes": 20,
+                },
+            }
+            mixed_rejection = run_host_guard_trap(
+                "123473",
+                host_guard_capture(
+                    host_guard_fault,
+                    host_guard,
+                    frame_diagnostic=dict(host_guard, available_bytes=900_000_001),
+                ),
+                report_bytes=json.dumps(mixed_diagnostics).encode("ascii"),
+            )
+            self.assertEqual(mixed_rejection.returncode, 0, mixed_rejection.stderr)
+            mixed_receipt = json.loads(
+                (host_guard_shared / "backup-failure-123473-1.json").read_text(
+                    encoding="ascii"
+                )
+            )
+            self.assertEqual(mixed_receipt["report_state"], "unclassified_json")
+            self.assertIsNone(mixed_receipt["backup_disk_diagnostic"])
+            self.assertIsNone(mixed_receipt["scratch_first_fault"])
+            self.assertIsNone(mixed_receipt["scratch_host_guard_diagnostic"])
+
+            # Exercise the source producer and storage forwarding chain before
+            # sending their exact report/frame bytes through the workflow trap.
+            drill = maintenance.backup_restore_drill
+
+            def fail_at_controller_host_guard(_args: object) -> int:
+                return drill._run_isolated_restore_drill(
+                    Path("/synthetic/not-opened.dump"),
+                    timestamp_slug="20261013T120000Z",
+                    private_scratch_diagnostics=True,
+                )
+
+            forwarded_stderr = io.StringIO()
+            with (
+                mock.patch.object(drill.os, "geteuid", return_value=0),
+                mock.patch.object(drill, "require_commands"),
+                mock.patch.object(drill, "require_restore_headroom") as disk_guard,
+                mock.patch.object(
+                    drill, "_scratch_mem_available_bytes", return_value=900_000_000
+                ) as memory_read,
+                mock.patch.object(
+                    drill.subprocess,
+                    "Popen",
+                    side_effect=AssertionError("host guard must stop before unit launch"),
+                ) as unit_launch,
+                mock.patch.object(drill, "create_backup", side_effect=fail_at_controller_host_guard),
+                mock.patch.object(drill, "_termination_signal_scope", return_value=mock.MagicMock()),
+                mock.patch.object(maintenance.sys, "stderr", forwarded_stderr),
+            ):
+                with self.assertRaises(maintenance.BackupCommandFailure) as forwarded_error:
+                    maintenance.run_backup(
+                        test_root / "runtime",
+                        keep=14,
+                        private_failure_diagnostics=True,
+                    )
+            disk_guard.assert_called_once()
+            memory_read.assert_called_once()
+            unit_launch.assert_not_called()
+            self.assertEqual(
+                forwarded_error.exception.scratch_host_guard_diagnostic["guard_site"],
+                "parent_before_archive_open",
+            )
+            self.assertEqual(
+                forwarded_error.exception.scratch_first_fault["site"],
+                "controller_host_guard",
+            )
+            self.assertIn("OLDS_PG_SCRATCH_HOST_GUARD_V1:", forwarded_stderr.getvalue())
+            self.assertIn("SCRATCH_FIRST_FAULT_V1\n", forwarded_stderr.getvalue())
+
+            maintenance_args = SimpleNamespace(
+                authorization_probe_only=False,
+                as_json=True,
+                private_backup_diagnostics=True,
+            )
+            workflow_report = io.StringIO()
+            with (
+                mock.patch.object(maintenance, "parse_args", return_value=maintenance_args),
+                mock.patch.object(maintenance, "run_maintenance", side_effect=forwarded_error.exception),
+                mock.patch.object(maintenance.sys, "stdout", workflow_report),
+            ):
+                self.assertEqual(maintenance.main(), 1)
+            final_report = json.loads(workflow_report.getvalue())
+            self.assertEqual(
+                final_report["scratch_host_guard_diagnostic"],
+                forwarded_error.exception.scratch_host_guard_diagnostic,
+            )
+            self.assertEqual(
+                final_report["scratch_first_fault"],
+                forwarded_error.exception.scratch_first_fault,
+            )
+            chained = run_host_guard_trap(
+                "123467",
+                forwarded_stderr.getvalue().encode("utf-8"),
+                report_bytes=workflow_report.getvalue().encode("utf-8"),
+            )
+            self.assertEqual(chained.returncode, 0, chained.stderr)
+            chained_receipt = json.loads(
+                (host_guard_shared / "backup-failure-123467-1.json").read_text(
+                    encoding="ascii"
+                )
+            )
+            self.assertEqual(chained_receipt["report_state"], "typed_failure")
+            self.assertEqual(
+                chained_receipt["scratch_host_guard_diagnostic"],
+                forwarded_error.exception.scratch_host_guard_diagnostic,
+            )
+            self.assertEqual(
+                chained_receipt["scratch_first_fault"],
+                forwarded_error.exception.scratch_first_fault,
+            )
+            self.assertNotIn(
+                "Scratch restore stopped by the host-memory reserve guard",
+                (host_guard_shared / "backup-failure-123467-1.json").read_text(
+                    encoding="ascii"
+                ),
+            )
 
     def _backup_operation_step(self, workflow_document: dict) -> dict:
         """Return the YAML step whose run scalar defines the remote operation."""

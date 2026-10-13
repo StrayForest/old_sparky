@@ -1117,6 +1117,8 @@ jobs:
           scratch_admission_diagnostic = None
           backup_disk_diagnostic = None
           scratch_first_fault = None
+          scratch_host_guard_diagnostic = None
+          host_guard_invalid = False
           if report_state == "read":
               try:
                   report = json.loads(
@@ -1135,8 +1137,11 @@ jobs:
                       scratch_admission = report.get("scratch_admission_diagnostic")
                       backup_disk = report.get("backup_disk_diagnostic")
                       first_fault = report.get("scratch_first_fault")
+                      scratch_host_guard = report.get("scratch_host_guard_diagnostic")
                       fault_marker = b"SCRATCH_FIRST_FAULT_V1\n"
                       fault_marker_count = stderr_bytes.count(fault_marker) if stderr_state == "read" else 0
+                      host_guard_marker = b"OLDS_PG_SCRATCH_HOST_GUARD_V1:"
+                      host_guard_marker_count = stderr_bytes.count(host_guard_marker) if stderr_state == "read" else 0
                       first_fault_sites = {
                           "controller_entry", "controller_archive_identity", "controller_unit_setup",
                           "controller_host_guard", "controller_launch", "controller_unit_snapshot",
@@ -1200,6 +1205,66 @@ jobs:
                               report_state = "unclassified_json"
                       elif fault_marker_count:
                           report_state = "unclassified_json"
+                      if "scratch_host_guard_diagnostic" in report or host_guard_marker_count:
+                          host_guard_sites = {
+                              "parent_before_archive_open", "parent_before_authorization_probe",
+                              "parent_before_unit_launch", "parent_active_poll",
+                              "parent_after_worker_cleanup", "worker_after_start_before_archive_open",
+                              "worker_after_start_before_authorization_probe",
+                              "worker_after_initdb_before_postgres_start", "worker_after_postgres_start",
+                              "worker_pg_restore_resource_guard",
+                              "worker_after_restore_before_postgres_stop",
+                          }
+                          valid_host_guard = (
+                              isinstance(scratch_host_guard, dict)
+                              and set(scratch_host_guard) == {
+                                  "schema", "guard_site", "guard_reason", "available_bytes", "required_bytes",
+                              }
+                              and type(scratch_host_guard.get("schema")) is int
+                              and scratch_host_guard.get("schema") == 2
+                              and type(scratch_host_guard.get("guard_site")) is str
+                              and scratch_host_guard.get("guard_site") in host_guard_sites
+                              and type(scratch_host_guard.get("guard_reason")) is str
+                              and scratch_host_guard.get("guard_reason") == "memory_reserve"
+                              and type(scratch_host_guard.get("available_bytes")) is int
+                              and 0 <= scratch_host_guard["available_bytes"] < 1073741824
+                              and type(scratch_host_guard.get("required_bytes")) is int
+                              and scratch_host_guard.get("required_bytes") == 1073741824
+                              and valid_first_fault
+                              and scratch_first_fault == first_fault
+                              and scratch_first_fault.get("origin") == (
+                                  "controller" if scratch_host_guard["guard_site"].startswith("parent_") else "worker"
+                              )
+                          )
+                          if valid_host_guard and host_guard_marker_count == 1:
+                              marker_start = stderr_bytes.index(host_guard_marker) + len(host_guard_marker)
+                              marker_end = stderr_bytes.find(b"\n", marker_start)
+                              marker_offset = marker_start - len(host_guard_marker)
+                              marker_is_line_start = marker_offset == 0 or stderr_bytes[marker_offset - 1 : marker_offset] == b"\n"
+                              frame_bytes = stderr_bytes[marker_start:marker_end] if marker_end >= 0 else b""
+                              try:
+                                  host_guard_frame = json.loads(
+                                      frame_bytes.decode("ascii"),
+                                      object_pairs_hook=reject_duplicate_keys,
+                                  )
+                              except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                                  host_guard_frame = None
+                              canonical_host_guard = json.dumps(
+                                  scratch_host_guard, sort_keys=True, separators=(",", ":")
+                              ).encode("ascii")
+                              if (
+                                  marker_is_line_start
+                                  and host_guard_frame == scratch_host_guard
+                                  and frame_bytes == canonical_host_guard
+                                  and len(frame_bytes) <= 512
+                              ):
+                                  scratch_host_guard_diagnostic = scratch_host_guard
+                              else:
+                                  report_state = "unclassified_json"
+                                  host_guard_invalid = True
+                          else:
+                              report_state = "unclassified_json"
+                              host_guard_invalid = True
                       valid_backup_disk = False
                       backup_disk_phases = {
                           "backup_admission", "pg_dump_pre_spawn", "pg_dump_post_start",
@@ -1521,6 +1586,14 @@ jobs:
                               scratch_unit_diagnostic = scratch_unit
                           else:
                               report_state = "unclassified_json"
+                      if host_guard_invalid:
+                          report_state = "unclassified_json"
+                          restore_diagnostic = None
+                          scratch_unit_diagnostic = None
+                          scratch_admission_diagnostic = None
+                          backup_disk_diagnostic = None
+                          scratch_first_fault = None
+                          scratch_host_guard_diagnostic = None
                   elif isinstance(report, dict) and report.get("ok") is True:
                       report_state = "success_payload"
                   else:
@@ -1565,6 +1638,7 @@ jobs:
                   "scratch_unit_diagnostic": scratch_unit_diagnostic,
                   "scratch_admission_diagnostic": scratch_admission_diagnostic,
                   "backup_disk_diagnostic": backup_disk_diagnostic,
+                  "scratch_host_guard_diagnostic": scratch_host_guard_diagnostic,
                   "scratch_first_fault": scratch_first_fault,
                   "report_bytes": len(report_bytes),
                   "report_sha256": hashlib.sha256(report_bytes).hexdigest() if report_bytes else None,

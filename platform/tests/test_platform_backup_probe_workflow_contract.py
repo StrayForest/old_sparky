@@ -77,6 +77,21 @@ def _heredocs(source: str, delimiter: str) -> list[str]:
     return bodies
 
 
+def _literal_set_assignment(tree: ast.AST, name: str) -> frozenset[str]:
+    assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+    ]
+    if len(assignments) != 1:
+        raise AssertionError(f"expected one closed {name} set in the workflow handler")
+    value = ast.literal_eval(assignments[0].value)
+    if not isinstance(value, set) or not all(isinstance(item, str) for item in value):
+        raise AssertionError(f"workflow {name} is not a literal string set")
+    return frozenset(value)
+
+
 class _StatView:
     def __init__(self, value: os.stat_result, *, fake_root: bool = True, inode_delta: int = 0):
         for field in (
@@ -247,6 +262,9 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         exec(compile(marker_parser, str(WORKFLOW), "exec"), cls.marker_parser)
         legacy_handler = _heredoc_with_suffix_after(cls.source, "backup_failure_marker() {")
         legacy_tree = ast.parse(legacy_handler)
+        cls.backup_first_fault_sites = _literal_set_assignment(legacy_tree, "first_fault_sites")
+        cls.backup_host_guard_sites = _literal_set_assignment(legacy_tree, "host_guard_sites")
+        cls.probe_first_fault_sites = _literal_set_assignment(ast.parse(handler), "sites")
         validator_names = {"first_fault_sites", "first_fault_kinds", "valid_first_fault"}
         validator_assignments = sorted(
             (
@@ -696,15 +714,32 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self._assert_probe_receipt_failure_keeps_only_pending_projection()
 
     def test_first_fault_is_closed_frame_bound_private_data(self) -> None:
-        sites = (
-            "worker_after_initdb_guard",
-            "worker_after_postgres_start_guard",
-            "worker_role_setup",
-            "worker_pg_restore_resource_guard",
-            "worker_after_restore_guard",
-        )
-        for site in sites:
-            self.assertEqual(self.source.count(f'"{site}"'), 2, site)
+        worker_sites = frozenset({
+            "worker_entry", "worker_start_token", "worker_root_identity", "worker_mount_snapshot",
+            "worker_cgroup_snapshot", "worker_host_reserve", "worker_archive_open",
+            "worker_directory_setup", "worker_postgres_tools", "worker_initdb",
+            "worker_after_initdb_guard", "worker_role_setup", "worker_postgres_start",
+            "worker_after_postgres_start_guard", "worker_pg_restore_resource_guard",
+            "worker_restore", "worker_after_restore_guard", "worker_postgres_stop",
+            "worker_result_frame", "worker_done_token",
+        })
+        controller_sites = frozenset({
+            "controller_entry", "controller_archive_identity", "controller_unit_setup",
+            "controller_host_guard", "controller_launch", "controller_unit_snapshot",
+            "controller_identity", "controller_start_token", "controller_active_poll",
+            "controller_worker_frame", "controller_completion_snapshot", "controller_done_token",
+            "controller_final_snapshot", "controller_cleanup",
+        })
+        expected_host_guard_sites = frozenset({
+            "parent_before_archive_open", "parent_before_authorization_probe",
+            "parent_before_unit_launch", "parent_active_poll", "parent_after_worker_cleanup",
+            "worker_after_start_before_archive_open", "worker_after_start_before_authorization_probe",
+            "worker_after_initdb_before_postgres_start", "worker_after_postgres_start",
+            "worker_pg_restore_resource_guard", "worker_after_restore_before_postgres_stop",
+        })
+        self.assertEqual(self.backup_first_fault_sites, worker_sites | controller_sites)
+        self.assertEqual(self.probe_first_fault_sites, worker_sites | controller_sites)
+        self.assertEqual(self.backup_host_guard_sites, expected_host_guard_sites)
         paths = self._fixture(status="failed", first_fault=FAULT)
         try:
             code, marker = self._process(paths, status="failed")
