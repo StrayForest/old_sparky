@@ -2409,7 +2409,7 @@ except lock.VerificationLockError as exc:
                 "PLATFORM_ENVIRONMENT=test",
                 "PLATFORM_DB_SCHEMA=platform",
                 "PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
-                "PLATFORM_SECRET_KEY=ci-only-privileged-test-secret-with-no-production-credentials",
+                "PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials",
                 "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15",
                 "PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13",
                 "PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14",
