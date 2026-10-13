@@ -2776,7 +2776,110 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     capture_output=True,
                     check=False,
                 )
-                self.assertEqual(completed.returncode, 1, completed.stderr)
+
+                if completed.returncode != 1:
+                    diagnostic_code = """
+import importlib.util
+import json
+from pathlib import Path
+import stat
+import sys
+
+helper_path, release_unit_path, installed_path = sys.argv[1:4]
+stage = "helper_import"
+
+def facts(path):
+    try:
+        info = Path(path).lstat()
+    except OSError:
+        return {"mode": None, "uid": None, "nlink": None, "size": None}
+    return {
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+    }
+
+release_facts = facts(release_unit_path)
+installed_facts = facts(installed_path)
+try:
+    sys.path.insert(0, str(Path(helper_path).parent))
+    spec = importlib.util.spec_from_file_location(
+        "maintenance_qa_preflight_diagnostic", helper_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    stage = "release_unit"
+    source_bytes = helper._safe_unit_bytes(release_unit_path, installed=False)
+    stage = "installed_unit"
+    installed_bytes = helper._safe_unit_bytes(installed_path, installed=True)
+    stage = "loaded_unit_contract"
+    helper._validate_maintenance_unit_bytes(
+        source_bytes, installed_bytes, installed_path, sys.stdin.read(65537)
+    )
+    stage = "passed"
+except Exception:
+    pass
+print(json.dumps({
+    "stage": stage,
+    "python_version": [sys.version_info.major, sys.version_info.minor, sys.version_info.micro],
+    "release_unit": release_facts,
+    "installed_unit": installed_facts,
+}, sort_keys=True, separators=(",", ":")))
+"""
+                    try:
+                        diagnostic_result = subprocess.run(
+                            [
+                                "/usr/bin/python3",
+                                "-I",
+                                "-c",
+                                diagnostic_code,
+                                str(current_release_tools / "platform_maintenance_qa_evidence.py"),
+                                str(current_release_systemd / installed_unit_name),
+                                "/etc/systemd/system/deadlock-maintenance.service",
+                            ],
+                            input=unit_properties + "\n",
+                            capture_output=True,
+                            check=False,
+                            text=True,
+                            timeout=5,
+                        )
+                        diagnostic_payload = json.loads(diagnostic_result.stdout)
+                        diagnostic_stage = diagnostic_payload["stage"]
+                        version_parts = diagnostic_payload["python_version"]
+                        python3_version = ".".join(
+                            str(part) for part in version_parts
+                        )
+                        release_facts = diagnostic_payload["release_unit"]
+                        installed_facts = diagnostic_payload["installed_unit"]
+                        if (
+                            diagnostic_result.returncode != 0
+                            or set(diagnostic_payload)
+                            != {"stage", "python_version", "release_unit", "installed_unit"}
+                            or diagnostic_stage
+                            not in {
+                                "helper_import",
+                                "release_unit",
+                                "installed_unit",
+                                "loaded_unit_contract",
+                                "passed",
+                            }
+                        ):
+                            raise ValueError
+                    except Exception:
+                        diagnostic_stage = "diagnostic_unavailable"
+                        python3_version = "unavailable"
+                        release_facts = {}
+                        installed_facts = {}
+                    self.fail(
+                        "extracted maintenance caller returned an unexpected "
+                        f"status; validator_stage={diagnostic_stage}; "
+                        f"system_python3={python3_version}; "
+                        f"release_unit={release_facts}; installed_unit={installed_facts}"
+                    )
+
                 self.assertTrue(started.is_file())
                 records = [json.loads(line) for line in completed.stdout.splitlines()]
                 service_summary = next(
