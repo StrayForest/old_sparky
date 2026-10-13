@@ -37,7 +37,6 @@ def _binding(**overrides: str) -> backup_guard.BackupBinding:
         "source_security_run_id": str(SECURITY_RUN_ID),
         "source_security_run_attempt": str(SECURITY_ATTEMPT),
         "source_sha": SOURCE_SHA,
-        "source_security_completed_at": "2026-10-12T19:10:00Z",
     }
     values.update(overrides)
     return backup_guard.BackupBinding(**values)
@@ -120,6 +119,30 @@ class FakeBackupProofApi:
             "run_started_at": _gh_time("18:59:00"),
             "updated_at": _gh_time("19:10:00"),
         }
+        self.security_job_rows: list[dict[str, Any]] = [
+            {
+                "id": 911,
+                "run_id": SECURITY_RUN_ID,
+                "run_attempt": SECURITY_ATTEMPT,
+                "head_sha": SOURCE_SHA,
+                "name": "Security gate",
+                "status": "completed",
+                "conclusion": "success",
+                "started_at": _gh_time("19:00:00"),
+                "completed_at": _gh_time("19:10:00"),
+            },
+            {
+                "id": 912,
+                "run_id": SECURITY_RUN_ID,
+                "run_attempt": SECURITY_ATTEMPT,
+                "head_sha": SOURCE_SHA,
+                "name": "Optional route gate",
+                "status": "completed",
+                "conclusion": "skipped",
+                "started_at": _gh_time("19:00:00"),
+                "completed_at": _gh_time("19:01:00"),
+            },
+        ]
         self.workflow = {"id": 901, "path": BACKUP_WORKFLOW}
         self.runs: list[dict[str, Any]] = [
             {
@@ -138,12 +161,15 @@ class FakeBackupProofApi:
                 "conclusion": "success",
                 "created_at": _gh_time("19:01:00"),
                 "run_started_at": _gh_time("19:02:00"),
+                "updated_at": _gh_time("19:10:00"),
             }
         ]
         self.jobs: list[dict[str, Any]] = [
             {
                 "id": 902,
+                "run_id": BACKUP_RUN_ID,
                 "run_attempt": BACKUP_ATTEMPT,
+                "head_sha": SOURCE_SHA,
                 "name": BACKUP_JOB,
                 "started_at": _gh_time("19:03:00"),
                 "completed_at": _gh_time("19:09:00"),
@@ -165,10 +191,16 @@ class FakeBackupProofApi:
         self.dev_sha = SOURCE_SHA
         self.downloads: list[tuple[int, int, int]] = []
         self.calls: list[str] = []
+        self.job_queries: list[tuple[str, str, str]] = []
 
     def security_run(self, run_id: str) -> dict[str, Any]:
         self.calls.append("security_run")
         return dict(self.security)
+
+    def security_jobs(self, run_id: str, attempt: str) -> list[dict[str, Any]]:
+        self.calls.append("security_jobs")
+        self.job_queries.append(("security", run_id, attempt))
+        return [dict(job) for job in self.security_job_rows]
 
     def backup_workflow(self, path: str) -> dict[str, Any]:
         self.calls.append("backup_workflow")
@@ -182,6 +214,7 @@ class FakeBackupProofApi:
 
     def backup_jobs(self, run_id: str, attempt: str) -> list[dict[str, Any]]:
         self.calls.append("backup_jobs")
+        self.job_queries.append(("backup", run_id, attempt))
         return [dict(job) for job in self.jobs]
 
     def backup_artifacts(self, run_id: int) -> list[dict[str, Any]]:
@@ -290,6 +323,13 @@ class BackupSuccessGuardTests(unittest.TestCase):
         self.assertEqual(result, _receipt())
         self.assertEqual(api.downloads, [(str(BACKUP_RUN_ID), 903, 1_048_576)])
         self.assertEqual(api.calls.count("download_artifact"), 1)
+        self.assertEqual(
+            api.job_queries,
+            [
+                ("security", str(SECURITY_RUN_ID), str(SECURITY_ATTEMPT)),
+                ("backup", str(BACKUP_RUN_ID), str(BACKUP_ATTEMPT)),
+            ],
+        )
 
     def test_dev_moving_during_artifact_download_invalidates_the_proof(self) -> None:
         api = FakeBackupProofApi()
@@ -462,6 +502,8 @@ class BackupSuccessGuardTests(unittest.TestCase):
             {"run_attempt": SECURITY_ATTEMPT - 1},
             {"status": "in_progress"},
             {"conclusion": "failure"},
+            {"updated_at": None},
+            {"updated_at": _gh_time("18:58:59")},
         )
         for mutation in mutations:
             api = FakeBackupProofApi()
@@ -471,6 +513,58 @@ class BackupSuccessGuardTests(unittest.TestCase):
             ):
                 backup_guard.wait_for_backup_success(api, _binding())
             self.assertNotIn("download_artifact", api.calls)
+
+        job_mutations = (
+            {"id": None},
+            {"run_id": SECURITY_RUN_ID + 1},
+            {"run_attempt": SECURITY_ATTEMPT + 1},
+            {"run_attempt": True},
+            {"run_attempt": None},
+            {"head_sha": "b" * 40},
+            {"head_sha": None},
+            {"status": "in_progress"},
+            {"status": []},
+            {"conclusion": "failure"},
+            {"conclusion": []},
+            {"started_at": None},
+            {"started_at": _gh_time("18:58:59")},
+            {"completed_at": None},
+            {"completed_at": _gh_time("18:59:59")},
+            {"completed_at": _gh_time("19:00:00")},
+            {"completed_at": _gh_time("19:10:01")},
+        )
+        for mutation in job_mutations:
+            api = FakeBackupProofApi()
+            api.security_job_rows[0].update(mutation)
+            with self.subTest(security_job=mutation), self.assertRaises(
+                backup_guard.BackupProofError
+            ):
+                backup_guard.wait_for_backup_success(api, _binding())
+            self.assertNotIn("download_artifact", api.calls)
+
+        api = FakeBackupProofApi()
+        api.security_job_rows[0].pop("run_attempt")
+        api.security_job_rows[0].pop("head_sha")
+        self.assertEqual(backup_guard.wait_for_backup_success(api, _binding()), _receipt())
+
+        api = FakeBackupProofApi()
+        api.security_job_rows.clear()
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+        api = FakeBackupProofApi()
+        with mock.patch.object(
+            api, "security_jobs", side_effect=backup_guard.BackupProofError("API unavailable")
+        ), self.assertRaisesRegex(backup_guard.BackupProofError, "API unavailable"):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("backup_workflow", api.calls)
+
+        api = FakeBackupProofApi()
+        api.security_job_rows.append(dict(api.security_job_rows[0]))
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
 
     def test_workflow_and_backup_run_attempt_identity_are_bound(self) -> None:
         mutations = (
@@ -483,6 +577,7 @@ class BackupSuccessGuardTests(unittest.TestCase):
             ("run", {"run_attempt": BACKUP_ATTEMPT + 1}),
             ("run", {"display_title": "stale backup"}),
             ("run", {"conclusion": "failure"}),
+            ("run", {"status": []}),
         )
         for target, mutation in mutations:
             api = FakeBackupProofApi()
@@ -507,20 +602,65 @@ class BackupSuccessGuardTests(unittest.TestCase):
 
     def test_backup_must_start_before_security_run_completes(self) -> None:
         api = FakeBackupProofApi()
-        api.runs[0]["created_at"] = _gh_time("19:11:00")
-        with self.assertRaises(backup_guard.BackupProofError):
+        api.runs[0].update(
+            {
+                "created_at": _gh_time("19:11:00"),
+                "run_started_at": _gh_time("19:11:00"),
+                "updated_at": _gh_time("19:12:00"),
+            }
+        )
+        with self.assertRaisesRegex(
+            backup_guard.BackupProofError,
+            "backup did not reserve its production slot during the source security run",
+        ):
             backup_guard.wait_for_backup_success(api, _binding())
         self.assertNotIn("download_artifact", api.calls)
 
         api = FakeBackupProofApi()
         api.runs[0]["created_at"] = _gh_time("18:58:00")
-        with self.assertRaises(backup_guard.BackupProofError):
+        with self.assertRaisesRegex(
+            backup_guard.BackupProofError,
+            "backup did not reserve its production slot during the source security run",
+        ):
             backup_guard.wait_for_backup_success(api, _binding())
         self.assertNotIn("download_artifact", api.calls)
 
         api = FakeBackupProofApi()
         api.jobs[0]["started_at"] = _gh_time("19:11:00")
-        with self.assertRaises(backup_guard.BackupProofError):
+        api.jobs[0]["completed_at"] = _gh_time("19:11:00")
+        api.runs[0]["updated_at"] = _gh_time("19:12:00")
+        with self.assertRaisesRegex(
+            backup_guard.BackupProofError,
+            "production backup job did not start while security was in progress",
+        ):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+        api = FakeBackupProofApi()
+        api.jobs[0]["started_at"] = _gh_time("19:10:00")
+        api.jobs[0]["completed_at"] = _gh_time("19:11:00")
+        api.runs[0]["updated_at"] = _gh_time("19:12:00")
+        with self.assertRaisesRegex(
+            backup_guard.BackupProofError,
+            "production backup job did not start while security was in progress",
+        ):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+        # Reservation equality with the conservative source-job completion
+        # bound is rejected, even though the run's later updated_at is not.
+        api = FakeBackupProofApi()
+        api.runs[0].update(
+            {"created_at": _gh_time("19:10:00"), "run_started_at": _gh_time("19:10:00")}
+        )
+        api.jobs[0].update(
+            {"started_at": _gh_time("19:10:00"), "completed_at": _gh_time("19:11:00")}
+        )
+        api.runs[0]["updated_at"] = _gh_time("19:12:00")
+        with self.assertRaisesRegex(
+            backup_guard.BackupProofError,
+            "backup did not reserve its production slot during the source security run",
+        ):
             backup_guard.wait_for_backup_success(api, _binding())
         self.assertNotIn("download_artifact", api.calls)
 
@@ -528,6 +668,11 @@ class BackupSuccessGuardTests(unittest.TestCase):
         job_failures = (
             {"name": "Different job"},
             {"run_attempt": BACKUP_ATTEMPT + 1},
+            {"run_attempt": True},
+            {"run_attempt": None},
+            {"head_sha": "b" * 40},
+            {"head_sha": None},
+            {"run_id": BACKUP_RUN_ID + 1},
             {"conclusion": "failure"},
         )
         for mutation in job_failures:
@@ -541,6 +686,87 @@ class BackupSuccessGuardTests(unittest.TestCase):
                     api, _binding(), deadline_seconds=1, clock=clock, sleep=clock.sleep
                 )
             self.assertNotIn("download_artifact", api.calls)
+
+        # The endpoint itself binds the requested run attempt. The documented
+        # job schema need not repeat run_attempt on every row.
+        api = FakeBackupProofApi()
+        api.jobs[0].pop("run_attempt")
+        self.assertEqual(backup_guard.wait_for_backup_success(api, _binding()), _receipt())
+
+        api = backup_guard.GitHubBackupProofApi(
+            "StrayForest/old_sparky", "https://api.github.com", "gh-token-sentinel"
+        )
+        jobs = [
+            {
+                "id": job_id,
+                "run_id": SECURITY_RUN_ID,
+                "head_sha": SOURCE_SHA,
+                "status": "completed",
+                "conclusion": "success",
+                "started_at": _gh_time("19:00:00"),
+                "completed_at": _gh_time("19:01:00"),
+            }
+            for job_id in range(1000, 1101)
+        ]
+        seen_paths: list[str] = []
+
+        def paged_json(path: str, *, max_bytes: int = 1_048_576) -> dict[str, Any]:
+            seen_paths.append(path)
+            page = int(path.rsplit("page=", 1)[1])
+            start = (page - 1) * 100
+            return {"total_count": len(jobs), "jobs": jobs[start : start + 100]}
+
+        with mock.patch.object(api, "_json", side_effect=paged_json):
+            self.assertEqual(api.security_jobs(str(SECURITY_RUN_ID), str(SECURITY_ATTEMPT)), jobs)
+        self.assertEqual(
+            seen_paths,
+            [
+                f"/actions/runs/{SECURITY_RUN_ID}/attempts/{SECURITY_ATTEMPT}/jobs?per_page=100&page=1",
+                f"/actions/runs/{SECURITY_RUN_ID}/attempts/{SECURITY_ATTEMPT}/jobs?per_page=100&page=2",
+            ],
+        )
+
+        backup_api = backup_guard.GitHubBackupProofApi(
+            "StrayForest/old_sparky", "https://api.github.com", "gh-token-sentinel"
+        )
+        with mock.patch.object(
+            backup_api,
+            "_json",
+            return_value={"total_count": 1, "jobs": [dict(jobs[0], run_id=BACKUP_RUN_ID)]},
+        ) as request_json:
+            backup_api.backup_jobs(str(BACKUP_RUN_ID), str(BACKUP_ATTEMPT))
+        request_json.assert_called_once_with(
+            f"/actions/runs/{BACKUP_RUN_ID}/attempts/{BACKUP_ATTEMPT}/jobs?per_page=100&page=1",
+            max_bytes=2_097_152,
+        )
+
+        pagination_failures = (
+            lambda rows: ({"total_count": 101, "jobs": rows[:99]}, {"total_count": 101, "jobs": rows[99:]}),
+            lambda rows: ({"total_count": 101, "jobs": rows[:100]}, {"total_count": 102, "jobs": rows[100:]}),
+            lambda rows: ({"total_count": 101, "jobs": rows[:100]}, {"total_count": 101, "jobs": [rows[0]]}),
+        )
+        for pages in pagination_failures:
+            page1, page2 = pages(jobs)
+            api = backup_guard.GitHubBackupProofApi(
+                "StrayForest/old_sparky", "https://api.github.com", "gh-token-sentinel"
+            )
+            with mock.patch.object(api, "_json", side_effect=[page1, page2]), self.subTest(pages=pages):
+                with self.assertRaises(backup_guard.BackupProofError):
+                    api.security_jobs(str(SECURITY_RUN_ID), str(SECURITY_ATTEMPT))
+
+        malformed_responses = (
+            {"total_count": 0, "jobs": []},
+            {"total_count": True, "jobs": []},
+            {"total_count": 1, "jobs": [dict(jobs[0], id=None)]},
+            {"total_count": 1, "jobs": [dict(jobs[0], run_id=SECURITY_RUN_ID + 1)]},
+        )
+        for response in malformed_responses:
+            api = backup_guard.GitHubBackupProofApi(
+                "StrayForest/old_sparky", "https://api.github.com", "gh-token-sentinel"
+            )
+            with mock.patch.object(api, "_json", return_value=response), self.subTest(response=response):
+                with self.assertRaises(backup_guard.BackupProofError):
+                    api.security_jobs(str(SECURITY_RUN_ID), str(SECURITY_ATTEMPT))
 
         artifact_failures_before_download = (
             {"name": "old-artifact"},

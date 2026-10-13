@@ -319,7 +319,6 @@ def source_bound_backup_dispatch_issues(workflow_text: str) -> list[str]:
         "GITHUB_API_URL": "${{ github.api_url }}",
         "SOURCE_SECURITY_RUN_ID": "${{ github.event.workflow_run.id }}",
         "SOURCE_SECURITY_RUN_ATTEMPT": "${{ github.event.workflow_run.run_attempt }}",
-        "SOURCE_RUN_COMPLETED_AT": "${{ github.event.workflow_run.completed_at }}",
         "TARGET_SHA": "${{ github.event.workflow_run.head_sha }}",
         "BACKUP_GUARD_TOOL": "${{ github.workspace }}/platform/tools/platform_backup_success_guard.py",
     }

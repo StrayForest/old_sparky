@@ -61,6 +61,8 @@ to `dev`. The chain is:
    object. It then requires `platform-security-build=success` and skips a SHA that already
    reports `platform-production-deploy=success` only when the matching
    successful deploy attempt has its exact bot-authored marker.
+   Before child dispatch, the guard revalidates the exact Security run/attempt/source and requires complete, terminal, source-bound pages from that attempt's [workflow-jobs endpoint](https://docs.github.com/en/rest/actions/workflow-jobs), with valid start/completion times. It derives the conservative `last_job_completed_at` bound as the maximum job `completed_at`.
+   The reserved backup workflow and production job must start strictly before that bound; `updated_at` is only a consistency upper bound, and event `workflow_run.completed_at` is never a fallback. Missing, malformed or incomplete jobs abort. This bound may reject starts after the final job but before overall workflow completion; it is not the exact workflow-finish time.
 4. The automatic chain dispatches `mode=deploy` for ordinary deployable full
    routes. For a recovery-bootstrap-only route it dispatches
    `mode=baseline-reconcile` only as part of the validated automatic chain; the

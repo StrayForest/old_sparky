@@ -80,7 +80,6 @@ class BackupBinding:
     source_security_run_id: str
     source_security_run_attempt: str
     source_sha: str
-    source_security_completed_at: str
 
     def validate(self) -> None:
         if (
@@ -91,13 +90,14 @@ class BackupBinding:
             or _SHA_RE.fullmatch(self.source_sha) is None
         ):
             raise BackupProofError("expected source binding is malformed")
-        _parse_time(self.source_security_completed_at, "security event completion")
 
 
 class BackupProofApi(Protocol):
     """Small HTTP boundary, injectable in tests without external services."""
 
     def security_run(self, run_id: str) -> dict[str, Any]: ...
+
+    def security_jobs(self, run_id: str, run_attempt: str) -> list[dict[str, Any]]: ...
 
     def backup_workflow(self, path: str) -> dict[str, Any]: ...
 
@@ -295,10 +295,64 @@ def _validate_security_run(run: Any, expected: BackupBinding) -> tuple[datetime,
     ):
         raise BackupProofError("exact security run is not successful or source-bound")
     started = _parse_time(run.get("run_started_at"), "security run start")
-    completed = _parse_time(expected.source_security_completed_at, "security event completion")
-    if started >= completed:
-        raise BackupProofError("security completion precedes its start")
-    return started, completed
+    updated = _parse_time(run.get("updated_at"), "security run update")
+    if started >= updated:
+        raise BackupProofError("security run update precedes its start")
+    return started, updated
+
+
+def _validate_attempt_jobs(
+    rows: Any,
+    *,
+    run_id: str,
+    run_attempt: str,
+    source_sha: str,
+    run_started: datetime,
+    run_updated: datetime,
+) -> datetime:
+    """Validate all jobs returned by an exact run-attempt endpoint."""
+
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 1_000:
+        raise BackupProofError("attempt job list is empty, malformed or excessive")
+    ids: set[int] = set()
+    latest_completion: datetime | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            raise BackupProofError("attempt job row is malformed")
+        job_id = row.get("id")
+        if type(job_id) is not int or job_id <= 0 or job_id in ids:
+            raise BackupProofError("attempt job IDs are missing, malformed or duplicate")
+        ids.add(job_id)
+        if type(row.get("run_id")) is not int or row["run_id"] != int(run_id):
+            raise BackupProofError("attempt job belongs to a different workflow run")
+        # The attempt-specific endpoint is the attempt authority. Job objects
+        # may include extra attempt/source fields; if present, bind them too.
+        if "run_attempt" in row and (
+            type(row["run_attempt"]) is not int or row["run_attempt"] != int(run_attempt)
+        ):
+            raise BackupProofError("attempt job belongs to a different run attempt")
+        if "head_sha" in row and (
+            not isinstance(row["head_sha"], str) or row["head_sha"] != source_sha
+        ):
+            raise BackupProofError("attempt job belongs to a different source SHA")
+        status = row.get("status")
+        conclusion = row.get("conclusion")
+        if (
+            not isinstance(status, str)
+            or status != "completed"
+            or not isinstance(conclusion, str)
+            or conclusion not in {"success", "skipped"}
+        ):
+            raise BackupProofError("attempt job did not reach an allowed terminal result")
+        started = _parse_time(row.get("started_at"), "attempt job start")
+        completed = _parse_time(row.get("completed_at"), "attempt job completion")
+        if not run_started <= started <= completed <= run_updated:
+            raise BackupProofError("attempt job timestamps are inconsistent with its exact run")
+        if latest_completion is None or completed > latest_completion:
+            latest_completion = completed
+    if latest_completion is None:
+        raise BackupProofError("attempt job completion bound is unavailable")
+    return latest_completion
 
 
 def _validate_candidate_identity(run: Any, workflow_id: int, expected: BackupBinding) -> tuple[str, str, datetime, datetime]:
@@ -378,8 +432,19 @@ def wait_for_backup_success(
     if hasattr(api, "set_deadline"):
         api.set_deadline(deadline, clock)
     _check_deadline(deadline, clock)
-    security_started, security_completed = _validate_security_run(
-        api.security_run(expected.source_security_run_id), expected
+    security_run = api.security_run(expected.source_security_run_id)
+    security_started, security_updated = _validate_security_run(security_run, expected)
+    security_jobs = api.security_jobs(
+        expected.source_security_run_id, expected.source_security_run_attempt
+    )
+    _check_deadline(deadline, clock)
+    last_job_completed_at = _validate_attempt_jobs(
+        security_jobs,
+        run_id=expected.source_security_run_id,
+        run_attempt=expected.source_security_run_attempt,
+        source_sha=expected.source_sha,
+        run_started=security_started,
+        run_updated=security_updated,
     )
     _check_deadline(deadline, clock)
     workflow = api.backup_workflow(BACKUP_WORKFLOW_PATH)
@@ -423,11 +488,20 @@ def wait_for_backup_success(
             candidate, workflow_id, expected
         )
         if not (
-            security_started <= created_at <= workflow_started < security_completed
+            security_started
+            <= created_at
+            <= workflow_started
+            < last_job_completed_at
         ):
             raise BackupProofError("backup did not reserve its production slot during the source security run")
         status = candidate.get("status")
-        if status in {"queued", "in_progress", "waiting", "pending", "requested"}:
+        if isinstance(status, str) and status in {
+            "queued",
+            "in_progress",
+            "waiting",
+            "pending",
+            "requested",
+        }:
             sleep(min(POLL_INTERVAL_SECONDS, max(0.0, deadline - clock())))
             _check_deadline(deadline, clock)
             continue
@@ -436,8 +510,8 @@ def wait_for_backup_success(
 
         jobs = api.backup_jobs(run_id, attempt)
         _check_deadline(deadline, clock)
-        if not isinstance(jobs, list) or len(jobs) > 1000:
-            raise BackupProofError("backup job list is malformed or excessive")
+        if not isinstance(jobs, list) or not 1 <= len(jobs) <= 1_000:
+            raise BackupProofError("backup job list is empty, malformed or excessive")
         matching_jobs = [
             job
             for job in jobs
@@ -449,15 +523,32 @@ def wait_for_backup_success(
         if (
             type(job.get("id")) is not int
             or job["id"] <= 0
-            or type(job.get("run_attempt")) is not int
-            or job["run_attempt"] != int(attempt)
+            or type(job.get("run_id")) is not int
+            or job["run_id"] != int(run_id)
+            or (
+                "run_attempt" in job
+                and (type(job["run_attempt"]) is not int or job["run_attempt"] != int(attempt))
+            )
+            or (
+                "head_sha" in job
+                and (not isinstance(job["head_sha"], str) or job["head_sha"] != expected.source_sha)
+            )
             or job.get("status") != "completed"
             or job.get("conclusion") != "success"
         ):
             raise BackupProofError("exact production backup job did not succeed")
         job_started = _parse_time(job.get("started_at"), "backup production job start")
         job_completed = _parse_time(job.get("completed_at"), "backup production job completion")
-        if not security_started <= created_at <= workflow_started <= job_started < security_completed:
+        backup_updated = _parse_time(candidate.get("updated_at"), "backup run update")
+        if not workflow_started <= job_started <= job_completed <= backup_updated:
+            raise BackupProofError("backup job timestamps are inconsistent with its exact run")
+        if not (
+            security_started
+            <= created_at
+            <= workflow_started
+            <= job_started
+            < last_job_completed_at
+        ):
             raise BackupProofError("production backup job did not start while security was in progress")
 
         artifacts = api.backup_artifacts(run_id)
@@ -575,6 +666,9 @@ class GitHubBackupProofApi:
             raise BackupProofError("security run ID is invalid")
         return self._json(f"/actions/runs/{run_id}")
 
+    def security_jobs(self, run_id: str, run_attempt: str) -> list[dict[str, Any]]:
+        return self._attempt_jobs(run_id, run_attempt)
+
     def backup_workflow(self, path: str) -> dict[str, Any]:
         if path != BACKUP_WORKFLOW_PATH:
             raise BackupProofError("backup workflow path is invalid")
@@ -620,10 +714,11 @@ class GitHubBackupProofApi:
             raise BackupProofError("backup workflow pagination has duplicate or malformed rows")
         return rows
 
-    def backup_jobs(self, run_id: str, run_attempt: str) -> list[dict[str, Any]]:
+    def _attempt_jobs(self, run_id: str, run_attempt: str) -> list[dict[str, Any]]:
         if _ID_RE.fullmatch(run_id) is None or _ATTEMPT_RE.fullmatch(run_attempt) is None:
-            raise BackupProofError("backup job query identity is invalid")
+            raise BackupProofError("workflow job query identity is invalid")
         rows: list[dict[str, Any]] = []
+        total: int | None = None
         for page in range(1, 11):
             query = urlencode({"per_page": 100, "page": page})
             payload = self._json(
@@ -633,17 +728,38 @@ class GitHubBackupProofApi:
             if (
                 not isinstance(payload, dict)
                 or type(payload.get("total_count")) is not int
-                or not 0 <= payload["total_count"] <= 1_000
+                or not 1 <= payload["total_count"] <= 1_000
                 or not isinstance(payload.get("jobs"), list)
                 or len(payload["jobs"]) > 100
             ):
-                raise BackupProofError("backup job response is malformed")
+                raise BackupProofError("workflow job response is malformed")
+            if total is None:
+                total = payload["total_count"]
+            elif total != payload["total_count"]:
+                raise BackupProofError("workflow job pagination changed during proof")
+            remaining = total - len(rows)
+            expected_page_size = min(100, remaining)
+            if expected_page_size <= 0 or len(payload["jobs"]) != expected_page_size:
+                raise BackupProofError("workflow job pagination is incomplete")
+            if any(not isinstance(job, dict) for job in payload["jobs"]):
+                raise BackupProofError("workflow job response contains a malformed row")
             rows.extend(payload["jobs"])
-            if len(rows) >= payload["total_count"] or len(payload["jobs"]) < 100:
+            if len(rows) == total:
                 break
-        if len(rows) > 1_000:
-            raise BackupProofError("backup job response is excessive")
+        if total is None or len(rows) != total:
+            raise BackupProofError("workflow job pagination exceeded its bound")
+        ids = [row.get("id") for row in rows]
+        run_ids = [row.get("run_id") for row in rows]
+        if (
+            any(type(job_id) is not int or job_id <= 0 for job_id in ids)
+            or len(ids) != len(set(ids))
+            or any(type(row_run_id) is not int or row_run_id != int(run_id) for row_run_id in run_ids)
+        ):
+            raise BackupProofError("backup job pagination has duplicate or mismatched rows")
         return rows
+
+    def backup_jobs(self, run_id: str, run_attempt: str) -> list[dict[str, Any]]:
+        return self._attempt_jobs(run_id, run_attempt)
 
     def backup_artifacts(self, run_id: str) -> list[dict[str, Any]]:
         if _ID_RE.fullmatch(run_id) is None:
@@ -740,14 +856,12 @@ def main() -> int:
     run_id = os.environ.get("SOURCE_SECURITY_RUN_ID", "")
     run_attempt = os.environ.get("SOURCE_SECURITY_RUN_ATTEMPT", "")
     source_sha = os.environ.get("TARGET_SHA", "")
-    source_completed_at = os.environ.get("SOURCE_RUN_COMPLETED_AT", "")
     binding = BackupBinding(
         repository=repository,
         ref="refs/heads/dev",
         source_security_run_id=run_id,
         source_security_run_attempt=run_attempt,
         source_sha=source_sha,
-        source_security_completed_at=source_completed_at,
     )
     try:
         proof = wait_for_backup_success(GitHubBackupProofApi(repository, api_url, token), binding)

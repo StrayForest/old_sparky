@@ -33,7 +33,6 @@ jobs:
       TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
       SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
       SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-      SOURCE_RUN_COMPLETED_AT: ${{ github.event.workflow_run.completed_at }}
       SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
       SECURITY_WORKFLOW_NAME: Platform security and build
       SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
@@ -900,7 +899,6 @@ jobs:
           GITHUB_API_URL: ${{ github.api_url }}
           SOURCE_SECURITY_RUN_ID: ${{ github.event.workflow_run.id }}
           SOURCE_SECURITY_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          SOURCE_RUN_COMPLETED_AT: ${{ github.event.workflow_run.completed_at }}
           TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
           BACKUP_GUARD_TOOL: ${{ github.workspace }}/platform/tools/platform_backup_success_guard.py
         run: |

@@ -2547,6 +2547,12 @@ except lock.VerificationLockError as exc:
                 '        continue-on-error: ${{ github.event_name == \'push\' }}\n',
                 1,
             ),
+            autodeploy.replace(
+                '          SOURCE_SECURITY_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}\n',
+                '          SOURCE_SECURITY_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}\n'
+                '          SOURCE_RUN_COMPLETED_AT: ${{ github.event.workflow_run.completed_at }}\n',
+                1,
+            ),
             "jobs:\n  malformed: [\n",
         ]
         for index, malformed in enumerate(mutations):
