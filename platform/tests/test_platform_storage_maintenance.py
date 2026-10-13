@@ -118,6 +118,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             apply=True,
             backup_only=False,
             verify_existing_backup_only=False,
+            preserve_existing_backups=False,
             purge_profile_access_cache_after_restore=False,
             evict_pinned_build_node_cache=False,
             eviction_run_id=None,
@@ -262,8 +263,76 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(args.maximum_used_percent, 85.0)
         self.assertEqual(args.backup_max_age_hours, 24.0)
         self.assertFalse(args.backup_only)
+        self.assertFalse(args.preserve_existing_backups)
         self.assertFalse(args.evict_pinned_build_node_cache)
         self.assertIsNone(args.eviction_run_id)
+
+    def test_preserve_existing_backups_is_full_apply_only(self) -> None:
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            ["platform_storage_maintenance.py", "--preserve-existing-backups"],
+        ), self.assertRaises(SystemExit):
+            maintenance.parse_args()
+
+        invalid_modes = (
+            ["--apply", "--preserve-existing-backups", "--skip-backup"],
+            ["--apply", "--preserve-existing-backups", "--backup-only"],
+            [
+                "--apply",
+                "--preserve-existing-backups",
+                "--verify-existing-backup-only",
+            ],
+        )
+        for options in invalid_modes:
+            with self.subTest(mode=options[-1]), mock.patch.object(
+                maintenance.sys,
+                "argv",
+                ["platform_storage_maintenance.py", *options],
+            ), self.assertRaises(SystemExit):
+                maintenance.parse_args()
+
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--apply",
+                "--preserve-existing-backups",
+            ],
+        ):
+            self.assertTrue(maintenance.parse_args().preserve_existing_backups)
+
+    def test_full_maintenance_preserves_backups_and_keeps_other_retention(self) -> None:
+        app_dir = self.root / "runtime" / "platform"
+        self.add_runtime_release(app_dir, "release-current")
+        self.add_runtime_release(app_dir, "release-previous")
+        (app_dir / "current").symlink_to(app_dir / "releases" / "release-current")
+        (app_dir / "previous").symlink_to(app_dir / "releases" / "release-previous")
+        args = self.maintenance_args(app_dir)
+        args.skip_backup = False
+        args.preserve_existing_backups = True
+
+        with (
+            mock.patch.object(maintenance, "run_backup", return_value={"restore_verified": True}) as backup,
+            mock.patch.object(maintenance, "apply_release_plan") as release_retention,
+            mock.patch.object(maintenance, "apply_artifact_retention_plan") as artifact_retention,
+        ):
+            result = maintenance._plan_and_maybe_apply(
+                args,
+                app_dir=app_dir,
+                source_release_dir=self.release_dir,
+            )
+
+        backup.assert_called_once_with(
+            app_dir,
+            keep=14,
+            max_age_hours=24.0,
+            rotate_existing=False,
+        )
+        release_retention.assert_called_once()
+        artifact_retention.assert_called_once()
+        self.assertTrue(result[5]["restore_verified"])
 
     def test_backup_only_cli_is_apply_only_and_cannot_skip_backup(self) -> None:
         with mock.patch.object(
@@ -1851,7 +1920,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             [
                 "ExecStart=/opt/oldsparky/platform/shared/venv/bin/python "
                 "/opt/oldsparky/platform/current/tools/"
-                "platform_storage_maintenance.py --apply --backup-keep 14 "
+                "platform_storage_maintenance.py --apply "
+                "--preserve-existing-backups --backup-keep 14 "
                 "--release-keep 5 --test-artifact-max-age-days 7 "
                 "--screenshot-max-age-days 30 --failed-build-max-age-days 1 "
                 "--minimum-free-gib 5 --maximum-used-percent 85"
@@ -1876,6 +1946,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             'exec 9>"$retained_load_lock"', maintenance_workflow
         )
         self.assertIn("CPUQuota=50%", service)
+        self.assertIn("MemoryMax=512M", service)
+        self.assertIn("TimeoutStartSec=30min", service)
+        self.assertIn("--minimum-free-gib 5 --maximum-used-percent 85", service)
         self.assertIn("IOSchedulingClass=idle", service)
         self.assertIn("Persistent=true", timer)
         self.assertIn("RandomizedDelaySec=30m", timer)
@@ -4364,7 +4437,21 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         "production_releases": {
                             "protected": ["release-current", "release-previous"]
                         },
-                        "backup": {"status": "completed", "restore_verified": True},
+                        "backup": {
+                            "status": "completed",
+                            "created": True,
+                            "restore_verified": True,
+                            "alembic_revision_verified": True,
+                            "rotation_mode": "preserve-existing",
+                            "preexisting_archives_preserved": True,
+                            "preexisting_archive_count": 0,
+                            "preexisting_sidecar_count": 0,
+                            "postexisting_archive_count": 1,
+                            "removed": [],
+                            "removed_count": 0,
+                            "preexisting_archive_inventory_sha256": "a" * 64,
+                            "postexisting_archive_inventory_sha256": "a" * 64,
+                        },
                         "private": "/root/private-maintenance-report.json",
                     }
                 ),
@@ -4392,6 +4479,34 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(bound.stdout.strip(), report.name)
             self.assertNotIn("private-maintenance-report", bound.stdout)
 
+            altered = json.loads(report.read_text(encoding="utf-8"))
+            altered["backup"]["rotation_mode"] = "rotate-existing"
+            report.write_text(json.dumps(altered), encoding="utf-8")
+            report.chmod(0o600)
+            refused_policy = subprocess.run(
+                [sys.executable, "-I", "-", *arguments],
+                input=binder,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(refused_policy.returncode, 0)
+            self.assertNotIn("private-maintenance-report", refused_policy.stderr)
+
+            altered["backup"]["rotation_mode"] = "preserve-existing"
+            altered["backup"]["postexisting_archive_count"] = 0
+            report.write_text(json.dumps(altered), encoding="utf-8")
+            report.chmod(0o600)
+            refused_count = subprocess.run(
+                [sys.executable, "-I", "-", *arguments],
+                input=binder,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(refused_count.returncode, 0)
+            self.assertNotIn("private-maintenance-report", refused_count.stderr)
+
             stale_start = completed_at + timedelta(seconds=10)
             stale_end = stale_start + timedelta(seconds=10)
             missing = subprocess.run(
@@ -4415,6 +4530,49 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(missing.returncode, 3)
             self.assertEqual(missing.stdout, "")
             self.assertNotIn("private-maintenance-report", missing.stderr)
+
+    def test_timer_activation_is_opt_in_and_requires_source_bound_qa_proofs(self) -> None:
+        workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-storage-maintenance.yml"
+        ).read_text(encoding="utf-8")
+        verifier = (
+            REPO_ROOT / "platform/tools/platform_maintenance_qa_evidence.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("enable_maintenance_timer:", workflow)
+        self.assertIn("default: false", workflow)
+        self.assertIn("actions: read", workflow)
+        self.assertIn("if: ${{ inputs.enable_maintenance_timer }}", workflow)
+        self.assertIn("platform_maintenance_qa_evidence.py", workflow)
+        self.assertIn("validate-maintenance-unit", workflow)
+        self.assertIn("CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec", workflow)
+        self.assertIn('"$LIVE_USER_QA_RUN_ATTEMPT" == 1', workflow)
+        self.assertIn("validate_workflow_run(", verifier)
+        self.assertIn("run_id_value = _input_id(run_id)", verifier)
+        self.assertIn("attempt_value = _input_id(attempt)", verifier)
+        self.assertIn('run.get("run_attempt") != attempt_value', verifier)
+        self.assertIn('artifact_run.get("head_sha") != expected_sha', verifier)
+        self.assertIn('artifact_run.get("head_branch") != "dev"', verifier)
+        self.assertIn("platform-live-launch-sanitized", verifier)
+        self.assertIn("platform-live-user-qa", verifier)
+        self.assertIn("total != 54", verifier)
+        self.assertIn('counts["attempt_total"] != 1', verifier)
+        proof_step = workflow.index("Verify exact live QA artifacts before timer activation")
+        ssh_step = workflow.index("Validate production SSH inputs")
+        self.assertLess(proof_step, ssh_step)
+        report_health = workflow.index("printf 'health=passed\\n'")
+        timer_enable = workflow.index("systemctl enable --now deadlock-maintenance.timer")
+        self.assertLess(report_health, timer_enable)
+        self.assertIn("timer_rollback_unverified", workflow)
+        self.assertIn('timer_active_after" == inactive && "$timer_enabled_after" == disabled', workflow)
+        self.assertIn('"rotation_mode") != "preserve-existing"', workflow)
+        unit_preflight = workflow.index("validate-maintenance-unit")
+        service_start = workflow.index("if systemctl start deadlock-maintenance.service; then")
+        self.assertLess(unit_preflight, service_start)
+        preflight_failure = workflow.index(
+            "fail_with_status maintenance_unit_contract_unavailable 2", unit_preflight
+        )
+        self.assertLess(preflight_failure, service_start)
 
     def test_maintenance_workflow_preserves_unhealthy_report_and_remote_status_after_upload(self) -> None:
         workflow_path = (

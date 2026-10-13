@@ -4174,6 +4174,71 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertEqual(old_dump.stat().st_mtime_ns, original_stat.st_mtime_ns)
             self.assertFalse((output_dir / "platformdb-20261006T120000Z.dump").exists())
 
+    def test_preserve_existing_post_publish_member_change_rolls_back_only_new_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            old_dump, old_sidecar = self._write_backup_pair(
+                output_dir, "platformdb-existing.dump", b"existing-archive"
+            )
+            original_dump = (old_dump.read_bytes(), old_dump.lstat().st_ino)
+            original_sidecar = (old_sidecar.read_bytes(), old_sidecar.lstat().st_ino)
+            original_mtime_ns = old_dump.stat().st_mtime_ns
+            initial_names = {old_dump.name, old_sidecar.name}
+            args = argparse.Namespace(
+                env_file=str(output_dir / ".env.platform"),
+                output_dir=str(output_dir),
+                keep=14,
+                admin_database_url=None,
+                dump_only=True,
+                rotate_existing=False,
+            )
+            real_inventory = backup_drill.backup_inventory
+            inventory_calls = 0
+
+            def mutate_old_member_after_publish(path: pathlib.Path):
+                nonlocal inventory_calls
+                inventory_calls += 1
+                # Calls 1 and 2 are the initial and pre-publication snapshots;
+                # call 3 is the post-publication inventory with both new files present.
+                if inventory_calls == 3:
+                    os.utime(
+                        old_dump,
+                        ns=(old_dump.stat().st_atime_ns, original_mtime_ns + 1_000_000),
+                    )
+                return real_inventory(path)
+
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    {"PLATFORM_DATABASE_URL": "postgresql://platform_user@localhost/platformdb"},
+                ),
+                mock.patch.object(backup_drill, "load_env", return_value={}),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
+                mock.patch.object(
+                    backup_drill, "backup_inventory", side_effect=mutate_old_member_after_publish
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Pre-existing backup inventory changed during preserve mode"
+                ) as raised:
+                    backup_drill.create_backup(args)
+
+            self.assertEqual(inventory_calls, 4)
+            self.assertEqual(
+                getattr(raised.exception, "_backup_preservation_integrity", None),
+                "preexisting_inventory_changed",
+            )
+            self.assertEqual({path.name for path in output_dir.iterdir()}, initial_names)
+            self.assertEqual((old_dump.read_bytes(), old_dump.lstat().st_ino), original_dump)
+            self.assertEqual((old_sidecar.read_bytes(), old_sidecar.lstat().st_ino), original_sidecar)
+            self.assertEqual(old_dump.stat().st_mtime_ns, original_mtime_ns + 1_000_000)
+
     def _assert_destination_collision_fails_before_dump_and_preserves_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)

@@ -24,7 +24,7 @@ platform dependencies.
 `deadlock-health-monitor.timer` performs the lightweight five-minute readiness,
 service, disk, memory, backup-age and certificate-expiry gate.
 `deadlock-maintenance.timer` runs the daily restore-verified backup and bounded
-retention workflow.
+non-backup retention workflow.
 
 The complete production perimeter proof is the SHA-locked operator workflow;
 run it after the exact release is active:
@@ -48,7 +48,7 @@ Maintenance keeps:
 | --- | --- |
 | production releases | newest 5; always protect `current` and `previous` |
 | local release artifacts | newest 5 matching release groups |
-| verified DB backups | newest 14 |
+| verified DB backups | all pairs preserved by installed full maintenance |
 | Playwright results on the production/pre-production host | 7 days |
 | GitHub Actions Playwright and CI evidence artifacts | 14 days |
 | trusted live-QA generations | protect the active/current/previous source SHAs; remove only older inactive generations after exact identity checks |
@@ -58,17 +58,8 @@ Maintenance keeps:
 | Nginx/system text logs | rotate at 50 MiB, keep 7 compressed files |
 | failed-login `btmp` | rotate at 16 MiB, keep 2 uncompressed files |
 
-It never deletes shared env/runtimes, upload staging, current/previous releases, the active trusted live-QA generation, or trusted generations for current/previous
-source commits, legacy live-QA caches for the current/previous source commits,
-business rows or canonical retained reports. Backup failure stops all pruning.
-Backup-only preserves all pre-existing archive pairs; full maintenance rotates to 14
-after restore verification. Backup-only skips other retention; see the [backup and
-restore runbook](backup-restore-runbook.md). Live-QA cache pruning takes the
-machine-wide live-QA lock, requires the dedicated browser cgroup
-and user identity to be idle, accepts only root-owned non-symlink
-`runtime-<40 lowercase hex>` trees with the published read-only manifest
-contract, and always retains at least the newest valid unprotected fallback.
-The keep count is a hard cap for unprotected caches, not an age window.
+It never deletes shared env/runtimes, upload staging, current/previous releases, active/source-protected live-QA generations or caches, business rows or canonical reports; backup failure stops pruning. Full maintenance preserves every backup pair while running other retention; backup-only also preserves pairs but skips other retention, and generic callers retain configured rotation (see the [backup and restore runbook](backup-restore-runbook.md)).
+Live-QA cache pruning holds the machine-wide lock, requires an idle browser cgroup and user, accepts only root-owned non-symlink `runtime-<40 lowercase hex>` trees, retains the newest valid unprotected fallback, and treats keep as a hard cap rather than an age window.
 Health monitoring and storage maintenance share one conservative hard gate: available free space must be at least 5 GiB and conservative use (`total - available`, including filesystem-reserved headroom) must be at most 85%; exact 5 GiB and 85% boundaries pass, and 80% is not a failure threshold.
 The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it.
 
@@ -132,9 +123,7 @@ Preview live-QA runtime cache retention (also machine-locked and idle-gated):
   prune-runtime-cache --keep 1
 ```
 
-The subcommand is dry-run unless `--apply` is explicit and takes the release
-lock before the live-QA lock. Daily storage maintenance runs the nested apply
-form only after its restore-verified backup step succeeds; after every production load or QA run, use `.agents/skills/platform-storage-retention/SKILL.md` to complete exact fixture and bounded storage cleanup before another run; do not replace either step with broad filesystem or database deletion.
+The preview is dry-run unless `--apply` and takes release then live-QA locks; the installed full service preserves backups while running other retention and health checks. Growth is unbounded; unchanged 5 GiB/85% gates fail closed, and this rollout enables the timer only through the source-bound workflow after load/CPU/live-QA evidence passes. After each run, follow `.agents/skills/platform-storage-retention/SKILL.md` for exact cleanup; never use broad deletion.
 
 ## Prepared media and R2
 

@@ -11,8 +11,34 @@ on:
         description: "Exact source SHA currently deployed on the production VPS"
         required: true
         type: string
+      enable_maintenance_timer:
+        description: "Opt in to enabling the daily timer after exact source-bound QA proofs and successful full maintenance"
+        required: true
+        default: false
+        type: boolean
+      live_launch_run_id:
+        description: "Exact successful live-launch workflow run ID; required only when enabling the timer"
+        required: false
+        default: ""
+        type: string
+      live_launch_run_attempt:
+        description: "Exact latest live-launch run attempt; required only when enabling the timer"
+        required: false
+        default: ""
+        type: string
+      live_user_qa_run_id:
+        description: "Exact successful live-user QA workflow run ID; required only when enabling the timer"
+        required: false
+        default: ""
+        type: string
+      live_user_qa_run_attempt:
+        description: "Exact live-user QA workflow run attempt (must be 1); required only when enabling the timer"
+        required: false
+        default: ""
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -28,6 +54,11 @@ jobs:
     env:
       CONFIRMATION: ${{ inputs.confirmation }}
       EXPECTED_SHA: ${{ inputs.expected_sha }}
+      ENABLE_MAINTENANCE_TIMER: ${{ inputs.enable_maintenance_timer }}
+      LIVE_LAUNCH_RUN_ID: ${{ inputs.live_launch_run_id }}
+      LIVE_LAUNCH_RUN_ATTEMPT: ${{ inputs.live_launch_run_attempt }}
+      LIVE_USER_QA_RUN_ID: ${{ inputs.live_user_qa_run_id }}
+      LIVE_USER_QA_RUN_ATTEMPT: ${{ inputs.live_user_qa_run_attempt }}
     steps:
       - name: Validate explicit maintenance confirmation
         shell: bash
@@ -39,6 +70,40 @@ jobs:
             || { echo "Refusing maintenance without exact confirmation." >&2; exit 1; }
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "expected_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
+          case "$ENABLE_MAINTENANCE_TIMER" in true|false) ;; *) echo "Timer opt-in must be boolean." >&2; exit 1 ;; esac
+          if [[ "$ENABLE_MAINTENANCE_TIMER" == true ]]; then
+            [[ "$LIVE_LAUNCH_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+              && "$LIVE_LAUNCH_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ \
+              && "$LIVE_USER_QA_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+              && "$LIVE_USER_QA_RUN_ATTEMPT" == 1 ]] \
+              || { echo "Timer activation requires exact live QA run IDs and attempts." >&2; exit 1; }
+          elif [[ -n "$LIVE_LAUNCH_RUN_ID" || -n "$LIVE_LAUNCH_RUN_ATTEMPT" \
+            || -n "$LIVE_USER_QA_RUN_ID" || -n "$LIVE_USER_QA_RUN_ATTEMPT" ]]; then
+            echo "QA run bindings are accepted only with timer activation." >&2; exit 1
+          fi
+
+      - name: Checkout source-bound maintenance evidence verifier
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact live QA artifacts before timer activation
+        if: ${{ inputs.enable_maintenance_timer }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          timeout --foreground 180s /usr/bin/python3 -I -B \
+            platform/tools/platform_maintenance_qa_evidence.py \
+            --target-sha "$EXPECTED_SHA" \
+            --live-launch-run-id "$LIVE_LAUNCH_RUN_ID" \
+            --live-launch-attempt "$LIVE_LAUNCH_RUN_ATTEMPT" \
+            --live-user-qa-run-id "$LIVE_USER_QA_RUN_ID" \
+            --live-user-qa-attempt "$LIVE_USER_QA_RUN_ATTEMPT"
 
       - name: Validate production SSH inputs
         shell: bash
@@ -109,13 +174,14 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-          bash -s -- "$EXPECTED_SHA" "$CONFIRMATION" > "$remote_log" 2> "$ssh_error" <<'REMOTE'
+          bash -s -- "$EXPECTED_SHA" "$CONFIRMATION" "$ENABLE_MAINTENANCE_TIMER" > "$remote_log" 2> "$ssh_error" <<'REMOTE'
           set -Eeuo pipefail
           CURRENT_STAGE=identity
           trap 'diagnostic_rc=$?; trap - ERR; if [[ "${service_status:-0}" =~ ^[1-9][0-9]{0,2}$ ]] && (( service_status <= 255 )); then diagnostic_rc=$service_status; fi; printf "{\"schema\":1,\"kind\":\"collection_failure\",\"status\":\"failed\",\"stage\":\"%s\",\"outcome\":\"producer_failed\",\"exit_code\":%d}\n" "$CURRENT_STAGE" "$diagnostic_rc"; exit "$diagnostic_rc"' ERR
 
           expected_sha="$1"
           confirmation="$2"
+          enable_maintenance_timer="$3"
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           shared="$runtime/shared"
@@ -175,6 +241,7 @@ jobs:
           PY
           )"
           test "$active_sha" = "$expected_sha" || fail "Active release SHA differs from expected_sha."
+          case "$enable_maintenance_timer" in true|false) ;; *) fail "Maintenance timer opt-in is invalid." ;; esac
           test -f "$current/tools/platform_storage_maintenance.py" \
             && test ! -L "$current/tools/platform_storage_maintenance.py" \
             && test -x "$current/tools/platform_storage_maintenance.py" \
@@ -192,6 +259,13 @@ jobs:
             || fail "Previous release identifier is invalid."
           test ! -e "$shared/.release-operation.json" \
             || fail "A release transaction is already pending."
+          if [[ "$enable_maintenance_timer" == true ]]; then
+            timer_active_before="$(systemctl show deadlock-maintenance.timer --property=ActiveState --value --no-pager 2>/dev/null)" \
+              || fail "Maintenance timer active state is unavailable."
+            timer_enabled_before="$(systemctl is-enabled deadlock-maintenance.timer 2>/dev/null || true)"
+            [[ "$timer_active_before" == inactive && "$timer_enabled_before" == disabled ]] \
+              || fail "Maintenance timer is not in the expected disabled baseline."
+          fi
 
           # The installed maintenance command acquires the canonical release
           # lock and then the retained-load lock in that order. Do not hold the
@@ -202,6 +276,23 @@ jobs:
           printf '{"schema":1,"kind":"storage_lock_lifecycle","owner":"deadlock-maintenance.service","state":"service_managed"}\n'
 
           CURRENT_STAGE=service_invocation
+          maintenance_unit_source="$current_before/deploy/systemd/deadlock-maintenance.service"
+          maintenance_unit_validator="$current_before/tools/platform_maintenance_qa_evidence.py"
+          test -f "$maintenance_unit_validator" && test ! -L "$maintenance_unit_validator" \
+            || fail_with_status maintenance_unit_contract_unavailable 2
+          loaded_maintenance_unit="$(systemctl show deadlock-maintenance.service \
+            --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
+            --no-pager 2>/dev/null)" \
+            || fail_with_status maintenance_unit_contract_unavailable 2
+          if ! printf '%s\n' "$loaded_maintenance_unit" \
+            | /usr/bin/python3 -I "$maintenance_unit_validator" \
+              validate-maintenance-unit \
+              "$maintenance_unit_source" \
+              /etc/systemd/system/deadlock-maintenance.service; then
+            fail_with_status maintenance_unit_contract_unavailable 2
+          fi
+          test "$(readlink -f "$current")" = "$current_before" \
+            || fail_with_status maintenance_unit_contract_unavailable 2
           service_state_before="$(systemctl show deadlock-maintenance.service \
             --property=ActiveState --value --no-pager 2>/dev/null)" \
             || fail "Maintenance service state producer failed."
@@ -354,7 +445,24 @@ jobs:
                       or previous_id not in protected
                       or not isinstance(backup, dict)
                       or backup.get("status") != "completed"
+                      or backup.get("created") is not True
                       or backup.get("restore_verified") is not True
+                      or backup.get("alembic_revision_verified") is not True
+                      or backup.get("rotation_mode") != "preserve-existing"
+                      or backup.get("preexisting_archives_preserved") is not True
+                      or type(backup.get("preexisting_archive_count")) is not int
+                      or backup["preexisting_archive_count"] < 0
+                      or type(backup.get("preexisting_sidecar_count")) is not int
+                      or backup["preexisting_sidecar_count"] != backup["preexisting_archive_count"]
+                      or type(backup.get("postexisting_archive_count")) is not int
+                      or backup["postexisting_archive_count"] != backup["preexisting_archive_count"] + 1
+                      or backup.get("removed") != []
+                      or type(backup.get("removed_count")) is not int
+                      or backup.get("removed_count") != 0
+                      or not isinstance(backup.get("preexisting_archive_inventory_sha256"), str)
+                      or not re.fullmatch(r"[0-9a-f]{64}", backup["preexisting_archive_inventory_sha256"])
+                      or backup.get("preexisting_archive_inventory_sha256")
+                         != backup.get("postexisting_archive_inventory_sha256")
                   ):
                       continue
                   report_started = datetime.fromisoformat(
@@ -412,6 +520,25 @@ jobs:
               raise SystemExit(2)
           if backup.get("status") != "completed" or backup.get("restore_verified") is not True:
               raise SystemExit(2)
+          if backup.get("created") is not True or backup.get("alembic_revision_verified") is not True:
+              raise SystemExit(2)
+          preexisting_archives = backup.get("preexisting_archive_count")
+          preexisting_sidecars = backup.get("preexisting_sidecar_count")
+          postexisting_archives = backup.get("postexisting_archive_count")
+          if (
+              backup.get("rotation_mode") != "preserve-existing"
+              or backup.get("preexisting_archives_preserved") is not True
+              or type(preexisting_archives) is not int or preexisting_archives < 0
+              or type(preexisting_sidecars) is not int or preexisting_sidecars != preexisting_archives
+              or type(postexisting_archives) is not int or postexisting_archives != preexisting_archives + 1
+              or type(backup.get("removed_count")) is not int
+              or backup.get("removed_count") != 0
+              or not isinstance(backup.get("preexisting_archive_inventory_sha256"), str)
+              or not re.fullmatch(r"[0-9a-f]{64}", backup["preexisting_archive_inventory_sha256"])
+              or backup.get("preexisting_archive_inventory_sha256")
+                 != backup.get("postexisting_archive_inventory_sha256")
+          ):
+              raise SystemExit(2)
           free_bytes = disk.get("free_bytes")
           used_percent = disk.get("used_percent")
           minimum_free = limits.get("minimum_free_bytes")
@@ -436,6 +563,8 @@ jobs:
               "status": status,
               "error_class": error_class,
               "service_exit_code": service_status,
+              "backup_preservation_status": "verified",
+              "preexisting_backup_count": preexisting_archives,
               "minimum_free_bytes": minimum_free,
               "maximum_used_percent": maximum_used,
               "free_bytes": free_bytes,
@@ -475,6 +604,38 @@ jobs:
             | /usr/bin/python3 -I "$summary_tool" --mode inode --category root \
             || fail "Inode usage summary failed."
           printf 'health=passed\n'
+          if [[ "$enable_maintenance_timer" == true ]]; then
+            CURRENT_STAGE=timer_activation
+            timer_active_before="$(systemctl show deadlock-maintenance.timer --property=ActiveState --value --no-pager 2>/dev/null)" \
+              || fail "Maintenance timer active state is unavailable before activation."
+            timer_enabled_before="$(systemctl is-enabled deadlock-maintenance.timer 2>/dev/null || true)"
+            [[ "$timer_active_before" == inactive && "$timer_enabled_before" == disabled ]] \
+              || fail "Maintenance timer changed before its guarded activation."
+            activation_status=0
+            if systemctl enable --now deadlock-maintenance.timer; then
+              activation_status=0
+            else
+              activation_status=$?
+              [[ "$activation_status" =~ ^[1-9][0-9]{0,2}$ ]] || activation_status=1
+              (( activation_status <= 255 )) || activation_status=1
+            fi
+            timer_active_after="$(systemctl show deadlock-maintenance.timer --property=ActiveState --value --no-pager 2>/dev/null || true)"
+            timer_enabled_after="$(systemctl is-enabled deadlock-maintenance.timer 2>/dev/null || true)"
+            if (( activation_status == 0 )) \
+              && [[ "$timer_active_after" == active && "$timer_enabled_after" == enabled ]]; then
+              printf '%s\n' '{"schema":1,"kind":"maintenance_timer","status":"enabled","unit":"deadlock-maintenance.timer"}'
+            else
+              if (( activation_status == 0 )); then activation_status=2; fi
+              systemctl stop deadlock-maintenance.timer >/dev/null 2>&1 || true
+              systemctl disable deadlock-maintenance.timer >/dev/null 2>&1 || true
+              timer_active_after="$(systemctl show deadlock-maintenance.timer --property=ActiveState --value --no-pager 2>/dev/null || true)"
+              timer_enabled_after="$(systemctl is-enabled deadlock-maintenance.timer 2>/dev/null || true)"
+              if [[ "$timer_active_after" == inactive && "$timer_enabled_after" == disabled ]]; then
+                fail_with_status timer_activation_failed "$activation_status"
+              fi
+              fail_with_status timer_rollback_unverified 2
+            fi
+          fi
           REMOTE
           remote_status=$?
           if (( remote_status != 0 )); then

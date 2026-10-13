@@ -143,11 +143,17 @@ records its exact size and SHA-256. The preservation inventory hashes both
 files and binds their paths, inode identities, modes, link counts, sizes and
 modification times. The operation checks that inventory before publishing and
 afterward, confirms exactly one new complete pair, and fails closed on an
-orphan, mismatch or change. It never deletes a pre-existing pair. Use full
-storage maintenance with
-`--backup-keep 14` when the reviewed maintenance policy calls for bounded
-rotation. The low-level backup CLI retains its historical rotation default;
-the lock-aware backup-only caller explicitly selects preservation.
+orphan, mismatch or change. It never deletes a pre-existing pair. The
+installed full-maintenance service also runs with
+`--preserve-existing-backups`: it preserves every pre-existing pair and adds
+one restore-verified pair while continuing the other retention and health
+checks. Its configured `--backup-keep 14` remains part of the CLI contract but
+does not delete backups in this mode. Disk use can grow without a fixed upper
+bound; the unchanged 5 GiB/85% disk gate fails maintenance closed rather than
+rotating backups when storage is low. Generic full-maintenance callers that do
+not opt into this service policy retain the existing rotation behavior. The
+low-level backup CLI retains its historical rotation default; the lock-aware
+backup-only caller explicitly selects preservation.
 
 For a reviewed `dev` release, an operator may run the same guarded backup
 through GitHub Actions without opening a direct production shell. The backup
@@ -219,9 +225,10 @@ fixed success marker records the exact workflow source SHA, attested bundle
 digest, and hashes of the staged storage-maintenance and backup-drill helpers.
 Its bounded public receipt contains counts, byte totals and inventory digests;
 failure diagnostics stay in a root-private file and are not copied to the
-public artifact. No backup-only branch rotates or removes existing archives.
-Full storage maintenance owns the separate archive-rotation path and applies
-its configured keep count only after a successful restore drill.
+public artifact. No backup-only or installed full-maintenance branch rotates
+or removes existing archives. Full maintenance still applies its non-backup
+release, source-artifact, transient and live-QA retention after the successful
+restore drill.
 
 The automatic deployment workflow waits for this exact create run before it
 dispatches a deployment child. It accepts one completed-success backup run

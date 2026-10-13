@@ -290,6 +290,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-backup", action="store_true")
     parser.add_argument(
+        "--preserve-existing-backups",
+        action="store_true",
+        help=(
+            "Run full maintenance without rotating or deleting any backup archive; "
+            "all non-backup retention and health checks still apply."
+        ),
+    )
+    parser.add_argument(
         "--private-backup-diagnostics",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -373,6 +381,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--backup-max-age-hours must be finite and positive")
     if args.backup_only and args.skip_backup:
         parser.error("--backup-only cannot be combined with --skip-backup")
+    if args.preserve_existing_backups and not args.apply:
+        parser.error("--preserve-existing-backups requires --apply")
+    if args.preserve_existing_backups and (
+        args.backup_only or args.verify_existing_backup_only or args.skip_backup
+    ):
+        parser.error(
+            "--preserve-existing-backups requires full maintenance with backup creation"
+        )
     if args.backup_only and args.verify_existing_backup_only:
         parser.error("backup-only modes are mutually exclusive")
     if args.verify_existing_backup_only and args.skip_backup:
@@ -386,6 +402,7 @@ def parse_args() -> argparse.Namespace:
             args.backup_only
             or args.verify_existing_backup_only
             or args.skip_backup
+            or args.preserve_existing_backups
             or args.private_backup_diagnostics
             or args.evict_pinned_build_node_cache
             or args.compact_legacy_fallback_runtime_cache
@@ -2198,7 +2215,9 @@ def _plan_and_maybe_apply(
                     app_dir,
                     keep=args.backup_keep,
                     max_age_hours=getattr(args, "backup_max_age_hours", 24.0),
-                    rotate_existing=True,
+                    rotate_existing=not getattr(
+                        args, "preserve_existing_backups", False
+                    ),
                 ),
             }
         apply_release_plan(production_plan, app_dir=app_dir)
