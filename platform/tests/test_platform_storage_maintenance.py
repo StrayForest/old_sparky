@@ -3770,7 +3770,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "schema", "event", "run_id", "attempt", "operation", "source_sha",
                     "bundle_sha256", "stage", "public_summary_error", "exit_code", "report_state",
                     "report_error_class", "restore_diagnostic", "scratch_unit_diagnostic",
-                    "scratch_admission_diagnostic", "report_bytes",
+                    "scratch_admission_diagnostic", "scratch_first_fault", "report_bytes",
                     "backup_disk_diagnostic",
                     "report_sha256", "stderr_state",
                     "stderr_exception_class", "stderr_bytes", "stderr_sha256",
@@ -3783,6 +3783,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(receipt["report_error_class"], "none")
             self.assertIsNone(receipt["scratch_unit_diagnostic"])
             self.assertIsNone(receipt["scratch_admission_diagnostic"])
+            self.assertIsNone(receipt["scratch_first_fault"])
             self.assertEqual(receipt["stderr_exception_class"], "none")
             self.assertNotIn("Current release symlink is missing", receipt_path.read_text())
             self.assertFalse(report_path.exists())
@@ -3896,6 +3897,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             typed_receipt = json.loads(typed_receipt_path.read_text(encoding="ascii"))
             self.assertEqual(typed_receipt["report_state"], "typed_failure")
             self.assertEqual(typed_receipt["report_error_class"], "backup")
+            self.assertIsNone(typed_receipt["scratch_first_fault"])
             self.assertNotIn("1060000000", typed_completed.stdout)
             self.assertNotIn("27000000", typed_completed.stdout)
             self.assertEqual(
@@ -4336,6 +4338,103 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(saved_path.lstat().st_mode), 0o600)
                 self.assertEqual(saved_path.lstat().st_nlink, 1)
                 self.assertNotIn("private detail", saved_path.read_text(encoding="ascii"))
+
+            first_fault_shared = test_root / "first-fault-shared"
+            first_fault_shared.mkdir(mode=0o755)
+            first_fault_shared.chmod(0o755)
+            first_fault = {
+                "schema": 1,
+                "origin": "worker",
+                "site": "worker_host_reserve",
+                "exception_kind": "os_error",
+                "errno": 12,
+            }
+            first_fault_report = {
+                "ok": False,
+                "status": "failed",
+                "error_class": "backup",
+                "scratch_first_fault": first_fault,
+            }
+            first_fault_frame = (
+                b"SCRATCH_FIRST_FAULT_V1\n"
+                + json.dumps(
+                    first_fault, sort_keys=True, separators=(",", ":")
+                ).encode("ascii")
+                + b"\n"
+            )
+
+            def run_first_fault_trap(run_id: str, frame: bytes) -> subprocess.CompletedProcess[str]:
+                report_file = test_root / f"first-fault-report-{run_id}.json"
+                capture_file = test_root / f"first-fault-stderr-{run_id}.log"
+                report_file.write_text(json.dumps(first_fault_report), encoding="ascii")
+                report_file.chmod(0o600)
+                capture_file.write_bytes(frame)
+                capture_file.chmod(0o600)
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-",
+                        str(first_fault_shared),
+                        run_id,
+                        "1",
+                        "create",
+                        "a" * 40,
+                        "b" * 64,
+                        "backup_create",
+                        "1",
+                        str(report_file),
+                        str(capture_file),
+                        "none",
+                    ],
+                    input=failure_receipt_script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+
+            bound_fault = run_first_fault_trap("123461", first_fault_frame)
+            self.assertEqual(bound_fault.returncode, 0, bound_fault.stderr)
+            self.assertEqual(bound_fault.stdout, "")
+            self.assertNotIn("SCRATCH_FIRST_FAULT_V1", bound_fault.stdout)
+            self.assertNotIn("worker_host_reserve", bound_fault.stdout)
+            bound_receipt = json.loads(
+                (first_fault_shared / "backup-failure-123461-1.json").read_text(
+                    encoding="ascii"
+                )
+            )
+            self.assertEqual(bound_receipt["report_state"], "typed_failure")
+            self.assertEqual(bound_receipt["scratch_first_fault"], first_fault)
+            self.assertEqual(
+                set(bound_receipt["scratch_first_fault"]),
+                {"schema", "origin", "site", "exception_kind", "errno"},
+            )
+            self.assertNotIn(
+                "SCRATCH_FIRST_FAULT_V1",
+                (first_fault_shared / "backup-failure-123461-1.json").read_text(
+                    encoding="ascii"
+                ),
+            )
+
+            mismatched_fault = dict(first_fault, site="worker_archive_open")
+            mismatched_frame = (
+                b"SCRATCH_FIRST_FAULT_V1\n"
+                + json.dumps(
+                    mismatched_fault, sort_keys=True, separators=(",", ":")
+                ).encode("ascii")
+                + b"\n"
+            )
+            mismatched = run_first_fault_trap("123462", mismatched_frame)
+            self.assertEqual(mismatched.returncode, 0, mismatched.stderr)
+            mismatched_receipt = json.loads(
+                (first_fault_shared / "backup-failure-123462-1.json").read_text(
+                    encoding="ascii"
+                )
+            )
+            self.assertEqual(mismatched_receipt["report_state"], "unclassified_json")
+            self.assertIsNone(mismatched_receipt["scratch_first_fault"])
 
     def _backup_operation_step(self, workflow_document: dict) -> dict:
         """Return the YAML step whose run scalar defines the remote operation."""
