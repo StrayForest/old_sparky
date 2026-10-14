@@ -291,7 +291,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 )
 
             actual_fstat = os.fstat
-            actual_lstat = os.lstat
 
             def fstat_with_root_owned_archive(fd):
                 value = actual_fstat(fd)
@@ -299,16 +298,84 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     return root_owned_archive_stat(value)
                 return value
 
-            def lstat_with_root_owned_archive(path, *args, **kwargs):
-                value = actual_lstat(path, *args, **kwargs)
-                if pathlib.Path(path) == archive_path:
+            token = uuid.uuid4().hex[:24]
+            mountpoint = pathlib.Path(f"/run/oldsparky-backup-restore-{token}")
+            mapped_mountpoint = pathlib.Path(temporary_dir) / f"mountpoint-{token}"
+            if mountpoint.exists():
+                self.fail("unique scratch fixture mountpoint unexpectedly exists")
+
+            # The production contract uses a root-owned directory directly
+            # under /run.  CI runs this regression as an unprivileged user,
+            # so route only this exact generated path into the test-owned
+            # temporary directory.  Every unrelated filesystem operation is
+            # delegated unchanged to the real OS function.
+            actual_mkdir = os.mkdir
+            actual_rmdir = os.rmdir
+            actual_listdir = os.listdir
+            actual_scandir = os.scandir
+            actual_stat = os.stat
+            actual_lstat = os.lstat
+
+            def mapped_path(path):
+                if not isinstance(path, (str, bytes, os.PathLike)):
+                    return path
+                candidate = pathlib.Path(path)
+                return mapped_mountpoint if candidate == mountpoint else path
+
+            def mkdir_in_fixture(path, mode=0o777, *, dir_fd=None):
+                target = mapped_path(path)
+                if dir_fd is None:
+                    return actual_mkdir(target, mode)
+                return actual_mkdir(target, mode, dir_fd=dir_fd)
+
+            def rmdir_in_fixture(path, *, dir_fd=None):
+                target = mapped_path(path)
+                if dir_fd is None:
+                    return actual_rmdir(target)
+                return actual_rmdir(target, dir_fd=dir_fd)
+
+            def scandir_in_fixture(path="."):
+                return actual_scandir(mapped_path(path))
+
+            def listdir_in_fixture(path="."):
+                return actual_listdir(mapped_path(path))
+
+            def stat_with_fixture_paths(path, *args, **kwargs):
+                target = mapped_path(path)
+                value = actual_stat(target, *args, **kwargs)
+                if pathlib.Path(path) == mountpoint:
+                    return types.SimpleNamespace(
+                        st_mode=value.st_mode,
+                        st_uid=0,
+                        st_gid=0,
+                        st_nlink=value.st_nlink,
+                        st_dev=value.st_dev,
+                        st_ino=value.st_ino,
+                        st_size=value.st_size,
+                        st_mtime_ns=value.st_mtime_ns,
+                        st_ctime_ns=value.st_ctime_ns,
+                    )
+                if pathlib.Path(path) == archive_path and kwargs.get("follow_symlinks") is False:
                     return root_owned_archive_stat(value)
                 return value
 
-            token = uuid.uuid4().hex[:24]
-            mountpoint = pathlib.Path(f"/run/oldsparky-backup-restore-{token}")
-            if mountpoint.exists():
-                self.fail("unique scratch fixture mountpoint unexpectedly exists")
+            def lstat_with_fixture_paths(path, *args, **kwargs):
+                value = actual_lstat(mapped_path(path), *args, **kwargs)
+                if pathlib.Path(path) == mountpoint:
+                    return types.SimpleNamespace(
+                        st_mode=value.st_mode,
+                        st_uid=0,
+                        st_gid=0,
+                        st_nlink=value.st_nlink,
+                        st_dev=value.st_dev,
+                        st_ino=value.st_ino,
+                        st_size=value.st_size,
+                        st_mtime_ns=value.st_mtime_ns,
+                        st_ctime_ns=value.st_ctime_ns,
+                    )
+                if pathlib.Path(path) == archive_path:
+                    return root_owned_archive_stat(value)
+                return value
 
             class Launcher:
                 def __init__(self, stdout, stderr) -> None:
@@ -365,14 +432,21 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(
                     backup_drill.os, "fstat", side_effect=fstat_with_root_owned_archive
                 ),
-                mock.patch.object(
-                    backup_drill.os, "lstat", side_effect=lstat_with_root_owned_archive
-                ),
+                mock.patch.object(backup_drill.os, "stat", side_effect=stat_with_fixture_paths),
+                mock.patch.object(backup_drill.os, "lstat", side_effect=lstat_with_fixture_paths),
+                mock.patch.object(backup_drill.os, "mkdir", side_effect=mkdir_in_fixture),
+                mock.patch.object(backup_drill.os, "rmdir", side_effect=rmdir_in_fixture),
+                mock.patch.object(backup_drill.os, "listdir", side_effect=listdir_in_fixture),
+                mock.patch.object(backup_drill.os, "scandir", side_effect=scandir_in_fixture),
                 mock.patch.object(backup_drill, "require_commands"),
                 mock.patch.object(backup_drill, "require_restore_headroom"),
                 mock.patch.object(backup_drill, "_scratch_host_guard", side_effect=host_guard_at),
                 mock.patch.object(backup_drill, "_scratch_unit_command", return_value=["systemd-run"]),
-                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountpoint_is_mounted",
+                    return_value=False,
+                ) as mountpoint_check,
                 mock.patch.object(
                     backup_drill,
                     "_scratch_service_snapshot",
@@ -417,6 +491,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertLess(events.index("sample"), events.index("stop"))
             self.assertLess(events.index("stop"), events.index("wait"))
             self.assertEqual(launcher.returncode, 0)
+            mountpoint_check.assert_has_calls([mock.call(mountpoint), mock.call(mountpoint)])
+            self.assertFalse(mapped_mountpoint.exists())
             self.assertFalse(mountpoint.exists())
 
     def test_scratch_postgres_directory_setup_without_cap_fowner(self) -> None:
@@ -1031,7 +1107,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         )
         self._assert_scratch_resource_attribution_is_identity_bound_and_private()
         self._assert_scratch_resource_attribution_fails_closed_on_identity_and_parser_errors()
-        self._assert_parent_active_poll_sampler_failure_preserves_guard_and_cleanup()
 
     def test_authorization_probe_worker_has_no_archive_or_database_effects(self) -> None:
         root = "/run/oldsparky-backup-restore-" + ("a" * 24)
@@ -3011,6 +3086,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         host_guard.assert_not_called()
 
     def test_isolated_restore_signal_cleanup_under_root(self) -> None:
+        self._assert_parent_active_poll_sampler_failure_preserves_guard_and_cleanup()
         self._assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db()
         self._assert_scratch_sigterm_stops_and_reaps_launched_unit()
         self._assert_scratch_worker_uses_pinned_archive_fd()
