@@ -2,9 +2,15 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-11
+- Last reviewed: 2026-10-15
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
+
+## Diagnostic checkpoint — 2026-10-15
+
+- The latest Ready Vote load matrix and backup-attribution evidence are summarized in the [2026-10-14 performance and backup checkpoint](../performance/README.md#performance-and-backup-checkpoint-2026-10-14). These are source-bound diagnostic results, not a production-deployment or restore claim. The exact-SHA Security run passed, but no eligible backup reservation preceded its all-job maximum; the saved automatic-chain observation had not dispatched production.
+- Separate bounded resource reads observed `MemAvailable` below the 1 GiB backup guard. Worker cgroup and MainPID samples are partial; effective host CPU capacity and production-host attribution remain unknown. A current task-path process scan was also partial and cannot establish historical process completion. No tmpfs object has proven cleanup ownership, so protected and unknown roots remain untouched.
+- The external browser/Turnstile human QA remains **NOT RUN**. Restore/Alembic, automatic production deployment, the remaining six profiles, final CPU/QA/maintenance work and external gate closure are not established by these observations. See the linked checkpoint for exact scope, values and limits.
 
 ## Verified checkpoint — 2026-10-10
 

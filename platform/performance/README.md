@@ -462,6 +462,66 @@ is evaluated from the observer's `pg_stat_activity` backend count and grouped
 separate `/proc/net/tcp*` socket diagnostic. Historical reports retain their
 original TCP-based wording and decisions.
 
+## Performance and backup checkpoint (2026-10-14)
+
+The five-run matrix remains **PASS / PASS / PASS / FAIL / FAIL** for
+`ready-vote-slo-v2` (38161685678), `read-mix-human-v2` (38162117136),
+`ready-vote-spike-v1` (38162697642), `ready-vote-capacity-ramp-v2`
+(38163212410) and `ready-vote-stress-15k-v2` (38165101863). Preserve each
+result against its original source and contract. The capacity profile's
+highest qualifying SLO rate is 60 logical actions/s. At 70/s, accepted and
+logical p95/p99 were 621.066/7,326.342 ms and 621.453/7,326.683 ms, over the
+600/1,000 ms limits. At 80/s, latency passed but retry amplification (0.3333%)
+and shedding (0.3322%) exceeded the profile's zero limits. Stable goodput was
+79.355 actions/s; it is a separate measure, not the SLO capacity or a proven
+server limit.
+
+The 15k stress profile failed: logical p95 was 109,811 ms versus HTTP p95
+439.348 ms; final logical failures were 22.273%, shedding 60.5453%, and retry
+amplification 97.0032%. These client outcomes do not establish CPU saturation
+or attribute a server-side cause. The report-only retry-queue correction in
+candidate source 5df binds retry HTTP attempts to their actual same-worker
+execution; the historical retry queue interval included prior HTTP/backoff
+time and is not server queue evidence. The correction does not change offered
+load, concurrency, acceptance thresholds or security behavior, and the
+candidate is not credited as deployed.
+
+Exact-SHA Security/build run
+[`38630875202`](https://github.com/StrayForest/old_sparky/actions/runs/38630875202)
+for source `5dfb95c211ed37d93fde31201cb768560b1fd6c8` completed with 16
+successful jobs and 2 expected skips. No eligible backup reservation preceded
+its all-job maximum, so this run cannot prove a fresh backup. The saved native
+observation for automatic chain
+[`38632646564`](https://github.com/StrayForest/old_sparky/actions/runs/38632646564)
+was still at the exact-source backup-verification step, before production
+dispatch; this checkpoint contains no terminal chain result, restore/Alembic
+pass or deployment proof. Earlier failed backup observations remain distinct:
+one measured a 13,541,376-byte reserve shortfall at the captured controller
+poll; a separate partial resource capture was 17,543,168 bytes below the
+1 GiB reserve. Do not infer OOM, a precise later phase, or a common cause from
+these observations.
+
+Separate bounded local resource reads on 2026-10-14 observed `MemAvailable`
+of 1,013,882,880 bytes, then 1,069,637,632 bytes in a later lightweight read;
+both were below the 1 GiB reserve and are not an admission pass. A worker
+cgroup read observed `memory.current=291,667,968` and `memory.max=1,073,741,824`
+with zero recorded OOM counters. The read was partial because
+`cpuset.cpus.effective` was absent; effective host CPU capacity and host
+attribution remain unknown. A bounded task-path process scan was also
+partial, with 157/157 numeric PID entries visited, zero exact selector matches,
+and 103 `/proc/<pid>/exe` lookup errors reported as ENOENT; affected processes
+and the cause were not identified. It does not establish historical process
+completion. No tmpfs object has proven cleanup ownership; protected and unknown
+roots remain retained.
+
+External browser/Turnstile human QA is **NOT RUN**. Restore/Alembic, automatic
+production deployment, the remaining six profiles, final CPU/automated QA,
+retention/maintenance and external gate closure are not established by this
+checkpoint. A later bounded source-prefix read found no currently loaded
+matching scratch units; it did not establish absence of mountpoints/files or
+cleanup ownership. Protected and unknown roots remain untouched pending new
+source-bound evidence.
+
 ## Historical production performance stage (2026-09-07)
 
 The 2026-09-07 performance stage is closed historical evidence with an
