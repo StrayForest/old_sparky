@@ -1280,6 +1280,57 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(summary["timing"]["late_start_count"], 1)
         self.assertEqual(summary["timing"]["missing_schedule_context"], 0)
 
+    def test_inline_retry_has_no_executor_queue_or_schedule_lateness(self) -> None:
+        first = RequestResult(
+            phase="write_external_vote",
+            method="POST",
+            path="/tournaments/qa/ready-check/vote",
+            status=503,
+            elapsed_ms=1_000.0,
+            ok=False,
+            response_bytes=1,
+            attempt_number=1,
+            started_at_monotonic=12.0,
+            finished_at_monotonic=13.0,
+        )
+        retry = RequestResult(
+            phase="write_external_vote",
+            method="POST",
+            path="/tournaments/qa/ready-check/vote",
+            status=200,
+            elapsed_ms=1_000.0,
+            ok=True,
+            response_bytes=1,
+            attempt_number=2,
+            started_at_monotonic=14.0,
+            finished_at_monotonic=15.0,
+        )
+        logical = LogicalRequestResult(
+            attempts=[first, retry],
+            elapsed_ms=3_000.0,
+            started_at_monotonic=12.0,
+            finished_at_monotonic=15.0,
+        )
+
+        _annotate_timing(logical, scheduled_at=10.0, enqueued_at=11.0)
+
+        self.assertEqual(first.executor_queue_wait_ms, 1_000.0)
+        self.assertEqual(retry.executor_queue_wait_ms, 0.0)
+        self.assertIsNone(retry.schedule_delay_ms)
+        self.assertIsNone(retry.late_start_ms)
+        self.assertEqual(logical.executor_queue_wait_ms, 1_000.0)
+        self.assertEqual(logical.schedule_delay_ms, 2_000.0)
+        self.assertEqual(logical.late_start_ms, 2_000.0)
+        self.assertEqual(logical.user_observed_elapsed_ms, 5_000.0)
+
+        raw_summary = summarize_results([first, retry])
+        self.assertEqual(raw_summary["timing"]["executor_queue_wait"]["p95_ms"], 950.0)
+        self.assertEqual(raw_summary["timing"]["schedule_delay"]["p95_ms"], 2_000.0)
+        self.assertEqual(raw_summary["timing"]["late_start_count"], 1)
+        self.assertFalse(raw_summary["timing"]["partial"])
+        logical_summary = summarize_logical_results([logical])
+        self.assertEqual(logical_summary["timing"]["user_observed_latency"]["p95_ms"], 5_000.0)
+
     def test_timing_summary_marks_uninstrumented_builder_context(self) -> None:
         result = RequestResult(
             phase="diagnostic",

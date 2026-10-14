@@ -1206,12 +1206,21 @@ def _annotate_timing(
             if result.finished_at_monotonic is not None
             else None
         )
-        for attempt in attempts:
+        for attempt_index, attempt in enumerate(attempts):
             _annotate_timing(
                 attempt,
                 scheduled_at=scheduled_at,
                 enqueued_at=enqueued_at,
             )
+            if attempt_index > 0:
+                # Retries execute inline in the same worker; they are not
+                # submitted to the executor again. Keep the action's schedule
+                # context on the raw attempt for completeness, but do not
+                # attribute the earlier attempt's queue delay or schedule
+                # lateness to this retry.
+                attempt.executor_queue_wait_ms = 0.0
+                attempt.schedule_delay_ms = None
+                attempt.late_start_ms = None
         return result
     if not isinstance(result, RequestResult):
         return result
