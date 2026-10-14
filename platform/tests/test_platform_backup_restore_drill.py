@@ -2676,13 +2676,37 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 self.assertIs(raised.exception, worker_failure)
                 if private:
                     self.assertEqual(stdout_capture.buffer.getvalue(), b"")
+                    forwarded = stderr_capture.buffer.getvalue()
+                    child_output = b"known pg_restore stdoutknown pg_restore stderr"
+                    phase_prefix, separator, forwarded_child_output = forwarded.partition(
+                        child_output
+                    )
+                    self.assertTrue(separator)
+                    self.assertEqual(forwarded_child_output, child_output)
+                    phase = backup_drill._scratch_parse_phase_attribution(
+                        phase_prefix,
+                        truncated=False,
+                        complete=False,
+                        launch_monotonic_ns=args._scratch_phase_origin_monotonic_ns,
+                    )
+                    self.assertTrue(backup_drill.valid_scratch_phase_attribution(phase))
+                    self.assertEqual(phase["status"], "unknown")
+                    self.assertEqual(phase["unknown_reason"], "incomplete")
                     self.assertEqual(
-                        stderr_capture.buffer.getvalue(),
-                        b"known pg_restore stdoutknown pg_restore stderr",
+                        [
+                            (frame["ordinal"], frame["phase"], frame["event"])
+                            for frame in phase["frames"]
+                        ],
+                        [
+                            (1, "archive_verify", "start"),
+                            (2, "archive_verify", "end"),
+                        ],
                     )
                 else:
                     self.assertEqual(stdout_capture.buffer.getvalue(), b"")
-                    self.assertEqual(stderr_capture.buffer.getvalue(), b"")
+                    private_stderr = stderr_capture.buffer.getvalue()
+                    self.assertEqual(private_stderr, b"")
+                    self.assertNotIn(backup_drill.SCRATCH_PHASE_FRAME_MARKER, private_stderr)
             finally:
                 shutil.rmtree(scratch_root)
 
