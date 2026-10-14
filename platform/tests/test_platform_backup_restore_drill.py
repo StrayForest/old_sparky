@@ -2605,6 +2605,36 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             def flush(self) -> None:
                 return None
 
+        child_output = b"known pg_restore stdoutknown pg_restore stderr"
+        expected_events = [
+            ("archive_verify", "start"), ("archive_verify", "end"),
+            ("initdb", "start"), ("initdb", "end"),
+            ("postgres_start", "start"), ("postgres_start", "end"),
+        ]
+
+        def assert_private_output(forwarded: bytes, launch_monotonic_ns: int) -> None:
+            phase_prefix, separator, forwarded_child_output = forwarded.partition(
+                child_output
+            )
+            self.assertEqual(separator, child_output)
+            self.assertEqual(forwarded_child_output, b"")
+            phase = backup_drill._scratch_parse_phase_attribution(
+                phase_prefix,
+                truncated=False,
+                complete=False,
+                launch_monotonic_ns=launch_monotonic_ns,
+            )
+            self.assertTrue(backup_drill.valid_scratch_phase_attribution(phase))
+            self.assertEqual(phase["status"], "unknown")
+            self.assertEqual(phase["unknown_reason"], "capture_prefix")
+            self.assertEqual(
+                [
+                    (frame["phase"], frame["event"])
+                    for frame in phase["frames"]
+                ],
+                expected_events,
+            )
+
         for private in (True, False):
             scratch_root = pathlib.Path("/run") / f"oldsparky-backup-restore-{uuid.uuid4().hex[:24]}"
             scratch_root.mkdir(mode=0o700)
@@ -2677,30 +2707,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 if private:
                     self.assertEqual(stdout_capture.buffer.getvalue(), b"")
                     forwarded = stderr_capture.buffer.getvalue()
-                    child_output = b"known pg_restore stdoutknown pg_restore stderr"
-                    phase_prefix, separator, forwarded_child_output = forwarded.partition(
-                        child_output
-                    )
-                    self.assertTrue(separator)
-                    self.assertEqual(forwarded_child_output, child_output)
-                    phase = backup_drill._scratch_parse_phase_attribution(
-                        phase_prefix,
-                        truncated=False,
-                        complete=False,
-                        launch_monotonic_ns=args._scratch_phase_origin_monotonic_ns,
-                    )
-                    self.assertTrue(backup_drill.valid_scratch_phase_attribution(phase))
-                    self.assertEqual(phase["status"], "unknown")
-                    self.assertEqual(phase["unknown_reason"], "incomplete")
-                    self.assertEqual(
-                        [
-                            (frame["ordinal"], frame["phase"], frame["event"])
-                            for frame in phase["frames"]
-                        ],
-                        [
-                            (1, "archive_verify", "start"),
-                            (2, "archive_verify", "end"),
-                        ],
+                    assert_private_output(
+                        forwarded, args._scratch_phase_origin_monotonic_ns
                     )
                 else:
                     self.assertEqual(stdout_capture.buffer.getvalue(), b"")
@@ -2709,6 +2717,46 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     self.assertNotIn(backup_drill.SCRATCH_PHASE_FRAME_MARKER, private_stderr)
             finally:
                 shutil.rmtree(scratch_root)
+
+        launch_monotonic_ns = time.monotonic_ns() - 100_000_000
+
+        def emit(events: list[tuple[str, str]], *, private: bool = True) -> bytes:
+            args = argparse.Namespace(
+                private_scratch_diagnostics=private,
+                _scratch_authorization_probe=False,
+                _scratch_phase_origin_monotonic_ns=launch_monotonic_ns,
+                _scratch_phase_ordinal=0,
+            )
+            capture = BinaryTextCapture()
+            with mock.patch.object(backup_drill.sys, "stderr", capture):
+                for phase_name, event_name in events:
+                    backup_drill._scratch_emit_phase_boundary(
+                        args, phase_name, event_name
+                    )
+            return capture.buffer.getvalue()
+
+        phase_prefix = emit(expected_events)
+        assert_private_output(phase_prefix + child_output, launch_monotonic_ns)
+        with self.assertRaises(AssertionError):
+            assert_private_output(
+                phase_prefix + child_output + b"unexpected", launch_monotonic_ns
+            )
+        with self.assertRaises(AssertionError):
+            assert_private_output(
+                phase_prefix + b"different child payload", launch_monotonic_ns
+            )
+        invalid_order = emit(
+            [
+                ("archive_verify", "start"), ("archive_verify", "end"),
+                ("initdb", "end"), ("initdb", "start"),
+                ("postgres_start", "start"), ("postgres_start", "end"),
+            ]
+        )
+        with self.assertRaises(AssertionError):
+            assert_private_output(invalid_order + child_output, launch_monotonic_ns)
+        private_disabled = emit([("archive_verify", "start")], private=False)
+        self.assertEqual(private_disabled, b"")
+        self.assertNotIn(backup_drill.SCRATCH_PHASE_FRAME_MARKER, private_disabled)
 
     def test_run_disk_guarded_command_captures_only_opted_in_failure_output(self) -> None:
         target = backup_drill.DatabaseTarget(
