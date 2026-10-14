@@ -27,6 +27,7 @@ import io
 BACKUP_WORKFLOW_PATH = ".github/workflows/platform-production-backup.yml"
 SECURITY_WORKFLOW_PATH = ".github/workflows/platform-security.yml"
 BACKUP_JOB_NAME = "Create restore-verified backup"
+SECURITY_DISPATCH_FINALIZER_JOB_NAME = "Dispatch exact baseline proof finalizer"
 BACKUP_RECEIPT_NAME = "backup-success-receipt.json"
 BACKUP_ARTIFACT_PREFIX = "platform-backup-success-"
 MAX_ARTIFACT_ZIP_BYTES = 1_048_576
@@ -307,6 +308,7 @@ def _validate_attempt_jobs(
     run_id: str,
     run_attempt: str,
     source_sha: str,
+    source_event: str,
     run_started: datetime,
     run_updated: datetime,
 ) -> datetime:
@@ -346,7 +348,26 @@ def _validate_attempt_jobs(
             raise BackupProofError("attempt job did not reach an allowed terminal result")
         started = _parse_time(row.get("started_at"), "attempt job start")
         completed = _parse_time(row.get("completed_at"), "attempt job completion")
-        if not run_started <= started <= completed <= run_updated:
+        # On the accepted push route, the conditionally dispatched baseline
+        # proof finalizer is expected to be skipped because its workflow
+        # dispatch/baseline-runtime condition is false. GitHub reports its
+        # steps as null or an empty list when it did not execute; only that
+        # exact source-event/job/result/steps combination may have inverted
+        # times. Its timestamps remain run-bounded and part of the all-job max.
+        unexecuted_baseline_dispatch_finalizer = (
+            source_event == "push"
+            and status == "completed"
+            and conclusion == "skipped"
+            and row.get("name") == SECURITY_DISPATCH_FINALIZER_JOB_NAME
+            and "steps" in row
+            and (row["steps"] is None or row["steps"] == [])
+        )
+        if (
+            not run_started <= started <= run_updated
+            or not run_started <= completed <= run_updated
+        ):
+            raise BackupProofError("attempt job timestamps are inconsistent with its exact run")
+        if started > completed and not unexecuted_baseline_dispatch_finalizer:
             raise BackupProofError("attempt job timestamps are inconsistent with its exact run")
         if latest_completion is None or completed > latest_completion:
             latest_completion = completed
@@ -443,6 +464,7 @@ def wait_for_backup_success(
         run_id=expected.source_security_run_id,
         run_attempt=expected.source_security_run_attempt,
         source_sha=expected.source_sha,
+        source_event=security_run["event"],
         run_started=security_started,
         run_updated=security_updated,
     )

@@ -168,6 +168,13 @@ backup/restore budget plus 15 minutes for completion and cleanup. Each API
 request and sleep is capped by the remaining poll deadline. It never substitutes another run or a newer `dev`
 head. It validates the exact successful verification job, artifact digest,
 attestation, and seven-file helper manifest before staging anything on the host.
+Attempt-job timestamps are parsed and bounded to that exact run. Start must not
+exceed completion for executed jobs. On the validated `push` route, the
+conditional `Dispatch exact baseline proof finalizer` job is expected to be
+skipped because its workflow-dispatch/baseline-runtime condition is false; an
+inverted timestamp pair is accepted only for that exact job when its API
+`steps` value is `null` or an empty list. Its completion timestamp remains
+included in the maximum job-completion reservation bound.
 It runs those staged, source-bound helper bytes for create, verify-existing
 and the opt-in authorization probe. If the run fails, times out, the source
 moves, or any bundle check fails, it stops without running a production backup

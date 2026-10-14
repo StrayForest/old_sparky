@@ -566,6 +566,147 @@ class BackupSuccessGuardTests(unittest.TestCase):
             backup_guard.wait_for_backup_success(api, _binding())
         self.assertNotIn("download_artifact", api.calls)
 
+    def test_unexecuted_baseline_dispatch_finalizer_may_invert_timestamps(self) -> None:
+        raw_finalizer = {
+            "id": 115_603_232_483,
+            "run_id": 38_486_040_017,
+            "run_attempt": 1,
+            "head_sha": "6a951e4ba7a2e6a71b1f6cd9ec91e07c42893e09",
+            "name": backup_guard.SECURITY_DISPATCH_FINALIZER_JOB_NAME,
+            "status": "completed",
+            "conclusion": "skipped",
+            "started_at": "2026-10-13T23:54:50Z",
+            "completed_at": "2026-10-13T23:54:49Z",
+            "steps": None,
+        }
+        earlier_executed_job = {
+            "id": 115_599_884_616,
+            "run_id": 38_486_040_017,
+            "run_attempt": 1,
+            "head_sha": "6a951e4ba7a2e6a71b1f6cd9ec91e07c42893e09",
+            "name": "Security gate",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-10-13T23:45:00Z",
+            "completed_at": "2026-10-13T23:45:25Z",
+            "steps": [],
+        }
+        latest_completion = backup_guard._validate_attempt_jobs(
+            [earlier_executed_job, raw_finalizer],
+            run_id="38486040017",
+            run_attempt="1",
+            source_sha="6a951e4ba7a2e6a71b1f6cd9ec91e07c42893e09",
+            source_event="push",
+            run_started=backup_guard._parse_time("2026-10-13T23:00:00Z", "start"),
+            run_updated=backup_guard._parse_time("2026-10-13T23:59:59Z", "update"),
+        )
+        self.assertEqual(
+            latest_completion,
+            backup_guard._parse_time("2026-10-13T23:54:49Z", "completion"),
+        )
+        empty_steps_finalizer = dict(raw_finalizer, id=115_603_232_484, steps=[])
+        self.assertEqual(
+            backup_guard._validate_attempt_jobs(
+                [empty_steps_finalizer],
+                run_id="38486040017",
+                run_attempt="1",
+                source_sha="6a951e4ba7a2e6a71b1f6cd9ec91e07c42893e09",
+                source_event="push",
+                run_started=backup_guard._parse_time("2026-10-13T23:00:00Z", "start"),
+                run_updated=backup_guard._parse_time("2026-10-13T23:59:59Z", "update"),
+            ),
+            backup_guard._parse_time("2026-10-13T23:54:49Z", "completion"),
+        )
+
+        # The public proof path validates the exact push route before using
+        # the same no-step exception.
+        api = FakeBackupProofApi()
+        api.security_job_rows.append(
+            {
+                "id": 913,
+                "run_id": SECURITY_RUN_ID,
+                "run_attempt": SECURITY_ATTEMPT,
+                "head_sha": SOURCE_SHA,
+                "name": backup_guard.SECURITY_DISPATCH_FINALIZER_JOB_NAME,
+                "status": "completed",
+                "conclusion": "skipped",
+                "started_at": _gh_time("19:09:59"),
+                "completed_at": _gh_time("19:09:58"),
+                "steps": None,
+            }
+        )
+
+        self.assertEqual(backup_guard.wait_for_backup_success(api, _binding()), _receipt())
+
+        # Inverted timestamps remain invalid for executed jobs, including a
+        # job that otherwise has the same exact source and successful result.
+        executed_api = FakeBackupProofApi()
+        executed_api.security_job_rows[0]["completed_at"] = _gh_time("18:59:59")
+        with self.assertRaisesRegex(
+            backup_guard.BackupProofError,
+            "attempt job timestamps are inconsistent with its exact run",
+        ):
+            backup_guard.wait_for_backup_success(executed_api, _binding())
+        self.assertNotIn("download_artifact", executed_api.calls)
+
+        rejected_skips: list[dict[str, Any]] = [
+            {
+                "id": 913,
+                "run_id": SECURITY_RUN_ID,
+                "run_attempt": SECURITY_ATTEMPT,
+                "head_sha": SOURCE_SHA,
+                "name": "status-final",
+                "status": "completed",
+                "conclusion": "skipped",
+                "started_at": _gh_time("19:09:59"),
+                "completed_at": _gh_time("19:09:58"),
+                "steps": None,
+            },
+            {
+                "id": 914,
+                "run_id": SECURITY_RUN_ID,
+                "run_attempt": SECURITY_ATTEMPT,
+                "head_sha": SOURCE_SHA,
+                "name": backup_guard.SECURITY_DISPATCH_FINALIZER_JOB_NAME,
+                "status": "completed",
+                "conclusion": "skipped",
+                "started_at": _gh_time("19:09:59"),
+                "completed_at": _gh_time("19:09:58"),
+                "steps": [{"name": "unexpected executed step"}],
+            },
+        ]
+        for row in rejected_skips:
+            rejected_api = FakeBackupProofApi()
+            rejected_api.security_job_rows.append(row)
+            with self.subTest(row=row), self.assertRaises(backup_guard.BackupProofError):
+                backup_guard.wait_for_backup_success(rejected_api, _binding())
+            self.assertNotIn("download_artifact", rejected_api.calls)
+
+        # The skipped dispatch is expected only on the accepted push route.
+        api = FakeBackupProofApi()
+        api.security_job_rows.append(
+            {
+                "id": 915,
+                "run_id": SECURITY_RUN_ID,
+                "name": backup_guard.SECURITY_DISPATCH_FINALIZER_JOB_NAME,
+                "status": "completed",
+                "conclusion": "skipped",
+                "started_at": _gh_time("19:09:59"),
+                "completed_at": _gh_time("19:09:58"),
+                "steps": None,
+            }
+        )
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard._validate_attempt_jobs(
+                api.security_job_rows,
+                run_id=str(SECURITY_RUN_ID),
+                run_attempt=str(SECURITY_ATTEMPT),
+                source_sha=SOURCE_SHA,
+                source_event="workflow_dispatch",
+                run_started=backup_guard._parse_time(_gh_time("18:59:00"), "start"),
+                run_updated=backup_guard._parse_time(_gh_time("19:10:00"), "update"),
+            )
+
     def test_workflow_and_backup_run_attempt_identity_are_bound(self) -> None:
         mutations = (
             ("workflow", {"path": ".github/workflows/other.yml"}),
