@@ -259,6 +259,22 @@ class EvidencePrivacyTests(unittest.TestCase):
             "cpu_max_missing",
         )
 
+        incomplete_quota_visibility = copy.deepcopy(inconsistent_capacity)
+        incomplete_quota_visibility["client_resource_usage"]["cpu_capacity_reason"] = (
+            "trusted_host_root_unproven"
+        )  # type: ignore[index]
+        incomplete_projection = project_public_artifact(
+            "external_load", incomplete_quota_visibility
+        )
+        self.assertEqual(
+            incomplete_projection["client_resource_usage"]["cpu_capacity_status"],
+            "unknown",
+        )
+        self.assertEqual(
+            incomplete_projection["client_resource_usage"]["cpu_capacity_reason"],
+            "trusted_host_root_unproven",
+        )
+
         malformed_capacity_reason = copy.deepcopy(inconsistent_capacity)
         malformed_capacity_reason["client_resource_usage"]["cpu_capacity_reason"] = (
             "/sys/fs/cgroup/private/job/cpu.max"

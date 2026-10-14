@@ -2776,6 +2776,7 @@ def _project_client_resource_usage(
         "affinity_unavailable",
         "affinity_invalid",
         "cgroup_capacity_unavailable",
+        "trusted_host_root_unproven",
     }
     if capacity_reason not in allowed_capacity_reasons:
         capacity_reason = "unknown"

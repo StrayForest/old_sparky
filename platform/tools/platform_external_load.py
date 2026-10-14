@@ -142,6 +142,8 @@ CLIENT_CGROUP_DIAGNOSTIC_REASONS = frozenset(
     {
         "cgroup_record_unavailable",
         "cgroup_record_invalid",
+        "cgroup_v2_unavailable",
+        "cgroup_path_invalid",
         "cgroup2_mount_missing",
         "cgroup2_mount_ambiguous",
         "mountinfo_unavailable",
@@ -172,15 +174,15 @@ _DEFAULT_HTTPS_CONTEXT: ssl.SSLContext | None = None
 def _effective_cpu_capacity_details(
     *,
     cgroup_text: str | None = None,
-    cpu_max_reader: Callable[[Path], str] | None = None,
-    affinity_cpu_count: int | None = None,
+    mountinfo_text: str | None = None,
 ) -> tuple[float | None, str]:
-    """Return bounded CPU capacity and a path-free reason category.
+    """Return UNKNOWN capacity until a trusted complete quota view exists.
 
     The optional inputs are a narrow parser seam for unit tests. Production
-    reads only the process cgroup record and `cpu.max` files on its ancestor
-    chain; no host-wide process or mount scan is performed. Failure categories
-    expose neither filesystem paths nor exception text.
+    validates the process cgroup record against the visible cgroup2 mount.
+    That mapping alone cannot prove that namespace-hidden ancestors impose no
+    tighter quota, so it never claims an effective host capacity. Failure
+    categories expose neither filesystem paths nor exception text.
     """
 
     if cgroup_text is None:
@@ -190,99 +192,38 @@ def _effective_cpu_capacity_details(
             return None, "cgroup_record_unavailable"
     if not isinstance(cgroup_text, str) or len(cgroup_text) > CLIENT_CGROUP_LINE_LIMIT:
         return None, "cgroup_record_invalid"
-    cgroup_path: str | None = None
-    for line in cgroup_text.splitlines():
-        if line.startswith("0::"):
-            cgroup_path = line[3:]
-            break
-    if (
-        cgroup_path is None
-        or len(cgroup_path) > CLIENT_CGROUP_LINE_LIMIT
-        or not cgroup_path.startswith("/")
-        or "\x00" in cgroup_path
-        or ".." in Path(cgroup_path).parts
-    ):
-        return None, "cgroup_v2_unavailable" if cgroup_path is None else "cgroup_path_invalid"
-    reader = cpu_max_reader
-    if reader is None:
-        def reader(path: Path) -> str:
-            return _read_bounded_ascii(path)
-
+    if mountinfo_text is None:
+        try:
+            mountinfo_text = _bounded_proc_text(
+                Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
+            )
+        except _CgroupDiagnosticError as exc:
+            return None, exc.reason
     try:
-        directory = (Path("/sys/fs/cgroup") / cgroup_path.lstrip("/")).resolve(
-            strict=False
+        _cgroup2_membership_mapping(
+            cgroup_text,
+            mountinfo_text,
+            missing_membership_reason="cgroup_v2_unavailable",
+            invalid_membership_reason="cgroup_path_invalid",
         )
-        mount = Path("/sys/fs/cgroup").resolve(strict=False)
-    except (OSError, RuntimeError, ValueError):
-        return None, "cgroup_path_invalid"
-    try:
-        directory.relative_to(mount)
-    except ValueError:
-        return None, "cgroup_path_invalid"
-    quota_cores: list[float] = []
-    current = directory
-    for _ in range(CLIENT_CGROUP_ANCESTOR_LIMIT):
-        try:
-            raw = reader(current / "cpu.max")
-        except FileNotFoundError:
-            # A missing ancestor could hide a tighter quota, so capacity is
-            # unknown instead of being inferred from a partial chain.
-            return None, "cpu_max_missing"
-        except (OSError, UnicodeError, ValueError):
-            return None, "cpu_max_unavailable"
-        if not isinstance(raw, str) or len(raw) > CLIENT_CGROUP_LINE_LIMIT:
-            return None, "cpu_max_invalid"
-        fields = raw.split()
-        if (
-            len(fields) != 2
-            or not fields[1].isdigit()
-            or int(fields[1]) <= 0
-        ):
-            return None, "cpu_max_invalid"
-        if fields[0] != "max":
-            if not fields[0].isdigit():
-                return None, "cpu_max_invalid"
-            quota, period = int(fields[0]), int(fields[1])
-            if quota <= 0:
-                return None, "cpu_max_invalid"
-            try:
-                quota_cores.append(quota / period)
-            except OverflowError:
-                return None, "cpu_max_invalid"
-        if current == mount:
-            break
-        parent = current.parent
-        try:
-            parent.relative_to(mount)
-        except ValueError:
-            break
-        current = parent
-    else:
-        return None, "cgroup_ancestor_limit"
-    if affinity_cpu_count is None:
-        return None, "affinity_unavailable"
-    if type(affinity_cpu_count) is not int or not 1 <= affinity_cpu_count <= 4096:
-        return None, "affinity_invalid"
-    if not quota_cores:
-        return float(affinity_cpu_count), "known"
-    quota_ceiling = min(quota_cores)
-    if not math.isfinite(quota_ceiling) or quota_ceiling <= 0:
-        return None, "cpu_max_invalid"
-    return min(float(affinity_cpu_count), quota_ceiling), "known"
+    except _CgroupDiagnosticError as exc:
+        return None, exc.reason
+    # The visible cgroup2 mount can be rooted at a namespace boundary, even
+    # when mountinfo reports `/`. Hidden ancestors may impose tighter quotas,
+    # so visible cpu.max values cannot establish effective host capacity.
+    return None, "trusted_host_root_unproven"
 
 
 def _effective_cpu_capacity_cores(
     *,
     cgroup_text: str | None = None,
-    cpu_max_reader: Callable[[Path], str] | None = None,
-    affinity_cpu_count: int | None = None,
+    mountinfo_text: str | None = None,
 ) -> float | None:
-    """Return a bounded cgroup-v2/affinity CPU ceiling, or UNKNOWN."""
+    """Return effective CPU capacity only when its complete view is trusted."""
 
     capacity, _reason = _effective_cpu_capacity_details(
         cgroup_text=cgroup_text,
-        cpu_max_reader=cpu_max_reader,
-        affinity_cpu_count=affinity_cpu_count,
+        mountinfo_text=mountinfo_text,
     )
     return capacity
 
@@ -345,27 +286,20 @@ def _decode_mountinfo_path(value: str) -> str:
     return decoded
 
 
-def _read_cgroup_diagnostic_snapshot(
+def _cgroup2_membership_mapping(
+    cgroup_text: str,
+    mountinfo_text: str,
     *,
-    cgroup_text: str | None = None,
-    mountinfo_text: str | None = None,
-    namespace_identity: tuple[int, int] | None = None,
-    file_reader: Callable[[Path], str] | None = None,
+    missing_membership_reason: str = "cgroup_record_invalid",
+    invalid_membership_reason: str = "cgroup_record_invalid",
 ) -> dict[str, Any]:
-    """Read a bounded, private in-memory view of this process's cgroup tree.
+    """Map the unified membership through the one visible cgroup2 mount."""
 
-    Raw paths and namespace/mount identities are used only to validate the
-    mapping and are never returned by the public report projection.
-    """
-
-    if cgroup_text is None:
-        try:
-            cgroup_text = _read_bounded_ascii(Path("/proc/self/cgroup"))
-        except (OSError, UnicodeError, ValueError) as exc:
-            raise _CgroupDiagnosticError("cgroup_record_unavailable") from exc
-    if len(cgroup_text) > CLIENT_CGROUP_LINE_LIMIT:
+    if not isinstance(cgroup_text, str) or len(cgroup_text) > CLIENT_CGROUP_LINE_LIMIT:
         raise _CgroupDiagnosticError("cgroup_record_invalid")
     memberships = [line[3:] for line in cgroup_text.splitlines() if line.startswith("0::")]
+    if not memberships:
+        raise _CgroupDiagnosticError(missing_membership_reason)
     if len(memberships) != 1:
         raise _CgroupDiagnosticError("cgroup_record_invalid")
     membership = memberships[0]
@@ -377,18 +311,12 @@ def _read_cgroup_diagnostic_snapshot(
         or any(part in {"", ".", ".."} for part in membership_parts)
         or len(membership) > CLIENT_CGROUP_LINE_LIMIT
     ):
-        raise _CgroupDiagnosticError("cgroup_record_invalid")
+        raise _CgroupDiagnosticError(invalid_membership_reason)
+    if not isinstance(mountinfo_text, str) or len(mountinfo_text) > CLIENT_CGROUP_MOUNTINFO_LIMIT:
+        raise _CgroupDiagnosticError("mountinfo_invalid")
 
-    if mountinfo_text is None:
-        mountinfo = _bounded_proc_text(
-            Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
-        )
-    else:
-        mountinfo = mountinfo_text
-        if len(mountinfo) > CLIENT_CGROUP_MOUNTINFO_LIMIT:
-            raise _CgroupDiagnosticError("mountinfo_invalid")
     cgroup2_mounts: list[dict[str, Any]] = []
-    for raw_line in mountinfo.splitlines():
+    for raw_line in mountinfo_text.splitlines():
         if len(raw_line) > CLIENT_CGROUP_LINE_LIMIT * 8:
             raise _CgroupDiagnosticError("mountinfo_invalid")
         fields = raw_line.split()
@@ -423,17 +351,54 @@ def _read_cgroup_diagnostic_snapshot(
     if len(cgroup2_mounts) != 1:
         raise _CgroupDiagnosticError("cgroup2_mount_ambiguous")
     mount = cgroup2_mounts[0]
-    root = mount["root"]
-    mountpoint = mount["mountpoint"]
     try:
-        relative_membership = membership_path.relative_to(root)
+        relative_membership = membership_path.relative_to(mount["root"])
     except ValueError as exc:
         raise _CgroupDiagnosticError("cgroup_mount_mapping_invalid") from exc
-    directory = mountpoint / relative_membership
+    directory = mount["mountpoint"] / relative_membership
     try:
-        directory.relative_to(mountpoint)
+        directory.relative_to(mount["mountpoint"])
     except ValueError as exc:
         raise _CgroupDiagnosticError("cgroup_mount_mapping_invalid") from exc
+    return {
+        "membership": membership,
+        "mount_identity": mount["identity"],
+        "root": mount["root"],
+        "mountpoint": mount["mountpoint"],
+        "directory": directory,
+    }
+
+
+def _read_cgroup_diagnostic_snapshot(
+    *,
+    cgroup_text: str | None = None,
+    mountinfo_text: str | None = None,
+    namespace_identity: tuple[int, int] | None = None,
+    file_reader: Callable[[Path], str] | None = None,
+) -> dict[str, Any]:
+    """Read a bounded, private in-memory view of this process's cgroup tree.
+
+    Raw paths and namespace/mount identities are used only to validate the
+    mapping and are never returned by the public report projection.
+    """
+
+    if cgroup_text is None:
+        try:
+            cgroup_text = _read_bounded_ascii(Path("/proc/self/cgroup"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise _CgroupDiagnosticError("cgroup_record_unavailable") from exc
+    if mountinfo_text is None:
+        mountinfo = _bounded_proc_text(
+            Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
+        )
+    else:
+        mountinfo = mountinfo_text
+        if len(mountinfo) > CLIENT_CGROUP_MOUNTINFO_LIMIT:
+            raise _CgroupDiagnosticError("mountinfo_invalid")
+    mapping = _cgroup2_membership_mapping(cgroup_text, mountinfo)
+    membership = mapping["membership"]
+    mountpoint = mapping["mountpoint"]
+    directory = mapping["directory"]
 
     if namespace_identity is None:
         try:
@@ -535,9 +500,9 @@ def _read_cgroup_diagnostic_snapshot(
         reasons.add("visible_ancestor_limit")
     return {
         "membership": membership,
-        "mount_identity": mount["identity"],
+        "mount_identity": mapping["mount_identity"],
         "namespace_identity": namespace_identity,
-        "mount_root_is_global": root == Path("/"),
+        "mount_root_is_global": mapping["root"] == Path("/"),
         "ancestors": ancestors,
         "reasons": sorted(reasons),
     }
@@ -704,9 +669,7 @@ class _ProcessCpuSampler:
             (
                 self.effective_cpu_capacity_cores,
                 self.cpu_capacity_reason,
-            ) = _effective_cpu_capacity_details(
-                affinity_cpu_count=self.affinity_cpu_count
-            )
+            ) = _effective_cpu_capacity_details()
         except (OSError, OverflowError, RuntimeError, TypeError, ValueError):
             self.effective_cpu_capacity_cores = None
             self.cpu_capacity_reason = "cgroup_capacity_unavailable"

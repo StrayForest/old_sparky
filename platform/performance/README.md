@@ -261,9 +261,9 @@ The public client report also carries a bounded UTC run window, ordered phase
 windows and process-CPU intervals. A CPU interval is publishable only when
 its full monotonic-measured interval lies inside the run window; an incomplete,
 malformed, or truncated series remains explicitly non-complete. Effective
-client CPU capacity remains reported only by the existing affinity and
-`cpu.max` calculation; a missing visible interface such as `cpu_max_missing`
-continues to produce UNKNOWN. The client also records bounded before/after
+client CPU capacity remains UNKNOWN unless the report can establish a trusted,
+complete view of quota ancestors. A visible cgroup2 mount root, including `/`,
+does not prove that namespace-hidden ancestors are absent. The client also records bounded before/after
 cgroup diagnostics: cgroup-v2 mount mapping, stable namespace/membership/mount
 identity, each visible ancestor's exact quota and period in microseconds, and
 nonnegative `cpu.stat` deltas. When an ancestor's quota interface is absent,

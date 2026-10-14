@@ -194,107 +194,52 @@ class ExternalLoadTests(unittest.TestCase):
             file_reader=reader,
         )
 
-    def test_effective_cpu_capacity_uses_affinity_and_strict_ancestor_quotas(self) -> None:
-        root = Path("/sys/fs/cgroup")
-        cpu_max = {
-            root / "tenant/job/cpu.max": "250000 100000\n",
-            root / "tenant/cpu.max": "max 100000\n",
-            root / "cpu.max": "150000 100000\n",
-        }
+    def test_effective_cpu_capacity_stays_unknown_without_trusted_host_root(self) -> None:
+        def unexpected_cpu_max_read(_path: Path) -> str:
+            self.fail("visible cpu.max files cannot prove hidden ancestors absent")
 
-        def reader(path: Path) -> str:
-            return cpu_max[path]
+        mount_cases = (
+            ("/", "0::/tenant/job\n"),
+            ("/tenant", "0::/tenant/job\n"),
+        )
+        for mount_root, cgroup_text in mount_cases:
+            with self.subTest(mount_root=mount_root):
+                mountinfo = (
+                    f"36 25 0:32 {mount_root} /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+                )
+                self.assertEqual(
+                    external_load._effective_cpu_capacity_details(
+                        cgroup_text=cgroup_text,
+                        mountinfo_text=mountinfo,
+                    ),
+                    (None, "trusted_host_root_unproven"),
+                )
+                self.assertIsNone(
+                    external_load._effective_cpu_capacity_cores(
+                        cgroup_text=cgroup_text,
+                        mountinfo_text=mountinfo,
+                    )
+                )
 
-        self.assertEqual(
-            external_load._effective_cpu_capacity_cores(
-                cgroup_text="0::/tenant/job\n",
-                cpu_max_reader=reader,
-                affinity_cpu_count=8,
-            ),
-            1.5,
+        ambiguous_mounts = (
+            "36 25 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+            "37 25 0:33 / /other/cgroup rw - cgroup2 cgroup rw\n"
         )
         self.assertEqual(
             external_load._effective_cpu_capacity_details(
                 cgroup_text="0::/tenant/job\n",
-                cpu_max_reader=reader,
-                affinity_cpu_count=8,
+                mountinfo_text=ambiguous_mounts,
             ),
-            (1.5, "known"),
-        )
-        self.assertEqual(
-            external_load._effective_cpu_capacity_cores(
-                cgroup_text="0::/tenant/job\n",
-                cpu_max_reader=lambda path: "max 100000\n",
-                affinity_cpu_count=2,
-            ),
-            2.0,
-        )
-        self.assertIsNone(
-            external_load._effective_cpu_capacity_cores(
-                cgroup_text="0::/tenant/job\n",
-                cpu_max_reader=lambda path: "max 100000\n",
-                affinity_cpu_count=None,
-            )
-        )
-        self.assertIsNone(
-            external_load._effective_cpu_capacity_cores(
-                cgroup_text="0::/tenant/job\n",
-                cpu_max_reader=lambda path: (
-                    "250000 100000\n" if path == root / "tenant/job/cpu.max" else "bad\n"
-                ),
-                affinity_cpu_count=8,
-            )
-        )
-        self.assertEqual(
-            external_load._effective_cpu_capacity_cores(
-                cgroup_text="0::/tenant/job\n",
-                cpu_max_reader=lambda path: "max 100000\n",
-                affinity_cpu_count=8,
-            ),
-            8.0,
-        )
-        self.assertIsNone(
-            external_load._effective_cpu_capacity_cores(
-                cgroup_text="0::/tenant/job\n",
-                cpu_max_reader=lambda path: "max nope\n",
-                affinity_cpu_count=8,
-            )
-        )
-
-        def missing_ancestor(path: Path) -> str:
-            if path == root / "tenant/job/cpu.max":
-                return "250000 100000\n"
-            raise FileNotFoundError
-
-        self.assertEqual(
-            external_load._effective_cpu_capacity_details(
-                cgroup_text="0::/tenant/job\n",
-                cpu_max_reader=missing_ancestor,
-                affinity_cpu_count=8,
-            ),
-            (None, "cpu_max_missing"),
+            (None, "cgroup2_mount_ambiguous"),
         )
         self.assertEqual(
             external_load._effective_cpu_capacity_details(
                 cgroup_text="0::/tenant/../private/path\n",
-                cpu_max_reader=reader,
-                affinity_cpu_count=8,
+                mountinfo_text=(
+                    "36 25 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+                ),
             ),
             (None, "cgroup_path_invalid"),
-        )
-        self.assertIsNone(
-            external_load._effective_cpu_capacity_cores(
-                cgroup_text="0::/tenant/job\n",
-                cpu_max_reader=missing_ancestor,
-                affinity_cpu_count=8,
-            )
-        )
-        self.assertIsNone(
-            external_load._effective_cpu_capacity_cores(
-                cgroup_text="0::/tenant/../escape\n",
-                cpu_max_reader=reader,
-                affinity_cpu_count=8,
-            )
         )
 
     def test_cgroup_diagnostics_keep_subroot_max_unknown_and_report_visible_deltas(self) -> None:
