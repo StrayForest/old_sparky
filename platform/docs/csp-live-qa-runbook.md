@@ -176,8 +176,8 @@ digest match the candidate manifest. Provider members are hashed in bounded
 chunks under the signed archive's per-member size limit; small trusted helper
 hashes retain their tighter default bound. Release bootstrap validates the
 complete archive and source SHA before omitting only the wheelhouse and
-standalone web bundle from its temporary control tree; full release contents
-remain intact.
+standalone web bundle from its temporary control tree; full release contents remain intact. For missing-provider recovery, see the [provider recovery runbook](liveqa-provider-recovery.md).
+
 The fixed root-owned supervisor at
 `/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh` (mode `0755`) then
 dispatches only that active generation; a missing, stale, symlinked or

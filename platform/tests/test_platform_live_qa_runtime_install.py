@@ -63,6 +63,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             "web/tests/smoke/live-user-journey.spec.ts": (b"journey\n", 0o444),
             "web/tests/support/live-qa-origin.ts": (b"origin\n", 0o444),
             "web/tests/support/live-qa-sandbox.ts": (b"support\n", 0o444),
+            "web/tests/support/live-count-reporter.cjs": (b"reporter\n", 0o444),
             "web/node_modules/@playwright/test/package.json": (b'{"name":"test"}\n', 0o444),
             "web/node_modules/@playwright/test/index.js": (b"test\n", 0o444),
             "web/node_modules/playwright/package.json": (b'{"name":"playwright"}\n', 0o444),
@@ -124,6 +125,571 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         node_version="26.3.1",
                         package_lock_sha256=lock_sha,
                     )
+
+    def _provider_recovery_fixture(self, root: Path):
+        source_sha = runtime.PROVIDER_RECOVERY_SOURCE_SHA
+        app_dir = root / "platform"
+        releases = app_dir / "releases"
+        payload_root = root / "liveqa" / "releases"
+        releases.mkdir(parents=True, mode=0o755)
+        payload_root.mkdir(parents=True, mode=0o755)
+        os.chmod(app_dir, 0o755)
+        owners = ["a" * 40, "b" * 40, "c" * 40]
+        for index, owner_sha in enumerate(owners[:2]):
+            release = releases / f"release-{index}"
+            release.mkdir(mode=0o755)
+            (release / "RELEASE.json").write_text(
+                json.dumps({"source_git_commit": owner_sha, "release_slug": release.name})
+                + "\n",
+                encoding="ascii",
+            )
+            os.chmod(release / "RELEASE.json", 0o444)
+            (app_dir / ("current" if index == 0 else "previous")).symlink_to(release)
+
+        source_parent = root / "attested-source"
+        source_parent.mkdir(mode=0o700)
+        fixture_runtime, engine_files, lock_sha = self._engine_provider_fixture(source_parent)
+        runtime_source = source_parent / "liveqa-runtime"
+        fixture_runtime.rename(runtime_source)
+        # The source-bound 19603 v1 artifact predates these two newer suite
+        # files. Recovery may accept this exact historical manifest only when
+        # its source SHA and manifest digest are both fixed above.
+        for relative in (
+            "web/tests/smoke/live-launch.spec.ts",
+            "web/tests/support/live-count-reporter.cjs",
+        ):
+            (runtime_source / relative).unlink()
+        sandbox = runtime_source / runtime.RUNTIME_SANDBOX_RELATIVE
+        sandbox_sha = hashlib.sha256(sandbox.read_bytes()).hexdigest()
+        with mock.patch.multiple(
+            runtime,
+            CHROMIUM_SANDBOX_SIZE=sandbox.stat().st_size,
+            CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+        ):
+            full_tree_sha, full_files = runtime._tree_digest(
+                runtime_source,
+                ignored=frozenset({runtime.RUNTIME_MANIFEST_RELATIVE.as_posix()}),
+                sandbox_relative=runtime.RUNTIME_SANDBOX_RELATIVE,
+            )
+        source_manifest = {
+            "version": 1,
+            "node_version": "26.3.1",
+            "package_lock_sha256": lock_sha,
+            "tree_sha256": full_tree_sha,
+            "files": full_files,
+        }
+        manifest_path = runtime_source / runtime.RUNTIME_MANIFEST_RELATIVE
+        manifest_path.write_text(json.dumps(source_manifest, sort_keys=True) + "\n", encoding="ascii")
+        os.chown(manifest_path, 0, 0)
+        os.chmod(manifest_path, 0o444)
+        source_manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        os.chmod(runtime_source, 0o555)
+        engine_sha = runtime._engine_digest(
+            engine_files,
+            node_version="26.3.1",
+            package_lock_sha256=lock_sha,
+        )
+        consumer = {
+            "version": 1,
+            "provider_sha": source_sha,
+            "engine_tree_sha256": engine_sha,
+            "node_version": "26.3.1",
+            "package_lock_sha256": lock_sha,
+            "engine_files": engine_files,
+        }
+        for owner_sha in owners:
+            payload = payload_root / owner_sha
+            payload.mkdir(mode=0o755)
+            record = {**consumer, "source_sha": owner_sha}
+            provider_path = payload / "runtime-provider.json"
+            provider_path.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="ascii")
+            os.chown(provider_path, 0, 0)
+            os.chmod(provider_path, 0o444)
+            os.chown(payload, 0, 0)
+            os.chmod(payload, 0o555)
+        trusted = root / "liveqa"
+        (trusted / "active").symlink_to(f"releases/{owners[2]}")
+        active_manifest_path = trusted / "active-manifest.json"
+        active_manifest_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "source_sha": owners[2],
+                    "release_slug": "active-generation",
+                    "payload": str(payload_root / owners[2]),
+                    "payload_tree_sha256": "d" * 64,
+                    "files": {},
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="ascii",
+        )
+        os.chown(active_manifest_path, 0, 0)
+        os.chmod(active_manifest_path, 0o444)
+        os.chown(trusted, 0, 0)
+        os.chmod(trusted, 0o700)
+        return (
+            app_dir,
+            runtime_source,
+            payload_root,
+            owners,
+            engine_files,
+            engine_sha,
+            lock_sha,
+            sandbox_sha,
+            source_manifest_sha,
+        )
+
+    def test_provider_recovery_publishes_only_attested_engine_and_preserves_consumers(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                app_dir,
+                runtime_source,
+                payload_root,
+                owners,
+                engine_files,
+                engine_sha,
+                lock_sha,
+                sandbox_sha,
+                source_manifest_sha,
+            ) = self._provider_recovery_fixture(root)
+            active_pointer = root / "liveqa" / "active"
+            before_pointer_ids = tuple(
+                (path.name, path.lstat().st_ino, os.readlink(path))
+                for path in (app_dir / "current", app_dir / "previous", active_pointer)
+            )
+            before_consumer_hashes = tuple(
+                runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                for owner in owners
+            )
+            with mock.patch.multiple(
+                runtime,
+                APP_DIR=app_dir,
+                PAYLOAD_ROOT=payload_root,
+                TRUSTED_ROOT=root / "liveqa",
+                ACTIVE_POINTER=active_pointer,
+                ACTIVE_MANIFEST=root / "liveqa" / "active-manifest.json",
+                PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256=source_manifest_sha,
+                CHROMIUM_SANDBOX_SIZE=(runtime_source / runtime.RUNTIME_SANDBOX_RELATIVE).stat().st_size,
+                CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+            ), mock.patch.object(runtime, "_require_release_lock"):
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_runtime_source(
+                        runtime_source,
+                        source_sha=runtime.PROVIDER_RECOVERY_SOURCE_SHA,
+                    )
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_runtime_source(
+                        runtime_source,
+                        allow_attested_provider_recovery=True,
+                        source_sha="f" * 40,
+                    )
+                result = runtime.recover_provider(
+                    app_dir,
+                    runtime_source,
+                )
+                self.assertEqual(result["status"], "published")
+                provider_root = payload_root / runtime.PROVIDER_RECOVERY_SOURCE_SHA
+                self.assertEqual({path.name for path in provider_root.iterdir()}, {"runtime"})
+                runtime._validate_engine_root(
+                    provider_root / "runtime",
+                    expected_files=engine_files,
+                    engine_sha256=engine_sha,
+                    node_version="26.3.1",
+                    package_lock_sha256=lock_sha,
+                )
+                after_pointer_ids = tuple(
+                    (path.name, path.lstat().st_ino, os.readlink(path))
+                    for path in (app_dir / "current", app_dir / "previous", active_pointer)
+                )
+                self.assertEqual(after_pointer_ids, before_pointer_ids)
+                after_consumer_hashes = tuple(
+                    runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                    for owner in owners
+                )
+                self.assertEqual(after_consumer_hashes, before_consumer_hashes)
+                repeated = runtime.recover_provider(app_dir, runtime_source)
+                self.assertEqual(repeated["status"], "already-valid")
+
+    def test_provider_recovery_refuses_alternate_app_directory_before_lock(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            app_dir, runtime_source, *_ = self._provider_recovery_fixture(root)
+            alternate_app_dir = root / "other-platform"
+            alternate_app_dir.mkdir(mode=0o755)
+            with mock.patch.object(runtime, "APP_DIR", app_dir), mock.patch.object(
+                runtime, "_require_release_lock"
+            ) as require_lock:
+                with self.assertRaisesRegex(
+                    runtime.InstallerError,
+                    "restricted to the production application directory",
+                ):
+                    runtime.recover_provider(alternate_app_dir, runtime_source)
+            require_lock.assert_not_called()
+
+    def test_provider_recovery_refuses_wrong_reference_or_existing_target(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                app_dir,
+                runtime_source,
+                payload_root,
+                owners,
+                engine_files,
+                _engine_sha,
+                lock_sha,
+                sandbox_sha,
+                source_manifest_sha,
+            ) = self._provider_recovery_fixture(root)
+            reference = payload_root / owners[0] / "runtime-provider.json"
+            wrong = json.loads(reference.read_text(encoding="ascii"))
+            wrong["engine_tree_sha256"] = "f" * 64
+            reference.chmod(0o644)
+            reference.write_text(json.dumps(wrong) + "\n", encoding="ascii")
+            reference.chmod(0o444)
+            active_pointer = root / "liveqa" / "active"
+            patch_args = {
+                "APP_DIR": app_dir,
+                "PAYLOAD_ROOT": payload_root,
+                "TRUSTED_ROOT": root / "liveqa",
+                "ACTIVE_POINTER": active_pointer,
+                "ACTIVE_MANIFEST": root / "liveqa" / "active-manifest.json",
+                "PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256": source_manifest_sha,
+                "CHROMIUM_SANDBOX_SIZE": (runtime_source / runtime.RUNTIME_SANDBOX_RELATIVE).stat().st_size,
+                "CHROMIUM_SANDBOX_SHA256": sandbox_sha,
+            }
+            with mock.patch.multiple(runtime, **patch_args), mock.patch.object(
+                runtime, "_require_release_lock"
+            ), self.assertRaises(runtime.InstallerError):
+                runtime.recover_provider(app_dir, runtime_source)
+            self.assertFalse((payload_root / runtime.PROVIDER_RECOVERY_SOURCE_SHA).exists())
+
+    def test_provider_recovery_refuses_invalid_existing_target_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                app_dir,
+                runtime_source,
+                payload_root,
+                _owners,
+                engine_files,
+                _engine_sha,
+                lock_sha,
+                sandbox_sha,
+                source_manifest_sha,
+            ) = self._provider_recovery_fixture(root)
+            target = payload_root / runtime.PROVIDER_RECOVERY_SOURCE_SHA
+            target.mkdir(mode=0o700)
+            sentinel = target / "operator-data"
+            sentinel.write_text("preserve\n", encoding="ascii")
+            active_pointer = root / "liveqa" / "active"
+            with mock.patch.multiple(
+                runtime,
+                APP_DIR=app_dir,
+                PAYLOAD_ROOT=payload_root,
+                TRUSTED_ROOT=root / "liveqa",
+                ACTIVE_POINTER=active_pointer,
+                ACTIVE_MANIFEST=root / "liveqa" / "active-manifest.json",
+                PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256=source_manifest_sha,
+                CHROMIUM_SANDBOX_SIZE=(runtime_source / runtime.RUNTIME_SANDBOX_RELATIVE).stat().st_size,
+                CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+            ), mock.patch.object(runtime, "_require_release_lock"), self.assertRaises(
+                runtime.InstallerError
+            ):
+                runtime.recover_provider(app_dir, runtime_source)
+            self.assertEqual(sentinel.read_text(encoding="ascii"), "preserve\n")
+            self.assertEqual({path.name for path in target.iterdir()}, {"operator-data"})
+
+    def test_provider_recovery_rejects_unbound_manifest_and_preserves_existing_state(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                app_dir,
+                runtime_source,
+                payload_root,
+                owners,
+                _engine_files,
+                _engine_sha,
+                _lock_sha,
+                sandbox_sha,
+                _source_manifest_sha,
+            ) = self._provider_recovery_fixture(root)
+            active_pointer = root / "liveqa" / "active"
+            references_before = tuple(
+                runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                for owner in owners
+            )
+            with mock.patch.multiple(
+                runtime,
+                APP_DIR=app_dir,
+                PAYLOAD_ROOT=payload_root,
+                TRUSTED_ROOT=root / "liveqa",
+                ACTIVE_POINTER=active_pointer,
+                ACTIVE_MANIFEST=root / "liveqa" / "active-manifest.json",
+                CHROMIUM_SANDBOX_SIZE=(runtime_source / runtime.RUNTIME_SANDBOX_RELATIVE).stat().st_size,
+                CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+            ), mock.patch.object(runtime, "_require_release_lock"), self.assertRaises(
+                runtime.InstallerError
+            ):
+                runtime.recover_provider(app_dir, runtime_source)
+            self.assertFalse((payload_root / runtime.PROVIDER_RECOVERY_SOURCE_SHA).exists())
+            references_after = tuple(
+                runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                for owner in owners
+            )
+            self.assertEqual(references_after, references_before)
+
+    def test_provider_recovery_requires_matching_active_manifest(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                app_dir,
+                runtime_source,
+                payload_root,
+                owners,
+                _engine_files,
+                _engine_sha,
+                _lock_sha,
+                sandbox_sha,
+                source_manifest_sha,
+            ) = self._provider_recovery_fixture(root)
+            manifest_path = root / "liveqa" / "active-manifest.json"
+            references_before = tuple(
+                runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                for owner in owners
+            )
+            patch_args = {
+                "APP_DIR": app_dir,
+                "PAYLOAD_ROOT": payload_root,
+                "TRUSTED_ROOT": root / "liveqa",
+                "ACTIVE_POINTER": root / "liveqa" / "active",
+                "ACTIVE_MANIFEST": manifest_path,
+                "PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256": source_manifest_sha,
+                "CHROMIUM_SANDBOX_SIZE": (runtime_source / runtime.RUNTIME_SANDBOX_RELATIVE).stat().st_size,
+                "CHROMIUM_SANDBOX_SHA256": sandbox_sha,
+            }
+            for state in ("missing", "malformed", "mismatched"):
+                with self.subTest(state=state):
+                    if manifest_path.exists():
+                        manifest_path.chmod(0o644)
+                    if state == "missing":
+                        manifest_path.unlink(missing_ok=True)
+                    elif state == "malformed":
+                        manifest_path.write_text("{\"version\":\n", encoding="ascii")
+                        os.chown(manifest_path, 0, 0)
+                        os.chmod(manifest_path, 0o444)
+                    else:
+                        mismatched = {
+                            "version": 1,
+                            "source_sha": "f" * 40,
+                            "release_slug": "active-generation",
+                            "payload": str(payload_root / ("f" * 40)),
+                            "payload_tree_sha256": "d" * 64,
+                            "files": {},
+                        }
+                        manifest_path.write_text(
+                            json.dumps(mismatched, sort_keys=True) + "\n",
+                            encoding="ascii",
+                        )
+                        os.chown(manifest_path, 0, 0)
+                        os.chmod(manifest_path, 0o444)
+                    with mock.patch.multiple(runtime, **patch_args), mock.patch.object(
+                        runtime, "_require_release_lock"
+                    ), self.assertRaises(runtime.InstallerError):
+                        runtime.recover_provider(app_dir, runtime_source)
+                    self.assertFalse((payload_root / runtime.PROVIDER_RECOVERY_SOURCE_SHA).exists())
+                    references_after = tuple(
+                        runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                        for owner in owners
+                    )
+                    self.assertEqual(references_after, references_before)
+
+    def test_provider_recovery_detects_active_provider_directory_replacement(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                app_dir,
+                runtime_source,
+                payload_root,
+                owners,
+                _engine_files,
+                _engine_sha,
+                _lock_sha,
+                sandbox_sha,
+                source_manifest_sha,
+            ) = self._provider_recovery_fixture(root)
+            active_owner_root = payload_root / owners[2]
+            active_pointer = root / "liveqa" / "active"
+            active_manifest = root / "liveqa" / "active-manifest.json"
+            references_before = tuple(
+                runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                for owner in owners
+            )
+            real_snapshot = runtime._provider_recovery_snapshot
+            calls = 0
+
+            def replace_active_owner_after_first_snapshot(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[object, ...]:
+                nonlocal calls
+                result = real_snapshot(*args, **kwargs)
+                calls += 1
+                if calls == 1:
+                    replacement = payload_root / ".active-owner-replacement"
+                    os.chmod(active_owner_root, 0o755)
+                    os.rename(active_owner_root, replacement)
+                    active_owner_root.mkdir(mode=0o755)
+                    os.rename(replacement / "runtime-provider.json", active_owner_root / "runtime-provider.json")
+                    os.chown(active_owner_root / "runtime-provider.json", 0, 0)
+                    os.chmod(active_owner_root / "runtime-provider.json", 0o444)
+                    os.chown(active_owner_root, 0, 0)
+                    os.chmod(active_owner_root, 0o555)
+                    os.rmdir(replacement)
+                return result
+
+            with mock.patch.multiple(
+                runtime,
+                APP_DIR=app_dir,
+                PAYLOAD_ROOT=payload_root,
+                TRUSTED_ROOT=root / "liveqa",
+                ACTIVE_POINTER=active_pointer,
+                ACTIVE_MANIFEST=active_manifest,
+                PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256=source_manifest_sha,
+                CHROMIUM_SANDBOX_SIZE=(runtime_source / runtime.RUNTIME_SANDBOX_RELATIVE).stat().st_size,
+                CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+            ), mock.patch.object(runtime, "_require_release_lock"), mock.patch.object(
+                runtime,
+                "_provider_recovery_snapshot",
+                side_effect=replace_active_owner_after_first_snapshot,
+            ), self.assertRaisesRegex(
+                runtime.InstallerError,
+                "provider recovery references changed before publish",
+            ):
+                runtime.recover_provider(app_dir, runtime_source)
+            self.assertEqual(calls, 2)
+            self.assertFalse((payload_root / runtime.PROVIDER_RECOVERY_SOURCE_SHA).exists())
+            self.assertFalse((payload_root / ".active-owner-replacement").exists())
+            references_after = tuple(
+                runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                for owner in owners
+            )
+            self.assertEqual(references_after, references_before)
+
+    def test_provider_recovery_reference_drift_cleans_only_private_stage(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                app_dir,
+                runtime_source,
+                payload_root,
+                owners,
+                _engine_files,
+                _engine_sha,
+                lock_sha,
+                sandbox_sha,
+                source_manifest_sha,
+            ) = self._provider_recovery_fixture(root)
+            active_pointer = root / "liveqa" / "active"
+            active_manifest = root / "liveqa" / "active-manifest.json"
+            unrelated_before = tuple(
+                runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                for owner in owners
+            )
+            real_snapshot = runtime._provider_recovery_snapshot
+            calls = 0
+
+            def mutate_after_first_snapshot(*args: object, **kwargs: object) -> tuple[object, ...]:
+                nonlocal calls
+                calls += 1
+                result = real_snapshot(*args, **kwargs)
+                if calls == 1:
+                    active_manifest.chmod(0o644)
+                    active_manifest.write_text("{\"changed\":true}\n", encoding="ascii")
+                    active_manifest.chmod(0o444)
+                return result
+
+            with mock.patch.multiple(
+                runtime,
+                APP_DIR=app_dir,
+                PAYLOAD_ROOT=payload_root,
+                TRUSTED_ROOT=root / "liveqa",
+                ACTIVE_POINTER=active_pointer,
+                ACTIVE_MANIFEST=active_manifest,
+                PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256=source_manifest_sha,
+                CHROMIUM_SANDBOX_SIZE=(runtime_source / runtime.RUNTIME_SANDBOX_RELATIVE).stat().st_size,
+                CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+            ), mock.patch.object(runtime, "_require_release_lock"), mock.patch.object(
+                runtime,
+                "_provider_recovery_snapshot",
+                side_effect=mutate_after_first_snapshot,
+            ), self.assertRaisesRegex(
+                runtime.InstallerError,
+                "trusted live-QA manifest schema is invalid",
+            ):
+                runtime.recover_provider(app_dir, runtime_source)
+            self.assertEqual(calls, 2)
+            self.assertFalse((payload_root / runtime.PROVIDER_RECOVERY_SOURCE_SHA).exists())
+            self.assertEqual(
+                sorted(path.name for path in payload_root.iterdir()),
+                sorted(owners),
+            )
+            unrelated_after = tuple(
+                runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                for owner in owners
+            )
+            self.assertEqual(unrelated_after, unrelated_before)
+
+    def test_provider_recovery_publish_failure_removes_only_its_private_stage(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                app_dir,
+                runtime_source,
+                payload_root,
+                owners,
+                _engine_files,
+                _engine_sha,
+                _lock_sha,
+                sandbox_sha,
+                source_manifest_sha,
+            ) = self._provider_recovery_fixture(root)
+            target = payload_root / runtime.PROVIDER_RECOVERY_SOURCE_SHA
+            active_pointer = root / "liveqa" / "active"
+            unrelated_before = tuple(
+                runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                for owner in owners
+            )
+            real_rename = os.rename
+
+            def fail_provider_publish(source: object, destination: object) -> None:
+                if Path(destination) == target:
+                    raise OSError("injected publish failure")
+                real_rename(source, destination)
+
+            with mock.patch.multiple(
+                runtime,
+                APP_DIR=app_dir,
+                PAYLOAD_ROOT=payload_root,
+                TRUSTED_ROOT=root / "liveqa",
+                ACTIVE_POINTER=active_pointer,
+                ACTIVE_MANIFEST=root / "liveqa" / "active-manifest.json",
+                PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256=source_manifest_sha,
+                CHROMIUM_SANDBOX_SIZE=(runtime_source / runtime.RUNTIME_SANDBOX_RELATIVE).stat().st_size,
+                CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+            ), mock.patch.object(runtime, "_require_release_lock"), mock.patch.object(
+                runtime.os, "rename", side_effect=fail_provider_publish
+            ), self.assertRaises(OSError):
+                runtime.recover_provider(app_dir, runtime_source)
+            self.assertFalse(target.exists())
+            self.assertEqual(sorted(path.name for path in payload_root.iterdir()), sorted(owners))
+            unrelated_after = tuple(
+                runtime._digest_regular(payload_root / owner / "runtime-provider.json")
+                for owner in owners
+            )
+            self.assertEqual(unrelated_after, unrelated_before)
 
     def test_retention_protects_transitively_referenced_provider(self) -> None:
         source_shas = ["a" * 40, "b" * 40, "c" * 40, "d" * 40, "e" * 40]

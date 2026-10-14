@@ -28,6 +28,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Report-only failed-deployment recovery | [Recovery bootstrap ADR](adr/recovery-bootstrap-retained-abort.md#operator-recovery-deployment-for-a-report-only-invalid-marker) and [deployment runbook](deployment-runbook.md#manual-workflow-fallback) |
 | Test-suite ownership and CI/live runners | [Test-suite governance](test-suite-governance.md) |
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
+| Missing immutable LiveQA engine provider | [Provider recovery runbook](liveqa-provider-recovery.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |
 | Exceptional fallback runtime cache compaction | [Fallback cache compaction](fallback-runtime-cache-compaction-runbook.md) |
 | Services, storage, media and performance | [Operations runbook](operations-runbook.md) |

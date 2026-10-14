@@ -91,6 +91,15 @@ CHROMIUM_SANDBOX_SHA256 = (
 )
 RUNTIME_MANIFEST_RELATIVE = PurePosixPath("runtime-manifest.json")
 LEGACY_RUNTIME_REPORTER_SOURCE_SHA = "6343099bb7686671bdef49d0c4ecd10f21ef19d2"
+# One-time repair target for the attested 19603 live-QA engine artifact.  This
+# command intentionally cannot be used to publish an arbitrary provider SHA.
+PROVIDER_RECOVERY_SOURCE_SHA = "19603dfff122386726313c86b0350812ebbe8cca"
+# This is the SHA-256 of the v1 runtime manifest inside the independently
+# attested artifact run 37614074702/attempt 1.  Its file map and tree digest
+# bind every runtime byte accepted by the recovery command to that artifact.
+PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256 = (
+    "a545fcaf4855b0d3199c21c367aa38fdb8b6d4284a640ecce95bf7b8df6efdc8"
+)
 RUNTIME_BROWSER_ROOTS = frozenset(
     {
         "chromium-1228",
@@ -835,6 +844,7 @@ def _validate_runtime_source(
     root: Path,
     *,
     allow_legacy_reporter_omission: bool = False,
+    allow_attested_provider_recovery: bool = False,
     source_sha: str | None = None,
 ) -> dict[str, object]:
     """Recheck the artifact member before any secret-bearing promotion."""
@@ -845,15 +855,31 @@ def _validate_runtime_source(
         allow_legacy_reporter_omission
         and source_sha == LEGACY_RUNTIME_REPORTER_SOURCE_SHA
     )
+    attested_provider_recovery = False
+    if (
+        allow_attested_provider_recovery
+        and source_sha == PROVIDER_RECOVERY_SOURCE_SHA
+    ):
+        manifest_metadata = _regular(
+            root / RUNTIME_MANIFEST_RELATIVE,
+            mode=0o444,
+            maximum=MAX_RUNTIME_MANIFEST_BYTES,
+        )
+        attested_provider_recovery = (
+            manifest_metadata.st_nlink == 1
+            and _digest_regular(root / RUNTIME_MANIFEST_RELATIVE)
+            == PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256
+        )
     required = [
         "web/package-lock.json",
         "web/playwright.live.config.ts",
-        "web/tests/smoke/live-launch.spec.ts",
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
     ]
-    if not legacy_reporter_runtime:
+    if not attested_provider_recovery:
+        required.append("web/tests/smoke/live-launch.spec.ts")
+    if not legacy_reporter_runtime and not attested_provider_recovery:
         required.append("web/tests/support/live-count-reporter.cjs")
     for relative in required:
         path = root / relative
@@ -862,12 +888,13 @@ def _validate_runtime_source(
     allowed_web_files = {
         "web/package-lock.json",
         "web/playwright.live.config.ts",
-        "web/tests/smoke/live-launch.spec.ts",
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
     }
-    if not legacy_reporter_runtime:
+    if not attested_provider_recovery:
+        allowed_web_files.add("web/tests/smoke/live-launch.spec.ts")
+    if not legacy_reporter_runtime and not attested_provider_recovery:
         allowed_web_files.add("web/tests/support/live-count-reporter.cjs")
     allowed_package_roots = (
         "web/node_modules/@playwright/test",
@@ -1013,7 +1040,10 @@ def _validate_runtime_source(
         }.issubset(engine_files):
             raise InstallerError("source-only live-QA dependency set is incomplete")
         return manifest
-    for relative in RUNTIME_REQUIRED_FILES:
+    required_runtime_files = set(RUNTIME_REQUIRED_FILES)
+    if attested_provider_recovery:
+        required_runtime_files.discard("web/tests/support/live-count-reporter.cjs")
+    for relative in required_runtime_files:
         _regular(root / relative, allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix())
     for browser_root in RUNTIME_BROWSER_ROOTS:
         _directory(root / "browsers" / browser_root)
@@ -1214,7 +1244,11 @@ def _runtime_provider_payload(
     return provider
 
 
-def _normalize_tree(root: Path) -> None:
+def _normalize_tree(
+    root: Path,
+    *,
+    sandbox_relative: PurePosixPath = CHROMIUM_SANDBOX_RELATIVE,
+) -> None:
     for path in sorted(root.rglob("*"), reverse=True):
         metadata = _metadata(path)
         if stat.S_ISDIR(metadata.st_mode):
@@ -1226,7 +1260,7 @@ def _normalize_tree(root: Path) -> None:
             # set-id authority.  Its digest is checked by the runtime manifest.
             if (
                 path.relative_to(root).as_posix()
-                == CHROMIUM_SANDBOX_RELATIVE.as_posix()
+                == sandbox_relative.as_posix()
             ):
                 os.chmod(path, 0o4755, follow_symlinks=False)
             else:
@@ -1649,6 +1683,404 @@ def _protected_shas(app_dir: Path) -> set[str]:
             values.add(provider_sha)
             pending.append(provider_sha)
     return values
+
+
+def _provider_recovery_snapshot(
+    app_dir: Path,
+    *,
+    source_sha: str,
+    runtime_manifest: dict[str, object],
+) -> tuple[object, ...]:
+    """Bind the exact three protected consumers before/after provider publish."""
+
+    _directory(PAYLOAD_ROOT, mode=0o755)
+    pointers: list[tuple[object, ...]] = []
+    owners: set[str] = set()
+    for pointer_name in ("current", "previous"):
+        pointer = app_dir / pointer_name
+        try:
+            metadata = pointer.lstat()
+        except FileNotFoundError:
+            pointers.append((pointer_name, "missing"))
+            continue
+        if (
+            not stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 1
+        ):
+            raise InstallerError("provider recovery release pointer is not a symlink")
+        target = pointer.resolve(strict=True)
+        _release, owner_sha, _slug = _safe_release(app_dir, target)
+        release_metadata = _directory(target)
+        release_file = target / "RELEASE.json"
+        release_file_metadata = _regular(
+            release_file,
+            maximum=MAX_RELEASE_JSON_BYTES,
+        )
+        pointers.append(
+            (
+                pointer_name,
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_uid,
+                metadata.st_gid,
+                stat.S_IMODE(metadata.st_mode),
+                os.readlink(pointer),
+                owner_sha,
+                release_metadata.st_dev,
+                release_metadata.st_ino,
+                release_file_metadata.st_dev,
+                release_file_metadata.st_ino,
+                release_file_metadata.st_uid,
+                release_file_metadata.st_gid,
+                stat.S_IMODE(release_file_metadata.st_mode),
+                release_file_metadata.st_nlink,
+                release_file_metadata.st_size,
+                _digest_regular(release_file),
+            )
+        )
+        owners.add(owner_sha)
+
+    active_pointer = ACTIVE_POINTER
+    try:
+        active_metadata = active_pointer.lstat()
+    except FileNotFoundError:
+        pointers.append(("active", "missing"))
+    else:
+        if (
+            not stat.S_ISLNK(active_metadata.st_mode)
+            or active_metadata.st_uid != 0
+            or active_metadata.st_gid != 0
+            or active_metadata.st_nlink != 1
+        ):
+            raise InstallerError("provider recovery active pointer is unsafe")
+        active_link = os.readlink(active_pointer)
+        active_target = active_pointer.resolve(strict=True)
+        if (
+            active_target.parent != PAYLOAD_ROOT
+            or PAYLOAD_PATTERN.fullmatch(active_target.name) is None
+            or active_link != f"{PAYLOAD_ROOT.name}/{active_target.name}"
+        ):
+            raise InstallerError("provider recovery active pointer is invalid")
+        active_target_metadata = _directory(active_target, mode=0o555)
+        if active_target_metadata.st_nlink < 2:
+            raise InstallerError("provider recovery active directory link count is unsafe")
+        pointers.append(
+            (
+                "active",
+                active_metadata.st_dev,
+                active_metadata.st_ino,
+                active_metadata.st_uid,
+                active_metadata.st_gid,
+                stat.S_IMODE(active_metadata.st_mode),
+                active_link,
+                active_target.name,
+                active_target_metadata.st_dev,
+                active_target_metadata.st_ino,
+                active_target_metadata.st_uid,
+                active_target_metadata.st_gid,
+                stat.S_IMODE(active_target_metadata.st_mode),
+                "nlink>=2",
+            )
+        )
+        owners.add(active_target.name)
+
+    if len(owners) != 3:
+        raise InstallerError("provider recovery requires exactly three protected consumers")
+    provider_snapshots: list[tuple[object, ...]] = []
+    expected_engine_fields = (
+        runtime_manifest.get("engine_tree_sha256"),
+        runtime_manifest.get("node_version"),
+        runtime_manifest.get("package_lock_sha256"),
+        runtime_manifest.get("engine_files"),
+    )
+    for owner_sha in sorted(owners):
+        owner_root = PAYLOAD_ROOT / owner_sha
+        owner_root_metadata = _directory(owner_root, mode=0o555)
+        if owner_root_metadata.st_nlink < 2:
+            raise InstallerError("protected provider directory link count is unsafe")
+        provider_path = owner_root / "runtime-provider.json"
+        metadata = _regular(
+            provider_path,
+            mode=0o444,
+            maximum=MAX_RUNTIME_MANIFEST_BYTES,
+        )
+        raw = _read_bounded_regular(
+            provider_path,
+            metadata=metadata,
+            maximum=MAX_RUNTIME_MANIFEST_BYTES,
+            mode=0o444,
+        )
+        try:
+            record = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+        except (UnicodeError, json.JSONDecodeError, InstallerError) as exc:
+            raise InstallerError("protected provider recovery reference is invalid") from exc
+        if (
+            not isinstance(record, dict)
+            or set(record)
+            != {
+                "version",
+                "source_sha",
+                "provider_sha",
+                "engine_tree_sha256",
+                "node_version",
+                "package_lock_sha256",
+                "engine_files",
+            }
+            or record.get("version") != 1
+            or record.get("source_sha") != owner_sha
+            or record.get("provider_sha") != source_sha
+            or (
+                record.get("engine_tree_sha256"),
+                record.get("node_version"),
+                record.get("package_lock_sha256"),
+                record.get("engine_files"),
+            )
+            != expected_engine_fields
+        ):
+            raise InstallerError("protected provider recovery reference does not match artifact")
+        provider_snapshots.append(
+            (
+                owner_sha,
+                owner_root_metadata.st_dev,
+                owner_root_metadata.st_ino,
+                owner_root_metadata.st_uid,
+                owner_root_metadata.st_gid,
+                stat.S_IMODE(owner_root_metadata.st_mode),
+                "nlink>=2",
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_uid,
+                metadata.st_gid,
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_nlink,
+                metadata.st_size,
+                hashlib.sha256(raw).hexdigest(),
+            )
+        )
+    # The existing active-generation contract requires a valid manifest whose
+    # source SHA agrees with the active pointer. A missing or malformed file
+    # cannot be treated as a stable recovery reference snapshot.
+    active_manifest = _read_manifest()
+    active_manifest_metadata = _regular(
+        ACTIVE_MANIFEST,
+        mode=0o444,
+        maximum=MAX_ACTIVE_MANIFEST_BYTES,
+    )
+    active_manifest_raw = _read_bounded_regular(
+        ACTIVE_MANIFEST,
+        metadata=active_manifest_metadata,
+        maximum=MAX_ACTIVE_MANIFEST_BYTES,
+        mode=0o444,
+    )
+    try:
+        captured_active_manifest = json.loads(
+            active_manifest_raw.decode("ascii"),
+            object_pairs_hook=_strict_object,
+        )
+    except (UnicodeError, json.JSONDecodeError, InstallerError) as exc:
+        raise InstallerError("provider recovery active manifest is invalid") from exc
+    active_link = os.readlink(ACTIVE_POINTER)
+    if (
+        captured_active_manifest != active_manifest
+        or not isinstance(active_manifest.get("source_sha"), str)
+        or active_link != f"{PAYLOAD_ROOT.name}/{active_manifest['source_sha']}"
+    ):
+        raise InstallerError("provider recovery active manifest does not match its pointer")
+    active_manifest_after_metadata = _regular(
+        ACTIVE_MANIFEST,
+        mode=0o444,
+        maximum=MAX_ACTIVE_MANIFEST_BYTES,
+    )
+    active_manifest_after_raw = _read_bounded_regular(
+        ACTIVE_MANIFEST,
+        metadata=active_manifest_after_metadata,
+        maximum=MAX_ACTIVE_MANIFEST_BYTES,
+        mode=0o444,
+    )
+    if (
+        _file_fingerprint(active_manifest_after_metadata)
+        != _file_fingerprint(active_manifest_metadata)
+        or active_manifest_after_raw != active_manifest_raw
+    ):
+        raise InstallerError("provider recovery active manifest changed during snapshot")
+    active_manifest_snapshot: tuple[object, ...] = (
+        active_manifest_metadata.st_dev,
+        active_manifest_metadata.st_ino,
+        active_manifest_metadata.st_uid,
+        active_manifest_metadata.st_gid,
+        active_manifest_metadata.st_nlink,
+        active_manifest_metadata.st_size,
+        hashlib.sha256(active_manifest_raw).hexdigest(),
+        active_manifest["source_sha"],
+        active_manifest["release_slug"],
+        active_manifest["payload"],
+        active_manifest["payload_tree_sha256"],
+    )
+    return tuple(pointers), tuple(provider_snapshots), active_manifest_snapshot
+
+
+def recover_provider(app_dir: Path, runtime_source: Path) -> dict[str, object]:
+    """Restore only the missing engine provider referenced by three protected consumers."""
+
+    if app_dir != APP_DIR:
+        raise InstallerError("provider recovery is restricted to the production application directory")
+    _require_release_lock()
+    source_sha = PROVIDER_RECOVERY_SOURCE_SHA
+    if not runtime_source.is_absolute() or Path(os.path.abspath(runtime_source)) != runtime_source:
+        raise InstallerError("provider recovery source path is not canonical")
+    runtime_manifest_path = runtime_source / RUNTIME_MANIFEST_RELATIVE
+    runtime_manifest_metadata = _regular(
+        runtime_manifest_path,
+        mode=0o444,
+        maximum=MAX_RUNTIME_MANIFEST_BYTES,
+    )
+    runtime_manifest_raw = _read_bounded_regular(
+        runtime_manifest_path,
+        metadata=runtime_manifest_metadata,
+        maximum=MAX_RUNTIME_MANIFEST_BYTES,
+        mode=0o444,
+    )
+    if hashlib.sha256(runtime_manifest_raw).hexdigest() != PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256:
+        raise InstallerError("provider recovery manifest is not bound to the attested artifact")
+    if runtime_manifest_metadata.st_nlink != 1:
+        raise InstallerError("provider recovery manifest link count is unsafe")
+    runtime_manifest = _validate_runtime_source(
+        runtime_source,
+        allow_attested_provider_recovery=True,
+        source_sha=source_sha,
+    )
+    if _digest_regular(runtime_manifest_path) != PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256:
+        raise InstallerError("provider recovery manifest changed during source validation")
+    if runtime_manifest.get("version") != 1:
+        raise InstallerError("provider recovery requires a full version-1 runtime artifact")
+    source_files = runtime_manifest.get("files")
+    if not isinstance(source_files, dict):
+        raise InstallerError("provider recovery artifact file map is invalid")
+    engine_files = {
+        relative: digest
+        for relative, digest in source_files.items()
+        if relative == "node/bin/node"
+        or relative.startswith(("browsers/", "web/node_modules/"))
+    }
+    if not engine_files:
+        raise InstallerError("provider recovery artifact engine map is invalid")
+    lock_sha = str(runtime_manifest["package_lock_sha256"])
+    engine_sha = _engine_digest(
+        engine_files,
+        node_version=str(runtime_manifest["node_version"]),
+        package_lock_sha256=lock_sha,
+    )
+    before = _provider_recovery_snapshot(
+        app_dir,
+        source_sha=source_sha,
+        runtime_manifest={
+            "engine_tree_sha256": engine_sha,
+            "node_version": runtime_manifest["node_version"],
+            "package_lock_sha256": lock_sha,
+            "engine_files": engine_files,
+        },
+    )
+    target = PAYLOAD_ROOT / source_sha
+    if os.path.lexists(target):
+        _directory(target, mode=0o555)
+        if {entry.name for entry in target.iterdir()} != {"runtime"}:
+            raise InstallerError("existing provider recovery target has unexpected members")
+        _validate_engine_root(
+            target / "runtime",
+            expected_files=engine_files,
+            engine_sha256=engine_sha,
+            node_version=str(runtime_manifest["node_version"]),
+            package_lock_sha256=lock_sha,
+        )
+        if before != _provider_recovery_snapshot(
+            app_dir,
+            source_sha=source_sha,
+            runtime_manifest={
+                "engine_tree_sha256": engine_sha,
+                "node_version": runtime_manifest["node_version"],
+                "package_lock_sha256": lock_sha,
+                "engine_files": engine_files,
+            },
+        ):
+            raise InstallerError("provider recovery references changed during verification")
+        return {"status": "already-valid", "source_sha": source_sha, "engine_tree_sha256": engine_sha}
+
+    _directory(PAYLOAD_ROOT, mode=0o755)
+    stage = PAYLOAD_ROOT / f".{source_sha}.install-{uuid4().hex}"
+    stage.mkdir(mode=0o700)
+    try:
+        staged_source = stage / "liveqa-runtime"
+        _copy_tree(runtime_source, staged_source, allow_sandbox=True)
+        _normalize_tree(staged_source, sandbox_relative=RUNTIME_SANDBOX_RELATIVE)
+        staged_manifest = _validate_runtime_source(
+            staged_source,
+            allow_attested_provider_recovery=True,
+            source_sha=source_sha,
+        )
+        if (
+            staged_manifest != runtime_manifest
+            or _digest_regular(staged_source / RUNTIME_MANIFEST_RELATIVE)
+            != PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256
+        ):
+            raise InstallerError("provider recovery staged source differs from attested artifact")
+        os.rename(staged_source, stage / "runtime")
+        _normalize_tree(stage)
+        for directory in [stage, *sorted((path for path in stage.rglob("*") if path.is_dir()), reverse=True)]:
+            _fsync_directory(directory)
+        _validate_engine_root(
+            stage / "runtime",
+            expected_files=engine_files,
+            engine_sha256=engine_sha,
+            node_version=str(runtime_manifest["node_version"]),
+            package_lock_sha256=lock_sha,
+        )
+        if before != _provider_recovery_snapshot(
+            app_dir,
+            source_sha=source_sha,
+            runtime_manifest={
+                "engine_tree_sha256": engine_sha,
+                "node_version": runtime_manifest["node_version"],
+                "package_lock_sha256": lock_sha,
+                "engine_files": engine_files,
+            },
+        ):
+            raise InstallerError("provider recovery references changed before publish")
+        if os.path.lexists(target):
+            raise InstallerError("provider recovery target appeared before publish")
+        os.rename(stage, target)
+        _fsync_directory(PAYLOAD_ROOT)
+        _validate_engine_root(
+            target / "runtime",
+            expected_files=engine_files,
+            engine_sha256=engine_sha,
+            node_version=str(runtime_manifest["node_version"]),
+            package_lock_sha256=lock_sha,
+        )
+        if before != _provider_recovery_snapshot(
+            app_dir,
+            source_sha=source_sha,
+            runtime_manifest={
+                "engine_tree_sha256": engine_sha,
+                "node_version": runtime_manifest["node_version"],
+                "package_lock_sha256": lock_sha,
+                "engine_files": engine_files,
+            },
+        ):
+            raise InstallerError("provider recovery references changed after publish")
+        return {"status": "published", "source_sha": source_sha, "engine_tree_sha256": engine_sha}
+    except BaseException:
+        # Once renamed, the target is now referenced and must be retained for
+        # inspection. Only the still-private transaction stage is removable.
+        if stage.exists() and not stage.is_symlink():
+            for path in [stage, *stage.rglob("*")]:
+                if path.is_dir() and not path.is_symlink():
+                    os.chmod(path, 0o700)
+                elif not path.is_symlink():
+                    os.chmod(path, 0o600)
+            shutil.rmtree(stage)
+        raise
 
 
 def _retention(app_dir: Path, *, apply: bool) -> int:
@@ -2100,6 +2532,8 @@ def parser() -> argparse.ArgumentParser:
     retention_parser = subparsers.add_parser("retention")
     retention_parser.add_argument("--app-dir", type=Path, default=APP_DIR)
     retention_parser.add_argument("--apply", action="store_true")
+    provider_parser = subparsers.add_parser("provider-recover")
+    provider_parser.add_argument("--runtime-source", type=Path, required=True)
     return command
 
 
@@ -2119,6 +2553,12 @@ def main(argv: list[str] | None = None) -> int:
                 rollback_transaction=args.rollback_transaction,
             )
             print(f"LIVE_QA_RUNTIME_RECONCILE status=passed source_sha={manifest['source_sha']}")
+        elif args.command == "provider-recover":
+            result = recover_provider(APP_DIR, args.runtime_source)
+            print(
+                "LIVE_QA_RUNTIME_PROVIDER_RECOVERY "
+                f"status={result['status']} source_sha={result['source_sha']}"
+            )
         else:
             removed = _retention(args.app_dir, apply=args.apply)
             print(f"LIVE_QA_RUNTIME_RETENTION status={'applied' if args.apply else 'preview'} removed={removed}")
