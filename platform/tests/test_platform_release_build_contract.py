@@ -294,6 +294,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         for name in (
             "platform_build_live_qa_runtime.py",
             "platform_live_qa_guard.py",
+            "platform_live_qa_machine_lock.py",
         ):
             destination = tools / name
             shutil.copyfile(TOOLS_DIR / name, destination)
