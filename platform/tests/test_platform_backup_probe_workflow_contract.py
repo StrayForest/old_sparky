@@ -920,6 +920,9 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         public_summary_region = self.source.split('public_report="$({', 1)[-1].split("failure_stage=private_capture_cleanup", 1)[0]
         self.assertIn('"scratch_phase_attribution": scratch_phase_attribution', private_record_region)
         self.assertNotIn("scratch_phase_attribution", public_summary_region)
+        self.assertIn('"scratch_cleanup_status": scratch_cleanup_status', private_record_region)
+        self.assertNotIn("scratch_cleanup_status", public_summary_region)
+        self.assertIn('{"confirmed", "failed", "unknown"}', self.source)
 
         worker_sites = frozenset({
             "worker_entry", "worker_start_token", "worker_root_identity", "worker_mount_snapshot",

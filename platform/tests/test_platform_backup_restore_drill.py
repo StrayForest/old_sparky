@@ -739,6 +739,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "ok": False,
                 "error": "fixed failure",
                 "scratch_host_guard_diagnostic": valid_host_guard,
+                "scratch_cleanup_status": "confirmed",
             },
             ensure_ascii=False,
             indent=2,
@@ -749,6 +750,22 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 truncated=False,
             ),
             valid_host_guard,
+        )
+        malformed_cleanup = json.dumps(
+            {
+                "ok": False,
+                "error": "fixed failure",
+                "scratch_host_guard_diagnostic": valid_host_guard,
+                "scratch_cleanup_status": "partial",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8") + b"\n"
+        self.assertIsNone(
+            backup_drill.parse_scratch_host_guard_failure_report(
+                malformed_cleanup,
+                truncated=False,
+            )
         )
         other_site_report = json.dumps(
             {
@@ -995,7 +1012,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         cleanup = RuntimeError("secondary private cleanup detail")
         self.assertIsNone(
             backup_drill._scratch_cleanup_failure(
-                first, [cleanup], authorization_probe=True
+                first,
+                [cleanup],
+                authorization_probe=True,
+                service_stopped=True,
+                mount_absent=True,
+                mountpoint_removed=False,
             )
         )
         self.assertEqual(first.scratch_first_fault, expected)
@@ -1006,9 +1028,26 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         )
         confirmed = RuntimeError("primary error")
         backup_drill._scratch_cleanup_failure(
-            confirmed, [], authorization_probe=True
+            confirmed,
+            [],
+            authorization_probe=False,
+            service_stopped=True,
+            mount_absent=True,
+            mountpoint_removed=True,
         )
         self.assertEqual(confirmed.scratch_cleanup_status, "confirmed")
+        cleanup_report = backup_drill.failure_report_for_exception(
+            confirmed, private_scratch_diagnostics=True
+        )
+        self.assertEqual(cleanup_report["scratch_cleanup_status"], "confirmed")
+        self.assertNotIn(
+            "scratch_cleanup_status",
+            backup_drill.failure_report_for_exception(
+                confirmed, private_scratch_diagnostics=False
+            ),
+        )
+        for invalid_status in (None, True, "partial", "Confirmed"):
+            self.assertFalse(backup_drill.valid_scratch_cleanup_status(invalid_status))
         self.assertEqual(
             backup_drill._scratch_exception_projection(
                 AttributeError("private detail")
@@ -3372,6 +3411,25 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         host_guard.assert_not_called()
 
     def test_isolated_restore_signal_cleanup_under_root(self) -> None:
+        initdb_command = backup_drill._scratch_initdb_command(
+            "/usr/lib/postgresql/16/bin/initdb",
+            pathlib.Path("/run/oldsparky-backup-restore-deadbeef/pgdata"),
+        )
+        self.assertEqual(
+            initdb_command,
+            [
+                "/usr/lib/postgresql/16/bin/initdb",
+                "--pgdata",
+                "/run/oldsparky-backup-restore-deadbeef/pgdata",
+                "--username=postgres",
+                "--no-locale",
+                "--encoding=UTF8",
+                "--set",
+                "shared_buffers=64MB",
+                "--auth-local=trust",
+                "--auth-host=reject",
+            ],
+        )
         self._assert_parent_active_poll_sampler_failure_preserves_guard_and_cleanup()
         self._assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db()
         self._assert_scratch_sigterm_stops_and_reaps_launched_unit()

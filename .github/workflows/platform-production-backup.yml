@@ -1122,6 +1122,7 @@ jobs:
           scratch_host_guard_diagnostic = None
           scratch_resource_attribution = None
           scratch_phase_attribution = None
+          scratch_cleanup_status = None
           host_guard_invalid = False
 
           def valid_resource_attribution(value):
@@ -1295,6 +1296,15 @@ jobs:
                       if "scratch_phase_attribution" in report:
                           if valid_phase_attribution(phase_attribution):
                               scratch_phase_attribution = phase_attribution
+                          else:
+                              report_state = "unclassified_json"
+                      if "scratch_cleanup_status" in report:
+                          cleanup_status = report.get("scratch_cleanup_status")
+                          if (
+                              type(cleanup_status) is str
+                              and cleanup_status in {"confirmed", "failed", "unknown"}
+                          ):
+                              scratch_cleanup_status = cleanup_status
                           else:
                               report_state = "unclassified_json"
                       fault_marker = b"SCRATCH_FIRST_FAULT_V1\n"
@@ -1753,6 +1763,7 @@ jobs:
                           backup_disk_diagnostic = None
                           scratch_first_fault = None
                           scratch_host_guard_diagnostic = None
+                          scratch_cleanup_status = None
                   elif isinstance(report, dict) and report.get("ok") is True:
                       report_state = "success_payload"
                   else:
@@ -1801,6 +1812,7 @@ jobs:
                   "scratch_first_fault": scratch_first_fault,
                   "scratch_resource_attribution": scratch_resource_attribution,
                   "scratch_phase_attribution": scratch_phase_attribution,
+                  "scratch_cleanup_status": scratch_cleanup_status,
                   "report_bytes": len(report_bytes),
                   "report_sha256": hashlib.sha256(report_bytes).hexdigest() if report_bytes else None,
                   "stderr_state": stderr_state,

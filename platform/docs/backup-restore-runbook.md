@@ -48,6 +48,11 @@ with at least 32 MiB headroom, swap remains disabled, and host `MemAvailable`
 stays at or above 1 GiB. It stops and reaps only the owned transient unit on a
 failed or unavailable sample. The monitor is sampled, so these margins are
 early-stop bounds rather than guarantees against a single allocation burst.
+A below-threshold refusal remains fail-closed. New private failure receipts may
+also report a closed `scratch_cleanup_status` value (`confirmed`, `failed`, or
+`unknown`) from the existing final cleanup checks. This optional field is not
+retroactive for older receipts and does not change the cleanup action or public
+workflow summary.
 A below-threshold host-memory guard retains a private closed schema-2
 diagnostic with the sampled `MemAvailable`, unchanged 1 GiB threshold and the
 source guard site. The sites distinguish parent checks before archive open,
@@ -66,6 +71,14 @@ identifies a guard observation, not its cause or sustained headroom.
 The legacy schema-1 admission receipt and its bounded best-effort RSS samples
 remain accepted unchanged. These diagnostics never change the 1 GiB guard and
 are excluded from public workflow output and artifacts.
+
+The isolated PostgreSQL 16 bootstrap sets `shared_buffers=64MB` through
+[`initdb --set`](https://www.postgresql.org/docs/16/app-initdb.html), matching
+the setting already passed to `pg_ctl`. This keeps the bootstrap and running
+server configuration aligned while preserving the
+existing durability, authentication, confinement and resource guards. It is a
+bounded memory-use candidate; it does not establish the cause of any prior
+reserve refusal.
 
 For a private failure during the parent active-poll guard, the root-private
 failure receipt may also contain the optional closed

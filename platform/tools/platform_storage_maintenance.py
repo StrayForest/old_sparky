@@ -69,6 +69,7 @@ try:
         valid_backup_disk_diagnostic,
         valid_scratch_admission_diagnostic,
         valid_scratch_host_guard_diagnostic,
+        valid_scratch_cleanup_status,
         valid_scratch_phase_attribution,
         valid_scratch_resource_attribution,
         valid_scratch_unit_diagnostic,
@@ -89,6 +90,7 @@ except ImportError:  # Direct execution from the tools directory.
         valid_backup_disk_diagnostic,
         valid_scratch_admission_diagnostic,
         valid_scratch_host_guard_diagnostic,
+        valid_scratch_cleanup_status,
         valid_scratch_phase_attribution,
         valid_scratch_resource_attribution,
         valid_scratch_unit_diagnostic,
@@ -266,6 +268,7 @@ class BackupCommandFailure(RuntimeError):
         scratch_first_fault: dict[str, Any] | None = None,
         scratch_resource_attribution: dict[str, Any] | None = None,
         scratch_phase_attribution: dict[str, Any] | None = None,
+        scratch_cleanup_status: str | None = None,
     ) -> None:
         self.restore_diagnostic = diagnostic
         self.backup_disk_diagnostic = backup_disk_diagnostic
@@ -275,6 +278,7 @@ class BackupCommandFailure(RuntimeError):
         self.scratch_first_fault = scratch_first_fault
         self.scratch_resource_attribution = scratch_resource_attribution
         self.scratch_phase_attribution = scratch_phase_attribution
+        self.scratch_cleanup_status = scratch_cleanup_status
         super().__init__("Platform backup failed.")
 
 
@@ -947,6 +951,12 @@ def _run_backup_command(
                 )
                 else None
             ),
+            (
+                result.get("scratch_cleanup_status")
+                if forward_failure_diagnostics
+                and valid_scratch_cleanup_status(result.get("scratch_cleanup_status"))
+                else None
+            ),
         )
     return result
 
@@ -1018,6 +1028,10 @@ def run_backup(
             report.get("scratch_phase_attribution")
             if private_failure_diagnostics
             and valid_scratch_phase_attribution(report.get("scratch_phase_attribution"))
+            else None,
+            report.get("scratch_cleanup_status")
+            if private_failure_diagnostics
+            and valid_scratch_cleanup_status(report.get("scratch_cleanup_status"))
             else None,
         ) from exc
 
@@ -2969,6 +2983,12 @@ def main() -> int:
                 and valid_scratch_phase_attribution(scratch_phase_attribution)
             ):
                 result["scratch_phase_attribution"] = scratch_phase_attribution
+            scratch_cleanup_status = getattr(exc, "scratch_cleanup_status", None)
+            if (
+                getattr(args, "private_backup_diagnostics", False)
+                and valid_scratch_cleanup_status(scratch_cleanup_status)
+            ):
+                result["scratch_cleanup_status"] = scratch_cleanup_status
             print(
                 json.dumps(result, ensure_ascii=False, indent=2)
             )

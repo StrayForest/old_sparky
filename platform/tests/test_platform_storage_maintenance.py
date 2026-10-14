@@ -1195,6 +1195,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         create_failure.scratch_host_guard_diagnostic = host_guard_diagnostic
         create_failure.scratch_resource_attribution = resource_attribution
         create_failure.scratch_phase_attribution = phase_attribution
+        create_failure.scratch_cleanup_status = "failed"
         create_failure.scratch_unit_private_output = (b"worker stdout", b"worker stderr")
         not_checked_after_failure = mock.Mock()
         public_stderr = io.StringIO()
@@ -1227,6 +1228,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIsNone(public_error.exception.scratch_host_guard_diagnostic)
         self.assertIsNone(public_error.exception.scratch_resource_attribution)
         self.assertIsNone(public_error.exception.scratch_phase_attribution)
+        self.assertIsNone(public_error.exception.scratch_cleanup_status)
         self.assertEqual(public_stderr.getvalue(), "")
 
         private_stderr = io.StringIO()
@@ -1265,6 +1267,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             private_error.exception.scratch_phase_attribution,
             phase_attribution,
         )
+        self.assertEqual(private_error.exception.scratch_cleanup_status, "failed")
         self.assertIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", private_stderr.getvalue())
         self.assertIn(
             maintenance.backup_restore_drill.SCRATCH_HOST_GUARD_FRAME_MARKER.decode("ascii"),
@@ -3941,7 +3944,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "report_error_class", "restore_diagnostic", "scratch_unit_diagnostic",
                     "scratch_admission_diagnostic", "scratch_host_guard_diagnostic",
                     "scratch_first_fault", "scratch_resource_attribution",
-                    "scratch_phase_attribution", "report_bytes",
+                    "scratch_phase_attribution", "scratch_cleanup_status", "report_bytes",
                     "backup_disk_diagnostic",
                     "report_sha256", "stderr_state",
                     "stderr_exception_class", "stderr_bytes", "stderr_sha256",
@@ -3956,6 +3959,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertIsNone(receipt["scratch_admission_diagnostic"])
             self.assertIsNone(receipt["scratch_host_guard_diagnostic"])
             self.assertIsNone(receipt["scratch_first_fault"])
+            self.assertIsNone(receipt["scratch_cleanup_status"])
             self.assertEqual(receipt["stderr_exception_class"], "none")
             self.assertNotIn("Current release symlink is missing", receipt_path.read_text())
             self.assertFalse(report_path.exists())
@@ -4028,6 +4032,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "observed_pair_rss_bytes": 27_000_000,
                             "observed_process_count": 2,
                         },
+                        "scratch_cleanup_status": "failed",
                     }
                 ),
                 encoding="ascii",
@@ -4069,6 +4074,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             typed_receipt = json.loads(typed_receipt_path.read_text(encoding="ascii"))
             self.assertEqual(typed_receipt["report_state"], "typed_failure")
             self.assertEqual(typed_receipt["report_error_class"], "backup")
+            self.assertEqual(typed_receipt["scratch_cleanup_status"], "failed")
             self.assertIsNone(typed_receipt["scratch_first_fault"])
             self.assertNotIn("1060000000", typed_completed.stdout)
             self.assertNotIn("27000000", typed_completed.stdout)

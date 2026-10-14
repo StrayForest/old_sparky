@@ -283,24 +283,37 @@ def _scratch_cleanup_failure(
     cleanup_errors: list[BaseException],
     *,
     authorization_probe: bool,
+    service_stopped: bool | None = None,
+    mount_absent: bool | None = None,
+    mountpoint_removed: bool | None = None,
 ) -> BaseException | None:
     """Keep cleanup status separate and never replace an existing first fault."""
+    observed_cleanup = (service_stopped, mount_absent, mountpoint_removed)
+    if all(type(value) is bool for value in observed_cleanup):
+        cleanup_status = (
+            "confirmed"
+            if all(observed_cleanup) and not cleanup_errors
+            else "failed"
+        )
+    elif cleanup_errors:
+        cleanup_status = "failed"
+    else:
+        cleanup_status = "unknown"
     if not cleanup_errors:
-        if primary_error is not None and authorization_probe:
-            setattr(primary_error, "scratch_cleanup_status", "confirmed")
+        if primary_error is not None:
+            setattr(primary_error, "scratch_cleanup_status", cleanup_status)
         return None
     if primary_error is not None:
-        if authorization_probe:
-            setattr(primary_error, "scratch_cleanup_status", "failed")
+        setattr(primary_error, "scratch_cleanup_status", cleanup_status)
         if hasattr(primary_error, "add_note"):
             primary_error.add_note("Scratch restore final cleanup also failed.")
         return None
     cleanup_error = RuntimeError(
         "Scratch restore unit or mount cleanup could not be confirmed."
     )
+    setattr(cleanup_error, "scratch_cleanup_status", cleanup_status)
     if authorization_probe:
         setattr(cleanup_error, "scratch_authorization_probe", True)
-        setattr(cleanup_error, "scratch_cleanup_status", "failed")
     _retain_first_scratch_fault(
         cleanup_error,
         origin="controller",
@@ -952,6 +965,11 @@ def valid_scratch_resource_attribution(value: Any) -> bool:
     return value["unknown_reason"] in _SCRATCH_RESOURCE_UNKNOWN_REASONS
 
 
+def valid_scratch_cleanup_status(value: Any) -> bool:
+    """Validate the closed, private cleanup outcome enum."""
+    return type(value) is str and value in {"confirmed", "failed", "unknown"}
+
+
 def parse_scratch_host_guard_frame(
     stderr: bytes, *, truncated: bool
 ) -> dict[str, Any] | None:
@@ -1019,6 +1037,7 @@ def parse_scratch_host_guard_failure_report(
         "scratch_unit_diagnostic",
         "scratch_admission_diagnostic",
         "scratch_host_guard_diagnostic",
+        "scratch_cleanup_status",
     }
     if (
         not isinstance(report, dict)
@@ -1028,6 +1047,10 @@ def parse_scratch_host_guard_failure_report(
         or type(report.get("error")) is not str
         or not valid_scratch_host_guard_diagnostic(
             report.get("scratch_host_guard_diagnostic")
+        )
+        or (
+            "scratch_cleanup_status" in report
+            and not valid_scratch_cleanup_status(report["scratch_cleanup_status"])
         )
     ):
         return None
@@ -1100,11 +1123,17 @@ def _parse_bound_scratch_first_fault(
             "scratch_unit_diagnostic", "scratch_admission_diagnostic",
             "scratch_host_guard_diagnostic", "scratch_first_fault",
             "scratch_phase_attribution",
+            "scratch_cleanup_status",
         }
     ):
         return None
     value = report.get("scratch_first_fault")
     if not valid_scratch_first_fault(value) or frame != value:
+        return None
+    if (
+        "scratch_cleanup_status" in report
+        and not valid_scratch_cleanup_status(report["scratch_cleanup_status"])
+    ):
         return None
     canonical_report = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
     if stdout != canonical_report:
@@ -3749,16 +3778,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         phase_observer,
         "initdb",
         lambda: as_postgres(
-            [
-                initdb,
-                "--pgdata",
-                str(pgdata),
-                "--username=postgres",
-                "--no-locale",
-                "--encoding=UTF8",
-                "--auth-local=trust",
-                "--auth-host=reject",
-            ],
+            _scratch_initdb_command(initdb, pgdata),
             capture_output=True,
         ),
     )
@@ -3961,6 +3981,22 @@ def _scratch_create_application_role(admin_target: DatabaseTarget) -> None:
         target=admin_target,
         capture_output=True,
     )
+
+
+def _scratch_initdb_command(initdb: str, pgdata: pathlib.Path) -> list[str]:
+    """Apply the same 64 MiB shared-buffer setting during bootstrap and runtime."""
+    return [
+        initdb,
+        "--pgdata",
+        str(pgdata),
+        "--username=postgres",
+        "--no-locale",
+        "--encoding=UTF8",
+        "--set",
+        "shared_buffers=64MB",
+        "--auth-local=trust",
+        "--auth-host=reject",
+    ]
 
 
 def _scratch_unit_command(
@@ -5268,6 +5304,9 @@ def _run_isolated_restore_drill(
                 sys.exc_info()[1],
                 final_cleanup_errors,
                 authorization_probe=authorization_probe,
+                service_stopped=service_stopped,
+                mount_absent=mount_absent,
+                mountpoint_removed=mountpoint_removed,
             )
             if cleanup_failure is not None:
                 raise cleanup_failure from final_cleanup_errors[0]
@@ -5659,6 +5698,9 @@ def failure_report_for_exception(
     phase_attribution = getattr(exc, "scratch_phase_attribution", None)
     if private_scratch_diagnostics and valid_scratch_phase_attribution(phase_attribution):
         report["scratch_phase_attribution"] = phase_attribution
+    cleanup_status = getattr(exc, "scratch_cleanup_status", None)
+    if private_scratch_diagnostics and valid_scratch_cleanup_status(cleanup_status):
+        report["scratch_cleanup_status"] = cleanup_status
     return report
 
 
