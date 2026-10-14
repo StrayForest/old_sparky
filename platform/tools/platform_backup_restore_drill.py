@@ -86,6 +86,18 @@ SCRATCH_DONE_TOKEN = b"OLDSPARKY_SCRATCH_RESTORE_DONE_V1\n"
 SCRATCH_APP_ROLE = "platform_user"
 SCRATCH_PRIVATE_OUTPUT_MARKER = b"SCRATCH_UNIT_PRIVATE_OUTPUT_V1\n"
 SCRATCH_FIRST_FAULT_MARKER = b"SCRATCH_FIRST_FAULT_V1\n"
+SCRATCH_PHASE_FRAME_MARKER = b"SCRATCH_PHASE_V1:"
+SCRATCH_PHASE_FRAME_MAX_BYTES = 192
+SCRATCH_PHASE_FRAME_MAX_COUNT = 12
+SCRATCH_PHASE_OFFSET_MAX_MS = (SCRATCH_RUNTIME_SECONDS + SCRATCH_STARTUP_SECONDS + 30) * 1000
+SCRATCH_PHASES = (
+    "archive_verify",
+    "initdb",
+    "postgres_start",
+    "restore_platform",
+    "restore_public",
+    "alembic_verify",
+)
 SCRATCH_PRIVATE_STDOUT_BYTES = 2 * 1024
 SCRATCH_PRIVATE_STDERR_BYTES = 32 * 1024
 SCRATCH_PRIVATE_RAW_BYTES = SCRATCH_PRIVATE_STDOUT_BYTES + SCRATCH_PRIVATE_STDERR_BYTES
@@ -545,6 +557,316 @@ def valid_scratch_host_guard_diagnostic(value: Any) -> bool:
 _SCRATCH_RESOURCE_UNKNOWN_REASONS = frozenset(
     {"sample_unavailable", "identity_drift", "parse_invalid", "cap_exceeded", "internal_error"}
 )
+_SCRATCH_PHASE_UNKNOWN_REASONS = frozenset(
+    {
+        "capture_unavailable",
+        "capture_prefix",
+        "incomplete",
+        "malformed",
+        "non_phase_bytes",
+        "truncated",
+        "internal_error",
+    }
+)
+
+
+def valid_scratch_phase_attribution(value: Any) -> bool:
+    """Validate closed, private phase-boundary observations."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "status", "unknown_reason", "controller_guard_offset_ms",
+        "controller_drain_offset_ms", "frames",
+    }:
+        return False
+    if (
+        type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or type(value.get("status")) is not str
+        or value["status"] not in {"complete", "unknown"}
+        or (
+            value.get("unknown_reason") is not None
+            and (
+                type(value["unknown_reason"]) is not str
+                or value["unknown_reason"] not in _SCRATCH_PHASE_UNKNOWN_REASONS
+            )
+        )
+    ):
+        return False
+    for key in ("controller_guard_offset_ms", "controller_drain_offset_ms"):
+        offset = value.get(key)
+        if offset is not None and (
+            type(offset) is not int or not 0 <= offset <= SCRATCH_PHASE_OFFSET_MAX_MS
+        ):
+            return False
+    if (value["controller_guard_offset_ms"] is None) != (
+        value["controller_drain_offset_ms"] is None
+    ):
+        return False
+    if (
+        value["controller_guard_offset_ms"] is not None
+        and value["controller_drain_offset_ms"] is not None
+        and value["controller_drain_offset_ms"] < value["controller_guard_offset_ms"]
+    ):
+        return False
+    frames = value.get("frames")
+    if not isinstance(frames, list) or len(frames) > SCRATCH_PHASE_FRAME_MAX_COUNT:
+        return False
+    expected = [
+        (phase, event)
+        for phase in SCRATCH_PHASES
+        for event in ("start", "end")
+    ]
+    previous_offset = -1
+    for index, frame in enumerate(frames):
+        if not isinstance(frame, dict) or set(frame) != {
+            "ordinal", "phase", "event", "worker_offset_ms",
+        }:
+            return False
+        if (
+            type(frame.get("ordinal")) is not int
+            or frame["ordinal"] != index + 1
+            or (frame.get("phase"), frame.get("event")) != expected[index]
+            or type(frame.get("worker_offset_ms")) is not int
+            or not 0 <= frame["worker_offset_ms"] <= SCRATCH_PHASE_OFFSET_MAX_MS
+            or frame["worker_offset_ms"] < previous_offset
+        ):
+            return False
+        previous_offset = frame["worker_offset_ms"]
+    if value["status"] == "complete":
+        return (
+            len(frames) == SCRATCH_PHASE_FRAME_MAX_COUNT
+            and value["unknown_reason"] is None
+        )
+    return value["unknown_reason"] in _SCRATCH_PHASE_UNKNOWN_REASONS
+
+
+def _scratch_unknown_phase_attribution(
+    reason: str,
+    *,
+    frames: list[dict[str, Any]] | None = None,
+    controller_guard_offset_ms: int | None = None,
+    controller_drain_offset_ms: int | None = None,
+) -> dict[str, Any]:
+    if reason not in _SCRATCH_PHASE_UNKNOWN_REASONS:
+        reason = "internal_error"
+    candidate = {
+        "schema": 1,
+        "status": "unknown",
+        "unknown_reason": reason,
+        "controller_guard_offset_ms": controller_guard_offset_ms,
+        "controller_drain_offset_ms": controller_drain_offset_ms,
+        "frames": frames if frames is not None else [],
+    }
+    return candidate if valid_scratch_phase_attribution(candidate) else {
+        "schema": 1,
+        "status": "unknown",
+        "unknown_reason": "internal_error",
+        "controller_guard_offset_ms": None,
+        "controller_drain_offset_ms": None,
+        "frames": [],
+    }
+
+
+def _scratch_phase_offset_ms(monotonic_ns: int | None, launch_monotonic_ns: int | None) -> int | None:
+    if (
+        type(monotonic_ns) is not int
+        or type(launch_monotonic_ns) is not int
+        or monotonic_ns < launch_monotonic_ns
+    ):
+        return None
+    offset = (monotonic_ns - launch_monotonic_ns) // 1_000_000
+    return offset if offset <= SCRATCH_PHASE_OFFSET_MAX_MS else None
+
+
+def _scratch_emit_phase_boundary(args: argparse.Namespace, phase: str, event: str) -> None:
+    """Emit one closed phase event to the existing private stderr pipe."""
+    if (
+        not getattr(args, "private_scratch_diagnostics", False)
+        or getattr(args, "_scratch_authorization_probe", False)
+    ):
+        return
+    ordinal = getattr(args, "_scratch_phase_ordinal", 0) + 1
+    if (
+        phase not in SCRATCH_PHASES
+        or event not in {"start", "end"}
+        or type(ordinal) is not int
+        or ordinal > SCRATCH_PHASE_FRAME_MAX_COUNT
+    ):
+        setattr(args, "_scratch_phase_emit_failed", True)
+        return
+    frame = {
+        "ordinal": ordinal,
+        "phase": phase,
+        "event": event,
+        "worker_offset_ms": _scratch_phase_offset_ms(
+            time.monotonic_ns(),
+            getattr(args, "_scratch_phase_origin_monotonic_ns", None),
+        ),
+    }
+    try:
+        if frame["worker_offset_ms"] is None:
+            setattr(args, "_scratch_phase_emit_failed", True)
+            return
+        encoded = (
+            SCRATCH_PHASE_FRAME_MARKER
+            + json.dumps(frame, separators=(",", ":"), sort_keys=True).encode("ascii")
+            + b"\n"
+        )
+        if len(encoded) > SCRATCH_PHASE_FRAME_MAX_BYTES:
+            setattr(args, "_scratch_phase_emit_failed", True)
+            return
+        stream = getattr(sys.stderr, "buffer", None)
+        if stream is None:
+            setattr(args, "_scratch_phase_emit_failed", True)
+            return
+        stream.write(encoded)
+        stream.flush()
+        setattr(args, "_scratch_phase_ordinal", ordinal)
+    except BaseException:
+        # Optional phase evidence must never replace the restore/guard result.
+        setattr(args, "_scratch_phase_emit_failed", True)
+
+
+def _scratch_run_observed_phase(
+    phase_observer: Callable[[str, str], None] | None,
+    phase: str,
+    operation: Callable[[], Any],
+) -> Any:
+    if phase_observer is not None:
+        phase_observer(phase, "start")
+    result = operation()
+    if phase_observer is not None:
+        phase_observer(phase, "end")
+    return result
+
+
+def _scratch_reject_duplicate_phase_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate phase frame key")
+        value[key] = item
+    return value
+
+
+def _scratch_parse_phase_attribution(
+    stderr: bytes,
+    *,
+    truncated: bool,
+    complete: bool,
+    launch_monotonic_ns: int | None,
+    controller_guard_monotonic_ns: int | None = None,
+    controller_drain_monotonic_ns: int | None = None,
+) -> dict[str, Any]:
+    guard_offset = _scratch_phase_offset_ms(
+        controller_guard_monotonic_ns, launch_monotonic_ns
+    )
+    drain_offset = _scratch_phase_offset_ms(
+        controller_drain_monotonic_ns, launch_monotonic_ns
+    )
+
+    def unknown(reason: str, frames: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        return _scratch_unknown_phase_attribution(
+            reason,
+            frames=frames,
+            controller_guard_offset_ms=guard_offset,
+            controller_drain_offset_ms=drain_offset,
+        )
+
+    if type(stderr) is not bytes or type(truncated) is not bool or type(complete) is not bool:
+        return unknown("malformed")
+    if truncated:
+        return unknown("truncated")
+    if not stderr:
+        return unknown("capture_unavailable")
+    if launch_monotonic_ns is None or type(launch_monotonic_ns) is not int:
+        return unknown("capture_unavailable")
+    lines = stderr.splitlines(keepends=True)
+    if not lines or len(lines) > SCRATCH_PHASE_FRAME_MAX_COUNT:
+        return unknown("malformed")
+    expected = [
+        (phase, event)
+        for phase in SCRATCH_PHASES
+        for event in ("start", "end")
+    ]
+    frames: list[dict[str, Any]] = []
+    previous_offset = -1
+    for index, line in enumerate(lines):
+        if not line.endswith(b"\n") or not line.startswith(SCRATCH_PHASE_FRAME_MARKER):
+            return unknown("non_phase_bytes", frames)
+        payload = line[len(SCRATCH_PHASE_FRAME_MARKER):-1]
+        if not payload or len(payload) > SCRATCH_PHASE_FRAME_MAX_BYTES:
+            return unknown("malformed")
+        try:
+            decoded = json.loads(
+                payload.decode("ascii"),
+                object_pairs_hook=_scratch_reject_duplicate_phase_keys,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return unknown("malformed", frames)
+        except ValueError:
+            return unknown("malformed", frames)
+        if (
+            not isinstance(decoded, dict)
+            or set(decoded) != {"ordinal", "phase", "event", "worker_offset_ms"}
+            or type(decoded.get("ordinal")) is not int
+            or decoded["ordinal"] != index + 1
+            or (decoded.get("phase"), decoded.get("event")) != expected[index]
+            or type(decoded.get("worker_offset_ms")) is not int
+            or not 0 <= decoded["worker_offset_ms"] <= SCRATCH_PHASE_OFFSET_MAX_MS
+            or decoded["worker_offset_ms"] < previous_offset
+        ):
+            return unknown("malformed", frames)
+        if json.dumps(decoded, separators=(",", ":"), sort_keys=True).encode("ascii") != payload:
+            return unknown("malformed", frames)
+        previous_offset = decoded["worker_offset_ms"]
+        frames.append(
+            {
+                "ordinal": decoded["ordinal"],
+                "phase": decoded["phase"],
+                "event": decoded["event"],
+                "worker_offset_ms": decoded["worker_offset_ms"],
+            }
+        )
+    if complete and len(frames) == SCRATCH_PHASE_FRAME_MAX_COUNT:
+        candidate = {
+            "schema": 1,
+            "status": "complete",
+            "unknown_reason": None,
+            "controller_guard_offset_ms": guard_offset,
+            "controller_drain_offset_ms": drain_offset,
+            "frames": frames,
+        }
+        return candidate if valid_scratch_phase_attribution(candidate) else unknown("malformed")
+    return unknown("capture_prefix" if not complete else "incomplete", frames)
+
+
+def _scratch_success_stderr_accepted(
+    stderr_prefix: bytes,
+    *,
+    observed_bytes: int,
+    stderr_eof: bool,
+    private_diagnostics: bool,
+    authorization_probe: bool,
+    launch_monotonic_ns: int | None,
+) -> bool:
+    """Keep legacy empty-stderr success except for the opt-in restore phase stream."""
+    if type(observed_bytes) is not int or observed_bytes < 0 or type(stderr_eof) is not bool:
+        return False
+    if observed_bytes == 0 and not stderr_prefix and stderr_eof:
+        return True
+    if authorization_probe or not private_diagnostics:
+        return False
+    phase = _scratch_parse_phase_attribution(
+        stderr_prefix,
+        truncated=observed_bytes > len(stderr_prefix),
+        complete=stderr_eof,
+        launch_monotonic_ns=launch_monotonic_ns,
+    )
+    return (
+        observed_bytes > 0
+        and valid_scratch_phase_attribution(phase)
+        and phase.get("status") == "complete"
+    )
 
 
 def valid_scratch_resource_attribution(value: Any) -> bool:
@@ -777,6 +1099,7 @@ def _parse_bound_scratch_first_fault(
             "ok", "error", "restore_diagnostic", "backup_disk_diagnostic",
             "scratch_unit_diagnostic", "scratch_admission_diagnostic",
             "scratch_host_guard_diagnostic", "scratch_first_fault",
+            "scratch_phase_attribution",
         }
     ):
         return None
@@ -2320,6 +2643,7 @@ def perform_restore_drill(
     restore_no_tablespaces: bool = False,
     resource_guard: Callable[[], None] | None = None,
     capture_private_output: bool = False,
+    phase_observer: Callable[[str, str], None] | None = None,
 ) -> int:
     drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
     use_local_admin = (
@@ -2404,12 +2728,16 @@ def perform_restore_drill(
                 archive_stdin.seek(0)
             if restore_as_postgres:
                 restore_command = ["runuser", "-u", "postgres", "--", *restore_command]
-            run_restore_command(
-                restore_command,
-                target=restore_target,
-                stdin_handle=archive_stdin,
-                resource_guard=resource_guard,
-                capture_private_output=capture_private_output,
+            _scratch_run_observed_phase(
+                phase_observer,
+                "restore_platform" if selector == ("--schema=platform",) else "restore_public",
+                lambda: run_restore_command(
+                    restore_command,
+                    target=restore_target,
+                    stdin_handle=archive_stdin,
+                    resource_guard=resource_guard,
+                    capture_private_output=capture_private_output,
+                ),
             )
         failure_stage = "validate_table_count"
         table_count_result = run_command(
@@ -2445,22 +2773,34 @@ def perform_restore_drill(
         if connectivity_result.stdout.strip() != "1":
             raise RuntimeError("Restore drill connectivity verification failed.")
         failure_stage = "validate_revision"
-        revision_result = run_command(
-            [
-                "psql",
-                "--no-psqlrc",
-                "--tuples-only",
-                "--no-align",
-                *connection_args(restore_target),
-                "--command",
-                "SELECT version_num FROM public.alembic_version;",
-            ],
-            target=restore_target,
-            capture_output=True,
+        def verify_alembic_revision() -> list[str]:
+            revision_result = run_command(
+                [
+                    "psql",
+                    "--no-psqlrc",
+                    "--tuples-only",
+                    "--no-align",
+                    *connection_args(restore_target),
+                    "--command",
+                    "SELECT version_num FROM public.alembic_version;",
+                ],
+                target=restore_target,
+                capture_output=True,
+            )
+            revisions = [
+                line.strip() for line in revision_result.stdout.splitlines() if line.strip()
+            ]
+            if len(revisions) != 1:
+                raise RuntimeError(
+                    "Restore drill did not recover exactly one Alembic revision."
+                )
+            return revisions
+
+        _scratch_run_observed_phase(
+            phase_observer,
+            "alembic_verify",
+            verify_alembic_revision,
         )
-        revisions = [line.strip() for line in revision_result.stdout.splitlines() if line.strip()]
-        if len(revisions) != 1:
-            raise RuntimeError("Restore drill did not recover exactly one Alembic revision.")
         failure_stage = "validate_extensions"
         extension_count_result = run_command(
             [
@@ -3355,12 +3695,23 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         if completion != SCRATCH_DONE_TOKEN:
             raise RuntimeError("Scratch authorization probe completion was not acknowledged.")
         return 0
+    args._scratch_phase_origin_monotonic_ns = time.monotonic_ns()
     args._scratch_fault_site = "worker_archive_open"
-    archive = _open_verified_scratch_archive(args)
-    archive_info = os.fstat(archive.fileno())
-    if (archive_info.st_dev, archive_info.st_ino) != (args._scratch_archive_dev, args._scratch_archive_ino):
-        archive.close()
-        raise RuntimeError("Scratch restore archive bind identity does not match.")
+    def verify_archive() -> BinaryIO:
+        opened_archive = _open_verified_scratch_archive(args)
+        archive_info = os.fstat(opened_archive.fileno())
+        if (archive_info.st_dev, archive_info.st_ino) != (
+            args._scratch_archive_dev, args._scratch_archive_ino
+        ):
+            opened_archive.close()
+            raise RuntimeError("Scratch restore archive bind identity does not match.")
+        return opened_archive
+
+    archive = _scratch_run_observed_phase(
+        lambda phase, event: _scratch_emit_phase_boundary(args, phase, event),
+        "archive_verify",
+        verify_archive,
+    )
 
     postgres = pwd.getpwnam("postgres")
     args._scratch_fault_site = "worker_directory_setup"
@@ -3390,18 +3741,26 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     pgctl = str(bindir / "pg_ctl")
     initdb = str(bindir / "initdb")
     args._scratch_fault_site = "worker_initdb"
-    as_postgres(
-        [
-            initdb,
-            "--pgdata",
-            str(pgdata),
-            "--username=postgres",
-            "--no-locale",
-            "--encoding=UTF8",
-            "--auth-local=trust",
-            "--auth-host=reject",
-        ],
-        capture_output=True,
+
+    def phase_observer(phase: str, event: str) -> None:
+        _scratch_emit_phase_boundary(args, phase, event)
+
+    _scratch_run_observed_phase(
+        phase_observer,
+        "initdb",
+        lambda: as_postgres(
+            [
+                initdb,
+                "--pgdata",
+                str(pgdata),
+                "--username=postgres",
+                "--no-locale",
+                "--encoding=UTF8",
+                "--auth-local=trust",
+                "--auth-host=reject",
+            ],
+            capture_output=True,
+        ),
     )
     started = False
     primary_error: BaseException | None = None
@@ -3438,10 +3797,14 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
             ]
         )
         args._scratch_fault_site = "worker_postgres_start"
-        as_postgres(
-            [pgctl, "--pgdata", str(pgdata), "--log", str(pglog), "--options", server_options,
-             "--wait", "--timeout=30", "start"],
-            capture_output=True,
+        _scratch_run_observed_phase(
+            phase_observer,
+            "postgres_start",
+            lambda: as_postgres(
+                [pgctl, "--pgdata", str(pgdata), "--log", str(pglog), "--options", server_options,
+                 "--wait", "--timeout=30", "start"],
+                capture_output=True,
+            ),
         )
         started = True
         args._scratch_fault_site = "worker_after_postgres_start_guard"
@@ -3478,6 +3841,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
             restore_no_tablespaces=True,
             resource_guard=pg_restore_resource_guard,
             capture_private_output=getattr(args, "private_scratch_diagnostics", False),
+            phase_observer=phase_observer,
         )
         args._scratch_fault_site = "worker_after_restore_guard"
         _scratch_resource_guard(
@@ -3775,6 +4139,40 @@ def _scratch_drain_early_exit_output(
         if stream is not None:
             selector.unregister(stream)
     return complete, stdout_observed, stderr_observed
+
+
+def _scratch_drain_phase_prefix_now(
+    process: subprocess.Popen[bytes],
+    stderr_buffer: bytearray,
+    stderr_observed: int,
+) -> tuple[int, bool]:
+    """Take one immediate, nonblocking, bounded stderr prefix before stopping."""
+    stream = process.stderr
+    if stream is None:
+        return stderr_observed, False
+    drained = 0
+    eof = False
+    while drained <= SCRATCH_PRIVATE_STDERR_BYTES:
+        remaining_total = 65536 - stderr_observed
+        budget = min(SCRATCH_PRIVATE_STDERR_BYTES + 1 - drained, remaining_total)
+        if budget <= 0:
+            break
+        try:
+            block = os.read(stream.fileno(), min(4096, budget))
+        except BlockingIOError:
+            break
+        except OSError:
+            break
+        if not block:
+            eof = True
+            break
+        drained += len(block)
+        stderr_observed += len(block)
+        if len(stderr_buffer) < SCRATCH_PRIVATE_STDERR_BYTES:
+            stderr_buffer.extend(block[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
+        if drained > SCRATCH_PRIVATE_STDERR_BYTES:
+            break
+    return stderr_observed, eof
 
 
 def _scratch_control_group_snapshot(control_group: str) -> dict[str, int]:
@@ -4228,11 +4626,16 @@ def _run_isolated_restore_drill(
         identity_checks_passed = False
         terminal_snapshot: dict[str, Any] | None = None
         selector: selectors.BaseSelector | None = None
+        stderr_eof = False
         launch_started = False
         launch_monotonic_ns: int | None = None
         last_tick = time.monotonic()
         deadline = last_tick + SCRATCH_RUNTIME_SECONDS + 30
         worker_result: dict[str, Any] | None = None
+        phase_prefix: bytes | None = None
+        phase_prefix_observed: int | None = None
+        phase_guard_monotonic_ns: int | None = None
+        phase_drain_monotonic_ns: int | None = None
         blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
         setup_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
         try:
@@ -4294,13 +4697,32 @@ def _run_isolated_restore_drill(
                 try:
                     _scratch_host_guard("parent_active_poll")
                 except BaseException as guard_error:
+                    guard_diagnostic = getattr(
+                        guard_error, "scratch_host_guard_diagnostic", None
+                    )
                     if (
                         private_scratch_diagnostics
-                        and valid_scratch_host_guard_diagnostic(
-                            getattr(guard_error, "scratch_host_guard_diagnostic", None)
-                        )
-                        and getattr(guard_error, "scratch_host_guard_diagnostic", {}).get("guard_site")
-                        == "parent_active_poll"
+                        and valid_scratch_host_guard_diagnostic(guard_diagnostic)
+                        and guard_diagnostic.get("guard_site") == "parent_active_poll"
+                    ):
+                        # Freeze only bytes already available at this stop boundary.
+                        # This read is nonblocking and completes before _scratch_stop_unit.
+                        phase_guard_monotonic_ns = time.monotonic_ns()
+                        try:
+                            if process is not None:
+                                stderr_size, _phase_prefix_eof = _scratch_drain_phase_prefix_now(
+                                    process, stderr_buffer, stderr_size
+                                )
+                                phase_prefix = bytes(stderr_buffer)
+                                phase_prefix_observed = stderr_size
+                        except BaseException:
+                            phase_prefix = None
+                            phase_prefix_observed = None
+                        phase_drain_monotonic_ns = time.monotonic_ns()
+                    if (
+                        private_scratch_diagnostics
+                        and valid_scratch_host_guard_diagnostic(guard_diagnostic)
+                        and guard_diagnostic.get("guard_site") == "parent_active_poll"
                     ):
                         try:
                             attribution = _scratch_private_resource_attribution(
@@ -4450,6 +4872,8 @@ def _run_isolated_restore_drill(
                         continue
                     if not data:
                         selector.unregister(key.fileobj)
+                        if key.data == "stderr":
+                            stderr_eof = True
                     elif key.data == "stdout":
                         stdout_observed += len(data)
                         stdout_buffer.extend(data)
@@ -4540,6 +4964,8 @@ def _run_isolated_restore_drill(
                         except BlockingIOError:
                             break
                         if not data:
+                            if stream is process.stderr:
+                                stderr_eof = True
                             break
                         if stream is process.stdout:
                             stdout_observed += len(data)
@@ -4552,7 +4978,15 @@ def _run_isolated_restore_drill(
                                 stderr_buffer.extend(data[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
                         if stderr_size > 65536:
                             raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
-            if return_code != 0 or stderr_size != 0:
+            stderr_accepted = _scratch_success_stderr_accepted(
+                bytes(stderr_buffer),
+                observed_bytes=stderr_size,
+                stderr_eof=stderr_eof,
+                private_diagnostics=private_scratch_diagnostics,
+                authorization_probe=authorization_probe,
+                launch_monotonic_ns=launch_monotonic_ns,
+            )
+            if return_code != 0 or not stderr_accepted:
                 try:
                     final_snapshot = _scratch_service_snapshot(unit_name)
                 except BaseException as snapshot_error:
@@ -4731,6 +5165,32 @@ def _run_isolated_restore_drill(
                     # drain/parser must not replace the first operation error;
                     # the controller projection captured above remains usable.
                     pass
+            if private_scratch_diagnostics and phase_guard_monotonic_ns is not None:
+                try:
+                    phase_observation = _scratch_parse_phase_attribution(
+                        phase_prefix if phase_prefix is not None else b"",
+                        truncated=(
+                            phase_prefix is not None
+                            and phase_prefix_observed is not None
+                            and phase_prefix_observed > len(phase_prefix)
+                        ),
+                        complete=False,
+                        launch_monotonic_ns=launch_monotonic_ns,
+                        controller_guard_monotonic_ns=phase_guard_monotonic_ns,
+                        controller_drain_monotonic_ns=phase_drain_monotonic_ns,
+                    )
+                except BaseException:
+                    phase_observation = _scratch_unknown_phase_attribution(
+                        "internal_error",
+                        controller_guard_offset_ms=_scratch_phase_offset_ms(
+                            phase_guard_monotonic_ns, launch_monotonic_ns
+                        ),
+                        controller_drain_offset_ms=_scratch_phase_offset_ms(
+                            phase_drain_monotonic_ns, launch_monotonic_ns
+                        ),
+                    )
+                if valid_scratch_phase_attribution(phase_observation):
+                    setattr(operation_error, "scratch_phase_attribution", phase_observation)
             for cleanup_error in cleanup_errors:
                 if hasattr(operation_error, "add_note"):
                     operation_error.add_note(
@@ -5196,6 +5656,9 @@ def failure_report_for_exception(
         and valid_scratch_resource_attribution(resource_attribution)
     ):
         report["scratch_resource_attribution"] = resource_attribution
+    phase_attribution = getattr(exc, "scratch_phase_attribution", None)
+    if private_scratch_diagnostics and valid_scratch_phase_attribution(phase_attribution):
+        report["scratch_phase_attribution"] = phase_attribution
     return report
 
 

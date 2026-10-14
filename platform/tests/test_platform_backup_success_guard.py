@@ -708,6 +708,150 @@ class BackupSuccessGuardTests(unittest.TestCase):
                 run_updated=backup_guard._parse_time(_gh_time("19:10:00"), "update"),
             )
 
+        # Exact captured push row for the conditionally dispatched internal
+        # baseline authentication job. Preserve the API's explicit null runner
+        # fields and empty steps array; do not infer a no-runner result from
+        # missing keys or other falsey values.
+        actual_auth_skip = {
+            "id": 115_748_756_505,
+            "run_id": 38_532_904_677,
+            "run_attempt": 1,
+            "head_sha": "f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+            "name": backup_guard.SECURITY_BASELINE_RUNTIME_JOB_NAME,
+            "status": "completed",
+            "conclusion": "skipped",
+            "started_at": "2026-10-14T08:07:21Z",
+            "completed_at": "2026-10-14T08:07:20Z",
+            "steps": [],
+            "runner_id": None,
+            "runner_name": None,
+            "runner_group_id": None,
+            "runner_group_name": None,
+        }
+        run_started = backup_guard._parse_time("2026-10-14T08:07:20Z", "start")
+        run_updated = backup_guard._parse_time("2026-10-14T08:19:10Z", "update")
+        older_executed_job = {
+            "id": 115_748_756_504,
+            "run_id": 38_532_904_677,
+            "run_attempt": 1,
+            "head_sha": "f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+            "name": "Earlier executed security job",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-10-14T08:07:20Z",
+            "completed_at": "2026-10-14T08:07:20Z",
+        }
+        auth_completion = backup_guard._validate_attempt_jobs(
+            [older_executed_job, actual_auth_skip],
+            run_id="38532904677",
+            run_attempt="1",
+            source_sha="f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+            source_event="push",
+            run_started=run_started,
+            run_updated=run_updated,
+        )
+        self.assertEqual(
+            backup_guard._validate_attempt_jobs(
+                [actual_auth_skip],
+                run_id="38532904677",
+                run_attempt="1",
+                source_sha="f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+                source_event="push",
+                run_started=run_started,
+                run_updated=run_updated,
+            ),
+            backup_guard._parse_time("2026-10-14T08:07:20Z", "completion"),
+        )
+        self.assertEqual(
+            auth_completion,
+            backup_guard._parse_time("2026-10-14T08:07:20Z", "completion"),
+        )
+        null_steps_auth_skip = dict(actual_auth_skip, id=115_748_756_506, steps=None)
+        self.assertEqual(
+            backup_guard._validate_attempt_jobs(
+                [null_steps_auth_skip],
+                run_id="38532904677",
+                run_attempt="1",
+                source_sha="f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+                source_event="push",
+                run_started=run_started,
+                run_updated=run_updated,
+            ),
+            backup_guard._parse_time("2026-10-14T08:07:20Z", "completion"),
+        )
+
+        security_workflow = (
+            Path(__file__).resolve().parents[2] / SECURITY_WORKFLOW
+        ).read_text(encoding="utf-8")
+        auth_job_source = security_workflow.split("  baseline-runtime-guard:", 1)[1].split(
+            "  status-start:", 1
+        )[0]
+        self.assertIn(
+            "if: ${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime' }}",
+            auth_job_source,
+        )
+
+        auth_rejections: list[dict[str, Any]] = [
+            dict(actual_auth_skip, name="status-final"),
+            dict(actual_auth_skip, steps=[{"name": "unexpected step"}]),
+            dict(actual_auth_skip, runner_id=0),
+            dict(actual_auth_skip, runner_name=""),
+            dict(actual_auth_skip, runner_group_id=0),
+            dict(actual_auth_skip, runner_group_name=""),
+            dict(actual_auth_skip, conclusion="success"),
+            dict(actual_auth_skip, status="in_progress"),
+            dict(actual_auth_skip, started_at="2026-10-14T08:07:19Z"),
+            dict(actual_auth_skip, completed_at="2026-10-14T08:19:11Z"),
+        ]
+        missing_steps = dict(actual_auth_skip)
+        missing_steps.pop("steps")
+        auth_rejections.append(missing_steps)
+        for runner_field in (
+            "runner_id",
+            "runner_name",
+            "runner_group_id",
+            "runner_group_name",
+        ):
+            missing_runner = dict(actual_auth_skip)
+            missing_runner.pop(runner_field)
+            auth_rejections.append(missing_runner)
+        for row in auth_rejections:
+            with self.subTest(auth_skip_row=row), self.assertRaises(
+                backup_guard.BackupProofError
+            ):
+                backup_guard._validate_attempt_jobs(
+                    [row],
+                    run_id="38532904677",
+                    run_attempt="1",
+                    source_sha="f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+                    source_event="push",
+                    run_started=run_started,
+                    run_updated=run_updated,
+                )
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard._validate_attempt_jobs(
+                [actual_auth_skip],
+                run_id="38532904677",
+                run_attempt="1",
+                source_sha="f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+                source_event="workflow_dispatch",
+                run_started=run_started,
+                run_updated=run_updated,
+            )
+        with self.assertRaisesRegex(
+            backup_guard.BackupProofError,
+            "attempt job timestamps are inconsistent with its exact run",
+        ):
+            backup_guard._validate_attempt_jobs(
+                [dict(actual_auth_skip, conclusion="success")],
+                run_id="38532904677",
+                run_attempt="1",
+                source_sha="f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+                source_event="push",
+                run_started=run_started,
+                run_updated=run_updated,
+            )
+
     def test_workflow_and_backup_run_attempt_identity_are_bound(self) -> None:
         backup_workflow = (Path(__file__).resolve().parents[2] / BACKUP_WORKFLOW).read_text(
             encoding="utf-8"

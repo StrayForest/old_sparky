@@ -293,6 +293,21 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             str(WORKFLOW),
             "exec",
         )
+        phase_validator = next(
+            (
+                node
+                for node in ast.walk(legacy_tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "valid_phase_attribution"
+            ),
+            None,
+        )
+        if phase_validator is None:
+            raise AssertionError("could not find the closed private phase-attribution validator")
+        cls.phase_validator = compile(
+            ast.fix_missing_locations(ast.Module(body=[phase_validator], type_ignores=[])),
+            str(WORKFLOW),
+            "exec",
+        )
         probe_tree = ast.parse(handler)
         cls.probe_first_fault_sites = _literal_set_assignment(probe_tree, "sites")
         cls.probe_host_guard_sites = _literal_set_assignment(probe_tree, "host_guard_sites")
@@ -326,6 +341,11 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         namespace = {}
         exec(self.resource_validator, namespace)
         return namespace["valid_resource_attribution"](value)
+
+    def _workflow_phase_attribution_valid(self, value) -> bool:
+        namespace = {}
+        exec(self.phase_validator, namespace)
+        return namespace["valid_phase_attribution"](value)
 
     def _report(self, status: str = "completed", *, first_fault=None, host_guard=None, extra: dict | None = None) -> bytes:
         if status == "completed":
@@ -854,6 +874,53 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self._assert_probe_receipt_failure_keeps_only_pending_projection()
 
     def test_first_fault_is_closed_frame_bound_private_data(self) -> None:
+        phase_names = (
+            "archive_verify", "initdb", "postgres_start", "restore_platform",
+            "restore_public", "alembic_verify",
+        )
+        complete_phase = {
+            "schema": 1,
+            "status": "complete",
+            "unknown_reason": None,
+            "controller_guard_offset_ms": None,
+            "controller_drain_offset_ms": None,
+            "frames": [
+                {
+                    "ordinal": index + 1,
+                    "phase": phase,
+                    "event": event,
+                    "worker_offset_ms": index,
+                }
+                for index, (phase, event) in enumerate(
+                    (item for phase in phase_names for item in ((phase, "start"), (phase, "end")))
+                )
+            ],
+        }
+        self.assertTrue(self._workflow_phase_attribution_valid(complete_phase))
+        prefix_phase = {
+            **complete_phase,
+            "status": "unknown",
+            "unknown_reason": "capture_prefix",
+            "controller_guard_offset_ms": 4,
+            "controller_drain_offset_ms": 5,
+            "frames": complete_phase["frames"][:4],
+        }
+        self.assertTrue(self._workflow_phase_attribution_valid(prefix_phase))
+        for malformed_phase in (
+            {**complete_phase, "status": "unknown"},
+            {**complete_phase, "unknown_reason": "unrecognized"},
+            {**prefix_phase, "controller_drain_offset_ms": 3},
+            {**prefix_phase, "frames": [{**prefix_phase["frames"][0], "worker_offset_ms": True}] + prefix_phase["frames"][1:]},
+            {**prefix_phase, "frames": prefix_phase["frames"] + [{"ordinal": 5, "phase": "restore_public", "event": "start", "worker_offset_ms": 2}]},
+            {**complete_phase, "unexpected": True},
+        ):
+            with self.subTest(phase_attribution=malformed_phase):
+                self.assertFalse(self._workflow_phase_attribution_valid(malformed_phase))
+        private_record_region = self.source.split('"event": "platform_backup_failure"', 1)[-1].split('encoded = (json.dumps(record', 1)[0]
+        public_summary_region = self.source.split('public_report="$({', 1)[-1].split("failure_stage=private_capture_cleanup", 1)[0]
+        self.assertIn('"scratch_phase_attribution": scratch_phase_attribution', private_record_region)
+        self.assertNotIn("scratch_phase_attribution", public_summary_region)
+
         worker_sites = frozenset({
             "worker_entry", "worker_start_token", "worker_root_identity", "worker_mount_snapshot",
             "worker_cgroup_snapshot", "worker_host_reserve", "worker_archive_open",

@@ -1119,6 +1119,7 @@ jobs:
           scratch_first_fault = None
           scratch_host_guard_diagnostic = None
           scratch_resource_attribution = None
+          scratch_phase_attribution = None
           host_guard_invalid = False
 
           def valid_resource_attribution(value):
@@ -1206,6 +1207,63 @@ jobs:
                   "cap_exceeded", "internal_error",
               }
 
+          def valid_phase_attribution(value):
+              if (
+                  not isinstance(value, dict)
+                  or set(value) != {
+                      "schema", "status", "unknown_reason", "controller_guard_offset_ms",
+                      "controller_drain_offset_ms", "frames",
+                  }
+                  or type(value.get("schema")) is not int
+                  or value["schema"] != 1
+                  or type(value.get("status")) is not str
+                  or value["status"] not in {"complete", "unknown"}
+              ):
+                  return False
+              reasons = {
+                  "capture_unavailable", "capture_prefix", "incomplete", "malformed",
+                  "non_phase_bytes", "truncated", "internal_error",
+              }
+              reason = value.get("unknown_reason")
+              if reason is not None and (type(reason) is not str or reason not in reasons):
+                  return False
+              guard_offset = value.get("controller_guard_offset_ms")
+              drain_offset = value.get("controller_drain_offset_ms")
+              for offset in (guard_offset, drain_offset):
+                  if offset is not None and (
+                      type(offset) is not int or not 0 <= offset <= 960_000
+                  ):
+                      return False
+              if (guard_offset is None) != (drain_offset is None):
+                  return False
+              if guard_offset is not None and drain_offset < guard_offset:
+                  return False
+              frames = value.get("frames")
+              if not isinstance(frames, list) or len(frames) > 12:
+                  return False
+              phases = (
+                  "archive_verify", "initdb", "postgres_start", "restore_platform",
+                  "restore_public", "alembic_verify",
+              )
+              expected = [(phase, event) for phase in phases for event in ("start", "end")]
+              previous = -1
+              for index, frame in enumerate(frames):
+                  if (
+                      not isinstance(frame, dict)
+                      or set(frame) != {"ordinal", "phase", "event", "worker_offset_ms"}
+                      or type(frame.get("ordinal")) is not int
+                      or frame["ordinal"] != index + 1
+                      or (frame.get("phase"), frame.get("event")) != expected[index]
+                      or type(frame.get("worker_offset_ms")) is not int
+                      or not 0 <= frame["worker_offset_ms"] <= 960_000
+                      or frame["worker_offset_ms"] < previous
+                  ):
+                      return False
+                  previous = frame["worker_offset_ms"]
+              if value["status"] == "complete":
+                  return len(frames) == 12 and reason is None
+              return reason in reasons
+
           if report_state == "read":
               try:
                   report = json.loads(
@@ -1229,6 +1287,12 @@ jobs:
                       if "scratch_resource_attribution" in report:
                           if valid_resource_attribution(resource_attribution):
                               scratch_resource_attribution = resource_attribution
+                          else:
+                              report_state = "unclassified_json"
+                      phase_attribution = report.get("scratch_phase_attribution")
+                      if "scratch_phase_attribution" in report:
+                          if valid_phase_attribution(phase_attribution):
+                              scratch_phase_attribution = phase_attribution
                           else:
                               report_state = "unclassified_json"
                       fault_marker = b"SCRATCH_FIRST_FAULT_V1\n"
@@ -1734,6 +1798,7 @@ jobs:
                   "scratch_host_guard_diagnostic": scratch_host_guard_diagnostic,
                   "scratch_first_fault": scratch_first_fault,
                   "scratch_resource_attribution": scratch_resource_attribution,
+                  "scratch_phase_attribution": scratch_phase_attribution,
                   "report_bytes": len(report_bytes),
                   "report_sha256": hashlib.sha256(report_bytes).hexdigest() if report_bytes else None,
                   "stderr_state": stderr_state,

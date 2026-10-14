@@ -1108,6 +1108,220 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._assert_scratch_resource_attribution_is_identity_bound_and_private()
         self._assert_scratch_resource_attribution_fails_closed_on_identity_and_parser_errors()
 
+        class PhaseStderr:
+            def __init__(self) -> None:
+                self.buffer = self
+                self._bytes = io.BytesIO()
+                self.flush_count = 0
+
+            def write(self, value: bytes) -> int:
+                return self._bytes.write(value)
+
+            def flush(self) -> None:
+                self.flush_count += 1
+
+            def getvalue(self) -> bytes:
+                return self._bytes.getvalue()
+
+        phase_stderr = PhaseStderr()
+        phase_origin = 100_000_000
+        phase_args = argparse.Namespace(
+            private_scratch_diagnostics=True,
+            _scratch_authorization_probe=False,
+            _scratch_phase_origin_monotonic_ns=phase_origin,
+        )
+        phase_times = iter(phase_origin + index * 1_000_000 for index in range(12))
+        with mock.patch.object(backup_drill.sys, "stderr", phase_stderr), mock.patch.object(
+            backup_drill.time, "monotonic_ns", side_effect=lambda: next(phase_times)
+        ):
+            for phase in backup_drill.SCRATCH_PHASES:
+                for event in ("start", "end"):
+                    backup_drill._scratch_emit_phase_boundary(phase_args, phase, event)
+        phase_bytes = phase_stderr.buffer.getvalue()
+        self.assertEqual(phase_stderr.flush_count, 12)
+        self.assertFalse(getattr(phase_args, "_scratch_phase_emit_failed", False))
+        complete_phase = backup_drill._scratch_parse_phase_attribution(
+            phase_bytes,
+            truncated=False,
+            complete=True,
+            launch_monotonic_ns=900_000_000,
+        )
+        self.assertTrue(backup_drill.valid_scratch_phase_attribution(complete_phase))
+        self.assertEqual(complete_phase["status"], "complete")
+        self.assertEqual(complete_phase["frames"][0]["worker_offset_ms"], 0)
+        self.assertEqual(complete_phase["frames"][-1]["worker_offset_ms"], 11)
+        prefix_bytes = b"".join(phase_bytes.splitlines(keepends=True)[:4])
+        self.assertTrue(
+            backup_drill._scratch_success_stderr_accepted(
+                phase_bytes,
+                observed_bytes=len(phase_bytes),
+                stderr_eof=True,
+                private_diagnostics=True,
+                authorization_probe=False,
+                launch_monotonic_ns=900_000_000,
+            )
+        )
+        self.assertTrue(
+            backup_drill._scratch_success_stderr_accepted(
+                b"",
+                observed_bytes=0,
+                stderr_eof=True,
+                private_diagnostics=True,
+                authorization_probe=False,
+                launch_monotonic_ns=900_000_000,
+            )
+        )
+        self.assertTrue(
+            backup_drill._scratch_success_stderr_accepted(
+                b"",
+                observed_bytes=0,
+                stderr_eof=True,
+                private_diagnostics=True,
+                authorization_probe=True,
+                launch_monotonic_ns=900_000_000,
+            )
+        )
+        self.assertTrue(
+            backup_drill._scratch_success_stderr_accepted(
+                b"",
+                observed_bytes=0,
+                stderr_eof=True,
+                private_diagnostics=False,
+                authorization_probe=False,
+                launch_monotonic_ns=900_000_000,
+            )
+        )
+        for kwargs in (
+            {
+                "observed_bytes": len(prefix_bytes),
+                "stderr_eof": False,
+                "private_diagnostics": True,
+                "authorization_probe": False,
+            },
+            {
+                "observed_bytes": len(phase_bytes),
+                "stderr_eof": True,
+                "private_diagnostics": False,
+                "authorization_probe": False,
+            },
+        ):
+            self.assertFalse(
+                backup_drill._scratch_success_stderr_accepted(
+                    prefix_bytes if kwargs["observed_bytes"] == len(prefix_bytes) else phase_bytes,
+                    launch_monotonic_ns=900_000_000,
+                    **kwargs,
+                )
+            )
+        prefix_phase = backup_drill._scratch_parse_phase_attribution(
+            prefix_bytes,
+            truncated=False,
+            complete=False,
+            launch_monotonic_ns=900_000_000,
+            controller_guard_monotonic_ns=901_000_000,
+            controller_drain_monotonic_ns=902_000_000,
+        )
+        self.assertEqual(prefix_phase["status"], "unknown")
+        self.assertEqual(prefix_phase["unknown_reason"], "capture_prefix")
+        self.assertEqual(len(prefix_phase["frames"]), 4)
+        fault_frame = backup_drill._scratch_first_fault_frame(expected)
+        self.assertIsNotNone(fault_frame)
+        mixed = backup_drill._scratch_parse_phase_attribution(
+            prefix_bytes + fault_frame,
+            truncated=False,
+            complete=False,
+            launch_monotonic_ns=900_000_000,
+        )
+        self.assertEqual(mixed["unknown_reason"], "non_phase_bytes")
+        self.assertEqual(len(mixed["frames"]), 4)
+        duplicate_key_line = (
+            backup_drill.SCRATCH_PHASE_FRAME_MARKER
+            + b'{"event":"start","event":"end","ordinal":1,"phase":"archive_verify","worker_offset_ms":0}\n'
+        )
+        self.assertEqual(
+            backup_drill._scratch_parse_phase_attribution(
+                duplicate_key_line,
+                truncated=False,
+                complete=False,
+                launch_monotonic_ns=900_000_000,
+            )["unknown_reason"],
+            "malformed",
+        )
+        self.assertEqual(
+            backup_drill._scratch_parse_phase_attribution(
+                phase_bytes,
+                truncated=True,
+                complete=False,
+                launch_monotonic_ns=900_000_000,
+            )["unknown_reason"],
+            "truncated",
+        )
+        no_phase_args = argparse.Namespace(
+            private_scratch_diagnostics=False,
+            _scratch_authorization_probe=False,
+            _scratch_phase_origin_monotonic_ns=phase_origin,
+        )
+        with mock.patch.object(backup_drill.sys, "stderr", phase_stderr):
+            backup_drill._scratch_emit_phase_boundary(no_phase_args, "archive_verify", "start")
+        self.assertEqual(phase_stderr.flush_count, 12)
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.set_blocking(read_fd, False)
+            os.write(write_fd, prefix_bytes)
+            fake_process = types.SimpleNamespace(
+                stderr=types.SimpleNamespace(fileno=lambda: read_fd)
+            )
+            drained_buffer = bytearray()
+            observed, reached_eof = backup_drill._scratch_drain_phase_prefix_now(
+                fake_process, drained_buffer, 0
+            )
+            self.assertEqual(bytes(drained_buffer), prefix_bytes)
+            self.assertEqual(observed, len(prefix_bytes))
+            self.assertFalse(reached_eof)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+        primary_guard = RuntimeError("primary active-poll reserve refusal")
+        primary_guard.scratch_host_guard_diagnostic = {
+            "schema": 2,
+            "guard_site": "parent_active_poll",
+            "guard_reason": "memory_reserve",
+            "available_bytes": backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES - 1,
+            "required_bytes": backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES,
+        }
+        primary_guard.scratch_first_fault = {
+            "schema": 1,
+            "origin": "controller",
+            "site": "controller_active_poll",
+            "exception_kind": "runtime",
+            "errno": None,
+        }
+        primary_guard.scratch_phase_attribution = prefix_phase
+        projected = backup_drill.failure_report_for_exception(
+            primary_guard, private_scratch_diagnostics=True
+        )
+        self.assertEqual(projected["error"], str(primary_guard))
+        self.assertEqual(projected["scratch_host_guard_diagnostic"], primary_guard.scratch_host_guard_diagnostic)
+        self.assertEqual(projected["scratch_first_fault"], primary_guard.scratch_first_fault)
+        self.assertEqual(projected["scratch_phase_attribution"], prefix_phase)
+        self.assertNotIn(
+            "scratch_phase_attribution",
+            backup_drill.failure_report_for_exception(
+                primary_guard, private_scratch_diagnostics=False
+            ),
+        )
+        phase_events: list[tuple[str, str]] = []
+        primary_operation_error = RuntimeError("operation remains primary")
+        with self.assertRaises(RuntimeError) as observed_error:
+            backup_drill._scratch_run_observed_phase(
+                lambda phase, event: phase_events.append((phase, event)),
+                "restore_platform",
+                lambda: (_ for _ in ()).throw(primary_operation_error),
+            )
+        self.assertIs(observed_error.exception, primary_operation_error)
+        self.assertEqual(phase_events, [("restore_platform", "start")])
+
     def test_authorization_probe_worker_has_no_archive_or_database_effects(self) -> None:
         root = "/run/oldsparky-backup-restore-" + ("a" * 24)
         args = argparse.Namespace(

@@ -1182,10 +1182,19 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "events": {"high": None, "max": None, "oom": None, "oom_kill": None},
             },
         }
+        phase_attribution = {
+            "schema": 1,
+            "status": "unknown",
+            "unknown_reason": "capture_prefix",
+            "controller_guard_offset_ms": 40,
+            "controller_drain_offset_ms": 41,
+            "frames": [],
+        }
         create_failure = RuntimeError("scratch admission failed")
         create_failure.scratch_admission_diagnostic = admission_diagnostic
         create_failure.scratch_host_guard_diagnostic = host_guard_diagnostic
         create_failure.scratch_resource_attribution = resource_attribution
+        create_failure.scratch_phase_attribution = phase_attribution
         create_failure.scratch_unit_private_output = (b"worker stdout", b"worker stderr")
         not_checked_after_failure = mock.Mock()
         public_stderr = io.StringIO()
@@ -1217,6 +1226,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIsNone(public_error.exception.scratch_admission_diagnostic)
         self.assertIsNone(public_error.exception.scratch_host_guard_diagnostic)
         self.assertIsNone(public_error.exception.scratch_resource_attribution)
+        self.assertIsNone(public_error.exception.scratch_phase_attribution)
         self.assertEqual(public_stderr.getvalue(), "")
 
         private_stderr = io.StringIO()
@@ -1250,6 +1260,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(
             private_error.exception.scratch_resource_attribution,
             resource_attribution,
+        )
+        self.assertEqual(
+            private_error.exception.scratch_phase_attribution,
+            phase_attribution,
         )
         self.assertIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", private_stderr.getvalue())
         self.assertIn(
@@ -1365,6 +1379,14 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         "available_bytes": 1_060_000_000,
                         "required_bytes": 1_073_741_824,
                     },
+                    "scratch_phase_attribution": {
+                        "schema": 1,
+                        "status": "unknown",
+                        "unknown_reason": "capture_prefix",
+                        "controller_guard_offset_ms": 40,
+                        "controller_drain_offset_ms": 41,
+                        "frames": [],
+                    },
                 }
             ),
             "SCRATCH_UNIT_PRIVATE_OUTPUT_V1\nprivate framed bytes\n",
@@ -1415,6 +1437,17 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(
             failure_error.exception.scratch_host_guard_diagnostic,
             host_guard_diagnostic,
+        )
+        self.assertEqual(
+            failure_error.exception.scratch_phase_attribution,
+            {
+                "schema": 1,
+                "status": "unknown",
+                "unknown_reason": "capture_prefix",
+                "controller_guard_offset_ms": 40,
+                "controller_drain_offset_ms": 41,
+                "frames": [],
+            },
         )
         after_confinement_diagnostic = {
             **scratch_diagnostic,

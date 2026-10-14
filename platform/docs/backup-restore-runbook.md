@@ -80,6 +80,19 @@ establishes an OOM cause, proves sustained memory headroom or permits backup
 admission. The object remains private and is not copied to public workflow
 summaries or artifacts.
 
+The same private receipt may carry `scratch_phase_attribution` schema 1 for a
+parent active-poll reserve refusal. Its bounded ordered events identify
+`archive_verify`, `initdb`, `postgres_start`, both schema restores, and
+`alembic_verify`; they are event history, not an instantaneous phase or a
+physical-memory peak. Worker-relative phase offsets and controller-relative
+guard/drain offsets have separate origins and must not be compared as one
+clock; each event's `worker_offset_ms` uses only the worker-local origin.
+On refusal the controller freezes only the stderr prefix immediately
+available from its already-nonblocking pipe before stopping the unit. A
+missing, truncated, mixed, malformed, or incomplete prefix is recorded as
+`unknown`; it never changes the original guard, cleanup result, or admission
+threshold. This sibling remains private and is excluded from public summaries.
+
 A failed or unavailable disk, memory or mount sample stops the drill; it does
 not rotate or remove any retained backup. A failed isolated restore or
 preserve-existing post-publication check removes only the operation's
@@ -184,11 +197,14 @@ head. It validates the exact successful verification job, artifact digest,
 attestation, and seven-file helper manifest before staging anything on the host.
 Attempt-job timestamps are parsed and bounded to that exact run. Start must not
 exceed completion for executed jobs. On the validated `push` route, the
-conditional `Dispatch exact baseline proof finalizer` job is expected to be
-skipped because its workflow-dispatch/baseline-runtime condition is false; an
-inverted timestamp pair is accepted only for that exact job when its API
-`steps` value is `null` or an empty list. Its completion timestamp remains
-included in the maximum job-completion reservation bound.
+conditional `Dispatch exact baseline proof finalizer` and `Authenticate
+internal baseline runtime proof` jobs are skipped because their respective
+workflow-dispatch/baseline-runtime conditions are false. An inverted timestamp
+pair is accepted only for those exact jobs with terminal `skipped` results and
+a present `steps` field of `null` or an empty list. The auth job must also have
+all four runner fields present and explicitly null, matching its captured API
+row. Both timestamps must remain inside the exact run bounds, and each
+completion remains included in the maximum job-completion reservation bound.
 It runs those staged, source-bound helper bytes for create, verify-existing
 and the opt-in authorization probe. If the run fails, times out, the source
 moves, or any bundle check fails, it stops without running a production backup

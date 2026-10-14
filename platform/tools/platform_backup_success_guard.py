@@ -27,6 +27,7 @@ import io
 BACKUP_WORKFLOW_PATH = ".github/workflows/platform-production-backup.yml"
 SECURITY_WORKFLOW_PATH = ".github/workflows/platform-security.yml"
 BACKUP_JOB_NAME = "Create restore-verified backup"
+SECURITY_BASELINE_RUNTIME_JOB_NAME = "Authenticate internal baseline runtime proof"
 SECURITY_DISPATCH_FINALIZER_JOB_NAME = "Dispatch exact baseline proof finalizer"
 BACKUP_RECEIPT_NAME = "backup-success-receipt.json"
 BACKUP_ARTIFACT_PREFIX = "platform-backup-success-"
@@ -348,12 +349,12 @@ def _validate_attempt_jobs(
             raise BackupProofError("attempt job did not reach an allowed terminal result")
         started = _parse_time(row.get("started_at"), "attempt job start")
         completed = _parse_time(row.get("completed_at"), "attempt job completion")
-        # On the accepted push route, the conditionally dispatched baseline
-        # proof finalizer is expected to be skipped because its workflow
-        # dispatch/baseline-runtime condition is false. GitHub reports its
-        # steps as null or an empty list when it did not execute; only that
-        # exact source-event/job/result/steps combination may have inverted
-        # times. Its timestamps remain run-bounded and part of the all-job max.
+        # On a validated push, these two conditionally dispatched baseline
+        # jobs are skipped by their workflow-dispatch/baseline-runtime guards.
+        # GitHub reports no executed steps as null or []; the authentication
+        # job also has all four runner fields explicitly null in the captured
+        # API shape. Only those exact source/job/result shapes may have
+        # inverted times. Timestamps remain run-bounded and in the all-job max.
         unexecuted_baseline_dispatch_finalizer = (
             source_event == "push"
             and status == "completed"
@@ -362,12 +363,26 @@ def _validate_attempt_jobs(
             and "steps" in row
             and (row["steps"] is None or row["steps"] == [])
         )
+        unexecuted_baseline_runtime_guard = (
+            source_event == "push"
+            and status == "completed"
+            and conclusion == "skipped"
+            and row.get("name") == SECURITY_BASELINE_RUNTIME_JOB_NAME
+            and "steps" in row
+            and (row["steps"] is None or row["steps"] == [])
+            and all(
+                field in row and row[field] is None
+                for field in ("runner_id", "runner_name", "runner_group_id", "runner_group_name")
+            )
+        )
         if (
             not run_started <= started <= run_updated
             or not run_started <= completed <= run_updated
         ):
             raise BackupProofError("attempt job timestamps are inconsistent with its exact run")
-        if started > completed and not unexecuted_baseline_dispatch_finalizer:
+        if started > completed and not (
+            unexecuted_baseline_dispatch_finalizer or unexecuted_baseline_runtime_guard
+        ):
             raise BackupProofError("attempt job timestamps are inconsistent with its exact run")
         if latest_completion is None or completed > latest_completion:
             latest_completion = completed
