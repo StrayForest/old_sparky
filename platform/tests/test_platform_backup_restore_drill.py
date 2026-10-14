@@ -85,6 +85,300 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "process identity is malformed"):
                         self._original_proc_start_time("123")
 
+    def _assert_scratch_resource_attribution_is_identity_bound_and_private(self) -> None:
+        pid = os.getpid()
+        worker_pid = 4321
+        invocation = "a" * 32
+        unit = "oldsparky-backup-restore-" + "b" * 24 + ".service"
+        control_group = "/system.slice/" + unit
+        snapshot = {
+            "properties": {
+                "ActiveState": "active",
+                "ExecMainPID": str(worker_pid),
+                "InvocationID": invocation,
+                "ControlGroup": control_group,
+            }
+        }
+        cgroup_payloads = {
+            "memory.current": b"331210752\n",
+            "memory.stat": b"anon 1200\nfile 900\nshmem 100\n",
+            "memory.events": b"high 1\nmax 2\noom 0\noom_kill 0\n",
+        }
+        identities = {
+            10: (1, 2),
+            11: (1, 3),
+            12: (1, 4),
+        }
+
+        def fake_open(path, flags, *args, **kwargs):
+            if path == "/sys/fs/cgroup":
+                return 10
+            if path == "system.slice":
+                return 11
+            if path == unit:
+                return 12
+            if path in cgroup_payloads:
+                return 100 + tuple(cgroup_payloads).index(path)
+            raise AssertionError("unexpected descriptor open in attribution fixture")
+
+        def fake_fstat(descriptor):
+            dev, ino = identities[descriptor]
+            return types.SimpleNamespace(st_dev=dev, st_ino=ino)
+
+        def fake_stat(path, *, dir_fd=None, follow_symlinks=True):
+            self.assertFalse(follow_symlinks)
+            self.assertIn(path, {"system.slice", unit})
+            dev, ino = (1, 3) if path == "system.slice" else (1, 4)
+            return types.SimpleNamespace(st_dev=dev, st_ino=ino)
+
+        def fake_proc_file(observed_pid, name):
+            self.assertEqual(name, "cgroup")
+            self.assertIn(observed_pid, {str(worker_pid)})
+            return f"0::/system.slice/{unit}\n".encode("ascii")
+
+        def fake_cgroup_file(_descriptor, name):
+            return cgroup_payloads.get(name)
+
+        with (
+            mock.patch.object(backup_drill, "_scratch_process_start_time", return_value="123456"),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_proc_status_sample",
+                side_effect=lambda observed_pid: (observed_pid, 1, 40_000_000),
+            ),
+            mock.patch.object(backup_drill, "_scratch_private_proc_file", side_effect=fake_proc_file),
+            mock.patch.object(backup_drill, "_scratch_private_cgroup_file", side_effect=fake_cgroup_file),
+            mock.patch.object(backup_drill.os, "open", side_effect=fake_open),
+            mock.patch.object(backup_drill.os, "fstat", side_effect=fake_fstat),
+            mock.patch.object(backup_drill.os, "stat", side_effect=fake_stat),
+            mock.patch.object(backup_drill.os, "close"),
+            mock.patch.object(backup_drill.os, "getpid", return_value=pid),
+            mock.patch.object(
+                backup_drill.time,
+                "monotonic_ns",
+                side_effect=(20_000_000, 21_000_000, 22_000_000, 23_000_000),
+            ),
+        ):
+            attribution = backup_drill._scratch_private_resource_attribution(
+                snapshot=snapshot,
+                worker_identity=(str(worker_pid), invocation, "123456"),
+                control_group=control_group,
+                launch_monotonic_ns=1_000_000,
+            )
+            with mock.patch.object(backup_drill, "SCRATCH_RESOURCE_ATTRIBUTION_MAX_BYTES", 1):
+                over_cap = backup_drill._scratch_private_resource_attribution(
+                    snapshot=snapshot,
+                    worker_identity=(str(worker_pid), invocation, "123456"),
+                    control_group=control_group,
+                    launch_monotonic_ns=1_000_000,
+                )
+        self.assertTrue(backup_drill.valid_scratch_resource_attribution(attribution))
+        self.assertEqual(attribution["status"], "complete")
+        self.assertEqual(attribution["sample_offset_ms"], 20)
+        self.assertEqual(attribution["controller"]["rss_bytes"], 40_000_000)
+        self.assertEqual(attribution["worker"]["rss_bytes"], 40_000_000)
+        self.assertEqual(attribution["cgroup"]["memory_current_bytes"], 331_210_752)
+        self.assertEqual(attribution["cgroup"]["shmem_bytes"], 100)
+        self.assertEqual(over_cap["status"], "unknown")
+        self.assertEqual(over_cap["unknown_reason"], "cap_exceeded")
+
+        refusal = RuntimeError("unchanged reserve refusal")
+        refusal.scratch_host_guard_diagnostic = {
+            "schema": 2,
+            "guard_site": "parent_active_poll",
+            "guard_reason": "memory_reserve",
+            "available_bytes": backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES - 1,
+            "required_bytes": backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES,
+        }
+        refusal.scratch_resource_attribution = attribution
+        private_report = backup_drill.failure_report_for_exception(
+            refusal, private_scratch_diagnostics=True
+        )
+        public_report = backup_drill.failure_report_for_exception(
+            refusal, private_scratch_diagnostics=False
+        )
+        self.assertEqual(private_report["error"], str(refusal))
+        self.assertEqual(private_report["scratch_resource_attribution"], attribution)
+        self.assertNotIn("scratch_resource_attribution", public_report)
+        self.assertNotIn("scratch_host_guard_diagnostic", public_report)
+
+    def _assert_scratch_resource_attribution_fails_closed_on_identity_and_parser_errors(self) -> None:
+        complete = {
+            "schema": 1,
+            "status": "complete",
+            "sample_offset_ms": 1,
+            "unknown_reason": None,
+            "controller": {"identity_bound": True, "rss_bytes": 1},
+            "worker": {"identity_bound": True, "rss_bytes": 2},
+            "cgroup": {
+                "identity_bound": True,
+                "memory_current_bytes": 3,
+                "anon_bytes": 1,
+                "file_bytes": 2,
+                "shmem_bytes": 0,
+                "events": {"high": 0, "max": 0, "oom": 0, "oom_kill": 0},
+            },
+        }
+        self.assertTrue(backup_drill.valid_scratch_resource_attribution(complete))
+        for malformed in (
+            {**complete, "schema": True},
+            {**complete, "unknown_reason": "host-memory-override"},
+            {**complete, "unexpected": 1},
+            {**complete, "worker": {"identity_bound": False, "rss_bytes": 2}},
+            {
+                **complete,
+                "cgroup": {**complete["cgroup"], "memory_current_bytes": True},
+            },
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertFalse(backup_drill.valid_scratch_resource_attribution(malformed))
+
+        unknown = backup_drill._scratch_unknown_resource_attribution("identity_drift", sample_offset_ms=4)
+        self.assertTrue(backup_drill.valid_scratch_resource_attribution(unknown))
+        self.assertEqual(unknown["status"], "unknown")
+        self.assertEqual(unknown["unknown_reason"], "identity_drift")
+        self.assertIsNone(unknown["cgroup"]["memory_current_bytes"])
+        self.assertFalse(backup_drill.valid_scratch_resource_attribution(
+            {**unknown, "unknown_reason": "unrecognized"}
+        ))
+        self.assertEqual(
+            backup_drill._scratch_private_resource_attribution(
+                snapshot=None,
+                worker_identity=None,
+                control_group=None,
+                launch_monotonic_ns=None,
+            )["unknown_reason"],
+            "sample_unavailable",
+        )
+        self.assertEqual(
+            backup_drill._scratch_private_resource_attribution(
+                snapshot={"properties": {"ActiveState": "inactive"}},
+                worker_identity=("4321", "a" * 32, "123456"),
+                control_group="/system.slice/oldsparky-backup-restore-" + "b" * 24 + ".service",
+                launch_monotonic_ns=time.monotonic_ns() - 1,
+            )["unknown_reason"],
+            "identity_drift",
+        )
+        self.assertIsNone(backup_drill._scratch_private_counter(b"not-a-counter\n"))
+        self.assertIsNone(
+            backup_drill._scratch_private_key_values(
+                b"anon 1\nfile 2\nshmem 3\nshmem 4\n", {"anon", "file", "shmem"}
+            )
+        )
+
+    def _assert_parent_active_poll_sampler_failure_preserves_guard_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scratch-attribution-guard-") as temporary_dir:
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            archive_path.chmod(0o600)
+            token = uuid.uuid4().hex[:24]
+            mountpoint = pathlib.Path(f"/run/oldsparky-backup-restore-{token}")
+            if mountpoint.exists():
+                self.fail("unique scratch fixture mountpoint unexpectedly exists")
+
+            class Launcher:
+                def __init__(self, stdout, stderr) -> None:
+                    self.stdin = io.BytesIO()
+                    self.stdout = stdout
+                    self.stderr = stderr
+                    self.returncode = None
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, *, timeout=None):
+                    del timeout
+                    events.append("wait")
+                    if self.returncode is None:
+                        self.returncode = 1
+                    return self.returncode
+
+                def kill(self):
+                    events.append("kill")
+                    self.returncode = -9
+
+            def eof_pipe():
+                read_fd, write_fd = os.pipe()
+                os.close(write_fd)
+                return os.fdopen(read_fd, "rb", buffering=0)
+
+            events: list[str] = []
+            launcher = Launcher(eof_pipe(), eof_pipe())
+            guard_error = RuntimeError("fixed parent active-poll reserve refusal")
+            host_guard = {
+                "schema": 2,
+                "guard_site": "parent_active_poll",
+                "guard_reason": "memory_reserve",
+                "available_bytes": backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES - 4096,
+                "required_bytes": backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES,
+            }
+            guard_error.scratch_host_guard_diagnostic = host_guard
+
+            def host_guard_at(site: str) -> None:
+                if site == "parent_active_poll":
+                    raise guard_error
+
+            def stop_unit(_unit_name: str) -> None:
+                events.append("stop")
+                launcher.returncode = 0
+
+            def sample_failure(**_kwargs) -> dict[str, object]:
+                events.append("sample")
+                raise RuntimeError("secondary sampler failure")
+
+            with (
+                mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
+                mock.patch.object(backup_drill, "_scratch_host_guard", side_effect=host_guard_at),
+                mock.patch.object(backup_drill, "_scratch_unit_command", return_value=["systemd-run"]),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_service_snapshot",
+                    return_value={
+                        "properties": {
+                            "LoadState": "not-found",
+                            "ActiveState": "inactive",
+                            "SubState": "dead",
+                            "Result": "success",
+                            "ExecMainStatus": "0",
+                            "ExecMainPID": "0",
+                            "ControlGroup": "",
+                        }
+                    },
+                ),
+                mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_private_resource_attribution",
+                    side_effect=sample_failure,
+                ) as sampler,
+                mock.patch.object(backup_drill.subprocess, "Popen", return_value=launcher),
+                mock.patch.object(backup_drill.secrets, "token_hex", return_value=token),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "fixed parent active-poll reserve refusal"
+                ) as failure:
+                    backup_drill._run_isolated_restore_drill(
+                        archive_path,
+                        timestamp_slug="20261014T010203Z",
+                        private_scratch_diagnostics=True,
+                    )
+
+            sampler.assert_called_once()
+            self.assertIs(failure.exception, guard_error)
+            self.assertEqual(str(failure.exception), "fixed parent active-poll reserve refusal")
+            self.assertEqual(failure.exception.scratch_host_guard_diagnostic, host_guard)
+            self.assertEqual(failure.exception.scratch_resource_attribution["status"], "unknown")
+            self.assertEqual(
+                failure.exception.scratch_resource_attribution["unknown_reason"], "internal_error"
+            )
+            self.assertLess(events.index("sample"), events.index("stop"))
+            self.assertLess(events.index("stop"), events.index("wait"))
+            self.assertEqual(launcher.returncode, 0)
+            self.assertFalse(mountpoint.exists())
+
     def test_scratch_postgres_directory_setup_without_cap_fowner(self) -> None:
         self.assertEqual(os.geteuid(), 0)
         setpriv = shutil.which("setpriv")
@@ -695,6 +989,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 stderr_truncated=False,
             )
         )
+        self._assert_scratch_resource_attribution_is_identity_bound_and_private()
+        self._assert_scratch_resource_attribution_fails_closed_on_identity_and_parser_errors()
+        self._assert_parent_active_poll_sampler_failure_preserves_guard_and_cleanup()
 
     def test_authorization_probe_worker_has_no_archive_or_database_effects(self) -> None:
         root = "/run/oldsparky-backup-restore-" + ("a" * 24)

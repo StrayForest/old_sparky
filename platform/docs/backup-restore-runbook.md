@@ -66,6 +66,20 @@ identifies a guard observation, not its cause or sustained headroom.
 The legacy schema-1 admission receipt and its bounded best-effort RSS samples
 remain accepted unchanged. These diagnostics never change the 1 GiB guard and
 are excluded from public workflow output and artifacts.
+
+For a private failure during the parent active-poll guard, the root-private
+failure receipt may also contain the optional closed
+`scratch_resource_attribution` schema-1 object. Its controller and worker RSS
+values are identity-bound role observations; `cgroup.memory_current_bytes`
+and the `memory.stat` fields are aggregate unit-cgroup readings and must not be
+added to the role RSS values or described as process ownership. The monotonic
+sample offset locates this observation relative to unit launch, not the exact
+guard decision. An `unknown` status records a missing, malformed, capped or
+identity-unstable sample. Neither status changes the original guard failure,
+establishes an OOM cause, proves sustained memory headroom or permits backup
+admission. The object remains private and is not copied to public workflow
+summaries or artifacts.
+
 A failed or unavailable disk, memory or mount sample stops the drill; it does
 not rotate or remove any retained backup. A failed isolated restore or
 preserve-existing post-publication check removes only the operation's

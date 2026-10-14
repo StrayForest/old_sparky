@@ -68,6 +68,7 @@ try:
         valid_backup_disk_diagnostic,
         valid_scratch_admission_diagnostic,
         valid_scratch_host_guard_diagnostic,
+        valid_scratch_resource_attribution,
         valid_scratch_unit_diagnostic,
     )
     from .platform_release_retention import (
@@ -88,6 +89,7 @@ except ImportError:  # Direct execution from the tools directory.
         valid_backup_disk_diagnostic,
         valid_scratch_admission_diagnostic,
         valid_scratch_host_guard_diagnostic,
+        valid_scratch_resource_attribution,
         valid_scratch_unit_diagnostic,
     )
     from platform_release_retention import (
@@ -222,6 +224,7 @@ class BackupCommandFailure(RuntimeError):
         scratch_admission_diagnostic: dict[str, Any] | None = None,
         scratch_host_guard_diagnostic: dict[str, Any] | None = None,
         scratch_first_fault: dict[str, Any] | None = None,
+        scratch_resource_attribution: dict[str, Any] | None = None,
     ) -> None:
         self.restore_diagnostic = diagnostic
         self.backup_disk_diagnostic = backup_disk_diagnostic
@@ -229,6 +232,7 @@ class BackupCommandFailure(RuntimeError):
         self.scratch_admission_diagnostic = scratch_admission_diagnostic
         self.scratch_host_guard_diagnostic = scratch_host_guard_diagnostic
         self.scratch_first_fault = scratch_first_fault
+        self.scratch_resource_attribution = scratch_resource_attribution
         super().__init__("Platform backup failed.")
 
 
@@ -885,6 +889,14 @@ def _run_backup_command(
                 and _valid_scratch_first_fault(result.get("scratch_first_fault"))
                 else None
             ),
+            (
+                result.get("scratch_resource_attribution")
+                if forward_failure_diagnostics
+                and valid_scratch_resource_attribution(
+                    result.get("scratch_resource_attribution")
+                )
+                else None
+            ),
         )
     return result
 
@@ -946,6 +958,12 @@ def run_backup(
             report.get("scratch_first_fault")
             if private_failure_diagnostics
             and _valid_scratch_first_fault(report.get("scratch_first_fault"))
+            else None,
+            report.get("scratch_resource_attribution")
+            if private_failure_diagnostics
+            and valid_scratch_resource_attribution(
+                report.get("scratch_resource_attribution")
+            )
             else None,
         ) from exc
 
@@ -2879,6 +2897,14 @@ def main() -> int:
                 and _valid_scratch_first_fault(scratch_first_fault)
             ):
                 result["scratch_first_fault"] = scratch_first_fault
+            scratch_resource_attribution = getattr(
+                exc, "scratch_resource_attribution", None
+            )
+            if (
+                getattr(args, "private_backup_diagnostics", False)
+                and valid_scratch_resource_attribution(scratch_resource_attribution)
+            ):
+                result["scratch_resource_attribution"] = scratch_resource_attribution
             print(
                 json.dumps(result, ensure_ascii=False, indent=2)
             )

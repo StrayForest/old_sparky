@@ -1118,7 +1118,94 @@ jobs:
           backup_disk_diagnostic = None
           scratch_first_fault = None
           scratch_host_guard_diagnostic = None
+          scratch_resource_attribution = None
           host_guard_invalid = False
+
+          def valid_resource_attribution(value):
+              if (
+                  not isinstance(value, dict)
+                  or set(value) != {
+                      "schema", "status", "sample_offset_ms", "unknown_reason", "controller",
+                      "worker", "cgroup",
+                  }
+                  or type(value.get("schema")) is not int
+                  or value["schema"] != 1
+                  or type(value.get("status")) is not str
+                  or value["status"] not in {"complete", "unknown"}
+                  or (
+                      value.get("sample_offset_ms") is not None
+                      and (type(value["sample_offset_ms"]) is not int or value["sample_offset_ms"] < 0)
+                  )
+                  or (
+                      value.get("unknown_reason") is not None
+                      and (
+                          type(value["unknown_reason"]) is not str
+                          or value["unknown_reason"] not in {
+                              "sample_unavailable", "identity_drift", "parse_invalid",
+                              "cap_exceeded", "internal_error",
+                          }
+                      )
+                  )
+              ):
+                  return False
+              for role in ("controller", "worker"):
+                  observation = value.get(role)
+                  if (
+                      not isinstance(observation, dict)
+                      or set(observation) != {"identity_bound", "rss_bytes"}
+                      or type(observation.get("identity_bound")) is not bool
+                      or (
+                          observation.get("rss_bytes") is not None
+                          and (
+                              type(observation["rss_bytes"]) is not int
+                              or not 0 <= observation["rss_bytes"] <= (1 << 40)
+                          )
+                      )
+                      or (observation.get("rss_bytes") is not None and not observation["identity_bound"])
+                  ):
+                      return False
+              cgroup = value.get("cgroup")
+              if (
+                  not isinstance(cgroup, dict)
+                  or set(cgroup) != {
+                      "identity_bound", "memory_current_bytes", "anon_bytes", "file_bytes",
+                      "shmem_bytes", "events",
+                  }
+                  or type(cgroup.get("identity_bound")) is not bool
+              ):
+                  return False
+              for key in ("memory_current_bytes", "anon_bytes", "file_bytes", "shmem_bytes"):
+                  item = cgroup.get(key)
+                  if (
+                      item is not None
+                      and (type(item) is not int or not 0 <= item <= (1 << 60) or not cgroup["identity_bound"])
+                  ):
+                      return False
+              events = cgroup.get("events")
+              if not isinstance(events, dict) or set(events) != {"high", "max", "oom", "oom_kill"}:
+                  return False
+              for item in events.values():
+                  if item is not None and (type(item) is not int or not 0 <= item <= (1 << 60) or not cgroup["identity_bound"]):
+                      return False
+              if value["status"] == "complete":
+                  return (
+                      value["sample_offset_ms"] is not None
+                      and value["unknown_reason"] is None
+                      and value["controller"]["identity_bound"]
+                      and value["controller"]["rss_bytes"] is not None
+                      and value["worker"]["identity_bound"]
+                      and value["worker"]["rss_bytes"] is not None
+                      and cgroup["identity_bound"]
+                      and all(cgroup[key] is not None for key in (
+                          "memory_current_bytes", "anon_bytes", "file_bytes", "shmem_bytes",
+                      ))
+                      and all(item is not None for item in events.values())
+                  )
+              return value.get("unknown_reason") in {
+                  "sample_unavailable", "identity_drift", "parse_invalid",
+                  "cap_exceeded", "internal_error",
+              }
+
           if report_state == "read":
               try:
                   report = json.loads(
@@ -1138,6 +1225,12 @@ jobs:
                       backup_disk = report.get("backup_disk_diagnostic")
                       first_fault = report.get("scratch_first_fault")
                       scratch_host_guard = report.get("scratch_host_guard_diagnostic")
+                      resource_attribution = report.get("scratch_resource_attribution")
+                      if "scratch_resource_attribution" in report:
+                          if valid_resource_attribution(resource_attribution):
+                              scratch_resource_attribution = resource_attribution
+                          else:
+                              report_state = "unclassified_json"
                       fault_marker = b"SCRATCH_FIRST_FAULT_V1\n"
                       fault_marker_count = stderr_bytes.count(fault_marker) if stderr_state == "read" else 0
                       host_guard_marker = b"OLDS_PG_SCRATCH_HOST_GUARD_V1:"
@@ -1640,6 +1733,7 @@ jobs:
                   "backup_disk_diagnostic": backup_disk_diagnostic,
                   "scratch_host_guard_diagnostic": scratch_host_guard_diagnostic,
                   "scratch_first_fault": scratch_first_fault,
+                  "scratch_resource_attribution": scratch_resource_attribution,
                   "report_bytes": len(report_bytes),
                   "report_sha256": hashlib.sha256(report_bytes).hexdigest() if report_bytes else None,
                   "stderr_state": stderr_state,

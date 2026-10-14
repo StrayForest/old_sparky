@@ -278,6 +278,21 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         legacy_tree = ast.parse(legacy_handler)
         cls.backup_first_fault_sites = _literal_set_assignment(legacy_tree, "first_fault_sites")
         cls.backup_host_guard_sites = _literal_set_assignment(legacy_tree, "host_guard_sites")
+        resource_validator = next(
+            (
+                node
+                for node in ast.walk(legacy_tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "valid_resource_attribution"
+            ),
+            None,
+        )
+        if resource_validator is None:
+            raise AssertionError("could not find the closed private resource-attribution validator")
+        cls.resource_validator = compile(
+            ast.fix_missing_locations(ast.Module(body=[resource_validator], type_ignores=[])),
+            str(WORKFLOW),
+            "exec",
+        )
         probe_tree = ast.parse(handler)
         cls.probe_first_fault_sites = _literal_set_assignment(probe_tree, "sites")
         cls.probe_host_guard_sites = _literal_set_assignment(probe_tree, "host_guard_sites")
@@ -306,6 +321,11 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         namespace = {"first_fault": value}
         exec(self.legacy_fault_validator, namespace)
         return namespace["valid_first_fault"]
+
+    def _workflow_resource_attribution_valid(self, value) -> bool:
+        namespace = {}
+        exec(self.resource_validator, namespace)
+        return namespace["valid_resource_attribution"](value)
 
     def _report(self, status: str = "completed", *, first_fault=None, host_guard=None, extra: dict | None = None) -> bytes:
         if status == "completed":
@@ -605,6 +625,52 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
 
     def test_probe_envelopes_require_verified_cleanup_and_reject_extra_fields(self) -> None:
         parse = self.handler["parse_probe_report"]
+        resource_attribution = {
+            "schema": 1,
+            "status": "complete",
+            "sample_offset_ms": 1200,
+            "unknown_reason": None,
+            "controller": {"identity_bound": True, "rss_bytes": 40_000_000},
+            "worker": {"identity_bound": True, "rss_bytes": 452_661_248},
+            "cgroup": {
+                "identity_bound": True,
+                "memory_current_bytes": 331_210_752,
+                "anon_bytes": 280_000_000,
+                "file_bytes": 40_000_000,
+                "shmem_bytes": 11_210_752,
+                "events": {"high": 0, "max": 0, "oom": 0, "oom_kill": 0},
+            },
+        }
+        self.assertTrue(self._workflow_resource_attribution_valid(resource_attribution))
+        for malformed_attribution in (
+            {**resource_attribution, "schema": True},
+            {**resource_attribution, "worker": {"identity_bound": False, "rss_bytes": 1}},
+            {**resource_attribution, "unexpected": 1},
+            {
+                **resource_attribution,
+                "cgroup": {**resource_attribution["cgroup"], "memory_current_bytes": True},
+            },
+            {**resource_attribution, "status": "unknown", "unknown_reason": "not-closed"},
+        ):
+            with self.subTest(resource_attribution=malformed_attribution):
+                self.assertFalse(self._workflow_resource_attribution_valid(malformed_attribution))
+        unknown_attribution = {
+            "schema": 1,
+            "status": "unknown",
+            "sample_offset_ms": None,
+            "unknown_reason": "sample_unavailable",
+            "controller": {"identity_bound": False, "rss_bytes": None},
+            "worker": {"identity_bound": False, "rss_bytes": None},
+            "cgroup": {
+                "identity_bound": False,
+                "memory_current_bytes": None,
+                "anon_bytes": None,
+                "file_bytes": None,
+                "shmem_bytes": None,
+                "events": {"high": None, "max": None, "oom": None, "oom_kill": None},
+            },
+        }
+        self.assertTrue(self._workflow_resource_attribution_valid(unknown_attribution))
         self.assertEqual(parse(self._report(), b"", "0"), ("completed", "confirmed", None, None))
         failed = self._report("failed", first_fault=FAULT)
         self.assertEqual(parse(failed, self._frame(), "1"), ("failed", "confirmed", FAULT, None))
@@ -919,9 +985,11 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         public_summary = self.source.split('public_report="$({', 1)[-1].split("failure_stage=private_capture_cleanup", 1)[0]
         self.assertNotIn("first_fault", public_summary)
         self.assertNotIn("scratch_host_guard_diagnostic", public_summary)
+        self.assertNotIn("scratch_resource_attribution", public_summary)
         self.assertNotIn("authorization_probe_diagnostic", public_summary)
         self.assertNotIn("SCRATCH_FIRST_FAULT_V1", public_summary)
         self.assertIn('"scratch_first_fault": scratch_first_fault', self.source)
+        self.assertIn('"scratch_resource_attribution": scratch_resource_attribution', self.source)
         self.assertIn('first_fault.get("site", "").startswith(first_fault.get("origin", "") + "_")', self.source)
         self.assertIn('value["site"].startswith("worker_")', self.source)
         controller_fault = {

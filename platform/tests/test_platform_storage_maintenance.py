@@ -1166,9 +1166,26 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "available_bytes": 1_060_000_000,
             "required_bytes": 1_073_741_824,
         }
+        resource_attribution = {
+            "schema": 1,
+            "status": "unknown",
+            "sample_offset_ms": 12,
+            "unknown_reason": "identity_drift",
+            "controller": {"identity_bound": False, "rss_bytes": None},
+            "worker": {"identity_bound": False, "rss_bytes": None},
+            "cgroup": {
+                "identity_bound": False,
+                "memory_current_bytes": None,
+                "anon_bytes": None,
+                "file_bytes": None,
+                "shmem_bytes": None,
+                "events": {"high": None, "max": None, "oom": None, "oom_kill": None},
+            },
+        }
         create_failure = RuntimeError("scratch admission failed")
         create_failure.scratch_admission_diagnostic = admission_diagnostic
         create_failure.scratch_host_guard_diagnostic = host_guard_diagnostic
+        create_failure.scratch_resource_attribution = resource_attribution
         create_failure.scratch_unit_private_output = (b"worker stdout", b"worker stderr")
         not_checked_after_failure = mock.Mock()
         public_stderr = io.StringIO()
@@ -1199,6 +1216,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         not_checked_after_failure.assert_not_called()
         self.assertIsNone(public_error.exception.scratch_admission_diagnostic)
         self.assertIsNone(public_error.exception.scratch_host_guard_diagnostic)
+        self.assertIsNone(public_error.exception.scratch_resource_attribution)
         self.assertEqual(public_stderr.getvalue(), "")
 
         private_stderr = io.StringIO()
@@ -1228,6 +1246,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(
             private_error.exception.scratch_host_guard_diagnostic,
             host_guard_diagnostic,
+        )
+        self.assertEqual(
+            private_error.exception.scratch_resource_attribution,
+            resource_attribution,
         )
         self.assertIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", private_stderr.getvalue())
         self.assertIn(
@@ -3876,7 +3898,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "bundle_sha256", "stage", "public_summary_error", "exit_code", "report_state",
                     "report_error_class", "restore_diagnostic", "scratch_unit_diagnostic",
                     "scratch_admission_diagnostic", "scratch_host_guard_diagnostic",
-                    "scratch_first_fault", "report_bytes",
+                    "scratch_first_fault", "scratch_resource_attribution", "report_bytes",
                     "backup_disk_diagnostic",
                     "report_sha256", "stderr_state",
                     "stderr_exception_class", "stderr_bytes", "stderr_sha256",
@@ -4560,6 +4582,22 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "available_bytes": 900_000_000,
                 "required_bytes": 1_073_741_824,
             }
+            resource_attribution = {
+                "schema": 1,
+                "status": "complete",
+                "sample_offset_ms": 1200,
+                "unknown_reason": None,
+                "controller": {"identity_bound": True, "rss_bytes": 40_000_000},
+                "worker": {"identity_bound": True, "rss_bytes": 452_661_248},
+                "cgroup": {
+                    "identity_bound": True,
+                    "memory_current_bytes": 331_210_752,
+                    "anon_bytes": 280_000_000,
+                    "file_bytes": 40_000_000,
+                    "shmem_bytes": 11_210_752,
+                    "events": {"high": 0, "max": 0, "oom": 0, "oom_kill": 0},
+                },
+            }
 
             def host_guard_capture(
                 fault: dict[str, object],
@@ -4589,20 +4627,22 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 *,
                 report_fault: dict[str, object] | None = None,
                 diagnostic: dict[str, object] | None = None,
+                report_resource: dict[str, object] | None = None,
                 report_bytes: bytes | None = None,
             ) -> subprocess.CompletedProcess[str]:
                 report_file = test_root / f"host-guard-report-{run_id}.json"
                 capture_file = test_root / f"host-guard-stderr-{run_id}.log"
                 if report_bytes is None:
-                    report_bytes = json.dumps(
-                        {
-                            "ok": False,
-                            "status": "failed",
-                            "error_class": "backup",
-                            "scratch_first_fault": report_fault,
-                            "scratch_host_guard_diagnostic": diagnostic,
-                        }
-                    ).encode("ascii")
+                    report = {
+                        "ok": False,
+                        "status": "failed",
+                        "error_class": "backup",
+                        "scratch_first_fault": report_fault,
+                        "scratch_host_guard_diagnostic": diagnostic,
+                    }
+                    if report_resource is not None:
+                        report["scratch_resource_attribution"] = report_resource
+                    report_bytes = json.dumps(report).encode("ascii")
                 report_file.write_bytes(report_bytes)
                 report_file.chmod(0o600)
                 capture_file.write_bytes(capture)
@@ -4637,6 +4677,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 host_guard_capture(host_guard_fault, host_guard),
                 report_fault=host_guard_fault,
                 diagnostic=host_guard,
+                report_resource=resource_attribution,
             )
             self.assertEqual(host_guard_result.returncode, 0, host_guard_result.stderr)
             self.assertEqual(host_guard_result.stdout, "")
@@ -4645,6 +4686,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(host_guard_receipt["report_state"], "typed_failure")
             self.assertEqual(host_guard_receipt["scratch_first_fault"], host_guard_fault)
             self.assertEqual(host_guard_receipt["scratch_host_guard_diagnostic"], host_guard)
+            self.assertEqual(host_guard_receipt["scratch_resource_attribution"], resource_attribution)
             self.assertNotIn("OLDS_PG_SCRATCH_HOST_GUARD_V1", host_guard_receipt_path.read_text(encoding="ascii"))
             self.assertNotIn("900000000", host_guard_result.stdout)
 

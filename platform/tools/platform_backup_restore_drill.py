@@ -70,6 +70,8 @@ SCRATCH_MEMORY_RESERVE_BYTES = 384 * 1024**2
 SCRATCH_MEMORY_ADMISSION_BYTES = SCRATCH_MEMORY_MAX_BYTES + SCRATCH_MEMORY_RESERVE_BYTES
 SCRATCH_ADMISSION_RSS_MAX_BYTES = 1 << 40
 SCRATCH_PROC_STATUS_MAX_BYTES = 16 * 1024
+SCRATCH_RESOURCE_ATTRIBUTION_FILE_MAX_BYTES = 16 * 1024
+SCRATCH_RESOURCE_ATTRIBUTION_MAX_BYTES = 4096
 SCRATCH_MEMORY_STOP_MARGIN_BYTES = 32 * 1024**2
 SCRATCH_TMPFS_STOP_BYTES = 64 * 1024**2
 SCRATCH_RUNTIME_SECONDS = 15 * 60
@@ -538,6 +540,94 @@ def valid_scratch_host_guard_diagnostic(value: Any) -> bool:
         and type(value.get("required_bytes")) is int
         and value["required_bytes"] == SCRATCH_MEMORY_ADMISSION_BYTES
     )
+
+
+_SCRATCH_RESOURCE_UNKNOWN_REASONS = frozenset(
+    {"sample_unavailable", "identity_drift", "parse_invalid", "cap_exceeded", "internal_error"}
+)
+
+
+def valid_scratch_resource_attribution(value: Any) -> bool:
+    """Validate optional private role/cgroup observations without admitting work."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "status", "sample_offset_ms", "unknown_reason", "controller",
+        "worker", "cgroup",
+    }:
+        return False
+    if (
+        type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or type(value.get("status")) is not str
+        or value["status"] not in {"complete", "unknown"}
+        or (
+            value.get("sample_offset_ms") is not None
+            and (type(value["sample_offset_ms"]) is not int or value["sample_offset_ms"] < 0)
+        )
+        or (
+            value.get("unknown_reason") is not None
+            and (
+                type(value["unknown_reason"]) is not str
+                or value["unknown_reason"] not in _SCRATCH_RESOURCE_UNKNOWN_REASONS
+            )
+        )
+    ):
+        return False
+    for role in ("controller", "worker"):
+        observation = value.get(role)
+        if (
+            not isinstance(observation, dict)
+            or set(observation) != {"identity_bound", "rss_bytes"}
+            or type(observation.get("identity_bound")) is not bool
+            or (
+                observation.get("rss_bytes") is not None
+                and (
+                    type(observation["rss_bytes"]) is not int
+                    or not 0 <= observation["rss_bytes"] <= SCRATCH_ADMISSION_RSS_MAX_BYTES
+                )
+            )
+        ):
+            return False
+        if observation["rss_bytes"] is not None and not observation["identity_bound"]:
+            return False
+    cgroup = value.get("cgroup")
+    if (
+        not isinstance(cgroup, dict)
+        or set(cgroup) != {
+            "identity_bound", "memory_current_bytes", "anon_bytes", "file_bytes",
+            "shmem_bytes", "events",
+        }
+        or type(cgroup.get("identity_bound")) is not bool
+    ):
+        return False
+    for key in ("memory_current_bytes", "anon_bytes", "file_bytes", "shmem_bytes"):
+        item = cgroup.get(key)
+        if item is not None and (type(item) is not int or not 0 <= item <= (1 << 60)):
+            return False
+        if item is not None and not cgroup["identity_bound"]:
+            return False
+    events = cgroup.get("events")
+    if not isinstance(events, dict) or set(events) != {"high", "max", "oom", "oom_kill"}:
+        return False
+    for item in events.values():
+        if item is not None and (type(item) is not int or not 0 <= item <= (1 << 60)):
+            return False
+        if item is not None and not cgroup["identity_bound"]:
+            return False
+    complete = (
+        value["status"] == "complete"
+        and value["sample_offset_ms"] is not None
+        and value["unknown_reason"] is None
+        and value["controller"]["identity_bound"]
+        and value["controller"]["rss_bytes"] is not None
+        and value["worker"]["identity_bound"]
+        and value["worker"]["rss_bytes"] is not None
+        and cgroup["identity_bound"]
+        and all(cgroup[key] is not None for key in ("memory_current_bytes", "anon_bytes", "file_bytes", "shmem_bytes"))
+        and all(item is not None for item in events.values())
+    )
+    if value["status"] == "complete":
+        return complete
+    return value["unknown_reason"] in _SCRATCH_RESOURCE_UNKNOWN_REASONS
 
 
 def parse_scratch_host_guard_frame(
@@ -2632,6 +2722,299 @@ def _scratch_proc_status_sample(pid: int) -> tuple[int, int, int] | None:
         return None
 
 
+def _scratch_private_cgroup_file(directory_fd: int, name: str) -> bytes | None:
+    if name not in {"memory.current", "memory.stat", "memory.events"}:
+        return None
+    try:
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd
+        )
+        try:
+            result = bytearray()
+            while len(result) <= SCRATCH_RESOURCE_ATTRIBUTION_FILE_MAX_BYTES:
+                block = os.read(
+                    descriptor,
+                    min(4096, SCRATCH_RESOURCE_ATTRIBUTION_FILE_MAX_BYTES + 1 - len(result)),
+                )
+                if not block:
+                    break
+                result.extend(block)
+            if len(result) > SCRATCH_RESOURCE_ATTRIBUTION_FILE_MAX_BYTES:
+                return None
+            return bytes(result)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return None
+
+
+def _scratch_private_counter(raw: bytes | None) -> int | None:
+    if raw is None:
+        return None
+    try:
+        value = raw.decode("ascii").strip()
+    except UnicodeError:
+        return None
+    if not value.isdecimal():
+        return None
+    number = int(value)
+    return number if number <= (1 << 60) else None
+
+
+def _scratch_private_proc_file(pid_text: str, name: str) -> bytes | None:
+    if (
+        not re.fullmatch(r"[1-9][0-9]{0,9}", pid_text)
+        or name not in {"cgroup"}
+    ):
+        return None
+    try:
+        descriptor = os.open(
+            f"/proc/{pid_text}/{name}",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            result = bytearray()
+            while len(result) <= SCRATCH_RESOURCE_ATTRIBUTION_FILE_MAX_BYTES:
+                block = os.read(
+                    descriptor,
+                    min(4096, SCRATCH_RESOURCE_ATTRIBUTION_FILE_MAX_BYTES + 1 - len(result)),
+                )
+                if not block:
+                    break
+                result.extend(block)
+            if len(result) > SCRATCH_RESOURCE_ATTRIBUTION_FILE_MAX_BYTES:
+                return None
+            return bytes(result)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return None
+
+
+def _scratch_private_key_values(raw: bytes | None, required: set[str]) -> dict[str, int] | None:
+    if raw is None:
+        return None
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeError:
+        return None
+    values: dict[str, int] = {}
+    for line in lines:
+        fields = line.split()
+        if not fields or fields[0] not in required:
+            continue
+        if len(fields) != 2 or fields[0] in values or not fields[1].isdecimal():
+            return None
+        number = int(fields[1])
+        if number > (1 << 60):
+            return None
+        values[fields[0]] = number
+    return values if set(values) == required else None
+
+
+def _scratch_unknown_resource_attribution(
+    reason: str, *, sample_offset_ms: int | None = None
+) -> dict[str, Any]:
+    if reason not in _SCRATCH_RESOURCE_UNKNOWN_REASONS:
+        reason = "internal_error"
+    return {
+        "schema": 1,
+        "status": "unknown",
+        "sample_offset_ms": sample_offset_ms,
+        "unknown_reason": reason,
+        "controller": {"identity_bound": False, "rss_bytes": None},
+        "worker": {"identity_bound": False, "rss_bytes": None},
+        "cgroup": {
+            "identity_bound": False,
+            "memory_current_bytes": None,
+            "anon_bytes": None,
+            "file_bytes": None,
+            "shmem_bytes": None,
+            "events": {"high": None, "max": None, "oom": None, "oom_kill": None},
+        },
+    }
+
+
+def _scratch_private_resource_attribution(
+    *,
+    snapshot: dict[str, Any] | None,
+    worker_identity: tuple[str, str, str] | None,
+    control_group: str | None,
+    launch_monotonic_ns: int | None,
+) -> dict[str, Any]:
+    """Capture bounded role/cgroup observations without affecting guard policy."""
+    started_ns = time.monotonic_ns()
+
+    def unknown(reason: str) -> dict[str, Any]:
+        offset = None
+        if type(launch_monotonic_ns) is int and launch_monotonic_ns <= started_ns:
+            offset = (started_ns - launch_monotonic_ns) // 1_000_000
+        return _scratch_unknown_resource_attribution(reason, sample_offset_ms=offset)
+
+    if (
+        not isinstance(snapshot, dict)
+        or worker_identity is None
+        or control_group is None
+        or type(launch_monotonic_ns) is not int
+        or launch_monotonic_ns > started_ns
+    ):
+        return unknown("sample_unavailable")
+    properties = snapshot.get("properties")
+    worker_pid_text, invocation_id, worker_start_time = worker_identity
+    if (
+        not isinstance(properties, dict)
+        or properties.get("ActiveState") != "active"
+        or properties.get("ExecMainPID") != worker_pid_text
+        or properties.get("InvocationID") != invocation_id
+        or properties.get("ControlGroup") != control_group
+        or not re.fullmatch(r"[1-9][0-9]{0,9}", worker_pid_text)
+        or not re.fullmatch(r"[0-9a-f]{32}", invocation_id)
+        or not re.fullmatch(r"[0-9]+", worker_start_time)
+        or not control_group.startswith("/system.slice/oldsparky-backup-restore-")
+        or not control_group.endswith(".service")
+        or ".." in pathlib.PurePosixPath(control_group).parts
+    ):
+        return unknown("identity_drift")
+
+    controller_pid = os.getpid()
+    try:
+        controller_start_before = _scratch_process_start_time(str(controller_pid))
+        controller_sample = _scratch_proc_status_sample(controller_pid)
+        controller_start_after = _scratch_process_start_time(str(controller_pid))
+        controller_bound = (
+            os.getpid() == controller_pid
+            and controller_start_before == controller_start_after
+            and controller_sample is not None
+            and controller_sample[0] == controller_pid
+        )
+        worker_start_before = _scratch_process_start_time(worker_pid_text)
+        worker_sample = _scratch_proc_status_sample(int(worker_pid_text))
+        worker_start_after = _scratch_process_start_time(worker_pid_text)
+        worker_cgroup_before_raw = _scratch_private_proc_file(worker_pid_text, "cgroup")
+        if worker_cgroup_before_raw is None:
+            return unknown("sample_unavailable")
+        worker_cgroup_before = worker_cgroup_before_raw.decode("ascii")
+        worker_membership_before = any(
+            row.split(":", 2) == ["0", "", control_group]
+            for row in worker_cgroup_before.splitlines()
+        )
+        if (
+            not controller_bound
+            or worker_start_before != worker_start_time
+            or worker_start_after != worker_start_time
+            or worker_sample is None
+            or worker_sample[0] != int(worker_pid_text)
+            or not worker_membership_before
+        ):
+            return unknown("identity_drift")
+    except (OSError, ValueError, UnicodeError, RuntimeError):
+        return unknown("sample_unavailable")
+
+    root_fd = system_slice_fd = cgroup_fd = -1
+    try:
+        root_fd = os.open(
+            "/sys/fs/cgroup",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        root_before = os.fstat(root_fd)
+        system_slice_fd = os.open(
+            "system.slice",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        system_slice_before = os.fstat(system_slice_fd)
+        leaf_name = control_group.removeprefix("/system.slice/")
+        if "/" in leaf_name or not re.fullmatch(
+            r"oldsparky-backup-restore-[0-9a-f]{24}\.service", leaf_name
+        ):
+            return unknown("identity_drift")
+        cgroup_fd = os.open(
+            leaf_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=system_slice_fd,
+        )
+        cgroup_before = os.fstat(cgroup_fd)
+        current = _scratch_private_counter(_scratch_private_cgroup_file(cgroup_fd, "memory.current"))
+        stat_values = _scratch_private_key_values(
+            _scratch_private_cgroup_file(cgroup_fd, "memory.stat"),
+            {"anon", "file", "shmem"},
+        )
+        event_values = _scratch_private_key_values(
+            _scratch_private_cgroup_file(cgroup_fd, "memory.events"),
+            {"high", "max", "oom", "oom_kill"},
+        )
+        if current is None or stat_values is None or event_values is None:
+            return unknown("parse_invalid")
+        cgroup_after = os.fstat(cgroup_fd)
+        system_slice_after = os.fstat(system_slice_fd)
+        root_after = os.fstat(root_fd)
+        system_slice_named = os.stat("system.slice", dir_fd=root_fd, follow_symlinks=False)
+        cgroup_named = os.stat(leaf_name, dir_fd=system_slice_fd, follow_symlinks=False)
+        worker_cgroup_after_raw = _scratch_private_proc_file(worker_pid_text, "cgroup")
+        if worker_cgroup_after_raw is None:
+            return unknown("sample_unavailable")
+        worker_cgroup_after = worker_cgroup_after_raw.decode("ascii")
+        worker_membership_after = any(
+            row.split(":", 2) == ["0", "", control_group]
+            for row in worker_cgroup_after.splitlines()
+        )
+        if (
+            _scratch_process_start_time(worker_pid_text) != worker_start_time
+            or not worker_membership_after
+            or _scratch_process_start_time(str(controller_pid)) != controller_start_before
+            or os.getpid() != controller_pid
+            or (root_before.st_dev, root_before.st_ino) != (root_after.st_dev, root_after.st_ino)
+            or (system_slice_before.st_dev, system_slice_before.st_ino)
+            != (system_slice_after.st_dev, system_slice_after.st_ino)
+            or (system_slice_before.st_dev, system_slice_before.st_ino)
+            != (system_slice_named.st_dev, system_slice_named.st_ino)
+            or (cgroup_before.st_dev, cgroup_before.st_ino)
+            != (cgroup_after.st_dev, cgroup_after.st_ino)
+            or (cgroup_before.st_dev, cgroup_before.st_ino)
+            != (cgroup_named.st_dev, cgroup_named.st_ino)
+        ):
+            return unknown("identity_drift")
+    except (OSError, ValueError, UnicodeError, RuntimeError):
+        return unknown("sample_unavailable")
+    finally:
+        for descriptor in (cgroup_fd, system_slice_fd, root_fd):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    finished_ns = time.monotonic_ns()
+    offset_ms = (finished_ns - launch_monotonic_ns) // 1_000_000
+    result = {
+        "schema": 1,
+        "status": "complete",
+        "sample_offset_ms": offset_ms,
+        "unknown_reason": None,
+        "controller": {"identity_bound": True, "rss_bytes": controller_sample[2]},
+        "worker": {"identity_bound": True, "rss_bytes": worker_sample[2]},
+        "cgroup": {
+            "identity_bound": True,
+            "memory_current_bytes": current,
+            "anon_bytes": stat_values["anon"],
+            "file_bytes": stat_values["file"],
+            "shmem_bytes": stat_values["shmem"],
+            "events": {
+                "high": event_values["high"],
+                "max": event_values["max"],
+                "oom": event_values["oom"],
+                "oom_kill": event_values["oom_kill"],
+            },
+        },
+    }
+    if not valid_scratch_resource_attribution(result):
+        return unknown("internal_error")
+    encoded = json.dumps(result, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
+    if len(encoded) > SCRATCH_RESOURCE_ATTRIBUTION_MAX_BYTES:
+        return unknown("cap_exceeded")
+    return result
+
+
 def _parse_scratch_proc_status(raw: bytes) -> tuple[int, int, int] | None:
     try:
         lines = raw.decode("ascii").splitlines()
@@ -3846,6 +4229,7 @@ def _run_isolated_restore_drill(
         terminal_snapshot: dict[str, Any] | None = None
         selector: selectors.BaseSelector | None = None
         launch_started = False
+        launch_monotonic_ns: int | None = None
         last_tick = time.monotonic()
         deadline = last_tick + SCRATCH_RUNTIME_SECONDS + 30
         worker_result: dict[str, Any] | None = None
@@ -3883,6 +4267,7 @@ def _run_isolated_restore_drill(
                 launch_started = True
                 fault_site = "controller_launch"
                 startup_deadline = time.monotonic() + SCRATCH_STARTUP_SECONDS
+                launch_monotonic_ns = time.monotonic_ns()
                 process = subprocess.Popen(
                     command,
                     stdin=subprocess.PIPE,
@@ -3906,7 +4291,33 @@ def _run_isolated_restore_drill(
                 if now >= deadline or now - last_tick > SCRATCH_RUNTIME_SAMPLE_SECONDS * 8:
                     raise RuntimeError("Scratch restore monitor exceeded its bounded runtime or sample interval.")
                 fault_site = "controller_active_poll"
-                _scratch_host_guard("parent_active_poll")
+                try:
+                    _scratch_host_guard("parent_active_poll")
+                except BaseException as guard_error:
+                    if (
+                        private_scratch_diagnostics
+                        and valid_scratch_host_guard_diagnostic(
+                            getattr(guard_error, "scratch_host_guard_diagnostic", None)
+                        )
+                        and getattr(guard_error, "scratch_host_guard_diagnostic", {}).get("guard_site")
+                        == "parent_active_poll"
+                    ):
+                        try:
+                            attribution = _scratch_private_resource_attribution(
+                                snapshot=active_snapshot,
+                                worker_identity=active_identity,
+                                control_group=active_control_group,
+                                launch_monotonic_ns=launch_monotonic_ns,
+                            )
+                        except BaseException:
+                            attribution = _scratch_unknown_resource_attribution("internal_error")
+                        try:
+                            if valid_scratch_resource_attribution(attribution):
+                                setattr(guard_error, "scratch_resource_attribution", attribution)
+                        except BaseException:
+                            # Optional evidence must never replace the reserve guard failure.
+                            pass
+                    raise
                 fault_site = "controller_unit_snapshot"
                 snapshot = _scratch_service_snapshot(unit_name)
                 properties = snapshot.get("properties", {})
@@ -4779,6 +5190,12 @@ def failure_report_for_exception(
     first_fault = getattr(exc, "scratch_first_fault", None)
     if private_scratch_diagnostics and valid_scratch_first_fault(first_fault):
         report["scratch_first_fault"] = first_fault
+    resource_attribution = getattr(exc, "scratch_resource_attribution", None)
+    if (
+        private_scratch_diagnostics
+        and valid_scratch_resource_attribution(resource_attribution)
+    ):
+        report["scratch_resource_attribution"] = resource_attribution
     return report
 
 
