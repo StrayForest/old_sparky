@@ -271,6 +271,40 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
             archive_path.write_bytes(b"PGDMPsynthetic archive")
             archive_path.chmod(0o600)
+            archive_identity = (archive_path.stat().st_dev, archive_path.stat().st_ino)
+
+            def root_owned_archive_stat(value):
+                # The production path requires a root-owned archive.  This
+                # contour also runs as an unprivileged CI user, so project
+                # only the fixture's ownership metadata instead of weakening
+                # the production check or relying on chown privileges.
+                return types.SimpleNamespace(
+                    st_mode=value.st_mode,
+                    st_uid=0,
+                    st_gid=value.st_gid,
+                    st_nlink=value.st_nlink,
+                    st_dev=value.st_dev,
+                    st_ino=value.st_ino,
+                    st_size=value.st_size,
+                    st_mtime_ns=value.st_mtime_ns,
+                    st_ctime_ns=value.st_ctime_ns,
+                )
+
+            actual_fstat = os.fstat
+            actual_lstat = os.lstat
+
+            def fstat_with_root_owned_archive(fd):
+                value = actual_fstat(fd)
+                if (value.st_dev, value.st_ino) == archive_identity:
+                    return root_owned_archive_stat(value)
+                return value
+
+            def lstat_with_root_owned_archive(path, *args, **kwargs):
+                value = actual_lstat(path, *args, **kwargs)
+                if pathlib.Path(path) == archive_path:
+                    return root_owned_archive_stat(value)
+                return value
+
             token = uuid.uuid4().hex[:24]
             mountpoint = pathlib.Path(f"/run/oldsparky-backup-restore-{token}")
             if mountpoint.exists():
@@ -328,6 +362,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
             with (
                 mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    backup_drill.os, "fstat", side_effect=fstat_with_root_owned_archive
+                ),
+                mock.patch.object(
+                    backup_drill.os, "lstat", side_effect=lstat_with_root_owned_archive
+                ),
                 mock.patch.object(backup_drill, "require_commands"),
                 mock.patch.object(backup_drill, "require_restore_headroom"),
                 mock.patch.object(backup_drill, "_scratch_host_guard", side_effect=host_guard_at),
