@@ -274,7 +274,7 @@ def validate_receipt_archive(
 
 def _expected_title(expected: BackupBinding) -> str:
     return (
-        f"Platform backup create s{expected.source_security_run_id}."
+        f"Platform backup/probe create s{expected.source_security_run_id}."
         f"{expected.source_security_run_attempt} {expected.source_sha}"
     )
 

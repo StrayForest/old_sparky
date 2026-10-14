@@ -352,6 +352,11 @@ backup preflight remains an additional check; it does not replace this
 source-bound proof. The auto-deploy workflow has no fallback to an older backup
 and does not dispatch a manual-deployment path.
 
+The source-bound candidate title is the exact `run-name` emitted by
+`platform-production-backup.yml`, including the operation label, Security run
+ID and attempt, and source SHA. A title mismatch is treated as a missing exact
+candidate; the guard does not infer identity from a similar title.
+
 When the source-bound scratch restore service exits before its confinement can
 be verified, the explicit private-diagnostics path records only a closed unit
 phase/state/result/status summary and bounded stream byte counts and hashes in

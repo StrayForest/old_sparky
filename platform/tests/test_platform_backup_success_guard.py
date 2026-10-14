@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from pathlib import Path
 import stat
 import unittest
 import warnings
@@ -154,7 +155,7 @@ class FakeBackupProofApi:
                 "head_branch": "dev",
                 "head_sha": SOURCE_SHA,
                 "display_title": (
-                    f"Platform backup create s{SECURITY_RUN_ID}."
+                    f"Platform backup/probe create s{SECURITY_RUN_ID}."
                     f"{SECURITY_ATTEMPT} {SOURCE_SHA}"
                 ),
                 "status": "completed",
@@ -708,6 +709,19 @@ class BackupSuccessGuardTests(unittest.TestCase):
             )
 
     def test_workflow_and_backup_run_attempt_identity_are_bound(self) -> None:
+        backup_workflow = (Path(__file__).resolve().parents[2] / BACKUP_WORKFLOW).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'run-name: "Platform backup/probe ${{ inputs.operation }} '
+            's${{ inputs.security_run_id }}.${{ inputs.security_run_attempt }} '
+            '${{ inputs.source_sha }}"',
+            backup_workflow.splitlines()[1],
+        )
+        self.assertEqual(
+            backup_guard._expected_title(_binding()),
+            f"Platform backup/probe create s{SECURITY_RUN_ID}.{SECURITY_ATTEMPT} {SOURCE_SHA}",
+        )
         mutations = (
             ("workflow", {"path": ".github/workflows/other.yml"}),
             ("run", {"workflow_id": 902}),
@@ -716,6 +730,15 @@ class BackupSuccessGuardTests(unittest.TestCase):
             ("run", {"head_branch": "other"}),
             ("run", {"head_sha": "e" * 40}),
             ("run", {"run_attempt": BACKUP_ATTEMPT + 1}),
+            (
+                "run",
+                {
+                    "display_title": (
+                        f"Platform backup create s{SECURITY_RUN_ID}."
+                        f"{SECURITY_ATTEMPT} {SOURCE_SHA}"
+                    )
+                },
+            ),
             ("run", {"display_title": "stale backup"}),
             ("run", {"conclusion": "failure"}),
             ("run", {"status": []}),
