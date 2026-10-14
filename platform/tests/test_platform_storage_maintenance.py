@@ -1711,6 +1711,12 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         with (
             mock.patch.object(maintenance, "maintenance_lock_scope", tracked_scope),
             mock.patch.object(maintenance, "_plan_and_maybe_apply") as retention_plan,
+            mock.patch.object(maintenance.live_qa_guard, "_module", None),
+            mock.patch.object(
+                maintenance,
+                "_load_live_qa_guard",
+                side_effect=AssertionError("backup-only path must not import live-QA cache policy"),
+            ) as load_live_qa_guard,
             mock.patch.object(
                 maintenance,
                 "run_backup",
@@ -1732,10 +1738,6 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "preexisting_archives_preserved": True,
                 },
             ) as run_backup,
-            mock.patch.object(
-                maintenance.live_qa_guard,
-                "prune_runtime_cache_release_lock_held",
-            ) as live_qa_prune,
         ):
             report = run_maintenance(args)
 
@@ -1751,7 +1753,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             rotate_existing=False,
             private_failure_diagnostics=False,
         )
-        live_qa_prune.assert_not_called()
+        load_live_qa_guard.assert_not_called()
         retention_plan.assert_not_called()
 
         self.assertTrue(candidate.exists())
@@ -2122,20 +2124,22 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
         with (
             mock.patch.object(maintenance, "maintenance_lock_scope", tracked_scope),
+            mock.patch.object(maintenance.live_qa_guard, "_module", None),
+            mock.patch.object(
+                maintenance,
+                "_load_live_qa_guard",
+                side_effect=AssertionError("backup-only path must not import live-QA cache policy"),
+            ) as load_live_qa_guard,
             mock.patch.object(
                 maintenance,
                 "run_backup",
                 side_effect=RuntimeError("restore verification failed"),
             ),
-            mock.patch.object(
-                maintenance.live_qa_guard,
-                "prune_runtime_cache_release_lock_held",
-            ) as live_qa_prune,
         ):
             with self.assertRaisesRegex(RuntimeError, "restore verification failed"):
                 run_maintenance(args)
 
-        live_qa_prune.assert_not_called()
+        load_live_qa_guard.assert_not_called()
         self.assertTrue(candidate.exists())
 
     def test_disk_snapshot_uses_available_free_for_conservative_percent(self) -> None:
@@ -2770,6 +2774,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "platform_backup_restore_drill.py",
                 "platform_disk_policy.py",
                 "platform_live_qa_guard.py",
+                "platform_live_qa_machine_lock.py",
                 "platform_release_retention.py",
                 "platform_build_node_cache.py",
                 "platform_storage_maintenance.py",
@@ -2779,6 +2784,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "platform_backup_restore_drill.py": 0o755,
                 "platform_disk_policy.py": 0o644,
                 "platform_live_qa_guard.py": 0o755,
+                "platform_live_qa_machine_lock.py": 0o644,
                 "platform_release_retention.py": 0o755,
                 "platform_build_node_cache.py": 0o644,
                 "platform_storage_maintenance.py": 0o755,
@@ -3283,6 +3289,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "platform_backup_restore_drill.py",
                 "platform_disk_policy.py",
                 "platform_live_qa_guard.py",
+                "platform_live_qa_machine_lock.py",
                 "platform_release_retention.py",
                 "platform_build_node_cache.py",
                 "platform_storage_maintenance.py",
@@ -3685,6 +3692,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "platform_backup_restore_drill.py",
             "platform_disk_policy.py",
             "platform_live_qa_guard.py",
+            "platform_live_qa_machine_lock.py",
             "platform_release_retention.py",
             "platform_build_node_cache.py",
             "platform_storage_maintenance.py",
@@ -3694,6 +3702,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "platform_backup_restore_drill.py": 0o755,
             "platform_disk_policy.py": 0o644,
             "platform_live_qa_guard.py": 0o755,
+            "platform_live_qa_machine_lock.py": 0o644,
             "platform_release_retention.py": 0o755,
             "platform_build_node_cache.py": 0o644,
             "platform_storage_maintenance.py": 0o755,

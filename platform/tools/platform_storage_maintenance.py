@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
 import fcntl
 import hashlib
+import importlib
 import importlib.util
 import json
 import math
@@ -19,7 +20,7 @@ import shutil
 import stat
 import subprocess
 import sys
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, NamedTuple
 from urllib.parse import urlsplit
 
 # The backup workflow executes this exact attested helper with Python's
@@ -29,6 +30,8 @@ from urllib.parse import urlsplit
 _SCRIPT_TOOLS_DIR = str(Path(__file__).resolve(strict=True).parent)
 if _SCRIPT_TOOLS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_TOOLS_DIR)
+
+import platform_live_qa_machine_lock as live_qa_machine_lock_owner
 
 
 def _load_staged_disk_policy() -> Any:
@@ -62,8 +65,6 @@ except ImportError:  # Direct execution from the tools directory.
 
 try:
     from . import platform_backup_restore_drill as backup_restore_drill
-    from . import platform_live_qa_guard as live_qa_guard
-    from . import platform_build_node_cache
     from .platform_backup_restore_drill import (
         valid_backup_disk_diagnostic,
         valid_scratch_admission_diagnostic,
@@ -84,8 +85,6 @@ try:
     )
 except ImportError:  # Direct execution from the tools directory.
     import platform_backup_restore_drill as backup_restore_drill
-    import platform_live_qa_guard as live_qa_guard
-    import platform_build_node_cache
     from platform_backup_restore_drill import (
         valid_backup_disk_diagnostic,
         valid_scratch_admission_diagnostic,
@@ -104,6 +103,45 @@ except ImportError:  # Direct execution from the tools directory.
         release_operation_lock,
         resolved_release_target,
     )
+
+
+def _load_live_qa_guard() -> Any:
+    module_name = "platform_live_qa_guard"
+    if __package__:
+        module_name = f"{__package__}.{module_name}"
+    return importlib.import_module(module_name)
+
+
+def _load_build_node_cache() -> Any:
+    module_name = "platform_build_node_cache"
+    if __package__:
+        module_name = f"{__package__}.{module_name}"
+    return importlib.import_module(module_name)
+
+
+class _LazyModule:
+    """Load optional cache policy only when a cache branch needs it."""
+
+    def __init__(self, loader: Callable[[], Any]) -> None:
+        self._loader = loader
+        self._module: Any | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        if self._module is None:
+            self._module = self._loader()
+        return getattr(self._module, name)
+
+
+live_qa_guard = _LazyModule(_load_live_qa_guard)
+platform_build_node_cache = _LazyModule(_load_build_node_cache)
+LIVE_QA_MACHINE_LOCK_PATH = live_qa_machine_lock_owner.MACHINE_LOCK_PATH
+
+
+class _EmptyLiveQARuntimeCachePlan(NamedTuple):
+    protected: tuple[Any, ...]
+    retained: tuple[Any, ...]
+    candidates: tuple[Any, ...]
+    tombstones: tuple[Any, ...]
 
 
 DEFAULT_APP_DIR = Path("/opt/oldsparky/platform")
@@ -2097,7 +2135,9 @@ def compact_legacy_fallback_runtime_cache(
 def live_qa_machine_lock() -> Iterator[None]:
     """Join the existing live-QA machine lock after release/build locks."""
 
-    descriptor = live_qa_guard._open_machine_lock()
+    descriptor = live_qa_machine_lock_owner.open_machine_lock(
+        LIVE_QA_MACHINE_LOCK_PATH
+    )
     try:
         yield
     finally:
@@ -2637,7 +2677,7 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                         "preprod_screenshots": 0,
                     },
                 )
-                live_qa_plan = live_qa_guard.RuntimeCacheRetentionPlan((), (), (), ())
+                live_qa_plan = _EmptyLiveQARuntimeCachePlan((), (), (), ())
             elif getattr(args, "backup_only", False):
                 # Do not construct or apply release, artifact, transient or
                 # live-QA retention plans in this mode. The backup owner may
@@ -2668,7 +2708,7 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                         "preprod_screenshots": 0,
                     },
                 )
-                live_qa_plan = live_qa_guard.RuntimeCacheRetentionPlan((), (), (), ())
+                live_qa_plan = _EmptyLiveQARuntimeCachePlan((), (), (), ())
             else:
                 maintenance_result = _plan_and_maybe_apply(
                     args,

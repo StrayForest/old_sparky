@@ -66,6 +66,7 @@ RUNTIME_SENSITIVE_FILES = frozenset(
         "platform/tools/platform_build_live_qa_runtime.py",
         "platform/tools/platform_build_release.sh",
         "platform/tools/platform_live_qa_guard.py",
+        "platform/tools/platform_live_qa_machine_lock.py",
         "platform/tools/platform_live_qa_runtime_install.py",
         # The public live-launch workflow passes validated inputs as argv to
         # this release-managed root entrypoint; changes require the active app

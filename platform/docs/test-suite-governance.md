@@ -121,7 +121,7 @@ these five catalog contours:
 | `backend` (aggregate) | 3600s | serial orchestration | disjoint union of the five contours |
 
 
-`test_platform_external_load` (performance-contract) covers bounded HTTP body failures, phase accounting, client CPU sampler lifecycle and cgroup-capacity reason parsing; `test_platform_evidence_privacy` (backend-tool-contract) owns whole-series run-window, production observer-row mapping, observer-timeline and identity-stripping projections. `test_platform_live_qa_runtime_install` (backend-privileged) exercises the copied dispatcher against its installed release validator, including missing/tampered refusal.
+`test_platform_external_load` (performance-contract) covers bounded HTTP body failures, phase accounting, client CPU sampler lifecycle and cgroup-capacity reason parsing; `test_platform_evidence_privacy` (backend-tool-contract) owns whole-series run-window, production observer-row mapping, observer-timeline and identity-stripping projections. `test_platform_live_qa_runtime_install` (backend-privileged) exercises the copied dispatcher against its installed release validator, including missing/tampered refusal. The existing `test_platform_live_qa_guard` lock cases own the shared machine-lock boundary, while `test_platform_storage_maintenance` checks backup-only lazy imports and maintenance-to-guard lock identity.
 The SSR admission-shed parser remains in `test_platform_ssr_observability` (performance-contract), public projection privacy in `test_platform_evidence_privacy` (backend-tool-contract), and the bounded web scheduler in the existing `frontend-audit-regressions.spec.ts` smoke owner; no test IDs or gate-ownership entries are added.
 
 Every aggregate and backend sub-contour is guarded before test discovery by

@@ -461,6 +461,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 launch_members = (
                     "platform/tools/platform_live_launch_supervisor.sh",
                     "platform/tools/platform_live_qa_guard.py",
+                    "platform/tools/platform_live_qa_machine_lock.py",
                     "platform/tools/platform_safe_env_exec.py",
                     "platform/tools/platform_live_browser_qa.sh",
                     "platform/tools/platform_provision_live_csp_qa.sh",

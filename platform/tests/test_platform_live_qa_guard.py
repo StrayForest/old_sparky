@@ -410,18 +410,37 @@ class LiveQaGuardTests(unittest.TestCase):
         self.assertEqual(second, guard.MACHINE_LOCK_PATH)
 
     def test_machine_lock_refuses_a_second_concurrent_open(self) -> None:
+        from tools import platform_storage_maintenance as maintenance
+
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             lock_path = Path(temporary) / "liveqa.lock"
             with (
                 mock.patch.object(guard, "MACHINE_LOCK_PATH", lock_path),
+                mock.patch.object(
+                    maintenance, "LIVE_QA_MACHINE_LOCK_PATH", lock_path
+                ),
                 mock.patch.object(guard, "_validate_root_secret_parent"),
             ):
                 first = guard._open_bundle_lock(Path("/root/one/bundle.json"))
                 try:
+                    opened = os.fstat(first)
+                    path_metadata = lock_path.stat()
+                    self.assertEqual(
+                        (opened.st_dev, opened.st_ino),
+                        (path_metadata.st_dev, path_metadata.st_ino),
+                    )
                     with self.assertRaisesRegex(guard.GuardError, "another live QA"):
                         guard._open_bundle_lock(Path("/root/two/bundle.json"))
+                    with self.assertRaisesRegex(guard.GuardError, "another live QA"):
+                        with maintenance.live_qa_machine_lock():
+                            self.fail("contended storage lock unexpectedly acquired")
                 finally:
                     os.close(first)
+                with maintenance.live_qa_machine_lock():
+                    self.assertEqual(
+                        (lock_path.stat().st_dev, lock_path.stat().st_ino),
+                        (path_metadata.st_dev, path_metadata.st_ino),
+                    )
 
     def test_locked_exec_rejects_non_trusted_wrapper(self) -> None:
         with self.assertRaisesRegex(guard.GuardError, "not a reviewed"):

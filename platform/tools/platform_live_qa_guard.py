@@ -9,6 +9,8 @@ from contextlib import contextmanager
 import fcntl
 import grp
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -148,7 +150,6 @@ MAX_TAR_MEMBER_BYTES = 768 * 1024 * 1024
 MAX_TAR_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
 MAX_NPM_FILE_BYTES = 256 * 1024 * 1024
 LOCK_ENV_NAME = "PLATFORM_LIVE_QA_LOCK_FD"
-MACHINE_LOCK_PATH = Path("/run/lock/oldsparky-liveqa.lock")
 RELEASE_LOCK_PATH = Path("/run/lock/oldsparky-platform-release.lock")
 STATE_PHASE_FILE = "phase.json"
 STATE_PHASE_SETUP = "setup"
@@ -227,9 +228,29 @@ LIVE_BROWSER_COUNT_FIELDS = (
 )
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-
-class GuardError(RuntimeError):
-    """A deliberately non-sensitive live-QA guard failure."""
+_machine_lock_name = "platform_live_qa_machine_lock"
+try:
+    _machine_lock_module = importlib.import_module(_machine_lock_name)
+except ModuleNotFoundError as exc:
+    if exc.name != _machine_lock_name:
+        raise
+    _machine_lock_path = Path(__file__).resolve().with_name(
+        "platform_live_qa_machine_lock.py"
+    )
+    _machine_lock_spec = importlib.util.spec_from_file_location(
+        _machine_lock_name, _machine_lock_path
+    )
+    if _machine_lock_spec is None or _machine_lock_spec.loader is None:
+        raise ImportError("live QA machine lock helper is unavailable") from exc
+    _machine_lock_module = importlib.util.module_from_spec(_machine_lock_spec)
+    sys.modules[_machine_lock_name] = _machine_lock_module
+    _machine_lock_spec.loader.exec_module(_machine_lock_module)
+GuardError = _machine_lock_module.GuardError
+MACHINE_LOCK_PATH = _machine_lock_module.MACHINE_LOCK_PATH
+_open_shared_machine_lock = _machine_lock_module.open_machine_lock
+_open_shared_machine_lock_directory = (
+    _machine_lock_module._open_machine_lock_directory
+)
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1122,65 +1143,11 @@ def _validate_trusted_wrapper(argv: list[str], *, recovery: bool) -> None:
 
 
 def _open_machine_lock_directory() -> int:
-    lock_parent = MACHINE_LOCK_PATH.parent
-    descriptor: int | None = None
-    try:
-        path_metadata = lock_parent.lstat()
-        descriptor = os.open(
-            lock_parent,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        opened = os.fstat(descriptor)
-    except OSError as exc:
-        if descriptor is not None:
-            os.close(descriptor)
-        raise GuardError("live QA machine lock directory is unavailable") from exc
-    if (
-        not stat.S_ISDIR(opened.st_mode)
-        or opened.st_uid != 0
-        or (opened.st_dev, opened.st_ino)
-        != (path_metadata.st_dev, path_metadata.st_ino)
-        or (stat.S_IMODE(opened.st_mode) & 0o022 and not opened.st_mode & stat.S_ISVTX)
-    ):
-        os.close(descriptor)
-        raise GuardError("live QA machine lock directory metadata is unsafe")
-    return descriptor
+    return _open_shared_machine_lock_directory(MACHINE_LOCK_PATH)
 
 
 def _open_machine_lock() -> int:
-    lock_path = MACHINE_LOCK_PATH
-    parent_fd = _open_machine_lock_directory()
-    try:
-        descriptor = os.open(
-            lock_path.name,
-            os.O_RDWR
-            | os.O_CREAT
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-            dir_fd=parent_fd,
-        )
-    finally:
-        os.close(parent_fd)
-    metadata = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or metadata.st_uid != 0
-        or metadata.st_gid != 0
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-    ):
-        os.close(descriptor)
-        raise GuardError("live QA lock file metadata is unsafe")
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        os.close(descriptor)
-        raise GuardError("another live QA operation holds the machine lock") from exc
-    return descriptor
+    return _open_shared_machine_lock(MACHINE_LOCK_PATH)
 
 
 def _open_bundle_lock(bundle_path: Path) -> int:
