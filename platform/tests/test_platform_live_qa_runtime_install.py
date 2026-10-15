@@ -313,6 +313,109 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 repeated = runtime.recover_provider(app_dir, runtime_source)
                 self.assertEqual(repeated["status"], "already-valid")
 
+    def test_provider_recovery_accepts_three_logical_roles_with_current_active_alias(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                app_dir,
+                runtime_source,
+                payload_root,
+                owners,
+                _engine_files,
+                _engine_sha,
+                _lock_sha,
+                sandbox_sha,
+                source_manifest_sha,
+            ) = self._provider_recovery_fixture(root)
+            active_pointer = root / "liveqa" / "active"
+            active_pointer.unlink()
+            active_pointer.symlink_to(f"releases/{owners[0]}")
+            active_manifest = root / "liveqa" / "active-manifest.json"
+            active_manifest.chmod(0o644)
+            active_manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "source_sha": owners[0],
+                        "release_slug": "active-generation",
+                        "payload": str(payload_root / owners[0]),
+                        "payload_tree_sha256": "d" * 64,
+                        "files": {},
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="ascii",
+            )
+            os.chown(active_manifest, 0, 0)
+            active_manifest.chmod(0o444)
+            with mock.patch.multiple(
+                runtime,
+                APP_DIR=app_dir,
+                PAYLOAD_ROOT=payload_root,
+                TRUSTED_ROOT=root / "liveqa",
+                ACTIVE_POINTER=active_pointer,
+                ACTIVE_MANIFEST=active_manifest,
+                PROVIDER_RECOVERY_RUNTIME_MANIFEST_SHA256=source_manifest_sha,
+                CHROMIUM_SANDBOX_SIZE=(runtime_source / runtime.RUNTIME_SANDBOX_RELATIVE).stat().st_size,
+                CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+            ), mock.patch.object(runtime, "_require_release_lock"):
+                result = runtime.recover_provider(app_dir, runtime_source)
+            self.assertEqual(result["status"], "published")
+            self.assertTrue((payload_root / runtime.PROVIDER_RECOVERY_SOURCE_SHA / "runtime").is_dir())
+
+    def test_provider_recovery_rejects_missing_logical_reference(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                app_dir,
+                _runtime_source,
+                payload_root,
+                _owners,
+                engine_files,
+                engine_sha,
+                lock_sha,
+                _sandbox_sha,
+                _manifest_sha,
+            ) = self._provider_recovery_fixture(root)
+            (app_dir / "current").unlink()
+            with mock.patch.multiple(
+                runtime,
+                PAYLOAD_ROOT=payload_root,
+                ACTIVE_POINTER=root / "liveqa" / "active",
+                ACTIVE_MANIFEST=root / "liveqa" / "active-manifest.json",
+            ), self.assertRaisesRegex(
+                runtime.InstallerError, "all three logical references"
+            ):
+                runtime._provider_recovery_snapshot(
+                    app_dir,
+                    source_sha=runtime.PROVIDER_RECOVERY_SOURCE_SHA,
+                    runtime_manifest={
+                        "engine_tree_sha256": engine_sha,
+                        "node_version": "26.3.1",
+                        "package_lock_sha256": lock_sha,
+                        "engine_files": engine_files,
+                    },
+                )
+
+    def test_provider_recovery_cli_diagnostic_hides_exception_text(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(runtime, "_require_release_lock"), mock.patch.object(
+            runtime,
+            "recover_provider",
+            side_effect=runtime.InstallerError("private path and provider details"),
+        ), redirect_stderr(stderr):
+            result = runtime.main(
+                ["provider-recover", "--runtime-source", "/tmp/fixed-source"]
+            )
+        diagnostic = stderr.getvalue()
+        self.assertEqual(result, 1)
+        self.assertIn("phase=provider_recovery", diagnostic)
+        self.assertIn("error=InstallerError", diagnostic)
+        self.assertIn("function=main", diagnostic)
+        self.assertNotIn("private path", diagnostic)
+        self.assertNotIn("provider details", diagnostic)
+
     def test_provider_recovery_refuses_alternate_app_directory_before_lock(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             root = Path(temporary)

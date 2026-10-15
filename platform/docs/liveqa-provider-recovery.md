@@ -33,6 +33,13 @@ provider, or remove other artifacts. On any mismatch, preserve protected state
 and stop. Provider recovery does not replace the required verified backup,
 browser QA or normal GitHub Actions release gates.
 
+The snapshot requires all three logical roles (`current`, `previous`, and the
+active LiveQA pointer), but validates provider manifests once per distinct
+release owner. The active pointer may alias `current`; this does not remove
+either role from the before/after snapshot. The retained 65a generation is
+unprotected under the canonical retention preview and is not a recovery owner;
+preserve it and its metadata without treating it as a current protected role.
+
 For the verified 2026-10-15 recovery, bind the invocation to app directory
 `/opt/oldsparky/platform`, current active source
 `9ceaf09ab7ba4bf5c5e636865106910eaa034c8d`, and the extracted runtime at
@@ -42,9 +49,11 @@ reviewed feature blob is published and its exact-SHA checks pass, place one
 O_EXCL root-owned, mode-0500 copy in a dedicated root-only directory outside
 both the LiveQA trust root and active release, named by the tool SHA-256; do
 not modify the active release or LiveQA tree. For the reviewed source blob,
-the 106,351-byte sidecar SHA-256 is
-`e2f3412de794b70c1fe5868b58f50cf1398fbbe2a3e9de1714f33f83af1f54a9`, and the path is
-`/root/.oldsparky/provider-recovery-tools/platform_live_qa_runtime_install-e2f3412de794b70c1fe5868b58f50cf1398fbbe2a3e9de1714f33f83af1f54a9.py`.
+the corrected 107,530-byte sidecar SHA-256 is
+`f2960463c186235cfb3c6c83eae6f2505f1f6ccb369fe7b99256b0af8af77ac3`, and the path is
+`/root/.oldsparky/provider-recovery-tools/platform_live_qa_runtime_install-f2960463c186235cfb3c6c83eae6f2505f1f6ccb369fe7b99256b0af8af77ac3.py`.
+Create a new hash-named sidecar after this exact blob is published; preserve
+the prior `e2f3412d…` sidecar and its failed-action evidence unchanged.
 Before execution, verify that sidecar's owner, mode, link count, size and
 SHA-256 against the published blob, and verify the sidecar parent directory's
 stable device/inode/owner/mode identity. Confirm that the extracted source and
@@ -56,7 +65,7 @@ take a fresh protected reference snapshot. The exact locked command is:
   --app-dir /opt/oldsparky/platform \
   --expected-sha 9ceaf09ab7ba4bf5c5e636865106910eaa034c8d \
   -- /usr/bin/python3.12 -I -B \
-  /root/.oldsparky/provider-recovery-tools/platform_live_qa_runtime_install-e2f3412de794b70c1fe5868b58f50cf1398fbbe2a3e9de1714f33f83af1f54a9.py \
+  /root/.oldsparky/provider-recovery-tools/platform_live_qa_runtime_install-f2960463c186235cfb3c6c83eae6f2505f1f6ccb369fe7b99256b0af8af77ac3.py \
   provider-recover \
   --runtime-source /root/old_sparky/.git/codex-performance-20261012/artifact-37614074702-attempt1-quarantine/private-extract-11479063406-19603-source19603-validator/gha-37614074702-1-19603dfff122/liveqa-runtime
 ```
@@ -70,3 +79,8 @@ successful result, independently verify the immutable provider tree and all
 three consumer references, plus unchanged current/previous/active pointers,
 before considering any later QA action. Do not treat this provider-only
 operation as a backup, deployment, restore or QA pass.
+
+On provider-recovery refusal, the CLI reports only a fixed phase, exception
+class, and the deepest function/line in the installed tool. It never prints
+exception text, local values, or arbitrary paths. Preserve that diagnostic and
+stop; do not retry without a separately reviewed correction.

@@ -1691,11 +1691,12 @@ def _provider_recovery_snapshot(
     source_sha: str,
     runtime_manifest: dict[str, object],
 ) -> tuple[object, ...]:
-    """Bind the exact three protected consumers before/after provider publish."""
+    """Bind three logical protected references and their distinct owners."""
 
     _directory(PAYLOAD_ROOT, mode=0o755)
     pointers: list[tuple[object, ...]] = []
     owners: set[str] = set()
+    logical_roles = 0
     for pointer_name in ("current", "previous"):
         pointer = app_dir / pointer_name
         try:
@@ -1741,6 +1742,7 @@ def _provider_recovery_snapshot(
             )
         )
         owners.add(owner_sha)
+        logical_roles += 1
 
     active_pointer = ACTIVE_POINTER
     try:
@@ -1785,9 +1787,10 @@ def _provider_recovery_snapshot(
             )
         )
         owners.add(active_target.name)
+        logical_roles += 1
 
-    if len(owners) != 3:
-        raise InstallerError("provider recovery requires exactly three protected consumers")
+    if logical_roles != 3:
+        raise InstallerError("provider recovery requires all three logical references")
     provider_snapshots: list[tuple[object, ...]] = []
     expected_engine_fields = (
         runtime_manifest.get("engine_tree_sha256"),
@@ -1919,6 +1922,30 @@ def _provider_recovery_snapshot(
         active_manifest["payload_tree_sha256"],
     )
     return tuple(pointers), tuple(provider_snapshots), active_manifest_snapshot
+
+
+def _provider_recovery_failure(exc: BaseException) -> None:
+    """Emit a closed diagnostic without exception text, paths, or locals."""
+
+    module_path = Path(__file__).resolve()
+    source_frame = None
+    traceback = exc.__traceback__
+    while traceback is not None:
+        try:
+            frame_path = Path(traceback.tb_frame.f_code.co_filename).resolve()
+        except (OSError, RuntimeError):
+            frame_path = None
+        if frame_path == module_path:
+            source_frame = traceback
+        traceback = traceback.tb_next
+    function = source_frame.tb_frame.f_code.co_name if source_frame is not None else "unknown"
+    line = source_frame.tb_lineno if source_frame is not None else 0
+    print(
+        "LIVE_QA_RUNTIME_PROVIDER_RECOVERY status=failed "
+        f"phase=provider_recovery error={type(exc).__name__} "
+        f"function={function} line={line}",
+        file=sys.stderr,
+    )
 
 
 def recover_provider(app_dir: Path, runtime_source: Path) -> dict[str, object]:
@@ -2539,6 +2566,18 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == "provider-recover":
+        try:
+            _require_release_lock()
+            result = recover_provider(APP_DIR, args.runtime_source)
+            print(
+                "LIVE_QA_RUNTIME_PROVIDER_RECOVERY "
+                f"status={result['status']} source_sha={result['source_sha']}"
+            )
+            return 0
+        except (InstallerError, OSError, ValueError) as exc:
+            _provider_recovery_failure(exc)
+            return 1
     try:
         _require_release_lock()
         if args.command == "install":
@@ -2553,12 +2592,6 @@ def main(argv: list[str] | None = None) -> int:
                 rollback_transaction=args.rollback_transaction,
             )
             print(f"LIVE_QA_RUNTIME_RECONCILE status=passed source_sha={manifest['source_sha']}")
-        elif args.command == "provider-recover":
-            result = recover_provider(APP_DIR, args.runtime_source)
-            print(
-                "LIVE_QA_RUNTIME_PROVIDER_RECOVERY "
-                f"status={result['status']} source_sha={result['source_sha']}"
-            )
         else:
             removed = _retention(args.app_dir, apply=args.apply)
             print(f"LIVE_QA_RUNTIME_RETENTION status={'applied' if args.apply else 'preview'} removed={removed}")
