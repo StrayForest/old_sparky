@@ -114,7 +114,7 @@ these five catalog contours:
 | Catalog contour | Timeout | Shared-resource execution | Ownership boundary |
 | --- | ---: | --- | --- |
 | `backend-unit` | 300s | not serial-resource constrained | unit/domain/backend tests with no external operator contour |
-| `backend-tool-contract` | 600s | not serial-resource constrained | hermetic repository tools, backup restore diagnostics and privacy-safe sampling projections (`test_platform_evidence_privacy`) without root-owned host metadata |
+| `backend-tool-contract` | 600s | not serial-resource constrained | hermetic repository tools, backup restore diagnostics (including paired scratch PostgreSQL startup settings) and privacy-safe sampling projections (`test_platform_evidence_privacy`) without root-owned host metadata |
 | `backend-integration` | 1200s | serial | PostgreSQL/Redis integration tests and real workflow races |
 | `backend-privileged` | 1200s | serial | root/service-identity, media, Redis DB 15 purge, release/install/systemd, root-owned artifact metadata and privileged wrapper tests |
 | `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts, including request sampling (`test_platform_request_performance`), production-QA summary (`test_platform_production_qa_write_burst_profile`), and bounded tmpfs diagnostic contracts (`test_platform_performance_contract`) |

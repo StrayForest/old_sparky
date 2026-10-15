@@ -68,6 +68,7 @@ SCRATCH_TMPFS_BYTES = 512 * 1024**2
 SCRATCH_MEMORY_MAX_BYTES = 640 * 1024**2
 SCRATCH_MEMORY_RESERVE_BYTES = 384 * 1024**2
 SCRATCH_MEMORY_ADMISSION_BYTES = SCRATCH_MEMORY_MAX_BYTES + SCRATCH_MEMORY_RESERVE_BYTES
+SCRATCH_SHARED_BUFFERS_MB = 32
 SCRATCH_ADMISSION_RSS_MAX_BYTES = 1 << 40
 SCRATCH_PROC_STATUS_MAX_BYTES = 16 * 1024
 SCRATCH_RESOURCE_ATTRIBUTION_FILE_MAX_BYTES = 16 * 1024
@@ -3790,32 +3791,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         _scratch_resource_guard(
             root, guard_site="worker_after_initdb_before_postgres_start"
         )
-        server_options = shlex.join(
-            [
-                "-c",
-                "listen_addresses=",
-                "-c",
-                f"unix_socket_directories={socket_dir}",
-                "-c",
-                f"port={SCRATCH_PG_PORT}",
-                "-c",
-                "fsync=on",
-                "-c",
-                "full_page_writes=on",
-                "-c",
-                "synchronous_commit=on",
-                "-c",
-                "dynamic_shared_memory_type=mmap",
-                "-c",
-                "shared_buffers=64MB",
-                "-c",
-                "work_mem=4MB",
-                "-c",
-                "maintenance_work_mem=32MB",
-                "-c",
-                "max_connections=10",
-            ]
-        )
+        server_options = shlex.join(_scratch_postgres_start_options(socket_dir))
         args._scratch_fault_site = "worker_postgres_start"
         _scratch_run_observed_phase(
             phase_observer,
@@ -3984,7 +3960,7 @@ def _scratch_create_application_role(admin_target: DatabaseTarget) -> None:
 
 
 def _scratch_initdb_command(initdb: str, pgdata: pathlib.Path) -> list[str]:
-    """Apply the same 64 MiB shared-buffer setting during bootstrap and runtime."""
+    """Apply the same bounded shared-buffer setting during bootstrap and runtime."""
     return [
         initdb,
         "--pgdata",
@@ -3993,9 +3969,37 @@ def _scratch_initdb_command(initdb: str, pgdata: pathlib.Path) -> list[str]:
         "--no-locale",
         "--encoding=UTF8",
         "--set",
-        "shared_buffers=64MB",
+        f"shared_buffers={SCRATCH_SHARED_BUFFERS_MB}MB",
         "--auth-local=trust",
         "--auth-host=reject",
+    ]
+
+
+def _scratch_postgres_start_options(socket_dir: pathlib.Path) -> list[str]:
+    """Return the isolated restore PostgreSQL settings passed through pg_ctl."""
+    return [
+        "-c",
+        "listen_addresses=",
+        "-c",
+        f"unix_socket_directories={socket_dir}",
+        "-c",
+        f"port={SCRATCH_PG_PORT}",
+        "-c",
+        "fsync=on",
+        "-c",
+        "full_page_writes=on",
+        "-c",
+        "synchronous_commit=on",
+        "-c",
+        "dynamic_shared_memory_type=mmap",
+        "-c",
+        f"shared_buffers={SCRATCH_SHARED_BUFFERS_MB}MB",
+        "-c",
+        "work_mem=4MB",
+        "-c",
+        "maintenance_work_mem=32MB",
+        "-c",
+        "max_connections=10",
     ]
 
 

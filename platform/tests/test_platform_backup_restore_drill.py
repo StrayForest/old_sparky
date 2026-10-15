@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import signal
 import subprocess
@@ -58,6 +59,47 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         )
         self._proc_start_time_patch.start()
         self.addCleanup(self._proc_start_time_patch.stop)
+
+    def test_scratch_postgres_memory_setting_is_paired_and_safety_options_stay_fixed(self) -> None:
+        socket_dir = pathlib.Path("/run/oldsparky-backup-restore-deadbeef/socket")
+        initdb_command = backup_drill._scratch_initdb_command(
+            "/usr/lib/postgresql/16/bin/initdb",
+            pathlib.Path("/run/oldsparky-backup-restore-deadbeef/pgdata"),
+        )
+        initdb_settings = [
+            initdb_command[index + 1]
+            for index, argument in enumerate(initdb_command[:-1])
+            if argument == "--set"
+        ]
+        start_options = backup_drill._scratch_postgres_start_options(socket_dir)
+        start_settings = {
+            start_options[index + 1].split("=", 1)[0]: start_options[index + 1].split("=", 1)[1]
+            for index, argument in enumerate(start_options[:-1])
+            if argument == "-c"
+        }
+
+        self.assertEqual(initdb_settings, ["shared_buffers=32MB"])
+        self.assertEqual(
+            start_settings["shared_buffers"],
+            initdb_settings[0].split("=", 1)[1],
+        )
+        self.assertEqual(
+            start_settings,
+            {
+                "listen_addresses": "",
+                "unix_socket_directories": str(socket_dir),
+                "port": str(backup_drill.SCRATCH_PG_PORT),
+                "fsync": "on",
+                "full_page_writes": "on",
+                "synchronous_commit": "on",
+                "dynamic_shared_memory_type": "mmap",
+                "shared_buffers": "32MB",
+                "work_mem": "4MB",
+                "maintenance_work_mem": "32MB",
+                "max_connections": "10",
+            },
+        )
+        self.assertNotIn("huge_pages", start_settings)
 
     def test_scratch_process_start_time_parses_binary_proc_stat_safely(self) -> None:
         actual = self._original_proc_start_time(str(os.getpid()))
@@ -3425,7 +3467,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "--no-locale",
                 "--encoding=UTF8",
                 "--set",
-                "shared_buffers=64MB",
+                "shared_buffers=32MB",
                 "--auth-local=trust",
                 "--auth-host=reject",
             ],
@@ -3578,7 +3620,45 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             create_role.assert_called_once()
             self.assertEqual(create_role.call_args.args[0].username, "postgres")
             self.assertTrue(any(command[:2] == ["pg_config", "--bindir"] for command, _ in command_calls))
-            self.assertTrue(any(command[-1:] == ["start"] for command, _ in command_calls))
+            initdb_call = next(
+                command
+                for command, _ in command_calls
+                if "--pgdata" in command
+                and any(pathlib.Path(token).name == "initdb" for token in command)
+            )
+            self.assertEqual(
+                initdb_call[initdb_call.index("--set") + 1],
+                "shared_buffers=32MB",
+            )
+            pgctl_start = next(
+                command
+                for command, _ in command_calls
+                if command[-1:] == ["start"] and "--options" in command
+            )
+            actual_start_options = shlex.split(
+                pgctl_start[pgctl_start.index("--options") + 1]
+            )
+            actual_start_settings = {
+                actual_start_options[index + 1].split("=", 1)[0]: actual_start_options[index + 1].split("=", 1)[1]
+                for index, argument in enumerate(actual_start_options[:-1])
+                if argument == "-c"
+            }
+            self.assertEqual(
+                actual_start_settings,
+                {
+                    "listen_addresses": "",
+                    "unix_socket_directories": str(scratch_root / "socket"),
+                    "port": str(backup_drill.SCRATCH_PG_PORT),
+                    "fsync": "on",
+                    "full_page_writes": "on",
+                    "synchronous_commit": "on",
+                    "dynamic_shared_memory_type": "mmap",
+                    "shared_buffers": "32MB",
+                    "work_mem": "4MB",
+                    "maintenance_work_mem": "32MB",
+                    "max_connections": "10",
+                },
+            )
             self.assertTrue(any(command[-1:] == ["stop"] for command, _ in command_calls))
             self.assertFalse((scratch_root / "data" / "postmaster.pid").exists())
         finally:

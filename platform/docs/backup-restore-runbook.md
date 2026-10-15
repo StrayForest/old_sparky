@@ -72,13 +72,17 @@ The legacy schema-1 admission receipt and its bounded best-effort RSS samples
 remain accepted unchanged. These diagnostics never change the 1 GiB guard and
 are excluded from public workflow output and artifacts.
 
-The isolated PostgreSQL 16 bootstrap sets `shared_buffers=64MB` through
+The isolated PostgreSQL 16 bootstrap sets `shared_buffers=32MB` through
 [`initdb --set`](https://www.postgresql.org/docs/16/app-initdb.html), matching
 the setting already passed to `pg_ctl`. This keeps the bootstrap and running
-server configuration aligned while preserving the
-existing durability, authentication, confinement and resource guards. It is a
-bounded memory-use candidate; it does not establish the cause of any prior
-reserve refusal.
+server configuration aligned while preserving the existing durability,
+authentication, confinement and resource guards. The 32 MiB value is a
+scratch-restore memory-budget candidate; no measured saving or causal link to
+any prior reserve refusal is established. It does not change production
+PostgreSQL settings. A future restore or timeout result must be evaluated with
+the unchanged 1 GiB host guard and full restore/Alembic checks; if this smaller
+cache prevents a verified restore, revert the paired `initdb` and `pg_ctl`
+settings together rather than relaxing those checks.
 
 For a private failure during the parent active-poll guard, the root-private
 failure receipt may also contain the optional closed
