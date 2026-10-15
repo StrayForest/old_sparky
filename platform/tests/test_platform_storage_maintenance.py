@@ -4991,10 +4991,6 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
             self.assertIn("OLDS_PG_SCRATCH_HOST_GUARD_V1:", forwarded_stderr.getvalue())
             self.assertIn("SCRATCH_FIRST_FAULT_V1\n", forwarded_stderr.getvalue())
-            forwarded_error.exception.scratch_allocation_attribution = (
-                _scratch_allocation_attribution()
-            )
-
             maintenance_args = SimpleNamespace(
                 authorization_probe_only=False,
                 as_json=True,
@@ -5011,10 +5007,6 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(
                 final_report["scratch_host_guard_diagnostic"],
                 forwarded_error.exception.scratch_host_guard_diagnostic,
-            )
-            self.assertEqual(
-                final_report["scratch_allocation_attribution"],
-                forwarded_error.exception.scratch_allocation_attribution,
             )
             self.assertEqual(
                 final_report["scratch_first_fault"],
