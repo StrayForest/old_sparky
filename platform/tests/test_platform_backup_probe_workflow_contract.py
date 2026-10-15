@@ -1152,11 +1152,13 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         private_record_region = self.source.split('"event": "platform_backup_failure"', 1)[-1].split(
             'encoded = (json.dumps(record', 1
         )[0]
-        public_summary_region = self.source.split('public_report="$({', 1)[-1].split(
-            "failure_stage=private_capture_cleanup", 1
+        public_summary_region = self.source.split("run_public_summary_normalizer() {", 1)[-1].split(
+            "\n          }", 1
         )[0]
         self.assertIn('record["scratch_allocation_attribution"] = scratch_allocation_attribution', private_record_region)
         self.assertNotIn("scratch_allocation_attribution", public_summary_region)
+        self.assertIn('"public_summary_normalizer_diagnostic": normalizer_diagnostic', private_record_region)
+        self.assertNotIn("public_summary_normalizer_diagnostic", public_summary_region)
         self.assertIn('"SCRATCH_ALLOCATION_ATTRIBUTION_V1:"', self.source)
 
     def test_first_fault_is_closed_frame_bound_private_data(self) -> None:

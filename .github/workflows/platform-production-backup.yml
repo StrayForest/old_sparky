@@ -1013,6 +1013,11 @@ jobs:
           fi
           failure_stage=preflight
           public_summary_error=none
+          public_summary_normalizer_diagnostic='{"schema":1,"status":"not_run","normalizer_exit_code":null,"stdout_bytes":null,"stdout_sha256":null,"stdout_class":"not_run","stderr_bytes":null,"stderr_sha256":null,"stderr_class":"not_run","exception_class":"none","collector_error_class":"none"}'
+          normalizer_capture_dir=""
+          normalizer_capture_identity=""
+          normalizer_stdout_identity=""
+          normalizer_stderr_identity=""
           backup_report_file=""
           helper_stage=""
           helper_stage_identity=""
@@ -1021,13 +1026,41 @@ jobs:
           probe_operation_status=unknown
           probe_cleanup_status=unknown
           probe_custody_status=unavailable
+          cleanup_normalizer_capture() {
+            [[ -n "$normalizer_capture_dir" ]] || return 0
+            local expected_prefix="/tmp/oldsparky-production-backup-normalizer-${run_id}-${run_attempt}."
+            case "$normalizer_capture_dir" in
+              "$expected_prefix"??????) ;;
+              *) return 1 ;;
+            esac
+            [[ ! -L "$normalizer_capture_dir" ]] || return 1
+            [[ "$(stat -c '%d:%i:%u:%g:%a:%h' -- "$normalizer_capture_dir")" = "$normalizer_capture_identity" ]] || return 1
+            [[ "$(stat -c '%F:%u:%g:%a:%h' -- "$normalizer_capture_dir")" = "directory:0:0:700:2" ]] || return 1
+            local name expected_identity
+            for name in stdout stderr; do
+              if [[ -e "$normalizer_capture_dir/$name" || -L "$normalizer_capture_dir/$name" ]]; then
+                [[ ! -L "$normalizer_capture_dir/$name" ]] || return 1
+                if [[ "$name" = stdout ]]; then expected_identity="$normalizer_stdout_identity"; else expected_identity="$normalizer_stderr_identity"; fi
+                [[ -n "$expected_identity" ]] || return 1
+                [[ "$(stat -c '%d:%i:%u:%g:%a:%h' -- "$normalizer_capture_dir/$name")" = "$expected_identity" ]] || return 1
+                [[ "$(stat -c '%F:%u:%g:%a:%h' -- "$normalizer_capture_dir/$name")" = "regular file:0:0:600:1" ]] || return 1
+                rm -- "$normalizer_capture_dir/$name" || return 1
+              fi
+            done
+            rmdir -- "$normalizer_capture_dir" || return 1
+            normalizer_capture_dir=""
+            normalizer_capture_identity=""
+            normalizer_stdout_identity=""
+            normalizer_stderr_identity=""
+          }
           backup_failure_marker() {
             exit_code=$?
             trap - EXIT
             if (( exit_code != 0 )) && [[ "$operation" != authorization-probe ]]; then
               /usr/bin/python3 -I -B - "$runtime/shared" "$run_id" "$run_attempt" \
                 "$operation" "$source_sha" "$bundle_sha" "$failure_stage" "$exit_code" \
-                "$backup_report_file" "$backup_capture_file" "$public_summary_error" <<'PY' >/dev/null 2>&1 || :
+                "$backup_report_file" "$backup_capture_file" "$public_summary_error" \
+                "$public_summary_normalizer_diagnostic" <<'PY' >/dev/null 2>&1 || :
           import hashlib
           import json
           import os
@@ -1035,7 +1068,7 @@ jobs:
           import stat
           import sys
 
-          shared_path, run_id, attempt, operation, source_sha, bundle_sha, stage, exit_code, report_path, capture_path, public_summary_error = sys.argv[1:]
+          shared_path, run_id, attempt, operation, source_sha, bundle_sha, stage, exit_code, report_path, capture_path, public_summary_error, normalizer_diagnostic_raw = sys.argv[1:]
           stages = {
               "preflight", "helper_bundle_validation", "backup_create", "backup_verify_existing",
               "summary_validation", "public_summary", "private_capture_cleanup", "helper_cleanup",
@@ -1058,6 +1091,90 @@ jobs:
           }
           if public_summary_error not in summary_errors:
               raise SystemExit(1)
+
+          try:
+              normalizer_diagnostic = json.loads(normalizer_diagnostic_raw)
+          except (TypeError, ValueError):
+              raise SystemExit(1)
+          normalizer_diagnostic_keys = {
+              "schema", "status", "normalizer_exit_code", "stdout_bytes", "stdout_sha256",
+              "stdout_class", "stderr_bytes", "stderr_sha256", "stderr_class",
+              "exception_class", "collector_error_class",
+          }
+          normalizer_stdout_classes = {
+              "not_run", "unavailable", "empty", "success_payload", "unclassified",
+              "normalizer_summary_invalid", "normalizer_mode_mismatch",
+              "normalizer_projection_invalid",
+          }
+          normalizer_stderr_classes = {
+              "not_run", "unavailable", "empty", "python_traceback", "nonempty_unclassified",
+              "over_cap",
+          }
+          normalizer_exception_classes = {
+              "none", "other", "ModuleNotFoundError", "ImportError", "FileNotFoundError",
+              "PermissionError", "RuntimeError", "ValueError", "OSError", "SyntaxError",
+              "SystemExit", "KeyError", "TypeError", "IndexError", "AttributeError",
+              "AssertionError", "OverflowError", "MemoryError",
+          }
+          if (
+              type(normalizer_diagnostic) is not dict
+              or set(normalizer_diagnostic) != normalizer_diagnostic_keys
+              or type(normalizer_diagnostic.get("schema")) is not int
+              or normalizer_diagnostic["schema"] != 1
+              or type(normalizer_diagnostic.get("status")) is not str
+              or normalizer_diagnostic["status"] not in {"not_run", "captured", "unavailable"}
+              or type(normalizer_diagnostic.get("stdout_class")) is not str
+              or normalizer_diagnostic["stdout_class"] not in normalizer_stdout_classes
+              or type(normalizer_diagnostic.get("stderr_class")) is not str
+              or normalizer_diagnostic["stderr_class"] not in normalizer_stderr_classes
+              or type(normalizer_diagnostic.get("exception_class")) is not str
+              or normalizer_diagnostic["exception_class"] not in normalizer_exception_classes
+              or type(normalizer_diagnostic.get("collector_error_class")) is not str
+              or normalizer_diagnostic["collector_error_class"] not in {"none", "capture_failed"}
+          ):
+              raise SystemExit(1)
+          if normalizer_diagnostic["status"] == "not_run":
+              if (
+                  normalizer_diagnostic["normalizer_exit_code"] is not None
+                  or normalizer_diagnostic["stdout_bytes"] is not None
+                  or normalizer_diagnostic["stdout_sha256"] is not None
+                  or normalizer_diagnostic["stdout_class"] != "not_run"
+                  or normalizer_diagnostic["stderr_bytes"] is not None
+                  or normalizer_diagnostic["stderr_sha256"] is not None
+                  or normalizer_diagnostic["stderr_class"] != "not_run"
+                  or normalizer_diagnostic["exception_class"] != "none"
+                  or normalizer_diagnostic["collector_error_class"] != "none"
+              ):
+                  raise SystemExit(1)
+          elif normalizer_diagnostic["status"] == "unavailable":
+              code = normalizer_diagnostic["normalizer_exit_code"]
+              if (
+                  type(code) is not int or not 0 <= code <= 255
+                  or normalizer_diagnostic["stdout_bytes"] is not None
+                  or normalizer_diagnostic["stdout_sha256"] is not None
+                  or normalizer_diagnostic["stdout_class"] != "unavailable"
+                  or normalizer_diagnostic["stderr_bytes"] is not None
+                  or normalizer_diagnostic["stderr_sha256"] is not None
+                  or normalizer_diagnostic["stderr_class"] != "unavailable"
+                  or normalizer_diagnostic["exception_class"] != "none"
+                  or normalizer_diagnostic["collector_error_class"] != "capture_failed"
+              ):
+                  raise SystemExit(1)
+          else:
+              code = normalizer_diagnostic["normalizer_exit_code"]
+              stdout_bytes = normalizer_diagnostic["stdout_bytes"]
+              stderr_bytes = normalizer_diagnostic["stderr_bytes"]
+              if (
+                  type(code) is not int or not 0 <= code <= 255
+                  or type(stdout_bytes) is not int or not 0 <= stdout_bytes <= (1 << 63) - 1
+                  or type(stderr_bytes) is not int or not 0 <= stderr_bytes <= (1 << 63) - 1
+                  or type(normalizer_diagnostic["stdout_sha256"]) is not str
+                  or re.fullmatch(r"[0-9a-f]{64}", normalizer_diagnostic["stdout_sha256"]) is None
+                  or type(normalizer_diagnostic["stderr_sha256"]) is not str
+                  or re.fullmatch(r"[0-9a-f]{64}", normalizer_diagnostic["stderr_sha256"]) is None
+                  or normalizer_diagnostic["collector_error_class"] != "none"
+              ):
+                  raise SystemExit(1)
 
           def identity(value):
               return (
@@ -2002,6 +2119,7 @@ jobs:
                   "bundle_sha256": None if bundle_sha == "none" else bundle_sha,
                   "stage": stage,
                   "public_summary_error": public_summary_error,
+                  "public_summary_normalizer_diagnostic": normalizer_diagnostic,
                   "exit_code": int(exit_code),
                   "report_state": report_state,
                   "report_error_class": report_error_class,
@@ -2063,7 +2181,8 @@ jobs:
               os.close(shared_fd)
           PY
             fi
-          if [[ ( "$operation" = verify-existing || "$operation" = create || "$operation" = authorization-probe ) && -n "$helper_stage" && -n "$helper_stage_identity" ]]; then
+            cleanup_normalizer_capture || :
+            if [[ ( "$operation" = verify-existing || "$operation" = create || "$operation" = authorization-probe ) && -n "$helper_stage" && -n "$helper_stage_identity" ]]; then
               if /usr/bin/python3 -I -B - "$helper_stage" "$helper_stage_identity" "$bundle_sha" "$source_sha" "$retain_helper_stage" <<'PY'
           import hashlib
           import json
@@ -3470,6 +3589,7 @@ jobs:
           public_summary_error=none
           failure_stage=public_summary
           public_summary_error=unclassified
+          public_summary_normalizer_exit_code=0
           classify_public_summary_error() {
             local output="$1"
             if [[ "$output" =~ ^BACKUP_PUBLIC_SUMMARY_FAILURE\ reason=(normalizer_summary_invalid|normalizer_mode_mismatch|normalizer_projection_invalid)$ ]]; then
@@ -3478,7 +3598,10 @@ jobs:
               public_summary_error=unclassified
             fi
           }
-          public_summary_output="$({
+          normalizer_diagnostic_unavailable() {
+            printf '{"schema":1,"status":"unavailable","normalizer_exit_code":%s,"stdout_bytes":null,"stdout_sha256":null,"stdout_class":"unavailable","stderr_bytes":null,"stderr_sha256":null,"stderr_class":"unavailable","exception_class":"none","collector_error_class":"capture_failed"}\n' "$1"
+          }
+          run_public_summary_normalizer() {
           /usr/bin/python3 -I - "$public_report" "$operation" "$backup_report_file" "$EVICT_BUILD_NODE_CACHE" "$COMPACT_FALLBACK_RUNTIME_CACHE" <<'PY'
           import json
           from pathlib import Path
@@ -3536,11 +3659,223 @@ jobs:
               fail("normalizer_projection_invalid")
           print(json.dumps(public, sort_keys=True, separators=(",", ":")))
           PY
-          } 2>/dev/null)" || {
+          }
+
+          normalizer_capture_ready=false
+          if normalizer_capture_dir="$(mktemp -d -- "/tmp/oldsparky-production-backup-normalizer-${run_id}-${run_attempt}.XXXXXX" 2>/dev/null)"; then
+            local_expected_prefix="/tmp/oldsparky-production-backup-normalizer-${run_id}-${run_attempt}."
+            case "$normalizer_capture_dir" in
+              "$local_expected_prefix"??????) ;;
+              *) normalizer_capture_dir="" ;;
+            esac
+            if [[ -n "$normalizer_capture_dir" && ! -L "$normalizer_capture_dir" ]] \
+              && [[ "$(stat -c '%F:%u:%g:%a:%h' -- "$normalizer_capture_dir" 2>/dev/null)" = "directory:0:0:700:2" ]]; then
+              normalizer_capture_identity="$(stat -c '%d:%i:%u:%g:%a:%h' -- "$normalizer_capture_dir" 2>/dev/null)" || normalizer_capture_identity=""
+              if ( set -o noclobber; : >"$normalizer_capture_dir/stdout" && : >"$normalizer_capture_dir/stderr" ) 2>/dev/null; then
+                chmod 600 -- "$normalizer_capture_dir/stdout" "$normalizer_capture_dir/stderr" 2>/dev/null || :
+              fi
+              if [[ -e "$normalizer_capture_dir/stdout" && ! -L "$normalizer_capture_dir/stdout" ]]; then
+                normalizer_stdout_identity="$(stat -c '%d:%i:%u:%g:%a:%h' -- "$normalizer_capture_dir/stdout" 2>/dev/null)" || normalizer_stdout_identity=""
+              fi
+              if [[ -e "$normalizer_capture_dir/stderr" && ! -L "$normalizer_capture_dir/stderr" ]]; then
+                normalizer_stderr_identity="$(stat -c '%d:%i:%u:%g:%a:%h' -- "$normalizer_capture_dir/stderr" 2>/dev/null)" || normalizer_stderr_identity=""
+              fi
+              if [[ "$normalizer_capture_identity" =~ ^[0-9]+:[0-9]+:0:0:700:2$ \
+                && "$normalizer_stdout_identity" =~ ^[0-9]+:[0-9]+:0:0:600:1$ \
+                && "$normalizer_stderr_identity" =~ ^[0-9]+:[0-9]+:0:0:600:1$ ]]; then
+                normalizer_capture_ready=true
+              fi
+            fi
+          fi
+
+          if [[ "$normalizer_capture_ready" = true ]]; then
+            normalizer_pipeline_result=""
+            if normalizer_pipeline_result="$(
+              run_public_summary_normalizer 2>"$normalizer_capture_dir/stderr" | /usr/bin/tee -- "$normalizer_capture_dir/stdout" 2>/dev/null
+              normalizer_pipeline_status=( "${PIPESTATUS[@]}" )
+              printf '\n%s:%s\n' "${normalizer_pipeline_status[0]}" "${normalizer_pipeline_status[1]}"
+              exit "${normalizer_pipeline_status[0]}"
+            )"; then
+              normalizer_pipeline_assignment_status=0
+            else
+              normalizer_pipeline_assignment_status=$?
+            fi
+            normalizer_pipeline_status_line="${normalizer_pipeline_result##*$'\n'}"
+            if [[ "$normalizer_pipeline_status_line" =~ ^([0-9]{1,3}):([0-9]{1,3})$ ]]; then
+              public_summary_normalizer_exit_code="${BASH_REMATCH[1]}"
+              normalizer_tee_exit_code="${BASH_REMATCH[2]}"
+              public_summary_output="${normalizer_pipeline_result%$'\n'*}"
+              while [[ "$public_summary_output" == *$'\n' ]]; do
+                public_summary_output="${public_summary_output%$'\n'}"
+              done
+            else
+              public_summary_normalizer_exit_code="$normalizer_pipeline_assignment_status"
+              normalizer_tee_exit_code=1
+              public_summary_output=""
+            fi
+            if [[ "$normalizer_tee_exit_code" != 0 ]]; then
+              public_summary_normalizer_diagnostic="$(normalizer_diagnostic_unavailable "$public_summary_normalizer_exit_code")"
+            elif public_summary_normalizer_diagnostic="$(/usr/bin/python3 -I -B - "$normalizer_capture_dir" "$normalizer_capture_identity" "$normalizer_stdout_identity" "$normalizer_stderr_identity" "$public_summary_normalizer_exit_code" <<'PY' 2>/dev/null
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import sys
+
+          directory_path, expected_directory, expected_stdout, expected_stderr, exit_code_raw = sys.argv[1:]
+          if not re.fullmatch(r"[0-9]+", exit_code_raw):
+              raise SystemExit(1)
+          exit_code = int(exit_code_raw)
+          if not 0 <= exit_code <= 255:
+              raise SystemExit(1)
+
+          def identity(value):
+              return f"{value.st_dev}:{value.st_ino}:{value.st_uid}:{value.st_gid}:{stat.S_IMODE(value.st_mode):o}:{value.st_nlink}"
+
+          def stable_file_fields(value):
+              return (
+                  value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+                  value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+              )
+
+          def require_root_directory(value):
+              if (
+                  not stat.S_ISDIR(value.st_mode) or value.st_uid != 0 or value.st_gid != 0
+                  or stat.S_IMODE(value.st_mode) != 0o700 or value.st_nlink != 2
+              ):
+                  raise ValueError
+
+          def read_capture(directory_fd, name, expected, cap):
+              named_before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+              if (
+                  not stat.S_ISREG(named_before.st_mode) or named_before.st_uid != 0
+                  or named_before.st_gid != 0 or stat.S_IMODE(named_before.st_mode) != 0o600
+                  or named_before.st_nlink != 1 or identity(named_before) != expected
+                  or named_before.st_size < 0 or named_before.st_size > cap
+              ):
+                  raise ValueError
+              file_fd = os.open(
+                  name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd
+              )
+              try:
+                  opened_before = os.fstat(file_fd)
+                  if stable_file_fields(opened_before) != stable_file_fields(named_before):
+                      raise ValueError
+                  chunks = []
+                  total = 0
+                  while True:
+                      block = os.read(file_fd, min(65536, cap + 1 - total))
+                      if not block:
+                          break
+                      chunks.append(block)
+                      total += len(block)
+                      if total > cap:
+                          raise ValueError
+                  opened_after = os.fstat(file_fd)
+                  named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                  if (
+                      stable_file_fields(opened_after) != stable_file_fields(opened_before)
+                      or stable_file_fields(named_after) != stable_file_fields(opened_before)
+                  ):
+                      raise ValueError
+                  payload = b"".join(chunks)
+                  if len(payload) != named_before.st_size:
+                      raise ValueError
+                  return payload
+              finally:
+                  os.close(file_fd)
+
+          directory_fd = os.open(
+              directory_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+          )
+          try:
+              before = os.fstat(directory_fd)
+              path_before = os.stat(directory_path, follow_symlinks=False)
+              require_root_directory(before)
+              if identity(before) != expected_directory or identity(path_before) != expected_directory:
+                  raise ValueError
+              stdout = read_capture(directory_fd, "stdout", expected_stdout, 1_056_768)
+              stderr = read_capture(directory_fd, "stderr", expected_stderr, 65_536)
+              after = os.fstat(directory_fd)
+              path_after = os.stat(directory_path, follow_symlinks=False)
+              require_root_directory(after)
+              if identity(after) != expected_directory or identity(path_after) != expected_directory:
+                  raise ValueError
+          finally:
+              os.close(directory_fd)
+
+          reason_match = re.fullmatch(
+              rb"BACKUP_PUBLIC_SUMMARY_FAILURE reason=(normalizer_summary_invalid|normalizer_mode_mismatch|normalizer_projection_invalid)\n",
+              stdout,
+          )
+          if not stdout:
+              stdout_class = "empty"
+          elif reason_match is not None:
+              stdout_class = reason_match.group(1).decode("ascii")
+          else:
+              try:
+                  parsed_stdout = json.loads(stdout)
+              except (TypeError, ValueError):
+                  stdout_class = "unclassified"
+              else:
+                  stdout_class = "success_payload" if type(parsed_stdout) is dict else "unclassified"
+
+          stderr_exception = "none"
+          if not stderr:
+              stderr_class = "empty"
+          elif stderr.startswith(b"Traceback (most recent call last):"):
+              stderr_class = "python_traceback"
+              allowed_exceptions = {
+                  "ModuleNotFoundError", "ImportError", "FileNotFoundError", "PermissionError",
+                  "RuntimeError", "ValueError", "OSError", "SyntaxError", "SystemExit",
+                  "KeyError", "TypeError", "IndexError", "AttributeError", "AssertionError",
+                  "OverflowError", "MemoryError",
+              }
+              for line in reversed(stderr.splitlines()):
+                  match = re.match(rb"^([A-Za-z][A-Za-z0-9_]*)(?::|$)", line)
+                  if match is not None:
+                      candidate = match.group(1).decode("ascii")
+                      stderr_exception = candidate if candidate in allowed_exceptions else "other"
+                      break
+          else:
+              stderr_class = "nonempty_unclassified"
+
+          record = {
+              "schema": 1,
+              "status": "captured",
+              "normalizer_exit_code": exit_code,
+              "stdout_bytes": len(stdout),
+              "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+              "stdout_class": stdout_class,
+              "stderr_bytes": len(stderr),
+              "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+              "stderr_class": stderr_class,
+              "exception_class": stderr_exception,
+              "collector_error_class": "none",
+          }
+          print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+          PY
+            )"; then
+              :
+            else
+              public_summary_normalizer_diagnostic="$(normalizer_diagnostic_unavailable "$public_summary_normalizer_exit_code")"
+            fi
+            cleanup_normalizer_capture || :
+          else
+            if public_summary_output="$(run_public_summary_normalizer 2>/dev/null)"; then
+              public_summary_normalizer_exit_code=0
+            else
+              public_summary_normalizer_exit_code=$?
+            fi
+            public_summary_normalizer_diagnostic="$(normalizer_diagnostic_unavailable "$public_summary_normalizer_exit_code")"
+            cleanup_normalizer_capture || :
+          fi
+          if (( public_summary_normalizer_exit_code != 0 )); then
             classify_public_summary_error "$public_summary_output"
             echo "Production backup public summary normalization failed" >&2
             exit 1
-          }
+          fi
           public_report="$public_summary_output"
           public_summary_error=none
           test -n "$public_report" || {

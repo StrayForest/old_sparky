@@ -805,6 +805,14 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         args.source_release_dir = self.release_dir
         events: list[str] = []
 
+        from tools.platform_test_runner import validate_test_resource_configuration
+
+        resources = validate_test_resource_configuration()
+        self.assertEqual(resources.database_name, "platformdb_test")
+        self.assertEqual(resources.database_schema, "platform")
+        self.assertEqual(resources.redis_database, "15")
+        self.assertEqual(resources.redis_host, "127.0.0.1")
+
         venv = app_dir / "shared" / "venv"
         python = venv / "bin" / "python"
         (venv / "bin").mkdir(parents=True)
@@ -812,7 +820,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
         shared_env = app_dir / "shared" / ".env.platform"
         shared_env.write_text(
-            "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15\n", encoding="utf-8"
+            f"PLATFORM_REDIS_URL={resources.redis_url}\n", encoding="utf-8"
         )
         shared_env.chmod(0o600)
         purge_helper = (
@@ -881,7 +889,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn("sys.path[:0]", child_command[child_command.index("-c") + 1])
         self.assertEqual(purge_child.call_args.kwargs["cwd"], "/")
         self.assertEqual(
-            child_environment["PLATFORM_REDIS_URL"], "redis://127.0.0.1:6379/15"
+            child_environment["PLATFORM_REDIS_URL"], resources.redis_url
         )
         self.assertEqual(
             set(child_environment),
@@ -950,14 +958,6 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         # canonical app root, so this test binds that root only inside its
         # disposable fixture and preserves the same argv/runtime checks.
         from redis.asyncio import from_url
-
-        from tools.platform_test_runner import validate_test_resource_configuration
-
-        resources = validate_test_resource_configuration()
-        self.assertEqual(resources.database_name, "platformdb_test")
-        self.assertEqual(resources.database_schema, "platform")
-        self.assertEqual(resources.redis_database, "15")
-        self.assertEqual(resources.redis_host, "127.0.0.1")
 
         test_prefixes = (
             "platform:tournament:profile-access:v1",
@@ -2680,6 +2680,43 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             '/usr/bin/python3 -I - "$public_report" "$operation" '
             '"$backup_report_file" "$EVICT_BUILD_NODE_CACHE"'
         )
+        normalizer_diagnostic_script = workflow_python(
+            "if public_summary_normalizer_diagnostic=\"$(/usr/bin/python3 -I -B - "
+            '"$normalizer_capture_dir" "$normalizer_capture_identity" '
+            '"$normalizer_stdout_identity" "$normalizer_stderr_identity" '
+            '"$public_summary_normalizer_exit_code" <<\'PY\' 2>/dev/null'
+        )
+
+        def collect_normalizer_diagnostic(
+            stdout_payload: bytes, stderr_payload: bytes, exit_code: int
+        ) -> tuple[subprocess.CompletedProcess[str], dict]:
+            with tempfile.TemporaryDirectory() as capture_dir_name:
+                capture_dir = Path(capture_dir_name)
+                capture_dir.chmod(0o700)
+                stdout_path = capture_dir / "stdout"
+                stderr_path = capture_dir / "stderr"
+                stdout_path.write_bytes(stdout_payload)
+                stderr_path.write_bytes(stderr_payload)
+                stdout_path.chmod(0o600)
+                stderr_path.chmod(0o600)
+
+                def capture_identity(path: Path) -> str:
+                    info = path.stat()
+                    return (
+                        f"{info.st_dev}:{info.st_ino}:{info.st_uid}:{info.st_gid}:"
+                        f"{stat.S_IMODE(info.st_mode):o}:{info.st_nlink}"
+                    )
+
+                completed = run_inline(
+                    normalizer_diagnostic_script,
+                    str(capture_dir),
+                    capture_identity(capture_dir),
+                    capture_identity(stdout_path),
+                    capture_identity(stderr_path),
+                    str(exit_code),
+                )
+                return completed, json.loads(completed.stdout) if completed.returncode == 0 else {}
+
         with tempfile.TemporaryDirectory() as normalizer_dir_name:
             normalizer_report_path = Path(normalizer_dir_name) / "report.json"
             normalizer_compaction = {
@@ -2744,6 +2781,118 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "BACKUP_PUBLIC_SUMMARY_FAILURE reason=normalizer_projection_invalid\n",
             )
             self.assertNotIn("4a04b2dffaf0d02c2d3910e7ba28dca9b89de209", missing_projection.stdout)
+
+        normalizer_success_bytes = b'{"mode":"backup-only","fixture":"private-body-not-retained"}\n'
+        captured_success, success_diagnostic = collect_normalizer_diagnostic(
+            normalizer_success_bytes, b"", 0
+        )
+        self.assertEqual(captured_success.returncode, 0, captured_success.stderr)
+        self.assertEqual(success_diagnostic["status"], "captured")
+        self.assertEqual(success_diagnostic["normalizer_exit_code"], 0)
+        self.assertEqual(success_diagnostic["stdout_bytes"], len(normalizer_success_bytes))
+        self.assertEqual(
+            success_diagnostic["stdout_sha256"],
+            hashlib.sha256(normalizer_success_bytes).hexdigest(),
+        )
+        self.assertEqual(success_diagnostic["stdout_class"], "success_payload")
+        self.assertEqual(success_diagnostic["stderr_class"], "empty")
+        self.assertNotIn("private-body-not-retained", captured_success.stdout)
+
+        normalizer_failure_bytes = b"BACKUP_PUBLIC_SUMMARY_FAILURE reason=normalizer_projection_invalid\n"
+        private_traceback = (
+            b"Traceback (most recent call last):\n"
+            b'  File "/tmp/private/report.json", line 1\n'
+            b"RuntimeError: private-normalizer-detail\n"
+        )
+        captured_failure, failure_diagnostic = collect_normalizer_diagnostic(
+            normalizer_failure_bytes, private_traceback, 1
+        )
+        self.assertEqual(captured_failure.returncode, 0, captured_failure.stderr)
+        self.assertEqual(failure_diagnostic["normalizer_exit_code"], 1)
+        self.assertEqual(failure_diagnostic["stdout_class"], "normalizer_projection_invalid")
+        self.assertEqual(failure_diagnostic["stderr_class"], "python_traceback")
+        self.assertEqual(failure_diagnostic["exception_class"], "RuntimeError")
+        self.assertEqual(failure_diagnostic["stderr_bytes"], len(private_traceback))
+        self.assertNotIn("private-normalizer-detail", captured_failure.stdout)
+        self.assertNotIn("/tmp/private/report.json", captured_failure.stdout)
+
+        additional_exception_classes = (
+            "KeyError", "TypeError", "IndexError", "AttributeError",
+            "AssertionError", "OverflowError", "MemoryError",
+        )
+        for exception_class in additional_exception_classes:
+            exception_traceback = (
+                b"Traceback (most recent call last):\n"
+                + exception_class.encode("ascii")
+                + b": private-diagnostic-only\n"
+            )
+            captured_exception, exception_diagnostic = collect_normalizer_diagnostic(
+                normalizer_failure_bytes, exception_traceback, 1
+            )
+            self.assertEqual(captured_exception.returncode, 0, captured_exception.stderr)
+            self.assertEqual(exception_diagnostic["exception_class"], exception_class)
+
+        pipeline_start = remote_script.index("normalizer_pipeline_result=\"\"")
+        pipeline_end = remote_script.index(
+            "cleanup_normalizer_capture || :", pipeline_start
+        )
+        normalizer_pipeline_source = textwrap.dedent(
+            remote_script[pipeline_start:pipeline_end]
+        )
+        unavailable_start = remote_script.index("normalizer_diagnostic_unavailable() {")
+        unavailable_end = remote_script.index("\n}", unavailable_start) + len("\n}")
+        unavailable_function = textwrap.dedent(
+            remote_script[unavailable_start:unavailable_end]
+        )
+        with tempfile.TemporaryDirectory() as tee_failure_dir_name:
+            tee_failure_dir = Path(tee_failure_dir_name)
+            (tee_failure_dir / "stdout").touch()
+            (tee_failure_dir / "stderr").touch()
+            tee_payload = "x" * 2048
+            tee_failure_script = textwrap.dedent(
+                """
+                set -euo pipefail
+                ulimit -f 1
+                normalizer_capture_dir="$1"
+                run_public_summary_normalizer() { printf '%s' "$NORMALIZER_PAYLOAD"; }
+                """
+            ) + unavailable_function + "\n" + normalizer_pipeline_source + textwrap.dedent(
+                """
+                printf 'RESULT %s %s %s\\n' \\
+                    "$public_summary_normalizer_exit_code" \\
+                    "$normalizer_tee_exit_code" \\
+                    "${#public_summary_output}"
+                printf '%s\\n' "$public_summary_normalizer_diagnostic"
+                printf 'CAPTURE_BYTES=%s\\n' "$(stat -c %s -- "$normalizer_capture_dir/stdout")"
+                """
+            )
+            tee_failure = subprocess.run(
+                ["bash", "-s", "--", str(tee_failure_dir)],
+                input=tee_failure_script,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+                env={**os.environ, "NORMALIZER_PAYLOAD": tee_payload},
+            )
+            self.assertEqual(tee_failure.returncode, 0, tee_failure.stderr)
+            tee_failure_lines = tee_failure.stdout.splitlines()
+            result_fields = tee_failure_lines[0].split()
+            self.assertEqual(result_fields[0], "RESULT")
+            self.assertEqual(result_fields[1], "0")
+            self.assertNotEqual(result_fields[2], "0")
+            self.assertEqual(result_fields[3], str(len(tee_payload)))
+            tee_diagnostic = json.loads(tee_failure_lines[1])
+            self.assertEqual(tee_diagnostic["status"], "unavailable")
+            self.assertEqual(tee_diagnostic["normalizer_exit_code"], 0)
+            self.assertEqual(tee_diagnostic["stdout_class"], "unavailable")
+            capture_bytes = int(tee_failure_lines[2].split("=", 1)[1])
+            self.assertLess(capture_bytes, len(tee_payload))
+
+        captured_signal, signal_diagnostic = collect_normalizer_diagnostic(b"", b"", 143)
+        self.assertEqual(captured_signal.returncode, 0, captured_signal.stderr)
+        self.assertEqual(signal_diagnostic["normalizer_exit_code"], 143)
+        self.assertEqual(signal_diagnostic["stdout_class"], "empty")
 
         with tempfile.TemporaryDirectory() as summary_dir_name:
             summary_dir = Path(summary_dir_name)
@@ -4036,7 +4185,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 set(receipt),
                 {
                     "schema", "event", "run_id", "attempt", "operation", "source_sha",
-                    "bundle_sha256", "stage", "public_summary_error", "exit_code", "report_state",
+                    "bundle_sha256", "stage", "public_summary_error",
+                    "public_summary_normalizer_diagnostic", "exit_code", "report_state",
                     "report_error_class", "restore_diagnostic", "scratch_unit_diagnostic",
                     "scratch_admission_diagnostic", "scratch_host_guard_diagnostic",
                     "scratch_first_fault", "scratch_resource_attribution",
@@ -4049,6 +4199,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(receipt["event"], "platform_backup_failure")
             self.assertEqual(receipt["stage"], "preflight")
             self.assertEqual(receipt["public_summary_error"], "none")
+            self.assertEqual(
+                receipt["public_summary_normalizer_diagnostic"]["status"], "not_run"
+            )
             self.assertEqual(receipt["exit_code"], completed.returncode)
             self.assertEqual(receipt["report_error_class"], "none")
             self.assertIsNone(receipt["scratch_unit_diagnostic"])
@@ -4554,6 +4707,20 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 + '\nclassify_public_summary_error "$1"\n'
                 + "printf '%s\\n' \"$public_summary_error\"\n"
             )
+            pipeline_start = remote_script.index("normalizer_pipeline_result=\"\"")
+            pipeline_end = remote_script.index(
+                "cleanup_normalizer_capture || :", pipeline_start
+            )
+            normalizer_pipeline_source = textwrap.dedent(
+                remote_script[pipeline_start:pipeline_end]
+            )
+            unavailable_start = remote_script.index(
+                "normalizer_diagnostic_unavailable() {"
+            )
+            unavailable_end = remote_script.index("\n}", unavailable_start) + len("\n}")
+            unavailable_function = textwrap.dedent(
+                remote_script[unavailable_start:unavailable_end]
+            )
             accepted_classification = subprocess.run(
                 ["bash", "-s", "--", "BACKUP_PUBLIC_SUMMARY_FAILURE reason=normalizer_projection_invalid"],
                 input=classifier_script,
@@ -4574,9 +4741,49 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(untrusted_classification.stdout, "unclassified\n")
             self.assertNotIn("operator@example.test", untrusted_classification.stdout)
 
-            for run_id, stage, summary_error in (
-                ("123459", "public_summary", "normalizer_projection_invalid"),
-                ("123460", "summary_validation", "summary_tool_failed"),
+            normalizer_failure_bytes = (
+                b"BACKUP_PUBLIC_SUMMARY_FAILURE reason=normalizer_projection_invalid\n"
+            )
+            private_traceback = (
+                b"Traceback (most recent call last):\n"
+                b'  File "/tmp/private/report.json", line 1\n'
+                b"RuntimeError: private-normalizer-detail\n"
+            )
+            normalizer_failure_diagnostic = {
+                "schema": 1,
+                "status": "captured",
+                "normalizer_exit_code": 1,
+                "stdout_bytes": len(normalizer_failure_bytes),
+                "stdout_sha256": hashlib.sha256(normalizer_failure_bytes).hexdigest(),
+                "stdout_class": "normalizer_projection_invalid",
+                "stderr_bytes": len(private_traceback),
+                "stderr_sha256": hashlib.sha256(private_traceback).hexdigest(),
+                "stderr_class": "python_traceback",
+                "exception_class": "RuntimeError",
+                "collector_error_class": "none",
+            }
+            normalizer_not_run_diagnostic = {
+                "schema": 1,
+                "status": "not_run",
+                "normalizer_exit_code": None,
+                "stdout_bytes": None,
+                "stdout_sha256": None,
+                "stdout_class": "not_run",
+                "stderr_bytes": None,
+                "stderr_sha256": None,
+                "stderr_class": "not_run",
+                "exception_class": "none",
+                "collector_error_class": "none",
+            }
+            for run_id, stage, summary_error, diagnostic in (
+                (
+                    "123459", "public_summary", "normalizer_projection_invalid",
+                    normalizer_failure_diagnostic,
+                ),
+                (
+                    "123460", "summary_validation", "summary_tool_failed",
+                    normalizer_not_run_diagnostic,
+                ),
             ):
                 failure_receipt = subprocess.run(
                     [
@@ -4595,6 +4802,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         "",
                         "",
                         summary_error,
+                        json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
                     ],
                     input=failure_receipt_script,
                     text=True,
@@ -4607,11 +4815,162 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 saved = json.loads(saved_path.read_text(encoding="ascii"))
                 self.assertEqual(saved["stage"], stage)
                 self.assertEqual(saved["public_summary_error"], summary_error)
+                self.assertEqual(saved["public_summary_normalizer_diagnostic"], diagnostic)
                 self.assertEqual(saved["source_sha"], "a" * 40)
                 self.assertEqual(saved["bundle_sha256"], "b" * 64)
                 self.assertEqual(stat.S_IMODE(saved_path.lstat().st_mode), 0o600)
                 self.assertEqual(saved_path.lstat().st_nlink, 1)
                 self.assertNotIn("private detail", saved_path.read_text(encoding="ascii"))
+
+            with tempfile.TemporaryDirectory() as trailer_dir_name:
+                trailer_dir = Path(trailer_dir_name)
+                trailer_dir.chmod(0o700)
+                trailer_stdout = trailer_dir / "stdout"
+                trailer_stderr = trailer_dir / "stderr"
+                trailer_stdout.touch(mode=0o600)
+                trailer_stderr.touch(mode=0o600)
+                trailer_stdout.chmod(0o600)
+                trailer_stderr.chmod(0o600)
+
+                def trailer_identity(path: Path) -> str:
+                    info = path.stat()
+                    return (
+                        f"{info.st_dev}:{info.st_ino}:{info.st_uid}:{info.st_gid}:"
+                        f"{stat.S_IMODE(info.st_mode):o}:{info.st_nlink}"
+                    )
+
+                trailer_payload = (
+                    "BACKUP_PUBLIC_SUMMARY_FAILURE "
+                    "reason=normalizer_projection_invalid"
+                )
+                trailer_script = textwrap.dedent(
+                    """
+                    set -euo pipefail
+                    normalizer_capture_dir="$1"
+                    normalizer_capture_identity="$2"
+                    normalizer_stdout_identity="$3"
+                    normalizer_stderr_identity="$4"
+                    run_public_summary_normalizer() {
+                        printf '%s\\n' "$NORMALIZER_PAYLOAD"
+                        return 1
+                    }
+                    """
+                ) + unavailable_function + "\n" + normalizer_pipeline_source + textwrap.dedent(
+                    """
+                    printf 'SUMMARY=%s\\n' "$public_summary_output"
+                    printf 'NORMALIZER_EXIT=%s TEE_EXIT=%s\\n' \\
+                        "$public_summary_normalizer_exit_code" "$normalizer_tee_exit_code"
+                    printf 'DIAGNOSTIC=%s\\n' "$public_summary_normalizer_diagnostic"
+                    """
+                )
+                trailer_result = subprocess.run(
+                    [
+                        "bash", "-s", "--", str(trailer_dir),
+                        trailer_identity(trailer_dir),
+                        trailer_identity(trailer_stdout),
+                        trailer_identity(trailer_stderr),
+                    ],
+                    input=trailer_script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                    env={**os.environ, "NORMALIZER_PAYLOAD": trailer_payload},
+                )
+                self.assertEqual(trailer_result.returncode, 0, trailer_result.stderr)
+                trailer_lines = trailer_result.stdout.splitlines()
+                self.assertEqual(trailer_lines[0], f"SUMMARY={trailer_payload}")
+                self.assertEqual(trailer_lines[1], "NORMALIZER_EXIT=1 TEE_EXIT=0")
+                trailer_diagnostic = json.loads(trailer_lines[2].removeprefix("DIAGNOSTIC="))
+                self.assertEqual(trailer_diagnostic["stdout_class"], "normalizer_projection_invalid")
+                classified_trailer = subprocess.run(
+                    ["bash", "-s", "--", trailer_payload],
+                    input=classifier_script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertEqual(classified_trailer.returncode, 0, classified_trailer.stderr)
+                self.assertEqual(
+                    classified_trailer.stdout, "normalizer_projection_invalid\n"
+                )
+                trailer_marker = subprocess.run(
+                    [
+                        sys.executable, "-I", "-B", "-", str(shared), "123468", "1",
+                        "verify-existing", "a" * 40, "b" * 64, "public_summary", "1",
+                        "", "", classified_trailer.stdout.strip(),
+                        json.dumps(trailer_diagnostic, sort_keys=True, separators=(",", ":")),
+                    ],
+                    input=failure_receipt_script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertEqual(trailer_marker.returncode, 0, trailer_marker.stderr)
+                saved_trailer_marker = json.loads(
+                    (shared / "backup-failure-123468-1.json").read_text(encoding="ascii")
+                )
+                self.assertEqual(
+                    saved_trailer_marker["public_summary_error"],
+                    "normalizer_projection_invalid",
+                )
+                self.assertEqual(
+                    saved_trailer_marker["public_summary_normalizer_diagnostic"],
+                    trailer_diagnostic,
+                )
+
+            for offset, exception_class in enumerate(
+                (
+                    "KeyError", "TypeError", "IndexError", "AttributeError",
+                    "AssertionError", "OverflowError", "MemoryError",
+                )
+            ):
+                run_id = str(123470 + offset)
+                diagnostic = {
+                    **normalizer_failure_diagnostic,
+                    "exception_class": exception_class,
+                }
+                accepted_exception = subprocess.run(
+                    [
+                        sys.executable, "-I", "-B", "-", str(shared), run_id, "1",
+                        "verify-existing", "a" * 40, "b" * 64, "public_summary", "1",
+                        "", "", "normalizer_projection_invalid",
+                        json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
+                    ],
+                    input=failure_receipt_script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertEqual(accepted_exception.returncode, 0, accepted_exception.stderr)
+                exception_receipt = json.loads(
+                    (shared / f"backup-failure-{run_id}-1.json").read_text(encoding="ascii")
+                )
+                self.assertEqual(
+                    exception_receipt["public_summary_normalizer_diagnostic"]["exception_class"],
+                    exception_class,
+                )
+
+            malformed_diagnostic = dict(normalizer_not_run_diagnostic)
+            malformed_diagnostic["schema"] = True
+            rejected_diagnostic = subprocess.run(
+                [
+                    sys.executable, "-I", "-B", "-", str(shared), "123461", "1",
+                    "verify-existing", "a" * 40, "b" * 64, "public_summary", "1",
+                    "", "", "unclassified",
+                    json.dumps(malformed_diagnostic, sort_keys=True, separators=(",", ":")),
+                ],
+                input=failure_receipt_script,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertNotEqual(rejected_diagnostic.returncode, 0)
+            self.assertFalse((shared / "backup-failure-123461-1.json").exists())
 
             first_fault_shared = test_root / "first-fault-shared"
             first_fault_shared.mkdir(mode=0o755)
@@ -4661,6 +5020,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         str(report_file),
                         str(capture_file),
                         "none",
+                        json.dumps(normalizer_not_run_diagnostic, sort_keys=True, separators=(",", ":")),
                     ],
                     input=failure_receipt_script,
                     text=True,
@@ -4809,6 +5169,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         str(report_file),
                         str(capture_file),
                         "none",
+                        json.dumps(normalizer_not_run_diagnostic, sort_keys=True, separators=(",", ":")),
                     ],
                     input=failure_receipt_script,
                     text=True,

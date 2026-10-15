@@ -103,10 +103,10 @@ expected skips). The 20 prior backup pairs and four protected roots remain
 preserved. These observations do not establish a restore-memory cause or
 change the 1 GiB guard.
 
-Run `38738894181` attempt 1 failed `parent_active_poll` by 10,694,656 bytes. At the last sample 9.76 seconds after restore start,
-nine 16 MiB WAL segments (150,994,944 bytes) and 157,286,400 allocated bytes under `base` were observed; this is not an atomic
-peak or proof WAL was the sole cause. Cleanup was confirmed; restore/Alembic remain UNKNOWN, no pair was produced, and the PG
-patch version was not retained. See the [performance checkpoint](../performance/README.md#backup-and-restore-follow-up-2026-10-15).
+Run `38738894181/1` failed `parent_active_poll` by 10,694,656 bytes; the last sample was 9.76 seconds after restore start.
+It showed nine 16 MiB WAL segments (150,994,944 bytes) and 157,286,400 allocated bytes under `base`, not an atomic peak or proof WAL alone caused failure.
+Cleanup was confirmed; restore/Alembic remain UNKNOWN, no pair was produced, and the PostgreSQL patch version is unknown.
+Run `38759048702/1` failed in `public_summary`; see the [performance checkpoint](../performance/README.md#backup-and-restore-follow-up-2026-10-15) for inventory and evidence limits.
 
 The un-deployed scratch-only candidate sets `max_wal_size=64MB` and `min_wal_size=32MB` (PostgreSQL 16 defaults: 1 GB and 80 MB).
 Max is a soft checkpoint threshold; min is a recycling floor, not a storage cap ([PostgreSQL WAL settings](https://www.postgresql.org/docs/16/runtime-config-wal.html)).

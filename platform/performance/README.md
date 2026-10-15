@@ -601,6 +601,22 @@ in `tree.data`; `tree.data` already includes both child paths. Cleanup was
 confirmed, while restore/Alembic completion and the full scratch peak remain
 UNKNOWN.
 
+The next bound create, `38759048702/1` on source
+`6f46b43da63f19ce0ae8ede29712d79e70d3c46e`, failed in `public_summary` with
+exit 1. The helper returned success and the closed report validator accepted
+the restore/Alembic success fields, but the external workflow failed; the
+normalizer cause remains UNKNOWN because its stderr was redirected and the
+report body was not retained. The natural auto-deploy guard failed without
+dispatching a child. A metadata-only inventory found 21 dump/sidecar pairs and
+stat-matched the 40 original entries to their saved nine-field baseline. The
+new sidecar declares restore/Alembic verification, but its archive SHA was not
+recomputed and it is not cryptographically bound to this run. This is not an
+external backup success. A pending private diagnostic records normalizer exit,
+bounded stdout/stderr lengths and hashes, fixed classes, and allowlisted
+exception class; it does not change acceptance. The 8 KiB capture cap is
+checked after the normalizer writes its private temporary output, so it bounds
+diagnostic reads and hashing, not temporary-file growth.
+
 A read-only snapshot of the current live `platformdb` (2026-10-15 14:52:18
 UTC, not bound to the failed archive) counted 36 platform physical relations:
 `pg_table_size` 272,400,384 bytes, attached indexes 3,571,712 bytes and combined
