@@ -594,6 +594,34 @@ and has no restore/Alembic result yet. Do not treat telemetry completion or a
 smaller observed `pg_wal` as backup success, capacity admission, or an
 application throughput result.
 
+The published WAL-only candidate's bound create `38746516837/1` then failed the
+same reserve guard by 2,363,392 bytes. Its last partial scratch sample recorded
+240,975,872 allocated bytes in `base`, 67,108,864 in `pg_wal`, and 309,854,208
+in `tree.data`; `tree.data` already includes both child paths. Cleanup was
+confirmed, while restore/Alembic completion and the full scratch peak remain
+UNKNOWN.
+
+A read-only snapshot of the current live `platformdb` (2026-10-15 14:52:18
+UTC, not bound to the failed archive) counted 36 platform physical relations:
+`pg_table_size` 272,400,384 bytes, attached indexes 3,571,712 bytes and combined
+relation total 275,972,096 bytes. Whole-database size was 286,825,495 bytes.
+The visibility flags for GUCs and activity statistics were false, so those
+returned fields are visibility-limited; this is a current database inventory,
+not the failed archive's complete scratch footprint or a restore peak.
+
+The disposable PG16.15 startup measurement found that `shared_buffers=16MB`
+reduced fixed main shared-memory allocation by 53,411,840 bytes versus 64 MiB,
+including derived `wal_buffers`. A rough scratch estimate is current platform
+relation bytes plus the 40,075,264-byte empty `PGDATA` baseline, less its initial
+16 MiB WAL, plus the observed 64 MiB WAL point: 366,379,008 bytes (349.41 MiB).
+This is not an upper bound: the live snapshot is not archive-bound, the failed
+scratch sample was partial, and `max_wal_size=64MB` is a soft checkpoint
+threshold rather than a cap. The next local candidate sets `shared_buffers=16MB`
+consistently in `initdb` and server startup for the disposable restore cluster
+only. A smaller cache may increase restore I/O or CPU; full restore/Alembic
+success remains unproven. WAL policy, durability settings, resource guards,
+confinement and timeouts stay unchanged.
+
 The source-pinned provider-only repair restored the attested legacy
 `19603dfff122386726313c86b0350812ebbe8cca` LiveQA runtime provider referenced
 by protected consumers. The installed 9ce provider verifier passed under the

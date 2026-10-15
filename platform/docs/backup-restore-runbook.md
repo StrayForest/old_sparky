@@ -72,17 +72,19 @@ The legacy schema-1 admission receipt and its bounded best-effort RSS samples
 remain accepted unchanged. These diagnostics never change the 1 GiB guard and
 are excluded from public workflow output and artifacts.
 
-The isolated PostgreSQL 16 bootstrap sets `shared_buffers=64MB` through
-[`initdb --set`](https://www.postgresql.org/docs/16/app-initdb.html), matching
-the setting already passed to `pg_ctl`. This keeps the bootstrap and running
-server configuration aligned while preserving the existing durability,
-authentication, confinement and resource guards. The paired 32 MiB candidate
-was reverted to the prior 64 MiB value after its backup attempt failed the
-unchanged reserve guard without completing restore/Alembic verification. The
-failure does not establish that the smaller cache caused the refusal, and no
-memory saving was measured. This scratch setting does not change production
-PostgreSQL settings. Future attempts retain the 1 GiB host guard and full
-restore/Alembic checks.
+The current source candidate sets `shared_buffers=16MB` for the isolated
+PostgreSQL 16 cluster through [`initdb --set`](https://www.postgresql.org/docs/16/app-initdb.html)
+and the matching `pg_ctl` startup option. A controlled PG16 startup
+measurement found lower fixed main shared-memory use at this setting; it does
+not prove that a full restore will pass the memory guard. Durability,
+authentication, confinement and resource guards remain unchanged. An earlier
+paired 32 MiB candidate was reverted to 64 MiB after its backup attempt failed
+the unchanged reserve guard without completing restore/Alembic verification.
+That failure neither measured a saving nor established a cause. This 16 MiB
+setting applies only to the scratch restore cluster and does not change
+production PostgreSQL settings. See the [performance checkpoint](../performance/README.md#backup-and-restore-follow-up-2026-10-15)
+for the measured fixed shared-memory delta and its limitations. Future attempts
+retain the 1 GiB host guard and full restore/Alembic checks.
 
 Two source-bound backup attempts on 2026-10-15 failed the 1 GiB reserve guard;
 the second used the paired 32 MiB candidate before it was reverted. Neither is

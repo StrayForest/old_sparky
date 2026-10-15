@@ -624,7 +624,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             if argument == "-c"
         }
 
-        self.assertEqual(initdb_settings, ["shared_buffers=64MB"])
+        self.assertEqual(initdb_settings, ["shared_buffers=16MB"])
         self.assertEqual(
             start_settings["shared_buffers"],
             initdb_settings[0].split("=", 1)[1],
@@ -639,7 +639,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "full_page_writes": "on",
                 "synchronous_commit": "on",
                 "dynamic_shared_memory_type": "mmap",
-                "shared_buffers": "64MB",
+                "shared_buffers": "16MB",
                 "work_mem": "4MB",
                 "maintenance_work_mem": "32MB",
                 "max_connections": "10",
@@ -4046,7 +4046,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "--no-locale",
                 "--encoding=UTF8",
                 "--set",
-                "shared_buffers=64MB",
+                "shared_buffers=16MB",
                 "--auth-local=trust",
                 "--auth-host=reject",
             ],
@@ -4207,7 +4207,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             )
             self.assertEqual(
                 initdb_call[initdb_call.index("--set") + 1],
-                "shared_buffers=64MB",
+                "shared_buffers=16MB",
             )
             pgctl_start = next(
                 command
@@ -4232,7 +4232,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "full_page_writes": "on",
                     "synchronous_commit": "on",
                     "dynamic_shared_memory_type": "mmap",
-                    "shared_buffers": "64MB",
+                    "shared_buffers": "16MB",
                     "work_mem": "4MB",
                     "maintenance_work_mem": "32MB",
                     "max_connections": "10",
