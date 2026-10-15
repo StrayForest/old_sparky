@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-12
+- Last reviewed: 2026-10-15
 
 ## Local verified backup
 
@@ -72,17 +72,24 @@ The legacy schema-1 admission receipt and its bounded best-effort RSS samples
 remain accepted unchanged. These diagnostics never change the 1 GiB guard and
 are excluded from public workflow output and artifacts.
 
-The isolated PostgreSQL 16 bootstrap sets `shared_buffers=32MB` through
+The isolated PostgreSQL 16 bootstrap sets `shared_buffers=64MB` through
 [`initdb --set`](https://www.postgresql.org/docs/16/app-initdb.html), matching
 the setting already passed to `pg_ctl`. This keeps the bootstrap and running
 server configuration aligned while preserving the existing durability,
-authentication, confinement and resource guards. The 32 MiB value is a
-scratch-restore memory-budget candidate; no measured saving or causal link to
-any prior reserve refusal is established. It does not change production
-PostgreSQL settings. A future restore or timeout result must be evaluated with
-the unchanged 1 GiB host guard and full restore/Alembic checks; if this smaller
-cache prevents a verified restore, revert the paired `initdb` and `pg_ctl`
-settings together rather than relaxing those checks.
+authentication, confinement and resource guards. The paired 32 MiB candidate
+was reverted to the prior 64 MiB value after its backup attempt failed the
+unchanged reserve guard without completing restore/Alembic verification. The
+failure does not establish that the smaller cache caused the refusal, and no
+memory saving was measured. This scratch setting does not change production
+PostgreSQL settings. Future attempts retain the 1 GiB host guard and full
+restore/Alembic checks.
+
+Two source-bound backup attempts on 2026-10-15 failed the 1 GiB reserve guard;
+the second used the paired 32 MiB candidate before it was reverted. Neither is
+a restore/Alembic pass, and no causal comparison or memory-saving result was
+established. Keep the reserve and all restore checks unchanged; see the [performance
+checkpoint](../performance/README.md#backup-and-restore-follow-up-2026-10-15)
+for the observed failures and their limits.
 
 For a private failure during the parent active-poll guard, the root-private
 failure receipt may also contain the optional closed

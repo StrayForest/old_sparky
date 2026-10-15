@@ -522,6 +522,49 @@ matching scratch units; it did not establish absence of mountpoints/files or
 cleanup ownership. Protected and unknown roots remain untouched pending new
 source-bound evidence.
 
+## Backup and restore follow-up (2026-10-15)
+
+Two later source-bound backup attempts failed the unchanged 1 GiB memory
+reserve guard: run `38662792582` reported a 786,432-byte deficit and run
+`38666349694` reported a 5,001,216-byte deficit. The latter used the paired
+scratch PostgreSQL `shared_buffers=32MB` initialization/start candidate, which
+the [backup and restore runbook](../docs/backup-restore-runbook.md) records as
+reverted to the prior paired 64 MiB setting. It did
+not complete restore/Alembic verification, so there is no causal comparison,
+measured memory-saving result or demonstrated effect on the reserve refusal. Keep
+durability, authentication, concurrency, confinement, tmpfs, MemoryMax,
+host-reserve and timeout settings unchanged. The evidence does not establish
+OOM or a common cause for the failures.
+
+The source-pinned provider-only repair restored the attested legacy
+`19603dfff122386726313c86b0350812ebbe8cca` LiveQA runtime provider referenced
+by protected consumers. The installed 9ce provider verifier passed under the
+canonical release lock; current/previous application pointers were preserved.
+This was not an application deployment or end-to-end QA pass.
+
+After exact source and reference checks, two duplicate tmpfs artifacts were
+removed individually while byte-identical private disk copies and manifests
+were retained through final QA: release ZIP run `11660433667` (72,206,034
+bytes, SHA-256 `7d1b4ed44559c144d58835baa2a3808f8be15c1f8f88c8f70c53bfa4e03b52e0`)
+and source tar run `11674976728` (72,302,841 bytes, SHA-256
+`785f31186d922f86176eaba22b7be2e1ed89fcf517eab943943dc3da15f4427f`). The
+source73 reference report remains PARTIAL because its outer collector return
+was exit 1 with truncated stdout; the independently preserved inner report
+and offline comparison support only the exact provenance/checksum marker
+pair. A separate COMPLETE FD/maps/map_files scan covered the exact tar inode
+at one current point, not future opens or an atomic lease. All 20 backup pairs,
+four protected `/run` roots, unrelated siblings, historical 65a, and retained
+copy/manifest evidence remain preserved.
+
+A post-cleanup point read recorded MemAvailable `1,302,296 kB`, `/dev/shm`
+available `1,158,631,424 bytes`, root filesystem available `7,858,356,224
+bytes`, and memory PSI some/full avg10 `0.00`. These observations are not an
+admission pass or root-cause finding. A fresh locked provider verification
+passed, but restore/Alembic, normal automatic deployment, the remaining six
+profiles, separate CPU validation, browser/Turnstile QA and timer completion
+remain NOT RUN / UNKNOWN. Preserve the existing 1 GiB reserve and all profile
+thresholds.
+
 ## Historical production performance stage (2026-09-07)
 
 The 2026-09-07 performance stage is closed historical evidence with an
