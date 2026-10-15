@@ -51,6 +51,552 @@ class StagedWorkerInput:
         return value
 
 
+class ScratchAllocationTreeTests(unittest.TestCase):
+    def test_metadata_walk_observes_created_and_deleted_files(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scratch-allocation-tree-") as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            data = root / "data"
+            base = data / "base"
+            nested = base / "nested"
+            wal = data / "pg_wal"
+            nested.mkdir(parents=True)
+            wal.mkdir()
+            (data / "PG_VERSION").write_bytes(b"16")
+            (base / "rel").write_bytes(b"abc")
+            (nested / "piece").write_bytes(b"12345")
+            (wal / "segment").write_bytes(b"1234567")
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            self.addCleanup(os.close, root_fd)
+
+            def sample() -> dict[str, list[int]]:
+                return backup_drill._scratch_allocation_tree(
+                    root_fd,
+                    os.fstat(root_fd).st_dev,
+                    time.monotonic() + 1.0,
+                )
+
+            before = sample()
+            self.assertEqual(before["data"][0], 17)
+            self.assertEqual(before["data"][2:], [4, 4])
+            self.assertEqual(before["base"][0], 8)
+            self.assertEqual(before["base"][2:], [2, 2])
+            self.assertEqual(before["pg_wal"][0], 7)
+            self.assertEqual(before["pg_wal"][2:], [1, 1])
+
+            added = base / "new"
+            added.write_bytes(b"later")
+            after_create = sample()
+            self.assertEqual(after_create["data"][0], before["data"][0] + 5)
+            self.assertEqual(after_create["data"][2], before["data"][2] + 1)
+            added.unlink()
+            after_delete = sample()
+            self.assertEqual(after_delete["data"][0], before["data"][0])
+            self.assertEqual(after_delete["base"][2], before["base"][2])
+
+    def test_symlink_is_rejected_without_following_it(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scratch-allocation-link-") as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            data = root / "data"
+            (data / "base").mkdir(parents=True)
+            (data / "pg_wal").mkdir()
+            outside = root / "outside"
+            outside.write_text("private fixture", encoding="ascii")
+            (data / "linked").symlink_to(outside)
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            self.addCleanup(os.close, root_fd)
+            with self.assertRaises(backup_drill._ScratchAllocationReadError) as caught:
+                backup_drill._scratch_allocation_tree(
+                    root_fd,
+                    os.fstat(root_fd).st_dev,
+                    time.monotonic() + 1.0,
+                )
+            self.assertEqual(caught.exception.reason, "unsupported_entry")
+
+    def test_node_cap_counts_root_once_and_does_not_list_all_names(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scratch-allocation-cap-") as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            data = root / "data"
+            (data / "base").mkdir(parents=True)
+            (data / "pg_wal").mkdir()
+            (data / "extra").write_bytes(b"x")
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            self.addCleanup(os.close, root_fd)
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_ALLOCATION_ENTRY_MAX", 3),
+                mock.patch.object(backup_drill.os, "listdir", side_effect=AssertionError("unbounded listing")),
+            ):
+                with self.assertRaises(backup_drill._ScratchAllocationReadError) as caught:
+                    backup_drill._scratch_allocation_tree(
+                        root_fd,
+                        os.fstat(root_fd).st_dev,
+                        time.monotonic() + 1.0,
+                    )
+            self.assertEqual(caught.exception.reason, "entry_cap")
+
+
+class ScratchAllocationAttributionTests(unittest.TestCase):
+    @staticmethod
+    def _sample(phase: str, *, status: str = "complete", reason: str | None = None) -> dict[str, Any]:
+        missing = status == "unknown"
+        return {
+            "schema": 1,
+            "phase": phase,
+            "status": status,
+            "unknown_reason": reason,
+            "sample_unix_ns": 1_800_000_000_000_000_000,
+            "sample_offset_ms": 25,
+            "guard_available_bytes": 1_066_323_968 if phase == "parent_last_guard" else None,
+            "guard_sample_lag_ms": 4 if phase == "parent_last_guard" else None,
+            "mount": {
+                "dev": 2049 if not missing else None,
+                "ino": 15 if not missing else None,
+                "mount_id": 55 if not missing else None,
+                "total_bytes": 512 * 1024**2 if not missing else None,
+                "used_bytes": 128 * 1024**2 if not missing else None,
+                "free_bytes": 384 * 1024**2 if not missing else None,
+            },
+            "host": {
+                "mem_available_bytes": 1_066_323_968 if not missing else None,
+                "rss_bytes": 90 * 1024**2 if not missing else None,
+                "memory_current_bytes": 300 * 1024**2 if not missing else None,
+                "anon_bytes": 20 * 1024**2 if not missing else None,
+                "file_bytes": 280 * 1024**2 if not missing else None,
+                "shmem_bytes": 200 * 1024**2 if not missing else None,
+            },
+            "tree": {
+                name: None if missing else [10, 16, 1, 1]
+                for name in ("data", "base", "pg_wal")
+            },
+        }
+
+    def test_four_lifecycle_boundaries_parse_and_match_private_failure_frame(self) -> None:
+        phases = (
+            "initdb_end",
+            "postgres_start_end",
+            "restore_platform_start",
+            "restore_platform_end",
+        )
+        raw = b"".join(
+            backup_drill.SCRATCH_ALLOCATION_FRAME_MARKER
+            + json.dumps(self._sample(phase), separators=(",", ":"), sort_keys=True).encode("ascii")
+            + b"\n"
+            for phase in phases
+        )
+        attribution = backup_drill._scratch_parse_allocation_attribution(
+            raw,
+            truncated=False,
+            archive_size_bytes=23,
+            archive_sha256="a" * 64,
+        )
+        self.assertTrue(backup_drill.valid_scratch_allocation_attribution(attribution))
+        self.assertEqual(attribution["status"], "complete")
+        self.assertEqual([row["phase"] for row in attribution["samples"]], list(phases))
+        error = RuntimeError("primary restore failure")
+        error.scratch_allocation_attribution = attribution
+        report = backup_drill.failure_report_for_exception(
+            error, private_scratch_diagnostics=True
+        )
+        frame = backup_drill._scratch_allocation_attribution_frame(attribution)
+        self.assertEqual(report["scratch_allocation_attribution"], attribution)
+        self.assertEqual(
+            frame,
+            backup_drill.SCRATCH_ALLOCATION_ATTRIBUTION_MARKER
+            + json.dumps(attribution, separators=(",", ":"), sort_keys=True).encode("ascii")
+            + b"\n",
+        )
+        self.assertNotIn(
+            "scratch_allocation_attribution",
+            backup_drill.failure_report_for_exception(
+                error, private_scratch_diagnostics=False
+            ),
+        )
+
+    def test_worker_failure_and_parent_samples_remain_partial(self) -> None:
+        phases = (
+            "initdb_end",
+            "postgres_start_end",
+            "restore_platform_start",
+            "worker_failure",
+        )
+        raw = b"".join(
+            backup_drill.SCRATCH_ALLOCATION_FRAME_MARKER
+            + json.dumps(self._sample(phase), separators=(",", ":"), sort_keys=True).encode("ascii")
+            + b"\n"
+            for phase in phases
+        )
+        attribution = backup_drill._scratch_parse_allocation_attribution(
+            raw,
+            truncated=False,
+            archive_size_bytes=23,
+            archive_sha256="e" * 64,
+            parent_sample=self._sample("parent_last_guard", status="unknown", reason="deadline"),
+        )
+        self.assertTrue(backup_drill.valid_scratch_allocation_attribution(attribution))
+        self.assertEqual(attribution["status"], "partial")
+        self.assertEqual(attribution["unknown_reason"], "deadline")
+        self.assertEqual(
+            [row["phase"] for row in attribution["samples"]],
+            [*phases, "parent_last_guard"],
+        )
+
+    def test_worker_sample_rechecks_mount_row_identity_after_walk(self) -> None:
+        host = {
+            "mem_available_bytes": 2**30,
+            "rss_bytes": 90 * 1024**2,
+            "memory_current_bytes": 300 * 1024**2,
+            "anon_bytes": 20 * 1024**2,
+            "file_bytes": 280 * 1024**2,
+            "shmem_bytes": 200 * 1024**2,
+        }
+        control_group = "/system.slice/oldsparky-backup-restore-" + "c" * 24 + ".service"
+        args = argparse.Namespace(
+            private_scratch_diagnostics=True,
+            _scratch_authorization_probe=False,
+            _scratch_phase_origin_monotonic_ns=time.monotonic_ns(),
+        )
+        with tempfile.TemporaryDirectory(prefix="scratch-worker-sample-") as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            (root / "data" / "base").mkdir(parents=True)
+            (root / "data" / "pg_wal").mkdir()
+            (root / "data" / "base" / "rel").write_bytes(b"relation")
+            (root / "data" / "pg_wal" / "segment").write_bytes(b"wal")
+            root_info = root.stat()
+            device = f"{os.major(root_info.st_dev)}:{os.minor(root_info.st_dev)}"
+
+            def mountinfo(mount_id: int) -> bytes:
+                return (
+                    f"{mount_id} 1 {device} / {root} rw - tmpfs tmpfs rw,size=536870912\n"
+                ).encode("ascii")
+
+            for rows, expected_status, expected_reason in (
+                ([mountinfo(55), mountinfo(55)], "complete", None),
+                ([mountinfo(55), mountinfo(56)], "unknown", "mount_identity"),
+            ):
+                with self.subTest(mount_id=expected_status):
+                    with tempfile.TemporaryDirectory(prefix="scratch-worker-mountinfo-") as mountinfo_dir:
+                        mountinfo_paths = []
+                        for index, payload in enumerate(rows):
+                            path = pathlib.Path(mountinfo_dir) / f"mountinfo-{index}"
+                            path.write_bytes(payload)
+                            mountinfo_paths.append(path)
+                        pending = list(mountinfo_paths)
+                        real_open = os.open
+
+                        def fake_open(path, flags, *open_args, **kwargs):
+                            if os.fspath(path) == "/proc/self/mountinfo":
+                                return real_open(pending.pop(0), flags, *open_args, **kwargs)
+                            return real_open(path, flags, *open_args, **kwargs)
+
+                        with (
+                            mock.patch.object(backup_drill.os, "open", side_effect=fake_open),
+                            mock.patch.object(
+                                backup_drill,
+                                "_scratch_allocation_host_values",
+                                return_value=(host, True),
+                            ),
+                            mock.patch.object(
+                                backup_drill,
+                                "_scratch_private_proc_file",
+                                return_value=f"0::{control_group}\n".encode("ascii"),
+                            ),
+                        ):
+                            sample = backup_drill._scratch_allocation_worker_sample(
+                                args, root, "restore_platform_start"
+                            )
+                    self.assertEqual(pending, [])
+                    self.assertTrue(backup_drill.valid_scratch_allocation_sample(sample))
+                    self.assertEqual(sample["status"], expected_status)
+                    self.assertEqual(sample["unknown_reason"], expected_reason)
+                    self.assertEqual(sample["mount"]["mount_id"], 55)
+
+    def test_phase_parser_ignores_interleaved_allocation_frames(self) -> None:
+        phase_rows = [
+            (phase, event)
+            for phase in backup_drill.SCRATCH_PHASES
+            for event in ("start", "end")
+        ]
+        lines: list[bytes] = []
+        allocation_line = (
+            backup_drill.SCRATCH_ALLOCATION_FRAME_MARKER
+            + json.dumps(
+                self._sample("initdb_end"), separators=(",", ":"), sort_keys=True
+            ).encode("ascii")
+            + b"\n"
+        )
+        for index, (phase, event) in enumerate(phase_rows):
+            if index == 5:
+                lines.append(allocation_line)
+            frame = {
+                "ordinal": index + 1,
+                "phase": phase,
+                "event": event,
+                "worker_offset_ms": index,
+            }
+            lines.append(
+                backup_drill.SCRATCH_PHASE_FRAME_MARKER
+                + json.dumps(frame, separators=(",", ":"), sort_keys=True).encode("ascii")
+                + b"\n"
+            )
+
+        phase = backup_drill._scratch_parse_phase_attribution(
+            b"".join(lines),
+            truncated=False,
+            complete=True,
+            launch_monotonic_ns=1,
+        )
+        self.assertTrue(backup_drill.valid_scratch_phase_attribution(phase))
+        self.assertEqual(phase["status"], "complete")
+        self.assertEqual(len(phase["frames"]), backup_drill.SCRATCH_PHASE_FRAME_MAX_COUNT)
+
+    def test_capture_prefix_and_malformed_frames_remain_partial_unknowns(self) -> None:
+        first = (
+            backup_drill.SCRATCH_ALLOCATION_FRAME_MARKER
+            + json.dumps(self._sample("initdb_end"), separators=(",", ":"), sort_keys=True).encode("ascii")
+            + b"\n"
+        )
+        prefix = backup_drill._scratch_parse_allocation_attribution(
+            first,
+            truncated=True,
+            archive_size_bytes=23,
+            archive_sha256="b" * 64,
+        )
+        self.assertTrue(backup_drill.valid_scratch_allocation_attribution(prefix))
+        self.assertEqual((prefix["status"], prefix["unknown_reason"]), ("partial", "capture_prefix"))
+        malformed = backup_drill._scratch_parse_allocation_attribution(
+            first + backup_drill.SCRATCH_ALLOCATION_FRAME_MARKER + b"{bad}\n",
+            truncated=False,
+            archive_size_bytes=23,
+            archive_sha256="b" * 64,
+        )
+        self.assertTrue(backup_drill.valid_scratch_allocation_attribution(malformed))
+        self.assertEqual((malformed["status"], malformed["unknown_reason"]), ("partial", "malformed"))
+        empty = backup_drill._scratch_parse_allocation_attribution(
+            b"", truncated=False, archive_size_bytes=23, archive_sha256="b" * 64
+        )
+        self.assertTrue(backup_drill.valid_scratch_allocation_attribution(empty))
+        self.assertEqual((empty["status"], empty["unknown_reason"], empty["samples"]), (
+            "unknown", "capture_unavailable", []
+        ))
+
+    def test_parent_sample_is_appended_without_replacing_first_fault(self) -> None:
+        worker = (
+            backup_drill.SCRATCH_ALLOCATION_FRAME_MARKER
+            + json.dumps(self._sample("initdb_end"), separators=(",", ":"), sort_keys=True).encode("ascii")
+            + b"\n"
+        )
+        parent = self._sample("parent_last_guard", status="unknown", reason="deadline")
+        attribution = backup_drill._scratch_parse_allocation_attribution(
+            worker,
+            truncated=False,
+            archive_size_bytes=23,
+            archive_sha256="c" * 64,
+            parent_sample=parent,
+        )
+        self.assertEqual(attribution["status"], "partial")
+        self.assertEqual(attribution["unknown_reason"], "deadline")
+        self.assertEqual(attribution["samples"][-1]["phase"], "parent_last_guard")
+        error = PermissionError(13, "primary reserve failure")
+        backup_drill._retain_first_scratch_fault(
+            error, origin="controller", site="controller_active_poll"
+        )
+        first_fault = dict(error.scratch_first_fault)
+        error.scratch_allocation_attribution = attribution
+        backup_drill._retain_first_scratch_fault(
+            error, origin="worker", site="worker_restore"
+        )
+        report = backup_drill.failure_report_for_exception(
+            error, private_scratch_diagnostics=True
+        )
+        self.assertEqual(error.scratch_first_fault, first_fault)
+        self.assertEqual(report["scratch_first_fault"], first_fault)
+        self.assertEqual(report["scratch_allocation_attribution"], attribution)
+        self.assertIn(
+            backup_drill.SCRATCH_ALLOCATION_ATTRIBUTION_MARKER,
+            backup_drill.private_failure_frame_for_exception(error, enabled=True).encode("ascii"),
+        )
+
+    def test_schema_rejects_boolean_counters_and_partial_values_as_complete(self) -> None:
+        sample = self._sample("initdb_end")
+        self.assertTrue(backup_drill.valid_scratch_allocation_sample(sample))
+        malformed = {
+            **sample,
+            "tree": {
+                **sample["tree"],
+                "data": [True, 16, 1, 1],
+            },
+        }
+        self.assertFalse(backup_drill.valid_scratch_allocation_sample(malformed))
+        unknown = self._sample("initdb_end", status="unknown", reason="deadline")
+        partial = {
+            "schema": 1,
+            "status": "partial",
+            "unknown_reason": "deadline",
+            "archive_size_bytes": 23,
+            "archive_sha256": "d" * 64,
+            "samples": [unknown],
+        }
+        self.assertTrue(backup_drill.valid_scratch_allocation_attribution(partial))
+        self.assertFalse(
+            backup_drill.valid_scratch_allocation_attribution(
+                {**partial, "status": "complete", "unknown_reason": None}
+            )
+        )
+
+    def test_parent_last_guard_uses_pinned_proc_root_fd_and_local_mount_row(self) -> None:
+        pid_text = "4321"
+        invocation = "b" * 32
+        expected_start = "123456"
+        control_group = "/system.slice/oldsparky-backup-restore-" + "c" * 24 + ".service"
+        relative_mount = "run/oldsparky-backup-restore-" + "a" * 24
+        mountpoint = pathlib.Path("/") / relative_mount
+        with tempfile.TemporaryDirectory(prefix="scratch-parent-last-guard-") as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            scratch = root / relative_mount
+            (scratch / "data" / "base").mkdir(parents=True)
+            (scratch / "data" / "pg_wal").mkdir()
+            (scratch / "data" / "base" / "rel").write_bytes(b"rel")
+            (scratch / "data" / "pg_wal" / "segment").write_bytes(b"wal")
+            real_open = os.open
+            real_stat = os.stat
+            temp_root_fd = real_open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            self.addCleanup(os.close, temp_root_fd)
+            root_info = os.fstat(temp_root_fd)
+            mountinfo = (
+                f"22 1 {os.major(root_info.st_dev)}:{os.minor(root_info.st_dev)} "
+                f"/ /{relative_mount} rw - tmpfs tmpfs rw,size=536870912\n"
+            ).encode("ascii")
+            mountinfo_reads = [mountinfo, mountinfo]
+
+            def read_mountinfo(_pid_text: str, _name: str, _cap: int) -> bytes:
+                return mountinfo_reads.pop(0)
+
+            def fake_open(path, flags, *args, **kwargs):
+                if os.fspath(path).endswith("/exe"):
+                    raise AssertionError("parent telemetry must not read proc exe")
+                if os.fspath(path) == f"/proc/{pid_text}/root":
+                    return real_open(root, flags)
+                return real_open(path, flags, *args, **kwargs)
+
+            def fake_stat(path, *args, **kwargs):
+                if os.fspath(path) == f"/proc/{pid_text}/root":
+                    return real_stat(root)
+                if os.fspath(path) == f"/proc/{pid_text}/ns/mnt":
+                    return types.SimpleNamespace(st_dev=7, st_ino=8)
+                return real_stat(path, *args, **kwargs)
+
+            resource = {
+                "schema": 1,
+                "status": "complete",
+                "sample_offset_ms": 20,
+                "unknown_reason": None,
+                "controller": {"identity_bound": True, "rss_bytes": 1_000_000},
+                "worker": {"identity_bound": True, "rss_bytes": 2_000_000},
+                "cgroup": {
+                    "identity_bound": True,
+                    "memory_current_bytes": 300_000_000,
+                    "anon_bytes": 20_000_000,
+                    "file_bytes": 280_000_000,
+                    "shmem_bytes": 200_000_000,
+                    "events": {"high": 0, "max": 0, "oom": 0, "oom_kill": 0},
+                },
+            }
+            guard = {
+                "schema": 2,
+                "guard_site": "parent_active_poll",
+                "guard_reason": "memory_reserve",
+                "available_bytes": backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES - 1,
+                "required_bytes": backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES,
+            }
+            with (
+                mock.patch.object(backup_drill.os, "open", side_effect=fake_open),
+                mock.patch.object(backup_drill.os, "stat", side_effect=fake_stat),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_process_start_time",
+                    return_value=expected_start,
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_proc_status_observation",
+                    return_value=(int(pid_text), 1, 2_000_000),
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_private_proc_file",
+                    return_value=f"0::{control_group}\n".encode("ascii"),
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_allocation_proc_bytes",
+                    side_effect=read_mountinfo,
+                ),
+            ):
+                sample_started = time.monotonic()
+                sample = backup_drill._scratch_allocation_parent_last_guard(
+                    mountpoint=mountpoint,
+                    worker_identity=(pid_text, invocation, expected_start),
+                    control_group=control_group,
+                    launch_monotonic_ns=time.monotonic_ns(),
+                    guard_diagnostic=guard,
+                    resource_attribution=resource,
+                    operation_deadline=time.monotonic() + 1.0,
+                    guard_monotonic_ns=time.monotonic_ns(),
+                )
+                sample_elapsed = time.monotonic() - sample_started
+                self.assertEqual(mountinfo_reads, [])
+            self.assertTrue(backup_drill.valid_scratch_allocation_sample(sample))
+            self.assertEqual(sample["phase"], "parent_last_guard")
+            self.assertEqual(sample["status"], "complete")
+            self.assertEqual(sample["mount"]["mount_id"], 22)
+            self.assertEqual(sample["tree"]["base"][0], 3)
+            self.assertEqual(sample["tree"]["pg_wal"][0], 3)
+            # This disposable fixture is expected to finish quickly. The
+            # assertion is a test observation, not a hard syscall deadline.
+            self.assertLess(sample_elapsed, 1.0)
+
+            mountinfo_reads.extend(
+                [mountinfo, mountinfo.replace(b"22 1 ", b"23 1 ", 1)]
+            )
+            with (
+                mock.patch.object(backup_drill.os, "open", side_effect=fake_open),
+                mock.patch.object(backup_drill.os, "stat", side_effect=fake_stat),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_process_start_time",
+                    return_value=expected_start,
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_proc_status_observation",
+                    return_value=(int(pid_text), 1, 2_000_000),
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_private_proc_file",
+                    return_value=f"0::{control_group}\n".encode("ascii"),
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_allocation_proc_bytes",
+                    side_effect=read_mountinfo,
+                ),
+            ):
+                changed = backup_drill._scratch_allocation_parent_last_guard(
+                    mountpoint=mountpoint,
+                    worker_identity=(pid_text, invocation, expected_start),
+                    control_group=control_group,
+                    launch_monotonic_ns=time.monotonic_ns(),
+                    guard_diagnostic=guard,
+                    resource_attribution=resource,
+                    operation_deadline=time.monotonic() + 1.0,
+                    guard_monotonic_ns=time.monotonic_ns(),
+                )
+            self.assertTrue(backup_drill.valid_scratch_allocation_sample(changed))
+            self.assertEqual(changed["status"], "unknown")
+            self.assertEqual(changed["unknown_reason"], "mount_identity")
+            self.assertEqual(changed["mount"]["mount_id"], 22)
+
+
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def setUp(self) -> None:
         self._original_proc_start_time = backup_drill._scratch_process_start_time
@@ -2691,9 +3237,15 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ("archive_verify", "start"), ("archive_verify", "end"),
             ("initdb", "start"), ("initdb", "end"),
             ("postgres_start", "start"), ("postgres_start", "end"),
+            ("restore_platform", "start"),
         ]
 
-        def assert_private_output(forwarded: bytes, launch_monotonic_ns: int) -> None:
+        def assert_private_output(
+            forwarded: bytes,
+            launch_monotonic_ns: int,
+            *,
+            expect_worker_allocation: bool = False,
+        ) -> None:
             phase_prefix, separator, forwarded_child_output = forwarded.partition(
                 child_output
             )
@@ -2715,6 +3267,24 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 ],
                 expected_events,
             )
+            if expect_worker_allocation:
+                allocation = backup_drill._scratch_parse_allocation_attribution(
+                    phase_prefix,
+                    truncated=False,
+                    archive_size_bytes=23,
+                    archive_sha256="f" * 64,
+                )
+                self.assertTrue(backup_drill.valid_scratch_allocation_attribution(allocation))
+                self.assertEqual(allocation["status"], "partial")
+                self.assertEqual(
+                    [row["phase"] for row in allocation["samples"]],
+                    [
+                        "initdb_end",
+                        "postgres_start_end",
+                        "restore_platform_start",
+                        "worker_failure",
+                    ],
+                )
 
         for private in (True, False):
             scratch_root = pathlib.Path("/run") / f"oldsparky-backup-restore-{uuid.uuid4().hex[:24]}"
@@ -2742,6 +3312,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     False,
                     False,
                 )
+
+                def fail_during_restore(*_args, **kwargs):
+                    kwargs["phase_observer"]("restore_platform", "start")
+                    raise worker_failure
+
                 command_results = [
                     subprocess.CompletedProcess([], 0, "/usr/lib/postgresql/16/bin\n", ""),
                     subprocess.CompletedProcess([], 0, "postgres (PostgreSQL) 16.10\n", ""),
@@ -2771,7 +3346,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
                     mock.patch.object(backup_drill, "_scratch_create_application_role"),
                     mock.patch.object(
-                        backup_drill, "perform_restore_drill", side_effect=worker_failure
+                        backup_drill, "perform_restore_drill", side_effect=fail_during_restore
                     ),
                     mock.patch.object(
                         backup_drill.sys,
@@ -2789,7 +3364,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     self.assertEqual(stdout_capture.buffer.getvalue(), b"")
                     forwarded = stderr_capture.buffer.getvalue()
                     assert_private_output(
-                        forwarded, args._scratch_phase_origin_monotonic_ns
+                        forwarded,
+                        args._scratch_phase_origin_monotonic_ns,
+                        expect_worker_allocation=True,
                     )
                 else:
                     self.assertEqual(stdout_capture.buffer.getvalue(), b"")

@@ -1122,6 +1122,7 @@ jobs:
           scratch_host_guard_diagnostic = None
           scratch_resource_attribution = None
           scratch_phase_attribution = None
+          scratch_allocation_attribution = None
           scratch_cleanup_status = None
           host_guard_invalid = False
 
@@ -1267,6 +1268,201 @@ jobs:
                   return len(frames) == 12 and reason is None
               return reason in reasons
 
+          def valid_scratch_allocation_attribution(value):
+              reasons = {
+                  "sample_unavailable", "identity_drift", "mount_identity", "read_error",
+                  "unsupported_entry", "entry_cap", "depth_cap", "deadline", "malformed",
+                  "incomplete", "capture_unavailable", "capture_prefix", "internal_error",
+              }
+              phases = {
+                  "initdb_end", "postgres_start_end", "restore_platform_start",
+                  "restore_platform_end", "worker_failure", "parent_last_guard",
+              }
+              if (
+                  not isinstance(value, dict)
+                  or set(value) != {
+                      "schema", "status", "unknown_reason", "archive_size_bytes", "archive_sha256", "samples",
+                  }
+                  or type(value.get("schema")) is not int
+                  or value["schema"] != 1
+                  or type(value.get("status")) is not str
+                  or value["status"] not in {"complete", "partial", "unknown"}
+                  or (
+                      value.get("unknown_reason") is not None
+                      and (type(value["unknown_reason"]) is not str or value["unknown_reason"] not in reasons)
+                  )
+                  or type(value.get("archive_size_bytes")) is not int
+                  or not 0 < value["archive_size_bytes"] <= (1 << 60)
+                  or type(value.get("archive_sha256")) is not str
+                  or re.fullmatch(r"[0-9a-f]{64}", value["archive_sha256"]) is None
+                  or not isinstance(value.get("samples"), list)
+                  or len(value["samples"]) > 6
+              ):
+                  return False
+
+              samples = value["samples"]
+              seen_phases = set()
+              complete_phases = set()
+              phase_order = {
+                  "initdb_end": 0,
+                  "postgres_start_end": 1,
+                  "restore_platform_start": 2,
+                  "restore_platform_end": 3,
+                  "worker_failure": 4,
+                  "parent_last_guard": 5,
+              }
+              previous_phase = -1
+              sample_keys = {
+                  "schema", "phase", "status", "unknown_reason", "sample_unix_ns", "sample_offset_ms",
+                  "guard_available_bytes", "guard_sample_lag_ms", "mount", "host", "tree",
+              }
+              mount_keys = {"dev", "ino", "mount_id", "total_bytes", "used_bytes", "free_bytes"}
+              host_keys = {
+                  "mem_available_bytes", "rss_bytes", "memory_current_bytes", "anon_bytes", "file_bytes", "shmem_bytes",
+              }
+              tree_keys = {"data", "base", "pg_wal"}
+              for sample in samples:
+                  if (
+                      not isinstance(sample, dict)
+                      or set(sample) != sample_keys
+                      or type(sample.get("schema")) is not int
+                      or sample["schema"] != 1
+                      or type(sample.get("phase")) is not str
+                      or sample["phase"] not in phases
+                      or sample["phase"] in seen_phases
+                      or phase_order[sample["phase"]] <= previous_phase
+                      or type(sample.get("status")) is not str
+                      or sample["status"] not in {"complete", "unknown"}
+                      or (
+                          sample.get("unknown_reason") is not None
+                          and (type(sample["unknown_reason"]) is not str or sample["unknown_reason"] not in reasons)
+                      )
+                      or type(sample.get("sample_unix_ns")) is not int
+                      or not 0 <= sample["sample_unix_ns"] <= (1 << 63) - 1
+                      or (
+                          sample.get("sample_offset_ms") is not None
+                          and (
+                              type(sample["sample_offset_ms"]) is not int
+                              or not 0 <= sample["sample_offset_ms"] <= 960_000
+                          )
+                      )
+                  ):
+                      return False
+                  seen_phases.add(sample["phase"])
+                  previous_phase = phase_order[sample["phase"]]
+                  guard_available = sample.get("guard_available_bytes")
+                  guard_lag = sample.get("guard_sample_lag_ms")
+                  if (
+                      (guard_available is not None and (type(guard_available) is not int or not 0 <= guard_available < 1_073_741_824))
+                      or (guard_lag is not None and (type(guard_lag) is not int or not 0 <= guard_lag <= 60_000))
+                  ):
+                      return False
+                  mount = sample.get("mount")
+                  if not isinstance(mount, dict) or set(mount) != mount_keys:
+                      return False
+                  mount_limits = {
+                      "dev": (1 << 63) - 1,
+                      "ino": (1 << 63) - 1,
+                      "mount_id": (1 << 31) - 1,
+                      "total_bytes": 1 << 60,
+                      "used_bytes": 1 << 60,
+                      "free_bytes": 1 << 60,
+                  }
+                  for key, item in mount.items():
+                      if item is not None and (type(item) is not int or not 0 <= item <= mount_limits[key]):
+                          return False
+                  if (
+                      mount.get("used_bytes") is not None
+                      and mount.get("free_bytes") is not None
+                      and mount["used_bytes"] + mount["free_bytes"] != mount.get("total_bytes")
+                  ):
+                      return False
+                  host = sample.get("host")
+                  if not isinstance(host, dict) or set(host) != host_keys:
+                      return False
+                  for item in host.values():
+                      if item is not None and (type(item) is not int or not 0 <= item <= (1 << 60)):
+                          return False
+                  tree = sample.get("tree")
+                  if not isinstance(tree, dict) or set(tree) != tree_keys:
+                      return False
+                  for counters in tree.values():
+                      if counters is not None and (
+                          not isinstance(counters, list)
+                          or len(counters) != 4
+                          or any(type(item) is not int or not 0 <= item <= (1 << 60) for item in counters[:2])
+                          or any(type(item) is not int or not 0 <= item <= 8192 for item in counters[2:])
+                      ):
+                          return False
+                  if sample["status"] == "complete":
+                      if (
+                          sample.get("unknown_reason") is not None
+                          or any(item is None for item in mount.values())
+                          or any(item is None for item in host.values())
+                          or any(item is None for item in tree.values())
+                      ):
+                          return False
+                      complete_phases.add(sample["phase"])
+                  elif sample.get("unknown_reason") is None:
+                      return False
+
+              reason = value.get("unknown_reason")
+              if value["status"] == "complete":
+                  valid_status = (
+                      reason is None
+                      and all(sample["status"] == "complete" for sample in samples)
+                      and seen_phases == {
+                          "initdb_end", "postgres_start_end", "restore_platform_start", "restore_platform_end",
+                      }
+                  )
+              elif value["status"] == "partial":
+                  valid_status = bool(samples) and reason is not None
+              else:
+                  valid_status = not samples and reason is not None
+              if not valid_status:
+                  return False
+              try:
+                  encoded = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("ascii")
+              except (TypeError, ValueError, UnicodeError):
+                  return False
+              return len(encoded) <= 8192
+
+          def parse_bound_scratch_allocation_attribution(report, stderr_state, stderr_bytes):
+              marker = b"SCRATCH_ALLOCATION_ATTRIBUTION_V1:"
+              marker_count = stderr_bytes.count(marker) if stderr_state == "read" else 0
+              if "scratch_allocation_attribution" not in report:
+                  return (stderr_state in {"absent", "read"} and marker_count == 0), None
+              attribution = report.get("scratch_allocation_attribution")
+              if not valid_scratch_allocation_attribution(attribution) or marker_count != 1:
+                  return False, None
+              marker_start = stderr_bytes.index(marker) + len(marker)
+              marker_end = stderr_bytes.find(b"\n", marker_start)
+              marker_offset = marker_start - len(marker)
+              marker_is_line_start = marker_offset == 0 or stderr_bytes[marker_offset - 1 : marker_offset] == b"\n"
+              frame_bytes = stderr_bytes[marker_start:marker_end] if marker_end >= 0 else b""
+
+              def reject_duplicate_keys(pairs):
+                  result = {}
+                  for key, value in pairs:
+                      if key in result:
+                          raise ValueError
+                      result[key] = value
+                  return result
+
+              try:
+                  frame = json.loads(frame_bytes.decode("ascii"), object_pairs_hook=reject_duplicate_keys)
+              except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                  return False, None
+              canonical = json.dumps(attribution, sort_keys=True, separators=(",", ":")).encode("ascii")
+              if (
+                  not marker_is_line_start
+                  or frame != attribution
+                  or frame_bytes != canonical
+                  or len(frame_bytes) > 8192
+              ):
+                  return False, None
+              return True, attribution
+
           if report_state == "read":
               try:
                   report = json.loads(
@@ -1298,6 +1494,11 @@ jobs:
                               scratch_phase_attribution = phase_attribution
                           else:
                               report_state = "unclassified_json"
+                      allocation_bound, scratch_allocation_attribution = parse_bound_scratch_allocation_attribution(
+                          report, stderr_state, stderr_bytes
+                      )
+                      if not allocation_bound:
+                          report_state = "unclassified_json"
                       if "scratch_cleanup_status" in report:
                           cleanup_status = report.get("scratch_cleanup_status")
                           if (
@@ -1820,6 +2021,8 @@ jobs:
                   "stderr_bytes": len(stderr_bytes),
                   "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest() if stderr_bytes else None,
               }
+              if scratch_allocation_attribution is not None:
+                  record["scratch_allocation_attribution"] = scratch_allocation_attribution
               encoded = (json.dumps(record, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
               descriptor = os.open(
                   filename,

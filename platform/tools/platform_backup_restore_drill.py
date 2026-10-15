@@ -91,6 +91,14 @@ SCRATCH_PHASE_FRAME_MARKER = b"SCRATCH_PHASE_V1:"
 SCRATCH_PHASE_FRAME_MAX_BYTES = 192
 SCRATCH_PHASE_FRAME_MAX_COUNT = 12
 SCRATCH_PHASE_OFFSET_MAX_MS = (SCRATCH_RUNTIME_SECONDS + SCRATCH_STARTUP_SECONDS + 30) * 1000
+SCRATCH_ALLOCATION_FRAME_MARKER = b"SCRATCH_ALLOCATION_V1:"
+SCRATCH_ALLOCATION_FRAME_MAX_BYTES = 4096
+SCRATCH_ALLOCATION_ATTRIBUTION_MARKER = b"SCRATCH_ALLOCATION_ATTRIBUTION_V1:"
+SCRATCH_ALLOCATION_ATTRIBUTION_MAX_BYTES = 8192
+SCRATCH_ALLOCATION_MAX_SAMPLES = 6
+SCRATCH_ALLOCATION_ENTRY_MAX = 8192
+SCRATCH_ALLOCATION_DEPTH_MAX = 32
+SCRATCH_ALLOCATION_SAMPLE_BUDGET_SECONDS = 0.1
 SCRATCH_PHASES = (
     "archive_verify",
     "initdb",
@@ -582,6 +590,22 @@ _SCRATCH_PHASE_UNKNOWN_REASONS = frozenset(
         "internal_error",
     }
 )
+_SCRATCH_ALLOCATION_PHASES = frozenset(
+    {
+        "initdb_end",
+        "postgres_start_end",
+        "restore_platform_start",
+        "restore_platform_end",
+    }
+)
+_SCRATCH_ALLOCATION_OPTIONAL_PHASES = frozenset({"worker_failure", "parent_last_guard"})
+_SCRATCH_ALLOCATION_UNKNOWN_REASONS = frozenset(
+    {
+        "sample_unavailable", "identity_drift", "mount_identity", "read_error",
+        "unsupported_entry", "entry_cap", "depth_cap", "deadline", "malformed",
+        "incomplete", "capture_unavailable", "capture_prefix", "internal_error",
+    }
+)
 
 
 def valid_scratch_phase_attribution(value: Any) -> bool:
@@ -795,7 +819,18 @@ def _scratch_parse_phase_attribution(
     if launch_monotonic_ns is None or type(launch_monotonic_ns) is not int:
         return unknown("capture_unavailable")
     lines = stderr.splitlines(keepends=True)
-    if not lines or len(lines) > SCRATCH_PHASE_FRAME_MAX_COUNT:
+    if not lines or len(lines) > SCRATCH_PHASE_FRAME_MAX_COUNT + SCRATCH_ALLOCATION_MAX_SAMPLES:
+        return unknown("malformed")
+    phase_lines: list[bytes] = []
+    for line in lines:
+        if line.startswith(SCRATCH_ALLOCATION_FRAME_MARKER):
+            # Allocation frames are optional observations. Their parser below
+            # can mark them unknown without rejecting the restore's phase stream.
+            if len(line) > len(SCRATCH_ALLOCATION_FRAME_MARKER) + SCRATCH_ALLOCATION_FRAME_MAX_BYTES + 1:
+                continue
+            continue
+        phase_lines.append(line)
+    if not phase_lines or len(phase_lines) > SCRATCH_PHASE_FRAME_MAX_COUNT:
         return unknown("malformed")
     expected = [
         (phase, event)
@@ -804,7 +839,7 @@ def _scratch_parse_phase_attribution(
     ]
     frames: list[dict[str, Any]] = []
     previous_offset = -1
-    for index, line in enumerate(lines):
+    for index, line in enumerate(phase_lines):
         if not line.endswith(b"\n") or not line.startswith(SCRATCH_PHASE_FRAME_MARKER):
             return unknown("non_phase_bytes", frames)
         payload = line[len(SCRATCH_PHASE_FRAME_MARKER):-1]
@@ -964,6 +999,147 @@ def valid_scratch_resource_attribution(value: Any) -> bool:
     if value["status"] == "complete":
         return complete
     return value["unknown_reason"] in _SCRATCH_RESOURCE_UNKNOWN_REASONS
+
+
+def valid_scratch_allocation_sample(value: Any) -> bool:
+    """Validate one closed aggregate-only restore allocation observation."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "phase", "status", "unknown_reason", "sample_unix_ns",
+        "sample_offset_ms", "guard_available_bytes", "guard_sample_lag_ms",
+        "mount", "host", "tree",
+    }:
+        return False
+    if (
+        type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or type(value.get("phase")) is not str
+        or value["phase"] not in _SCRATCH_ALLOCATION_PHASES | _SCRATCH_ALLOCATION_OPTIONAL_PHASES
+        or type(value.get("status")) is not str
+        or value["status"] not in {"complete", "unknown"}
+        or type(value.get("sample_unix_ns")) is not int
+        or not 0 <= value["sample_unix_ns"] <= (1 << 63) - 1
+    ):
+        return False
+    reason = value.get("unknown_reason")
+    if reason is not None and (type(reason) is not str or reason not in _SCRATCH_ALLOCATION_UNKNOWN_REASONS):
+        return False
+    for key, upper in (
+        ("sample_offset_ms", SCRATCH_PHASE_OFFSET_MAX_MS),
+        ("guard_available_bytes", SCRATCH_MEMORY_ADMISSION_BYTES - 1),
+        ("guard_sample_lag_ms", 60_000),
+    ):
+        item = value.get(key)
+        if item is not None and (type(item) is not int or not 0 <= item <= upper):
+            return False
+    mount = value.get("mount")
+    if not isinstance(mount, dict) or set(mount) != {
+        "dev", "ino", "mount_id", "total_bytes", "used_bytes", "free_bytes",
+    }:
+        return False
+    for key, upper in (
+        ("dev", (1 << 63) - 1), ("ino", (1 << 63) - 1),
+        ("mount_id", (1 << 31) - 1),
+        ("total_bytes", 1 << 60), ("used_bytes", 1 << 60), ("free_bytes", 1 << 60),
+    ):
+        item = mount.get(key)
+        if item is not None and (type(item) is not int or not 0 <= item <= upper):
+            return False
+    if (
+        mount.get("used_bytes") is not None
+        and mount.get("free_bytes") is not None
+        and mount["used_bytes"] + mount["free_bytes"] != mount.get("total_bytes")
+    ):
+        return False
+    host = value.get("host")
+    if not isinstance(host, dict) or set(host) != {
+        "mem_available_bytes", "rss_bytes", "memory_current_bytes", "anon_bytes",
+        "file_bytes", "shmem_bytes",
+    }:
+        return False
+    for item in host.values():
+        if item is not None and (type(item) is not int or not 0 <= item <= (1 << 60)):
+            return False
+    tree = value.get("tree")
+    if not isinstance(tree, dict) or set(tree) != {"data", "base", "pg_wal"}:
+        return False
+    for counters in tree.values():
+        if counters is not None and (
+            not isinstance(counters, list)
+            or len(counters) != 4
+            or any(type(item) is not int or not 0 <= item <= (1 << 60) for item in counters[:2])
+            or any(type(item) is not int or not 0 <= item <= SCRATCH_ALLOCATION_ENTRY_MAX for item in counters[2:])
+        ):
+            return False
+    if value["status"] == "complete":
+        return (
+            reason is None
+            and all(type(mount.get(key)) is int for key in mount)
+            and all(type(host.get(key)) is int for key in host)
+            and all(isinstance(tree.get(key), list) for key in ("data", "base", "pg_wal"))
+        )
+    return type(reason) is str
+
+
+def valid_scratch_allocation_attribution(value: Any) -> bool:
+    """Validate the bounded private restore sample series."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "status", "unknown_reason", "archive_size_bytes", "archive_sha256", "samples",
+    }:
+        return False
+    if (
+        type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or type(value.get("status")) is not str
+        or value["status"] not in {"complete", "partial", "unknown"}
+        or type(value.get("archive_size_bytes")) is not int
+        or not 0 < value["archive_size_bytes"] <= (1 << 60)
+        or type(value.get("archive_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["archive_sha256"]) is None
+    ):
+        return False
+    reason = value.get("unknown_reason")
+    if reason is not None and (type(reason) is not str or reason not in _SCRATCH_ALLOCATION_UNKNOWN_REASONS):
+        return False
+    samples = value.get("samples")
+    if not isinstance(samples, list) or len(samples) > SCRATCH_ALLOCATION_MAX_SAMPLES:
+        return False
+    phases: list[str] = []
+    phase_order = {
+        "initdb_end": 0,
+        "postgres_start_end": 1,
+        "restore_platform_start": 2,
+        "restore_platform_end": 3,
+        "worker_failure": 4,
+        "parent_last_guard": 5,
+    }
+    previous_phase = -1
+    for sample in samples:
+        if (
+            not valid_scratch_allocation_sample(sample)
+            or sample["phase"] in phases
+            or phase_order[sample["phase"]] <= previous_phase
+        ):
+            return False
+        phases.append(sample["phase"])
+        previous_phase = phase_order[sample["phase"]]
+    all_complete = all(sample["status"] == "complete" for sample in samples)
+    if value["status"] == "complete":
+        valid = (
+            all_complete
+            and reason is None
+            and set(phases) == set(_SCRATCH_ALLOCATION_PHASES)
+        )
+    elif value["status"] == "partial":
+        valid = bool(samples) and reason is not None
+    else:
+        valid = not samples and reason is not None
+    if not valid:
+        return False
+    try:
+        encoded = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("ascii")
+    except (TypeError, ValueError, UnicodeError):
+        return False
+    return len(encoded) <= SCRATCH_ALLOCATION_ATTRIBUTION_MAX_BYTES
 
 
 def valid_scratch_cleanup_status(value: Any) -> bool:
@@ -3063,7 +3239,7 @@ def _scratch_prepare_postgres_directory(
 
 
 def _scratch_proc_status_sample(pid: int) -> tuple[int, int, int] | None:
-    """Return (pid, ppid, VmRSS bytes) for a bounded, stable root process sample."""
+    """Return (pid, ppid, VmRSS bytes) for a bounded, stable process sample."""
     if type(pid) is not int or pid <= 1:
         return None
     status_path = pathlib.Path(f"/proc/{pid}/status")
@@ -3079,6 +3255,35 @@ def _scratch_proc_status_sample(pid: int) -> tuple[int, int, int] | None:
         expected_exe = pathlib.Path("/proc/self/exe").stat()
         sampled_exe = exe_path.stat()
         if (sampled_exe.st_dev, sampled_exe.st_ino) != (expected_exe.st_dev, expected_exe.st_ino):
+            return None
+        with status_path.open("rb") as status_file:
+            raw_after = status_file.read(SCRATCH_PROC_STATUS_MAX_BYTES + 1)
+        if len(raw_after) > SCRATCH_PROC_STATUS_MAX_BYTES:
+            return None
+        parsed_after = _parse_scratch_proc_status(raw_after)
+        if parsed_after is None or parsed_before[:2] != parsed_after[:2]:
+            return None
+        return parsed_before
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def _scratch_proc_status_observation(
+    pid: int, *, require_helper_executable: bool = True
+) -> tuple[int, int, int] | None:
+    """Read stable status using the established parser, optionally without exe lookup."""
+    if require_helper_executable:
+        return _scratch_proc_status_sample(pid)
+    if type(pid) is not int or pid <= 1:
+        return None
+    status_path = pathlib.Path(f"/proc/{pid}/status")
+    try:
+        with status_path.open("rb") as status_file:
+            raw_before = status_file.read(SCRATCH_PROC_STATUS_MAX_BYTES + 1)
+        if len(raw_before) > SCRATCH_PROC_STATUS_MAX_BYTES:
+            return None
+        parsed_before = _parse_scratch_proc_status(raw_before)
+        if parsed_before is None or parsed_before[0] != pid:
             return None
         with status_path.open("rb") as status_file:
             raw_after = status_file.read(SCRATCH_PROC_STATUS_MAX_BYTES + 1)
@@ -3205,6 +3410,106 @@ def _scratch_unknown_resource_attribution(
     }
 
 
+def _scratch_private_cgroup_values(
+    pid_text: str, control_group: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read one identity-joined v2 cgroup snapshot for existing private diagnostics."""
+    if (
+        not re.fullmatch(r"[1-9][0-9]{0,9}", pid_text)
+        or not re.fullmatch(
+            r"/system\.slice/oldsparky-backup-restore-[0-9a-f]{24}\.service",
+            control_group,
+        )
+    ):
+        return None, "identity_drift"
+    membership_before = _scratch_private_proc_file(pid_text, "cgroup")
+    if membership_before is None:
+        return None, "sample_unavailable"
+    try:
+        if not any(
+            row.split(":", 2) == ["0", "", control_group]
+            for row in membership_before.decode("ascii").splitlines()
+        ):
+            return None, "identity_drift"
+    except UnicodeError:
+        return None, "parse_invalid"
+
+    root_fd = system_slice_fd = cgroup_fd = -1
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        root_fd = os.open("/sys/fs/cgroup", flags)
+        root_before = os.fstat(root_fd)
+        system_slice_fd = os.open("system.slice", flags, dir_fd=root_fd)
+        system_slice_before = os.fstat(system_slice_fd)
+        leaf_name = control_group.removeprefix("/system.slice/")
+        if "/" in leaf_name:
+            return None, "identity_drift"
+        cgroup_fd = os.open(leaf_name, flags, dir_fd=system_slice_fd)
+        cgroup_before = os.fstat(cgroup_fd)
+        current = _scratch_private_counter(
+            _scratch_private_cgroup_file(cgroup_fd, "memory.current")
+        )
+        stat_values = _scratch_private_key_values(
+            _scratch_private_cgroup_file(cgroup_fd, "memory.stat"),
+            {"anon", "file", "shmem"},
+        )
+        event_values = _scratch_private_key_values(
+            _scratch_private_cgroup_file(cgroup_fd, "memory.events"),
+            {"high", "max", "oom", "oom_kill"},
+        )
+        if current is None or stat_values is None or event_values is None:
+            return None, "parse_invalid"
+        cgroup_after = os.fstat(cgroup_fd)
+        system_slice_after = os.fstat(system_slice_fd)
+        root_after = os.fstat(root_fd)
+        system_slice_named = os.stat(
+            "system.slice", dir_fd=root_fd, follow_symlinks=False
+        )
+        cgroup_named = os.stat(
+            leaf_name, dir_fd=system_slice_fd, follow_symlinks=False
+        )
+        membership_after = _scratch_private_proc_file(pid_text, "cgroup")
+        if membership_after is None:
+            return None, "sample_unavailable"
+        try:
+            still_member = any(
+                row.split(":", 2) == ["0", "", control_group]
+                for row in membership_after.decode("ascii").splitlines()
+            )
+        except UnicodeError:
+            return None, "parse_invalid"
+        if (
+            not still_member
+            or (root_before.st_dev, root_before.st_ino)
+            != (root_after.st_dev, root_after.st_ino)
+            or (system_slice_before.st_dev, system_slice_before.st_ino)
+            != (system_slice_after.st_dev, system_slice_after.st_ino)
+            or (system_slice_before.st_dev, system_slice_before.st_ino)
+            != (system_slice_named.st_dev, system_slice_named.st_ino)
+            or (cgroup_before.st_dev, cgroup_before.st_ino)
+            != (cgroup_after.st_dev, cgroup_after.st_ino)
+            or (cgroup_before.st_dev, cgroup_before.st_ino)
+            != (cgroup_named.st_dev, cgroup_named.st_ino)
+        ):
+            return None, "identity_drift"
+        return {
+            "memory_current_bytes": current,
+            "anon_bytes": stat_values["anon"],
+            "file_bytes": stat_values["file"],
+            "shmem_bytes": stat_values["shmem"],
+            "events": event_values,
+        }, None
+    except (OSError, ValueError, UnicodeError, RuntimeError):
+        return None, "sample_unavailable"
+    finally:
+        for descriptor in (cgroup_fd, system_slice_fd, root_fd):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
 def _scratch_private_resource_attribution(
     *,
     snapshot: dict[str, Any] | None,
@@ -3260,99 +3565,31 @@ def _scratch_private_resource_attribution(
         worker_start_before = _scratch_process_start_time(worker_pid_text)
         worker_sample = _scratch_proc_status_sample(int(worker_pid_text))
         worker_start_after = _scratch_process_start_time(worker_pid_text)
-        worker_cgroup_before_raw = _scratch_private_proc_file(worker_pid_text, "cgroup")
-        if worker_cgroup_before_raw is None:
-            return unknown("sample_unavailable")
-        worker_cgroup_before = worker_cgroup_before_raw.decode("ascii")
-        worker_membership_before = any(
-            row.split(":", 2) == ["0", "", control_group]
-            for row in worker_cgroup_before.splitlines()
-        )
         if (
             not controller_bound
             or worker_start_before != worker_start_time
             or worker_start_after != worker_start_time
             or worker_sample is None
             or worker_sample[0] != int(worker_pid_text)
-            or not worker_membership_before
         ):
             return unknown("identity_drift")
     except (OSError, ValueError, UnicodeError, RuntimeError):
         return unknown("sample_unavailable")
 
-    root_fd = system_slice_fd = cgroup_fd = -1
+    cgroup_values, cgroup_reason = _scratch_private_cgroup_values(
+        worker_pid_text, control_group
+    )
+    if cgroup_values is None:
+        return unknown(cgroup_reason or "sample_unavailable")
     try:
-        root_fd = os.open(
-            "/sys/fs/cgroup",
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        )
-        root_before = os.fstat(root_fd)
-        system_slice_fd = os.open(
-            "system.slice",
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=root_fd,
-        )
-        system_slice_before = os.fstat(system_slice_fd)
-        leaf_name = control_group.removeprefix("/system.slice/")
-        if "/" in leaf_name or not re.fullmatch(
-            r"oldsparky-backup-restore-[0-9a-f]{24}\.service", leaf_name
-        ):
-            return unknown("identity_drift")
-        cgroup_fd = os.open(
-            leaf_name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=system_slice_fd,
-        )
-        cgroup_before = os.fstat(cgroup_fd)
-        current = _scratch_private_counter(_scratch_private_cgroup_file(cgroup_fd, "memory.current"))
-        stat_values = _scratch_private_key_values(
-            _scratch_private_cgroup_file(cgroup_fd, "memory.stat"),
-            {"anon", "file", "shmem"},
-        )
-        event_values = _scratch_private_key_values(
-            _scratch_private_cgroup_file(cgroup_fd, "memory.events"),
-            {"high", "max", "oom", "oom_kill"},
-        )
-        if current is None or stat_values is None or event_values is None:
-            return unknown("parse_invalid")
-        cgroup_after = os.fstat(cgroup_fd)
-        system_slice_after = os.fstat(system_slice_fd)
-        root_after = os.fstat(root_fd)
-        system_slice_named = os.stat("system.slice", dir_fd=root_fd, follow_symlinks=False)
-        cgroup_named = os.stat(leaf_name, dir_fd=system_slice_fd, follow_symlinks=False)
-        worker_cgroup_after_raw = _scratch_private_proc_file(worker_pid_text, "cgroup")
-        if worker_cgroup_after_raw is None:
-            return unknown("sample_unavailable")
-        worker_cgroup_after = worker_cgroup_after_raw.decode("ascii")
-        worker_membership_after = any(
-            row.split(":", 2) == ["0", "", control_group]
-            for row in worker_cgroup_after.splitlines()
-        )
         if (
             _scratch_process_start_time(worker_pid_text) != worker_start_time
-            or not worker_membership_after
             or _scratch_process_start_time(str(controller_pid)) != controller_start_before
             or os.getpid() != controller_pid
-            or (root_before.st_dev, root_before.st_ino) != (root_after.st_dev, root_after.st_ino)
-            or (system_slice_before.st_dev, system_slice_before.st_ino)
-            != (system_slice_after.st_dev, system_slice_after.st_ino)
-            or (system_slice_before.st_dev, system_slice_before.st_ino)
-            != (system_slice_named.st_dev, system_slice_named.st_ino)
-            or (cgroup_before.st_dev, cgroup_before.st_ino)
-            != (cgroup_after.st_dev, cgroup_after.st_ino)
-            or (cgroup_before.st_dev, cgroup_before.st_ino)
-            != (cgroup_named.st_dev, cgroup_named.st_ino)
         ):
             return unknown("identity_drift")
     except (OSError, ValueError, UnicodeError, RuntimeError):
         return unknown("sample_unavailable")
-    finally:
-        for descriptor in (cgroup_fd, system_slice_fd, root_fd):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
 
     finished_ns = time.monotonic_ns()
     offset_ms = (finished_ns - launch_monotonic_ns) // 1_000_000
@@ -3365,16 +3602,11 @@ def _scratch_private_resource_attribution(
         "worker": {"identity_bound": True, "rss_bytes": worker_sample[2]},
         "cgroup": {
             "identity_bound": True,
-            "memory_current_bytes": current,
-            "anon_bytes": stat_values["anon"],
-            "file_bytes": stat_values["file"],
-            "shmem_bytes": stat_values["shmem"],
-            "events": {
-                "high": event_values["high"],
-                "max": event_values["max"],
-                "oom": event_values["oom"],
-                "oom_kill": event_values["oom_kill"],
-            },
+            "memory_current_bytes": cgroup_values["memory_current_bytes"],
+            "anon_bytes": cgroup_values["anon_bytes"],
+            "file_bytes": cgroup_values["file_bytes"],
+            "shmem_bytes": cgroup_values["shmem_bytes"],
+            "events": cgroup_values["events"],
         },
     }
     if not valid_scratch_resource_attribution(result):
@@ -3383,6 +3615,843 @@ def _scratch_private_resource_attribution(
     if len(encoded) > SCRATCH_RESOURCE_ATTRIBUTION_MAX_BYTES:
         return unknown("cap_exceeded")
     return result
+
+
+class _ScratchAllocationReadError(RuntimeError):
+    def __init__(
+        self, reason: str, *, partial_tree: dict[str, list[int] | None] | None = None
+    ) -> None:
+        self.reason = reason if reason in _SCRATCH_ALLOCATION_UNKNOWN_REASONS else "internal_error"
+        self.partial_tree = partial_tree
+        super().__init__(self.reason)
+
+
+def _scratch_allocation_read_fd(descriptor: int, cap: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) <= cap:
+        block = os.read(descriptor, min(8192, cap + 1 - len(chunks)))
+        if not block:
+            break
+        chunks.extend(block)
+    if len(chunks) > cap:
+        raise _ScratchAllocationReadError("entry_cap")
+    return bytes(chunks)
+
+
+def _scratch_allocation_mount_row(raw: bytes, target: str) -> tuple[int, int, int] | None:
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeError:
+        return None
+    found: list[tuple[int, int, int]] = []
+    for line in lines:
+        left, separator, right = line.partition(" - ")
+        fields = left.split()
+        post = right.split()
+        if not separator or len(fields) < 6 or len(post) < 3:
+            continue
+        mountpoint = re.sub(
+            r"\\([0-7]{3})",
+            lambda match: chr(int(match.group(1), 8)),
+            fields[4],
+        )
+        if mountpoint != target:
+            continue
+        device = fields[2].split(":", 1)
+        if (
+            len(device) != 2
+            or not device[0].isdecimal()
+            or not device[1].isdecimal()
+            or fields[3] != "/"
+            or post[0] != "tmpfs"
+            or "rw" not in fields[5].split(",")
+            or not fields[0].isdecimal()
+        ):
+            return None
+        found.append((int(fields[0]), int(device[0]), int(device[1])))
+    return found[0] if len(found) == 1 else None
+
+
+def _scratch_allocation_tree(root_fd: int, root_dev: int, deadline: float) -> dict[str, list[int]]:
+    """Aggregate PGDATA, base and pg_wal with a best-effort metadata-only walk.
+
+    The unique-node bound includes the PGDATA root itself. File sizes and
+    directory membership are observations over the scan interval; ordinary
+    PostgreSQL writes do not count as identity drift. Deadline checks happen
+    between filesystem calls and cannot interrupt a blocking kernel call.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    data_fd = os.open("data", flags, dir_fd=root_fd)
+    open_fds = {data_fd}
+    counters = {
+        name: [0, 0, 0, 0]
+        for name in ("data", "base", "pg_wal")
+    }
+    seen = {"base": False, "pg_wal": False}
+    visited_nodes = 1
+
+    def identity(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_uid,
+            info.st_gid, stat.S_IMODE(info.st_mode),
+        )
+
+    def add_file(buckets: frozenset[str], info: os.stat_result) -> None:
+        for bucket in buckets:
+            row = counters[bucket]
+            row[0] += info.st_size
+            row[1] += info.st_blocks * 512
+            row[2] += 1
+
+    try:
+        root_info = os.fstat(data_fd)
+        root_named = os.stat("data", dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_dev != root_dev
+            or identity(root_info) != identity(root_named)
+        ):
+            raise _ScratchAllocationReadError("identity_drift")
+        counters["data"][3] = 1
+        if visited_nodes > SCRATCH_ALLOCATION_ENTRY_MAX:
+            raise _ScratchAllocationReadError("entry_cap")
+
+        def walk(directory_fd: int, depth: int, buckets: frozenset[str]) -> None:
+            nonlocal visited_nodes
+            if time.monotonic() >= deadline:
+                raise _ScratchAllocationReadError("deadline")
+            before = os.fstat(directory_fd)
+            try:
+                with os.scandir(directory_fd) as entries:
+                    for entry in entries:
+                        if time.monotonic() >= deadline:
+                            raise _ScratchAllocationReadError("deadline")
+                        if visited_nodes >= SCRATCH_ALLOCATION_ENTRY_MAX:
+                            raise _ScratchAllocationReadError("entry_cap")
+                        visited_nodes += 1
+                        name = entry.name
+                        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if info.st_dev != root_dev:
+                            raise _ScratchAllocationReadError("mount_identity")
+                        if stat.S_ISREG(info.st_mode):
+                            file_fd = os.open(
+                                name,
+                                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                dir_fd=directory_fd,
+                            )
+                            try:
+                                opened_info = os.fstat(file_fd)
+                                named_info = os.stat(
+                                    name, dir_fd=directory_fd, follow_symlinks=False
+                                )
+                                if (
+                                    identity(info) != identity(opened_info)
+                                    or identity(info) != identity(named_info)
+                                ):
+                                    raise _ScratchAllocationReadError("identity_drift")
+                                add_file(buckets, opened_info)
+                            finally:
+                                os.close(file_fd)
+                            continue
+                        if not stat.S_ISDIR(info.st_mode):
+                            raise _ScratchAllocationReadError("unsupported_entry")
+                        child_depth = depth + 1
+                        if child_depth > SCRATCH_ALLOCATION_DEPTH_MAX:
+                            raise _ScratchAllocationReadError("depth_cap")
+                        child_fd = os.open(name, flags, dir_fd=directory_fd)
+                        open_fds.add(child_fd)
+                        try:
+                            child_info = os.fstat(child_fd)
+                            named_info = os.stat(
+                                name, dir_fd=directory_fd, follow_symlinks=False
+                            )
+                            if (
+                                identity(info) != identity(child_info)
+                                or identity(info) != identity(named_info)
+                            ):
+                                raise _ScratchAllocationReadError("identity_drift")
+                            child_buckets = buckets
+                            if depth == 0 and name in {"base", "pg_wal"}:
+                                child_buckets = frozenset((*buckets, name))
+                                seen[name] = True
+                            for bucket in child_buckets:
+                                counters[bucket][3] += 1
+                            walk(child_fd, child_depth, child_buckets)
+                        finally:
+                            os.close(child_fd)
+                            open_fds.discard(child_fd)
+                after = os.fstat(directory_fd)
+                named_after = os.stat(
+                    ".", dir_fd=directory_fd, follow_symlinks=False
+                )
+                if identity(before) != identity(after) or identity(after) != identity(named_after):
+                    raise _ScratchAllocationReadError("identity_drift")
+            except _ScratchAllocationReadError:
+                raise
+            except (OSError, ValueError, UnicodeError):
+                raise _ScratchAllocationReadError("read_error") from None
+
+        walk(data_fd, 0, frozenset({"data"}))
+        if not all(seen.values()):
+            raise _ScratchAllocationReadError("read_error")
+        if any(
+            item > (1 << 60)
+            for row in counters.values()
+            for item in row[:2]
+        ):
+            raise _ScratchAllocationReadError("entry_cap")
+        return counters
+    except _ScratchAllocationReadError as exc:
+        if exc.partial_tree is None:
+            exc.partial_tree = {
+                name: (
+                    list(counters[name])
+                    if name == "data" or seen[name]
+                    else None
+                )
+                for name in counters
+            }
+        raise
+    except (OSError, ValueError, UnicodeError):
+        raise _ScratchAllocationReadError("read_error") from None
+    finally:
+        for descriptor in open_fds:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _scratch_allocation_host_values(
+    pid_text: str, control_group: str
+) -> tuple[dict[str, int | None], bool]:
+    values: dict[str, int | None] = {
+        "mem_available_bytes": None,
+        "rss_bytes": None,
+        "memory_current_bytes": None,
+        "anon_bytes": None,
+        "file_bytes": None,
+        "shmem_bytes": None,
+    }
+    try:
+        start_before = _scratch_process_start_time(pid_text)
+        namespace_before = os.stat(f"/proc/{pid_text}/ns/mnt")
+        parsed = _scratch_proc_status_observation(
+            int(pid_text), require_helper_executable=False
+        )
+        cgroup, _cgroup_reason = _scratch_private_cgroup_values(
+            pid_text, control_group
+        )
+        values["mem_available_bytes"] = _scratch_mem_available_bytes()
+        if parsed is not None and parsed[0] == int(pid_text):
+            values["rss_bytes"] = parsed[2]
+        if cgroup is not None:
+            values["memory_current_bytes"] = cgroup["memory_current_bytes"]
+            values["anon_bytes"] = cgroup["anon_bytes"]
+            values["file_bytes"] = cgroup["file_bytes"]
+            values["shmem_bytes"] = cgroup["shmem_bytes"]
+        namespace_after = os.stat(f"/proc/{pid_text}/ns/mnt")
+        start_after = _scratch_process_start_time(pid_text)
+        membership_after = _scratch_private_proc_file(pid_text, "cgroup")
+        if membership_after is None or not any(
+            row.split(":", 2) == ["0", "", control_group]
+            for row in membership_after.decode("ascii").splitlines()
+        ):
+            return values, False
+        stable = (
+            start_before == start_after
+            and (namespace_before.st_dev, namespace_before.st_ino)
+            == (namespace_after.st_dev, namespace_after.st_ino)
+            and parsed is not None
+            and cgroup is not None
+        )
+        return values, stable
+    except (OSError, ValueError, UnicodeError, RuntimeError, _ScratchAllocationReadError):
+        return values, False
+
+
+def _scratch_allocation_empty_tree() -> dict[str, list[int] | None]:
+    return {name: None for name in ("data", "base", "pg_wal")}
+
+
+def _scratch_allocation_sample_from_root_fd(
+    root_fd: int,
+    *,
+    mount_id: int,
+    phase: str,
+    pid_text: str,
+    control_group: str,
+    launch_monotonic_ns: int | None,
+    guard_available_bytes: int | None = None,
+    guard_monotonic_ns: int | None = None,
+    operation_deadline: float | None = None,
+    host_observation: dict[str, int | None] | None = None,
+    host_identity_bound: bool | None = None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    deadline = started + SCRATCH_ALLOCATION_SAMPLE_BUDGET_SECONDS
+    if operation_deadline is not None:
+        deadline = min(deadline, operation_deadline)
+    sampled_unix_ns = time.time_ns()
+    offset_ms = None
+    if type(launch_monotonic_ns) is int and launch_monotonic_ns <= time.monotonic_ns():
+        offset_ms = (time.monotonic_ns() - launch_monotonic_ns) // 1_000_000
+    guard_lag_ms = None
+    if type(guard_monotonic_ns) is int:
+        guard_lag_ms = max(0, (time.monotonic_ns() - guard_monotonic_ns) // 1_000_000)
+    root_before = os.fstat(root_fd)
+    mount: dict[str, int | None] = {
+        "dev": root_before.st_dev,
+        "ino": root_before.st_ino,
+        "mount_id": mount_id,
+        "total_bytes": None,
+        "used_bytes": None,
+        "free_bytes": None,
+    }
+    if host_observation is None:
+        host, host_stable = _scratch_allocation_host_values(pid_text, control_group)
+    else:
+        host = dict(host_observation)
+        host_stable = host_identity_bound is True
+    tree = _scratch_allocation_empty_tree()
+    reason: str | None = None
+    try:
+        statvfs = os.fstatvfs(root_fd)
+        total = statvfs.f_blocks * statvfs.f_frsize
+        free = statvfs.f_bavail * statvfs.f_frsize
+        if total <= 0 or not 0 <= free <= total:
+            raise _ScratchAllocationReadError("mount_identity")
+        mount.update({"total_bytes": total, "used_bytes": total - free, "free_bytes": free})
+        if time.monotonic() >= deadline:
+            raise _ScratchAllocationReadError("deadline")
+        try:
+            tree = _scratch_allocation_tree(root_fd, root_before.st_dev, deadline)
+        except _ScratchAllocationReadError as exc:
+            tree = exc.partial_tree or _scratch_allocation_empty_tree()
+            raise
+        if time.monotonic() >= deadline:
+            raise _ScratchAllocationReadError("deadline")
+        root_after = os.fstat(root_fd)
+        def root_identity(info: os.stat_result) -> tuple[int, ...]:
+            return (
+                info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_uid,
+                info.st_gid, stat.S_IMODE(info.st_mode),
+            )
+        if root_identity(root_before) != root_identity(root_after):
+            raise _ScratchAllocationReadError("identity_drift")
+    except _ScratchAllocationReadError as exc:
+        reason = exc.reason
+        if exc.partial_tree is not None:
+            tree = exc.partial_tree
+    except (OSError, ValueError, OverflowError):
+        reason = "read_error"
+        tree = _scratch_allocation_empty_tree()
+    if not host_stable and reason is None:
+        reason = "identity_drift"
+    if any(value is None for value in host.values()) and reason is None:
+        reason = "sample_unavailable"
+    sample = {
+        "schema": 1,
+        "phase": phase,
+        "status": "complete" if reason is None else "unknown",
+        "unknown_reason": reason,
+        "sample_unix_ns": sampled_unix_ns,
+        "sample_offset_ms": offset_ms,
+        "guard_available_bytes": guard_available_bytes,
+        "guard_sample_lag_ms": guard_lag_ms,
+        "mount": mount,
+        "host": host,
+        "tree": tree,
+    }
+    if not valid_scratch_allocation_sample(sample):
+        sample.update(
+            status="unknown",
+            unknown_reason="internal_error",
+            tree=_scratch_allocation_empty_tree(),
+        )
+    return sample
+
+
+def _scratch_allocation_proc_bytes(pid_text: str, name: str, cap: int) -> bytes:
+    if (
+        not re.fullmatch(r"[1-9][0-9]{0,9}", pid_text)
+        or name not in {"mountinfo"}
+        or type(cap) is not int
+        or not 1 <= cap <= 4 * 1024 * 1024
+    ):
+        raise _ScratchAllocationReadError("identity_drift")
+    descriptor = os.open(
+        f"/proc/{pid_text}/{name}", os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    try:
+        return _scratch_allocation_read_fd(descriptor, cap)
+    finally:
+        os.close(descriptor)
+
+
+def _scratch_allocation_parent_last_guard(
+    *,
+    mountpoint: pathlib.Path,
+    worker_identity: tuple[str, str, str] | None,
+    control_group: str | None,
+    launch_monotonic_ns: int | None,
+    guard_diagnostic: dict[str, Any],
+    resource_attribution: dict[str, Any] | None,
+    operation_deadline: float,
+    guard_monotonic_ns: int,
+) -> dict[str, Any]:
+    """Best-effort root-view sample pinned to the active worker, never a guard."""
+    now = time.monotonic()
+    default_host: dict[str, int | None] = {
+        "mem_available_bytes": guard_diagnostic.get("available_bytes"),
+        "rss_bytes": None,
+        "memory_current_bytes": None,
+        "anon_bytes": None,
+        "file_bytes": None,
+        "shmem_bytes": None,
+    }
+    resource_bound = (
+        isinstance(resource_attribution, dict)
+        and valid_scratch_resource_attribution(resource_attribution)
+        and resource_attribution.get("status") == "complete"
+    )
+    if resource_bound:
+        default_host["rss_bytes"] = resource_attribution["worker"]["rss_bytes"]
+        for key in ("memory_current_bytes", "anon_bytes", "file_bytes", "shmem_bytes"):
+            default_host[key] = resource_attribution["cgroup"][key]
+
+    def unknown(reason: str) -> dict[str, Any]:
+        now_ns = time.monotonic_ns()
+        return {
+            "schema": 1,
+            "phase": "parent_last_guard",
+            "status": "unknown",
+            "unknown_reason": reason,
+            "sample_unix_ns": time.time_ns(),
+            "sample_offset_ms": (
+                (now_ns - launch_monotonic_ns) // 1_000_000
+                if type(launch_monotonic_ns) is int and launch_monotonic_ns <= now_ns
+                else None
+            ),
+            "guard_available_bytes": guard_diagnostic.get("available_bytes"),
+            "guard_sample_lag_ms": max(0, (now_ns - guard_monotonic_ns) // 1_000_000),
+            "mount": {key: None for key in ("dev", "ino", "mount_id", "total_bytes", "used_bytes", "free_bytes")},
+            "host": default_host,
+            "tree": _scratch_allocation_empty_tree(),
+        }
+
+    if now >= operation_deadline:
+        return unknown("deadline")
+    if (
+        not isinstance(worker_identity, tuple)
+        or len(worker_identity) != 3
+        or control_group is None
+        or guard_diagnostic.get("guard_site") != "parent_active_poll"
+        or re.fullmatch(r"/run/oldsparky-backup-restore-[0-9a-f]{24}", str(mountpoint)) is None
+    ):
+        return unknown("identity_drift")
+    pid_text, invocation_id, expected_start = worker_identity
+    if (
+        not re.fullmatch(r"[1-9][0-9]{0,9}", pid_text)
+        or not re.fullmatch(r"[0-9a-f]{32}", invocation_id)
+        or not re.fullmatch(r"[0-9]+", expected_start)
+        or not re.fullmatch(
+            r"/system\.slice/oldsparky-backup-restore-[0-9a-f]{24}\.service",
+            control_group,
+        )
+    ):
+        return unknown("identity_drift")
+
+    proc_root_fd = root_fd = -1
+    try:
+        start_before = _scratch_process_start_time(pid_text)
+        status_before = _scratch_proc_status_observation(
+            int(pid_text), require_helper_executable=False
+        )
+        namespace_before = os.stat(f"/proc/{pid_text}/ns/mnt")
+        membership_before = _scratch_private_proc_file(pid_text, "cgroup")
+        if (
+            start_before != expected_start
+            or status_before is None
+            or status_before[0] != int(pid_text)
+            or membership_before is None
+            or not any(
+                row.split(":", 2) == ["0", "", control_group]
+                for row in membership_before.decode("ascii").splitlines()
+            )
+        ):
+            return unknown("identity_drift")
+        proc_root_path = pathlib.Path(f"/proc/{pid_text}/root")
+        root_path_before = proc_root_path.stat()
+        proc_root_fd = os.open(
+            proc_root_path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        proc_root_before = os.fstat(proc_root_fd)
+        def root_identity(info: os.stat_result) -> tuple[int, ...]:
+            return (
+                info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_uid,
+                info.st_gid, stat.S_IMODE(info.st_mode),
+            )
+        if root_identity(root_path_before) != root_identity(proc_root_before):
+            return unknown("identity_drift")
+        if time.monotonic() >= operation_deadline:
+            return unknown("deadline")
+        relative = str(mountpoint).lstrip("/")
+        target_path_before = os.stat(relative, dir_fd=proc_root_fd, follow_symlinks=False)
+        root_fd = os.open(
+            relative,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=proc_root_fd,
+        )
+        target_opened = os.fstat(root_fd)
+        if root_identity(target_path_before) != root_identity(target_opened):
+            return unknown("identity_drift")
+        if time.monotonic() >= operation_deadline:
+            return unknown("deadline")
+        mountinfo = _scratch_allocation_proc_bytes(pid_text, "mountinfo", 4 * 1024 * 1024)
+        row = _scratch_allocation_mount_row(mountinfo, str(mountpoint))
+        if row is None or (os.major(target_opened.st_dev), os.minor(target_opened.st_dev)) != row[1:]:
+            return unknown("mount_identity")
+        if time.monotonic() >= operation_deadline:
+            return unknown("deadline")
+
+        host_bound = resource_bound and all(value is not None for value in default_host.values())
+        sample = _scratch_allocation_sample_from_root_fd(
+            root_fd,
+            mount_id=row[0],
+            phase="parent_last_guard",
+            pid_text=pid_text,
+            control_group=control_group,
+            launch_monotonic_ns=launch_monotonic_ns,
+            guard_available_bytes=guard_diagnostic.get("available_bytes"),
+            guard_monotonic_ns=guard_monotonic_ns,
+            operation_deadline=operation_deadline,
+            host_observation=default_host,
+            host_identity_bound=host_bound,
+        )
+        try:
+            mountinfo_after = _scratch_allocation_proc_bytes(
+                pid_text, "mountinfo", 4 * 1024 * 1024
+            )
+            row_after = _scratch_allocation_mount_row(
+                mountinfo_after, str(mountpoint)
+            )
+        except _ScratchAllocationReadError as exc:
+            sample.update(status="unknown", unknown_reason=exc.reason)
+            row_after = None
+        except (OSError, ValueError, UnicodeError, RuntimeError):
+            sample.update(status="unknown", unknown_reason="read_error")
+            row_after = None
+        if row_after != row:
+            sample.update(status="unknown", unknown_reason="mount_identity")
+        target_path_after = os.stat(relative, dir_fd=proc_root_fd, follow_symlinks=False)
+        target_opened_after = os.fstat(root_fd)
+        root_path_after = proc_root_path.stat()
+        proc_root_after = os.fstat(proc_root_fd)
+        namespace_after = os.stat(f"/proc/{pid_text}/ns/mnt")
+        membership_after = _scratch_private_proc_file(pid_text, "cgroup")
+        start_after = _scratch_process_start_time(pid_text)
+        status_after = _scratch_proc_status_observation(
+            int(pid_text), require_helper_executable=False
+        )
+        if (
+            root_identity(target_path_before) != root_identity(target_path_after)
+            or root_identity(target_opened) != root_identity(target_opened_after)
+            or root_identity(root_path_before) != root_identity(root_path_after)
+            or root_identity(proc_root_before) != root_identity(proc_root_after)
+            or (namespace_before.st_dev, namespace_before.st_ino)
+            != (namespace_after.st_dev, namespace_after.st_ino)
+            or start_after != expected_start
+            or status_after is None
+            or status_after[0] != int(pid_text)
+            or status_after[:2] != status_before[:2]
+            or membership_after is None
+            or not any(
+                row_text.split(":", 2) == ["0", "", control_group]
+                for row_text in membership_after.decode("ascii").splitlines()
+            )
+        ):
+            sample.update(status="unknown", unknown_reason="identity_drift")
+        return sample
+    except _ScratchAllocationReadError as exc:
+        return unknown(exc.reason)
+    except (OSError, ValueError, UnicodeError, RuntimeError, OverflowError):
+        return unknown("sample_unavailable")
+    finally:
+        for descriptor in (root_fd, proc_root_fd):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _scratch_allocation_worker_sample(
+    args: argparse.Namespace,
+    root: pathlib.Path,
+    phase: str,
+    *,
+    guard_available_bytes: int | None = None,
+) -> dict[str, Any]:
+    started_ns = time.monotonic_ns()
+    unknown = {
+        "schema": 1, "phase": phase, "status": "unknown", "unknown_reason": "sample_unavailable",
+        "sample_unix_ns": time.time_ns(), "sample_offset_ms": None,
+        "guard_available_bytes": guard_available_bytes, "guard_sample_lag_ms": None,
+        "mount": {key: None for key in ("dev", "ino", "mount_id", "total_bytes", "used_bytes", "free_bytes")},
+        "host": {key: None for key in ("mem_available_bytes", "rss_bytes", "memory_current_bytes", "anon_bytes", "file_bytes", "shmem_bytes")},
+        "tree": _scratch_allocation_empty_tree(),
+    }
+    fd = -1
+    try:
+        root_stat = os.stat(root, follow_symlinks=False)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        opened = os.fstat(fd)
+        def stable_identity(info: os.stat_result) -> tuple[int, ...]:
+            return (
+                info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_uid,
+                info.st_gid, stat.S_IMODE(info.st_mode),
+            )
+        if stable_identity(root_stat) != stable_identity(opened):
+            raise _ScratchAllocationReadError("identity_drift")
+        mountinfo_fd = os.open("/proc/self/mountinfo", os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            mountinfo = _scratch_allocation_read_fd(mountinfo_fd, 4 * 1024 * 1024)
+        finally:
+            os.close(mountinfo_fd)
+        row = _scratch_allocation_mount_row(mountinfo, str(root))
+        if row is None or (os.major(opened.st_dev), os.minor(opened.st_dev)) != row[1:]:
+            raise _ScratchAllocationReadError("mount_identity")
+        control_group_raw = _scratch_private_proc_file(str(os.getpid()), "cgroup")
+        if control_group_raw is None:
+            raise _ScratchAllocationReadError("sample_unavailable")
+        rows = [item.split(":", 2) for item in control_group_raw.decode("ascii").splitlines()]
+        current = next((item[2] for item in rows if len(item) == 3 and item[:2] == ["0", ""]), None)
+        if current is None:
+            raise _ScratchAllocationReadError("sample_unavailable")
+        sample = _scratch_allocation_sample_from_root_fd(
+            fd,
+            mount_id=row[0],
+            phase=phase,
+            pid_text=str(os.getpid()),
+            control_group=current,
+            launch_monotonic_ns=getattr(args, "_scratch_phase_origin_monotonic_ns", None),
+            guard_available_bytes=guard_available_bytes,
+            guard_monotonic_ns=started_ns if guard_available_bytes is not None else None,
+        )
+        try:
+            mountinfo_after_fd = os.open(
+                "/proc/self/mountinfo", os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            )
+            try:
+                mountinfo_after = _scratch_allocation_read_fd(
+                    mountinfo_after_fd, 4 * 1024 * 1024
+                )
+            finally:
+                os.close(mountinfo_after_fd)
+            row_after = _scratch_allocation_mount_row(mountinfo_after, str(root))
+        except _ScratchAllocationReadError as exc:
+            sample.update(status="unknown", unknown_reason=exc.reason)
+            row_after = None
+        except (OSError, ValueError, UnicodeError, RuntimeError):
+            sample.update(status="unknown", unknown_reason="read_error")
+            row_after = None
+        if row_after != row:
+            sample.update(status="unknown", unknown_reason="mount_identity")
+        named_after = os.stat(root, follow_symlinks=False)
+        opened_after = os.fstat(fd)
+        if stable_identity(root_stat) != stable_identity(named_after) or (
+            stable_identity(opened) != stable_identity(opened_after)
+        ):
+            sample.update(status="unknown", unknown_reason="identity_drift", tree=_scratch_allocation_empty_tree())
+        return sample
+    except _ScratchAllocationReadError as exc:
+        unknown["unknown_reason"] = exc.reason
+    except (OSError, ValueError, UnicodeError, RuntimeError):
+        unknown["unknown_reason"] = "sample_unavailable"
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return unknown
+
+
+def _scratch_emit_allocation_sample(
+    args: argparse.Namespace,
+    root: pathlib.Path,
+    phase: str,
+    *,
+    guard_available_bytes: int | None = None,
+) -> None:
+    if (
+        not getattr(args, "private_scratch_diagnostics", False)
+        or getattr(args, "_scratch_authorization_probe", False)
+        or phase not in _SCRATCH_ALLOCATION_PHASES | {"worker_failure"}
+    ):
+        return
+    try:
+        sample = _scratch_allocation_worker_sample(
+            args, root, phase, guard_available_bytes=guard_available_bytes
+        )
+        if not valid_scratch_allocation_sample(sample):
+            return
+        payload = json.dumps(sample, separators=(",", ":"), sort_keys=True).encode("ascii")
+        if len(payload) > SCRATCH_ALLOCATION_FRAME_MAX_BYTES:
+            return
+        stream = getattr(sys.stderr, "buffer", None)
+        if stream is None:
+            return
+        stream.write(SCRATCH_ALLOCATION_FRAME_MARKER + payload + b"\n")
+        stream.flush()
+    except BaseException:
+        # Optional attribution never alters restore or resource-guard behavior.
+        return
+
+
+def _scratch_unknown_allocation_attribution(
+    archive_size_bytes: int, archive_sha256: str, reason: str
+) -> dict[str, Any]:
+    if reason not in _SCRATCH_ALLOCATION_UNKNOWN_REASONS:
+        reason = "internal_error"
+    candidate = {
+        "schema": 1,
+        "status": "unknown",
+        "unknown_reason": reason,
+        "archive_size_bytes": archive_size_bytes,
+        "archive_sha256": archive_sha256,
+        "samples": [],
+    }
+    if not valid_scratch_allocation_attribution(candidate):
+        candidate.update(
+            archive_size_bytes=1,
+            archive_sha256="0" * 64,
+            unknown_reason="internal_error",
+        )
+    return candidate
+
+
+def _scratch_parse_allocation_attribution(
+    stderr: bytes,
+    *,
+    truncated: bool,
+    archive_size_bytes: int,
+    archive_sha256: str,
+    parent_sample: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Collect only bounded canonical worker frames and one parent observation."""
+    if (
+        type(stderr) is not bytes
+        or type(truncated) is not bool
+        or type(archive_size_bytes) is not int
+        or archive_size_bytes <= 0
+        or type(archive_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", archive_sha256) is None
+    ):
+        return _scratch_unknown_allocation_attribution(
+            max(1, archive_size_bytes if type(archive_size_bytes) is int else 1),
+            archive_sha256 if type(archive_sha256) is str and re.fullmatch(r"[0-9a-f]{64}", archive_sha256) else "0" * 64,
+            "malformed",
+        )
+    samples: list[dict[str, Any]] = []
+    parse_reason = "capture_prefix" if truncated else None
+    expected_order = {
+        "initdb_end": 0,
+        "postgres_start_end": 1,
+        "restore_platform_start": 2,
+        "restore_platform_end": 3,
+        "worker_failure": 4,
+    }
+    previous_phase = -1
+    seen: set[str] = set()
+    for line in stderr.splitlines(keepends=True):
+        if not line.startswith(SCRATCH_ALLOCATION_FRAME_MARKER):
+            continue
+        if not line.endswith(b"\n"):
+            parse_reason = parse_reason or "capture_prefix"
+            continue
+        payload = line[len(SCRATCH_ALLOCATION_FRAME_MARKER):-1]
+        if not payload or len(payload) > SCRATCH_ALLOCATION_FRAME_MAX_BYTES:
+            parse_reason = parse_reason or "malformed"
+            continue
+        try:
+            decoded = json.loads(
+                payload.decode("ascii"),
+                object_pairs_hook=_scratch_reject_duplicate_phase_keys,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            parse_reason = parse_reason or "malformed"
+            continue
+        if (
+            not isinstance(decoded, dict)
+            or not valid_scratch_allocation_sample(decoded)
+            or decoded["phase"] not in expected_order
+            or decoded["phase"] in seen
+            or expected_order[decoded["phase"]] <= previous_phase
+            or json.dumps(decoded, separators=(",", ":"), sort_keys=True).encode("ascii") != payload
+            or len(samples) >= SCRATCH_ALLOCATION_MAX_SAMPLES
+        ):
+            parse_reason = parse_reason or "malformed"
+            continue
+        previous_phase = expected_order[decoded["phase"]]
+        seen.add(decoded["phase"])
+        samples.append(decoded)
+    if parent_sample is not None:
+        if (
+            valid_scratch_allocation_sample(parent_sample)
+            and parent_sample.get("phase") == "parent_last_guard"
+            and len(samples) < SCRATCH_ALLOCATION_MAX_SAMPLES
+        ):
+            samples.append(parent_sample)
+        else:
+            parse_reason = parse_reason or "sample_unavailable"
+    samples_by_phase = [sample["phase"] for sample in samples]
+    all_lifecycle_phases = set(samples_by_phase) == set(_SCRATCH_ALLOCATION_PHASES)
+    all_complete = all(sample["status"] == "complete" for sample in samples)
+    if not samples:
+        return _scratch_unknown_allocation_attribution(
+            archive_size_bytes, archive_sha256, parse_reason or "capture_unavailable"
+        )
+    if (
+        all_lifecycle_phases
+        and all_complete
+        and parse_reason is None
+        and "worker_failure" not in samples_by_phase
+        and "parent_last_guard" not in samples_by_phase
+    ):
+        status = "complete"
+        reason = None
+    else:
+        status = "partial"
+        reason = parse_reason
+        if reason is None:
+            reason = next(
+                (sample["unknown_reason"] for sample in samples if sample["unknown_reason"] is not None),
+                "incomplete",
+            )
+    candidate = {
+        "schema": 1,
+        "status": status,
+        "unknown_reason": reason,
+        "archive_size_bytes": archive_size_bytes,
+        "archive_sha256": archive_sha256,
+        "samples": samples,
+    }
+    if not valid_scratch_allocation_attribution(candidate):
+        return _scratch_unknown_allocation_attribution(
+            archive_size_bytes, archive_sha256, "internal_error"
+        )
+    return candidate
+
+
+def _scratch_allocation_attribution_frame(value: Any) -> bytes | None:
+    if not valid_scratch_allocation_attribution(value):
+        return None
+    payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("ascii")
+    frame = SCRATCH_ALLOCATION_ATTRIBUTION_MARKER + payload + b"\n"
+    return frame if len(frame) <= SCRATCH_ALLOCATION_ATTRIBUTION_MAX_BYTES + len(SCRATCH_ALLOCATION_ATTRIBUTION_MARKER) + 1 else None
 
 
 def _parse_scratch_proc_status(raw: bytes) -> tuple[int, int, int] | None:
@@ -3774,6 +4843,10 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
 
     def phase_observer(phase: str, event: str) -> None:
         _scratch_emit_phase_boundary(args, phase, event)
+        if phase == "restore_platform" and event == "start":
+            _scratch_emit_allocation_sample(args, root, "restore_platform_start")
+        if phase == "restore_platform" and event == "end":
+            _scratch_emit_allocation_sample(args, root, "restore_platform_end")
 
     _scratch_run_observed_phase(
         phase_observer,
@@ -3791,6 +4864,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         _scratch_resource_guard(
             root, guard_site="worker_after_initdb_before_postgres_start"
         )
+        _scratch_emit_allocation_sample(args, root, "initdb_end")
         server_options = shlex.join(_scratch_postgres_start_options(socket_dir))
         args._scratch_fault_site = "worker_postgres_start"
         _scratch_run_observed_phase(
@@ -3805,6 +4879,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         started = True
         args._scratch_fault_site = "worker_after_postgres_start_guard"
         _scratch_resource_guard(root, guard_site="worker_after_postgres_start")
+        _scratch_emit_allocation_sample(args, root, "postgres_start_end")
         args._scratch_fault_site = "worker_role_setup"
         admin_target = DatabaseTarget(
             host=str(socket_dir),
@@ -3850,6 +4925,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
                 origin="worker",
                 site=getattr(args, "_scratch_fault_site", "worker_entry"),
             )
+            _scratch_emit_allocation_sample(args, root, "worker_failure")
         primary_error = exc
         if getattr(args, "private_scratch_diagnostics", False) and not hasattr(
             exc, "scratch_worker_private_output"
@@ -4745,6 +5821,17 @@ def _run_isolated_restore_drill(
                         and valid_scratch_host_guard_diagnostic(guard_diagnostic)
                         and guard_diagnostic.get("guard_site") == "parent_active_poll"
                     ):
+                        # Preserve the reserve refusal before any optional sample.
+                        _retain_first_scratch_fault(
+                            guard_error,
+                            origin="controller",
+                            site="controller_active_poll",
+                        )
+                    if (
+                        private_scratch_diagnostics
+                        and valid_scratch_host_guard_diagnostic(guard_diagnostic)
+                        and guard_diagnostic.get("guard_site") == "parent_active_poll"
+                    ):
                         # Freeze only bytes already available at this stop boundary.
                         # This read is nonblocking and completes before _scratch_stop_unit.
                         phase_guard_monotonic_ns = time.monotonic_ns()
@@ -4764,6 +5851,7 @@ def _run_isolated_restore_drill(
                         and valid_scratch_host_guard_diagnostic(guard_diagnostic)
                         and guard_diagnostic.get("guard_site") == "parent_active_poll"
                     ):
+                        resource_attribution: dict[str, Any] | None = None
                         try:
                             attribution = _scratch_private_resource_attribution(
                                 snapshot=active_snapshot,
@@ -4775,9 +5863,39 @@ def _run_isolated_restore_drill(
                             attribution = _scratch_unknown_resource_attribution("internal_error")
                         try:
                             if valid_scratch_resource_attribution(attribution):
+                                resource_attribution = attribution
                                 setattr(guard_error, "scratch_resource_attribution", attribution)
                         except BaseException:
                             # Optional evidence must never replace the reserve guard failure.
+                            pass
+                        try:
+                            assert phase_guard_monotonic_ns is not None
+                            assert archive_before is not None and archive_sha256 is not None
+                            guard_deadline = min(
+                                deadline,
+                                phase_guard_monotonic_ns / 1_000_000_000
+                                + SCRATCH_ALLOCATION_SAMPLE_BUDGET_SECONDS,
+                            )
+                            allocation_sample = _scratch_allocation_parent_last_guard(
+                                mountpoint=mountpoint,
+                                worker_identity=active_identity,
+                                control_group=active_control_group,
+                                launch_monotonic_ns=launch_monotonic_ns,
+                                guard_diagnostic=guard_diagnostic,
+                                resource_attribution=resource_attribution,
+                                operation_deadline=guard_deadline,
+                                guard_monotonic_ns=phase_guard_monotonic_ns,
+                            )
+                            if valid_scratch_allocation_sample(allocation_sample):
+                                setattr(
+                                    guard_error,
+                                    "scratch_parent_last_guard_sample",
+                                    allocation_sample,
+                                )
+                        except BaseException:
+                            # The monotonic budget is checked between syscalls; it
+                            # cannot interrupt a blocking kernel call. Sampling
+                            # remains best effort and cannot replace the guard.
                             pass
                     raise
                 fault_site = "controller_unit_snapshot"
@@ -5200,6 +6318,38 @@ def _run_isolated_restore_drill(
                             "scratch_unit_private_output",
                             (stdout_prefix, stderr_prefix),
                         )
+                    if (
+                        private_scratch_diagnostics
+                        and archive_before is not None
+                        and archive_sha256 is not None
+                    ):
+                        try:
+                            attribution = _scratch_parse_allocation_attribution(
+                                stderr_prefix,
+                                truncated=(
+                                    stderr_size > len(stderr_prefix)
+                                    or not drain_complete["stderr"]
+                                ),
+                                archive_size_bytes=archive_before.st_size,
+                                archive_sha256=archive_sha256,
+                                parent_sample=getattr(
+                                    operation_error,
+                                    "scratch_parent_last_guard_sample",
+                                    None,
+                                ),
+                            )
+                        except BaseException:
+                            attribution = _scratch_unknown_allocation_attribution(
+                                archive_before.st_size,
+                                archive_sha256,
+                                "internal_error",
+                            )
+                        if valid_scratch_allocation_attribution(attribution):
+                            setattr(
+                                operation_error,
+                                "scratch_allocation_attribution",
+                                attribution,
+                            )
                 except BaseException:
                     # Failure-only projection is secondary evidence. A broken
                     # drain/parser must not replace the first operation error;
@@ -5702,6 +6852,12 @@ def failure_report_for_exception(
     phase_attribution = getattr(exc, "scratch_phase_attribution", None)
     if private_scratch_diagnostics and valid_scratch_phase_attribution(phase_attribution):
         report["scratch_phase_attribution"] = phase_attribution
+    allocation_attribution = getattr(exc, "scratch_allocation_attribution", None)
+    if (
+        private_scratch_diagnostics
+        and valid_scratch_allocation_attribution(allocation_attribution)
+    ):
+        report["scratch_allocation_attribution"] = allocation_attribution
     cleanup_status = getattr(exc, "scratch_cleanup_status", None)
     if private_scratch_diagnostics and valid_scratch_cleanup_status(cleanup_status):
         report["scratch_cleanup_status"] = cleanup_status
@@ -5736,6 +6892,11 @@ def private_failure_frame_for_exception(
     )
     if first_fault_frame is not None:
         frames.append(first_fault_frame)
+    allocation_frame = _scratch_allocation_attribution_frame(
+        getattr(exc, "scratch_allocation_attribution", None)
+    )
+    if allocation_frame is not None:
+        frames.append(allocation_frame)
     return b"".join(frames).decode("ascii") if frames else None
 
 

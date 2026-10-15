@@ -91,6 +91,16 @@ established. Keep the reserve and all restore checks unchanged; see the [perform
 checkpoint](../performance/README.md#backup-and-restore-follow-up-2026-10-15)
 for the observed failures and their limits.
 
+A third bound create, run `38722295410` attempt 1, also failed the unchanged
+guard during `restore_platform`: `MemAvailable` was 1,066,323,968 bytes, a
+7,417,856-byte deficit. Scratch cleanup was confirmed; restore/Alembic
+completion remains UNKNOWN, no backup pair was produced, and automatic
+deployment did not run. Security run `38671815760` attempt 2 passed all 18
+jobs for source `16d956c63c1b0360d147b7916c9e513fe9b4876c` (16 success, 2
+expected skips). The 20 prior backup pairs and four protected roots remain
+preserved. These observations do not establish a restore-memory cause or
+change the 1 GiB guard.
+
 For a private failure during the parent active-poll guard, the root-private
 failure receipt may also contain the optional closed
 `scratch_resource_attribution` schema-1 object. Its controller and worker RSS

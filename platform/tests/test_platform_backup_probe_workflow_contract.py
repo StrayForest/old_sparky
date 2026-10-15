@@ -13,6 +13,8 @@ import tempfile
 import textwrap
 import unittest
 
+from tools import platform_backup_restore_drill
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-backup.yml"
@@ -308,6 +310,36 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             str(WORKFLOW),
             "exec",
         )
+        allocation_validator = next(
+            (
+                node
+                for node in ast.walk(legacy_tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "valid_scratch_allocation_attribution"
+            ),
+            None,
+        )
+        if allocation_validator is None:
+            raise AssertionError("could not find the closed private scratch-allocation attribution validator")
+        cls.allocation_validator = compile(
+            ast.fix_missing_locations(ast.Module(body=[allocation_validator], type_ignores=[])),
+            str(WORKFLOW),
+            "exec",
+        )
+        allocation_parser = next(
+            (
+                node
+                for node in ast.walk(legacy_tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "parse_bound_scratch_allocation_attribution"
+            ),
+            None,
+        )
+        if allocation_parser is None:
+            raise AssertionError("could not find the private scratch-allocation frame binder")
+        cls.allocation_parser = compile(
+            ast.fix_missing_locations(ast.Module(body=[allocation_parser], type_ignores=[])),
+            str(WORKFLOW),
+            "exec",
+        )
         probe_tree = ast.parse(handler)
         cls.probe_first_fault_sites = _literal_set_assignment(probe_tree, "sites")
         cls.probe_host_guard_sites = _literal_set_assignment(probe_tree, "host_guard_sites")
@@ -346,6 +378,171 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         namespace = {}
         exec(self.phase_validator, namespace)
         return namespace["valid_phase_attribution"](value)
+
+    def _workflow_allocation_attribution_valid(self, value) -> bool:
+        namespace = {"re": re, "json": json}
+        exec(self.allocation_validator, namespace)
+        return namespace["valid_scratch_allocation_attribution"](value)
+
+    def _workflow_allocation_binding(self, report, stderr_state, stderr_bytes):
+        namespace = {"re": re, "json": json}
+        exec(self.allocation_validator, namespace)
+        exec(self.allocation_parser, namespace)
+        return namespace["parse_bound_scratch_allocation_attribution"](
+            report, stderr_state, stderr_bytes
+        )
+
+    @staticmethod
+    def _complete_allocation_sample(phase: str) -> dict:
+        return {
+            "schema": 1,
+            "phase": phase,
+            "status": "complete",
+            "unknown_reason": None,
+            "sample_unix_ns": 1_760_000_000_000_000_000,
+            "sample_offset_ms": 500,
+            "guard_available_bytes": None,
+            "guard_sample_lag_ms": None,
+            "mount": {
+                "dev": 2049,
+                "ino": 123,
+                "mount_id": 55,
+                "total_bytes": 1_073_741_824,
+                "used_bytes": 500_000_000,
+                "free_bytes": 573_741_824,
+            },
+            "host": {
+                "mem_available_bytes": 2_000_000_000,
+                "rss_bytes": 50_000_000,
+                "memory_current_bytes": 60_000_000,
+                "anon_bytes": 45_000_000,
+                "file_bytes": 10_000_000,
+                "shmem_bytes": 5_000_000,
+            },
+            "tree": {
+                "data": [1000, 2048, 5, 2],
+                "base": [2000, 4096, 8, 3],
+                "pg_wal": [3000, 4096, 9, 2],
+            },
+        }
+
+    @classmethod
+    def _complete_allocation_attribution(cls) -> dict:
+        return {
+            "schema": 1,
+            "status": "complete",
+            "unknown_reason": None,
+            "archive_size_bytes": 123456,
+            "archive_sha256": "c" * 64,
+            "samples": [
+                cls._complete_allocation_sample(phase)
+                for phase in (
+                    "initdb_end", "postgres_start_end", "restore_platform_start", "restore_platform_end"
+                )
+            ],
+        }
+
+    def _assert_scratch_allocation_validator_parity(self) -> None:
+        complete = self._complete_allocation_attribution()
+        unknown = {
+            "schema": 1,
+            "status": "unknown",
+            "unknown_reason": "capture_prefix",
+            "archive_size_bytes": 123456,
+            "archive_sha256": "c" * 64,
+            "samples": [],
+        }
+        partial_sample = self._complete_allocation_sample("initdb_end")
+        partial_sample.update(status="unknown", unknown_reason="read_error")
+        partial_sample["sample_offset_ms"] = None
+        partial_sample["mount"]["mount_id"] = None
+        partial_sample["tree"]["pg_wal"] = None
+        partial = {
+            **complete,
+            "status": "partial",
+            "unknown_reason": "read_error",
+            "samples": [partial_sample],
+        }
+        pg_restore_failure = {
+            **partial,
+            "samples": [
+                self._complete_allocation_sample(phase)
+                for phase in ("initdb_end", "postgres_start_end", "restore_platform_start")
+            ],
+        }
+        worker_failure = self._complete_allocation_sample("worker_failure")
+        worker_failure.update(status="unknown", unknown_reason="read_error")
+        parent_after_failure = self._complete_allocation_sample("parent_last_guard")
+        parent_after_failure.update(status="unknown", unknown_reason="sample_unavailable")
+        failure_after_restore_end = {
+            **partial,
+            "samples": [*complete["samples"], worker_failure, parent_after_failure],
+        }
+
+        def sample_with(path: tuple[str, ...], replacement) -> dict:
+            sample = self._complete_allocation_sample("initdb_end")
+            sample.update(status="unknown", unknown_reason="read_error")
+            target = sample
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = replacement
+            if path == ("mount", "total_bytes") and replacement is None:
+                sample["mount"]["used_bytes"] = None
+                sample["mount"]["free_bytes"] = None
+            return {**partial, "samples": [sample]}
+
+        cases = [
+            (complete, True),
+            (partial, True),
+            (unknown, True),
+            (pg_restore_failure, True),
+            (failure_after_restore_end, True),
+            ({**partial, "samples": [self._complete_allocation_sample("parent_last_guard")]}, True),
+            ({**complete, "samples": [{**complete["samples"][0], "sample_offset_ms": 0}, *complete["samples"][1:]]}, True),
+            ({**complete, "samples": [{**complete["samples"][0], "sample_offset_ms": 960_000}, *complete["samples"][1:]]}, True),
+            ({**complete, "samples": [{**complete["samples"][0], "phase": "unknown_phase"}, *complete["samples"][1:]]}, False),
+            ({**complete, "samples": [{**complete["samples"][0], "sample_offset_ms": True}, *complete["samples"][1:]]}, False),
+            ({**complete, "samples": [{**complete["samples"][0], "sample_offset_ms": -1}, *complete["samples"][1:]]}, False),
+            ({**complete, "samples": [{**complete["samples"][0], "sample_offset_ms": 960_001}, *complete["samples"][1:]]}, False),
+            ({**complete, "samples": [{**complete["samples"][0], "tree": {**complete["samples"][0]["tree"], "data": [1, 2, True, 4]}}, *complete["samples"][1:]]}, False),
+            ({**complete, "samples": [{**complete["samples"][0], "mount": {"dev": 1}} , *complete["samples"][1:]]}, False),
+            ({**complete, "archive_size_bytes": True}, False),
+            ({**complete, "archive_sha256": "C" * 64}, False),
+            ({**complete, "unknown_reason": "open-ended"}, False),
+            ({**complete, "samples": [*complete["samples"], complete["samples"][0]]}, False),
+            ({**complete, "samples": [*complete["samples"], self._complete_allocation_sample("worker_failure")]}, False),
+        ]
+        nullable_paths = (
+            ("sample_offset_ms",),
+            ("guard_available_bytes",),
+            ("guard_sample_lag_ms",),
+            ("mount", "dev"),
+            ("mount", "ino"),
+            ("mount", "mount_id"),
+            ("mount", "total_bytes"),
+            ("mount", "used_bytes"),
+            ("mount", "free_bytes"),
+            ("host", "mem_available_bytes"),
+            ("host", "rss_bytes"),
+            ("host", "memory_current_bytes"),
+            ("host", "anon_bytes"),
+            ("host", "file_bytes"),
+            ("host", "shmem_bytes"),
+            ("tree", "data"),
+            ("tree", "base"),
+            ("tree", "pg_wal"),
+        )
+        cases.extend((sample_with(path, None), True) for path in nullable_paths)
+        cases.extend((sample_with(path, True), False) for path in nullable_paths)
+        cases.append((sample_with(("unknown_reason",), None), False))
+        for attribution, expected in cases:
+            with self.subTest(attribution=attribution):
+                workflow_valid = self._workflow_allocation_attribution_valid(attribution)
+                helper_valid = platform_backup_restore_drill.valid_scratch_allocation_attribution(
+                    attribution
+                )
+                self.assertEqual(workflow_valid, expected)
+                self.assertEqual(helper_valid, expected)
 
     def _report(self, status: str = "completed", *, first_fault=None, host_guard=None, extra: dict | None = None) -> bytes:
         if status == "completed":
@@ -873,7 +1070,97 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("platform-authorization-probe-success", self.source)
         self._assert_probe_receipt_failure_keeps_only_pending_projection()
 
+    def _assert_scratch_allocation_attribution_is_closed_private_and_frame_bound(self) -> None:
+        self._assert_scratch_allocation_validator_parity()
+        complete = self._complete_allocation_attribution()
+        self.assertTrue(self._workflow_allocation_attribution_valid(complete))
+        unknown = {
+            "schema": 1,
+            "status": "unknown",
+            "unknown_reason": "capture_prefix",
+            "archive_size_bytes": 123456,
+            "archive_sha256": "c" * 64,
+            "samples": [],
+        }
+        self.assertTrue(self._workflow_allocation_attribution_valid(unknown))
+        partial_sample = self._complete_allocation_sample("initdb_end")
+        partial_sample["status"] = "unknown"
+        partial_sample["unknown_reason"] = "read_error"
+        partial_sample["sample_offset_ms"] = None
+        partial_sample["mount"]["mount_id"] = None
+        partial_sample["tree"]["pg_wal"] = None
+        partial = {
+            **complete,
+            "status": "partial",
+            "unknown_reason": "read_error",
+            "samples": [partial_sample],
+        }
+        self.assertTrue(self._workflow_allocation_attribution_valid(partial))
+
+        for malformed in (
+            {**complete, "schema": True},
+            {**complete, "archive_size_bytes": True},
+            {**complete, "archive_sha256": "C" * 64},
+            {**complete, "unknown_reason": "not-closed"},
+            {**complete, "samples": complete["samples"] + [complete["samples"][0]]},
+            {**complete, "unexpected": 1},
+            {
+                **complete,
+                "samples": [
+                    {**complete["samples"][0], "sample_offset_ms": True},
+                    *complete["samples"][1:],
+                ],
+            },
+            {
+                **complete,
+                "samples": [
+                    {
+                        **complete["samples"][0],
+                        "tree": {**complete["samples"][0]["tree"], "data": [1, 2, True, 4]},
+                    },
+                    *complete["samples"][1:],
+                ],
+            },
+            {**complete, "status": "unknown"},
+            {**complete, "status": "partial", "unknown_reason": None},
+            {**unknown, "samples": [self._complete_allocation_sample("initdb_end")]},
+        ):
+            with self.subTest(allocation_attribution=malformed):
+                self.assertFalse(self._workflow_allocation_attribution_valid(malformed))
+
+        marker = b"SCRATCH_ALLOCATION_ATTRIBUTION_V1:"
+        canonical = json.dumps(complete, sort_keys=True, separators=(",", ":")).encode("ascii")
+        bound_report = {"scratch_allocation_attribution": complete}
+        self.assertEqual(
+            self._workflow_allocation_binding(bound_report, "read", b"prior output\n" + marker + canonical + b"\n"),
+            (True, complete),
+        )
+        self.assertEqual(self._workflow_allocation_binding({}, "read", b"legacy failure\n"), (True, None))
+        self.assertEqual(self._workflow_allocation_binding({}, "absent", b""), (True, None))
+        self.assertEqual(self._workflow_allocation_binding({}, "unsafe", b""), (False, None))
+        for report, capture in (
+            (bound_report, b""),
+            ({}, marker + canonical + b"\n"),
+            (bound_report, marker + canonical + b"\n" + marker + canonical + b"\n"),
+            (bound_report, b"prefix" + marker + canonical + b"\n"),
+            (bound_report, marker + json.dumps(complete, sort_keys=True).encode("ascii") + b"\n"),
+            ({"scratch_allocation_attribution": {**complete, "archive_size_bytes": 7}}, marker + canonical + b"\n"),
+        ):
+            with self.subTest(allocation_capture=capture[:80]):
+                self.assertEqual(self._workflow_allocation_binding(report, "read", capture), (False, None))
+
+        private_record_region = self.source.split('"event": "platform_backup_failure"', 1)[-1].split(
+            'encoded = (json.dumps(record', 1
+        )[0]
+        public_summary_region = self.source.split('public_report="$({', 1)[-1].split(
+            "failure_stage=private_capture_cleanup", 1
+        )[0]
+        self.assertIn('record["scratch_allocation_attribution"] = scratch_allocation_attribution', private_record_region)
+        self.assertNotIn("scratch_allocation_attribution", public_summary_region)
+        self.assertIn('"SCRATCH_ALLOCATION_ATTRIBUTION_V1:"', self.source)
+
     def test_first_fault_is_closed_frame_bound_private_data(self) -> None:
+        self._assert_scratch_allocation_attribution_is_closed_private_and_frame_bound()
         phase_names = (
             "archive_verify", "initdb", "postgres_start", "restore_platform",
             "restore_public", "alembic_verify",

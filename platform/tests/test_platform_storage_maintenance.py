@@ -63,6 +63,54 @@ def _read_linux_proc_state(proc_stat: Path) -> str | None:
     return fields[0]
 
 
+def _scratch_allocation_attribution() -> dict:
+    sample = {
+        "schema": 1,
+        "phase": "initdb_end",
+        "status": "complete",
+        "unknown_reason": None,
+        "sample_unix_ns": 1_760_000_000_000_000_000,
+        "sample_offset_ms": 500,
+        "guard_available_bytes": None,
+        "guard_sample_lag_ms": None,
+        "mount": {
+            "dev": 2049,
+            "ino": 123,
+            "mount_id": 55,
+            "total_bytes": 1_073_741_824,
+            "used_bytes": 500_000_000,
+            "free_bytes": 573_741_824,
+        },
+        "host": {
+            "mem_available_bytes": 2_000_000_000,
+            "rss_bytes": 50_000_000,
+            "memory_current_bytes": 60_000_000,
+            "anon_bytes": 45_000_000,
+            "file_bytes": 10_000_000,
+            "shmem_bytes": 5_000_000,
+        },
+        "tree": {
+            "data": [1000, 2048, 5, 2],
+            "base": [2000, 4096, 8, 3],
+            "pg_wal": [3000, 4096, 9, 2],
+        },
+    }
+    attribution = {
+        "schema": 1,
+        "status": "complete",
+        "unknown_reason": None,
+        "archive_size_bytes": 123456,
+        "archive_sha256": "c" * 64,
+        "samples": [
+            {**sample, "phase": phase}
+            for phase in (
+                "initdb_end", "postgres_start_end", "restore_platform_start", "restore_platform_end"
+            )
+        ],
+    }
+    return attribution
+
+
 class PlatformStorageMaintenanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1190,11 +1238,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "controller_drain_offset_ms": 41,
             "frames": [],
         }
+        allocation_attribution = _scratch_allocation_attribution()
         create_failure = RuntimeError("scratch admission failed")
         create_failure.scratch_admission_diagnostic = admission_diagnostic
         create_failure.scratch_host_guard_diagnostic = host_guard_diagnostic
         create_failure.scratch_resource_attribution = resource_attribution
         create_failure.scratch_phase_attribution = phase_attribution
+        create_failure.scratch_allocation_attribution = allocation_attribution
         create_failure.scratch_cleanup_status = "failed"
         create_failure.scratch_unit_private_output = (b"worker stdout", b"worker stderr")
         not_checked_after_failure = mock.Mock()
@@ -1228,6 +1278,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIsNone(public_error.exception.scratch_host_guard_diagnostic)
         self.assertIsNone(public_error.exception.scratch_resource_attribution)
         self.assertIsNone(public_error.exception.scratch_phase_attribution)
+        self.assertIsNone(public_error.exception.scratch_allocation_attribution)
         self.assertIsNone(public_error.exception.scratch_cleanup_status)
         self.assertEqual(public_stderr.getvalue(), "")
 
@@ -1267,7 +1318,12 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             private_error.exception.scratch_phase_attribution,
             phase_attribution,
         )
+        self.assertEqual(
+            private_error.exception.scratch_allocation_attribution,
+            allocation_attribution,
+        )
         self.assertEqual(private_error.exception.scratch_cleanup_status, "failed")
+        self.assertIn("SCRATCH_ALLOCATION_ATTRIBUTION_V1:", private_stderr.getvalue())
         self.assertIn("SCRATCH_UNIT_PRIVATE_OUTPUT_V1", private_stderr.getvalue())
         self.assertIn(
             maintenance.backup_restore_drill.SCRATCH_HOST_GUARD_FRAME_MARKER.decode("ascii"),
@@ -1539,6 +1595,46 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIsNone(public_error.exception.scratch_admission_diagnostic)
         self.assertIsNone(public_error.exception.scratch_host_guard_diagnostic)
         self.assertEqual(public_stderr.getvalue(), "")
+        self._assert_backup_command_allocation_failure_projection_is_optional_and_closed()
+
+    def _assert_backup_command_allocation_failure_projection_is_optional_and_closed(self) -> None:
+        attribution = _scratch_allocation_attribution()
+        failure = subprocess.CompletedProcess(
+            [], 1, json.dumps({"ok": False, "scratch_allocation_attribution": attribution}), ""
+        )
+        with (
+            mock.patch.object(maintenance.subprocess, "run", return_value=failure),
+            self.assertRaisesRegex(RuntimeError, "Platform backup failed") as private_error,
+        ):
+            maintenance._run_backup_command(["fixed-backup-child"], forward_failure_diagnostics=True)
+        self.assertEqual(private_error.exception.scratch_allocation_attribution, attribution)
+
+        with (
+            mock.patch.object(maintenance.subprocess, "run", return_value=failure),
+            self.assertRaisesRegex(RuntimeError, "Platform backup failed") as default_error,
+        ):
+            maintenance._run_backup_command(["fixed-backup-child"])
+        self.assertIsNone(default_error.exception.scratch_allocation_attribution)
+
+        malformed_values = (
+            {**attribution, "schema": True},
+            {**attribution, "archive_sha256": "C" * 64},
+            {**attribution, "unknown_reason": "open-ended"},
+            {**attribution, "samples": [*attribution["samples"], attribution["samples"][0]]},
+        )
+        for malformed in malformed_values:
+            with self.subTest(attribution=malformed):
+                bad_failure = subprocess.CompletedProcess(
+                    [], 1, json.dumps({"ok": False, "scratch_allocation_attribution": malformed}), ""
+                )
+                with (
+                    mock.patch.object(maintenance.subprocess, "run", return_value=bad_failure),
+                    self.assertRaisesRegex(RuntimeError, "Platform backup failed") as rejected_error,
+                ):
+                    maintenance._run_backup_command(
+                        ["fixed-backup-child"], forward_failure_diagnostics=True
+                    )
+                self.assertIsNone(rejected_error.exception.scratch_allocation_attribution)
 
     def test_backup_failure_prevents_retention_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
@@ -4895,6 +4991,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
             self.assertIn("OLDS_PG_SCRATCH_HOST_GUARD_V1:", forwarded_stderr.getvalue())
             self.assertIn("SCRATCH_FIRST_FAULT_V1\n", forwarded_stderr.getvalue())
+            forwarded_error.exception.scratch_allocation_attribution = (
+                _scratch_allocation_attribution()
+            )
 
             maintenance_args = SimpleNamespace(
                 authorization_probe_only=False,
@@ -4912,6 +5011,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(
                 final_report["scratch_host_guard_diagnostic"],
                 forwarded_error.exception.scratch_host_guard_diagnostic,
+            )
+            self.assertEqual(
+                final_report["scratch_allocation_attribution"],
+                forwarded_error.exception.scratch_allocation_attribution,
             )
             self.assertEqual(
                 final_report["scratch_first_fault"],

@@ -536,6 +536,23 @@ durability, authentication, concurrency, confinement, tmpfs, MemoryMax,
 host-reserve and timeout settings unchanged. The evidence does not establish
 OOM or a common cause for the failures.
 
+Security run `38671815760`, attempt 2, passed all 18 jobs for source
+`16d956c63c1b0360d147b7916c9e513fe9b4876c` (16 success, 2 expected skips).
+The one bound backup create, run `38722295410` attempt 1, failed the unchanged
+1 GiB reserve in `restore_platform`: the observed `MemAvailable` was
+1,066,323,968 bytes, 7,417,856 bytes below threshold. Scratch cleanup is
+confirmed, while restore/Alembic completion is UNKNOWN. No pair was produced,
+so the automatic deployment chain did not run; the prior 20 pairs and four
+protected roots remain preserved. One cgroup observation recorded
+`memory.current=494,878,720`, `anon=36,368,384`, `file=452,292,608`, and
+`shmem=416,301,056` bytes, with zero reported high/max/oom/oom_kill events at
+that sample. This is not a peak or causal attribution. The failed attempt did
+not retain aggregate PGDATA/base/pg_wal allocation; a private bounded
+attribution change is under review and is not deployed. In that candidate
+schema, `tree.data` includes nested `base` and `pg_wal`; these are overlapping
+views and must not be added. Attribution `complete` means the expected samples
+were collected, not that restore, Alembic, or backup verification succeeded.
+
 The source-pinned provider-only repair restored the attested legacy
 `19603dfff122386726313c86b0350812ebbe8cca` LiveQA runtime provider referenced
 by protected consumers. The installed 9ce provider verifier passed under the
