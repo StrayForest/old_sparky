@@ -3602,7 +3602,7 @@ jobs:
             printf '{"schema":1,"status":"unavailable","normalizer_exit_code":%s,"stdout_bytes":null,"stdout_sha256":null,"stdout_class":"unavailable","stderr_bytes":null,"stderr_sha256":null,"stderr_class":"unavailable","exception_class":"none","collector_error_class":"capture_failed"}\n' "$1"
           }
           run_public_summary_normalizer() {
-          /usr/bin/python3 -I - "$public_report" "$operation" "$backup_report_file" "$EVICT_BUILD_NODE_CACHE" "$COMPACT_FALLBACK_RUNTIME_CACHE" <<'PY'
+          /usr/bin/python3 -I - "$public_report" "$operation" "$backup_report_file" "$evict_build_node_cache" "$compact_fallback_runtime_cache" <<'PY'
           import json
           from pathlib import Path
           import sys

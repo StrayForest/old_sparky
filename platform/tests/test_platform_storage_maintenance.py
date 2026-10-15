@@ -2678,7 +2678,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         )
         normalizer_script = workflow_python(
             '/usr/bin/python3 -I - "$public_report" "$operation" '
-            '"$backup_report_file" "$EVICT_BUILD_NODE_CACHE"'
+            '"$backup_report_file" "$evict_build_node_cache" '
+            '"$compact_fallback_runtime_cache"'
         )
         normalizer_diagnostic_script = workflow_python(
             "if public_summary_normalizer_diagnostic=\"$(/usr/bin/python3 -I -B - "
@@ -2735,6 +2736,59 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "fallback_runtime_cache_compaction": normalizer_compaction
                 }
             }
+
+            normalizer_start = remote_script.index(
+                "run_public_summary_normalizer() {"
+            )
+            normalizer_end = remote_script.index("\n}", normalizer_start) + 2
+            normalizer_function = textwrap.dedent(
+                remote_script[normalizer_start:normalizer_end]
+            )
+            remote_assignments = (
+                'operation="${3:-}"',
+                'evict_build_node_cache="${6:-false}"',
+                'compact_fallback_runtime_cache="${7:-false}"',
+            )
+            self.assertTrue(
+                all(item in remote_script for item in remote_assignments)
+            )
+            normalizer_shell = (
+                "set -Eeuo pipefail\n"
+                + "\n".join(remote_assignments)
+                + '\npublic_report="${8}"\nbackup_report_file="${9}"\n'
+                + normalizer_function
+                + "\nrun_public_summary_normalizer\n"
+            )
+            normalizer_report_path.write_text(
+                json.dumps(normalizer_report, sort_keys=True), encoding="utf-8"
+            )
+            normalizer_env = os.environ.copy()
+            normalizer_env.pop("EVICT_BUILD_NODE_CACHE", None)
+            normalizer_env.pop("COMPACT_FALLBACK_RUNTIME_CACHE", None)
+            actual_caller = subprocess.run(
+                [
+                    "bash",
+                    "-s",
+                    "--",
+                    "123456",
+                    "1",
+                    "create",
+                    "a" * 40,
+                    "b" * 64,
+                    "false",
+                    "false",
+                    '{"mode":"unknown"}',
+                    str(normalizer_report_path),
+                ],
+                input=normalizer_shell,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+                env=normalizer_env,
+            )
+            self.assertEqual(actual_caller.returncode, 0, actual_caller.stderr)
+            self.assertEqual(json.loads(actual_caller.stdout)["mode"], "backup-only")
 
             def normalize_public_summary(
                 public_json: str = '{"mode":"unknown"}',

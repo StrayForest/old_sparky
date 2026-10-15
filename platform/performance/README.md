@@ -611,11 +611,38 @@ dispatching a child. A metadata-only inventory found 21 dump/sidecar pairs and
 stat-matched the 40 original entries to their saved nine-field baseline. The
 new sidecar declares restore/Alembic verification, but its archive SHA was not
 recomputed and it is not cryptographically bound to this run. This is not an
-external backup success. A pending private diagnostic records normalizer exit,
+external backup success. A private diagnostic records normalizer exit,
 bounded stdout/stderr lengths and hashes, fixed classes, and allowlisted
-exception class; it does not change acceptance. The 8 KiB capture cap is
-checked after the normalizer writes its private temporary output, so it bounds
-diagnostic reads and hashing, not temporary-file growth.
+exception class; it does not change acceptance. Its stdout readback cap is
+1,056,768 bytes and its stderr readback cap is 65,536 bytes; both are checked
+after the normalizer writes temporary files, so they bound diagnostic reads and
+hashing, not temporary-file growth.
+
+The later create `38781187992/1` on source
+`3f42b5686dc683418653c7931a4d8952f29bc6ce` also failed at `public_summary`
+after the closed report validator accepted the helper report; the success
+receipt was skipped. Its private normalizer diagnostic recorded zero stdout
+bytes and 58 stderr bytes with SHA-256
+`1b6eab82de5b2e21bfe75bbde1b6fbc8354135fbd6c8349b676eec57c0e94970`.
+Offline execution of the exact remote caller reproduced those bytes: the
+remote Bash script runs with `nounset`, receives the two cache flags as
+positional arguments and assigns lowercase variables, while the normalizer
+call expanded unassigned uppercase names. Bash exited before starting Python,
+leaving stdout empty. The local correction passes the already validated
+lowercase flags and does not alter summary validation, backup acceptance,
+retention or restore behavior. The reviewed local fix remains unpublished and
+undeployed; the regression is in
+`PlatformStorageMaintenanceTests.test_manual_backup_uses_lock_aware_backup_only_workflow`
+under `backend-privileged`, and no new bound CREATE or retry was dispatched.
+This explains only run
+`38781187992/1`. The cause of the preceding `38759048702/1` remains UNKNOWN,
+and the original confinement/restore failure `38261983678` also remains
+UNKNOWN; do not relabel either as this callsite bug.
+
+The external 11-profile matrix remains 5/11 complete; this workflow repair
+adds no load-profile result or server-capacity evidence. Human browser and
+Turnstile QA, the remaining six profiles, separate CPU validation, final QA,
+and healthy maintenance-timer completion remain outstanding.
 
 A read-only snapshot of the current live `platformdb` (2026-10-15 14:52:18
 UTC, not bound to the failed archive) counted 36 platform physical relations:
