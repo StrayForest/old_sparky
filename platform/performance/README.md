@@ -546,12 +546,53 @@ so the automatic deployment chain did not run; the prior 20 pairs and four
 protected roots remain preserved. One cgroup observation recorded
 `memory.current=494,878,720`, `anon=36,368,384`, `file=452,292,608`, and
 `shmem=416,301,056` bytes, with zero reported high/max/oom/oom_kill events at
-that sample. This is not a peak or causal attribution. The failed attempt did
-not retain aggregate PGDATA/base/pg_wal allocation; a private bounded
-attribution change is under review and is not deployed. In that candidate
-schema, `tree.data` includes nested `base` and `pg_wal`; these are overlapping
+that sample. This is not a peak or causal attribution. That attempt's report
+did not retain aggregate PGDATA/base/pg_wal allocation; the later run below
+did. `tree.data` includes nested `base` and `pg_wal`; these are overlapping
 views and must not be added. Attribution `complete` means the expected samples
 were collected, not that restore, Alembic, or backup verification succeeded.
+
+The bound create `38738894181`, attempt 1, used source
+`a9360edb0c914f3240654ac4d9755df968db115b` and failed the same 1 GiB
+`parent_active_poll` reserve guard. `MemAvailable` was 1,063,047,168 bytes,
+10,694,656 bytes below threshold. Scratch cleanup was confirmed; restore and
+Alembic completion remain UNKNOWN, no backup pair was produced, and the natural
+auto-deploy parent failed its source-bound backup guard without dispatching a
+child. The original 20 backup pairs and four protected roots remain preserved.
+The private attribution was partial because no restore-end sample was
+available. Its phase points were:
+
+| Sample | Offset / interval | MemAvailable | 512 MiB tmpfs used | `tree.data` logical / allocated (files / dirs) | `base` allocated | `pg_wal` allocated (files) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `initdb_end` | 1.698 s | 1,392,975,872 B | 40,075,264 B | 40,029,512 / 40,075,264 B (968 / 26) | 22,585,344 B | 16,777,216 B (1) |
+| `postgres_start_end` | +0.185 s | 1,386,594,304 B | 41,082,880 B | 41,018,434 / 41,074,688 B (971 / 26) | 22,585,344 B | 16,777,216 B (1) |
+| `restore_platform_start` | +0.384 s | 1,381,892,096 B | 43,540,480 B | 48,974,437 / 43,532,288 B (1,272 / 27) | 24,985,600 B | 16,777,216 B (1) |
+| `parent_last_guard` | +9.760 s (6 ms guard lag) | 1,063,047,168 B | 309,264,384 B | 309,979,749 / 310,050,816 B (1,368 / 27) | 157,286,400 B | 150,994,944 B (9) |
+
+From restore start to the last guard sample, tmpfs usage rose by 265,723,904
+bytes, `base` allocation by 132,300,800 bytes, and `pg_wal` by 134,217,728
+bytes. These are interval observations, not an atomic peak or proof that WAL
+alone caused the reserve refusal; `tree.data` already contains both nested
+subtrees. The source selects PostgreSQL 16 but does not record the patch
+version used by this attempt. It also passes no WAL or checkpoint overrides.
+PostgreSQL 16 documents default `max_wal_size=1GB` as a soft automatic
+checkpoint threshold, `min_wal_size=80MB` as a checkpoint recycling floor,
+and a five-minute default checkpoint timeout
+([WAL configuration](https://www.postgresql.org/docs/16/runtime-config-wal.html)).
+Those defaults are large relative to this 512 MiB scratch tmpfs and the roughly
+10-second restore interval, while nine 16 MiB WAL segments were present at the
+guard sample. This supports a scratch-only checkpoint/recycling experiment,
+not a guaranteed WAL cap or memory saving.
+
+The reviewed local source candidate adds `max_wal_size=64MB` and
+`min_wal_size=32MB` only to the disposable scratch PostgreSQL startup. It
+leaves `wal_level`, `fsync`, `full_page_writes`, `synchronous_commit`, all
+resource guards and timeouts unchanged. These settings may cause more
+checkpoint I/O/CPU; `max_wal_size` is not a hard cap, and a lower WAL recycling
+floor is useful only after checkpoints complete. The candidate is not deployed
+and has no restore/Alembic result yet. Do not treat telemetry completion or a
+smaller observed `pg_wal` as backup success, capacity admission, or an
+application throughput result.
 
 The source-pinned provider-only repair restored the attested legacy
 `19603dfff122386726313c86b0350812ebbe8cca` LiveQA runtime provider referenced

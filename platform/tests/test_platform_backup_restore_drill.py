@@ -643,6 +643,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "work_mem": "4MB",
                 "maintenance_work_mem": "32MB",
                 "max_connections": "10",
+                "max_wal_size": "64MB",
+                "min_wal_size": "32MB",
             },
         )
         self.assertNotIn("huge_pages", start_settings)
@@ -4234,6 +4236,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "work_mem": "4MB",
                     "maintenance_work_mem": "32MB",
                     "max_connections": "10",
+                    "max_wal_size": "64MB",
+                    "min_wal_size": "32MB",
                 },
             )
             self.assertTrue(any(command[-1:] == ["stop"] for command, _ in command_calls))

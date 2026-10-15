@@ -5052,7 +5052,11 @@ def _scratch_initdb_command(initdb: str, pgdata: pathlib.Path) -> list[str]:
 
 
 def _scratch_postgres_start_options(socket_dir: pathlib.Path) -> list[str]:
-    """Return the isolated restore PostgreSQL settings passed through pg_ctl."""
+    """Return isolated restore settings passed through pg_ctl.
+
+    The WAL limits are scratch-cluster checkpoint/recycling thresholds, not
+    hard tmpfs limits. Durability settings remain enabled.
+    """
     return [
         "-c",
         "listen_addresses=",
@@ -5076,6 +5080,10 @@ def _scratch_postgres_start_options(socket_dir: pathlib.Path) -> list[str]:
         "maintenance_work_mem=32MB",
         "-c",
         "max_connections=10",
+        "-c",
+        "max_wal_size=64MB",
+        "-c",
+        "min_wal_size=32MB",
     ]
 
 
