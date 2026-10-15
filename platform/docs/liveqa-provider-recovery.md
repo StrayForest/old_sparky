@@ -52,7 +52,7 @@ its manifest still match the attested run-37614074702/attempt-1 artifact, and
 take a fresh protected reference snapshot. The exact locked command is:
 
 ```sh
-/opt/oldsparky/platform/tools/platform_release_lock_exec.sh \
+/opt/oldsparky/platform/current/tools/platform_release_lock_exec.sh \
   --app-dir /opt/oldsparky/platform \
   --expected-sha 9ceaf09ab7ba4bf5c5e636865106910eaa034c8d \
   -- /usr/bin/python3.12 -I -B \
