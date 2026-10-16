@@ -4378,13 +4378,17 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
                 self.assertNotIn("ExecMainStatus", requested)
                 self.assertNotIn("MainPID", requested)
 
-        timer_output = b"ActiveState=inactive\nSubState=dead\nResult=success\nControlGroup=\nStateChangeTimestamp=\nUnitFileState=disabled\n"
+        timer_output = b"ActiveState=inactive\nSubState=dead\nResult=success\nStateChangeTimestamp=\nUnitFileState=disabled\n"
         with mock.patch.object(
             maintenance_evidence.subprocess, "run",
             return_value=subprocess.CompletedProcess([], 0, timer_output, b"private systemd detail"),
         ):
             timer = maintenance_evidence._systemd_properties(maintenance_evidence.TIMER)
         self.assertEqual(set(timer), set(maintenance_evidence.TIMER_PROPERTIES))
+        self.assertEqual(
+            set(maintenance_evidence.TIMER_PROPERTIES),
+            {"ActiveState", "SubState", "Result", "StateChangeTimestamp", "UnitFileState"},
+        )
 
         with mock.patch.object(
             maintenance_evidence.subprocess, "run",
@@ -4398,7 +4402,7 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
         self.assertEqual(cause["returncode"], 1)
         self.assertEqual(base64.b64decode(cause["stderr_b64"]), b"private failure detail")
 
-        incomplete = timer_output.replace(b"Result=success\n", b"")
+        incomplete = timer_output.replace(b"UnitFileState=disabled\n", b"")
         with mock.patch.object(
             maintenance_evidence.subprocess, "run",
             return_value=subprocess.CompletedProcess([], 0, incomplete, b""),
@@ -4406,7 +4410,7 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
             with self.assertRaises(maintenance_evidence.EvidenceError) as caught:
                 maintenance_evidence._systemd_properties(maintenance_evidence.TIMER)
         self.assertEqual(caught.exception.private_cause["reason"], "missing_properties")
-        self.assertEqual(caught.exception.private_cause["missing_properties"], ["Result"])
+        self.assertEqual(caught.exception.private_cause["missing_properties"], ["UnitFileState"])
 
         extra_property = timer_output + b"ExecMainStatus=0\n"
         with mock.patch.object(

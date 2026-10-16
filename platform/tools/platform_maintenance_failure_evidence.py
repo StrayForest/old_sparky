@@ -33,8 +33,8 @@ SERVICE_PROPERTIES = (
     "ExecMainExitTimestamp", "StateChangeTimestamp", "UnitFileState",
 )
 TIMER_PROPERTIES = (
-    "ActiveState", "SubState", "Result", "ControlGroup",
-    "StateChangeTimestamp", "UnitFileState",
+    "ActiveState", "SubState", "Result", "StateChangeTimestamp",
+    "UnitFileState",
 )
 SYSTEMD_PROPERTIES_BY_UNIT = {UNIT: SERVICE_PROPERTIES, TIMER: TIMER_PROPERTIES}
 MAX_PRIVATE_COMMAND_OUTPUT = 4096

@@ -55,7 +55,11 @@ record. That record identifies the fixed service or timer query, its closed
 failure class and return code, missing or extra fixed properties, and bounded
 base64 stdout/stderr. It remains inside CMS ciphertext; it is never written to
 the public manifest, Actions output or logs. The service query uses the fixed
-Service/Unit property set; the timer query uses only its Timer/Unit properties.
+12-field Service/Unit property set. The timer query uses the five fields
+exposed by its Timer/Unit interfaces: `ActiveState`, `SubState`, `Result`,
+`StateChangeTimestamp`, and `UnitFileState`. `ControlGroup` is service-only;
+timer evidence does not query it. Cgroup membership is read from the
+maintenance service's `ControlGroup` and remains part of the reset fence.
 When a guard fails after the bound host output path is established, the
 workflow encrypts and uploads that diagnostic, then still finishes with a
 failed Action conclusion. The public manifest, Actions output and logs contain

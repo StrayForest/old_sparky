@@ -58,8 +58,8 @@ SERVICE_PROPERTIES = {
     "ExecMainExitTimestamp", "StateChangeTimestamp", "UnitFileState",
 }
 TIMER_PROPERTIES = {
-    "ActiveState", "SubState", "Result", "ControlGroup",
-    "StateChangeTimestamp", "UnitFileState",
+    "ActiveState", "SubState", "Result", "StateChangeTimestamp",
+    "UnitFileState",
 }
 DIAGNOSTIC_STAGES = {
     "transaction_receipt", "transaction_context", "host_identity",
