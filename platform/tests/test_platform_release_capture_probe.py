@@ -369,6 +369,20 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 probe.subprocess,
                 "run",
                 side_effect=lambda argv, **kwargs: nginx_calls.append({"argv": argv, **kwargs}) or SimpleNamespace(returncode=0),
+            ), patch.object(
+                probe,
+                "_private_capture_requested",
+                return_value=False,
+            ), patch.object(
+                probe,
+                "_read_stable_state",
+                return_value={
+                    "operation_id": "a" * 32,
+                    "operation": "install",
+                    "phase": "recovery-restored",
+                    "current_before": str(transaction.parents[1] / "releases/old"),
+                    "previous_before": str(transaction.parents[1] / "releases/pending"),
+                },
             ):
                 result = self._run(fake, transaction, companion)
             self.assertEqual(result["runtime_target"], "old")

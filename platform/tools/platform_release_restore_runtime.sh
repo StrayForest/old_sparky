@@ -233,6 +233,38 @@ PY
 } 2>/dev/null)"
 [[ -n "$source_sha" ]] && PUBLIC_SOURCE_SHA="$source_sha"
 
+emit_private_guard_context() {
+  [[ "$RUNTIME_PRIVATE_CAPTURE" == "1" && "$RUNTIME_PRIVATE_MARKER_COUNT" -eq 0 ]] || return 0
+  /usr/bin/python3 -I - "$RUNTIME_PRIVATE_ROUTE" "$RUNTIME_PRIVATE_LAST_GUARD" "$1" <<'PY' >&2
+import json
+import sys
+route, guard_id, status = sys.argv[1:]
+if route != "recover_pending" or guard_id not in {
+    "argument", "privilege", "lock", "layout", "tooling", "systemd_state",
+    "transaction_state", "legacy_liveqa_authority", "liveqa_runtime", "nginx", "runtime",
+}:
+    guard_id = "runtime"
+try:
+    returncode = int(status)
+except ValueError:
+    returncode = 1
+if not 1 <= returncode <= 255:
+    returncode = 1
+print("RUNTIME_PRIVATE_CONTEXT " + json.dumps({
+    "schema": 1,
+    "route": route,
+    "component": "runtime_guard",
+    "guard_id": guard_id,
+    "returncode": returncode,
+    "stream": "guard",
+    "output_b64": "",
+    "total_bytes": 0,
+    "truncated": False,
+    "retained": "tail",
+}, sort_keys=True, separators=(",", ":")))
+PY
+}
+
 on_exit() {
   local exit_status="$?"
   trap - EXIT
@@ -299,33 +331,6 @@ else
     exit 1
   fi
 fi
-if [[ -n "$SYSTEMD_STATE" ]]; then
-  # Correlate the durable systemd receipt, transaction operation and helper
-  # manifest before live-QA reconciliation or any release helper can mutate
-  # runtime files.  The bootstrap performs the same check, but rollback calls
-  # this script directly during retry recovery.
-  run_private_command systemd_state_validate "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
-    validate --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
-    --transaction "$TRANSACTION_STATE" --helper-release "$RELEASE" \
-    --systemctl "$SYSTEMCTL_BIN"
-fi
-if [[ "$PRESERVE_LEGACY_LIVE_QA" -eq 0 \
-  && ( "$PREPARE_RUNTIME" -eq 1 || "$RUN_RESTART" -eq 1 ) ]]; then
-  # Rollback/recovery uses this same path, so reconcile the digest-bound
-  # generation before units, Nginx, readiness or smoke can observe the restored
-  # release. A smoke-only invocation follows a completed prepare/restart and
-  # must not re-enter reconciliation after the transaction has advanced past
-  # its runtime-pending phase. The canonical release lock remains held here.
-  if [[ -n "$ROLLBACK_RECONCILE_TRANSACTION" ]]; then
-    run_private_command runtime_reconcile "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
-      reconcile --app-dir "$APP_DIR" \
-      --rollback-transaction "$ROLLBACK_RECONCILE_TRANSACTION"
-  else
-    run_private_command runtime_reconcile "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
-      reconcile --app-dir "$APP_DIR"
-  fi
-fi
-
 prepare_runtime_private() {
   # Restoring unit files is a data-plane operation.  The installer defaults
   # to enable/start for a first activation, so every rollback/recovery call
@@ -436,37 +441,30 @@ with os.fdopen(descriptor, "w", encoding="ascii") as stream:
   return "$status"
 }
 
-emit_private_guard_context() {
-  [[ "$RUNTIME_PRIVATE_CAPTURE" == "1" && "$RUNTIME_PRIVATE_MARKER_COUNT" -eq 0 ]] || return 0
-  /usr/bin/python3 -I - "$RUNTIME_PRIVATE_ROUTE" "$RUNTIME_PRIVATE_LAST_GUARD" "$1" <<'PY' >&2
-import json
-import sys
-route, guard_id, status = sys.argv[1:]
-if route != "recover_pending" or guard_id not in {
-    "argument", "privilege", "lock", "layout", "tooling", "systemd_state",
-    "transaction_state", "legacy_liveqa_authority", "liveqa_runtime", "nginx", "runtime",
-}:
-    guard_id = "runtime"
-try:
-    returncode = int(status)
-except ValueError:
-    returncode = 1
-if not 1 <= returncode <= 255:
-    returncode = 1
-print("RUNTIME_PRIVATE_CONTEXT " + json.dumps({
-    "schema": 1,
-    "route": route,
-    "component": "runtime_guard",
-    "guard_id": guard_id,
-    "returncode": returncode,
-    "stream": "guard",
-    "output_b64": "",
-    "total_bytes": 0,
-    "truncated": False,
-    "retained": "tail",
-}, sort_keys=True, separators=(",", ":")))
-PY
-}
+
+if [[ -n "$SYSTEMD_STATE" ]]; then
+  # Correlate the durable systemd receipt, transaction operation and helper
+  # manifest before live-QA reconciliation or any release helper can mutate
+  # runtime files. The validator is read-only and runs once under the lock.
+  run_private_command systemd_state_validate "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
+    validate --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+    --transaction "$TRANSACTION_STATE" --helper-release "$RELEASE" \
+    --systemctl "$SYSTEMCTL_BIN"
+fi
+if [[ "$PRESERVE_LEGACY_LIVE_QA" -eq 0 \
+  && ( "$PREPARE_RUNTIME" -eq 1 || "$RUN_RESTART" -eq 1 ) ]]; then
+  # Rollback/recovery uses this same path, so reconcile the digest-bound
+  # generation before units, Nginx, readiness or smoke can observe the restored
+  # release. The canonical release lock remains held here.
+  if [[ -n "$ROLLBACK_RECONCILE_TRANSACTION" ]]; then
+    run_private_command runtime_reconcile "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+      reconcile --app-dir "$APP_DIR" \
+      --rollback-transaction "$ROLLBACK_RECONCILE_TRANSACTION"
+  else
+    run_private_command runtime_reconcile "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+      reconcile --app-dir "$APP_DIR"
+  fi
+fi
 
 # Keep all direct systemctl calls bounded just like the immutable systemd
 # receipt helper.  A hung manager must retain the caller's recovery receipt.

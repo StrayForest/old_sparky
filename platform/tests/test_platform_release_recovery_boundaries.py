@@ -2237,12 +2237,15 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             str(systemctl),
             env={
                 **self.runtime_env(label="previous"),
+                "PLATFORM_RUNTIME_PRIVATE_CAPTURE": "1",
+                "PLATFORM_RUNTIME_PRIVATE_ROUTE": "recover_pending",
                 "PLATFORM_TEST_NGINX_LABEL": "previous",
             },
             check=False,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("RUNTIME_PRIVATE_CONTEXT", result.stderr)
         self.assertFalse((self.shared / STATE_NAME).exists())
         self.assertFalse(receipt.exists())
         self.assertEqual((self.app_dir / "current").resolve(), previous)
@@ -3071,8 +3074,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         current, previous = self.prepare_rollback_state()
         runtime = self.copy_runtime_with_fault(
             "runtime-before-recovery-retry.sh",
-            '  PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"\n',
-            '  PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"\n'
+            '  PLATFORM_APP_DIR="$APP_DIR" run_private_command systemd_units "$UNITS_TOOL"\n',
+            '  PLATFORM_APP_DIR="$APP_DIR" run_private_command systemd_units "$UNITS_TOOL"\n'
             '  /bin/kill -KILL "$PPID"\n',
         )
         interrupted = self.copy_rollback_with_runtime(
@@ -3295,11 +3298,11 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         for label, needle in (
             (
                 "units",
-                '  PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"\n',
+                '  PLATFORM_APP_DIR="$APP_DIR" run_private_command systemd_units "$UNITS_TOOL"\n',
             ),
             (
                 "nginx",
-                '    "$NGINX_TOOL" --apply --reload --json\n',
+                '    "$SHARED_VENV/bin/python" "$NGINX_TOOL" --apply --reload --json\n',
             ),
         ):
             with self.subTest(label=label):
@@ -3418,8 +3421,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         legacy_state = self.root / "legacy-helper.state"
         runtime = self.copy_runtime_with_fault(
             "runtime-after-pointer-switch-kill.sh",
-            '  PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"\n',
-            '  PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"\n'
+            '  PLATFORM_APP_DIR="$APP_DIR" run_private_command systemd_units "$UNITS_TOOL"\n',
+            '  PLATFORM_APP_DIR="$APP_DIR" run_private_command systemd_units "$UNITS_TOOL"\n'
             '  /bin/kill -KILL "$PPID"\n',
         )
         interrupted = self.copy_rollback_with_runtime(
