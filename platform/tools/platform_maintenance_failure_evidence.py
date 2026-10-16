@@ -344,6 +344,56 @@ def _atomic_private_file(path: Path, raw: bytes) -> None:
         raise
 
 
+def _durable_evidence_path(
+    app_dir: Path, source_sha: str, capture_run_id: str, capture_run_attempt: str,
+    *, create: bool,
+) -> Path:
+    if not SOURCE_SHA.fullmatch(source_sha):
+        raise EvidenceError("maintenance evidence source identity is invalid")
+    run_id_pattern = re.compile(r"^[1-9][0-9]{0,31}$")
+    if not run_id_pattern.fullmatch(capture_run_id) or not run_id_pattern.fullmatch(capture_run_attempt):
+        raise EvidenceError("maintenance capture run identity is invalid")
+    app_dir = app_dir.resolve(strict=True)
+    shared = app_dir / "shared"
+    recovery = shared / ".release-recovery"
+    for directory, expected_mode in ((shared, None), (recovery, 0o755)):
+        try:
+            metadata = directory.lstat()
+        except OSError as exc:
+            raise EvidenceError("maintenance evidence directory is unavailable") from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or (expected_mode is not None and stat.S_IMODE(metadata.st_mode) != expected_mode)
+        ):
+            raise EvidenceError("maintenance evidence directory is unsafe")
+    directory = recovery / "maintenance-failure-evidence"
+    if create and not os.path.lexists(directory):
+        try:
+            directory.mkdir(mode=0o700)
+            os.chown(directory, 0, 0)
+            os.chmod(directory, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise EvidenceError("maintenance evidence directory cannot be created") from exc
+    try:
+        metadata = directory.lstat()
+    except OSError as exc:
+        raise EvidenceError("maintenance evidence directory is unavailable") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise EvidenceError("maintenance evidence directory is unsafe")
+    return directory / f"{source_sha}-{capture_run_id}-{capture_run_attempt}.json"
+
+
 def capture(
     *, app_dir: Path, source_sha: str, bundle_sha: str, output: Path,
     capture_run_id: str, capture_run_attempt: str,
@@ -409,7 +459,12 @@ def capture(
         "journal": journal,
     }
     raw = (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
-    _atomic_private_file(output, raw)
+    expected_output = _durable_evidence_path(
+        app_dir, source_sha, capture_run_id, capture_run_attempt, create=True,
+    )
+    if output != expected_output:
+        raise EvidenceError("maintenance evidence destination is not source/run bound")
+    _atomic_private_file(expected_output, raw)
     return hashlib.sha256(raw).hexdigest(), payload
 
 
@@ -529,8 +584,13 @@ def reset_failed(
 ) -> None:
     if os.geteuid() != 0:
         raise EvidenceError("maintenance reset requires root")
+    expected_evidence = _durable_evidence_path(
+        app_dir, source_sha, capture_run_id, capture_run_attempt, create=False,
+    )
+    if evidence != expected_evidence:
+        raise EvidenceError("maintenance evidence path is not source/run bound")
     evidence_value = _validate_evidence(
-        evidence, evidence_sha, source_sha=source_sha, bundle_sha=bundle_sha,
+        expected_evidence, evidence_sha, source_sha=source_sha, bundle_sha=bundle_sha,
         capture_run_id=capture_run_id, capture_run_attempt=capture_run_attempt,
         security_run_id=security_run_id, security_run_attempt=security_run_attempt,
     )
@@ -575,13 +635,11 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--source-sha", required=True)
         command.add_argument("--bundle-sha", required=True)
         if action == "capture_maintenance_failure":
-            command.add_argument("--output", type=Path, required=True)
             command.add_argument("--capture-run-id", required=True)
             command.add_argument("--capture-run-attempt", required=True)
             command.add_argument("--security-run-id", required=True)
             command.add_argument("--security-run-attempt", required=True)
         else:
-            command.add_argument("--evidence", type=Path, required=True)
             command.add_argument("--evidence-sha256", required=True)
             command.add_argument("--capture-run-id", required=True)
             command.add_argument("--capture-run-attempt", required=True)
@@ -594,19 +652,26 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
         if args.action == "capture_maintenance_failure":
+            output = _durable_evidence_path(
+                args.app_dir, args.source_sha, args.capture_run_id,
+                args.capture_run_attempt, create=True,
+            )
             digest, _ = capture(
                 app_dir=args.app_dir, source_sha=args.source_sha,
-                bundle_sha=args.bundle_sha, output=args.output,
+                bundle_sha=args.bundle_sha, output=output,
                 capture_run_id=args.capture_run_id,
                 capture_run_attempt=args.capture_run_attempt,
                 security_run_id=args.security_run_id,
                 security_run_attempt=args.security_run_attempt,
             )
-            print(f"MAINTENANCE_EVIDENCE schema=1 status=captured sha256={digest} private=true")
+            print("MAINTENANCE_EVIDENCE schema=1 status=captured private=true")
             return 0
         reset_failed(
             app_dir=args.app_dir, source_sha=args.source_sha, bundle_sha=args.bundle_sha,
-            evidence=args.evidence, evidence_sha=args.evidence_sha256,
+            evidence=_durable_evidence_path(
+                args.app_dir, args.source_sha, args.capture_run_id,
+                args.capture_run_attempt, create=False,
+            ), evidence_sha=args.evidence_sha256,
             capture_run_id=args.capture_run_id,
             capture_run_attempt=args.capture_run_attempt,
             security_run_id=args.security_run_id,

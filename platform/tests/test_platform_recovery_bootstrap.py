@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 from contextlib import ExitStack
 import hashlib
 import io
@@ -20,6 +21,7 @@ from unittest import mock
 
 from tools import platform_recovery_bootstrap as recovery
 from tools import platform_maintenance_failure_evidence as maintenance_evidence
+from tools import platform_decrypt_maintenance_evidence as maintenance_decrypt
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +87,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_production_classifier_artifact.py",
         "platform/tools/platform_recovery_bootstrap.py",
         "platform/tools/platform_maintenance_failure_evidence.py",
+        "platform/tools/platform_decrypt_maintenance_evidence.py",
         "platform/tools/platform_release_retention.py",
         "platform/tools/platform_tournament_list_read_model_recovery.py",
         "platform/tools/platform_release_restore_runtime.sh",
@@ -107,9 +110,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/python_packages/platform_infra/db.py",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 66
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 67
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "eb862c5854614053470064b677d3d4c816a10e5b6d559f15b42c6c6de0cdabb1"
+    "523c8876a083c34a3b5a3aa5b040825b194b5ed3c55327f55d99ba86572f7d4e"
 )
 
 # These paths are deliberately present in the recovery route allowlist but are
@@ -175,6 +178,7 @@ RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
         "platform/tools/platform_recover_pending.sh",
         "platform/tools/platform_recovery_bootstrap.py",
         "platform/tools/platform_maintenance_failure_evidence.py",
+        "platform/tools/platform_decrypt_maintenance_evidence.py",
         "platform/tools/platform_release_retention.py",
         "platform/tools/platform_tournament_list_read_model_recovery.py",
         "platform/tools/platform_release_restore_runtime.sh",
@@ -190,9 +194,9 @@ RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
         "platform/tools/platform_workflow_remote_dispatch.py",
     }
 )
-RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT = 44
+RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT = 45
 RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST = (
-    "621fafd27cc1091fed6a5a3978042e979adffbec438ff9f435368645c2363195"
+    "ad3678c7702a11388630cfbfca4474ce71d643ce853c65a596b8ba7fa8b43d03"
 )
 
 
@@ -1093,30 +1097,71 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("platform_abort_retained_only.sh", workflow)
         self.assertIn("platform_maintenance_failure_evidence.py", workflow)
         self.assertIn("platform-maintenance-failure-${{ github.run_id }}-${{ github.run_attempt }}", workflow)
-        self.assertEqual(workflow.count("github.event.repository.private"), 2)
-        self.assertEqual(workflow.count('test "$REPOSITORY_PRIVATE" = true'), 2)
-        private_guard = 'test "$REPOSITORY_PRIVATE" = true'
-        for value, expected_status in (("true", 0), ("false", 1), (None, 1)):
-            private_env = os.environ.copy()
-            if value is None:
-                private_env.pop("REPOSITORY_PRIVATE", None)
-            else:
-                private_env["REPOSITORY_PRIVATE"] = value
-            with self.subTest(repository_private=value):
-                self.assertEqual(
-                    subprocess.run(
-                        ["bash", "-c", private_guard],
-                        env=private_env,
-                        check=False,
-                        timeout=5,
-                    ).returncode,
-                    expected_status,
-                )
+        self.assertIn("recipient_certificate_b64", workflow)
+        self.assertIn("recipient_certificate_sha256", workflow)
+        self.assertIn("openssl cms -encrypt -binary -aes-256-gcm", workflow)
+        self.assertNotIn("plaintext_sha256", workflow)
+        self.assertNotIn("plaintext_sha256=", workflow)
+        self.assertNotIn('evidence_sha256=%s', workflow)
         action_step = workflow.split(
             "- name: Execute one exact signed recovery capability", 1
         )[1].split("\n      - name:", 1)[0]
         action_script = textwrap.dedent(action_step.split("run: |\n", 1)[1])
-        evidence_bytes = b'{"fixture":"private-capture-evidence"}\n'
+        evidence_bytes = (
+            json.dumps(
+                {
+                    "schema": 1,
+                    "kind": "maintenance_failure_evidence",
+                    "source_sha": "a" * 40,
+                    "bundle_sha256": "b" * 64,
+                    "capture_run_id": "56789",
+                    "capture_run_attempt": "1",
+                    "security_run_id": "12345",
+                    "security_run_attempt": "1",
+                    "host_id_sha256": "c" * 64,
+                    "captured_at_utc": "2026-10-16T00:00:00Z",
+                    "app_dir": "/opt/oldsparky/platform",
+                    "pointers": {"current": "current-a", "previous": "previous-b"},
+                    "receipts": {
+                        "operation_sha256": "d" * 64,
+                        "systemd_sha256": "e" * 64,
+                    },
+                    "unit": {
+                        "ActiveState": "failed",
+                        "SubState": "failed",
+                        "Result": "signal",
+                        "ExecMainCode": "killed",
+                        "ExecMainStatus": "17",
+                        "MainPID": "0",
+                        "ExecMainPID": "4321",
+                        "ControlGroup": "",
+                        "ExecMainStartTimestamp": "start",
+                        "ExecMainExitTimestamp": "exit",
+                        "StateChangeTimestamp": "exit",
+                    },
+                    "timer": {
+                        "ActiveState": "inactive",
+                        "SubState": "dead",
+                        "Result": "success",
+                        "ExecMainCode": "exited",
+                        "ExecMainStatus": "0",
+                        "MainPID": "0",
+                        "ExecMainPID": "0",
+                        "ControlGroup": "",
+                        "ExecMainStartTimestamp": "",
+                        "ExecMainExitTimestamp": "",
+                        "StateChangeTimestamp": "",
+                        "UnitFileState": "disabled",
+                    },
+                    "queued_jobs": [],
+                    "cgroup_pids": [],
+                    "journal": [{"message": "private-capture-evidence"}],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
         evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1127,6 +1172,55 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             evidence_fixture = root / "evidence-fixture.json"
             evidence_fixture.write_bytes(evidence_bytes)
             evidence_path = root / "maintenance-evidence.json"
+            artifact_dir = root / "encrypted-artifact"
+            certificate_path = root / "recipient-cert.pem"
+            private_key_path = root / "recipient-key.pem"
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:3072", "-nodes", "-keyout", str(private_key_path), "-out", str(certificate_path), "-days", "2", "-subj", "/CN=workflow-contract-test", "-addext", "basicConstraints=critical,CA:FALSE", "-addext", "keyUsage=critical,keyEncipherment"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            certificate_fingerprint = subprocess.check_output(
+                ["openssl", "x509", "-in", str(certificate_path), "-noout", "-fingerprint", "-sha256"],
+                text=True,
+            ).strip().split("=", 1)[1].replace(":", "").lower()
+            recipient_step = workflow.split(
+                "- name: Validate pinned encrypted-capture recipient before production access", 1
+            )[1].split("\n      - name:", 1)[0]
+            recipient_script = textwrap.dedent(recipient_step.split("run: |\n", 1)[1])
+            recipient_env = {
+                **os.environ,
+                "RECIPIENT_CERTIFICATE_B64": base64.b64encode(certificate_path.read_bytes()).decode("ascii"),
+                "RECIPIENT_CERTIFICATE_SHA256": certificate_fingerprint,
+                "RUNNER_TEMP": str(root),
+                "GITHUB_ENV": str(root / "github-env"),
+            }
+            validated = subprocess.run(
+                ["bash", "-c", recipient_script], env=recipient_env,
+                capture_output=True, text=True, check=False, timeout=20,
+            )
+            self.assertEqual(validated.returncode, 0, validated.stderr)
+            self.assertEqual(stat.S_IMODE((root / "platform-maintenance-recipient.pem").stat().st_mode), 0o600)
+            self.assertIn(f"RECIPIENT_CERTIFICATE_FINGERPRINT={certificate_fingerprint}", (root / "github-env").read_text(encoding="ascii"))
+            self.assertNotIn("BEGIN CERTIFICATE", validated.stdout)
+            (root / "platform-maintenance-recipient.pem").unlink()
+            mismatched_fingerprint = subprocess.run(
+                ["bash", "-c", recipient_script],
+                env={**recipient_env, "RECIPIENT_CERTIFICATE_SHA256": "0" * 64},
+                capture_output=True, text=True, check=False, timeout=20,
+            )
+            self.assertNotEqual(mismatched_fingerprint.returncode, 0)
+            self.assertFalse(ssh_log.exists())
+            (root / "platform-maintenance-recipient.pem").unlink()
+            rejected_private_key = subprocess.run(
+                ["bash", "-c", recipient_script],
+                env={**recipient_env, "RECIPIENT_CERTIFICATE_B64": base64.b64encode(private_key_path.read_bytes()).decode("ascii")},
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+            self.assertNotEqual(rejected_private_key.returncode, 0)
+            self.assertFalse(ssh_log.exists())
+            (root / "platform-maintenance-recipient.pem").unlink(missing_ok=True)
             github_output = root / "github-output"
             ssh_script = fake_bin / "ssh"
             ssh_script.write_text(
@@ -1185,17 +1279,26 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 "ACTION_CONFIRMATION": "CAPTURE-MAINTENANCE-FAILURE",
                 "EVIDENCE_SHA256": "e" * 64,
                 "CAPTURE_EVIDENCE_PATH": str(evidence_path),
+                "CAPTURE_CIPHERTEXT_DIR": str(artifact_dir),
+                "RECIPIENT_CERT_PATH": str(root / "platform-maintenance-recipient.pem"),
+                "RECIPIENT_CERTIFICATE_FINGERPRINT": certificate_fingerprint,
                 "CAPTURE_RUN_ID": "45678",
                 "CAPTURE_RUN_ATTEMPT": "1",
                 "ACTION_RUN_ID": "56789",
                 "ACTION_RUN_ATTEMPT": "1",
+                "PUBLISHER_RUN_ID": "34568",
+                "PUBLISHER_RUN_ATTEMPT": "1",
+                "RUNNER_TEMP": str(root),
                 "GITHUB_OUTPUT": str(github_output),
                 "FAKE_SSH_LOG": str(ssh_log),
                 "FAKE_SCP_LOG": str(scp_log),
                 "FAKE_REMOTE_STAGE": "/tmp/oldsparky-recovery-bootstrap.ABC123",
-                "FAKE_CAPTURE_SOURCE": "runner@host.invalid:/tmp/oldsparky-recovery-bootstrap.ABC123/maintenance-evidence.json",
+                "FAKE_CAPTURE_SOURCE": "runner@host.invalid:/opt/oldsparky/platform/shared/.release-recovery/maintenance-failure-evidence/" + "a" * 40 + "-56789-1.json",
                 "FAKE_EVIDENCE_FIXTURE": str(evidence_fixture),
             }
+            action_certificate = Path(environment["RECIPIENT_CERT_PATH"])
+            action_certificate.write_bytes(certificate_path.read_bytes())
+            action_certificate.chmod(0o600)
             result = subprocess.run(
                 ["bash", "-c", action_script],
                 env=environment,
@@ -1205,20 +1308,147 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 timeout=20,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(evidence_path.read_bytes(), evidence_bytes)
-            metadata = evidence_path.lstat()
-            self.assertTrue(stat.S_ISREG(metadata.st_mode))
-            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
-            self.assertEqual(metadata.st_nlink, 1)
-            self.assertEqual(
-                result.stdout,
-                f"MAINTENANCE_EVIDENCE status=downloaded sha256={evidence_sha256} private=true\n",
+            ciphertext_path = artifact_dir / "evidence.cms"
+            manifest_path = artifact_dir / "manifest.json"
+            self.assertFalse(evidence_path.exists())
+            self.assertTrue(ciphertext_path.is_file())
+            self.assertTrue(manifest_path.is_file())
+            self.assertEqual(stat.S_IMODE(ciphertext_path.stat().st_mode), 0o600)
+            git_dir = root / ".git"
+            private_dir = git_dir / "maintenance-evidence"
+            git_dir.mkdir(mode=0o700)
+            private_dir.mkdir(mode=0o700)
+            local_key = private_dir / "recipient-key.pem"
+            local_certificate = private_dir / "recipient-cert.pem"
+            shutil.copyfile(private_key_path, local_key)
+            shutil.copyfile(certificate_path, local_certificate)
+            local_key.chmod(0o600)
+            local_certificate.chmod(0o600)
+            archive_path = private_dir / "capture.zip"
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", manifest_path.read_bytes())
+                archive.writestr("evidence.cms", ciphertext_path.read_bytes())
+            archive_path.chmod(0o600)
+            archive_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            binding_path = private_dir / "capture-binding.json"
+            binding = {
+                "schema": 1,
+                "kind": "github_capture_artifact_binding",
+                "repository": "StrayForest/old_sparky",
+                "workflow_path": ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+                "artifact_id": "67890",
+                "artifact_name": "platform-maintenance-failure-56789-1",
+                "artifact_digest": f"sha256:{archive_digest}",
+                "capture_run_id": "56789",
+                "capture_run_attempt": "1",
+                "source_sha": "a" * 40,
+                "bundle_sha256": "b" * 64,
+                "security_run_id": "12345",
+                "security_run_attempt": "1",
+                "recovery_run_id": "23456",
+                "recovery_run_attempt": "1",
+                "publisher_run_id": "34568",
+                "publisher_run_attempt": "1",
+            }
+            binding_path.write_text(json.dumps(binding, sort_keys=True), encoding="ascii")
+            binding_path.chmod(0o600)
+            decrypted_path = private_dir / "decrypted.json"
+            with mock.patch.object(
+                maintenance_decrypt,
+                "RECIPIENT_CERTIFICATE_SHA256",
+                certificate_fingerprint,
+            ):
+                decrypted_sha, decrypted_size = maintenance_decrypt.decrypt_capture(
+                    artifact_archive=archive_path,
+                    binding_json=binding_path,
+                    private_key=local_key,
+                    certificate=local_certificate,
+                    destination=decrypted_path,
+                    git_dir=git_dir,
+                )
+            self.assertEqual(decrypted_path.read_bytes(), evidence_bytes)
+            self.assertEqual(decrypted_sha, evidence_sha256)
+            self.assertEqual(decrypted_size, len(evidence_bytes))
+            self.assertEqual(stat.S_IMODE(decrypted_path.stat().st_mode), 0o600)
+            manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+            self.assertNotIn("plaintext_sha256", manifest)
+            self.assertNotIn("plaintext_size", manifest)
+            self.assertEqual(manifest["ciphertext_sha256"], hashlib.sha256(ciphertext_path.read_bytes()).hexdigest())
+            self.assertEqual(manifest["recipient_certificate_sha256"], certificate_fingerprint)
+            self.assertEqual(manifest["capture_run_id"], "56789")
+            self.assertEqual({path.name for path in artifact_dir.iterdir()}, {"manifest.json", "evidence.cms"})
+            self.assertNotIn(b"private-capture-evidence", ciphertext_path.read_bytes())
+            self.assertNotIn(b"private-capture-evidence", manifest_path.read_bytes())
+            mismatched_binding = dict(binding)
+            mismatched_binding["source_sha"] = "f" * 40
+            mismatched_binding_path = private_dir / "mismatched-capture-binding.json"
+            mismatched_binding_path.write_text(
+                json.dumps(mismatched_binding, sort_keys=True), encoding="ascii"
             )
+            mismatched_binding_path.chmod(0o600)
+            mismatched_binding_output = private_dir / "mismatched-binding.json"
+            with mock.patch.object(
+                maintenance_decrypt,
+                "RECIPIENT_CERTIFICATE_SHA256",
+                certificate_fingerprint,
+            ), self.assertRaises(maintenance_decrypt.DecryptError):
+                maintenance_decrypt.decrypt_capture(
+                    artifact_archive=archive_path,
+                    binding_json=mismatched_binding_path,
+                    private_key=local_key,
+                    certificate=local_certificate,
+                    destination=mismatched_binding_output,
+                    git_dir=git_dir,
+                )
+            self.assertFalse(mismatched_binding_output.exists())
+            tampered_archive = private_dir / "tampered-capture.zip"
+            tampered = bytearray(ciphertext_path.read_bytes())
+            tampered[-1] ^= 1
+            with zipfile.ZipFile(tampered_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", manifest_path.read_bytes())
+                archive.writestr("evidence.cms", tampered)
+            tampered_archive.chmod(0o600)
+            tampered_output = private_dir / "tampered.json"
+            with mock.patch.object(
+                maintenance_decrypt,
+                "RECIPIENT_CERTIFICATE_SHA256",
+                certificate_fingerprint,
+            ), self.assertRaises(maintenance_decrypt.DecryptError):
+                maintenance_decrypt.decrypt_capture(
+                    artifact_archive=tampered_archive,
+                    binding_json=binding_path,
+                    private_key=local_key,
+                    certificate=local_certificate, destination=tampered_output,
+                    git_dir=git_dir,
+                )
+            self.assertFalse(tampered_output.exists())
+            wrong_key = root / "wrong-key.pem"
+            wrong_cert = root / "wrong-cert.pem"
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:3072", "-nodes", "-keyout", str(wrong_key), "-out", str(wrong_cert), "-days", "2", "-subj", "/CN=wrong-recipient"],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            local_wrong_key = private_dir / "wrong-key.pem"
+            shutil.copyfile(wrong_key, local_wrong_key)
+            local_wrong_key.chmod(0o600)
+            wrong_key_output = private_dir / "wrong-key.json"
+            with mock.patch.object(
+                maintenance_decrypt,
+                "RECIPIENT_CERTIFICATE_SHA256",
+                certificate_fingerprint,
+            ), self.assertRaises(maintenance_decrypt.DecryptError):
+                maintenance_decrypt.decrypt_capture(
+                    artifact_archive=archive_path,
+                    binding_json=binding_path,
+                    private_key=local_wrong_key,
+                    certificate=local_certificate, destination=wrong_key_output,
+                    git_dir=git_dir,
+                )
+            self.assertFalse(wrong_key_output.exists())
+            self.assertIn("status=encrypted", result.stdout)
             self.assertNotIn("private-capture-evidence", result.stdout)
-            self.assertEqual(
-                github_output.read_text(encoding="ascii"),
-                f"evidence_sha256={evidence_sha256}\n",
-            )
+            self.assertNotIn(evidence_sha256, result.stdout)
+            self.assertFalse(github_output.exists())
             ssh_calls = [
                 json.loads(line) for line in ssh_log.read_text(encoding="utf-8").splitlines()
             ]
@@ -1265,10 +1495,6 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("retention-days: 1", workflow)
         self.assertIn('size_in_bytes"] <= 1024 * 1024', workflow)
         self.assertIn('os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW', workflow)
-        self.assertIn('"UnitFileState"', workflow)
-        self.assertIn('UnitFileState") not in {"disabled", "masked"}', workflow)
-        self.assertIn('payload.get("unit", {}).get("MainPID") != "0"', workflow)
-        self.assertNotIn('ExecMainStatus") != "3"', workflow)
         self.assertIn("EXPECTED_EVIDENCE_SHA256", workflow)
         self.assertIn("--capability \"$action\"", workflow)
         self.assertIn("reset_maintenance_failed", workflow)
@@ -1277,12 +1503,23 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         maintenance_helper = (
             TOOLS / "platform_maintenance_failure_evidence.py"
         ).read_text(encoding="utf-8")
+        self.assertNotIn('status=captured sha256=', maintenance_helper)
+        self.assertIn('"UnitFileState"', maintenance_helper)
+        self.assertIn('timer["UnitFileState"] not in {"disabled", "masked"}', maintenance_helper)
+        self.assertIn('unit["MainPID"] != "0"', maintenance_helper)
+        self.assertNotIn('ExecMainStatus") != "3"', maintenance_helper)
         self.assertIn('[SYSTEMCTL, "reset-failed", UNIT]', maintenance_helper)
         self.assertNotIn('[SYSTEMCTL, "start", UNIT]', maintenance_helper)
         self.assertNotIn('[SYSTEMCTL, "restart", UNIT]', maintenance_helper)
         self.assertIn("_validate_evidence(", maintenance_helper)
         self.assertIn("host_id_sha256", maintenance_helper)
         self.assertIn("platform_release_lock.sh\" --run", workflow)
+        upload_step = workflow.split("- name: Upload encrypted maintenance failure evidence", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn("actions/upload-artifact@", upload_step)
+        self.assertIn("path: ${{ runner.temp }}/platform-maintenance-capture-artifact/*", upload_step)
+        self.assertNotIn("path: ${{ runner.temp }}/platform-maintenance-evidence.json", workflow)
+        self.assertNotIn("$remote_stage/evidence.upload", workflow)
+        self.assertNotIn("REPOSITORY_PRIVATE", workflow)
         self.assertNotIn("git checkout", workflow)
         self.assertNotIn("platform_release_deploy", workflow)
         self.assertNotIn("downgrade", workflow)
@@ -4006,6 +4243,17 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
 
 
 class MaintenanceFailureEvidenceTests(unittest.TestCase):
+    def _evidence_path(self, app: Path, *, source_sha: str = "a" * 40) -> Path:
+        shared = app / "shared"
+        recovery = shared / ".release-recovery"
+        evidence_dir = recovery / "maintenance-failure-evidence"
+        shared.mkdir(exist_ok=True)
+        recovery.mkdir(mode=0o755, exist_ok=True)
+        evidence_dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(recovery, 0o755)
+        os.chmod(evidence_dir, 0o700)
+        return evidence_dir / f"{source_sha}-12345-1.json"
+
     def _properties(self, unit: str) -> dict[str, str]:
         return {
             "ActiveState": "failed" if unit == maintenance_evidence.UNIT else "inactive",
@@ -4029,7 +4277,8 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
             app.mkdir()
             (app / "releases").mkdir()
             (app / "shared").mkdir()
-            output = root / "evidence.json"
+            (app / "shared" / ".release-recovery").mkdir(mode=0o755)
+            output = self._evidence_path(app)
             def capture_properties(unit: str) -> dict[str, str]:
                 properties = self._properties(unit)
                 if unit == maintenance_evidence.TIMER:
@@ -4156,7 +4405,7 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
             root = Path(temporary)
             app = root / "app"
             app.mkdir()
-            evidence = root / "evidence.json"
+            evidence = self._evidence_path(app)
             with (
                 mock.patch.object(maintenance_evidence, "_validate_evidence", return_value={"pointers": {"current": "current-a", "previous": "previous-b"}, "receipts": {"operation_sha256": "b" * 64, "systemd_sha256": "c" * 64}, "unit": self._properties(maintenance_evidence.UNIT), "timer": self._properties(maintenance_evidence.TIMER)}),
                 mock.patch.object(maintenance_evidence, "_pointer", side_effect=("current-a", "previous-b")),
@@ -4187,6 +4436,7 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
             root = Path(temporary)
             app = root / "app"
             app.mkdir()
+            evidence = self._evidence_path(app)
             for mutation in ("receipt", "live-main-pid", "enabled-timer", "unit-tuple-drift"):
                 with self.subTest(reset_guard=mutation):
                     evidence_unit = self._properties(maintenance_evidence.UNIT)
@@ -4214,7 +4464,7 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
                                 app_dir=app,
                                 source_sha="a" * 40,
                                 bundle_sha="b" * 64,
-                                evidence=root / "evidence.json",
+                                evidence=evidence,
                                 evidence_sha="e" * 64,
                                 capture_run_id="12345",
                                 capture_run_attempt="1",
