@@ -31,6 +31,7 @@ MAX_STATE_BYTES = 64 * 1024
 MAX_PRIVATE_RETAINED_BYTES = 16 * 1024
 MAX_PRIVATE_TOTAL_VALUE = 2**63 - 1
 MAX_MODULE_BYTES = 2 * 1024 * 1024
+DIAGNOSTIC_TARGET_SOURCE_SHA = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
 HEALTH_URLS = (
     ("api_live", "http://127.0.0.1:8010/api/v1/health/live"),
     ("api_ready", "http://127.0.0.1:8010/api/v1/health/ready"),
@@ -385,6 +386,34 @@ def _private_runtime_detail(component: str, detail: dict[str, object]) -> None:
         stream.close()
 
 
+def _private_runtime_report(
+    component: str,
+    detail: dict[str, object],
+    *,
+    returncode: int,
+) -> None:
+    raw = json.dumps(detail, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
+    if len(raw) > MAX_PRIVATE_RETAINED_BYTES:
+        raise ProbeFailure("private_report_size")
+    stream = tempfile.TemporaryFile(mode="w+b")
+    try:
+        metadata = os.fstat(stream.fileno())
+        if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != _private_report_owner_uid():
+            raise ProbeFailure("private_report_metadata")
+        stream.write(raw)
+        stream.flush()
+        _emit_private_runtime_context(
+            stream,
+            component=component,
+            returncode=returncode,
+            total_bytes=len(raw),
+            position=len(raw),
+            retained_bytes=len(raw),
+        )
+    finally:
+        stream.close()
+
+
 def _unit_snapshot_with_deadline(
     module: Any,
     *,
@@ -633,11 +662,12 @@ def _read_stable_state(path: Path, check: str) -> dict[str, object]:
         before = path.lstat()
     except OSError:
         raise ProbeFailure(check, "oserror") from None
+    trusted_uid, trusted_gid = _trusted_state_owner()
     if (
         stat.S_ISLNK(before.st_mode)
         or not stat.S_ISREG(before.st_mode)
-        or before.st_uid != 0
-        or before.st_gid != 0
+        or before.st_uid != trusted_uid
+        or before.st_gid != trusted_gid
         or before.st_nlink != 1
         or stat.S_IMODE(before.st_mode) != 0o600
         or before.st_size > MAX_STATE_BYTES
@@ -671,6 +701,10 @@ def _read_stable_state(path: Path, check: str) -> dict[str, object]:
     if not isinstance(record, dict):
         raise ProbeFailure(check)
     return record
+
+
+def _trusted_state_owner() -> tuple[int, int]:
+    return 0, 0
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -730,6 +764,10 @@ def _private_capture_requested() -> bool:
         os.environ.get("PLATFORM_RUNTIME_PRIVATE_CAPTURE") == "1"
         and os.environ.get("PLATFORM_RUNTIME_PRIVATE_ROUTE") == "capture_probe"
     )
+
+
+def _private_report_owner_uid() -> int:
+    return os.geteuid()
 
 
 def _emit_private_runtime_context(
@@ -874,7 +912,11 @@ def _run_private_preflight(
 
 
 def _receipt_snapshot_and_preflight(
-    module: Any, transaction: tuple[object, ...], *, deadline: float
+    module: Any,
+    transaction: tuple[object, ...],
+    *,
+    deadline: float,
+    diagnostic_evidence: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], dict[str, object], str, str | None]:
     readonly_deadline = deadline
     (operation_id, operation, current_before, previous_before, _current_identity, _previous_identity, _active_overrides) = transaction
@@ -905,15 +947,22 @@ def _receipt_snapshot_and_preflight(
         "existing_receipt_validate",
         lambda: module._read_receipt(SYSTEMD_RECEIPT),
     )
-    _run(
-        "existing_receipt_validate",
-        lambda: module.validate(
-            SYSTEMD_RECEIPT,
-            app_dir=APP_DIR,
-            transaction=TRANSACTION,
-            helper_release=validation_release,
-        ),
-    )
+    try:
+        _run(
+            "existing_receipt_validate",
+            lambda: module.validate(
+                SYSTEMD_RECEIPT,
+                app_dir=APP_DIR,
+                transaction=TRANSACTION,
+                helper_release=validation_release,
+            ),
+        )
+    except ProbeFailure:
+        if diagnostic_evidence is not None:
+            diagnostic_evidence["validate_status"] = "failed"
+        raise
+    if diagnostic_evidence is not None:
+        diagnostic_evidence["validate_status"] = "passed"
     if (
         record.get("operation") != "rollback"
         or record.get("operation_id") != operation_id
@@ -929,10 +978,37 @@ def _receipt_snapshot_and_preflight(
     if not isinstance(manifest, dict):
         raise ProbeFailure("runtime_target_binding")
     source_sha = _run("release_metadata", lambda: _verify_release_source(validation_release, module))
+    if diagnostic_evidence is not None:
+        phase = transaction_record.get("phase")
+        rollback_runtime_phase = operation == "rollback" and phase in {
+            "rollback-runtime-pending",
+            "services-restarted",
+            "smoke-passed",
+            "filesystem-restored-runtime-pending",
+        }
+        restored_install_phase = operation == "install" and phase == "recovery-restored"
+        if (
+            not (rollback_runtime_phase or restored_install_phase)
+            or target_label != "current_before"
+            or source_sha != DIAGNOSTIC_TARGET_SOURCE_SHA
+        ):
+            raise ProbeFailure("diagnostic_target_binding")
     actual_helpers = _run("helper_digests", lambda: module._helper_digests(validation_release))
     nginx_digest = actual_helpers.get("tools/platform_install_nginx.py") if isinstance(actual_helpers, dict) else None
     if not isinstance(nginx_digest, str) or manifest.get("tools/platform_install_nginx.py") != nginx_digest:
         raise ProbeFailure("runtime_target_binding")
+    state_helper_relative = "tools/platform_release_systemd_state.py"
+    state_helper_digest = (
+        actual_helpers.get(state_helper_relative)
+        if isinstance(actual_helpers, dict)
+        else None
+    )
+    if diagnostic_evidence is not None and (
+        not isinstance(state_helper_digest, str)
+        or state_helper_digest != module.__verified_sha256__
+        or manifest.get(state_helper_relative) != state_helper_digest
+    ):
+        raise ProbeFailure("diagnostic_target_binding")
     runtime_installer_relative = "tools/platform_live_qa_runtime_install.py"
     runtime_installer_digest = (
         actual_helpers.get(runtime_installer_relative)
@@ -976,6 +1052,55 @@ def _receipt_snapshot_and_preflight(
         raise ProbeFailure("unit_snapshot")
     result["service_active_count"] = sum(item["active"] == "active" for item in states)
     result["service_enabled_count"] = sum(item["enabled"] == "enabled" for item in states)
+    if diagnostic_evidence is not None:
+        expected_units = record.get("units")
+        if (
+            not isinstance(expected_units, list)
+            or len(expected_units) != 13
+            or any(
+                not isinstance(item, dict)
+                or set(item) != {"name", "active", "enabled"}
+                or item.get("name") != unit
+                or item.get("active") not in _SYSTEMD_STATE_VALUES
+                or item.get("enabled") not in _SYSTEMD_ENABLED_VALUES
+                for unit, item in zip(units, expected_units, strict=True)
+            )
+        ):
+            raise ProbeFailure("diagnostic_receipt_units")
+        expected_snapshot = [
+            {"unit": item["name"], "active": item["active"], "enabled": item["enabled"]}
+            for item in expected_units
+        ]
+        observed_snapshot = [
+            {"unit": item["name"], "active": item["active"], "enabled": item["enabled"]}
+            for item in states
+        ]
+        mismatch_count = sum(
+            expected != observed
+            for expected, observed in zip(expected_snapshot, observed_snapshot, strict=True)
+        )
+        diagnostic_evidence.update(
+            collection_completed=True,
+            expected_units=expected_snapshot,
+            observed_units=observed_snapshot,
+            mismatch_count=mismatch_count,
+            current_facts_status="mismatch" if mismatch_count else "matched",
+        )
+        try:
+            _run(
+                "systemd_verify",
+                lambda: module.verify(
+                    SYSTEMD_RECEIPT,
+                    app_dir=APP_DIR,
+                    transaction=TRANSACTION,
+                    helper_release=validation_release,
+                ),
+            )
+        except ProbeFailure:
+            diagnostic_evidence["verify_status"] = "failed"
+        else:
+            diagnostic_evidence["verify_status"] = "passed"
+        return record, result, target_label, target_path
     if target is None:
         result["nginx_preflight"] = "not_applicable"
         result["nginx_preflight_returncode"] = "unavailable"
@@ -1150,10 +1275,90 @@ def _health() -> dict[str, bool]:
     return result
 
 
-def probe(expected_systemd_sha256: str) -> dict[str, object]:
+def _diagnostic_systemd_probe(
+    expected_systemd_sha256: str,
+    *,
+    companion_present: bool,
+    deadline: float,
+) -> dict[str, object]:
+    evidence: dict[str, object] = {
+        "schema": 1,
+        "collection_completed": False,
+        "validate_status": "unavailable",
+        "verify_status": "unavailable",
+        "current_facts_status": "unavailable",
+        "mismatch_count": 0,
+        "historical_cause_proven": False,
+        "expected_units": [],
+        "observed_units": [],
+    }
+    try:
+        if not companion_present:
+            raise ProbeFailure("diagnostic_receipt_absent")
+        module = _load_pinned_module(expected_systemd_sha256)
+        _run("systemctl_path", lambda: module._validate_systemctl_path(module.SYSTEMCTL))
+        transaction = _run("transaction_read", lambda: module._read_transaction(TRANSACTION, APP_DIR))
+        _receipt_snapshot_and_preflight(
+            module,
+            transaction,
+            deadline=deadline,
+            diagnostic_evidence=evidence,
+        )
+    except Exception:
+        state = "unavailable"
+        public_report: dict[str, object] = {
+            "schema": 1,
+            "kind": "release_capture_probe",
+            "status": "failed",
+            "failed_check": "diagnostic_unavailable",
+            "error_class": "predicate",
+            "diagnostic_systemd_state": state,
+            "diagnostic_systemd_state_returncode": "unavailable",
+        }
+        marker_returncode = 1
+    else:
+        passed = (
+            evidence["collection_completed"] is True
+            and evidence["validate_status"] == "passed"
+            and evidence["verify_status"] == "passed"
+            and evidence["current_facts_status"] == "matched"
+        )
+        state = "passed" if passed else (
+            "mismatch"
+            if evidence["current_facts_status"] == "mismatch"
+            else "unavailable"
+        )
+        public_report = {
+            "schema": 1,
+            "kind": "release_capture_probe",
+            "status": "passed" if passed else "failed",
+            "failed_check": "diagnostic_mismatch" if state == "mismatch" else "diagnostic_unavailable",
+            "error_class": "predicate",
+            "diagnostic_systemd_state": state,
+            "diagnostic_systemd_state_returncode": 0 if passed else 1,
+        }
+        if passed:
+            public_report.pop("failed_check")
+            public_report.pop("error_class")
+        marker_returncode = 0 if passed else 1
+    _private_runtime_report(
+        "systemd_state_probe",
+        evidence,
+        returncode=marker_returncode,
+    )
+    return public_report
+
+
+def probe(
+    expected_systemd_sha256: str,
+    *,
+    diagnostic_systemd_state: bool = False,
+) -> dict[str, object]:
     readonly_deadline = time.monotonic() + 480
     if os.geteuid() != 0:
         raise ProbeFailure("root", "permission")
+    if diagnostic_systemd_state and not _private_capture_requested():
+        raise ProbeFailure("diagnostic_private_capture", "permission")
     try:
         companion = SYSTEMD_RECEIPT.lstat()
         companion_present = True
@@ -1163,6 +1368,15 @@ def probe(expected_systemd_sha256: str) -> dict[str, object]:
         companion_present = False
     except OSError:
         raise ProbeFailure("companion_lstat", "oserror") from None
+
+    if diagnostic_systemd_state:
+        if not _private_capture_requested():
+            raise ProbeFailure("diagnostic_private_capture", "permission")
+        return _diagnostic_systemd_probe(
+            expected_systemd_sha256,
+            companion_present=companion_present,
+            deadline=readonly_deadline,
+        )
 
     module = _load_pinned_module(expected_systemd_sha256)
     if companion_present:
@@ -1330,18 +1544,23 @@ def probe(expected_systemd_sha256: str) -> dict[str, object]:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
+    arguments = sys.argv[1:]
+    diagnostic_systemd_state = bool(arguments and arguments[0] == "--diagnostic-systemd-state")
+    if diagnostic_systemd_state:
+        arguments = arguments[1:]
+    if len(arguments) != 2:
         report: dict[str, object] = {
             "schema": 1,
             "kind": "release_capture_probe",
             "status": "failed",
             "failed_check": "probe_identity",
             "error_class": "input",
-            "health": _health(),
         }
+        if not diagnostic_systemd_state:
+            report["health"] = _health()
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))
         return 1
-    expected_probe_sha256, expected_systemd_sha256 = sys.argv[1:]
+    expected_probe_sha256, expected_systemd_sha256 = arguments
     try:
         probe_source, probe_metadata = _safe_module_bytes(Path(__file__))
         if (
@@ -1351,7 +1570,10 @@ def main() -> int:
             raise ProbeFailure("probe_identity")
         if stat.S_IMODE(probe_metadata.st_mode) != 0o600:
             raise ProbeFailure("probe_identity")
-        report = probe(expected_systemd_sha256)
+        report = probe(
+            expected_systemd_sha256,
+            diagnostic_systemd_state=diagnostic_systemd_state,
+        )
     except ProbeFailure as exc:
         report = {
             "schema": 1,
@@ -1359,8 +1581,9 @@ def main() -> int:
             "status": "failed",
             "failed_check": exc.check,
             "error_class": exc.error_class,
-            "health": _health(),
         }
+        if not diagnostic_systemd_state:
+            report["health"] = _health()
         if exc.systemd_observation is not None:
             report["systemd_observation"] = exc.systemd_observation
         report.update(exc.safe_fields)
@@ -1371,8 +1594,9 @@ def main() -> int:
             "status": "failed",
             "failed_check": "internal",
             "error_class": "exception",
-            "health": _health(),
         }
+        if not diagnostic_systemd_state:
+            report["health"] = _health()
     print(json.dumps(report, sort_keys=True, separators=(",", ":")))
     return 0 if report["status"] == "passed" else 1
 

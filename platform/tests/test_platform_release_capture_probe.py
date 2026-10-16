@@ -26,6 +26,8 @@ class FakeSystemdState:
     def __init__(self, *, fail_query: tuple[str, str] | None = None, operation: str = "install", transaction_operation: str | None = None, phase: str = "rollback-runtime-pending") -> None:
         self.events: list[str] = []
         self.fail_query = fail_query
+        self.snapshot_active = "active"
+        self.snapshot_enabled = "enabled"
         self.operation = operation
         self.transaction_operation = transaction_operation or operation
         self.phase = phase
@@ -75,27 +77,33 @@ class FakeSystemdState:
             "previous_before": str(path.parents[1] / "releases" / "pending"),
             "helper_digests": {
                 "current_before": {
+                    "tools/platform_release_systemd_state.py": self.__verified_sha256__,
                     "tools/platform_install_nginx.py": "c" * 64,
                     "tools/platform_live_qa_runtime_install.py": "d" * 64,
                 },
                 "previous_before": {
+                    "tools/platform_release_systemd_state.py": self.__verified_sha256__,
                     "tools/platform_install_nginx.py": "c" * 64,
                     "tools/platform_live_qa_runtime_install.py": "d" * 64,
                 },
             },
+            "units": [
+                {"name": unit, "active": "active", "enabled": "enabled"}
+                for unit in self.OWNED_UNITS
+            ],
         }
 
     def _read_active(self, unit: str) -> str:
         self.events.append("active:" + unit)
         if self.fail_query == ("active", unit):
             raise RuntimeError("private command output must not escape")
-        return "active"
+        return self.snapshot_active
 
     def _read_enabled(self, unit: str) -> str:
         self.events.append("enabled:" + unit)
         if self.fail_query == ("enabled", unit):
             raise RuntimeError("private command output must not escape")
-        return "enabled"
+        return self.snapshot_enabled
 
     def _unit_snapshot(self, active_overrides=None):
         self.events.append("unit_snapshot")
@@ -103,6 +111,12 @@ class FakeSystemdState:
 
     def validate(self, path: Path, **kwargs) -> None:
         self.events.append("validate")
+
+    def verify(self, path: Path, **kwargs) -> None:
+        self.events.append("verify")
+        for unit in self.OWNED_UNITS:
+            if self._read_active(unit) != "active" or self._read_enabled(unit) != "enabled":
+                raise RuntimeError("unit state mismatch")
 
     def capture_transaction(self, *args, **kwargs):  # pragma: no cover - must remain unreachable
         raise AssertionError("write-capable capture invoked")
@@ -123,13 +137,21 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
         shared.mkdir()
         return shared / ".release-operation.json", shared / ".release-systemd-state.json"
 
-    def _run(self, fake: FakeSystemdState, transaction: Path, companion: Path):
+    def _run(
+        self,
+        fake: FakeSystemdState,
+        transaction: Path,
+        companion: Path,
+        *,
+        diagnostic_systemd_state: bool = False,
+        release_source: str = "a" * 40,
+    ):
         app_dir = transaction.parents[1]
         releases = app_dir / "releases"
         releases.mkdir()
         old_release = releases / "old"
         old_release.mkdir()
-        (old_release / "RELEASE.json").write_text('{"source_git_commit":"' + "a" * 40 + '"}\n', encoding="ascii")
+        (old_release / "RELEASE.json").write_text('{"source_git_commit":"' + release_source + '"}\n', encoding="ascii")
         if fake.operation == "rollback":
             previous_release = releases / "pending"
             previous_release.mkdir()
@@ -153,6 +175,9 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
         current_link.symlink_to(current_release)
         if fake.operation == "rollback":
             (app_dir / "previous").symlink_to(previous_release)
+        actual_effective_uid = os.geteuid()
+        actual_effective_gid = os.getegid()
+        effective_uid_patch = patch.object(probe.os, "geteuid", return_value=0)
         with (
             patch.object(probe, "APP_DIR", app_dir),
             patch.object(probe, "SHARED_DIR", transaction.parent),
@@ -162,9 +187,14 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             patch.object(probe, "SHARED_PYTHON", app_dir / "shared/venv/bin/python"),
             patch.object(probe, "_load_pinned_module", return_value=fake),
             patch.object(probe, "_health", return_value={"api_live": True, "api_ready": True, "web_local": True, "public": True}),
-            patch.object(probe.os, "geteuid", return_value=0),
+            effective_uid_patch,
+            patch.object(probe, "_private_report_owner_uid", return_value=actual_effective_uid),
+            patch.object(probe, "_trusted_state_owner", return_value=(actual_effective_uid, actual_effective_gid)),
         ):
-            return probe.probe(fake.__verified_sha256__)
+            return probe.probe(
+                fake.__verified_sha256__,
+                diagnostic_systemd_state=diagnostic_systemd_state,
+            )
 
     def test_absent_companion_runs_read_only_getters_and_fails_at_exact_unit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -314,6 +344,142 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             with self.assertRaises(probe.ProbeFailure) as caught:
                 self._run(fake, transaction, companion)
             self.assertEqual(caught.exception.check, "unit_enabled_deadlock-api_service")
+
+    def test_diagnostic_systemd_state_emits_private_success_without_runtime_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            transaction, companion = self._paths(Path(directory))
+            companion.write_text("fixture", encoding="ascii")
+            fake = FakeSystemdState(
+                operation="rollback", transaction_operation="install",
+                phase="recovery-restored",
+            )
+            fake.OWNED_UNITS = systemd_state.OWNED_UNITS
+            emitted = BytesIO()
+            with (
+                patch.object(probe, "_private_capture_requested", return_value=True),
+                patch.object(probe.sys, "stderr", SimpleNamespace(buffer=emitted)),
+                patch.object(
+                    probe,
+                    "_runtime_payload_integrity",
+                    side_effect=AssertionError("diagnostic route must skip the payload gate"),
+                ),
+            ):
+                result = self._run(
+                    fake,
+                    transaction,
+                    companion,
+                    diagnostic_systemd_state=True,
+                    release_source=probe.DIAGNOSTIC_TARGET_SOURCE_SHA,
+                )
+
+            self.assertEqual(
+                result,
+                {
+                    "schema": 1,
+                    "kind": "release_capture_probe",
+                    "status": "passed",
+                    "diagnostic_systemd_state": "passed",
+                    "diagnostic_systemd_state_returncode": 0,
+                },
+            )
+            self.assertEqual(fake.events.count("validate"), 1)
+            self.assertEqual(fake.events.count("verify"), 1)
+            self.assertNotIn("restore", fake.events)
+            transaction_record = json.loads(transaction.read_text(encoding="ascii"))
+            self.assertEqual(transaction_record["operation"], "install")
+            self.assertEqual(transaction_record["phase"], "recovery-restored")
+            self.assertTrue(transaction_record["current_before"])
+            self.assertTrue(transaction_record["previous_before"])
+            self.assertEqual(fake._read_receipt(companion)["operation"], "rollback")
+            marker_line = emitted.getvalue().decode("ascii").strip()
+            self.assertTrue(marker_line.startswith("RUNTIME_PRIVATE_CONTEXT "))
+            marker = json.loads(marker_line.removeprefix("RUNTIME_PRIVATE_CONTEXT "))
+            self.assertEqual(marker["component"], "systemd_state_probe")
+            self.assertEqual(marker["returncode"], 0)
+            detail = json.loads(base64.b64decode(marker["output_b64"]))
+            self.assertTrue(detail["collection_completed"])
+            self.assertEqual(detail["validate_status"], "passed")
+            self.assertEqual(detail["verify_status"], "passed")
+            self.assertEqual(detail["current_facts_status"], "matched")
+            self.assertFalse(detail["historical_cause_proven"])
+            self.assertEqual(len(detail["expected_units"]), 13)
+            self.assertEqual(detail["expected_units"], detail["observed_units"])
+            self.assertNotIn("expected_units", json.dumps(result))
+
+
+    def test_diagnostic_systemd_state_preserves_bounded_private_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            transaction, companion = self._paths(Path(directory))
+            companion.write_text("fixture", encoding="ascii")
+            fake = FakeSystemdState(operation="rollback")
+            fake.OWNED_UNITS = systemd_state.OWNED_UNITS
+            fake.snapshot_active = "inactive"
+            emitted = BytesIO()
+            with (
+                patch.object(probe, "_private_capture_requested", return_value=True),
+                patch.object(probe.sys, "stderr", SimpleNamespace(buffer=emitted)),
+            ):
+                result = self._run(
+                    fake,
+                    transaction,
+                    companion,
+                    diagnostic_systemd_state=True,
+                    release_source=probe.DIAGNOSTIC_TARGET_SOURCE_SHA,
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failed_check"], "diagnostic_mismatch")
+            self.assertEqual(result["diagnostic_systemd_state"], "mismatch")
+            self.assertEqual(result["diagnostic_systemd_state_returncode"], 1)
+            marker_line = emitted.getvalue().decode("ascii").strip()
+            marker = json.loads(marker_line.removeprefix("RUNTIME_PRIVATE_CONTEXT "))
+            self.assertEqual(marker["component"], "systemd_state_probe")
+            self.assertEqual(marker["returncode"], 1)
+            detail = json.loads(base64.b64decode(marker["output_b64"]))
+            self.assertTrue(detail["collection_completed"])
+            self.assertEqual(detail["verify_status"], "failed")
+            self.assertEqual(detail["current_facts_status"], "mismatch")
+            self.assertEqual(detail["mismatch_count"], 13)
+            self.assertEqual(detail["observed_units"][0]["active"], "inactive")
+            self.assertFalse(detail["historical_cause_proven"])
+            self.assertNotIn("inactive", json.dumps(result))
+
+    def test_diagnostic_systemd_state_fails_closed_for_unbound_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            transaction, companion = self._paths(Path(directory))
+            companion.write_text("fixture", encoding="ascii")
+            fake = FakeSystemdState(operation="rollback")
+            fake.OWNED_UNITS = systemd_state.OWNED_UNITS
+            emitted = BytesIO()
+            with (
+                patch.object(probe, "_private_capture_requested", return_value=True),
+                patch.object(probe.sys, "stderr", SimpleNamespace(buffer=emitted)),
+            ):
+                result = self._run(
+                    fake,
+                    transaction,
+                    companion,
+                    diagnostic_systemd_state=True,
+                    release_source="b" * 40,
+                )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["diagnostic_systemd_state"], "unavailable")
+            self.assertEqual(result["diagnostic_systemd_state_returncode"], "unavailable")
+            detail = json.loads(
+                base64.b64decode(
+                    json.loads(
+                        emitted.getvalue().decode("ascii").strip().removeprefix("RUNTIME_PRIVATE_CONTEXT ")
+                    )["output_b64"]
+                )
+            )
+            self.assertEqual(detail["validate_status"], "passed")
+            self.assertEqual(detail["verify_status"], "unavailable")
+            self.assertFalse(detail["collection_completed"])
+            self.assertEqual(detail["expected_units"], [])
+            self.assertEqual(detail["observed_units"], [])
+            self.assertNotIn("unit_snapshot", fake.events)
+            self.assertNotIn("verify", fake.events)
 
     def test_existing_companion_uses_only_existing_read_validator(self) -> None:
         expected_files = {"platform/tools/helper.py": "a" * 64, "source-sha": "b" * 64}

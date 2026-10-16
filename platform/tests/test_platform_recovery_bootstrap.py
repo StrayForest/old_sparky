@@ -1615,7 +1615,14 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             private_stderr = PrivateStderr()
             components = (
                 "runtime_reconcile", "systemd_units", "nginx_apply",
-                "nginx_config_test", "nginx_reload",
+                "nginx_config_test", "systemd_state_restore",
+            )
+            all_runtime_components = (
+                "systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile",
+                "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload",
+                "systemd_restore_enabled", "systemd_state_restore", "systemd_restart",
+                "systemd_active_api", "systemd_active_worker", "systemd_active_web",
+                "readiness_internal", "readiness_public", "smoke_internal", "smoke_external",
             )
             with mock.patch.object(capture_probe.sys, "stderr", private_stderr):
                 for component in components:
@@ -1634,6 +1641,346 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     )
             marker_line = private_stderr.buffer.getvalue()
             self.assertLessEqual(len(marker_line), 131072)
+            recovery_workflow = (
+                REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
+            ).read_text(encoding="utf-8")
+            validator_start = recovery_workflow.index(
+                'raw = Path(os.environ["PRIVATE_REMOTE_ERROR"]).read_bytes()'
+            )
+            validator_start = recovery_workflow.rfind("          import base64\n", 0, validator_start)
+            validator_end = recovery_workflow.index("\n          PY\n", validator_start)
+            embedded_runtime_validator = textwrap.dedent(
+                recovery_workflow[validator_start:validator_end]
+            )
+            with tempfile.TemporaryDirectory() as validator_directory:
+                validator_root = Path(validator_directory)
+                remote_error_path = validator_root / "remote-error"
+                remote_error_path.write_bytes(marker_line)
+                payload_path = validator_root / "payload.json"
+                validator_env = os.environ.copy()
+                validator_env.update({
+                    "PRIVATE_REMOTE_ERROR": str(remote_error_path),
+                    "PRIVATE_PAYLOAD": str(payload_path),
+                    "PRIVATE_ACTION_RUN_ID": "78901",
+                    "PRIVATE_ACTION_RUN_ATTEMPT": "1",
+                    "PRIVATE_WORKFLOW_SHA": "f" * 40,
+                    "PRIVATE_SOURCE_SHA": "f" * 40,
+                    "PRIVATE_BUNDLE_SHA": "b" * 64,
+                    "PRIVATE_SECURITY_RUN_ID": "12345",
+                    "PRIVATE_SECURITY_RUN_ATTEMPT": "1",
+                    "PRIVATE_RECOVERY_RUN_ID": "23456",
+                    "PRIVATE_RECOVERY_RUN_ATTEMPT": "1",
+                    "PRIVATE_PUBLISHER_RUN_ID": "34567",
+                    "PRIVATE_PUBLISHER_RUN_ATTEMPT": "1",
+                })
+                validator_result = subprocess.run(
+                    [sys.executable, "-I", "-c", embedded_runtime_validator],
+                    capture_output=True, text=True, env=validator_env,
+                    check=False, timeout=5,
+                )
+                self.assertEqual(
+                    validator_result.returncode, 0,
+                    validator_result.stdout + validator_result.stderr,
+                )
+                encrypted_payload = json.loads(payload_path.read_text(encoding="ascii"))
+                self.assertEqual(encrypted_payload["kind"], "release_runtime_failure_private_context")
+                self.assertEqual(encrypted_payload["route"], "recover_pending")
+                self.assertEqual(
+                    base64.b64decode(encrypted_payload["remote_stderr_b64"], validate=True),
+                    marker_line,
+                )
+            for component in all_runtime_components:
+                with self.subTest(private_component=component):
+                    retained_output = io.BytesIO()
+                    marker_output = io.BytesIO()
+                    private_stderr.buffer = marker_output
+                    position, retained_size = capture_probe._append_private_tail(
+                        retained_output, 0, 0, (component.encode("ascii") + b" private detail"),
+                    )
+                    with mock.patch.object(capture_probe.sys, "stderr", private_stderr):
+                        capture_probe._emit_private_runtime_context(
+                            retained_output,
+                            route="recover_pending",
+                            component=component,
+                            returncode=2,
+                            total_bytes=len(component) + len(b" private detail"),
+                            position=position,
+                            retained_bytes=retained_size,
+                        )
+                    maintenance_decrypt._validate_runtime_marker(
+                        marker_output.getvalue(), "recover_pending",
+                    )
+            diagnostic_units = [
+                "deadlock-api.service", "deadlock-worker.service", "deadlock-web.service",
+                "deadlock-maintenance.service", "deadlock-maintenance.timer",
+                "deadlock-logrotate.service", "deadlock-logrotate.timer",
+                "deadlock-offsite-backup.service", "deadlock-offsite-backup.timer",
+                "deadlock-cloudflare-ips.service", "deadlock-cloudflare-ips.timer",
+                "deadlock-health-monitor.service", "deadlock-health-monitor.timer",
+            ]
+            diagnostic_rows = [
+                {"unit": unit, "active": "inactive", "enabled": "disabled"}
+                for unit in diagnostic_units
+            ]
+            systemd_diagnostic = {
+                "schema": 1,
+                "collection_completed": True,
+                "validate_status": "passed",
+                "verify_status": "passed",
+                "current_facts_status": "matched",
+                "mismatch_count": 0,
+                "historical_cause_proven": False,
+                "expected_units": diagnostic_rows,
+                "observed_units": diagnostic_rows,
+            }
+            diagnostic_output = json.dumps(
+                systemd_diagnostic, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+            diagnostic_retained = io.BytesIO()
+            diagnostic_marker_stream = io.BytesIO()
+            private_stderr.buffer = diagnostic_marker_stream
+            diagnostic_position, diagnostic_retained_size = capture_probe._append_private_tail(
+                diagnostic_retained, 0, 0, diagnostic_output,
+            )
+            with mock.patch.object(capture_probe.sys, "stderr", private_stderr):
+                capture_probe._emit_private_runtime_context(
+                    diagnostic_retained,
+                    route="capture_probe",
+                    component="systemd_state_probe",
+                    returncode=0,
+                    total_bytes=len(diagnostic_output),
+                    position=diagnostic_position,
+                    retained_bytes=diagnostic_retained_size,
+                )
+            diagnostic_marker = diagnostic_marker_stream.getvalue()
+            maintenance_decrypt._validate_runtime_marker(diagnostic_marker, "capture_probe")
+            bad_diagnostic = dict(systemd_diagnostic, historical_cause_proven=True)
+            bad_output = json.dumps(bad_diagnostic, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            bad_stream = io.BytesIO()
+            private_stderr.buffer = bad_stream
+            bad_buffer = io.BytesIO()
+            bad_position, bad_retained_size = capture_probe._append_private_tail(
+                bad_buffer, 0, 0, bad_output,
+            )
+            with mock.patch.object(capture_probe.sys, "stderr", private_stderr):
+                capture_probe._emit_private_runtime_context(
+                    bad_buffer,
+                    route="capture_probe",
+                    component="systemd_state_probe",
+                    returncode=0,
+                    total_bytes=len(bad_output),
+                    position=bad_position,
+                    retained_bytes=bad_retained_size,
+                )
+            with self.assertRaises(maintenance_decrypt.DecryptError):
+                maintenance_decrypt._validate_runtime_marker(bad_stream.getvalue(), "capture_probe")
+
+            diagnostics_workflow = (
+                REPO_ROOT / ".github/workflows/platform-production-diagnostics.yml"
+            ).read_text(encoding="utf-8")
+            diagnostic_validator_start = diagnostics_workflow.index(
+                'raw = Path(os.environ["PRIVATE_REMOTE_ERROR"]).read_bytes()'
+            )
+            diagnostic_validator_start = diagnostics_workflow.rfind(
+                "          import base64\n", 0, diagnostic_validator_start,
+            )
+            diagnostic_validator_end = diagnostics_workflow.index(
+                "\n          PY\n", diagnostic_validator_start,
+            )
+            embedded_diagnostic_validator = textwrap.dedent(
+                diagnostics_workflow[diagnostic_validator_start:diagnostic_validator_end]
+            )
+            with tempfile.TemporaryDirectory() as diagnostic_validator_directory:
+                validator_root = Path(diagnostic_validator_directory)
+                remote_error = validator_root / "remote-error"
+                remote_error.write_bytes(diagnostic_marker)
+                private_payload = validator_root / "private-payload.json"
+                validated = subprocess.run(
+                    [sys.executable, "-I", "-c", embedded_diagnostic_validator, str(remote_error), "0"],
+                    capture_output=True, text=True, check=False, timeout=5,
+                    env={
+                        **os.environ,
+                        "PRIVATE_REMOTE_ERROR": str(remote_error),
+                        "PRIVATE_PAYLOAD": str(private_payload),
+                        "PRIVATE_ACTION_RUN_ID": "78901",
+                        "PRIVATE_ACTION_RUN_ATTEMPT": "1",
+                        "PRIVATE_WORKFLOW_SHA": "f" * 40,
+                        "PRIVATE_SOURCE_SHA": "f" * 40,
+                    },
+                )
+                self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
+                diagnostic_private = json.loads(private_payload.read_text(encoding="ascii"))
+                self.assertEqual(diagnostic_private["route"], "capture_probe")
+                self.assertEqual(
+                    base64.b64decode(diagnostic_private["remote_stderr_b64"], validate=True),
+                    diagnostic_marker,
+                )
+                success_marker = json.loads(
+                    diagnostic_marker.decode("ascii").split(" ", 1)[1]
+                )
+                impossible_failure_marker = dict(success_marker, returncode=1)
+                remote_error.write_bytes(
+                    b"RUNTIME_PRIVATE_CONTEXT "
+                    + json.dumps(impossible_failure_marker, sort_keys=True, separators=(",", ":")).encode("ascii")
+                    + b"\n"
+                )
+                inconsistent_marker = subprocess.run(
+                    [sys.executable, "-I", "-c", embedded_diagnostic_validator, str(remote_error), "0"],
+                    capture_output=True, text=True, check=False, timeout=5,
+                    env={
+                        **os.environ,
+                        "PRIVATE_REMOTE_ERROR": str(remote_error),
+                        "PRIVATE_PAYLOAD": str(private_payload),
+                        "PRIVATE_ACTION_RUN_ID": "78901",
+                        "PRIVATE_ACTION_RUN_ATTEMPT": "1",
+                        "PRIVATE_WORKFLOW_SHA": "f" * 40,
+                        "PRIVATE_SOURCE_SHA": "f" * 40,
+                    },
+                )
+                self.assertEqual(inconsistent_marker.returncode, 2)
+                public_validator_start = diagnostics_workflow.index(
+                    'fallback = {"schema": 1, "kind": "release_capture_probe"',
+                )
+                public_validator_start = diagnostics_workflow.rfind(
+                    "          import json, re, sys\n", 0, public_validator_start,
+                )
+                public_validator_end = diagnostics_workflow.index(
+                    "\n          PY\n", public_validator_start,
+                )
+                embedded_public_validator = textwrap.dedent(
+                    diagnostics_workflow[public_validator_start:public_validator_end]
+                )
+                public_report_path = validator_root / "public-report.jsonl"
+                public_success_report = {
+                    "schema": 1,
+                    "kind": "release_capture_probe",
+                    "status": "passed",
+                    "diagnostic_systemd_state": "passed",
+                    "diagnostic_systemd_state_returncode": 0,
+                }
+                public_report_path.write_text(
+                    json.dumps(public_success_report, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                public_success = subprocess.run(
+                    [sys.executable, "-I", "-c", embedded_public_validator, str(public_report_path), "0"],
+                    capture_output=True, text=True, check=False, timeout=5,
+                )
+                self.assertEqual(public_success.returncode, 0, public_success.stdout + public_success.stderr)
+                self.assertIn('"diagnostic_systemd_state":"passed"', public_success.stdout)
+                public_mismatch_report = {
+                    "schema": 1,
+                    "kind": "release_capture_probe",
+                    "status": "failed",
+                    "failed_check": "diagnostic_mismatch",
+                    "error_class": "predicate",
+                    "diagnostic_systemd_state": "mismatch",
+                    "diagnostic_systemd_state_returncode": 1,
+                }
+                public_report_path.write_text(
+                    json.dumps(public_mismatch_report, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                public_mismatch = subprocess.run(
+                    [sys.executable, "-I", "-c", embedded_public_validator, str(public_report_path), "1"],
+                    capture_output=True, text=True, check=False, timeout=5,
+                )
+                self.assertEqual(public_mismatch.returncode, 0, public_mismatch.stdout + public_mismatch.stderr)
+                self.assertIn('"diagnostic_systemd_state":"mismatch"', public_mismatch.stdout)
+
+            capture_provenance = {
+                "route": "capture_probe",
+                "workflow_run_id": "78901",
+                "workflow_run_attempt": "1",
+                "workflow_sha": "f" * 40,
+                "source_sha": "f" * 40,
+                "bundle_sha256": None,
+                "security_run_id": None,
+                "security_run_attempt": None,
+                "recovery_run_id": None,
+                "recovery_run_attempt": None,
+                "publisher_run_id": None,
+                "publisher_run_attempt": None,
+            }
+            capture_plaintext = {
+                "schema": 1,
+                "kind": "release_runtime_failure_private_context",
+                "repository": "StrayForest/old_sparky",
+                "workflow_path": ".github/workflows/platform-production-diagnostics.yml",
+                **capture_provenance,
+                "remote_stderr_b64": base64.b64encode(diagnostic_marker).decode("ascii"),
+                "remote_stderr_size": len(diagnostic_marker),
+            }
+            capture_plaintext_path = private_dir / "capture-probe-plaintext.json"
+            capture_plaintext_path.write_text(
+                json.dumps(capture_plaintext, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="ascii",
+            )
+            capture_plaintext_path.chmod(0o600)
+            capture_ciphertext_path = private_dir / "capture-probe-evidence.cms"
+            subprocess.run(
+                [
+                    "openssl", "cms", "-encrypt", "-binary", "-aes-256-gcm", "-outform", "DER",
+                    "-in", str(capture_plaintext_path), "-out", str(capture_ciphertext_path),
+                    "-recip", str(local_certificate), "-keyopt", "rsa_padding_mode:oaep",
+                    "-keyopt", "rsa_oaep_md:sha256",
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            capture_ciphertext = capture_ciphertext_path.read_bytes()
+            capture_manifest = {
+                "schema": 1,
+                "kind": "encrypted_release_runtime_failure_context",
+                "repository": "StrayForest/old_sparky",
+                "workflow_path": ".github/workflows/platform-production-diagnostics.yml",
+                **capture_provenance,
+                "recipient_certificate_sha256": certificate_fingerprint,
+                "encryption": maintenance_decrypt.ENCRYPTION_PROFILE,
+                "ciphertext_sha256": hashlib.sha256(capture_ciphertext).hexdigest(),
+                "ciphertext_size": len(capture_ciphertext),
+            }
+            capture_archive = private_dir / "capture-probe-evidence.zip"
+            with zipfile.ZipFile(capture_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    "manifest.json",
+                    json.dumps(capture_manifest, sort_keys=True, separators=(",", ":")).encode("ascii"),
+                )
+                archive.writestr("evidence.cms", capture_ciphertext)
+            capture_archive.chmod(0o600)
+            capture_binding = {
+                "schema": 1,
+                "kind": "github_release_runtime_failure_binding",
+                "repository": "StrayForest/old_sparky",
+                "workflow_path": ".github/workflows/platform-production-diagnostics.yml",
+                "artifact_id": "99012",
+                "artifact_name": "platform-release-runtime-failure-78901-1",
+                "artifact_digest": f"sha256:{hashlib.sha256(capture_archive.read_bytes()).hexdigest()}",
+                **capture_provenance,
+            }
+            capture_binding_path = private_dir / "capture-probe-binding.json"
+            capture_binding_path.write_text(
+                json.dumps(capture_binding, sort_keys=True, separators=(",", ":")),
+                encoding="ascii",
+            )
+            capture_binding_path.chmod(0o600)
+            capture_decrypted_path = private_dir / "capture-probe-decrypted.json"
+            with mock.patch.object(
+                maintenance_decrypt,
+                "RECIPIENT_CERTIFICATE_SHA256",
+                certificate_fingerprint,
+            ):
+                maintenance_decrypt.decrypt_runtime_failure_context(
+                    artifact_archive=capture_archive,
+                    binding_json=capture_binding_path,
+                    private_key=local_key,
+                    certificate=local_certificate,
+                    destination=capture_decrypted_path,
+                    git_dir=git_dir,
+                )
+            self.assertEqual(
+                json.loads(capture_decrypted_path.read_text(encoding="ascii")),
+                capture_plaintext,
+            )
             runtime_provenance = {
                 "route": "recover_pending",
                 "workflow_run_id": "78901",
@@ -2300,6 +2647,34 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn('"$NGINX_TOOL" --apply --reload --json', runtime_restore)
         self.assertIn('RUNTIME_PRIVATE_CAPTURE="${PLATFORM_RUNTIME_PRIVATE_CAPTURE:-0}"', runtime_restore)
         self.assertIn('prepare_runtime_private >/dev/null 2>/dev/null', runtime_restore)
+        self.assertIn("if run_systemctl is-active --quiet deadlock-api >/dev/null 2>/dev/null; then", runtime_restore)
+        self.assertIn("if run_systemctl is-active --quiet deadlock-web >/dev/null 2>/dev/null; then", runtime_restore)
+        self.assertNotIn(
+            "if run_private_command systemd_active_api run_systemctl is-active --quiet deadlock-api; then",
+            runtime_restore,
+        )
+        predicate_start = runtime_restore.index(
+            "  if run_systemctl is-active --quiet deadlock-api >/dev/null 2>/dev/null; then",
+        )
+        predicate_end = runtime_restore.index(
+            '\nfi\n\nif [[ "$RUN_SMOKE"', predicate_start,
+        )
+        predicate_shell = (
+            "set -euo pipefail\n"
+            "run_systemctl() { printf 'systemctl:%s\\n' \"$*\"; return 3; }\n"
+            "run_private_command() { printf 'unexpected-private-marker:%s\\n' \"$1\"; return 3; }\n"
+            "if true; then\n"
+            + runtime_restore[predicate_start:predicate_end]
+            + "\nfi\n"
+        )
+        predicate_result = subprocess.run(
+            ["bash", "-c", predicate_shell], capture_output=True, text=True,
+            check=False, timeout=3,
+        )
+        self.assertEqual(predicate_result.returncode, 0, predicate_result.stderr)
+        self.assertEqual(predicate_result.stdout, "")
+        self.assertEqual(predicate_result.stderr, "")
+        self.assertNotIn("unexpected-private-marker", predicate_result.stdout)
 
         private_runner = "run_private_command() {" + runtime_restore.split(
             "run_private_command() {", 1
@@ -2426,6 +2801,66 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             self.assertEqual(quiet_result.returncode, 0, quiet_result.stdout + quiet_result.stderr)
             self.assertEqual(quiet_result.stdout, "status=23\n")
             self.assertEqual(quiet_result.stderr, "")
+
+            restore_function = runtime_restore.split(
+                "restore_systemd_state() {", 1
+            )[1].split("\n}\n", 1)[0]
+            restore_script = "restore_systemd_state() {" + restore_function + "\n}\n"
+            restore_venv = root / "restore-venv"
+            restore_python = restore_venv / "bin" / "python"
+            restore_python.parent.mkdir(parents=True, exist_ok=True)
+            restore_python.write_text(
+                "#!/usr/bin/env bash\n"
+                'printf "state-restore-private-error\\n" >&2\n'
+                "exit 2\n",
+                encoding="ascii",
+            )
+            restore_python.chmod(0o700)
+            later_restore_step = root / "later-restore-step"
+            restore_command = "\n".join((
+                "set -euo pipefail",
+                'RUNTIME_PRIVATE_CAPTURE="1"',
+                'RUNTIME_PRIVATE_ROUTE="recover_pending"',
+                'RUNTIME_PRIVATE_MARKER_COUNT=0',
+                f"SHARED_VENV={shlex.quote(str(restore_venv))}",
+                f"SYSTEMD_STATE_TOOL={shlex.quote(str(root / 'systemd-state.py'))}",
+                f"SYSTEMD_STATE={shlex.quote(str(root / 'state.json'))}",
+                f"TRANSACTION_STATE={shlex.quote(str(root / 'transaction.json'))}",
+                f"APP_DIR={shlex.quote(str(root / 'app'))}",
+                f"RELEASE={shlex.quote(str(root / 'release'))}",
+                'SYSTEMCTL_BIN="/usr/bin/systemctl"',
+                script,
+                restore_script,
+                "restore_systemd_state",
+                f"touch {shlex.quote(str(later_restore_step))}",
+            ))
+            restore_result = subprocess.run(
+                ["bash", "-c", restore_command], capture_output=True, text=True,
+                check=False, timeout=5,
+            )
+            self.assertEqual(restore_result.returncode, 2, restore_result.stdout + restore_result.stderr)
+            self.assertFalse(later_restore_step.exists())
+            self.assertNotIn("state-restore-private-error", restore_result.stdout)
+            self.assertNotIn("state-restore-private-error", restore_result.stderr)
+            restore_marker = next(
+                line for line in restore_result.stderr.splitlines()
+                if line.startswith("RUNTIME_PRIVATE_CONTEXT ")
+            )
+            self.assertEqual(
+                json.loads(restore_marker.removeprefix("RUNTIME_PRIVATE_CONTEXT ")),
+                {
+                    "schema": 1,
+                    "route": "recover_pending",
+                    "component": "systemd_state_restore",
+                    "guard_id": None,
+                    "returncode": 2,
+                    "stream": "combined",
+                    "output_b64": base64.b64encode(b"state-restore-private-error\n").decode("ascii"),
+                    "total_bytes": len(b"state-restore-private-error\n"),
+                    "truncated": False,
+                    "retained": "tail",
+                },
+            )
 
             ran_later = root / "later-command-ran"
             reconcile = root / "fake-reconcile"

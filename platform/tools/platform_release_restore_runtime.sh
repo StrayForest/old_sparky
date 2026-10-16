@@ -382,7 +382,7 @@ run_private_command() {
   fi
 
   case "$component" in
-    systemd_state_validate|runtime_artifact_proof|runtime_reconcile|systemd_units|nginx_apply|nginx_config_test|nginx_reload|systemd_restore_enabled) ;;
+    systemd_state_validate|runtime_artifact_proof|runtime_reconcile|systemd_units|nginx_apply|nginx_config_test|nginx_reload|systemd_restore_enabled|systemd_state_restore|systemd_restart|systemd_active_api|systemd_active_worker|systemd_active_web|readiness_internal|readiness_public|smoke_internal|smoke_external) ;;
     *) return 1 ;;
   esac
   marker_path="$(mktemp --tmpdir=/tmp "oldsparky-runtime-${component}.XXXXXX")" || return 1
@@ -406,7 +406,9 @@ while True:
         del raw[:-16384]
 if route != "recover_pending" or component not in {
     "systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile", "systemd_units", "nginx_apply",
-    "nginx_config_test", "nginx_reload", "systemd_restore_enabled",
+    "nginx_config_test", "nginx_reload", "systemd_restore_enabled", "systemd_state_restore",
+    "systemd_restart", "systemd_active_api", "systemd_active_worker", "systemd_active_web",
+    "readiness_internal", "readiness_public", "smoke_internal", "smoke_external",
 }:
     raise SystemExit("private runtime context is invalid")
 payload = "RUNTIME_PRIVATE_CONTEXT " + json.dumps({
@@ -563,12 +565,11 @@ restore_systemd_state() {
   [[ -n "$SYSTEMD_STATE" ]] || return 0
   local transaction_args=()
   [[ -n "$TRANSACTION_STATE" ]] && transaction_args=(--transaction "$TRANSACTION_STATE")
-  "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
+  run_private_command systemd_state_restore "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
     restore --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
     --helper-release "$RELEASE" \
     --systemctl "$SYSTEMCTL_BIN" \
-    "${transaction_args[@]}" \
-    >/dev/null 2>/dev/null
+    "${transaction_args[@]}"
 }
 
 if [[ "$PREPARE_RUNTIME" -eq 1 ]]; then
@@ -595,18 +596,23 @@ if [[ "$RUN_RESTART" -eq 1 && "$RESTART_AFTER" -eq 1 ]]; then
   if [[ -n "$SYSTEMD_STATE" ]]; then
     restore_systemd_state
   else
-    run_systemctl restart deadlock-api deadlock-worker deadlock-web >/dev/null 2>/dev/null
+    run_private_command systemd_restart run_systemctl restart deadlock-api deadlock-worker deadlock-web
     for service in deadlock-api deadlock-worker deadlock-web; do
-      run_systemctl is-active --quiet "$service" >/dev/null 2>/dev/null
+      case "$service" in
+        deadlock-api) active_component=systemd_active_api ;;
+        deadlock-worker) active_component=systemd_active_worker ;;
+        deadlock-web) active_component=systemd_active_web ;;
+      esac
+      run_private_command "$active_component" run_systemctl is-active --quiet "$service"
     done
   fi
   if run_systemctl is-active --quiet deadlock-api >/dev/null 2>/dev/null; then
-    /usr/bin/curl --fail --silent --show-error --max-time 10 \
-      http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null
+    run_private_command readiness_internal /usr/bin/curl --fail --silent --show-error --max-time 10 \
+      http://127.0.0.1:8010/api/v1/health/ready
   fi
   if run_systemctl is-active --quiet deadlock-web >/dev/null 2>/dev/null; then
-    /usr/bin/curl --fail --silent --show-error --max-time 10 \
-      http://127.0.0.1:3000/ >/dev/null 2>/dev/null
+    run_private_command readiness_public /usr/bin/curl --fail --silent --show-error --max-time 10 \
+      http://127.0.0.1:3000/
   fi
 fi
 
@@ -615,22 +621,22 @@ if [[ "$RUN_SMOKE" -eq 1 ]]; then
     PLATFORM_PYTHON_BIN="$SHARED_VENV/bin/python" \
     PLATFORM_SHARED_DIR="$APP_DIR/shared" \
     PLATFORM_APP_DIR="$APP_DIR" \
-    "$SHARED_VENV/bin/python" "$SMOKE_TOOL" \
+    run_private_command smoke_internal "$SHARED_VENV/bin/python" "$SMOKE_TOOL" \
       --app-dir "$APP_DIR" \
       --env-file "$APP_DIR/shared/.env.platform" \
       --edge-origin "$EDGE_ORIGIN" \
       --edge-host "$EDGE_HOST" \
       --edge-insecure-loopback \
-      --expected-csp-mode "$EXPECTED_CSP_MODE" >/dev/null 2>/dev/null
+      --expected-csp-mode "$EXPECTED_CSP_MODE"
   PLATFORM_ENV_FILE="$APP_DIR/shared/.env.platform" \
     PLATFORM_PYTHON_BIN="$SHARED_VENV/bin/python" \
     PLATFORM_SHARED_DIR="$APP_DIR/shared" \
     PLATFORM_APP_DIR="$APP_DIR" \
-    "$SHARED_VENV/bin/python" "$SMOKE_TOOL" \
+    run_private_command smoke_external "$SHARED_VENV/bin/python" "$SMOKE_TOOL" \
       --app-dir "$APP_DIR" \
       --env-file "$APP_DIR/shared/.env.platform" \
       --edge-origin "$PUBLIC_EDGE_ORIGIN" \
-      --expected-csp-mode "$EXPECTED_CSP_MODE" >/dev/null 2>/dev/null
+      --expected-csp-mode "$EXPECTED_CSP_MODE"
 fi
 
 public_status restored

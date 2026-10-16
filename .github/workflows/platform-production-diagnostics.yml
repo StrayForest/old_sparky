@@ -11,6 +11,11 @@ on:
           - capture-probe
         default: existing
         required: true
+      diagnostic_systemd_state:
+        description: Collect a private read-only systemd receipt/current-state comparison for the fixed pending target
+        type: boolean
+        default: false
+        required: false
       recipient_certificate_b64:
         description: Pinned public certificate for encrypted read-only preflight diagnostics
         type: string
@@ -494,10 +499,12 @@ jobs:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           PRIVATE_CAPTURE: ${{ steps.runtime_failure_recipient.outputs.capture_enabled }}
+          DIAGNOSTIC_SYSTEMD_STATE: ${{ inputs.diagnostic_systemd_state }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
           [[ "${PRIVATE_CAPTURE:-}" == 1 ]]
+          [[ "$DIAGNOSTIC_SYSTEMD_STATE" == true || "$DIAGNOSTIC_SYSTEMD_STATE" == false ]]
           remote_log="$RUNNER_TEMP/platform-production-capture-probe.log"
           remote_error="$RUNNER_TEMP/platform-production-capture-probe-error.log"
           umask 077
@@ -508,7 +515,7 @@ jobs:
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
             -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "PLATFORM_RUNTIME_PRIVATE_CAPTURE=1 PLATFORM_RUNTIME_PRIVATE_ROUTE='capture_probe' bash -c 'set -euo pipefail; lock=/run/oldsparky-capture-probe-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/platform_release_lock.sh; expected=$LOCK_HELPER_SHA256; test -f \"\$lock\" && test ! -L \"\$lock\"; test \"\$(stat -c %u:%g:%a:%h \"\$lock\")\" = 0:0:600:1; read -r actual _ < <(/usr/bin/sha256sum -- \"\$lock\"); [[ \"\$actual\" == \"\$expected\" ]]; exec bash \"\$lock\" --run /usr/bin/bash -s -- \"\$@\"' _ '$TARGET_SHA' '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT' '$CAPTURE_PROBE_DIR_ID' '$PROBE_SHA256' '$SYSTEMD_SHA256' '$LOCK_HELPER_SHA256'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
+            "PLATFORM_RUNTIME_PRIVATE_CAPTURE=1 PLATFORM_RUNTIME_PRIVATE_ROUTE='capture_probe' bash -c 'set -euo pipefail; lock=/run/oldsparky-capture-probe-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/platform_release_lock.sh; expected=$LOCK_HELPER_SHA256; test -f \"\$lock\" && test ! -L \"\$lock\"; test \"\$(stat -c %u:%g:%a:%h \"\$lock\")\" = 0:0:600:1; read -r actual _ < <(/usr/bin/sha256sum -- \"\$lock\"); [[ \"\$actual\" == \"\$expected\" ]]; exec bash \"\$lock\" --run /usr/bin/bash -s -- \"\$@\"' _ '$TARGET_SHA' '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT' '$CAPTURE_PROBE_DIR_ID' '$PROBE_SHA256' '$SYSTEMD_SHA256' '$LOCK_HELPER_SHA256' '$DIAGNOSTIC_SYSTEMD_STATE'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
           target_sha="$1"
           run_id="$2"
@@ -517,9 +524,11 @@ jobs:
           probe_sha256="$5"
           systemd_sha256="$6"
           lock_helper_sha256="$7"
+          diagnostic_systemd_state="$8"
           [[ "$target_sha" =~ ^[0-9a-f]{40}$ && "$run_id" =~ ^[0-9]+$ && "$run_attempt" =~ ^[0-9]+$ ]]
           [[ "$probe_dir_identity" =~ ^[0-9]+:[0-9]+$ ]]
           [[ "$probe_sha256" =~ ^[0-9a-f]{64}$ && "$systemd_sha256" =~ ^[0-9a-f]{64}$ && "$lock_helper_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$diagnostic_systemd_state" == true || "$diagnostic_systemd_state" == false ]]
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           tools="$current/tools"
@@ -572,7 +581,11 @@ jobs:
           trap 'platform_release_lock_close; cleanup_probe' EXIT
           [[ "$target_sha" =~ ^[0-9a-f]{40,64}$ ]]
           export PYTHONDONTWRITEBYTECODE=1
-          timeout --signal=TERM --kill-after=30s 560s /usr/bin/python3 -I -B "$probe_path" "$probe_sha256" "$systemd_sha256"
+          probe_args=("$probe_sha256" "$systemd_sha256")
+          if [[ "$diagnostic_systemd_state" == true ]]; then
+            probe_args=(--diagnostic-systemd-state "${probe_args[@]}")
+          fi
+          timeout --signal=TERM --kill-after=30s 560s /usr/bin/python3 -I -B "$probe_path" "${probe_args[@]}"
           REMOTE
           remote_status=$?
           set -e
@@ -590,9 +603,26 @@ jobs:
                   raise ValueError
               report = json.loads(lines[0])
               common = {"schema", "kind", "status", "health"}
+              diagnostic_keys = {"schema", "kind", "status", "diagnostic_systemd_state", "diagnostic_systemd_state_returncode"}
+              diagnostic_failed_keys = diagnostic_keys | {"failed_check", "error_class"}
               health_keys = {"api_live", "api_ready", "web_local", "public"}
               if type(report) is not dict or report.get("schema") != 1 or report.get("kind") != "release_capture_probe":
                   raise ValueError
+              if "diagnostic_systemd_state" in report or "diagnostic_systemd_state_returncode" in report:
+                  if report.get("status") == "passed":
+                      if set(report) != diagnostic_keys or report["diagnostic_systemd_state"] != "passed" or report["diagnostic_systemd_state_returncode"] != 0 or sys.argv[2] != "0":
+                          raise ValueError
+                      safe = report
+                  elif report.get("status") == "failed":
+                      if set(report) != diagnostic_failed_keys or report["diagnostic_systemd_state"] not in {"mismatch", "unavailable"} or report["diagnostic_systemd_state_returncode"] != 1 or sys.argv[2] != "1":
+                          raise ValueError
+                      if report["failed_check"] != ("diagnostic_mismatch" if report["diagnostic_systemd_state"] == "mismatch" else "diagnostic_unavailable") or report["error_class"] != "predicate":
+                          raise ValueError
+                      safe = report
+                  else:
+                      raise ValueError
+                  print("PRODUCTION_CAPTURE_PROBE " + json.dumps(safe, sort_keys=True, separators=(",", ":")))
+                  raise SystemExit(0)
               health = report.get("health")
               if type(health) is not dict or set(health) != health_keys or any(type(value) is not bool for value in health.values()):
                   raise ValueError
@@ -808,13 +838,60 @@ jobs:
               type(marker) is not dict
               or set(marker) != {"schema", "route", "component", "guard_id", "returncode", "stream", "output_b64", "total_bytes", "truncated", "retained"}
               or marker.get("schema") != 1 or marker.get("route") != "capture_probe"
-              or marker.get("component") not in {"nginx_preflight", "runtime_payload_verify", "runtime_expected_tree", "systemd_unit_snapshot"} or marker.get("guard_id") is not None or marker.get("stream") != "stderr"
+              or marker.get("component") not in {"nginx_preflight", "runtime_payload_verify", "runtime_expected_tree", "systemd_unit_snapshot", "systemd_state_probe"} or marker.get("guard_id") is not None or marker.get("stream") != "stderr"
               or marker.get("retained") != "tail" or type(marker.get("truncated")) is not bool
-              or (marker.get("returncode") != "unavailable" and (type(marker.get("returncode")) is not int or not 1 <= marker["returncode"] <= 255))
+              or (marker.get("returncode") != "unavailable" and (type(marker.get("returncode")) is not int or not 0 <= marker["returncode"] <= 255))
               or len(output) > 16384 or base64.b64encode(output).decode("ascii") != marker["output_b64"]
               or (marker.get("total_bytes") != "unavailable" and (type(marker.get("total_bytes")) is not int or not len(output) <= marker["total_bytes"] <= 9223372036854775807))
               or marker["truncated"] != (marker["total_bytes"] == "unavailable" or marker["total_bytes"] > len(output))
           ):
+              raise SystemExit(2)
+          if marker["component"] == "systemd_state_probe":
+              def unique_object(pairs):
+                  value = {}
+                  for key, item in pairs:
+                      if key in value:
+                          raise ValueError("duplicate diagnostic field")
+                      value[key] = item
+                  return value
+              try:
+                  state = json.loads(output.decode("utf-8"), object_pairs_hook=unique_object)
+              except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                  raise SystemExit(2) from exc
+              unit_names = ["deadlock-api.service", "deadlock-worker.service", "deadlock-web.service", "deadlock-maintenance.service", "deadlock-maintenance.timer", "deadlock-logrotate.service", "deadlock-logrotate.timer", "deadlock-offsite-backup.service", "deadlock-offsite-backup.timer", "deadlock-cloudflare-ips.service", "deadlock-cloudflare-ips.timer", "deadlock-health-monitor.service", "deadlock-health-monitor.timer"]
+              state_keys = {"schema", "collection_completed", "validate_status", "verify_status", "current_facts_status", "mismatch_count", "historical_cause_proven", "expected_units", "observed_units"}
+              if type(state) is not dict or set(state) != state_keys or type(state["schema"]) is not int or state["schema"] != 1 or type(state["collection_completed"]) is not bool or state["historical_cause_proven"] is not False:
+                  raise SystemExit(2)
+              if not isinstance(state["validate_status"], str) or state["validate_status"] not in {"passed", "failed", "unavailable"} or not isinstance(state["verify_status"], str) or state["verify_status"] not in {"passed", "failed", "unavailable"} or not isinstance(state["current_facts_status"], str) or state["current_facts_status"] not in {"matched", "mismatch", "unavailable"}:
+                  raise SystemExit(2)
+              if type(state["mismatch_count"]) is not int or not 0 <= state["mismatch_count"] <= 13:
+                  raise SystemExit(2)
+              for key in ("expected_units", "observed_units"):
+                  rows = state[key]
+                  if type(rows) is not list:
+                      raise SystemExit(2)
+                  if state["collection_completed"]:
+                      if len(rows) != len(unit_names):
+                          raise SystemExit(2)
+                      for expected_name, row in zip(unit_names, rows, strict=True):
+                          if type(row) is not dict or set(row) != {"unit", "active", "enabled"} or row["unit"] != expected_name:
+                              raise SystemExit(2)
+                          if not isinstance(row["active"], str) or row["active"] not in {"active", "inactive"} or not isinstance(row["enabled"], str) or row["enabled"] not in {"enabled", "disabled", "static", "indirect", "masked", "generated", "transient"}:
+                              raise SystemExit(2)
+                  elif rows:
+                      raise SystemExit(2)
+              if state["collection_completed"]:
+                  differences = sum(expected != observed for expected, observed in zip(state["expected_units"], state["observed_units"], strict=True))
+                  if differences != state["mismatch_count"] or state["current_facts_status"] != ("mismatch" if differences else "matched"):
+                      raise SystemExit(2)
+              elif state["current_facts_status"] != "unavailable" or state["mismatch_count"] != 0:
+                  raise SystemExit(2)
+              state_passed = (state["collection_completed"] and state["validate_status"] == "passed" and state["verify_status"] == "passed" and state["current_facts_status"] == "matched" and state["mismatch_count"] == 0)
+              if (marker["returncode"] == 0) != state_passed:
+                  raise SystemExit(2)
+              if marker["returncode"] != 0 and marker["returncode"] != 1:
+                  raise SystemExit(2)
+          elif marker["returncode"] == 0:
               raise SystemExit(2)
           payload = {
               "schema": 1,

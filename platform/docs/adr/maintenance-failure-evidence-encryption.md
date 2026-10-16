@@ -124,6 +124,17 @@ markers, each retaining a 16 KiB tail; the total SSH error stream is bounded to
 after the workflow validates the recipient certificate. This diagnostic kind
 is never accepted as maintenance reset evidence.
 
+The diagnostics workflow also exposes a default-off, diagnostic-only
+`diagnostic_systemd_state` route for the exact bound pending recovery target.
+It uses the canonical read-only systemd receipt validator and verifier and
+collects only the fixed owned-unit state tuple. The encrypted record keeps
+collection completion, receipt validation, verification, and observed-state
+comparison separate and always records `historical_cause_proven: false`.
+This route performs no restore, reconcile, health, nginx, or maintenance
+action; a successful current-state comparison is not evidence of the earlier
+failure's cause. Its bounded private marker uses the existing API-bound CMS
+transport and is not accepted by the reset validator.
+
 The local command is
 `python3 platform/tools/platform_decrypt_maintenance_evidence.py --artifact-archive <archive.zip> --binding-json <protected-binding.json> --private-key <0600-private-key.pem> --certificate <matching-certificate.pem> --destination <new-git-private-evidence.json> --git-dir <repository/.git>`.
 

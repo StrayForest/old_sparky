@@ -1192,8 +1192,8 @@ jobs:
           if not 1 <= len(markers) <= 5:
               raise SystemExit(1)
           allowed_guards = {"argument", "privilege", "lock", "layout", "tooling", "systemd_state", "transaction_state", "legacy_liveqa_authority", "liveqa_runtime", "nginx", "runtime"}
-          allowed_components = {"systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile", "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload", "systemd_restore_enabled", "runtime_guard"}
-          order = ["systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile", "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload", "systemd_restore_enabled"]
+          allowed_components = {"systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile", "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload", "systemd_restore_enabled", "systemd_state_restore", "systemd_restart", "systemd_active_api", "systemd_active_worker", "systemd_active_web", "readiness_internal", "readiness_public", "smoke_internal", "smoke_external", "runtime_guard"}
+          order = ["systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile", "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload", "systemd_restore_enabled", "systemd_state_restore", "systemd_restart", "systemd_active_api", "systemd_active_worker", "systemd_active_web", "readiness_internal", "readiness_public", "smoke_internal", "smoke_external"]
           previous_order = -1
           seen = set()
           for raw_marker in markers:

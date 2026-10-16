@@ -530,6 +530,78 @@ def _validate_runtime_binding(binding: dict[str, Any]) -> None:
         raise DecryptError("runtime failure artifact binding is invalid")
 
 
+_SYSTEMD_DIAGNOSTIC_UNITS = (
+    "deadlock-api.service", "deadlock-worker.service", "deadlock-web.service",
+    "deadlock-maintenance.service", "deadlock-maintenance.timer",
+    "deadlock-logrotate.service", "deadlock-logrotate.timer",
+    "deadlock-offsite-backup.service", "deadlock-offsite-backup.timer",
+    "deadlock-cloudflare-ips.service", "deadlock-cloudflare-ips.timer",
+    "deadlock-health-monitor.service", "deadlock-health-monitor.timer",
+)
+
+
+def _validate_systemd_diagnostic_payload(output: bytes, returncode: object) -> None:
+    try:
+        value = json.loads(output.decode("utf-8", errors="strict"), object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, DecryptError) as exc:
+        raise DecryptError("systemd diagnostic payload is invalid") from exc
+    keys = {
+        "schema", "collection_completed", "validate_status", "verify_status",
+        "current_facts_status", "mismatch_count", "historical_cause_proven",
+        "expected_units", "observed_units",
+    }
+    if (
+        not isinstance(value, dict) or set(value) != keys or type(value.get("schema")) is not int or value.get("schema") != 1
+        or type(value.get("collection_completed")) is not bool
+        or value.get("historical_cause_proven") is not False
+        or not isinstance(value.get("validate_status"), str)
+        or value.get("validate_status") not in {"passed", "failed", "unavailable"}
+        or not isinstance(value.get("verify_status"), str)
+        or value.get("verify_status") not in {"passed", "failed", "unavailable"}
+        or not isinstance(value.get("current_facts_status"), str)
+        or value.get("current_facts_status") not in {"matched", "mismatch", "unavailable"}
+        or type(value.get("mismatch_count")) is not int
+        or not 0 <= value["mismatch_count"] <= len(_SYSTEMD_DIAGNOSTIC_UNITS)
+        or type(returncode) is not int or returncode not in {0, 1}
+    ):
+        raise DecryptError("systemd diagnostic payload fields are invalid")
+    expected = value["expected_units"]
+    observed = value["observed_units"]
+    if not isinstance(expected, list) or not isinstance(observed, list):
+        raise DecryptError("systemd diagnostic unit snapshots are invalid")
+    if not value["collection_completed"]:
+        if (
+            expected or observed or value["current_facts_status"] != "unavailable"
+            or value["mismatch_count"] != 0 or returncode != 1
+        ):
+            raise DecryptError("incomplete systemd diagnostic snapshot is inconsistent")
+    else:
+        if len(expected) != len(_SYSTEMD_DIAGNOSTIC_UNITS) or len(observed) != len(_SYSTEMD_DIAGNOSTIC_UNITS):
+            raise DecryptError("systemd diagnostic unit count is invalid")
+        for rows in (expected, observed):
+            for name, row in zip(_SYSTEMD_DIAGNOSTIC_UNITS, rows, strict=True):
+                if (
+                    not isinstance(row, dict) or set(row) != {"unit", "active", "enabled"}
+                    or row.get("unit") != name
+                    or not isinstance(row.get("active"), str)
+                    or row.get("active") not in {"active", "inactive"}
+                    or not isinstance(row.get("enabled"), str)
+                    or row.get("enabled") not in {"enabled", "disabled", "static", "indirect", "masked", "generated", "transient"}
+                ):
+                    raise DecryptError("systemd diagnostic unit row is invalid")
+        mismatch_count = sum(left != right for left, right in zip(expected, observed, strict=True))
+        facts_status = "mismatch" if mismatch_count else "matched"
+        if value["mismatch_count"] != mismatch_count or value["current_facts_status"] != facts_status:
+            raise DecryptError("systemd diagnostic mismatch summary is invalid")
+    passed = (
+        value["collection_completed"] and value["validate_status"] == "passed"
+        and value["verify_status"] == "passed" and value["current_facts_status"] == "matched"
+        and value["mismatch_count"] == 0
+    )
+    if (returncode == 0) != passed:
+        raise DecryptError("systemd diagnostic result does not match its return code")
+
+
 def _validate_runtime_marker(remote_stderr: bytes, route: str) -> None:
     if not 1 <= len(remote_stderr) <= MAX_RUNTIME_REMOTE_STDERR_BYTES:
         raise DecryptError("runtime failure stderr exceeded its bound")
@@ -550,13 +622,19 @@ def _validate_runtime_marker(remote_stderr: bytes, route: str) -> None:
             "runtime_payload_verify": "stderr",
             "runtime_expected_tree": "stderr",
             "systemd_unit_snapshot": "stderr",
+            "systemd_state_probe": "stderr",
         },
         "recover_pending": {
             "systemd_state_validate": "combined", "runtime_artifact_proof": "combined",
             "runtime_reconcile": "combined",
             "systemd_units": "combined", "nginx_apply": "combined",
             "nginx_config_test": "combined", "nginx_reload": "combined",
-            "systemd_restore_enabled": "combined", "runtime_guard": "guard",
+            "systemd_restore_enabled": "combined", "systemd_state_restore": "combined",
+            "systemd_restart": "combined", "systemd_active_api": "combined",
+            "systemd_active_worker": "combined", "systemd_active_web": "combined",
+            "readiness_internal": "combined", "readiness_public": "combined",
+            "smoke_internal": "combined", "smoke_external": "combined",
+            "runtime_guard": "guard",
         },
     }
     allowed_guards = {
@@ -569,6 +647,9 @@ def _validate_runtime_marker(remote_stderr: bytes, route: str) -> None:
         "systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile",
         "systemd_units", "nginx_apply",
         "nginx_config_test", "nginx_reload", "systemd_restore_enabled",
+        "systemd_state_restore", "systemd_restart", "systemd_active_api",
+        "systemd_active_worker", "systemd_active_web", "readiness_internal",
+        "readiness_public", "smoke_internal", "smoke_external",
     ]
     for marker_line in marker_lines:
         try:
@@ -584,7 +665,7 @@ def _validate_runtime_marker(remote_stderr: bytes, route: str) -> None:
             or marker.get("retained") != "tail"
             or type(marker.get("truncated")) is not bool
             or (marker.get("returncode") != "unavailable" and (
-                type(marker["returncode"]) is not int or not 1 <= marker["returncode"] <= 255
+                type(marker["returncode"]) is not int or not 0 <= marker["returncode"] <= 255
             ))
         ):
             raise DecryptError("runtime failure marker fields are invalid")
@@ -618,6 +699,10 @@ def _validate_runtime_marker(remote_stderr: bytes, route: str) -> None:
             raise DecryptError("runtime failure marker output is invalid") from exc
         if len(retained) > MAX_RUNTIME_MARKER_OUTPUT_BYTES or base64.b64encode(retained).decode("ascii") != encoded:
             raise DecryptError("runtime failure marker output is invalid")
+        if component == "systemd_state_probe":
+            _validate_systemd_diagnostic_payload(retained, marker["returncode"])
+        elif marker["returncode"] == 0:
+            raise DecryptError("runtime command failure marker has a successful return code")
         total = marker.get("total_bytes")
         if total == "unavailable":
             if marker["truncated"] is not True:
