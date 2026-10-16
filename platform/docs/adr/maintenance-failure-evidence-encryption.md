@@ -49,12 +49,18 @@ encrypt it. It uploads exactly two members: DER CMS ciphertext and a closed
 recipient certificate fingerprint, ciphertext SHA-256 digest and size, and
 algorithm profile. The encrypted plaintext is either the full
 `maintenance_failure_evidence` document or a closed
-`maintenance_failure_diagnostic` containing only source/run bindings, a fixed
-stage and fixed error code. When a guard fails after the bound host output path
-is established, the workflow encrypts and uploads that diagnostic, then still
-finishes with a failed Action conclusion. The public manifest, Actions output
-and logs contain no plaintext digest or size. No raw journal or plaintext JSON
-is printed or uploaded. The public artifact expires after one day. CMS
+`maintenance_failure_diagnostic` containing source/run bindings, a fixed stage
+and error code, and—only for a systemd property failure—a bounded private cause
+record. That record identifies the fixed service or timer query, its closed
+failure class and return code, missing or extra fixed properties, and bounded
+base64 stdout/stderr. It remains inside CMS ciphertext; it is never written to
+the public manifest, Actions output or logs. The service query uses the fixed
+Service/Unit property set; the timer query uses only its Timer/Unit properties.
+When a guard fails after the bound host output path is established, the
+workflow encrypts and uploads that diagnostic, then still finishes with a
+failed Action conclusion. The public manifest, Actions output and logs contain
+no plaintext digest or size. No raw journal or plaintext JSON is printed or
+uploaded. The public artifact expires after one day. CMS
 encryption does not authenticate the sender; trust comes from the
 exact-source Actions run, the previously verified signed recovery
 producer/publisher chain, and the independently verified GitHub artifact

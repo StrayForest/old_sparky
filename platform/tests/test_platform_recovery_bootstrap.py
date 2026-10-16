@@ -1464,8 +1464,22 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 "security_run_id": "12345",
                 "security_run_attempt": "1",
                 "captured_at_utc": "2026-10-16T00:00:00Z",
-                "stage": "transaction_context",
-                "error_code": "receipt_binding_mismatch",
+                "stage": "systemd_properties",
+                "error_code": "unit_properties_unavailable",
+                "private_cause": {
+                    "command": "systemctl_show",
+                    "unit": "timer",
+                    "reason": "malformed_output",
+                    "error_message": "systemd properties are malformed",
+                    "exception_class": "EvidenceError",
+                    "returncode": 0,
+                    "missing_properties": [],
+                    "extra_properties": ["ExecMainStatus"],
+                    "stdout_b64": base64.b64encode(b"ExecMainStatus=0\n").decode("ascii"),
+                    "stdout_truncated": False,
+                    "stderr_b64": base64.b64encode(b"private interface detail").decode("ascii"),
+                    "stderr_truncated": False,
+                },
             }
             evidence_fixture.write_text(json.dumps(diagnostic), encoding="ascii")
             diagnostic_path = root / "diagnostic.json"
@@ -1520,6 +1534,9 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     git_dir=git_dir,
                 )
             self.assertEqual(json.loads(decrypted_diagnostic.read_text(encoding="ascii")), diagnostic)
+            self.assertTrue(maintenance_decrypt._valid_private_diagnostic_cause(diagnostic["private_cause"]))
+            invalid_cause = dict(diagnostic["private_cause"], unit="unknown")
+            self.assertFalse(maintenance_decrypt._valid_private_diagnostic_cause(invalid_cause))
             ssh_calls = [
                 json.loads(line) for line in ssh_log.read_text(encoding="utf-8").splitlines()
             ]
@@ -4326,7 +4343,7 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
         return evidence_dir / f"{source_sha}-12345-1.json"
 
     def _properties(self, unit: str) -> dict[str, str]:
-        return {
+        service_properties = {
             "ActiveState": "failed" if unit == maintenance_evidence.UNIT else "inactive",
             "SubState": "failed" if unit == maintenance_evidence.UNIT else "dead",
             "Result": "signal" if unit == maintenance_evidence.UNIT else "success",
@@ -4340,8 +4357,71 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
             "StateChangeTimestamp": "Mon 2026-10-12 01:00:01 UTC",
             "UnitFileState": "disabled" if unit == maintenance_evidence.TIMER else "enabled",
         }
+        if unit == maintenance_evidence.TIMER:
+            return {key: service_properties[key] for key in maintenance_evidence.TIMER_PROPERTIES}
+        return service_properties
+
+    def _assert_systemd_property_queries_use_interface_specific_fields_and_private_diagnostics(self) -> None:
+        for unit, fields in maintenance_evidence.SYSTEMD_PROPERTIES_BY_UNIT.items():
+            output = "".join(f"{field}=sample\n" for field in fields).encode("ascii")
+            with self.subTest(unit=unit), mock.patch.object(
+                maintenance_evidence.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, output, b""),
+            ) as run:
+                properties = maintenance_evidence._systemd_properties(unit)
+            self.assertEqual(set(properties), set(fields))
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[:3], [maintenance_evidence.SYSTEMCTL, "show", unit])
+            requested = {item.removeprefix("--property=") for item in argv[4:]}
+            self.assertEqual(requested, set(fields))
+            if unit == maintenance_evidence.TIMER:
+                self.assertNotIn("ExecMainStatus", requested)
+                self.assertNotIn("MainPID", requested)
+
+        timer_output = b"ActiveState=inactive\nSubState=dead\nResult=success\nControlGroup=\nStateChangeTimestamp=\nUnitFileState=disabled\n"
+        with mock.patch.object(
+            maintenance_evidence.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, timer_output, b"private systemd detail"),
+        ):
+            timer = maintenance_evidence._systemd_properties(maintenance_evidence.TIMER)
+        self.assertEqual(set(timer), set(maintenance_evidence.TIMER_PROPERTIES))
+
+        with mock.patch.object(
+            maintenance_evidence.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 1, b"partial\n", b"private failure detail"),
+        ):
+            with self.assertRaises(maintenance_evidence.EvidenceError) as caught:
+                maintenance_evidence._systemd_properties(maintenance_evidence.TIMER)
+        cause = caught.exception.private_cause
+        self.assertEqual(cause["unit"], "timer")
+        self.assertEqual(cause["reason"], "nonzero_exit")
+        self.assertEqual(cause["returncode"], 1)
+        self.assertEqual(base64.b64decode(cause["stderr_b64"]), b"private failure detail")
+
+        incomplete = timer_output.replace(b"Result=success\n", b"")
+        with mock.patch.object(
+            maintenance_evidence.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, incomplete, b""),
+        ):
+            with self.assertRaises(maintenance_evidence.EvidenceError) as caught:
+                maintenance_evidence._systemd_properties(maintenance_evidence.TIMER)
+        self.assertEqual(caught.exception.private_cause["reason"], "missing_properties")
+        self.assertEqual(caught.exception.private_cause["missing_properties"], ["Result"])
+
+        extra_property = timer_output + b"ExecMainStatus=0\n"
+        with mock.patch.object(
+            maintenance_evidence.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, extra_property, b""),
+        ):
+            with self.assertRaises(maintenance_evidence.EvidenceError) as caught:
+                maintenance_evidence._systemd_properties(maintenance_evidence.TIMER)
+        extra_cause = caught.exception.private_cause
+        self.assertEqual(extra_cause["reason"], "malformed_output")
+        self.assertEqual(extra_cause["extra_properties"], ["ExecMainStatus"])
+        self.assertTrue(maintenance_decrypt._valid_private_diagnostic_cause(extra_cause))
 
     def test_capture_writes_private_digest_bound_evidence_without_printing_journal(self) -> None:
+        self._assert_systemd_property_queries_use_interface_specific_fields_and_private_diagnostics()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             app = root / "app"
@@ -4394,7 +4474,13 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
             error_output = io.StringIO()
             with (
                 mock.patch.object(maintenance_evidence, "_durable_evidence_path", return_value=generated_diagnostic),
-                mock.patch.object(maintenance_evidence, "capture", side_effect=maintenance_evidence.EvidenceError("release transaction receipt schema is invalid")),
+                mock.patch.object(maintenance_evidence, "capture", side_effect=maintenance_evidence.EvidenceError(
+                    "systemd properties could not be read",
+                    private_cause=maintenance_evidence._systemd_cause(
+                        unit=maintenance_evidence.TIMER, reason="nonzero_exit",
+                        returncode=1, stderr=b"private failure detail",
+                    ),
+                )),
                 mock.patch("sys.stderr", error_output),
             ):
                 exit_code = maintenance_evidence.main([
@@ -4406,9 +4492,12 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
             self.assertEqual(exit_code, 1)
             generated = json.loads(generated_diagnostic.read_text(encoding="ascii"))
             self.assertEqual(generated["kind"], "maintenance_failure_diagnostic")
-            self.assertEqual(generated["stage"], "transaction_receipt")
-            self.assertEqual(generated["error_code"], "receipt_invalid")
-            self.assertNotIn("schema is invalid", error_output.getvalue())
+            self.assertEqual(generated["stage"], "systemd_properties")
+            self.assertEqual(generated["error_code"], "unit_properties_unavailable")
+            self.assertEqual(generated["private_cause"]["unit"], "timer")
+            self.assertEqual(generated["private_cause"]["reason"], "nonzero_exit")
+            self.assertEqual(base64.b64decode(generated["private_cause"]["stderr_b64"]), b"private failure detail")
+            self.assertNotIn("private failure detail", error_output.getvalue())
             diagnostic_path = output.with_name("diagnostic.json")
             diagnostic_path.write_text(json.dumps({
                 "schema": 1,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -46,6 +47,20 @@ DIAGNOSTIC_KEYS = {
     "capture_run_attempt", "security_run_id", "security_run_attempt",
     "captured_at_utc", "stage", "error_code",
 }
+DIAGNOSTIC_PRIVATE_CAUSE_KEYS = {
+    "command", "unit", "reason", "error_message", "exception_class", "returncode",
+    "missing_properties", "extra_properties", "stdout_b64", "stdout_truncated",
+    "stderr_b64", "stderr_truncated",
+}
+SERVICE_PROPERTIES = {
+    "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus",
+    "MainPID", "ExecMainPID", "ControlGroup", "ExecMainStartTimestamp",
+    "ExecMainExitTimestamp", "StateChangeTimestamp", "UnitFileState",
+}
+TIMER_PROPERTIES = {
+    "ActiveState", "SubState", "Result", "ControlGroup",
+    "StateChangeTimestamp", "UnitFileState",
+}
 DIAGNOSTIC_STAGES = {
     "transaction_receipt", "transaction_context", "host_identity",
     "systemd_properties", "systemd_jobs", "cgroup", "journal",
@@ -85,6 +100,68 @@ def _parse_json(raw: bytes, *, maximum: int) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise DecryptError("capture JSON is invalid")
     return value
+
+
+def _valid_private_diagnostic_cause(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != DIAGNOSTIC_PRIVATE_CAUSE_KEYS:
+        return False
+    expected_messages = {
+        "command_error": "systemd properties command failed",
+        "output_too_large": "systemd properties output exceeded its bound",
+        "nonzero_exit": "systemd properties could not be read",
+        "invalid_utf8": "systemd properties are malformed",
+        "malformed_output": "systemd properties are malformed",
+        "missing_properties": "systemd properties are incomplete",
+    }
+    expected_classes = {
+        "command_error": {"OSError", "TimeoutExpired"},
+        "output_too_large": {"EvidenceError"},
+        "nonzero_exit": {"EvidenceError"},
+        "invalid_utf8": {"UnicodeDecodeError"},
+        "malformed_output": {"EvidenceError"},
+        "missing_properties": {"EvidenceError"},
+    }
+    if (
+        value.get("command") != "systemctl_show"
+        or value.get("unit") not in {"service", "timer"}
+        or value.get("reason") not in expected_messages
+        or value.get("error_message") != expected_messages.get(value.get("reason"))
+        or value.get("exception_class") not in expected_classes.get(value.get("reason"), set())
+        or (value.get("returncode") is not None and (type(value["returncode"]) is not int or not -255 <= value["returncode"] <= 255))
+        or type(value.get("stdout_truncated")) is not bool
+        or type(value.get("stderr_truncated")) is not bool
+    ):
+        return False
+    allowed = SERVICE_PROPERTIES if value["unit"] == "service" else TIMER_PROPERTIES
+    missing = value.get("missing_properties")
+    extra = value.get("extra_properties")
+    if (
+        not isinstance(missing, list) or len(missing) > len(SERVICE_PROPERTIES)
+        or any(not isinstance(item, str) or item not in allowed for item in missing)
+        or missing != sorted(set(missing))
+        or not isinstance(extra, list) or len(extra) > 1
+        or any(
+            not isinstance(item, str)
+            or (
+                item != "invalid_property_name"
+                and (item in allowed or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", item) is None)
+            )
+            for item in extra
+        )
+        or extra != sorted(set(extra))
+    ):
+        return False
+    for name in ("stdout_b64", "stderr_b64"):
+        encoded = value.get(name)
+        if not isinstance(encoded, str) or len(encoded) > 5464:
+            return False
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error):
+            return False
+        if len(decoded) > 4096 or base64.b64encode(decoded).decode("ascii") != encoded:
+            return False
+    return True
 
 
 def _run_openssl(arguments: list[str], *, maximum: int = 16 * 1024) -> bytes:
@@ -309,12 +386,19 @@ def decrypt_capture(
         diagnostic_kind = isinstance(evidence, dict) and evidence.get("kind") == "maintenance_failure_diagnostic"
         diagnostic_valid = (
             diagnostic_kind
-            and set(evidence) == DIAGNOSTIC_KEYS
+            and set(evidence) in (DIAGNOSTIC_KEYS, DIAGNOSTIC_KEYS | {"private_cause"})
             and isinstance(evidence.get("captured_at_utc"), str)
             and isinstance(evidence.get("stage"), str)
             and evidence["stage"] in DIAGNOSTIC_STAGES
             and isinstance(evidence.get("error_code"), str)
             and evidence["error_code"] in DIAGNOSTIC_CODES
+            and (
+                "private_cause" not in evidence
+                or (
+                    evidence.get("stage") == "systemd_properties"
+                    and _valid_private_diagnostic_cause(evidence["private_cause"])
+                )
+            )
         )
         if not common_binding or not (
             (evidence_kind and set(evidence) == EVIDENCE_KEYS)

@@ -9,6 +9,7 @@ only the exact immutable evidence digest emitted by capture.
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -26,6 +27,17 @@ UNIT = "deadlock-maintenance.service"
 TIMER = "deadlock-maintenance.timer"
 SYSTEMCTL = "/usr/bin/systemctl"
 JOURNALCTL = "/usr/bin/journalctl"
+SERVICE_PROPERTIES = (
+    "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus",
+    "MainPID", "ExecMainPID", "ControlGroup", "ExecMainStartTimestamp",
+    "ExecMainExitTimestamp", "StateChangeTimestamp", "UnitFileState",
+)
+TIMER_PROPERTIES = (
+    "ActiveState", "SubState", "Result", "ControlGroup",
+    "StateChangeTimestamp", "UnitFileState",
+)
+SYSTEMD_PROPERTIES_BY_UNIT = {UNIT: SERVICE_PROPERTIES, TIMER: TIMER_PROPERTIES}
+MAX_PRIVATE_COMMAND_OUTPUT = 4096
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_JOURNAL_BYTES = 128 * 1024
 MAX_EVIDENCE_BYTES = 256 * 1024
@@ -41,6 +53,10 @@ BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 
 class EvidenceError(ValueError):
     """A closed, non-sensitive evidence operation failure."""
+
+    def __init__(self, message: str, *, private_cause: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.private_cause = private_cause
 
 
 _TRANSACTION_VALIDATOR = runpy.run_path(
@@ -99,23 +115,93 @@ def _diagnostic_payload(args: argparse.Namespace, error: BaseException) -> dict[
         "captured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "stage": stage,
         "error_code": code,
+        **({"private_cause": error.private_cause} if isinstance(error, EvidenceError) and error.private_cause else {}),
     }
 
 
-def _run(argv: list[str], *, maximum: int = MAX_JOURNAL_BYTES) -> subprocess.CompletedProcess[bytes]:
+def _bounded_command_output(value: bytes | None) -> tuple[str, bool]:
+    raw = value if isinstance(value, bytes) else b""
+    bounded = raw[:MAX_PRIVATE_COMMAND_OUTPUT]
+    return base64.b64encode(bounded).decode("ascii"), len(raw) > len(bounded)
+
+
+def _systemd_cause(
+    *, unit: str, reason: str, returncode: int | None = None,
+    exception_class: str | None = None, missing: list[str] | None = None,
+    extra: list[str] | None = None, stdout: bytes | None = None,
+    stderr: bytes | None = None,
+) -> dict[str, Any]:
+    error_messages = {
+        "command_error": "systemd properties command failed",
+        "output_too_large": "systemd properties output exceeded its bound",
+        "nonzero_exit": "systemd properties could not be read",
+        "invalid_utf8": "systemd properties are malformed",
+        "malformed_output": "systemd properties are malformed",
+        "missing_properties": "systemd properties are incomplete",
+    }
+    default_exception_classes = {
+        "command_error": "OSError",
+        "output_too_large": "EvidenceError",
+        "nonzero_exit": "EvidenceError",
+        "invalid_utf8": "UnicodeDecodeError",
+        "malformed_output": "EvidenceError",
+        "missing_properties": "EvidenceError",
+    }
+    stdout_b64, stdout_truncated = _bounded_command_output(stdout)
+    stderr_b64, stderr_truncated = _bounded_command_output(stderr)
+    return {
+        "command": "systemctl_show",
+        "unit": "service" if unit == UNIT else "timer",
+        "reason": reason,
+        "error_message": error_messages[reason],
+        "exception_class": exception_class or default_exception_classes[reason],
+        "returncode": returncode,
+        "missing_properties": sorted(missing or []),
+        "extra_properties": sorted(extra or []),
+        "stdout_b64": stdout_b64,
+        "stdout_truncated": stdout_truncated,
+        "stderr_b64": stderr_b64,
+        "stderr_truncated": stderr_truncated,
+    }
+
+
+def _run(
+    argv: list[str], *, maximum: int = MAX_JOURNAL_BYTES,
+    private_systemd_unit: str | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    stderr_target = subprocess.PIPE if private_systemd_unit is not None else subprocess.DEVNULL
     try:
         result = subprocess.run(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr_target,
             check=False,
             timeout=15,
             env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
+        if private_systemd_unit is not None:
+            stdout = exc.stdout if isinstance(exc.stdout, bytes) else None
+            stderr = exc.stderr if isinstance(exc.stderr, bytes) else None
+            raise EvidenceError(
+                "systemd properties command failed",
+                private_cause=_systemd_cause(
+                    unit=private_systemd_unit, reason="command_error",
+                    exception_class="TimeoutExpired" if isinstance(exc, subprocess.TimeoutExpired) else "OSError",
+                    stdout=stdout, stderr=stderr,
+                ),
+            ) from exc
         raise EvidenceError("fixed evidence command failed") from exc
     if len(result.stdout) > maximum:
+        if private_systemd_unit is not None:
+            raise EvidenceError(
+                "systemd properties output exceeded its bound",
+                private_cause=_systemd_cause(
+                    unit=private_systemd_unit, reason="output_too_large",
+                    returncode=result.returncode, stdout=result.stdout, stderr=result.stderr,
+                ),
+            )
         raise EvidenceError("fixed evidence command output exceeded its bound")
     return result
 
@@ -203,25 +289,58 @@ def _pointer(app_dir: Path, name: str) -> str | None:
 
 
 def _systemd_properties(unit: str) -> dict[str, str]:
-    fields = (
-        "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus",
-        "MainPID", "ExecMainPID", "ControlGroup", "ExecMainStartTimestamp", "ExecMainExitTimestamp",
-        "StateChangeTimestamp", "UnitFileState",
-    )
+    fields = SYSTEMD_PROPERTIES_BY_UNIT.get(unit)
+    if fields is None:
+        raise EvidenceError("systemd properties unit is not owned")
     result = _run(
         [SYSTEMCTL, "show", unit, "--no-pager", *(f"--property={field}" for field in fields)],
         maximum=16 * 1024,
+        private_systemd_unit=unit,
     )
     if result.returncode != 0:
-        raise EvidenceError("systemd properties could not be read")
+        raise EvidenceError(
+            "systemd properties could not be read",
+            private_cause=_systemd_cause(
+                unit=unit, reason="nonzero_exit", returncode=result.returncode,
+                stdout=result.stdout, stderr=result.stderr,
+            ),
+        )
     values: dict[str, str] = {}
-    for line in result.stdout.decode("utf-8", "strict").splitlines():
+    try:
+        decoded = result.stdout.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise EvidenceError(
+            "systemd properties are malformed",
+            private_cause=_systemd_cause(
+                unit=unit, reason="invalid_utf8", returncode=result.returncode,
+                stdout=result.stdout, stderr=result.stderr,
+            ),
+        ) from None
+    for line in decoded.splitlines():
         key, separator, value = line.partition("=")
         if not separator or key not in fields or key in values or "\x00" in value:
-            raise EvidenceError("systemd properties are malformed")
+            raise EvidenceError(
+                "systemd properties are malformed",
+                private_cause=_systemd_cause(
+                    unit=unit, reason="malformed_output", returncode=result.returncode,
+                    missing=sorted(set(fields) - set(values)),
+                    extra=[
+                        key if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", key)
+                        else "invalid_property_name"
+                    ] if key and key not in fields else [],
+                    stdout=result.stdout, stderr=result.stderr,
+                ),
+            )
         values[key] = value[:512]
     if set(values) != set(fields):
-        raise EvidenceError("systemd properties are incomplete")
+        raise EvidenceError(
+            "systemd properties are incomplete",
+            private_cause=_systemd_cause(
+                unit=unit, reason="missing_properties", returncode=result.returncode,
+                missing=sorted(set(fields) - set(values)),
+                stdout=result.stdout, stderr=result.stderr,
+            ),
+        )
     if values["ActiveState"] not in UNIT_STATES:
         values["ActiveState"] = "unknown"
     return values
@@ -573,16 +692,8 @@ def _validate_evidence(
         or not isinstance(value.get("unit"), dict)
         or not isinstance(value.get("timer"), dict)
         or not isinstance(value.get("journal"), list)
-        or set(value.get("unit", {})) != {
-            "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus",
-            "MainPID", "ExecMainPID", "ControlGroup", "ExecMainStartTimestamp",
-            "ExecMainExitTimestamp", "StateChangeTimestamp", "UnitFileState",
-        }
-        or set(value.get("timer", {})) != {
-            "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus",
-            "MainPID", "ExecMainPID", "ControlGroup", "ExecMainStartTimestamp",
-            "ExecMainExitTimestamp", "StateChangeTimestamp", "UnitFileState",
-        }
+        or set(value.get("unit", {})) != set(SERVICE_PROPERTIES)
+        or set(value.get("timer", {})) != set(TIMER_PROPERTIES)
         or any(item is not None and (not isinstance(item, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", item) is None) for item in value.get("pointers", {}).values())
         or not HEX64.fullmatch(str(value.get("receipts", {}).get("operation_sha256", "")))
         or (value.get("receipts", {}).get("companion_present") is True and not HEX64.fullmatch(str(value.get("receipts", {}).get("systemd_sha256", ""))))
