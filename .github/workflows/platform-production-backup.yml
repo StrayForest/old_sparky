@@ -4016,16 +4016,39 @@ jobs:
           fi
           success_marker="$(/usr/bin/python3 -I - "$remote_report" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$REMOTE_OPERATION" "$SOURCE_SHA" "$BUNDLE_SHA256" "$EXPECTED_STORAGE_HELPER_SHA256" "$EXPECTED_BACKUP_DRILL_SHA256" <<'PY'
           import json
-          from pathlib import Path
           import re
           import sys
 
-          lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
-          if len(lines) != 2:
+          max_marker_bytes = 512
+          max_summary_bytes = 1_056_768
+          max_report_bytes = max_marker_bytes + max_summary_bytes + 2
+          try:
+              with open(sys.argv[1], "rb") as handle:
+                  raw = handle.read(max_report_bytes + 1)
+          except OSError as exc:
+              raise SystemExit("remote success output is unavailable") from exc
+          if (
+              len(raw) > max_report_bytes
+              or raw.count(b"\n") != 2
+              or not raw.endswith(b"\n")
+              or b"\r" in raw
+          ):
               raise SystemExit("remote success output is not the closed two-line receipt")
+          marker_raw, summary_raw, trailing = raw.split(b"\n")
+          if (
+              trailing
+              or len(marker_raw) > max_marker_bytes
+              or len(summary_raw) > max_summary_bytes
+          ):
+              raise SystemExit("remote success output is not the closed two-line receipt")
+          try:
+              marker = marker_raw.decode("ascii")
+              summary_text = summary_raw.decode("utf-8")
+          except UnicodeDecodeError as exc:
+              raise SystemExit("remote success output is not the closed two-line receipt") from exc
           match = re.fullmatch(
               r"BACKUP_SUCCESS schema=1 run_id=([1-9][0-9]{0,19}) attempt=([1-9][0-9]{0,5}) operation=(create|verify-existing) source_sha=([0-9a-f]{40}) bundle_sha256=([0-9a-f]{64}) storage_helper_sha256=([0-9a-f]{64}) backup_drill_sha256=([0-9a-f]{64})",
-              lines[0],
+              marker,
           )
           if (
               match is None
@@ -4033,18 +4056,18 @@ jobs:
               or match.groups()[5:] != tuple(sys.argv[7:9])
           ):
               raise SystemExit("remote success marker source/run binding is invalid")
-          summary = json.loads(lines[1])
+          summary = json.loads(summary_text)
           expected_mode = "backup-only" if sys.argv[4] == "create" else "verify-existing-backup-only"
           if not isinstance(summary, dict) or summary.get("mode") != expected_mode:
               raise SystemExit("remote success summary does not match operation")
-          print(lines[0])
+          print(marker)
           PY
           )"
           if [[ "$REMOTE_OPERATION" = create ]]; then
             receipt_path="$RUNNER_TEMP/platform-backup-success-receipt.json"
             test "$receipt_path" = "$RUNNER_TEMP/platform-backup-success-receipt.json"
             test ! -e "$receipt_path" && test ! -L "$receipt_path"
-            /usr/bin/python3 -I - "$public_report" "$REPOSITORY" "$SOURCE_SHA" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$receipt_path" <<'PY'
+            /usr/bin/python3 -I - "$remote_report" "$REPOSITORY" "$SOURCE_SHA" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$receipt_path" "$BUNDLE_SHA256" "$EXPECTED_STORAGE_HELPER_SHA256" "$EXPECTED_BACKUP_DRILL_SHA256" <<'PY'
           import json
           import os
           from pathlib import Path
@@ -4052,7 +4075,11 @@ jobs:
           import stat
           import sys
 
-          report_path, repository, source_sha, security_id, security_attempt, backup_id, backup_attempt, output_path = sys.argv[1:]
+          (
+              report_path, repository, source_sha, security_id, security_attempt,
+              backup_id, backup_attempt, output_path, bundle_sha, storage_helper_sha,
+              backup_drill_sha,
+          ) = sys.argv[1:]
           if (
               repository != "StrayForest/old_sparky"
               or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
@@ -4060,9 +4087,51 @@ jobs:
               or re.fullmatch(r"[1-9][0-9]{0,5}", security_attempt) is None
               or re.fullmatch(r"[1-9][0-9]{0,19}", backup_id) is None
               or re.fullmatch(r"[1-9][0-9]{0,5}", backup_attempt) is None
+              or re.fullmatch(r"[0-9a-f]{64}", bundle_sha) is None
+              or re.fullmatch(r"[0-9a-f]{64}", storage_helper_sha) is None
+              or re.fullmatch(r"[0-9a-f]{64}", backup_drill_sha) is None
           ):
               raise SystemExit("source-bound backup receipt identity is invalid")
-          report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+          max_marker_bytes = 512
+          max_summary_bytes = 1_056_768
+          max_report_bytes = max_marker_bytes + max_summary_bytes + 2
+          try:
+              with Path(report_path).open("rb") as handle:
+                  raw_report = handle.read(max_report_bytes + 1)
+          except OSError as exc:
+              raise SystemExit("source-bound backup report is unavailable") from exc
+          if (
+              len(raw_report) > max_report_bytes
+              or raw_report.count(b"\n") != 2
+              or not raw_report.endswith(b"\n")
+              or b"\r" in raw_report
+          ):
+              raise SystemExit("source-bound backup report is not the closed two-line output")
+          marker_raw, summary_raw, trailing = raw_report.split(b"\n")
+          if (
+              trailing
+              or len(marker_raw) > max_marker_bytes
+              or len(summary_raw) > max_summary_bytes
+          ):
+              raise SystemExit("source-bound backup report is not the closed two-line output")
+          marker_match = re.fullmatch(
+              rb"BACKUP_SUCCESS schema=1 run_id=([1-9][0-9]{0,19}) attempt=([1-9][0-9]{0,5}) operation=(create|verify-existing) source_sha=([0-9a-f]{40}) bundle_sha256=([0-9a-f]{64}) storage_helper_sha256=([0-9a-f]{64}) backup_drill_sha256=([0-9a-f]{64})",
+              marker_raw,
+          )
+          expected_marker = (
+              backup_id, backup_attempt, "create", source_sha, bundle_sha,
+              storage_helper_sha, backup_drill_sha,
+          )
+          if (
+              marker_match is None
+              or marker_match.groups()
+              != tuple(value.encode("ascii") for value in expected_marker)
+          ):
+              raise SystemExit("source-bound backup success marker is invalid")
+          try:
+              report = json.loads(summary_raw.decode("utf-8"))
+          except (UnicodeDecodeError, ValueError) as exc:
+              raise SystemExit("source-bound backup report is invalid") from exc
           backup = report.get("backup") if isinstance(report, dict) else None
           if not isinstance(backup, dict):
               raise SystemExit("source-bound backup report is invalid")

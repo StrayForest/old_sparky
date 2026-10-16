@@ -8,7 +8,7 @@ step.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 import os
@@ -29,6 +29,12 @@ SECURITY_WORKFLOW_PATH = ".github/workflows/platform-security.yml"
 BACKUP_JOB_NAME = "Create restore-verified backup"
 SECURITY_BASELINE_RUNTIME_JOB_NAME = "Authenticate internal baseline runtime proof"
 SECURITY_DISPATCH_FINALIZER_JOB_NAME = "Dispatch exact baseline proof finalizer"
+SECURITY_CONDITIONAL_RUNTIME_JOB_NAMES = frozenset(
+    {
+        "Conditional release runtime fixture",
+        "Trusted dev immutable release runtime",
+    }
+)
 BACKUP_RECEIPT_NAME = "backup-success-receipt.json"
 BACKUP_ARTIFACT_PREFIX = "platform-backup-success-"
 MAX_ARTIFACT_ZIP_BYTES = 1_048_576
@@ -375,13 +381,29 @@ def _validate_attempt_jobs(
                 for field in ("runner_id", "runner_name", "runner_group_id", "runner_group_name")
             )
         )
+        unexecuted_conditional_runtime_job = (
+            source_event == "push"
+            and status == "completed"
+            and conclusion == "skipped"
+            and row.get("name") in SECURITY_CONDITIONAL_RUNTIME_JOB_NAMES
+            and "steps" in row
+            and row["steps"] == []
+            and row.get("labels") == ["ubuntu-latest"]
+            and all(
+                field in row and row[field] is None
+                for field in ("runner_id", "runner_name", "runner_group_id", "runner_group_name")
+            )
+            and started == completed + timedelta(seconds=1)
+        )
         if (
             not run_started <= started <= run_updated
             or not run_started <= completed <= run_updated
         ):
             raise BackupProofError("attempt job timestamps are inconsistent with its exact run")
         if started > completed and not (
-            unexecuted_baseline_dispatch_finalizer or unexecuted_baseline_runtime_guard
+            unexecuted_baseline_dispatch_finalizer
+            or unexecuted_baseline_runtime_guard
+            or unexecuted_conditional_runtime_job
         ):
             raise BackupProofError("attempt job timestamps are inconsistent with its exact run")
         if latest_completion is None or completed > latest_completion:

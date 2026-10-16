@@ -639,6 +639,157 @@ class BackupSuccessGuardTests(unittest.TestCase):
 
         self.assertEqual(backup_guard.wait_for_backup_success(api, _binding()), _receipt())
 
+        # The exact push route can also skip the conditional release-runtime
+        # jobs without starting a runner. GitHub emits these rows with an
+        # empty steps list, null runner fields, and a one-second inverted
+        # timestamp pair; keep that exception limited to the two known names.
+        runtime_run_started = backup_guard._parse_time("2026-10-14T08:07:20Z", "start")
+        runtime_run_updated = backup_guard._parse_time("2026-10-14T08:19:10Z", "update")
+        runtime_job_base = {
+            "run_id": 38_532_904_677,
+            "run_attempt": 1,
+            "head_sha": "f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+            "status": "completed",
+            "conclusion": "skipped",
+            "started_at": "2026-10-14T08:07:21Z",
+            "completed_at": "2026-10-14T08:07:20Z",
+            "runner_id": None,
+            "runner_name": None,
+            "runner_group_id": None,
+            "runner_group_name": None,
+            "labels": ["ubuntu-latest"],
+            "steps": [],
+        }
+        runtime_job_names = (
+            "Conditional release runtime fixture",
+            "Trusted dev immutable release runtime",
+        )
+        self.assertEqual(
+            frozenset(runtime_job_names), backup_guard.SECURITY_CONDITIONAL_RUNTIME_JOB_NAMES
+        )
+        for index, name in enumerate(runtime_job_names):
+            runtime_job = dict(runtime_job_base, id=115_748_756_510 + index, name=name)
+            self.assertEqual(
+                backup_guard._validate_attempt_jobs(
+                    [
+                        {
+                            "id": 115_748_756_509 + index,
+                            "run_id": 38_532_904_677,
+                            "run_attempt": 1,
+                            "head_sha": "f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+                            "name": "Earlier executed security job",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "started_at": "2026-10-14T08:07:20Z",
+                            "completed_at": "2026-10-14T08:07:20Z",
+                        },
+                        runtime_job,
+                    ],
+                    run_id="38532904677",
+                    run_attempt="1",
+                    source_sha="f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+                    source_event="push",
+                    run_started=runtime_run_started,
+                    run_updated=runtime_run_updated,
+                ),
+                runtime_run_started,
+            )
+
+        rejected_runtime_jobs = [
+            dict(runtime_job_base, id=115_748_756_520, name="Unrelated skipped job"),
+            dict(
+                runtime_job_base,
+                id=115_748_756_521,
+                name="Conditional release runtime fixture",
+                conclusion="success",
+            ),
+            dict(
+                runtime_job_base,
+                id=115_748_756_522,
+                name="Conditional release runtime fixture",
+                steps=[{"name": "unexpected executed step"}],
+            ),
+            dict(
+                runtime_job_base,
+                id=115_748_756_523,
+                name="Conditional release runtime fixture",
+                started_at="2026-10-14T08:07:22Z",
+            ),
+            dict(
+                runtime_job_base,
+                id=115_748_756_524,
+                name="Conditional release runtime fixture",
+                started_at="2026-10-14T08:19:11Z",
+            ),
+            dict(
+                runtime_job_base,
+                id=115_748_756_531,
+                name="Conditional release runtime fixture",
+                completed_at="2026-10-14T08:19:11Z",
+            ),
+            dict(
+                runtime_job_base,
+                id=115_748_756_525,
+                name="Conditional release runtime fixture",
+                runner_name="runner-1",
+            ),
+            dict(
+                runtime_job_base,
+                id=115_748_756_527,
+                name="Conditional release runtime fixture",
+                labels=["ubuntu-24.04"],
+            ),
+            dict(
+                runtime_job_base,
+                id=115_748_756_528,
+                name="Conditional release runtime fixture",
+                labels="ubuntu-latest",
+            ),
+            dict(
+                runtime_job_base,
+                id=115_748_756_529,
+                name="Conditional release runtime fixture",
+                status="in_progress",
+            ),
+        ]
+        missing_steps = dict(
+            runtime_job_base,
+            id=115_748_756_526,
+            name="Conditional release runtime fixture",
+        )
+        missing_steps.pop("steps")
+        rejected_runtime_jobs.append(missing_steps)
+        missing_runner = dict(
+            runtime_job_base,
+            id=115_748_756_530,
+            name="Conditional release runtime fixture",
+        )
+        missing_runner.pop("runner_group_name")
+        rejected_runtime_jobs.append(missing_runner)
+        for row in rejected_runtime_jobs:
+            with self.subTest(runtime_skip=row), self.assertRaises(
+                backup_guard.BackupProofError
+            ):
+                backup_guard._validate_attempt_jobs(
+                    [row],
+                    run_id="38532904677",
+                    run_attempt="1",
+                    source_sha="f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+                    source_event="push",
+                    run_started=runtime_run_started,
+                    run_updated=runtime_run_updated,
+                )
+        with self.assertRaises(backup_guard.BackupProofError):
+            backup_guard._validate_attempt_jobs(
+                [runtime_job],
+                run_id="38532904677",
+                run_attempt="1",
+                source_sha="f39830cf1fd2bea7d6df9cd5b909e49d7fc73889",
+                source_event="workflow_dispatch",
+                run_started=runtime_run_started,
+                run_updated=runtime_run_updated,
+            )
+
         # Inverted timestamps remain invalid for executed jobs, including a
         # job that otherwise has the same exact source and successful result.
         executed_api = FakeBackupProofApi()

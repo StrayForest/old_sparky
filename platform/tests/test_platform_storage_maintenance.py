@@ -3564,6 +3564,144 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self._assert_backup_failure_trap_executes(workflow_path)
         self._assert_backup_child_group_is_terminated(workflow_path)
         self._assert_backup_wrapper_bounds_private_stderr(workflow_path)
+        self._assert_backup_local_receipt_uses_ssh_report(operation_run)
+
+    def _assert_backup_local_receipt_uses_ssh_report(self, operation_run: str) -> None:
+        report_assignment = (
+            'remote_report="$RUNNER_TEMP/platform-production-backup-report.log"'
+        )
+        invocation = (
+            '\nif [[ "$BACKUP_OPERATION" = create '
+            '&& "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true ]]; then'
+        )
+        operation_start = operation_run.index(report_assignment)
+        operation_end = operation_run.index(invocation, operation_start)
+        local_operation = textwrap.dedent(
+            operation_run[operation_start:operation_end]
+        )
+        shell_script = "\n".join(
+            (
+                "set -euo pipefail",
+                "verify_current_dev_source() { :; }",
+                local_operation,
+                'run_remote_operation "$BACKUP_OPERATION" false',
+            )
+        )
+
+        source_sha = "a" * 40
+        bundle_sha = "b" * 64
+        storage_helper_sha = "c" * 64
+        backup_drill_sha = "d" * 64
+        archive_sha = "e" * 64
+        marker = (
+            "BACKUP_SUCCESS schema=1 run_id=123456 attempt=2 operation=create "
+            f"source_sha={source_sha} bundle_sha256={bundle_sha} "
+            f"storage_helper_sha256={storage_helper_sha} "
+            f"backup_drill_sha256={backup_drill_sha}"
+        )
+        public_report = {
+            "mode": "backup-only",
+            "ok": True,
+            "backup": {
+                "status": "completed",
+                "created": True,
+                "restore_verified": True,
+                "alembic_revision_verified": True,
+                "checksum_present": True,
+                "format_version": 2,
+                "archive_name": "platformdb-20261016T120000Z.dump",
+                "archive_sha256": archive_sha,
+                "size_bytes": 123456,
+                "restored_table_count": 1,
+                "preexisting_archives_preserved": True,
+                "rotation_mode": "preserve-existing",
+            },
+        }
+        report_json = json.dumps(public_report, sort_keys=True, separators=(",", ":"))
+        remote_output = f"{marker}\n{report_json}\n"
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "test -f \"$RUNNER_TEMP/platform-production-backup-report.log\"\n"
+                "test \"$(stat -c '%a' -- \"$RUNNER_TEMP/platform-production-backup-report.log\")\" = 600\n"
+                "cat >/dev/null\n"
+                "printf '%s' \"$FIXTURE_REMOTE_STDOUT\"\n"
+                "printf 'called\\n' >\"$FIXTURE_SSH_CALLED\"\n",
+                encoding="ascii",
+            )
+            fake_ssh.chmod(0o700)
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            ssh_called = root / "ssh-called"
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.defpath}",
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_RUN_ID": "123456",
+                "GITHUB_RUN_ATTEMPT": "2",
+                "JOB_DEADLINE_MONOTONIC_NS": str(
+                    time.monotonic_ns() + 7_200_000_000_000
+                ),
+                "BACKUP_OPERATION": "create",
+                "AUTHORIZATION_PROBE_BEFORE_CREATE": "false",
+                "SOURCE_SHA": source_sha,
+                "BUNDLE_SHA256": bundle_sha,
+                "EVICT_BUILD_NODE_CACHE": "false",
+                "COMPACT_FALLBACK_RUNTIME_CACHE": "false",
+                "RESUME_FALLBACK_CACHE_COMPACTION": "false",
+                "RESUME_COMPACTION_RUN_ID": "none",
+                "RESUME_COMPACTION_RUN_ATTEMPT": "none",
+                "RESUME_COMPACTION_BUNDLE_SHA256": "none",
+                "SECURITY_RUN_ID": "123450",
+                "SECURITY_RUN_ATTEMPT": "1",
+                "SSH_DIR": str(root / "ssh"),
+                "PROD_SSH_HOST": "production.invalid",
+                "PROD_SSH_USER": "fixture",
+                "REPOSITORY": "StrayForest/old_sparky",
+                "EXPECTED_STORAGE_HELPER_SHA256": storage_helper_sha,
+                "EXPECTED_BACKUP_DRILL_SHA256": backup_drill_sha,
+                "FIXTURE_REMOTE_STDOUT": remote_output,
+                "FIXTURE_SSH_CALLED": str(ssh_called),
+            }
+            completed = subprocess.run(
+                ["bash", "-s"],
+                input=shell_script,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(ssh_called.read_text(encoding="ascii"), "called\n")
+            self.assertEqual(completed.stdout, marker + "\n")
+            receipt_path = runner_temp / "platform-backup-success-receipt.json"
+            receipt_stat = receipt_path.lstat()
+            self.assertEqual(
+                (stat.S_IMODE(receipt_stat.st_mode), receipt_stat.st_nlink),
+                (0o600, 1),
+            )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["source_sha"], source_sha)
+            self.assertEqual(
+                receipt["archive_name"], public_report["backup"]["archive_name"]
+            )
+            self.assertEqual(receipt["archive_sha256"], archive_sha)
+            self.assertEqual(
+                receipt["archive_size_bytes"], public_report["backup"]["size_bytes"]
+            )
+            self.assertTrue(receipt["restore_verified"])
+            self.assertTrue(receipt["alembic_revision_verified"])
+            self.assertFalse(
+                (runner_temp / "platform-production-backup-report.log").exists()
+            )
 
     def _assert_backup_stage_finalizer_is_bounded_and_identity_pinned(
         self, workflow_document: dict
