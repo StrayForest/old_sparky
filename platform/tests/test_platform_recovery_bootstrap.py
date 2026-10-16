@@ -84,6 +84,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_live_qa_runtime_install.py",
         "platform/tools/platform_production_classifier_artifact.py",
         "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_maintenance_failure_evidence.py",
         "platform/tools/platform_release_retention.py",
         "platform/tools/platform_tournament_list_read_model_recovery.py",
         "platform/tools/platform_release_restore_runtime.sh",
@@ -106,9 +107,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/python_packages/platform_infra/db.py",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 65
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 66
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "0656d020f21dda9ae2dc796da5b863f5ca84f905ac32616208499085d6b63907"
+    "eb862c5854614053470064b677d3d4c816a10e5b6d559f15b42c6c6de0cdabb1"
 )
 
 # These paths are deliberately present in the recovery route allowlist but are
@@ -173,6 +174,7 @@ RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
         "platform/tools/platform_production_deploy_supervisor.sh",
         "platform/tools/platform_recover_pending.sh",
         "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_maintenance_failure_evidence.py",
         "platform/tools/platform_release_retention.py",
         "platform/tools/platform_tournament_list_read_model_recovery.py",
         "platform/tools/platform_release_restore_runtime.sh",
@@ -188,9 +190,9 @@ RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
         "platform/tools/platform_workflow_remote_dispatch.py",
     }
 )
-RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT = 43
+RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT = 44
 RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST = (
-    "efde01f81ace41eba0be44093484a7941768df99cf951fe5e3c4fc0b8560d8c8"
+    "621fafd27cc1091fed6a5a3978042e979adffbec438ff9f435368645c2363195"
 )
 
 
@@ -1091,8 +1093,175 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("platform_abort_retained_only.sh", workflow)
         self.assertIn("platform_maintenance_failure_evidence.py", workflow)
         self.assertIn("platform-maintenance-failure-${{ github.run_id }}-${{ github.run_attempt }}", workflow)
-        self.assertGreaterEqual(workflow.count("github.event.repository.visibility"), 2)
-        self.assertIn("test \"$REPOSITORY_VISIBILITY\" = private", workflow)
+        self.assertEqual(workflow.count("github.event.repository.private"), 2)
+        self.assertEqual(workflow.count('test "$REPOSITORY_PRIVATE" = true'), 2)
+        private_guard = 'test "$REPOSITORY_PRIVATE" = true'
+        for value, expected_status in (("true", 0), ("false", 1), (None, 1)):
+            private_env = os.environ.copy()
+            if value is None:
+                private_env.pop("REPOSITORY_PRIVATE", None)
+            else:
+                private_env["REPOSITORY_PRIVATE"] = value
+            with self.subTest(repository_private=value):
+                self.assertEqual(
+                    subprocess.run(
+                        ["bash", "-c", private_guard],
+                        env=private_env,
+                        check=False,
+                        timeout=5,
+                    ).returncode,
+                    expected_status,
+                )
+        action_step = workflow.split(
+            "- name: Execute one exact signed recovery capability", 1
+        )[1].split("\n      - name:", 1)[0]
+        action_script = textwrap.dedent(action_step.split("run: |\n", 1)[1])
+        evidence_bytes = b'{"fixture":"private-capture-evidence"}\n'
+        evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            ssh_log = root / "ssh-calls.jsonl"
+            scp_log = root / "scp-calls.jsonl"
+            evidence_fixture = root / "evidence-fixture.json"
+            evidence_fixture.write_bytes(evidence_bytes)
+            evidence_path = root / "maintenance-evidence.json"
+            github_output = root / "github-output"
+            ssh_script = fake_bin / "ssh"
+            ssh_script.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "body = sys.stdin.buffer.read()\n"
+                "with open(os.environ['FAKE_SSH_LOG'], 'a', encoding='utf-8') as log:\n"
+                "    log.write(json.dumps({'args': sys.argv[1:], 'body': body.decode('utf-8')}) + '\\n')\n"
+                "if sys.argv[-1] == 'bash -s':\n"
+                "    print(os.environ['FAKE_REMOTE_STAGE'])\n"
+                "elif not sys.argv[-1].startswith('bash -s -- '):\n"
+                "    raise SystemExit(41)\n",
+                encoding="utf-8",
+            )
+            ssh_script.chmod(0o755)
+            scp_script = fake_bin / "scp"
+            scp_script.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, stat, sys\n"
+                "args = sys.argv[1:]\n"
+                "source, destination = args[-2:]\n"
+                "with open(os.environ['FAKE_SCP_LOG'], 'a', encoding='utf-8') as log:\n"
+                "    log.write(json.dumps({'args': args, 'source': source, 'destination': destination}) + '\\n')\n"
+                "if destination == os.environ['CAPTURE_EVIDENCE_PATH']:\n"
+                "    metadata = os.lstat(destination)\n"
+                "    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1:\n"
+                "        raise SystemExit(42)\n"
+                "    if source != os.environ['FAKE_CAPTURE_SOURCE']:\n"
+                "        raise SystemExit(43)\n"
+                "    with open(destination, 'wb') as output:\n"
+                "        from pathlib import Path\n"
+                "        output.write(Path(os.environ['FAKE_EVIDENCE_FIXTURE']).read_bytes())\n"
+                "",
+                encoding="utf-8",
+            )
+            scp_script.chmod(0o755)
+            ssh_dir = root / "ssh"
+            ssh_dir.mkdir(mode=0o700)
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "SSH_DIR": str(ssh_dir),
+                "PROD_SSH_HOST": "host.invalid",
+                "PROD_SSH_USER": "runner",
+                "BUNDLE": str(root / "bundle.zip"),
+                "BUNDLE_SHA": "b" * 64,
+                "SOURCE_SHA": "a" * 40,
+                "SECURITY_RUN_ID": "12345",
+                "SECURITY_RUN_ATTEMPT": "1",
+                "RECOVERY_RUN_ID": "23456",
+                "RECOVERY_RUN_ATTEMPT": "1",
+                "RECOVERY_JOB_ID": "34567",
+                "RECOVERY_WORKFLOW_SHA": "c" * 40,
+                "ROUTE_DIGEST": "d" * 64,
+                "ACTION": "capture_maintenance_failure",
+                "ACTION_CONFIRMATION": "CAPTURE-MAINTENANCE-FAILURE",
+                "EVIDENCE_SHA256": "e" * 64,
+                "CAPTURE_EVIDENCE_PATH": str(evidence_path),
+                "CAPTURE_RUN_ID": "45678",
+                "CAPTURE_RUN_ATTEMPT": "1",
+                "ACTION_RUN_ID": "56789",
+                "ACTION_RUN_ATTEMPT": "1",
+                "GITHUB_OUTPUT": str(github_output),
+                "FAKE_SSH_LOG": str(ssh_log),
+                "FAKE_SCP_LOG": str(scp_log),
+                "FAKE_REMOTE_STAGE": "/tmp/oldsparky-recovery-bootstrap.ABC123",
+                "FAKE_CAPTURE_SOURCE": "runner@host.invalid:/tmp/oldsparky-recovery-bootstrap.ABC123/maintenance-evidence.json",
+                "FAKE_EVIDENCE_FIXTURE": str(evidence_fixture),
+            }
+            result = subprocess.run(
+                ["bash", "-c", action_script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(evidence_path.read_bytes(), evidence_bytes)
+            metadata = evidence_path.lstat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_nlink, 1)
+            self.assertEqual(
+                result.stdout,
+                f"MAINTENANCE_EVIDENCE status=downloaded sha256={evidence_sha256} private=true\n",
+            )
+            self.assertNotIn("private-capture-evidence", result.stdout)
+            self.assertEqual(
+                github_output.read_text(encoding="ascii"),
+                f"evidence_sha256={evidence_sha256}\n",
+            )
+            ssh_calls = [
+                json.loads(line) for line in ssh_log.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(ssh_calls), 4)
+            self.assertTrue(all(call["body"] for call in ssh_calls))
+            self.assertEqual(ssh_calls[0]["args"][-1], "bash -s")
+            self.assertEqual(
+                ssh_calls[1]["args"][-1],
+                "bash -s -- '/tmp/oldsparky-recovery-bootstrap.ABC123'",
+            )
+            action_argv = ssh_calls[2]["args"][-1]
+            self.assertTrue(
+                action_argv.startswith(
+                    "bash -s -- '/tmp/oldsparky-recovery-bootstrap.ABC123' '"
+                    + environment["BUNDLE_SHA"]
+                    + "' '"
+                    + environment["SOURCE_SHA"]
+                    + "' '12345' '1' '23456' '1' '34567' '"
+                    + environment["RECOVERY_WORKFLOW_SHA"]
+                    + "' '"
+                    + environment["ROUTE_DIGEST"]
+                    + "' 'capture_maintenance_failure'"
+                )
+            )
+            self.assertIn("platform_maintenance_failure_evidence.py", ssh_calls[2]["body"])
+            self.assertIn(
+                "capture_maintenance_failure", ssh_calls[2]["body"]
+            )
+            self.assertIn("rm -rf -- \"$stage\"", ssh_calls[3]["body"])
+            self.assertTrue(
+                all("runner@host.invalid" in call["args"] for call in ssh_calls)
+            )
+            scp_calls = [
+                json.loads(line) for line in scp_log.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(scp_calls), 2)
+            self.assertEqual(scp_calls[0]["source"], environment["BUNDLE"])
+            self.assertEqual(
+                scp_calls[0]["destination"],
+                "runner@host.invalid:/tmp/oldsparky-recovery-bootstrap.ABC123/bundle.zip",
+            )
+            self.assertEqual(scp_calls[-1]["source"], environment["FAKE_CAPTURE_SOURCE"])
+            self.assertEqual(scp_calls[-1]["destination"], str(evidence_path))
         self.assertIn("retention-days: 1", workflow)
         self.assertIn('size_in_bytes"] <= 1024 * 1024', workflow)
         self.assertIn('os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW', workflow)

@@ -2563,6 +2563,12 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         recover = (
             REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
         ).read_text()
+        expected_recovery_capabilities = (
+            '["abort_retained_only", "recover_pending", '
+            '"quarantine_populated_quiesce", "prune_task_releases", '
+            '"capture_maintenance_failure", "reset_maintenance_failed"]'
+        )
+        self.assertEqual(recover.count(expected_recovery_capabilities), 2)
         recover_provenance = recover.index(
             "Validate exact security and recovery provenance before SSH"
         )

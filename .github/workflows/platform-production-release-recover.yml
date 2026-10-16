@@ -469,7 +469,7 @@ jobs:
           if (
               set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "bundle_artifact_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance", "publisher_workflow_sha", "publisher_run_id", "publisher_run_attempt", "publisher_job_id", "publisher_bundle_name", "publisher_bundle_artifact_id", "publisher_bundle_artifact_sha256"}
               or payload.get("schema") != 3 or payload.get("capability") != "recovery_bootstrap"
-              or payload.get("capabilities") != ["abort_retained_only", "recover_pending", "quarantine_populated_quiesce", "prune_task_releases"]
+              or payload.get("capabilities") != ["abort_retained_only", "recover_pending", "quarantine_populated_quiesce", "prune_task_releases", "capture_maintenance_failure", "reset_maintenance_failed"]
               or payload.get("deployable") is not False
           ):
               raise SystemExit("recovery evidence schema is not closed")
@@ -1004,7 +1004,7 @@ jobs:
               manifest = json.loads(manifest_raw.decode("ascii"), object_pairs_hook=unique_object)
               if (not isinstance(manifest, dict) or manifest.get("schema") != 1
                       or manifest.get("source_sha") != expected_source_sha
-                      or manifest.get("capabilities") != ["abort_retained_only", "recover_pending", "quarantine_populated_quiesce", "prune_task_releases"]):
+                      or manifest.get("capabilities") != ["abort_retained_only", "recover_pending", "quarantine_populated_quiesce", "prune_task_releases", "capture_maintenance_failure", "reset_maintenance_failed"]):
                   raise SystemExit("immutable recovery manifest source is invalid")
               records = manifest.get("files")
               if not isinstance(records, list):

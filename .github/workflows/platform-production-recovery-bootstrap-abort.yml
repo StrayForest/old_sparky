@@ -741,11 +741,11 @@ jobs:
       - name: Confirm private repository evidence boundary before host access
         shell: bash
         env:
-          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
-          test "$REPOSITORY_VISIBILITY" = private
+          test "$REPOSITORY_PRIVATE" = true
 
       - name: Validate production SSH inputs
         shell: bash
@@ -1188,11 +1188,11 @@ jobs:
         if: ${{ inputs.action == 'capture_maintenance_failure' && success() }}
         shell: bash
         env:
-          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
-          test "$REPOSITORY_VISIBILITY" = private
+          test "$REPOSITORY_PRIVATE" = true
 
       - name: Upload private maintenance failure evidence
         if: ${{ inputs.action == 'capture_maintenance_failure' && success() }}
