@@ -350,11 +350,12 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 nginx_calls[0]["argv"],
                 [str(transaction.parents[1] / "shared/venv/bin/python"), str(transaction.parents[1] / "releases/old/tools/platform_install_nginx.py"), "--json"],
             )
-            self.assertEqual(nginx_calls[0]["env"], {"PATH": "/usr/bin:/bin", "PLATFORM_APP_DIR": str(transaction.parents[1]), "PYTHONDONTWRITEBYTECODE": "1"})
+            self.assertEqual(nginx_calls[0]["env"], {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "PLATFORM_APP_DIR": str(transaction.parents[1]), "PYTHONDONTWRITEBYTECODE": "1"})
             self.assertEqual(nginx_calls[0]["stdout"], subprocess.DEVNULL)
             self.assertEqual(nginx_calls[0]["stderr"], subprocess.DEVNULL)
             self.assertEqual(nginx_calls[0]["timeout"], 60)
             self.assertFalse(any(flag in nginx_calls[0]["argv"] for flag in ("--apply", "--reload")))
+            self.assertNotIn("--nginx-bin", nginx_calls[0]["argv"])
             self.assertFalse(any("platform_install_systemd_units" in str(arg) for arg in nginx_calls[0]["argv"]))
 
         with tempfile.TemporaryDirectory() as directory:

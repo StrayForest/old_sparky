@@ -572,7 +572,7 @@ def _receipt_snapshot_and_preflight(
         result["nginx_preflight"] = "not_applicable"
         result["nginx_preflight_returncode"] = "unavailable"
         return record, result, target_label, target_path
-    env = {"PATH": "/usr/bin:/bin", "PLATFORM_APP_DIR": str(APP_DIR), "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "PLATFORM_APP_DIR": str(APP_DIR), "PYTHONDONTWRITEBYTECODE": "1"}
     private_capture = _private_capture_requested()
     argv = [str(SHARED_PYTHON), str(target / "tools/platform_install_nginx.py"), "--json"]
     private_stderr = None
