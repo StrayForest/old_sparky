@@ -2,11 +2,19 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-16
+- Last reviewed: 2026-10-17
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
 ## Current operational checkpoint — 2026-10-17
+
+- Latest published source `320408bce56be30d43fad2d237bb19f4ca1315ed` is on `dev` and `codex/backup-memory-attribution`. Its storage-diagnostics route does not produce a deployment artifact or run a production deploy. Recovery [`38979405271/1`](https://github.com/StrayForest/old_sparky/actions/runs/38979405271), using the exact prior immutable bundle and source-bound LiveQA reuse, passed pre-SSH binding/proof and restored the systemd snapshot, but failed its one-shot `readiness_public` curl with rc 7 (connection refused at `127.0.0.1:3000`). The pending install receipt remains at `recovery-restored`; `current` remains source `9ceaf09ab7ba4bf5c5e636865106910eaa034c8d` and `previous` remains `f1154c7dba4f`. No reset or repeat recovery was run.
+- Read-only local correlation after that failure found API/web/worker active, pointers unchanged, and the web listener returning HTTP 200. The same web invocation logged systemd start at 23:06:03.16Z and Next readiness at 23:06:04.696Z; the encrypted failure marker has no curl timestamp. The timing is consistent with a startup/readiness race but does not prove the historical curl ran before readiness. The natural health timer then completed successfully at 23:07:16–18Z with all checks passing, including disk 5.85 GiB free / 84.3% used, memory 42.3%, and backup restore verification. No service was manually started or reset. The failure artifact and bounded correlation are retained privately under `/root/old_sparky/.git/codex-performance-20261016/recovery-38979405271/`.
+- The current recovery-source fix adds bounded polling to the API and public readiness checks, preserving one final component failure marker and the pending receipt on exhaustion. The installed immutable helper remains the previous one-shot version until a new source-bound recovery bundle passes its exact-SHA chain. The pending transaction is not complete; do not retry recovery before that bundle is validated. The 11-profile external load matrix remains 5/11; six profiles, separate CPU validation and final QA remain incomplete, and human-visible Chrome/authentication/Turnstile QA remains **NOT RUN**.
+
+### Superseded snapshots
+
+The following diagnostic and storage snapshots predate recovery `38979405271`; their status statements are historical and are superseded by the current facts above.
 
 - Latest published source `c63e8db76b2379fa673d05a6bcd98b7923386469` is on `dev` and `codex/backup-memory-attribution`. Exact-SHA Security [`38966235648/1`](https://github.com/StrayForest/old_sparky/actions/runs/38966235648), natural producer [`38967645316/1`](https://github.com/StrayForest/old_sparky/actions/runs/38967645316), and publisher [`38967686128/1`](https://github.com/StrayForest/old_sparky/actions/runs/38967686128) succeeded. The auto-deploy parent [`38967645330/1`](https://github.com/StrayForest/old_sparky/actions/runs/38967645330) was cancelled before child dispatch; no production deployment ran.
 - Two API-bound diagnostic-only captures, [`38968240821/1`](https://github.com/StrayForest/old_sparky/actions/runs/38968240821) and [`38969079109/1`](https://github.com/StrayForest/old_sparky/actions/runs/38969079109), show the same current mismatch: `deadlock-health-monitor.service` is `failed/static` while its timer is `active/enabled`; canonical receipt validation passed and current systemd verification failed. The second capture followed a full timer interval, but its evidence does not show whether the timer actually fired. The checker report, unit properties/timestamps, jobs, cgroup membership, and bounded journal are not yet captured, so the historical failure cause and current health-check predicates remain **UNKNOWN**. No reset, stop, start, or recovery retry was run.

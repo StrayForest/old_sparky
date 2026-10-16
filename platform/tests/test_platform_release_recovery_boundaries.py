@@ -2935,6 +2935,197 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertFalse((self.shared / STATE_NAME).exists())
         self.assertEqual((self.app_dir / "current").resolve(), current)
 
+    def _assert_runtime_restore_public_readiness_retry_cases(self) -> None:
+        app_dir = self.root / "readiness-app"
+        release = app_dir / "releases" / "readiness-release"
+        shared = app_dir / "shared"
+        tools = release / "tools"
+        tools.mkdir(parents=True)
+        (release / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": "e" * 40}) + "\n", encoding="ascii"
+        )
+        release_manifest = (release / "RELEASE.json").read_bytes()
+        (app_dir / "shared").mkdir(parents=True)
+        (shared / "venv/bin").mkdir(parents=True)
+        (shared / "venv/bin/python").write_text(
+            "#!/usr/bin/env bash\nexit 0\n", encoding="ascii"
+        )
+        (shared / "venv/bin/python").chmod(0o755)
+        units_tool = tools / "platform_install_systemd_units.sh"
+        units_tool.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="ascii")
+        units_tool.chmod(0o755)
+        (tools / "platform_install_nginx.py").write_text("pass\n", encoding="ascii")
+        (tools / "platform_live_qa_runtime_install.py").write_text(
+            "pass\n", encoding="ascii"
+        )
+        (tools / "platform_deploy_smoke.py").write_text("pass\n", encoding="ascii")
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "active",
+                "deadlock-web": "active",
+            }
+        )
+        curl = self.root / "curl-fixture"
+        curl_calls = self.root / "curl-calls"
+        api_count = self.root / "api-curl-count"
+        public_count = self.root / "public-curl-count"
+        curl.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"printf '%s\\t%s\\n' \"$*\" \"${{!#}}\" >> {str(curl_calls)!r}\n"
+            "url=\"${!#}\"\n"
+            "if [[ \"$url\" == 'http://127.0.0.1:8010/api/v1/health/ready' ]]; then\n"
+            f"  target=api; count_file={str(api_count)!r}\n"
+            "elif [[ \"$url\" == 'http://127.0.0.1:3000/' ]]; then\n"
+            f"  target=web; count_file={str(public_count)!r}\n"
+            "else exit 64; fi\n"
+            "if [[ \"${PLATFORM_TEST_READINESS_TARGET:-}\" != \"$target\" ]]; then exit 0; fi\n"
+            "count=$(cat \"$count_file\" 2>/dev/null || printf '0')\n"
+            "count=$((count + 1))\n"
+            "printf '%s\\n' \"$count\" > \"$count_file\"\n"
+            "case \"${PLATFORM_TEST_READINESS_MODE:-transient}\" in\n"
+            "  transient) if [[ \"$count\" -lt 3 ]]; then printf '%s\\n' 'curl: (7) connection refused' >&2; exit 7; fi ;;\n"
+            "  refused) printf '%s\\n' 'curl: (7) connection refused' >&2; exit 7 ;;\n"
+            "  invalid) printf '%s\\n' 'curl: (22) HTTP response code said error' >&2; exit 22 ;;\n"
+            "  *) exit 64 ;;\n"
+            "esac\n"
+            "exit 0\n",
+            encoding="ascii",
+        )
+        curl.chmod(0o755)
+        sleep = self.root / "sleep-fixture"
+        sleep_calls = self.root / "sleep-calls"
+        sleep.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"printf '%s\\n' \"$*\" >> {str(sleep_calls)!r}\n",
+            encoding="ascii",
+        )
+        sleep.chmod(0o755)
+
+        for label, target, mode, expected_rc, expected_attempts in (
+            ("api-transient", "api", "transient", 0, 3),
+            ("api-permanent-refusal", "api", "refused", 7, 30),
+            ("api-invalid-health", "api", "invalid", 22, 30),
+            ("web-transient", "web", "transient", 0, 3),
+            ("web-permanent-refusal", "web", "refused", 7, 30),
+            ("web-invalid-health", "web", "invalid", 22, 30),
+        ):
+            with self.subTest(readiness=label):
+                curl_calls.unlink(missing_ok=True)
+                api_count.unlink(missing_ok=True)
+                public_count.unlink(missing_ok=True)
+                sleep_calls.unlink(missing_ok=True)
+                (self.root / "systemctl.log").write_text("")
+                runtime = self.root / f"runtime-{label}" / "platform_release_restore_runtime.sh"
+                runtime.parent.mkdir()
+                script = RUNTIME_RESTORE_SCRIPT.read_text(encoding="utf-8")
+                self.assertIn("/usr/bin/curl", script)
+                self.assertIn("sleep 1", script)
+                script = script.replace("/usr/bin/curl", str(curl))
+                script = script.replace("sleep 1", f"{sleep} 1")
+                runtime.write_text(script, encoding="utf-8")
+                runtime.chmod(0o755)
+                self.install_test_lock_helper(runtime.parent / "platform_release_lock.sh")
+                shutil.copy2(
+                    SYSTEMD_STATE_TOOL,
+                    runtime.parent / "platform_release_systemd_state.py",
+                )
+                (runtime.parent / "platform_release_systemd_state.py").chmod(0o755)
+
+                result = self.run_script(
+                    runtime,
+                    "--restart-only",
+                    "--skip-smoke",
+                    "--app-dir",
+                    str(app_dir),
+                    "--release",
+                    str(release),
+                    "--systemctl",
+                    str(systemctl),
+                    env={
+                        **self.runtime_env(label="readiness"),
+                        "PLATFORM_RUNTIME_PRIVATE_CAPTURE": "1",
+                        "PLATFORM_RUNTIME_PRIVATE_ROUTE": "recover_pending",
+                        "PLATFORM_TEST_READINESS_MODE": mode,
+                        "PLATFORM_TEST_READINESS_TARGET": target,
+                    },
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, expected_rc, result.stderr)
+                curl_rows = [
+                    line.split("\t", 1) for line in curl_calls.read_text().splitlines()
+                ]
+                api_rows = [
+                    row
+                    for row in curl_rows
+                    if row[-1] == "http://127.0.0.1:8010/api/v1/health/ready"
+                ]
+                public_rows = [
+                    row for row in curl_rows if row[-1] == "http://127.0.0.1:3000/"
+                ]
+                expected_api_attempts = expected_attempts if target == "api" else 1
+                expected_web_attempts = (
+                    expected_attempts
+                    if target == "web"
+                    else (0 if target == "api" and expected_rc != 0 else 1)
+                )
+                self.assertEqual(len(api_rows), expected_api_attempts)
+                self.assertEqual(len(public_rows), expected_web_attempts)
+                for row in api_rows:
+                    self.assertEqual(
+                        row[0],
+                        "--fail --silent --show-error --max-time 5 "
+                        "http://127.0.0.1:8010/api/v1/health/ready",
+                    )
+                for row in public_rows:
+                    self.assertEqual(
+                        row[0],
+                        "--fail --silent --show-error --max-time 5 http://127.0.0.1:3000/",
+                    )
+                sleep_rows = (
+                    sleep_calls.read_text().splitlines() if sleep_calls.exists() else []
+                )
+                expected_sleeps = (
+                    expected_attempts - 1 if expected_rc == 0 else expected_attempts
+                )
+                self.assertEqual(len(sleep_rows), expected_sleeps)
+                self.assertEqual(set(sleep_rows), {"1"})
+                markers = [
+                    line.removeprefix("RUNTIME_PRIVATE_CONTEXT ")
+                    for line in result.stderr.splitlines()
+                    if line.startswith("RUNTIME_PRIVATE_CONTEXT ")
+                ]
+                if expected_rc == 0:
+                    self.assertEqual(markers, [])
+                    self.assertIn("status=restored", result.stdout)
+                    self.assertNotIn("connection refused", result.stderr)
+                else:
+                    self.assertEqual(len(markers), 1)
+                    marker = json.loads(markers[0])
+                    expected_component = (
+                        "readiness_internal" if target == "api" else "readiness_public"
+                    )
+                    self.assertEqual(marker["component"], expected_component)
+                    self.assertEqual(marker["returncode"], expected_rc)
+                    self.assertIn("status=failed", result.stderr)
+                    self.assertNotIn("connection refused", result.stdout)
+                self.assertEqual((release / "RELEASE.json").read_bytes(), release_manifest)
+                systemctl_calls = (self.root / "systemctl.log").read_text().splitlines()
+                self.assertEqual(
+                    [line for line in systemctl_calls if line.startswith("restart ")],
+                    [
+                        "restart deadlock-api",
+                        "restart deadlock-worker",
+                        "restart deadlock-web",
+                    ],
+                )
+                self.assertFalse(
+                    any(line.startswith(("start ", "stop ")) for line in systemctl_calls)
+                )
+
     def test_rollback_restores_previous_units_and_nginx_before_completion(self) -> None:
         current = self.add_release("current")
         previous = self.add_release("previous")
@@ -3008,6 +3199,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             ),
             recorded_restore_calls,
         )
+        self._assert_runtime_restore_public_readiness_retry_cases()
 
     def test_rollback_crash_after_systemd_clear_retries_transaction_completion(self) -> None:
         current, previous = self.prepare_rollback_state()

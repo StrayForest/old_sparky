@@ -607,12 +607,45 @@ if [[ "$RUN_RESTART" -eq 1 && "$RESTART_AFTER" -eq 1 ]]; then
     done
   fi
   if run_systemctl is-active --quiet deadlock-api >/dev/null 2>/dev/null; then
-    run_private_command readiness_internal /usr/bin/curl --fail --silent --show-error --max-time 10 \
-      http://127.0.0.1:8010/api/v1/health/ready
+    # A simple systemd service can be active before the API binds its listener.
+    # Keep the strict health endpoint but wait within a fixed bound, capturing
+    # all retries as one private command so only terminal failure is retained.
+    run_private_command readiness_internal /usr/bin/bash -c '
+      ready=0
+      last_status=1
+      for attempt in {1..30}; do
+        if /usr/bin/curl --fail --silent --show-error --max-time 5 \
+          http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
+          ready=1
+          break
+        else
+          last_status=$?
+        fi
+        sleep 1
+      done
+      [[ "$ready" == 1 ]] || exit "$last_status"
+    '
   fi
   if run_systemctl is-active --quiet deadlock-web >/dev/null 2>/dev/null; then
-    run_private_command readiness_public /usr/bin/curl --fail --silent --show-error --max-time 10 \
-      http://127.0.0.1:3000/
+    # The restored web service can take a short interval to bind its listener
+    # after systemd reports it active. Retry only this same strict HTTP check
+    # within a fixed bound; run it as one private command so transient curl
+    # errors are discarded on success and exhaustion emits one final context.
+    run_private_command readiness_public /usr/bin/bash -c '
+      ready=0
+      last_status=1
+      for attempt in {1..30}; do
+        if /usr/bin/curl --fail --silent --show-error --max-time 5 \
+          http://127.0.0.1:3000/ >/dev/null; then
+          ready=1
+          break
+        else
+          last_status=$?
+        fi
+        sleep 1
+      done
+      [[ "$ready" == 1 ]] || exit "$last_status"
+    '
   fi
 fi
 
