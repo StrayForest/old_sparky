@@ -401,10 +401,12 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
-          dir_identity="$(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+          probe_dir="/run/oldsparky-capture-probe-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          dir_identity="$(
+            ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
             -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT'")" <<'REMOTE_STAGE'
+            "bash -s -- '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT'" <<'REMOTE_STAGE'
           set -euo pipefail
           run_id="$1"; run_attempt="$2"
           [[ "$run_id" =~ ^[0-9]+$ && "$run_attempt" =~ ^[0-9]+$ ]]
@@ -422,6 +424,7 @@ jobs:
           printf '%s:%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
           trap - EXIT
           REMOTE_STAGE
+          )"
           [[ "$dir_identity" =~ ^[0-9]+:[0-9]+$ ]]
           printf 'CAPTURE_PROBE_DIR_ID=%s\n' "$dir_identity" >> "$GITHUB_ENV"
           scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \

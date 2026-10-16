@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -257,7 +258,81 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             "platform_release_lock_exec.sh",
         ):
             self.assertNotIn(forbidden, probe_path)
+        self._assert_capture_probe_stage_feeds_heredoc_to_ssh_before_copy()
         self._assert_remote_cleanup_failure_still_removes_local_ssh_material()
+
+    def _assert_capture_probe_stage_feeds_heredoc_to_ssh_before_copy(self) -> None:
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/platform-production-diagnostics.yml").read_text(encoding="utf-8")
+        stage_step = workflow.split("      - name: Stage read-only probe in a private task directory", 1)[1].split(
+            "      - name: Read-only systemd capture precondition probe", 1
+        )[0]
+        script = textwrap.dedent(stage_step.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            ssh_calls = root / "ssh-calls.jsonl"
+            scp_calls = root / "scp-calls.jsonl"
+            ssh_stub = fake_bin / "ssh"
+            ssh_stub.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "command = sys.argv[-1]\n"
+                "body = sys.stdin.read()\n"
+                "with Path(os.environ['FAKE_SSH_CALLS']).open('a', encoding='utf-8') as stream:\n"
+                "    stream.write(json.dumps({'command': command, 'body': body}) + '\\n')\n"
+                "if command.startswith('bash -s -- '):\n"
+                "    if 'probe_dir=\"/run/oldsparky-capture-probe-$run_id-$run_attempt\"' not in body or 'mkdir -m 0700' not in body:\n"
+                "        raise SystemExit(42)\n"
+                "    print('2049:123')\n",
+                encoding="utf-8",
+            )
+            ssh_stub.chmod(0o755)
+            scp_stub = fake_bin / "scp"
+            scp_stub.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "with Path(os.environ['FAKE_SCP_CALLS']).open('a', encoding='utf-8') as stream:\n"
+                "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+                encoding="utf-8",
+            )
+            scp_stub.chmod(0o755)
+            github_env = root / "github-env"
+            github_env.touch()
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                    "GITHUB_RUN_ID": "12345",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_ENV": str(github_env),
+                    "GITHUB_WORKSPACE": str(Path(__file__).resolve().parents[2]),
+                    "SSH_DIR": str(root / "ssh"),
+                    "PROD_SSH_HOST": "host.invalid",
+                    "PROD_SSH_USER": "operator",
+                    "FAKE_SSH_CALLS": str(ssh_calls),
+                    "FAKE_SCP_CALLS": str(scp_calls),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = [json.loads(line) for line in ssh_calls.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0]["command"], "bash -s -- '12345' '1'")
+            self.assertIn("mkdir -m 0700 -- \"$probe_dir\"", calls[0]["body"])
+            self.assertEqual(calls[1]["command"], "chmod 0600 -- '/run/oldsparky-capture-probe-12345-1/probe.py'")
+            self.assertEqual(calls[1]["body"], "")
+            copy_calls = [json.loads(line) for line in scp_calls.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(copy_calls), 1)
+            self.assertEqual(
+                copy_calls[0][-1],
+                "operator@host.invalid:/run/oldsparky-capture-probe-12345-1/probe.py",
+            )
+            self.assertIn("CAPTURE_PROBE_DIR_ID=2049:123", github_env.read_text(encoding="utf-8"))
 
     def _assert_remote_cleanup_failure_still_removes_local_ssh_material(self) -> None:
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/platform-production-diagnostics.yml").read_text(encoding="utf-8")
