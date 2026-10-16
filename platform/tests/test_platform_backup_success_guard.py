@@ -24,7 +24,7 @@ SECURITY_ATTEMPT = 2
 BACKUP_RUN_ID = 741_991
 BACKUP_ATTEMPT = 1
 SOURCE_SHA = "85b287932efe846e126edf4b6fcdaa9b412cc000"
-RECEIPT_MEMBER = "backup-success-receipt.json"
+RECEIPT_MEMBER = "platform-backup-success-receipt.json"
 
 
 def _digest(payload: bytes) -> str:
@@ -397,12 +397,15 @@ class BackupSuccessGuardTests(unittest.TestCase):
     def test_traversal_and_symlink_members_fail_closed(self) -> None:
         body = json.dumps(_receipt(), sort_keys=True, separators=(",", ":")).encode()
         traversal = _zip_receipt(
-            None, entries=[("../backup-success-receipt.json", body, stat.S_IFREG)]
+            None, entries=[("../platform-backup-success-receipt.json", body, stat.S_IFREG)]
+        )
+        legacy_name = _zip_receipt(
+            None, entries=[("backup-success-receipt.json", body, stat.S_IFREG)]
         )
         symlink = _zip_receipt(
             None, entries=[(RECEIPT_MEMBER, body, stat.S_IFLNK)]
         )
-        for archive in (traversal, symlink):
+        for archive in (legacy_name, traversal, symlink):
             with self.subTest(digest=_digest(archive)), self.assertRaises(
                 backup_guard.BackupProofError
             ):

@@ -29,6 +29,7 @@ import zipfile
 import yaml
 
 from tests import platform_test_lock_support as lock_support
+from tools import platform_backup_success_guard as backup_success_guard
 from tools import platform_storage_maintenance as maintenance
 from tools.platform_disk_policy import BYTES_PER_GIB, snapshot_from_usage
 from tools.platform_storage_maintenance import (
@@ -3564,9 +3565,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self._assert_backup_failure_trap_executes(workflow_path)
         self._assert_backup_child_group_is_terminated(workflow_path)
         self._assert_backup_wrapper_bounds_private_stderr(workflow_path)
-        self._assert_backup_local_receipt_uses_ssh_report(operation_run)
+        self._assert_backup_local_receipt_uses_ssh_report(
+            operation_run, workflow_document
+        )
 
-    def _assert_backup_local_receipt_uses_ssh_report(self, operation_run: str) -> None:
+    def _assert_backup_local_receipt_uses_ssh_report(
+        self, operation_run: str, workflow_document: dict
+    ) -> None:
         report_assignment = (
             'remote_report="$RUNNER_TEMP/platform-production-backup-report.log"'
         )
@@ -3579,6 +3584,25 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         local_operation = textwrap.dedent(
             operation_run[operation_start:operation_end]
         )
+        receipt_path_matches = re.findall(
+            r'^\s*receipt_path="\$RUNNER_TEMP/([^/"\n]+)"$',
+            operation_run,
+            flags=re.MULTILINE,
+        )
+        self.assertEqual(len(receipt_path_matches), 1)
+        upload_steps = [
+            step
+            for step in workflow_document["jobs"]["backup"]["steps"]
+            if step.get("name") == "Publish source-bound backup success receipt"
+        ]
+        self.assertEqual(len(upload_steps), 1)
+        upload_path = upload_steps[0].get("with", {}).get("path")
+        upload_path_match = re.fullmatch(
+            r"\$\{\{\s*runner\.temp\s*\}\}/([^/]+)", upload_path or ""
+        )
+        self.assertIsNotNone(upload_path_match)
+        receipt_member_name = upload_path_match.group(1)
+        self.assertEqual(receipt_member_name, receipt_path_matches[0])
         shell_script = "\n".join(
             (
                 "set -euo pipefail",
@@ -3682,7 +3706,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(ssh_called.read_text(encoding="ascii"), "called\n")
             self.assertEqual(completed.stdout, marker + "\n")
-            receipt_path = runner_temp / "platform-backup-success-receipt.json"
+            receipt_path = runner_temp / receipt_member_name
             receipt_stat = receipt_path.lstat()
             self.assertEqual(
                 (stat.S_IMODE(receipt_stat.st_mode), receipt_stat.st_nlink),
@@ -3702,6 +3726,29 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertFalse(
                 (runner_temp / "platform-production-backup-report.log").exists()
             )
+
+            artifact_stream = io.BytesIO()
+            with zipfile.ZipFile(
+                artifact_stream, "w", compression=zipfile.ZIP_STORED
+            ) as archive:
+                member = zipfile.ZipInfo(receipt_member_name)
+                member.external_attr = (stat.S_IFREG | 0o600) << 16
+                archive.writestr(member, receipt_path.read_bytes())
+            artifact_bytes = artifact_stream.getvalue()
+            validated_receipt = backup_success_guard.validate_receipt_archive(
+                artifact_bytes,
+                f"sha256:{hashlib.sha256(artifact_bytes).hexdigest()}",
+                backup_success_guard.BackupBinding(
+                    repository="StrayForest/old_sparky",
+                    ref="refs/heads/dev",
+                    source_security_run_id="123450",
+                    source_security_run_attempt="1",
+                    source_sha=source_sha,
+                ),
+                backup_run_id="123456",
+                backup_run_attempt="2",
+            )
+            self.assertEqual(validated_receipt, receipt)
 
     def _assert_backup_stage_finalizer_is_bounded_and_identity_pinned(
         self, workflow_document: dict

@@ -35,7 +35,7 @@ SECURITY_CONDITIONAL_RUNTIME_JOB_NAMES = frozenset(
         "Trusted dev immutable release runtime",
     }
 )
-BACKUP_RECEIPT_NAME = "backup-success-receipt.json"
+BACKUP_RECEIPT_NAME = "platform-backup-success-receipt.json"
 BACKUP_ARTIFACT_PREFIX = "platform-backup-success-"
 MAX_ARTIFACT_ZIP_BYTES = 1_048_576
 MAX_RECEIPT_BYTES = 4_096
