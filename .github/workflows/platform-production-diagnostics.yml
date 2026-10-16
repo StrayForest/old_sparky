@@ -11,6 +11,10 @@ on:
           - capture-probe
         default: existing
         required: true
+      recipient_certificate_b64:
+        description: Pinned public certificate for encrypted read-only preflight diagnostics
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -26,6 +30,7 @@ jobs:
     environment: production
     env:
       TARGET_SHA: ${{ github.sha }}
+      RECIPIENT_CERTIFICATE_SHA256: 28d857f5fc6ff987444ca920a2bb5072081dbf2e41ef158d362b60e45e3f67a3
     steps:
       - name: Checkout exact diagnostic source
         if: ${{ inputs.mode == 'capture-probe' }}
@@ -48,6 +53,45 @@ jobs:
           systemd_sha256="$(sha256sum platform/tools/platform_release_systemd_state.py | awk '{print $1}')"
           [[ "$probe_sha256" =~ ^[0-9a-f]{64}$ && "$systemd_sha256" =~ ^[0-9a-f]{64}$ ]]
           printf 'PROBE_SHA256=%s\nSYSTEMD_SHA256=%s\n' "$probe_sha256" "$systemd_sha256" >> "$GITHUB_ENV"
+
+      - name: Validate pinned runtime failure recipient before production access
+        id: runtime_failure_recipient
+        if: ${{ inputs.mode == 'capture-probe' }}
+        shell: bash
+        env:
+          RECIPIENT_CERTIFICATE_B64: ${{ inputs.recipient_certificate_b64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$RECIPIENT_CERTIFICATE_B64" && test "${#RECIPIENT_CERTIFICATE_B64}" -le 16384
+          certificate="$RUNNER_TEMP/platform-release-runtime-recipient.pem"
+          public_key="$RUNNER_TEMP/platform-release-runtime-recipient-public.pem"
+          /usr/bin/python3 -I - "$certificate" <<'PY'
+          import base64, os, re, sys
+          from pathlib import Path
+          encoded = os.environ.get("RECIPIENT_CERTIFICATE_B64", "")
+          try:
+              raw = base64.b64decode(encoded, validate=True)
+          except (ValueError, base64.binascii.Error) as exc:
+              raise SystemExit("runtime recipient encoding is invalid") from exc
+          if len(raw) > 8192 or re.fullmatch(rb"\s*-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\s*", raw) is None:
+              raise SystemExit("runtime recipient must be one PEM certificate")
+          destination = Path(sys.argv[1])
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "wb") as stream:
+              stream.write(raw)
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+          openssl x509 -in "$certificate" -noout -checkend 0 >/dev/null
+          fingerprint="$(openssl x509 -in "$certificate" -noout -fingerprint -sha256 | sed 's/^[^=]*=//; s/://g' | tr '[:upper:]' '[:lower:]')"
+          test "$fingerprint" = "$RECIPIENT_CERTIFICATE_SHA256"
+          openssl x509 -in "$certificate" -pubkey -noout -out "$public_key"
+          grep -Eq 'Public-Key: \(3072 bit\)' <<<"$(openssl pkey -pubin -in "$public_key" -text -noout)"
+          printf 'runtime-cms-capability-check\n' | openssl cms -encrypt -binary -aes-256-gcm -outform DER \
+            -recip "$certificate" -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256 \
+            -out "$RUNNER_TEMP/platform-runtime-cms-capability.der"
+          printf 'capture_enabled=1\ncertificate_path=%s\n' "$certificate" >> "$GITHUB_OUTPUT"
 
       - name: Configure SSH
         shell: bash
@@ -437,14 +481,17 @@ jobs:
             "chmod 0600 -- '$probe_dir/probe.py'"
 
       - name: Read-only systemd capture precondition probe
+        id: capture_probe
         if: ${{ inputs.mode == 'capture-probe' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PRIVATE_CAPTURE: ${{ steps.runtime_failure_recipient.outputs.capture_enabled }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          [[ "${PRIVATE_CAPTURE:-}" == 1 ]]
           remote_log="$RUNNER_TEMP/platform-production-capture-probe.log"
           remote_error="$RUNNER_TEMP/platform-production-capture-probe-error.log"
           umask 077
@@ -455,7 +502,7 @@ jobs:
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
             -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$TARGET_SHA' '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT' '$CAPTURE_PROBE_DIR_ID' '$PROBE_SHA256' '$SYSTEMD_SHA256'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
+            "PLATFORM_RUNTIME_PRIVATE_CAPTURE=1 PLATFORM_RUNTIME_PRIVATE_ROUTE='capture_probe' bash -s -- '$TARGET_SHA' '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT' '$CAPTURE_PROBE_DIR_ID' '$PROBE_SHA256' '$SYSTEMD_SHA256'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
           target_sha="$1"
           run_id="$2"
@@ -514,9 +561,10 @@ jobs:
           remote_status=$?
           set -e
           /usr/bin/python3 - "$remote_log" "$remote_status" <<'PY'
-          import json, sys
+          import json, re, sys
           from pathlib import Path
           fallback = {"schema": 1, "kind": "release_capture_probe", "status": "failed", "failed_check": "remote_or_transport", "error_class": "remote"}
+          preserve_preflight_failure = False
           try:
               path = Path(sys.argv[1])
               if path.stat().st_size > 8192:
@@ -533,12 +581,13 @@ jobs:
               if type(health) is not dict or set(health) != health_keys or any(type(value) is not bool for value in health.values()):
                   raise ValueError
               if report.get("status") == "failed":
-                  if set(report) not in (common | {"failed_check", "error_class"}, common | {"failed_check", "error_class", "systemd_observation"}):
+                  receipt_evidence = {"capture_predicate", "receipt_present", "current_bound", "previous_bound", "runtime_target", "runtime_target_source", "runtime_target_helper_sha256", "service_active_count", "service_enabled_count", "nginx_preflight", "nginx_preflight_returncode"}
+                  if set(report) not in (common | {"failed_check", "error_class"}, common | {"failed_check", "error_class", "systemd_observation"}, common | {"failed_check", "error_class"} | receipt_evidence):
                       raise ValueError
                   units = ("deadlock-api.service", "deadlock-worker.service", "deadlock-web.service", "deadlock-maintenance.service", "deadlock-maintenance.timer", "deadlock-logrotate.service", "deadlock-logrotate.timer", "deadlock-offsite-backup.service", "deadlock-offsite-backup.timer", "deadlock-cloudflare-ips.service", "deadlock-cloudflare-ips.timer", "deadlock-health-monitor.service", "deadlock-health-monitor.timer")
-                  checks = {"root", "probe_identity", "systemd_module_identity", "module_metadata", "module_open", "module_identity", "module_size", "module_changed", "module_import", "release_metadata", "companion_metadata", "companion_lstat", "companion_recheck", "companion_changed", "systemctl_path", "transaction_read", "install_operation", "active_overrides", "current_binding", "previous_binding", "helper_digests", "helper_release_binding", "capture_context", "receipt_absence", "existing_receipt_validate", "unit_snapshot", "internal"}
+                  checks = {"root", "probe_identity", "systemd_module_identity", "module_metadata", "module_open", "module_identity", "module_size", "module_changed", "module_import", "release_metadata", "companion_metadata", "companion_lstat", "companion_recheck", "companion_changed", "systemctl_path", "transaction_read", "install_operation", "active_overrides", "current_binding", "previous_binding", "helper_digests", "helper_release_binding", "capture_context", "receipt_absence", "existing_receipt_validate", "existing_receipt_transaction", "existing_receipt_phase", "runtime_target_binding", "nginx_preflight", "unit_snapshot", "internal"}
                   checks |= {"unit_" + verb + "_" + unit.replace(".", "_") for unit in units for verb in ("active", "enabled")}
-                  classes = {"permission", "predicate", "oserror", "input", "StateError", "ValueError", "TypeError", "JSONDecodeError", "TimeoutExpired", "exception"}
+                  classes = {"permission", "predicate", "oserror", "input", "StateError", "ValueError", "TypeError", "JSONDecodeError", "TimeoutExpired", "child_failure", "exception"}
                   if report["failed_check"] not in checks or report["error_class"] not in classes:
                       raise ValueError
                   if "systemd_observation" in report:
@@ -581,12 +630,44 @@ jobs:
                               raise ValueError
                       else:
                           raise ValueError
+                  if set(report) == common | {"failed_check", "error_class"} | receipt_evidence:
+                      if report["capture_predicate"] != "existing_receipt_valid" or report["receipt_present"] is not True or report["current_bound"] is not True or report["previous_bound"] is not True:
+                          raise ValueError
+                      if report["failed_check"] != "nginx_preflight" or report["error_class"] != "child_failure":
+                          raise ValueError
+                      if report["nginx_preflight"] not in {"failed", "timeout", "unavailable"}:
+                          raise ValueError
+                      nginx_rc = report["nginx_preflight_returncode"]
+                      if nginx_rc != "unavailable" and (type(nginx_rc) is not int or not 0 <= nginx_rc <= 255):
+                          raise ValueError
+                      if report["nginx_preflight"] == "failed" and nginx_rc not in {"unavailable", *range(1, 256)}:
+                          raise ValueError
+                      if report["nginx_preflight"] in {"timeout", "unavailable"} and nginx_rc != "unavailable":
+                          raise ValueError
+                      if report["runtime_target"] is None or not isinstance(report["runtime_target"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", report["runtime_target"]):
+                          raise ValueError
+                      if not isinstance(report["runtime_target_source"], str) or not re.fullmatch(r"[0-9a-f]{40,64}", report["runtime_target_source"]):
+                          raise ValueError
+                      if not isinstance(report["runtime_target_helper_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", report["runtime_target_helper_sha256"]):
+                          raise ValueError
+                      for key in ("service_active_count", "service_enabled_count"):
+                          if type(report[key]) is not int or not 0 <= report[key] <= 13:
+                              raise ValueError
                   safe = {key: report[key] for key in ("schema", "kind", "status", "failed_check", "error_class", "health")}
                   if "systemd_observation" in report:
                       safe["systemd_observation"] = report["systemd_observation"]
+                  if set(report) == common | {"failed_check", "error_class"} | receipt_evidence:
+                      safe.update({key: report[key] for key in receipt_evidence})
+                  preserve_preflight_failure = (
+                      report.get("status") == "failed"
+                      and report.get("failed_check") == "nginx_preflight"
+                      and report.get("error_class") == "child_failure"
+                      and "nginx_preflight" in report
+                  )
               elif report.get("status") == "passed":
                   keys = common | {"capture_predicate", "receipt_present", "current_bound", "previous_bound", "service_active_count", "service_enabled_count"}
-                  if set(report) != keys or report["capture_predicate"] not in {"existing_receipt_valid", "prewrite_predicates_passed"}:
+                  receipt_keys = keys | {"runtime_target", "runtime_target_source", "runtime_target_helper_sha256", "nginx_preflight", "nginx_preflight_returncode"}
+                  if set(report) not in (keys, receipt_keys) or report["capture_predicate"] not in {"existing_receipt_valid", "prewrite_predicates_passed"}:
                       raise ValueError
                   if type(report["receipt_present"]) is not bool:
                       raise ValueError
@@ -596,8 +677,28 @@ jobs:
                   for key in ("service_active_count", "service_enabled_count"):
                       if report[key] is not None and (type(report[key]) is not int or not 0 <= report[key] <= 13):
                           raise ValueError
-                  safe = {key: report[key] for key in sorted(keys)}
-                  if sys.argv[2] != "0":
+                  if set(report) == receipt_keys:
+                      if report["receipt_present"] is not True or report["current_bound"] is not True or report["previous_bound"] is not True:
+                          raise ValueError
+                      if report["nginx_preflight"] not in {"passed", "not_applicable"}:
+                          raise ValueError
+                      nginx_rc = report["nginx_preflight_returncode"]
+                      if nginx_rc != "unavailable" and (type(nginx_rc) is not int or not 0 <= nginx_rc <= 255):
+                          raise ValueError
+                      if report["nginx_preflight"] == "not_applicable":
+                          if nginx_rc != "unavailable" or any(report[key] is not None for key in ("runtime_target", "runtime_target_source", "runtime_target_helper_sha256")):
+                              raise ValueError
+                      else:
+                          if nginx_rc != 0:
+                              raise ValueError
+                          if not isinstance(report["runtime_target"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", report["runtime_target"]):
+                              raise ValueError
+                          if not isinstance(report["runtime_target_source"], str) or not re.fullmatch(r"[0-9a-f]{40,64}", report["runtime_target_source"]):
+                              raise ValueError
+                          if not isinstance(report["runtime_target_helper_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", report["runtime_target_helper_sha256"]):
+                              raise ValueError
+                  safe = {key: report[key] for key in sorted(report)}
+                  if sys.argv[2] != "0" and not preserve_preflight_failure:
                       safe = {"schema": 1, "kind": "release_capture_probe", "status": "failed", "failed_check": "remote_or_transport", "error_class": "remote", "health": health}
               else:
                   raise ValueError
@@ -605,8 +706,170 @@ jobs:
           except Exception:
               print("PRODUCTION_CAPTURE_PROBE " + json.dumps(fallback, sort_keys=True, separators=(",", ":")))
           PY
-          rm -f -- "$remote_log" "$remote_error"
+          printf 'remote_status=%s\n' "$remote_status" >> "$GITHUB_OUTPUT"
+          printf 'private_error_path=%s\n' "$remote_error" >> "$GITHUB_OUTPUT"
           (( remote_status == 0 ))
+
+      - name: Encrypt private read-only preflight failure context
+        id: encrypt_runtime_failure
+        if: ${{ always() && inputs.mode == 'capture-probe' && steps.runtime_failure_recipient.outputs.capture_enabled == '1' }}
+        shell: bash
+        env:
+          RECIPIENT_CERTIFICATE_PATH: ${{ steps.runtime_failure_recipient.outputs.certificate_path }}
+        run: |
+          set -euo pipefail
+          printf 'private_failure_ready=false\n' >> "$GITHUB_OUTPUT"
+          remote_error="$RUNNER_TEMP/platform-production-capture-probe-error.log"
+          if [[ ! -f "$remote_error" || -L "$remote_error" ]]; then exit 0; fi
+          [[ "$(stat -c '%u:%h:%a' "$remote_error")" == "$(id -u):1:600" ]]
+          test "$(stat -c '%s' "$remote_error")" -le 131072
+          private_dir="$RUNNER_TEMP/platform-release-runtime-failure"
+          [[ ! -e "$private_dir" && ! -L "$private_dir" ]]
+          install -d -m 700 "$private_dir"
+          set +e
+          PRIVATE_REMOTE_ERROR="$remote_error" PRIVATE_PAYLOAD="$private_dir/evidence.json" \
+          PRIVATE_ACTION_RUN_ID="$GITHUB_RUN_ID" PRIVATE_ACTION_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+          PRIVATE_WORKFLOW_SHA="$GITHUB_SHA" PRIVATE_SOURCE_SHA="$TARGET_SHA" \
+          /usr/bin/python3 -I - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          raw = Path(os.environ["PRIVATE_REMOTE_ERROR"]).read_bytes()
+          if not 1 <= len(raw) <= 131072:
+              raise SystemExit(2)
+          try:
+              text = raw.decode("utf-8")
+          except UnicodeDecodeError as exc:
+              raise SystemExit(2) from exc
+          markers = [line.removeprefix("RUNTIME_PRIVATE_CONTEXT ") for line in text.splitlines() if line.startswith("RUNTIME_PRIVATE_CONTEXT ")]
+          if not markers:
+              raise SystemExit(3)
+          if len(markers) != 1:
+              raise SystemExit(2)
+          try:
+              marker = json.loads(markers[0])
+              output = base64.b64decode(marker["output_b64"], validate=True)
+          except Exception as exc:
+              raise SystemExit(2) from exc
+          if (
+              type(marker) is not dict
+              or set(marker) != {"schema", "route", "component", "guard_id", "returncode", "stream", "output_b64", "total_bytes", "truncated", "retained"}
+              or marker.get("schema") != 1 or marker.get("route") != "capture_probe"
+              or marker.get("component") != "nginx_preflight" or marker.get("guard_id") is not None or marker.get("stream") != "stderr"
+              or marker.get("retained") != "tail" or type(marker.get("truncated")) is not bool
+              or (marker.get("returncode") != "unavailable" and (type(marker.get("returncode")) is not int or not 1 <= marker["returncode"] <= 255))
+              or len(output) > 16384 or base64.b64encode(output).decode("ascii") != marker["output_b64"]
+              or (marker.get("total_bytes") != "unavailable" and (type(marker.get("total_bytes")) is not int or not len(output) <= marker["total_bytes"] <= 9223372036854775807))
+              or marker["truncated"] != (marker["total_bytes"] == "unavailable" or marker["total_bytes"] > len(output))
+          ):
+              raise SystemExit(2)
+          payload = {
+              "schema": 1,
+              "kind": "release_runtime_failure_private_context",
+              "route": "capture_probe",
+              "repository": "StrayForest/old_sparky",
+              "workflow_path": ".github/workflows/platform-production-diagnostics.yml",
+              "workflow_run_id": os.environ["PRIVATE_ACTION_RUN_ID"],
+              "workflow_run_attempt": os.environ["PRIVATE_ACTION_RUN_ATTEMPT"],
+              "workflow_sha": os.environ["PRIVATE_WORKFLOW_SHA"],
+              "source_sha": os.environ["PRIVATE_SOURCE_SHA"],
+              "bundle_sha256": None,
+              "security_run_id": None,
+              "security_run_attempt": None,
+              "recovery_run_id": None,
+              "recovery_run_attempt": None,
+              "publisher_run_id": None,
+              "publisher_run_attempt": None,
+              "remote_stderr_b64": base64.b64encode(raw).decode("ascii"),
+              "remote_stderr_size": len(raw),
+          }
+          target = Path(os.environ["PRIVATE_PAYLOAD"])
+          descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+              json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+              stream.write("\n")
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+          payload_status=$?
+          set -e
+          if (( payload_status == 3 )); then
+            rm -rf -- "$private_dir"
+            exit 0
+          fi
+          if (( payload_status != 0 )); then
+            rm -rf -- "$private_dir"
+            exit "$payload_status"
+          fi
+          chmod 600 "$private_dir/evidence.json"
+          openssl cms -encrypt -binary -aes-256-gcm -outform DER \
+            -in "$private_dir/evidence.json" -out "$private_dir/evidence.cms" \
+            -recip "$RECIPIENT_CERTIFICATE_PATH" \
+            -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256
+          chmod 600 "$private_dir/evidence.cms"
+          PRIVATE_DIR="$private_dir" PRIVATE_ACTION_RUN_ID="$GITHUB_RUN_ID" \
+          PRIVATE_ACTION_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" PRIVATE_WORKFLOW_SHA="$GITHUB_SHA" \
+          PRIVATE_SOURCE_SHA="$TARGET_SHA" /usr/bin/python3 -I - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          directory = Path(os.environ["PRIVATE_DIR"])
+          ciphertext = (directory / "evidence.cms").read_bytes()
+          manifest = {
+              "schema": 1,
+              "kind": "encrypted_release_runtime_failure_context",
+              "repository": "StrayForest/old_sparky",
+              "workflow_path": ".github/workflows/platform-production-diagnostics.yml",
+              "route": "capture_probe",
+              "workflow_run_id": os.environ["PRIVATE_ACTION_RUN_ID"],
+              "workflow_run_attempt": os.environ["PRIVATE_ACTION_RUN_ATTEMPT"],
+              "workflow_sha": os.environ["PRIVATE_WORKFLOW_SHA"],
+              "source_sha": os.environ["PRIVATE_SOURCE_SHA"],
+              "bundle_sha256": None,
+              "security_run_id": None, "security_run_attempt": None,
+              "recovery_run_id": None, "recovery_run_attempt": None,
+              "publisher_run_id": None, "publisher_run_attempt": None,
+              "recipient_certificate_sha256": os.environ["RECIPIENT_CERTIFICATE_SHA256"],
+              "encryption": "CMS-EnvelopedData/AES-256-GCM/RSA-OAEP-SHA-256",
+              "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+              "ciphertext_size": len(ciphertext),
+          }
+          target = directory / "manifest.json"
+          descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+              json.dump(manifest, stream, sort_keys=True, separators=(",", ":"))
+              stream.write("\n")
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+          rm -f -- "$private_dir/evidence.json"
+          printf 'private_failure_ready=true\n' >> "$GITHUB_OUTPUT"
+          printf 'RUNTIME_PRIVATE_FAILURE status=encrypted route=capture_probe\n'
+
+      - name: Upload encrypted runtime failure context
+        if: ${{ always() && steps.encrypt_runtime_failure.outputs.private_failure_ready == 'true' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-release-runtime-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-release-runtime-failure/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove private runtime failure staging
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          private_dir="$RUNNER_TEMP/platform-release-runtime-failure"
+          if [[ -e "$private_dir" || -L "$private_dir" ]]; then
+            [[ -d "$private_dir" && ! -L "$private_dir" ]]
+            rm -f -- "$private_dir/manifest.json" "$private_dir/evidence.cms" "$private_dir/evidence.json"
+            rmdir -- "$private_dir"
+          fi
+          rm -f -- "$RUNNER_TEMP/platform-production-capture-probe.log" "$RUNNER_TEMP/platform-production-capture-probe-error.log" \
+            "$RUNNER_TEMP/platform-release-runtime-recipient.pem" "$RUNNER_TEMP/platform-release-runtime-recipient-public.pem" \
+            "$RUNNER_TEMP/platform-runtime-cms-capability.der"
 
       - name: Remove production SSH material
         id: cleanup_ssh

@@ -56,6 +56,10 @@ on:
         description: "Type RECOVER-PENDING-RELEASE after reviewing the retained receipt"
         required: true
         type: string
+      recipient_certificate_b64:
+        description: "Optional pinned recipient certificate for encrypted runtime failure context"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -81,6 +85,7 @@ jobs:
       PUBLISHER_RUN_ID: ${{ inputs.publisher_run_id }}
       PUBLISHER_RUN_ATTEMPT: ${{ inputs.publisher_run_attempt }}
       RECOVERY_CONFIRMATION: ${{ inputs.confirmation }}
+      RECIPIENT_CERTIFICATE_SHA256: 28d857f5fc6ff987444ca920a2bb5072081dbf2e41ef158d362b60e45e3f67a3
       RECOVERY_ACTION: ${{ inputs.recovery_action }}
       FAILED_DEPLOY_RUN_ID: ${{ inputs.failed_deploy_run_id }}
       FAILED_DEPLOY_RUN_ATTEMPT: ${{ inputs.failed_deploy_run_attempt }}
@@ -95,6 +100,8 @@ jobs:
     steps:
       - name: Validate explicit recovery confirmation
         shell: bash
+        env:
+          RECIPIENT_CERTIFICATE_B64: ${{ inputs.recipient_certificate_b64 }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "$REPOSITORY" \
@@ -117,16 +124,22 @@ jobs:
             recover_pending:RECOVER-PENDING-RELEASE)
               test -z "$FAILED_DEPLOY_RUN_ID$FAILED_DEPLOY_RUN_ATTEMPT$EXPECTED_CANDIDATES_JSON$PROTECTED_RELEASES_JSON" \
                 || { echo "Unexpected action-specific inputs" >&2; exit 1; }
+              if [[ -n "$RECIPIENT_CERTIFICATE_B64" && ${#RECIPIENT_CERTIFICATE_B64} -gt 16384 ]]; then
+                echo "Private failure recipient input is outside its bound" >&2
+                exit 1
+              fi
               ;;
             quarantine_populated_quiesce:QUARANTINE-POPULATED-QUIESCE)
               [[ "$FAILED_DEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
                 && "$FAILED_DEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ \
-                && -z "$EXPECTED_CANDIDATES_JSON$PROTECTED_RELEASES_JSON" ]] \
+                && -z "$EXPECTED_CANDIDATES_JSON$PROTECTED_RELEASES_JSON$RECIPIENT_CERTIFICATE_B64" ]] \
                 || { echo "Exact failed deployment run and attempt are required" >&2; exit 1; }
               ;;
             prune_task_releases:PRUNE-TASK-RELEASES)
               test -n "$EXPECTED_CANDIDATES_JSON" && test -n "$PROTECTED_RELEASES_JSON" \
                 || { echo "Exact reviewed release sets are required" >&2; exit 1; }
+              test -z "$RECIPIENT_CERTIFICATE_B64" \
+                || { echo "Private failure recipient is only supported for recover_pending" >&2; exit 1; }
               ;;
             *) echo "Refusing recovery without exact action confirmation" >&2; exit 1 ;;
           esac
@@ -584,6 +597,48 @@ jobs:
             echo "publisher_run_id=$PUBLISHER_RUN_ID"
             echo "publisher_run_attempt=$PUBLISHER_RUN_ATTEMPT"
           } >> "$GITHUB_OUTPUT"
+      - name: Validate optional pinned private-failure recipient before production access
+        id: runtime_failure_recipient
+        if: ${{ inputs.recovery_action == 'recover_pending' && inputs.recipient_certificate_b64 != '' }}
+        shell: bash
+        env:
+          RECIPIENT_CERTIFICATE_B64: ${{ inputs.recipient_certificate_b64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          certificate="$RUNNER_TEMP/platform-release-runtime-recipient.pem"
+          public_key="$RUNNER_TEMP/platform-release-runtime-recipient-public.pem"
+          /usr/bin/python3 -I - "$certificate" <<'PY'
+          import base64, os, re, sys
+          from pathlib import Path
+          encoded = os.environ.get("RECIPIENT_CERTIFICATE_B64", "")
+          if not encoded or len(encoded) > 16384:
+              raise SystemExit("private failure recipient input is outside its bound")
+          try:
+              raw = base64.b64decode(encoded, validate=True)
+          except (ValueError, base64.binascii.Error) as exc:
+              raise SystemExit("private failure recipient encoding is invalid") from exc
+          if len(raw) > 8192 or re.fullmatch(rb"\s*-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\s*", raw) is None:
+              raise SystemExit("private failure recipient must be exactly one PEM certificate")
+          destination = Path(sys.argv[1])
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "wb") as stream:
+              stream.write(raw)
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+          openssl x509 -in "$certificate" -noout -checkend 0 >/dev/null
+          fingerprint="$(openssl x509 -in "$certificate" -noout -fingerprint -sha256 | sed 's/^[^=]*=//; s/://g' | tr '[:upper:]' '[:lower:]')"
+          test "$fingerprint" = "$RECIPIENT_CERTIFICATE_SHA256"
+          openssl x509 -in "$certificate" -pubkey -noout -out "$public_key"
+          key_description="$(openssl pkey -pubin -in "$public_key" -text -noout)"
+          grep -Eq 'Public-Key: \(3072 bit\)' <<<"$key_description"
+          if ! printf 'cms-capability-check\n' | openssl cms -encrypt -binary -aes-256-gcm -outform DER -recip "$certificate" -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256 -out "$RUNNER_TEMP/platform-runtime-cms-capability.der"; then
+            echo "Pinned private-failure CMS profile is unavailable" >&2
+            exit 1
+          fi
+          printf 'capture_enabled=1\nrecipient_certificate_path=%s\n' "$certificate" >> "$GITHUB_OUTPUT"
+
       - name: Validate production SSH inputs
         shell: bash
         env:
@@ -713,6 +768,7 @@ jobs:
           rmdir -- "$stage"
           REMOTE
       - name: Recover the pending release and restore runtime
+        id: recovery_action
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -737,6 +793,8 @@ jobs:
           EXPECTED_CANDIDATES_CSV: ${{ steps.provenance.outputs.expected_candidates_csv }}
           PROTECTED_RELEASES_CSV: ${{ steps.provenance.outputs.protected_releases_csv }}
           EXPECTED_CANDIDATE_COUNT: ${{ steps.provenance.outputs.expected_candidate_count }}
+          RUNTIME_PRIVATE_CAPTURE: ${{ steps.runtime_failure_recipient.outputs.capture_enabled }}
+          RECIPIENT_CERTIFICATE_PATH: ${{ steps.runtime_failure_recipient.outputs.recipient_certificate_path }}
         run: |
           set -euo pipefail
           umask 077
@@ -746,6 +804,13 @@ jobs:
           expected_candidates_csv="${EXPECTED_CANDIDATES_CSV:-}"
           protected_releases_csv="${PROTECTED_RELEASES_CSV:-}"
           expected_candidate_count="${EXPECTED_CANDIDATE_COUNT:-}"
+          runtime_private_capture="${RUNTIME_PRIVATE_CAPTURE:-0}"
+          [[ "$runtime_private_capture" == 0 || "$runtime_private_capture" == 1 ]]
+          if [[ "$runtime_private_capture" == 1 ]]; then
+            test "$RECOVERY_ACTION" = recover_pending
+            test -f "$RECIPIENT_CERTIFICATE_PATH" && test ! -L "$RECIPIENT_CERTIFICATE_PATH"
+            test "$(stat -c '%u:%h:%a' "$RECIPIENT_CERTIFICATE_PATH")" = "$(id -u):1:600"
+          fi
           input_errors=0
           check_recovery_input() {
             local key="$1" value="$2"
@@ -783,6 +848,7 @@ jobs:
           printf 'RECOVERY_INPUTS schema=1 count=%s status=valid\n' "$checked_input_count"
           remote_log="$RUNNER_TEMP/platform-production-release-recovery.log"
           remote_error="$RUNNER_TEMP/platform-production-release-recovery-error.log"
+          private_failure_dir="$RUNNER_TEMP/platform-release-runtime-failure"
           : >"$remote_log"
           : >"$remote_error"
           chmod 600 "$remote_log" "$remote_error"
@@ -791,6 +857,149 @@ jobs:
             rm -f -- "$remote_log" "$remote_error"
           }
           trap cleanup_recovery_capture EXIT
+          printf 'private_failure_ready=false\n' >> "$GITHUB_OUTPUT"
+          encrypt_private_failure_context() {
+            [[ "$runtime_private_capture" == 1 ]] || return 0
+            [[ -f "$remote_error" && ! -L "$remote_error" ]]
+            [[ "$(stat -c '%u:%h:%a' "$remote_error")" == "$(id -u):1:600" ]]
+            test "$(stat -c '%s' "$remote_error")" -le 131072
+            test ! -e "$private_failure_dir" && test ! -L "$private_failure_dir"
+            install -d -m 700 "$private_failure_dir"
+            if ! PRIVATE_REMOTE_ERROR="$remote_error" PRIVATE_PAYLOAD="$private_failure_dir/evidence.json" \
+              PRIVATE_SOURCE_SHA="$SOURCE_SHA" PRIVATE_BUNDLE_SHA="$BUNDLE_SHA" \
+              PRIVATE_SECURITY_RUN_ID="$SECURITY_RUN_ID" PRIVATE_SECURITY_RUN_ATTEMPT="$SECURITY_RUN_ATTEMPT" \
+              PRIVATE_RECOVERY_RUN_ID="$RECOVERY_RUN_ID" PRIVATE_RECOVERY_RUN_ATTEMPT="$RECOVERY_RUN_ATTEMPT" \
+              PRIVATE_PUBLISHER_RUN_ID="$PUBLISHER_RUN_ID" PRIVATE_PUBLISHER_RUN_ATTEMPT="$PUBLISHER_RUN_ATTEMPT" \
+              PRIVATE_ACTION_RUN_ID="$GITHUB_RUN_ID" PRIVATE_ACTION_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+              PRIVATE_WORKFLOW_SHA="$GITHUB_SHA" /usr/bin/python3 -I - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          raw = Path(os.environ["PRIVATE_REMOTE_ERROR"]).read_bytes()
+          if len(raw) > 131072:
+              raise SystemExit(1)
+          try:
+              text = raw.decode("utf-8")
+          except UnicodeDecodeError:
+              raise SystemExit(1)
+          markers = [line.removeprefix("RUNTIME_PRIVATE_CONTEXT ") for line in text.splitlines() if line.startswith("RUNTIME_PRIVATE_CONTEXT ")]
+          if not 1 <= len(markers) <= 5:
+              raise SystemExit(1)
+          allowed_guards = {"argument", "privilege", "lock", "layout", "tooling", "systemd_state", "transaction_state", "legacy_liveqa_authority", "liveqa_runtime", "nginx", "runtime"}
+          allowed_components = {"systemd_state_validate", "runtime_reconcile", "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload", "systemd_restore_enabled", "runtime_guard"}
+          order = ["systemd_state_validate", "runtime_reconcile", "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload", "systemd_restore_enabled"]
+          previous_order = -1
+          seen = set()
+          for raw_marker in markers:
+              try:
+                  marker = json.loads(raw_marker)
+                  output = base64.b64decode(marker["output_b64"], validate=True)
+              except Exception:
+                  raise SystemExit(1)
+              if (
+                  type(marker) is not dict
+                  or set(marker) != {"schema", "route", "component", "guard_id", "returncode", "stream", "output_b64", "total_bytes", "truncated", "retained"}
+                  or marker.get("schema") != 1 or marker.get("route") != "recover_pending"
+                  or marker.get("component") not in allowed_components or marker.get("retained") != "tail"
+                  or type(marker.get("truncated")) is not bool
+                  or (marker.get("returncode") != "unavailable" and (type(marker["returncode"]) is not int or not 1 <= marker["returncode"] <= 255))
+              ):
+                  raise SystemExit(1)
+              component = marker["component"]
+              if component == "runtime_guard":
+                  if (len(markers) != 1 or marker.get("guard_id") not in allowed_guards or marker.get("stream") != "guard" or marker.get("returncode") == "unavailable" or output or marker.get("total_bytes") != 0 or marker.get("truncated") is not False):
+                      raise SystemExit(1)
+                  continue
+              if component in seen or marker.get("guard_id") is not None or marker.get("stream") != "combined":
+                  raise SystemExit(1)
+              seen.add(component)
+              position = order.index(component)
+              if position <= previous_order:
+                  raise SystemExit(1)
+              previous_order = position
+              if (len(output) > 16384 or base64.b64encode(output).decode("ascii") != marker["output_b64"]
+                  or (marker.get("total_bytes") != "unavailable" and (type(marker.get("total_bytes")) is not int or not len(output) <= marker["total_bytes"] <= 9223372036854775807))
+                  or marker["truncated"] != (marker["total_bytes"] == "unavailable" or marker["total_bytes"] > len(output))):
+                  raise SystemExit(1)
+          if len(markers) > 1 and any(json.loads(item).get("component") == "runtime_guard" for item in markers):
+              raise SystemExit(1)
+          payload = {
+              "schema": 1,
+              "kind": "release_runtime_failure_private_context",
+              "route": "recover_pending",
+              "repository": "StrayForest/old_sparky",
+              "workflow_path": ".github/workflows/platform-production-release-recover.yml",
+              "workflow_run_id": os.environ["PRIVATE_ACTION_RUN_ID"],
+              "workflow_run_attempt": os.environ["PRIVATE_ACTION_RUN_ATTEMPT"],
+              "workflow_sha": os.environ["PRIVATE_WORKFLOW_SHA"],
+              "source_sha": os.environ["PRIVATE_SOURCE_SHA"],
+              "bundle_sha256": os.environ["PRIVATE_BUNDLE_SHA"],
+              "security_run_id": os.environ["PRIVATE_SECURITY_RUN_ID"],
+              "security_run_attempt": os.environ["PRIVATE_SECURITY_RUN_ATTEMPT"],
+              "recovery_run_id": os.environ["PRIVATE_RECOVERY_RUN_ID"],
+              "recovery_run_attempt": os.environ["PRIVATE_RECOVERY_RUN_ATTEMPT"],
+              "publisher_run_id": os.environ["PRIVATE_PUBLISHER_RUN_ID"],
+              "publisher_run_attempt": os.environ["PRIVATE_PUBLISHER_RUN_ATTEMPT"],
+              "remote_stderr_b64": base64.b64encode(raw).decode("ascii"),
+              "remote_stderr_size": len(raw),
+          }
+          target = Path(os.environ["PRIVATE_PAYLOAD"])
+          descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+              json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+              stream.write("\n")
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+            then
+              rm -rf -- "$private_failure_dir"
+              return 0
+            fi
+            openssl cms -encrypt -binary -aes-256-gcm -outform DER \
+              -in "$private_failure_dir/evidence.json" -out "$private_failure_dir/evidence.cms" \
+              -recip "$RECIPIENT_CERTIFICATE_PATH" \
+              -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256
+            chmod 600 "$private_failure_dir/evidence.cms"
+            PRIVATE_DIR="$private_failure_dir" PRIVATE_CERTIFICATE_SHA="$RECIPIENT_CERTIFICATE_SHA256" \
+            PRIVATE_ACTION_RUN_ID="$GITHUB_RUN_ID" PRIVATE_ACTION_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            PRIVATE_WORKFLOW_SHA="$GITHUB_SHA" PRIVATE_SOURCE_SHA="$SOURCE_SHA" PRIVATE_BUNDLE_SHA="$BUNDLE_SHA" \
+            PRIVATE_SECURITY_RUN_ID="$SECURITY_RUN_ID" PRIVATE_SECURITY_RUN_ATTEMPT="$SECURITY_RUN_ATTEMPT" \
+            PRIVATE_RECOVERY_RUN_ID="$RECOVERY_RUN_ID" PRIVATE_RECOVERY_RUN_ATTEMPT="$RECOVERY_RUN_ATTEMPT" \
+            PRIVATE_PUBLISHER_RUN_ID="$PUBLISHER_RUN_ID" PRIVATE_PUBLISHER_RUN_ATTEMPT="$PUBLISHER_RUN_ATTEMPT" \
+            /usr/bin/python3 -I - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          directory = Path(os.environ["PRIVATE_DIR"])
+          ciphertext = (directory / "evidence.cms").read_bytes()
+          manifest = {
+              "schema": 1, "kind": "encrypted_release_runtime_failure_context",
+              "repository": "StrayForest/old_sparky",
+              "workflow_path": ".github/workflows/platform-production-release-recover.yml",
+              "route": "recover_pending", "workflow_run_id": os.environ["PRIVATE_ACTION_RUN_ID"],
+              "workflow_run_attempt": os.environ["PRIVATE_ACTION_RUN_ATTEMPT"],
+              "workflow_sha": os.environ["PRIVATE_WORKFLOW_SHA"], "source_sha": os.environ["PRIVATE_SOURCE_SHA"],
+              "bundle_sha256": os.environ["PRIVATE_BUNDLE_SHA"],
+              "security_run_id": os.environ["PRIVATE_SECURITY_RUN_ID"], "security_run_attempt": os.environ["PRIVATE_SECURITY_RUN_ATTEMPT"],
+              "recovery_run_id": os.environ["PRIVATE_RECOVERY_RUN_ID"], "recovery_run_attempt": os.environ["PRIVATE_RECOVERY_RUN_ATTEMPT"],
+              "publisher_run_id": os.environ["PRIVATE_PUBLISHER_RUN_ID"], "publisher_run_attempt": os.environ["PRIVATE_PUBLISHER_RUN_ATTEMPT"],
+              "recipient_certificate_sha256": os.environ["PRIVATE_CERTIFICATE_SHA"],
+              "encryption": "CMS-EnvelopedData/AES-256-GCM/RSA-OAEP-SHA-256",
+              "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(), "ciphertext_size": len(ciphertext),
+          }
+          target = directory / "manifest.json"
+          descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+              json.dump(manifest, stream, sort_keys=True, separators=(",", ":"))
+              stream.write("\n")
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+            rm -f -- "$private_failure_dir/evidence.json"
+            printf 'private_failure_ready=true\n' >> "$GITHUB_OUTPUT"
+            printf 'RECOVERY_PRIVATE_FAILURE status=encrypted recipient_certificate_sha256=%s\n' "$RECIPIENT_CERTIFICATE_SHA256"
+          }
           set +e
           timeout --foreground 900s ssh \
             -F /dev/null \
@@ -803,7 +1012,7 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$PUBLISHER_RUN_ID' '$PUBLISHER_RUN_ATTEMPT' '$PUBLISHER_WORKFLOW_SHA' '$PUBLISHER_JOB_ID' '$ROUTE_DIGEST' '$RECOVERY_ACTION' '$failed_deploy_run_id' '$failed_deploy_run_attempt' '$failed_deploy_source_sha' '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT' '$EXPECTED_CANDIDATES_CSV' '$PROTECTED_RELEASES_CSV' '$EXPECTED_CANDIDATE_COUNT'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
+            "PLATFORM_RUNTIME_PRIVATE_CAPTURE='$runtime_private_capture' PLATFORM_RUNTIME_PRIVATE_ROUTE='recover_pending' bash -s -- '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$PUBLISHER_RUN_ID' '$PUBLISHER_RUN_ATTEMPT' '$PUBLISHER_WORKFLOW_SHA' '$PUBLISHER_JOB_ID' '$ROUTE_DIGEST' '$RECOVERY_ACTION' '$failed_deploy_run_id' '$failed_deploy_run_attempt' '$failed_deploy_source_sha' '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT' '$EXPECTED_CANDIDATES_CSV' '$PROTECTED_RELEASES_CSV' '$EXPECTED_CANDIDATE_COUNT'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
           recovery_stage=remote_identity
           report_recovery_failure() {
@@ -1120,6 +1329,11 @@ jobs:
           remote_status="$?"
           set -e
           if (( remote_status != 0 )); then
+            if [[ "$runtime_private_capture" == 1 ]]; then
+              if ! encrypt_private_failure_context; then
+                printf '%s\n' 'RECOVERY_PRIVATE_FAILURE status=unavailable' >&2
+              fi
+            fi
             safe_stage="$(grep -E '^RECOVERY_STAGE schema=1 status=failed stage=(remote_identity|argument_count|bundle_sha|source_sha|security_run_id|security_run_attempt|recovery_run_id|recovery_run_attempt|recovery_job_id|recovery_workflow_sha|publisher_run_id|publisher_run_attempt|publisher_workflow_sha|publisher_job_id|route_digest|bundle_input|staging|provenance|bootstrap_extract|generation_install|generation_validate|install_stage_cleanup|quiesce_recovery)$' "$remote_error" | tail -n 1 | sed -E 's/^RECOVERY_STAGE schema=1 status=failed stage=//' || true)"
             if [[ -z "$safe_stage" ]]; then safe_stage=transport_or_unclassified; fi
             safe_class=unavailable
@@ -1171,6 +1385,28 @@ jobs:
               "$EXPECTED_CANDIDATE_COUNT" "$EXPECTED_CANDIDATE_COUNT"
           fi
           printf '%s\n' "$public_line"
+
+      - name: Upload encrypted recovery runtime failure context
+        if: ${{ always() && steps.recovery_action.outputs.private_failure_ready == 'true' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-release-runtime-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-release-runtime-failure/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove encrypted recovery runtime failure staging
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          private_dir="$RUNNER_TEMP/platform-release-runtime-failure"
+          if [[ -e "$private_dir" || -L "$private_dir" ]]; then
+            [[ -d "$private_dir" && ! -L "$private_dir" ]]
+            [[ "$(stat -c '%u:%a:%h' "$private_dir")" == "$(id -u):700:2" || "$(stat -c '%u:%a:%h' "$private_dir")" == "$(id -u):700:1" ]]
+            rm -f -- "$private_dir/manifest.json" "$private_dir/evidence.cms" "$private_dir/evidence.json"
+            rmdir -- "$private_dir"
+          fi
 
       - name: Remove production SSH material
         id: cleanup_ssh

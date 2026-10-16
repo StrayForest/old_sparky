@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -18,10 +20,12 @@ from tools import platform_release_systemd_state as systemd_state
 class FakeSystemdState:
     SYSTEMCTL = "/usr/bin/systemctl"
 
-    def __init__(self, *, fail_query: tuple[str, str] | None = None, operation: str = "install") -> None:
+    def __init__(self, *, fail_query: tuple[str, str] | None = None, operation: str = "install", transaction_operation: str | None = None, phase: str = "rollback-runtime-pending") -> None:
         self.events: list[str] = []
         self.fail_query = fail_query
         self.operation = operation
+        self.transaction_operation = transaction_operation or operation
+        self.phase = phase
         self.__verified_sha256__ = "a" * 64
         self.OWNED_UNITS = ("deadlock-api.service",)
 
@@ -40,11 +44,15 @@ class FakeSystemdState:
 
     def _read_transaction(self, path: Path, app_dir: Path):
         self.events.append("transaction")
-        return ("a" * 32, self.operation, str(app_dir / "releases" / "old"), "", {}, {}, {"deadlock-api.service": "active"})
+        previous = str(app_dir / "releases" / "pending") if self.operation == "rollback" else ""
+        return ("a" * 32, self.transaction_operation, str(app_dir / "releases" / "old"), previous, {}, {}, {"deadlock-api.service": "active"})
 
     def _helper_digests(self, release: Path):
         self.events.append("helper_digests")
-        return {"tools/platform_release_systemd_state.py": self.__verified_sha256__}
+        return {
+            "tools/platform_release_systemd_state.py": self.__verified_sha256__,
+            "tools/platform_install_nginx.py": "c" * 64,
+        }
 
     def _release_context(self, app_dir: Path, current: str, previous: str):
         self.events.append("capture_context")
@@ -52,6 +60,20 @@ class FakeSystemdState:
 
     def _safe_receipt(self, path: Path):
         raise AssertionError("probe must not read or write receipt bytes")
+
+    def _read_receipt(self, path: Path):
+        self.events.append("receipt_read")
+        return {
+            "operation": "rollback",
+            "operation_id": "a" * 32,
+            "app_dir": str(path.parents[1]),
+            "current_before": str(path.parents[1] / "releases" / "old"),
+            "previous_before": str(path.parents[1] / "releases" / "pending"),
+            "helper_digests": {
+                "current_before": {"tools/platform_install_nginx.py": "c" * 64},
+                "previous_before": {"tools/platform_install_nginx.py": "c" * 64},
+            },
+        }
 
     def _read_active(self, unit: str) -> str:
         self.events.append("active:" + unit)
@@ -98,14 +120,36 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
         old_release = releases / "old"
         old_release.mkdir()
         (old_release / "RELEASE.json").write_text('{"source_git_commit":"' + "a" * 40 + '"}\n', encoding="ascii")
+        if fake.operation == "rollback":
+            previous_release = releases / "pending"
+            previous_release.mkdir()
+            (previous_release / "RELEASE.json").write_text('{"source_git_commit":"' + "b" * 40 + '"}\n', encoding="ascii")
+            current_release = old_release
+            previous_path = str(previous_release)
+            (transaction.parent / ".release-operation.json").write_text(
+                json.dumps({
+                    "operation_id": "a" * 32,
+                    "operation": fake.transaction_operation,
+                    "phase": fake.phase,
+                    "current_before": str(old_release),
+                    "previous_before": previous_path,
+                }),
+                encoding="ascii",
+            )
+            (transaction.parent / ".release-operation.json").chmod(0o600)
+        else:
+            current_release = old_release
         current_link = app_dir / "current"
-        current_link.symlink_to(old_release)
+        current_link.symlink_to(current_release)
+        if fake.operation == "rollback":
+            (app_dir / "previous").symlink_to(previous_release)
         with (
             patch.object(probe, "APP_DIR", app_dir),
             patch.object(probe, "SHARED_DIR", transaction.parent),
             patch.object(probe, "TRANSACTION", transaction),
             patch.object(probe, "SYSTEMD_RECEIPT", companion),
             patch.object(probe, "CURRENT_LINK", current_link),
+            patch.object(probe, "SHARED_PYTHON", app_dir / "shared/venv/bin/python"),
             patch.object(probe, "_load_pinned_module", return_value=fake),
             patch.object(probe, "_health", return_value={"api_live": True, "api_ready": True, "web_local": True, "public": True}),
             patch.object(probe.os, "geteuid", return_value=0),
@@ -265,10 +309,197 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             transaction, companion = self._paths(Path(directory))
             companion.write_text("fixture", encoding="ascii")
-            fake = FakeSystemdState()
-            result = self._run(fake, transaction, companion)
+            fake = FakeSystemdState(operation="rollback")
+            fake.OWNED_UNITS = systemd_state.OWNED_UNITS
+            nginx_calls: list[dict[str, object]] = []
+            with patch.object(
+                probe.subprocess,
+                "run",
+                side_effect=lambda argv, **kwargs: nginx_calls.append({"argv": argv, **kwargs}) or SimpleNamespace(returncode=0),
+            ), patch.object(
+                probe,
+                "_private_capture_requested",
+                return_value=False,
+            ), patch.object(
+                probe,
+                "_read_stable_state",
+                return_value={
+                    "operation_id": "a" * 32,
+                    "operation": "rollback",
+                    "phase": "rollback-runtime-pending",
+                    "current_before": str(transaction.parents[1] / "releases/old"),
+                    "previous_before": str(transaction.parents[1] / "releases/pending"),
+                },
+            ):
+                result = self._run(fake, transaction, companion)
             self.assertEqual(result["capture_predicate"], "existing_receipt_valid")
-            self.assertEqual(fake.events, ["validate"])
+            self.assertEqual(result["receipt_present"], True)
+            self.assertEqual(result["current_bound"], True)
+            self.assertEqual(result["previous_bound"], True)
+            self.assertEqual(result["runtime_target"], "old")
+            self.assertEqual(result["runtime_target_source"], "a" * 40)
+            self.assertEqual(result["runtime_target_helper_sha256"], "c" * 64)
+            self.assertEqual(result["nginx_preflight"], "passed")
+            self.assertEqual(result["nginx_preflight_returncode"], 0)
+            self.assertEqual(result["service_active_count"], 13)
+            self.assertEqual(result["service_enabled_count"], 13)
+            self.assertIn("validate", fake.events)
+            self.assertIn("receipt_read", fake.events)
+            self.assertEqual(len(nginx_calls), 1)
+            self.assertEqual(
+                nginx_calls[0]["argv"],
+                [str(transaction.parents[1] / "shared/venv/bin/python"), str(transaction.parents[1] / "releases/old/tools/platform_install_nginx.py"), "--json"],
+            )
+            self.assertEqual(nginx_calls[0]["env"], {"PATH": "/usr/bin:/bin", "PLATFORM_APP_DIR": str(transaction.parents[1]), "PYTHONDONTWRITEBYTECODE": "1"})
+            self.assertEqual(nginx_calls[0]["stdout"], subprocess.DEVNULL)
+            self.assertEqual(nginx_calls[0]["stderr"], subprocess.DEVNULL)
+            self.assertEqual(nginx_calls[0]["timeout"], 60)
+            self.assertFalse(any(flag in nginx_calls[0]["argv"] for flag in ("--apply", "--reload")))
+            self.assertFalse(any("platform_install_systemd_units" in str(arg) for arg in nginx_calls[0]["argv"]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            transaction, companion = self._paths(Path(directory))
+            companion.write_text("fixture", encoding="ascii")
+            fake = FakeSystemdState(
+                operation="rollback", transaction_operation="install", phase="recovery-restored",
+            )
+            fake.OWNED_UNITS = systemd_state.OWNED_UNITS
+            nginx_calls: list[dict[str, object]] = []
+            with patch.object(
+                probe.subprocess,
+                "run",
+                side_effect=lambda argv, **kwargs: nginx_calls.append({"argv": argv, **kwargs}) or SimpleNamespace(returncode=0),
+            ):
+                result = self._run(fake, transaction, companion)
+            self.assertEqual(result["runtime_target"], "old")
+            self.assertEqual(result["runtime_target_source"], "a" * 40)
+            self.assertEqual(len(nginx_calls), 1)
+            self.assertEqual(nginx_calls[0]["argv"][1], str(transaction.parents[1] / "releases/old/tools/platform_install_nginx.py"))
+            self.assertEqual(fake._read_receipt(companion)["operation"], "rollback")
+
+        with tempfile.TemporaryDirectory() as directory:
+            transaction, companion = self._paths(Path(directory))
+            companion.write_text("fixture", encoding="ascii")
+            fake = FakeSystemdState(operation="rollback")
+            fake.OWNED_UNITS = systemd_state.OWNED_UNITS
+            with patch.object(
+                probe.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=17, stdout="private stdout", stderr="private stderr"),
+            ), patch.object(
+                probe,
+                "_private_capture_requested",
+                return_value=False,
+            ), patch.object(
+                probe,
+                "_read_stable_state",
+                return_value={
+                    "operation_id": "a" * 32,
+                    "operation": "rollback",
+                    "phase": "rollback-runtime-pending",
+                    "current_before": str(transaction.parents[1] / "releases/old"),
+                    "previous_before": str(transaction.parents[1] / "releases/pending"),
+                },
+            ):
+                with self.assertRaises(probe.ProbeFailure) as caught:
+                    self._run(fake, transaction, companion)
+            self.assertEqual(caught.exception.check, "nginx_preflight")
+            self.assertEqual(caught.exception.error_class, "child_failure")
+            self.assertEqual(caught.exception.safe_fields["nginx_preflight"], "failed")
+            self.assertEqual(caught.exception.safe_fields["nginx_preflight_returncode"], 17)
+            self.assertNotIn("private", json.dumps(caught.exception.safe_fields))
+
+        with tempfile.TemporaryDirectory() as directory:
+            transaction, companion = self._paths(Path(directory))
+            companion.write_text("fixture", encoding="ascii")
+            fake = FakeSystemdState(operation="rollback")
+            fake.OWNED_UNITS = systemd_state.OWNED_UNITS
+            private_text = b"private nginx failure detail"
+            private_output = tempfile.TemporaryFile(mode="w+b")
+            private_output.write(private_text)
+            private_output.flush()
+            emitted = BytesIO()
+            with (
+                patch.object(probe, "_private_capture_requested", return_value=True),
+                patch.object(
+                    probe,
+                    "_run_private_preflight",
+                    return_value=(17, len(private_text), private_output, 0, len(private_text), False),
+                ),
+                patch.object(probe.sys, "stderr", SimpleNamespace(buffer=emitted)),
+                patch.object(
+                    probe,
+                    "_read_stable_state",
+                    return_value={
+                        "operation_id": "a" * 32,
+                        "operation": "rollback",
+                        "phase": "rollback-runtime-pending",
+                        "current_before": str(transaction.parents[1] / "releases/old"),
+                        "previous_before": str(transaction.parents[1] / "releases/pending"),
+                    },
+                ),
+            ):
+                with self.assertRaises(probe.ProbeFailure):
+                    self._run(fake, transaction, companion)
+            private_output.close()
+            marker = emitted.getvalue().decode("ascii").strip()
+            self.assertTrue(marker.startswith("RUNTIME_PRIVATE_CONTEXT "))
+            context = json.loads(marker.removeprefix("RUNTIME_PRIVATE_CONTEXT "))
+            self.assertEqual(
+                set(context),
+                {"schema", "route", "component", "guard_id", "returncode", "stream", "output_b64", "total_bytes", "truncated", "retained"},
+            )
+            self.assertEqual(context["schema"], 1)
+            self.assertEqual(context["route"], "capture_probe")
+            self.assertEqual(context["component"], "nginx_preflight")
+            self.assertIsNone(context["guard_id"])
+            self.assertEqual(context["returncode"], 17)
+            self.assertEqual(context["stream"], "stderr")
+            self.assertEqual(base64.b64decode(context["output_b64"]), private_text)
+            self.assertEqual(context["total_bytes"], len(private_text))
+            self.assertFalse(context["truncated"])
+            self.assertEqual(context["retained"], "tail")
+
+        install_target, install_path, install_validation = probe._receipt_runtime_target({
+            "operation": "install",
+            "phase": "recovery-restored",
+            "current_before": "/opt/oldsparky/platform/releases/current-before",
+            "previous_before": "/opt/oldsparky/platform/releases/previous-before",
+        })
+        self.assertEqual(install_target, "current_before")
+        self.assertEqual(install_path, "/opt/oldsparky/platform/releases/current-before")
+        self.assertEqual(install_validation, "current_before")
+
+        for invalid_operation in ([], {}):
+            with self.assertRaises(probe.ProbeFailure) as caught:
+                probe._receipt_runtime_target({
+                    "operation": invalid_operation,
+                    "phase": "recovery-restored",
+                    "current_before": "/opt/oldsparky/platform/releases/current-before",
+                    "previous_before": "/opt/oldsparky/platform/releases/previous-before",
+                })
+            self.assertEqual(caught.exception.check, "existing_receipt_transaction")
+
+        with tempfile.TemporaryDirectory() as directory:
+            transaction, companion = self._paths(Path(directory))
+            companion.write_text("fixture", encoding="ascii")
+            fake = FakeSystemdState(operation="rollback", phase="unknown-runtime-phase")
+            with patch.object(
+                probe,
+                "_read_stable_state",
+                return_value={
+                    "operation_id": "a" * 32,
+                    "operation": "rollback",
+                    "phase": "unknown-runtime-phase",
+                    "current_before": str(transaction.parents[1] / "releases/old"),
+                    "previous_before": str(transaction.parents[1] / "releases/pending"),
+                },
+            ):
+                with self.assertRaises(probe.ProbeFailure) as caught:
+                    self._run(fake, transaction, companion)
+            self.assertEqual(caught.exception.check, "existing_receipt_phase")
+            self.assertNotIn("unit_snapshot", fake.events)
+            self.assertNotIn("validate", fake.events)
 
     def test_non_install_transaction_fails_before_helper_manifest_or_unit_queries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -378,10 +609,50 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                     )
                     output = result.stdout.removeprefix("PRODUCTION_CAPTURE_PROBE ").strip()
                     parsed = json.loads(output)
-                    self.assertEqual(
-                        parsed.get("failed_check") == "remote_or_transport",
-                        not accepted,
-                    )
+                self.assertEqual(
+                    parsed.get("failed_check") == "remote_or_transport",
+                    not accepted,
+                )
+            failed_preflight = {
+                "schema": 1,
+                "kind": "release_capture_probe",
+                "status": "failed",
+                "failed_check": "nginx_preflight",
+                "error_class": "child_failure",
+                "health": base["health"],
+                "capture_predicate": "existing_receipt_valid",
+                "receipt_present": True,
+                "current_bound": True,
+                "previous_bound": True,
+                "runtime_target": "gha-123-1-abcdef012345",
+                "runtime_target_source": "a" * 40,
+                "runtime_target_helper_sha256": "b" * 64,
+                "service_active_count": 13,
+                "service_enabled_count": 12,
+                "nginx_preflight": "failed",
+                "nginx_preflight_returncode": 17,
+            }
+            report_path.write_text(json.dumps(failed_preflight), encoding="ascii")
+            result = subprocess.run(
+                [sys.executable, "-c", validator, str(report_path), "1"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            parsed = json.loads(result.stdout.removeprefix("PRODUCTION_CAPTURE_PROBE ").strip())
+            self.assertEqual(parsed["failed_check"], "nginx_preflight")
+            self.assertEqual(parsed["nginx_preflight"], "failed")
+            self.assertEqual(parsed["nginx_preflight_returncode"], 17)
+            failed_preflight["raw_stderr"] = "private command output"
+            report_path.write_text(json.dumps(failed_preflight), encoding="ascii")
+            result = subprocess.run(
+                [sys.executable, "-c", validator, str(report_path), "1"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            parsed = json.loads(result.stdout.removeprefix("PRODUCTION_CAPTURE_PROBE ").strip())
+            self.assertEqual(parsed["failed_check"], "remote_or_transport")
 
     def _assert_capture_probe_stage_feeds_heredoc_to_ssh_before_copy(self) -> None:
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/platform-production-diagnostics.yml").read_text(encoding="utf-8")

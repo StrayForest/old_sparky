@@ -27,13 +27,29 @@ ROLLBACK_RECONCILE_TRANSACTION=""
 PRESERVE_LEGACY_LIVE_QA=0
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
+RUNTIME_PRIVATE_CAPTURE="${PLATFORM_RUNTIME_PRIVATE_CAPTURE:-0}"
+RUNTIME_PRIVATE_ROUTE="${PLATFORM_RUNTIME_PRIVATE_ROUTE:-}"
+RUNTIME_PRIVATE_MARKER_COUNT=0
+RUNTIME_PRIVATE_LAST_GUARD="runtime"
 
 public_status() {
   local status="$1"
   local class="${2:-runtime}"
+  [[ "$status" != "failed" ]] || RUNTIME_PRIVATE_LAST_GUARD="$class"
   printf 'RELEASE_RUNTIME schema=1 status=%s class=%s release_slug=%s source_sha=%s\n' \
     "$status" "$class" "$PUBLIC_RELEASE_SLUG" "$PUBLIC_SOURCE_SHA"
 }
+
+case "$RUNTIME_PRIVATE_CAPTURE" in
+  0) ;;
+  1)
+    case "$RUNTIME_PRIVATE_ROUTE" in
+      recover_pending) ;;
+      *) public_status failed argument >&2; exit 1 ;;
+    esac
+    ;;
+  *) public_status failed argument >&2; exit 1 ;;
+esac
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -221,6 +237,7 @@ on_exit() {
   local exit_status="$?"
   trap - EXIT
   if [[ "$exit_status" -ne 0 ]]; then
+    emit_private_guard_context "$exit_status"
     public_status failed >&2
   fi
   platform_release_lock_close
@@ -287,11 +304,10 @@ if [[ -n "$SYSTEMD_STATE" ]]; then
   # manifest before live-QA reconciliation or any release helper can mutate
   # runtime files.  The bootstrap performs the same check, but rollback calls
   # this script directly during retry recovery.
-  "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
+  run_private_command systemd_state_validate "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
     validate --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
     --transaction "$TRANSACTION_STATE" --helper-release "$RELEASE" \
-    --systemctl "$SYSTEMCTL_BIN" \
-    >/dev/null 2>/dev/null
+    --systemctl "$SYSTEMCTL_BIN"
 fi
 if [[ "$PRESERVE_LEGACY_LIVE_QA" -eq 0 \
   && ( "$PREPARE_RUNTIME" -eq 1 || "$RUN_RESTART" -eq 1 ) ]]; then
@@ -301,13 +317,12 @@ if [[ "$PRESERVE_LEGACY_LIVE_QA" -eq 0 \
   # must not re-enter reconciliation after the transaction has advanced past
   # its runtime-pending phase. The canonical release lock remains held here.
   if [[ -n "$ROLLBACK_RECONCILE_TRANSACTION" ]]; then
-    "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+    run_private_command runtime_reconcile "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
       reconcile --app-dir "$APP_DIR" \
-      --rollback-transaction "$ROLLBACK_RECONCILE_TRANSACTION" \
-      >/dev/null 2>/dev/null
+      --rollback-transaction "$ROLLBACK_RECONCILE_TRANSACTION"
   else
-    "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
-      reconcile --app-dir "$APP_DIR" >/dev/null 2>/dev/null
+    run_private_command runtime_reconcile "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+      reconcile --app-dir "$APP_DIR"
   fi
 fi
 
@@ -317,12 +332,140 @@ prepare_runtime_private() {
   # must override that default explicitly before it can touch systemd.
   export PLATFORM_ENABLE_SYSTEMD_UNITS=0
   export PLATFORM_SYSTEMCTL_BIN="$SYSTEMCTL_BIN"
-  PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"
+  PLATFORM_APP_DIR="$APP_DIR" run_private_command systemd_units "$UNITS_TOOL"
   set +e
-  PLATFORM_APP_DIR="$APP_DIR" "$SHARED_VENV/bin/python" \
-    "$NGINX_TOOL" --apply --reload --json
+  PLATFORM_APP_DIR="$APP_DIR" run_private_command nginx_apply \
+    "$SHARED_VENV/bin/python" "$NGINX_TOOL" --apply --reload --json
   nginx_status="$?"
   set -e
+}
+
+run_private_command() {
+  local component="$1" status=0 marker_path capture_status=0
+  local -a pipeline_status
+  shift
+  if [[ "$RUNTIME_PRIVATE_CAPTURE" != "1" ]]; then
+    "$@" >/dev/null 2>&1
+    return $?
+  fi
+
+  case "$component" in
+    systemd_state_validate|runtime_reconcile|systemd_units|nginx_apply|nginx_config_test|nginx_reload|systemd_restore_enabled) ;;
+    *) return 1 ;;
+  esac
+  marker_path="$(mktemp --tmpdir=/tmp "oldsparky-runtime-${component}.XXXXXX")" || return 1
+  chmod 600 -- "$marker_path"
+  if "$@" 2>&1 | /usr/bin/python3 -I -c '
+import base64
+import json
+import os
+import sys
+
+route, component, filename = sys.argv[1:]
+raw = bytearray()
+total = 0
+while True:
+    chunk = sys.stdin.buffer.read(8192)
+    if not chunk:
+        break
+    total += len(chunk)
+    raw.extend(chunk)
+    if len(raw) > 16384:
+        del raw[:-16384]
+if route != "recover_pending" or component not in {
+    "systemd_state_validate", "runtime_reconcile", "systemd_units", "nginx_apply",
+    "nginx_config_test", "nginx_reload", "systemd_restore_enabled",
+}:
+    raise SystemExit("private runtime context is invalid")
+payload = "RUNTIME_PRIVATE_CONTEXT " + json.dumps({
+    "schema": 1,
+    "route": route,
+    "component": component,
+    "guard_id": None,
+    "returncode": "unavailable",
+    "stream": "combined",
+    "output_b64": base64.b64encode(raw).decode("ascii"),
+    "total_bytes": total if total <= 9223372036854775807 else "unavailable",
+    "truncated": total > len(raw),
+    "retained": "tail",
+}, sort_keys=True, separators=(",", ":"))
+descriptor = os.open(filename, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+    stream.write(payload + "\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+' "$RUNTIME_PRIVATE_ROUTE" "$component" "$marker_path"; then
+    pipeline_status=("${PIPESTATUS[@]}")
+  else
+    pipeline_status=("${PIPESTATUS[@]}")
+  fi
+  status="${pipeline_status[0]:-1}"
+  capture_status="${pipeline_status[1]:-1}"
+  if (( capture_status != 0 )); then
+    rm -f -- "$marker_path"
+    return 1
+  fi
+  if (( status == 0 )); then
+    rm -f -- "$marker_path"
+    return 0
+  fi
+  /usr/bin/python3 -I -c '
+import json
+import os
+import sys
+
+path, returncode = sys.argv[1:]
+with open(path, "r", encoding="ascii") as stream:
+    line = stream.read()
+if not line.startswith("RUNTIME_PRIVATE_CONTEXT "):
+    raise SystemExit("private runtime context is invalid")
+value = json.loads(line.removeprefix("RUNTIME_PRIVATE_CONTEXT "))
+value["returncode"] = int(returncode)
+payload = "RUNTIME_PRIVATE_CONTEXT " + json.dumps(value, sort_keys=True, separators=(",", ":"))
+descriptor = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+    stream.write(payload + "\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+' "$marker_path" "$status"
+  # Ordered bounded markers are encrypted by the runner; no raw child bytes
+  # reach the Actions log or public failure report.
+  cat -- "$marker_path" >&2
+  rm -f -- "$marker_path"
+  RUNTIME_PRIVATE_MARKER_COUNT=$((RUNTIME_PRIVATE_MARKER_COUNT + 1))
+  return "$status"
+}
+
+emit_private_guard_context() {
+  [[ "$RUNTIME_PRIVATE_CAPTURE" == "1" && "$RUNTIME_PRIVATE_MARKER_COUNT" -eq 0 ]] || return 0
+  /usr/bin/python3 -I - "$RUNTIME_PRIVATE_ROUTE" "$RUNTIME_PRIVATE_LAST_GUARD" "$1" <<'PY' >&2
+import json
+import sys
+route, guard_id, status = sys.argv[1:]
+if route != "recover_pending" or guard_id not in {
+    "argument", "privilege", "lock", "layout", "tooling", "systemd_state",
+    "transaction_state", "legacy_liveqa_authority", "liveqa_runtime", "nginx", "runtime",
+}:
+    guard_id = "runtime"
+try:
+    returncode = int(status)
+except ValueError:
+    returncode = 1
+if not 1 <= returncode <= 255:
+    returncode = 1
+print("RUNTIME_PRIVATE_CONTEXT " + json.dumps({
+    "schema": 1,
+    "route": route,
+    "component": "runtime_guard",
+    "guard_id": guard_id,
+    "returncode": returncode,
+    "stream": "guard",
+    "output_b64": "",
+    "total_bytes": 0,
+    "truncated": False,
+    "retained": "tail",
+}, sort_keys=True, separators=(",", ":")))
+PY
 }
 
 # Keep all direct systemctl calls bounded just like the immutable systemd
@@ -332,20 +475,19 @@ run_systemctl() {
 }
 
 run_nginx_config_test() {
-  "$NGINX_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${NGINX_CONFIG_TIMEOUT_SECONDS}s" \
-    "$NGINX_BIN" -t >/dev/null 2>/dev/null
+  run_private_command nginx_config_test "$NGINX_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${NGINX_CONFIG_TIMEOUT_SECONDS}s" \
+    "$NGINX_BIN" -t
 }
 
 restore_systemd_enabled_state() {
   [[ -n "$SYSTEMD_STATE" ]] || return 0
   local transaction_args=()
   [[ -n "$TRANSACTION_STATE" ]] && transaction_args=(--transaction "$TRANSACTION_STATE")
-  "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
+  run_private_command systemd_restore_enabled "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
     restore-enabled --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
     --helper-release "$RELEASE" \
     --systemctl "$SYSTEMCTL_BIN" \
-    "${transaction_args[@]}" \
-    >/dev/null 2>/dev/null
+    "${transaction_args[@]}"
 }
 
 restore_systemd_state() {
@@ -361,13 +503,17 @@ restore_systemd_state() {
 }
 
 if [[ "$PREPARE_RUNTIME" -eq 1 ]]; then
-  prepare_runtime_private >/dev/null 2>/dev/null
+  if [[ "$RUNTIME_PRIVATE_CAPTURE" == "1" ]]; then
+    prepare_runtime_private
+  else
+    prepare_runtime_private >/dev/null 2>/dev/null
+  fi
   if [[ "$nginx_status" -ne 0 ]]; then
     # The installer restores its disk snapshots on failure. Validate and reload
     # that restored disk state before returning failure so active Nginx cannot
     # remain divergent from the recovery contour.
     run_nginx_config_test || { public_status failed nginx >&2; exit "$nginx_status"; }
-    run_systemctl reload nginx.service >/dev/null 2>/dev/null
+    run_private_command nginx_reload run_systemctl reload nginx.service
     exit "$nginx_status"
   fi
   # --prepare-only must never start an inactive unit.  It may repair the

@@ -114,6 +114,16 @@ after checking the exact completed run and artifact metadata for the linked
 security, recovery producer and publisher runs; the local tool then proves the
 downloaded bytes and encrypted manifest match that binding.
 
+The same CMS transport also carries a separate
+`release_runtime_failure_private_context` kind for explicit `capture_probe` or
+`recover_pending` diagnostics. Its closed local binding includes the route,
+exact workflow/source and signed-run tuples, artifact ID/name, and the GitHub
+API archive digest. Remote context permits at most five ordered command
+markers, each retaining a 16 KiB tail; the total SSH error stream is bounded to
+128 KiB. Child commands remain quiet by default and emit this context only
+after the workflow validates the recipient certificate. This diagnostic kind
+is never accepted as maintenance reset evidence.
+
 The local command is
 `python3 platform/tools/platform_decrypt_maintenance_evidence.py --artifact-archive <archive.zip> --binding-json <protected-binding.json> --private-key <0600-private-key.pem> --certificate <matching-certificate.pem> --destination <new-git-private-evidence.json> --git-dir <repository/.git>`.
 

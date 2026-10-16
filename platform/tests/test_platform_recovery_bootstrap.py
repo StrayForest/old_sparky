@@ -1104,6 +1104,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("conclusion\") == \"success\"", workflow)
 
     def test_manual_abort_validates_artifacts_before_secrets_and_uses_bundle_only(self) -> None:
+        self._assert_runtime_child_private_capture_is_opt_in_bounded_and_runner_only()
         workflow = (REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-abort.yml").read_text(encoding="utf-8")
         self._run_reset_capture_artifact_fetch_contract(workflow)
         evidence = workflow.index("Validate exact successful security run")
@@ -1602,6 +1603,142 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     git_dir=git_dir,
                 )
             self.assertFalse(wrong_key_output.exists())
+
+            from tools import platform_release_capture_probe as capture_probe
+
+            class PrivateStderr:
+                buffer = io.BytesIO()
+
+            private_stderr = PrivateStderr()
+            components = (
+                "runtime_reconcile", "systemd_units", "nginx_apply",
+                "nginx_config_test", "nginx_reload",
+            )
+            with mock.patch.object(capture_probe.sys, "stderr", private_stderr):
+                for component in components:
+                    bounded_stream = io.BytesIO()
+                    position, retained_size = capture_probe._append_private_tail(
+                        bounded_stream, 0, 0, (component.encode("ascii") + b"x" * 60000),
+                    )
+                    capture_probe._emit_private_runtime_context(
+                        bounded_stream,
+                        route="recover_pending",
+                        component=component,
+                        returncode=17,
+                        total_bytes=60000 + len(component),
+                        position=position,
+                        retained_bytes=retained_size,
+                    )
+            marker_line = private_stderr.buffer.getvalue()
+            self.assertLessEqual(len(marker_line), 131072)
+            runtime_provenance = {
+                "route": "recover_pending",
+                "workflow_run_id": "78901",
+                "workflow_run_attempt": "1",
+                "workflow_sha": "f" * 40,
+                "source_sha": "f" * 40,
+                "bundle_sha256": "b" * 64,
+                "security_run_id": "12345",
+                "security_run_attempt": "1",
+                "recovery_run_id": "23456",
+                "recovery_run_attempt": "1",
+                "publisher_run_id": "34567",
+                "publisher_run_attempt": "1",
+            }
+            runtime_remote_stderr = b"safe private transport detail\n" + marker_line
+            runtime_plaintext = {
+                "schema": 1,
+                "kind": "release_runtime_failure_private_context",
+                "repository": "StrayForest/old_sparky",
+                "workflow_path": ".github/workflows/platform-production-release-recover.yml",
+                **runtime_provenance,
+                "remote_stderr_b64": base64.b64encode(runtime_remote_stderr).decode("ascii"),
+                "remote_stderr_size": len(runtime_remote_stderr),
+            }
+            runtime_plaintext_bytes = (
+                json.dumps(runtime_plaintext, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("ascii")
+            runtime_plain_path = private_dir / "runtime-plaintext.json"
+            runtime_plain_path.write_bytes(runtime_plaintext_bytes)
+            runtime_plain_path.chmod(0o600)
+            runtime_cipher_path = private_dir / "runtime-evidence.cms"
+            subprocess.run(
+                [
+                    "openssl", "cms", "-encrypt", "-binary", "-aes-256-gcm", "-outform", "DER",
+                    "-in", str(runtime_plain_path), "-out", str(runtime_cipher_path),
+                    "-recip", str(local_certificate), "-keyopt", "rsa_padding_mode:oaep",
+                    "-keyopt", "rsa_oaep_md:sha256",
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            runtime_cipher_path.chmod(0o600)
+            runtime_ciphertext = runtime_cipher_path.read_bytes()
+            runtime_manifest = {
+                "schema": 1,
+                "kind": "encrypted_release_runtime_failure_context",
+                "repository": "StrayForest/old_sparky",
+                "workflow_path": ".github/workflows/platform-production-release-recover.yml",
+                **runtime_provenance,
+                "recipient_certificate_sha256": certificate_fingerprint,
+                "encryption": maintenance_decrypt.ENCRYPTION_PROFILE,
+                "ciphertext_sha256": hashlib.sha256(runtime_ciphertext).hexdigest(),
+                "ciphertext_size": len(runtime_ciphertext),
+            }
+            runtime_manifest_path = private_dir / "runtime-manifest.json"
+            runtime_manifest_path.write_text(
+                json.dumps(runtime_manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="ascii",
+            )
+            runtime_archive = private_dir / "runtime-capture.zip"
+            with zipfile.ZipFile(runtime_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", runtime_manifest_path.read_bytes())
+                archive.writestr("evidence.cms", runtime_ciphertext)
+            runtime_archive.chmod(0o600)
+            runtime_archive_sha = hashlib.sha256(runtime_archive.read_bytes()).hexdigest()
+            runtime_binding = {
+                "schema": 1,
+                "kind": "github_release_runtime_failure_binding",
+                "repository": "StrayForest/old_sparky",
+                "workflow_path": ".github/workflows/platform-production-release-recover.yml",
+                "artifact_id": "89012",
+                "artifact_name": "platform-release-runtime-failure-78901-1",
+                "artifact_digest": f"sha256:{runtime_archive_sha}",
+                **runtime_provenance,
+            }
+            runtime_binding_path = private_dir / "runtime-binding.json"
+            runtime_binding_path.write_text(
+                json.dumps(runtime_binding, sort_keys=True, separators=(",", ":")),
+                encoding="ascii",
+            )
+            runtime_binding_path.chmod(0o600)
+            runtime_decrypted = private_dir / "runtime-decrypted.json"
+            with mock.patch.object(
+                maintenance_decrypt,
+                "RECIPIENT_CERTIFICATE_SHA256",
+                certificate_fingerprint,
+            ):
+                runtime_digest, runtime_size = maintenance_decrypt.decrypt_runtime_failure_context(
+                    artifact_archive=runtime_archive,
+                    binding_json=runtime_binding_path,
+                    private_key=local_key,
+                    certificate=local_certificate,
+                    destination=runtime_decrypted,
+                    git_dir=git_dir,
+                )
+            self.assertEqual(runtime_decrypted.read_bytes(), runtime_plaintext_bytes)
+            self.assertEqual(runtime_digest, hashlib.sha256(runtime_plaintext_bytes).hexdigest())
+            self.assertEqual(runtime_size, len(runtime_plaintext_bytes))
+            self.assertEqual(stat.S_IMODE(runtime_decrypted.stat().st_mode), 0o600)
+            decrypted_runtime = json.loads(runtime_decrypted.read_text(encoding="ascii"))
+            decoded_remote = base64.b64decode(decrypted_runtime["remote_stderr_b64"], validate=True)
+            decoded_markers = [
+                json.loads(line.removeprefix("RUNTIME_PRIVATE_CONTEXT "))
+                for line in decoded_remote.decode("utf-8").splitlines()
+                if line.startswith("RUNTIME_PRIVATE_CONTEXT ")
+            ]
+            self.assertEqual([marker["component"] for marker in decoded_markers], list(components))
+            self.assertTrue(all(marker["total_bytes"] > 16384 and marker["truncated"] for marker in decoded_markers))
+            self.assertTrue(all(len(base64.b64decode(marker["output_b64"])) == 16384 for marker in decoded_markers))
             self.assertIn("status=encrypted", result.stdout)
             self.assertNotIn("private-capture-evidence", result.stdout)
             self.assertNotIn(evidence_sha256, result.stdout)
@@ -2121,6 +2258,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                         (
                             "set -euo pipefail",
                             "remote_status=1",
+                            "runtime_private_capture=0",
                             f"remote_error={shlex.quote(str(error))}",
                             receiver,
                         )
@@ -2137,6 +2275,225 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     self.assertNotIn("private-detail", result.stdout)
                     self.assertNotIn("private-detail", result.stderr)
                     self.assertIn("class=remote_or_transport", result.stdout)
+
+    def _assert_runtime_child_private_capture_is_opt_in_bounded_and_runner_only(self) -> None:
+        diagnostics_workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        recipient_step = diagnostics_workflow.split(
+            "- name: Validate pinned runtime failure recipient before production access", 1
+        )[1].split("\n      - name: Configure SSH", 1)[0]
+        cms_probe = "openssl cms -encrypt -binary -aes-256-gcm -outform DER"
+        self.assertIn(cms_probe, recipient_step)
+        self.assertLess(recipient_step.index(cms_probe), recipient_step.index("capture_enabled=1"))
+
+        runtime_restore = (
+            REPO_ROOT / "platform/tools/platform_release_restore_runtime.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'PLATFORM_APP_DIR="$APP_DIR" run_private_command systemd_units "$UNITS_TOOL"',
+            runtime_restore,
+        )
+        self.assertIn('"$NGINX_TOOL" --apply --reload --json', runtime_restore)
+        self.assertIn('RUNTIME_PRIVATE_CAPTURE="${PLATFORM_RUNTIME_PRIVATE_CAPTURE:-0}"', runtime_restore)
+        self.assertIn('prepare_runtime_private >/dev/null 2>/dev/null', runtime_restore)
+
+        function = runtime_restore.split("run_private_command() {", 1)[1].split("\n}\n", 1)[0]
+        script = "run_private_command() {" + function + "\n}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / "fake-child"
+            child.write_text(
+                "#!/usr/bin/env bash\nprintf 'private child detail\\n' >&2\nexit 23\n",
+                encoding="ascii",
+            )
+            child.chmod(0o700)
+            command = "\n".join((
+                "set -euo pipefail",
+                'RUNTIME_PRIVATE_CAPTURE="1"',
+                'RUNTIME_PRIVATE_ROUTE="recover_pending"',
+                'RUNTIME_PRIVATE_MARKER_COUNT=0',
+                script,
+                f"if run_private_command nginx_apply {shlex.quote(str(child))} --apply --reload --json; then status=0; else status=$?; fi",
+                'printf ' + shlex.quote("status=%s\\n") + ' "$status"',
+            ))
+            result = subprocess.run(
+                ["bash", "-c", command], capture_output=True, text=True,
+                check=False, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "status=23\n")
+            marker = next(line for line in result.stderr.splitlines() if line.startswith("RUNTIME_PRIVATE_CONTEXT "))
+            private = json.loads(marker.removeprefix("RUNTIME_PRIVATE_CONTEXT "))
+            self.assertEqual(
+                private,
+                {
+                    "schema": 1,
+                    "route": "recover_pending",
+                    "component": "nginx_apply",
+                    "guard_id": None,
+                    "returncode": 23,
+                    "stream": "combined",
+                    "output_b64": base64.b64encode(b"private child detail\n").decode("ascii"),
+                    "total_bytes": len(b"private child detail\n"),
+                    "truncated": False,
+                    "retained": "tail",
+                },
+            )
+            self.assertNotIn("private child detail", result.stdout)
+            self.assertNotIn("private child detail", result.stderr)
+
+            quiet = command.replace('RUNTIME_PRIVATE_CAPTURE="1"', 'RUNTIME_PRIVATE_CAPTURE="0"')
+            quiet_result = subprocess.run(
+                ["bash", "-c", quiet], capture_output=True, text=True,
+                check=False, timeout=5,
+            )
+            self.assertEqual(quiet_result.returncode, 0, quiet_result.stdout + quiet_result.stderr)
+            self.assertEqual(quiet_result.stdout, "status=23\n")
+            self.assertEqual(quiet_result.stderr, "")
+
+            ran_later = root / "later-command-ran"
+            reconcile = root / "fake-reconcile"
+            reconcile.write_text(
+                "#!/usr/bin/env bash\nprintf 'reconcile private detail\\n' >&2\nexit 37\n",
+                encoding="ascii",
+            )
+            reconcile.chmod(0o700)
+            later = root / "fake-later"
+            later.write_text(
+                "#!/usr/bin/env bash\nprintf ran >" + shlex.quote(str(ran_later)) + "\n",
+                encoding="ascii",
+            )
+            later.chmod(0o700)
+            early_failure = subprocess.run(
+                [
+                    "bash", "-c", "\n".join((
+                        "set -euo pipefail",
+                        'RUNTIME_PRIVATE_CAPTURE="1"',
+                        'RUNTIME_PRIVATE_ROUTE="recover_pending"',
+                        'RUNTIME_PRIVATE_MARKER_COUNT=0',
+                        script,
+                        f"run_private_command runtime_reconcile {shlex.quote(str(reconcile))}",
+                        f"run_private_command systemd_units {shlex.quote(str(later))}",
+                    ))],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+            self.assertEqual(early_failure.returncode, 37, early_failure.stdout + early_failure.stderr)
+            self.assertFalse(ran_later.exists())
+            self.assertNotIn("reconcile private detail", early_failure.stdout)
+            self.assertNotIn("reconcile private detail", early_failure.stderr)
+            failure_marker = json.loads(next(
+                line.removeprefix("RUNTIME_PRIVATE_CONTEXT ")
+                for line in early_failure.stderr.splitlines()
+                if line.startswith("RUNTIME_PRIVATE_CONTEXT ")
+            ))
+            self.assertEqual(failure_marker["component"], "runtime_reconcile")
+            self.assertEqual(failure_marker["returncode"], 37)
+
+            # Exercise the actual caller that temporarily disables errexit so
+            # it can run the config-test/reload repair path after nginx apply
+            # fails. The private wrapper must restore that caller state.
+            events = root / "runtime-events"
+            shared_venv = root / "shared-venv"
+            (shared_venv / "bin").mkdir(parents=True)
+            fake_python = shared_venv / "bin" / "python"
+            fake_python.write_text(
+                "#!/usr/bin/env bash\nprintf 'nginx-apply\\n' >>" + shlex.quote(str(events)) + "\nexit 23\n",
+                encoding="ascii",
+            )
+            fake_python.chmod(0o700)
+            fake_timeout = root / "fake-timeout"
+            fake_timeout.write_text(
+                "#!/usr/bin/env bash\nshift 3\nexec \"$@\"\n", encoding="ascii",
+            )
+            fake_timeout.chmod(0o700)
+            fake_nginx = root / "fake-nginx"
+            fake_nginx.write_text(
+                "#!/usr/bin/env bash\nprintf 'nginx-test\\n' >>" + shlex.quote(str(events)) + "\n",
+                encoding="ascii",
+            )
+            fake_nginx.chmod(0o700)
+            fake_systemctl = root / "fake-systemctl"
+            fake_systemctl.write_text(
+                "#!/usr/bin/env bash\nprintf 'systemctl-%s\\n' \"$*\" >>" + shlex.quote(str(events)) + "\n",
+                encoding="ascii",
+            )
+            fake_systemctl.chmod(0o700)
+            unit_installer = root / "fake-unit-installer"
+            unit_installer.write_text(
+                "#!/usr/bin/env bash\nprintf 'units\\n' >>" + shlex.quote(str(events)) + "\n",
+                encoding="ascii",
+            )
+            unit_installer.chmod(0o700)
+            prepare_function = runtime_restore.split("prepare_runtime_private() {", 1)[1].split("\n}\n", 1)[0]
+            prepare_script = "prepare_runtime_private() {" + prepare_function + "\n}\n"
+            timeout_functions = (
+                "run_systemctl() {" + runtime_restore.split("run_systemctl() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+                + "run_nginx_config_test() {" + runtime_restore.split("run_nginx_config_test() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+            )
+            prepare_flow = runtime_restore.split('if [[ "$PREPARE_RUNTIME" -eq 1 ]]; then', 1)[1].split(
+                '\nfi\n\nif [[ "$RUN_RESTART"', 1,
+            )[0]
+            flow_script = 'if [[ "$PREPARE_RUNTIME" -eq 1 ]]; then' + prepare_flow + "\nfi\n"
+            repair_result = subprocess.run(
+                ["bash", "-c", "\n".join((
+                    "set -euo pipefail",
+                    'RUNTIME_PRIVATE_CAPTURE="1"',
+                    'RUNTIME_PRIVATE_ROUTE="recover_pending"',
+                    'RUNTIME_PRIVATE_MARKER_COUNT=0',
+                    f"SHARED_VENV={shlex.quote(str(shared_venv))}",
+                    f"NGINX_TOOL={shlex.quote(str(root / 'unused-nginx-tool'))}",
+                    f"UNITS_TOOL={shlex.quote(str(unit_installer))}",
+                    f"NGINX_TIMEOUT_BIN={shlex.quote(str(fake_timeout))}",
+                    f"SYSTEMCTL_TIMEOUT_BIN={shlex.quote(str(fake_timeout))}",
+                    "NGINX_CONFIG_TIMEOUT_SECONDS=30",
+                    f"NGINX_BIN={shlex.quote(str(fake_nginx))}",
+                    f"SYSTEMCTL_BIN={shlex.quote(str(fake_systemctl))}",
+                    'APP_DIR="/tmp/fake-app"',
+                    'PREPARE_RUNTIME=1',
+                    'RUN_RESTART=0',
+                    'nginx_status=0',
+                    'public_status() { :; }',
+                    script,
+                    timeout_functions,
+                    prepare_script,
+                    flow_script,
+                ))],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+            self.assertEqual(repair_result.returncode, 23, repair_result.stdout + repair_result.stderr)
+            self.assertEqual(
+                events.read_text(encoding="ascii").splitlines(),
+                ["units", "nginx-apply", "nginx-test", "systemctl-reload nginx.service"],
+            )
+            self.assertEqual(
+                [json.loads(line.removeprefix("RUNTIME_PRIVATE_CONTEXT "))["component"]
+                 for line in repair_result.stderr.splitlines()
+                 if line.startswith("RUNTIME_PRIVATE_CONTEXT ")],
+                ["nginx_apply"],
+            )
+
+            guard_function = runtime_restore.split("emit_private_guard_context() {", 1)[1].split("\n}\n", 1)[0]
+            guard_script = "emit_private_guard_context() {" + guard_function + "\n}\n"
+            guard_result = subprocess.run(
+                ["bash", "-c", "\n".join((
+                    'RUNTIME_PRIVATE_CAPTURE="1"',
+                    'RUNTIME_PRIVATE_ROUTE="recover_pending"',
+                    'RUNTIME_PRIVATE_MARKER_COUNT=0',
+                    'RUNTIME_PRIVATE_LAST_GUARD="layout"',
+                    guard_script,
+                    "emit_private_guard_context 3",
+                ))],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+            self.assertEqual(guard_result.returncode, 0, guard_result.stdout + guard_result.stderr)
+            guard_line = next(
+                line for line in guard_result.stderr.splitlines()
+                if line.startswith("RUNTIME_PRIVATE_CONTEXT ")
+            )
+            maintenance_decrypt._validate_runtime_marker(
+                (guard_line + "\n").encode("ascii"), "recover_pending",
+            )
 
     def test_legacy_v2_bridge_cleans_only_with_exact_no_systemd_state(self) -> None:
         if os.geteuid() != 0:
