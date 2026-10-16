@@ -1888,6 +1888,43 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertTrue(candidate.is_dir())
         self.assertFalse((self.root / "current-helper-used").exists())
 
+    def test_immutable_recovery_wrapper_reports_real_capture_transaction_failure(self) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("capture-failure-current")
+        previous = self.add_release("capture-failure-previous")
+        (self.app_dir / "current").symlink_to(current)
+        (self.app_dir / "previous").symlink_to(previous)
+        self.add_bound_release_tools(current)
+        candidate = self.create_wrapper_transaction(
+            current, previous, "capture-failure", complete_snapshot=True
+        )
+        systemctl, systemctl_log = self.write_failing_systemctl(
+            "capture-failure", exit_code=4
+        )
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "RECOVERY_CHECK schema=1 status=failed check=capture_transaction",
+            result.stderr,
+        )
+        self.assertIn(
+            "RELEASE_RUNTIME schema=1 status=failed class=systemd_state",
+            result.stderr,
+        )
+        self.assertTrue(systemctl_log.exists())
+        self.assertTrue((self.shared / STATE_NAME).is_file())
+        self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+        self.assertTrue(candidate.exists())
+
     def test_immutable_recovery_wrapper_two_pointer_uses_bound_data_helpers(self) -> None:
         generation = self.install_recovery_generation()
         current = self.add_release("upgrade-current")
@@ -1994,6 +2031,10 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 )
 
                 self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "RECOVERY_CHECK schema=1 status=failed check=verify_units",
+                    result.stderr,
+                )
                 self.assertTrue(systemctl_log.exists())
                 self.assertTrue(
                     receipt.exists(),

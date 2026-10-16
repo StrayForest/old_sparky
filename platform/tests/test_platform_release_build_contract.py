@@ -5872,8 +5872,8 @@ cleanup
             patterns = re.findall(r"^\s*marker_pattern='([^']+)'$", body, re.MULTILINE)
             self.assertEqual(len(patterns), 1, step_name)
             marker_patterns.append(patterns[0])
-        self.assertEqual(marker_patterns[0], marker_patterns[1])
-        marker_pattern = marker_patterns[0]
+        self.assertTrue(marker_patterns[1].startswith(marker_patterns[0][:-1] + "|"))
+        marker_pattern = marker_patterns[1]
 
         slug = "gha-123456789-1-aaaaaaaaaaaa"
         sha = "a" * 40
@@ -6071,6 +6071,85 @@ cleanup
                     result = run_outer_consumer(marker, status=1)
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertEqual(result.stdout, marker + "\n")
+                    self.assertNotIn("private", result.stdout + result.stderr)
+
+            candidate_markers = (
+                "RELEASE_DEPLOY schema=1 status=failed class=deployment "
+                "phase=candidate reason=activation_failed "
+                "candidate_diag_state=classified candidate_diag_reason=matched "
+                "candidate_class=artifact candidate_stage=artifact_validation "
+                "candidate_exit_status=1 "
+                f"release_slug={slug} source_sha={sha}",
+                "RELEASE_DEPLOY schema=1 status=failed class=deployment "
+                "phase=candidate reason=activation_failed "
+                "candidate_diag_state=unknown candidate_diag_reason=truncated "
+                "candidate_class=unknown candidate_stage=unknown "
+                "candidate_exit_status=255 "
+                f"release_slug={slug} source_sha={sha}",
+            )
+            for marker in candidate_markers:
+                with self.subTest(candidate_marker=marker):
+                    result = run_outer_consumer(marker, status=1)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, marker + "\n")
+                    self.assertNotIn("private", result.stdout + result.stderr)
+
+            zero_status = run_outer_consumer(candidate_markers[0], status=0)
+            self.assertEqual(zero_status.returncode, 1, zero_status.stderr)
+            self.assertEqual(
+                zero_status.stdout,
+                "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                "stage=marker_validation ssh_rc=0 reason=marker_missing_or_invalid "
+                f"stdout_bytes={len((candidate_markers[0] + chr(10)).encode())} stderr_bytes=24\n",
+            )
+            self.assertNotIn(candidate_markers[0], zero_status.stdout)
+            self.assertNotIn("private", zero_status.stdout + zero_status.stderr)
+
+            rejected_candidate_markers = (
+                candidate_markers[0].replace("candidate_exit_status=1 ", "", 1),
+                candidate_markers[0].replace("phase=candidate", "phase=readiness", 1),
+                candidate_markers[0].replace(
+                    "candidate_exit_status=1", "candidate_exit_status=0", 1
+                ),
+                candidate_markers[0].replace(
+                    "candidate_exit_status=1", "candidate_exit_status=256", 1
+                ),
+                candidate_markers[0].replace(
+                    "candidate_class=artifact", "candidate_class=invalid", 1
+                ),
+                candidate_markers[0].replace(
+                    "candidate_diag_reason=matched", "candidate_diag_reason=missing", 1
+                ),
+                candidate_markers[1].replace(
+                    "candidate_diag_reason=truncated", "candidate_diag_reason=matched", 1
+                ),
+                candidate_markers[1].replace(
+                    "candidate_class=unknown", "candidate_class=artifact", 1
+                ),
+                candidate_markers[1].replace(
+                    "candidate_stage=unknown", "candidate_stage=artifact_validation", 1
+                ),
+                candidate_markers[0].replace("status=failed", "status=passed", 1),
+                candidate_markers[0].replace(
+                    "release_slug=",
+                    "candidate_diag_state=classified candidate_diag_reason=matched "
+                    "candidate_class=artifact candidate_stage=artifact_validation "
+                    "candidate_exit_status=1 release_slug=",
+                    1,
+                ),
+                candidate_markers[0] + " extra=x",
+            )
+            for marker in rejected_candidate_markers:
+                with self.subTest(rejected_candidate_marker=marker):
+                    result = run_outer_consumer(marker, status=1)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(
+                        result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        "stage=remote_dispatch ssh_rc=1 reason=remote_failed_without_marker "
+                        f"stdout_bytes={len((marker + chr(10)).encode())} stderr_bytes=24\n",
+                    )
+                    self.assertNotIn(marker, result.stdout)
                     self.assertNotIn("private", result.stdout + result.stderr)
 
             for marker_class in ("preflight", "deployment"):

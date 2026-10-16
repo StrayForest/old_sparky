@@ -27,6 +27,16 @@ public_status() {
     "$status" "$class" "$PUBLIC_RELEASE_SLUG" "$PUBLIC_SOURCE_SHA"
 }
 
+recovery_check_failed() {
+  local check="$1"
+  case "$check" in
+    receipt_metadata|receipt_validate|capture_transaction|expected_receipt_current|verify_units|expected_unit_snapshot|unit_state|clear_receipt|receipt_absent)
+      printf 'RECOVERY_CHECK schema=1 status=failed check=%s\n' "$check" >&2
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --action)
@@ -973,12 +983,12 @@ PY
 if [[ -e "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE" ]]; then
   test -f "$SYSTEMD_STATE" && test ! -L "$SYSTEMD_STATE" \
     && test "$(stat -c '%u:%h:%a' "$SYSTEMD_STATE" 2>/dev/null)" = "0:1:600" \
-    || { public_status failed systemd_state >&2; exit 1; }
+    || { recovery_check_failed receipt_metadata; public_status failed systemd_state >&2; exit 1; }
   /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" validate \
     --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
     --transaction "$STATE" --helper-release "$original_current" \
     --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
-    || { public_status failed systemd_state >&2; exit 1; }
+    || { recovery_check_failed receipt_validate; public_status failed systemd_state >&2; exit 1; }
 else
   # Reject null/partial snapshots before capture can query systemctl or write
   # the durable receipt; the operation receipt remains retained on failure.
@@ -988,7 +998,7 @@ else
     --state "$SYSTEMD_STATE" --transaction "$STATE" --app-dir "$APP_DIR" \
     --helper-release "$original_current" --require-helper-manifest \
     --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
-    || { public_status failed systemd_state >&2; exit 1; }
+    || { recovery_check_failed capture_transaction; public_status failed systemd_state >&2; exit 1; }
 fi
 
 /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --retain --state "$STATE" \
@@ -1015,7 +1025,7 @@ if not isinstance(value, str):
     raise SystemExit(1)
 print(value)
 PY
-} 2>/dev/null)" || { public_status failed systemd_state >&2; exit 1; }
+} 2>/dev/null)" || { recovery_check_failed expected_receipt_current; public_status failed systemd_state >&2; exit 1; }
 test "$current_release" = "$expected_current" \
   || { public_status failed topology >&2; exit 1; }
 PUBLIC_RELEASE_SLUG="$(basename "$current_release")"
@@ -1049,7 +1059,7 @@ PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$RESTORE_TOOL" \
   --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
   --transaction "$STATE" --helper-release "$current_release" \
   --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
-  || { public_status failed systemd_state >&2; exit 1; }
+  || { recovery_check_failed verify_units; public_status failed systemd_state >&2; exit 1; }
 run_nginx_config_test || { public_status failed nginx >&2; exit 1; }
 for service in deadlock-api.service deadlock-worker.service deadlock-web.service; do
   expected_state="$({
@@ -1065,7 +1075,7 @@ for item in record["units"]:
 else:
     raise SystemExit(1)
 PY
-  } 2>/dev/null)"
+  } 2>/dev/null)" || { recovery_check_failed expected_unit_snapshot; public_status failed systemd_state >&2; exit 1; }
   case "$expected_state" in
     active|inactive)
       # ``systemctl is-active`` uses rc=0/active and rc=3/inactive.  Capture
@@ -1080,19 +1090,19 @@ PY
       fi
       case "$expected_state:$actual_status:$actual_state" in
         active:0:active|inactive:3:inactive) ;;
-        *) public_status failed systemd_state >&2; exit 1 ;;
+        *) recovery_check_failed unit_state; public_status failed systemd_state >&2; exit 1 ;;
       esac
       ;;
-    *) public_status failed systemd_state >&2; exit 1 ;;
+    *) recovery_check_failed unit_state; public_status failed systemd_state >&2; exit 1 ;;
   esac
 done
 /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" clear \
   --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
   --transaction "$STATE" --helper-release "$current_release" \
   --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
-  || { public_status failed systemd_state >&2; exit 1; }
+  || { recovery_check_failed clear_receipt; public_status failed systemd_state >&2; exit 1; }
 test ! -e "$SYSTEMD_STATE" && test ! -L "$SYSTEMD_STATE" \
-  || { public_status failed systemd_state >&2; exit 1; }
+  || { recovery_check_failed receipt_absent; public_status failed systemd_state >&2; exit 1; }
 /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery --state "$STATE" \
   >/dev/null 2>/dev/null \
   || { public_status failed transaction >&2; exit 1; }

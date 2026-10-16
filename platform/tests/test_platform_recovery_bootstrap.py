@@ -1353,6 +1353,52 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 if expected_status == 0:
                     self.assertEqual(result.stdout.strip(), candidate)
 
+    def test_recovery_failure_receiver_accepts_only_one_closed_systemd_check(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
+        ).read_text(encoding="utf-8")
+        block = "if (( remote_status != 0 )); then" + workflow.split(
+            "if (( remote_status != 0 )); then", 1
+        )[1].split("\n          fi\n          public_line=", 1)[0] + "\n          fi"
+        receiver = textwrap.dedent(block)
+        runtime = (
+            "RELEASE_RUNTIME schema=1 status=failed class=systemd_state "
+            "release_slug=release-a source_sha=" + "a" * 40 + "\n"
+        )
+        stage = "RECOVERY_STAGE schema=1 status=failed stage=quiesce_recovery\n"
+        cases = (
+            ("valid", stage + runtime + "RECOVERY_CHECK schema=1 status=failed check=capture_transaction\n", "check=capture_transaction"),
+            ("duplicate", stage + runtime + "RECOVERY_CHECK schema=1 status=failed check=capture_transaction\nRECOVERY_CHECK schema=1 status=failed check=unit_state\n", None),
+            ("unknown", stage + runtime + "RECOVERY_CHECK schema=1 status=failed check=arbitrary\n", None),
+            ("malformed", stage + runtime + "RECOVERY_CHECK schema=1 status=failed check=unit_state extra=raw\n", None),
+            ("unpaired", stage + "RECOVERY_CHECK schema=1 status=failed check=unit_state\n", None),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            error = Path(temporary) / "remote-error.log"
+            for label, contents, expected in cases:
+                with self.subTest(case=label):
+                    error.write_text(contents + "private-detail-do-not-print\n", encoding="ascii")
+                    command = "\n".join(
+                        (
+                            "set -euo pipefail",
+                            "remote_status=1",
+                            f"remote_error={shlex.quote(str(error))}",
+                            receiver,
+                        )
+                    )
+                    result = subprocess.run(
+                        ["bash", "-c", command], capture_output=True, text=True, check=False, timeout=3
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    failure = next(line for line in result.stdout.splitlines() if line.startswith("RECOVERY_FAILURE "))
+                    if expected is None:
+                        self.assertNotIn(" check=", failure)
+                    else:
+                        self.assertIn(expected, failure)
+                    self.assertNotIn("private-detail", result.stdout)
+                    self.assertNotIn("private-detail", result.stderr)
+                    self.assertIn("class=remote_or_transport", result.stdout)
+
     def test_legacy_v2_bridge_cleans_only_with_exact_no_systemd_state(self) -> None:
         if os.geteuid() != 0:
             self.skipTest("legacy recovery bridge contract requires root")

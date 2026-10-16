@@ -487,7 +487,7 @@ For an operation-ID v2 `install` receipt from a pre-managed-LiveQA release, reco
 Immutable recovery prepares old unit/Nginx files without reconcile and restores the recorded service/timer state.
 `legacy-services-restored` is written only after state checks and a bounded 30-second
 API/web readiness wait; retries recheck readiness before cleanup. Shared QA remains untouched.
-Child failures expose only fixed stage/status labels; use the bootstrap, never clear the receipt manually.
+On `quiesce_recovery/systemd_state` failure, a paired closed `RECOVERY_CHECK` label identifies the failed guard without helper stderr; retain the receipt and do not retry or clear it manually.
 
 The normal systemd installer uses the same crash discipline for retired unit
 cleanup: it persists an fsynced, root-owned file/digest/state record before
