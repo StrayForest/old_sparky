@@ -1231,6 +1231,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 "    log.write(json.dumps({'args': sys.argv[1:], 'body': body.decode('utf-8')}) + '\\n')\n"
                 "if sys.argv[-1] == 'bash -s':\n"
                 "    print(os.environ['FAKE_REMOTE_STAGE'])\n"
+                "elif 'capture_maintenance_failure' in sys.argv[-1] and os.environ.get('FAKE_CAPTURE_FAILURE') == '1':\n"
+                "    raise SystemExit(23)\n"
                 "elif not sys.argv[-1].startswith('bash -s -- '):\n"
                 "    raise SystemExit(41)\n",
                 encoding="utf-8",
@@ -1448,11 +1450,80 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             self.assertIn("status=encrypted", result.stdout)
             self.assertNotIn("private-capture-evidence", result.stdout)
             self.assertNotIn(evidence_sha256, result.stdout)
-            self.assertFalse(github_output.exists())
+            self.assertEqual(
+                set(github_output.read_text(encoding="ascii").splitlines()),
+                {"encrypted_artifact_ready=true", "capture_remote_status=0"},
+            )
+            diagnostic = {
+                "schema": 1,
+                "kind": "maintenance_failure_diagnostic",
+                "source_sha": "a" * 40,
+                "bundle_sha256": "b" * 64,
+                "capture_run_id": "56789",
+                "capture_run_attempt": "1",
+                "security_run_id": "12345",
+                "security_run_attempt": "1",
+                "captured_at_utc": "2026-10-16T00:00:00Z",
+                "stage": "transaction_context",
+                "error_code": "receipt_binding_mismatch",
+            }
+            evidence_fixture.write_text(json.dumps(diagnostic), encoding="ascii")
+            diagnostic_path = root / "diagnostic.json"
+            diagnostic_dir = root / "diagnostic-artifact"
+            diagnostic_output = root / "diagnostic-github-output"
+            shutil.copyfile(certificate_path, action_certificate)
+            action_certificate.chmod(0o600)
+            failed = subprocess.run(
+                ["bash", "-c", action_script],
+                env={
+                    **environment,
+                    "CAPTURE_EVIDENCE_PATH": str(diagnostic_path),
+                    "CAPTURE_CIPHERTEXT_DIR": str(diagnostic_dir),
+                    "GITHUB_OUTPUT": str(diagnostic_output),
+                    "FAKE_CAPTURE_FAILURE": "1",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertTrue(diagnostic_dir.exists(), failed.stdout + failed.stderr)
+            self.assertEqual(
+                set(diagnostic_output.read_text(encoding="ascii").splitlines()),
+                {"encrypted_artifact_ready=true", "capture_remote_status=23"},
+            )
+            self.assertTrue((diagnostic_dir / "evidence.cms").is_file())
+            self.assertFalse(diagnostic_path.exists())
+            diagnostic_archive = private_dir / "diagnostic-capture.zip"
+            with zipfile.ZipFile(diagnostic_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", (diagnostic_dir / "manifest.json").read_bytes())
+                archive.writestr("evidence.cms", (diagnostic_dir / "evidence.cms").read_bytes())
+            diagnostic_archive.chmod(0o600)
+            diagnostic_binding = dict(binding)
+            diagnostic_binding["artifact_digest"] = f"sha256:{hashlib.sha256(diagnostic_archive.read_bytes()).hexdigest()}"
+            diagnostic_binding_path = private_dir / "diagnostic-binding.json"
+            diagnostic_binding_path.write_text(json.dumps(diagnostic_binding), encoding="ascii")
+            diagnostic_binding_path.chmod(0o600)
+            decrypted_diagnostic = private_dir / "decrypted-diagnostic.json"
+            with mock.patch.object(
+                maintenance_decrypt,
+                "RECIPIENT_CERTIFICATE_SHA256",
+                certificate_fingerprint,
+            ):
+                maintenance_decrypt.decrypt_capture(
+                    artifact_archive=diagnostic_archive,
+                    binding_json=diagnostic_binding_path,
+                    private_key=local_key,
+                    certificate=local_certificate,
+                    destination=decrypted_diagnostic,
+                    git_dir=git_dir,
+                )
+            self.assertEqual(json.loads(decrypted_diagnostic.read_text(encoding="ascii")), diagnostic)
             ssh_calls = [
                 json.loads(line) for line in ssh_log.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(ssh_calls), 4)
+            self.assertEqual(len(ssh_calls), 8)
             self.assertTrue(all(call["body"] for call in ssh_calls))
             self.assertEqual(ssh_calls[0]["args"][-1], "bash -s")
             self.assertEqual(
@@ -1484,14 +1555,14 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             scp_calls = [
                 json.loads(line) for line in scp_log.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(scp_calls), 2)
+            self.assertEqual(len(scp_calls), 4)
             self.assertEqual(scp_calls[0]["source"], environment["BUNDLE"])
             self.assertEqual(
                 scp_calls[0]["destination"],
                 "runner@host.invalid:/tmp/oldsparky-recovery-bootstrap.ABC123/bundle.zip",
             )
-            self.assertEqual(scp_calls[-1]["source"], environment["FAKE_CAPTURE_SOURCE"])
-            self.assertEqual(scp_calls[-1]["destination"], str(evidence_path))
+            self.assertEqual(scp_calls[1]["source"], environment["FAKE_CAPTURE_SOURCE"])
+            self.assertEqual(scp_calls[1]["destination"], str(evidence_path))
         self.assertIn("retention-days: 1", workflow)
         self.assertIn('size_in_bytes"] <= 1024 * 1024', workflow)
         self.assertIn('os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW', workflow)
@@ -4287,7 +4358,7 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
                 return properties
             with (
                 mock.patch.object(maintenance_evidence, "_pointer", side_effect=("current-a", "previous-b")),
-                mock.patch.object(maintenance_evidence, "_read_receipt", side_effect=(({"operation_id": "a" * 32, "operation": "install", "phase": "capture"}, "b" * 64), ({"operation_id": "a" * 32}, "c" * 64))),
+                mock.patch.object(maintenance_evidence, "_read_receipt", side_effect=(({"operation_id": "a" * 32, "operation": "install", "phase": "capture"}, "b" * 64), (None, None))),
                 mock.patch.object(maintenance_evidence, "_validate_transaction_context", return_value="d" * 40),
                 mock.patch.object(maintenance_evidence, "_systemd_properties", side_effect=capture_properties),
                 mock.patch.object(maintenance_evidence, "_queued_jobs", return_value=[{"unit": "other.service", "job_type": "start", "job_state": "waiting"}]),
@@ -4315,38 +4386,102 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
             self.assertEqual(evidence["timer"]["UnitFileState"], "enabled")
             self.assertEqual(evidence["queued_jobs"][0]["unit"], "other.service")
             self.assertEqual(evidence["cgroup_pids"], [4321])
+            self.assertIsNone(evidence["receipts"]["systemd_sha256"])
+            self.assertFalse(evidence["receipts"]["companion_present"])
+            self.assertEqual(evidence["receipts"]["candidate_source_sha"], "d" * 40)
             printed.assert_not_called()
+            generated_diagnostic = root / "generated-diagnostic.json"
+            error_output = io.StringIO()
+            with (
+                mock.patch.object(maintenance_evidence, "_durable_evidence_path", return_value=generated_diagnostic),
+                mock.patch.object(maintenance_evidence, "capture", side_effect=maintenance_evidence.EvidenceError("release transaction receipt schema is invalid")),
+                mock.patch("sys.stderr", error_output),
+            ):
+                exit_code = maintenance_evidence.main([
+                    "capture_maintenance_failure", "--app-dir", str(app),
+                    "--source-sha", "a" * 40, "--bundle-sha", "b" * 64,
+                    "--capture-run-id", "12345", "--capture-run-attempt", "1",
+                    "--security-run-id", "12340", "--security-run-attempt", "2",
+                ])
+            self.assertEqual(exit_code, 1)
+            generated = json.loads(generated_diagnostic.read_text(encoding="ascii"))
+            self.assertEqual(generated["kind"], "maintenance_failure_diagnostic")
+            self.assertEqual(generated["stage"], "transaction_receipt")
+            self.assertEqual(generated["error_code"], "receipt_invalid")
+            self.assertNotIn("schema is invalid", error_output.getvalue())
+            diagnostic_path = output.with_name("diagnostic.json")
+            diagnostic_path.write_text(json.dumps({
+                "schema": 1,
+                "kind": "maintenance_failure_diagnostic",
+                "source_sha": "a" * 40,
+                "bundle_sha256": "b" * 64,
+                "capture_run_id": "12345",
+                "capture_run_attempt": "1",
+                "security_run_id": "12340",
+                "security_run_attempt": "2",
+                "captured_at_utc": "2026-10-16T00:00:00Z",
+                "stage": "transaction_context",
+                "error_code": "receipt_binding_mismatch",
+            }), encoding="ascii")
+            diagnostic_path.chmod(0o600)
+            with self.assertRaises(maintenance_evidence.EvidenceError):
+                maintenance_evidence._validate_evidence(
+                    diagnostic_path, hashlib.sha256(diagnostic_path.read_bytes()).hexdigest(),
+                    source_sha="a" * 40, bundle_sha="b" * 64,
+                    capture_run_id="12345", capture_run_attempt="1",
+                    security_run_id="12340", security_run_attempt="2",
+                )
             releases = app / "releases"
             current, previous, candidate = (releases / name for name in ("current-a", "previous-b", "candidate-c"))
             current.mkdir(parents=True)
             previous.mkdir()
             candidate.mkdir()
+            (candidate / "RELEASE.json").write_text(
+                json.dumps({"source_git_commit": "d" * 40}) + "\n", encoding="ascii",
+            )
+            (candidate / "RELEASE.json").chmod(0o444)
+            os.chmod(app, 0o755)
+            os.chmod(releases, 0o755)
+            os.chmod(app / "shared", 0o755)
             def identity(path: Path) -> dict[str, object]:
-                return {"slug": path.name, "dev": 1, "ino": 2, "source_sha": "d" * 40}
+                metadata = path.stat()
+                return {"dev": metadata.st_dev, "ino": metadata.st_ino}
             operation = {
                 "operation_id": "a" * 32, "version": 2, "operation": "install", "phase": "recovery-restored",
                 "app_dir": str(app), "current_before": str(current), "previous_before": str(previous),
                 "candidate_release": str(candidate), "shared_venv": str(app / "shared/venv"),
-                "peer": str(app / "shared/peer"), "snapshot": str(candidate / ".rollback/shared-venv-before-install"),
+                "peer": str(app / "shared/.venv-install-candidate-c.test"), "snapshot": str(candidate / ".rollback/shared-venv-before-install"),
                 "transition": "none", "shared_before": None, "peer_before": None,
                 "current_before_identity": identity(current), "previous_before_identity": identity(previous),
                 "candidate_identity": identity(candidate), "remove_env_on_recovery": False,
-                "service_state_before": None, "service_enabled_before": None, "quiesced_services": None,
-                "timer_active_before": False, "timer_enabled_before": "disabled", "systemd_state_before": {},
+                "service_state_before": {"deadlock-api": "active", "deadlock-worker": "inactive", "deadlock-web": "active"},
+                "service_enabled_before": {"deadlock-api": "enabled", "deadlock-worker": "disabled", "deadlock-web": "enabled"},
+                "quiesced_services": ["deadlock-api", "deadlock-worker", "deadlock-web"],
+                "timer_active_before": True, "timer_enabled_before": "enabled", "systemd_state_before": None,
                 "profile_access_cache_purge_proof": None,
-            }
-            systemd = {
-                "schema": 1, "operation": "install", "operation_id": "a" * 32, "app_dir": str(app),
-                "current_before": str(current), "previous_before": str(previous),
-                "current_before_identity": identity(current), "previous_before_identity": identity(previous),
-                "helper_digests": {}, "units": [],
             }
             self.assertEqual(
                 maintenance_evidence._validate_transaction_context(
-                    app, "current-a", "previous-b", operation, systemd,
-                ),
-                "d" * 40,
+                    app, "current-a", "previous-b", operation, None,
+                ), "d" * 40,
             )
+            companion = {
+                "schema": 1, "operation": "rollback", "operation_id": "a" * 32,
+                "app_dir": str(app), "current_before": str(current),
+                "previous_before": str(previous),
+                "current_before_identity": identity(current),
+                "previous_before_identity": identity(previous),
+                "helper_digests": {}, "units": [],
+            }
+            with mock.patch.dict(
+                maintenance_evidence._SYSTEMD_RECEIPT_VALIDATOR,
+                {"_read_receipt": lambda _path: companion},
+            ):
+                self.assertEqual(
+                    maintenance_evidence._validate_transaction_context(
+                        app, "current-a", "previous-b", operation, companion,
+                    ), "d" * 40,
+                )
             for mutation in ("phase", "pointers"):
                 with self.subTest(receipt_case=mutation):
                     changed = dict(operation)
@@ -4357,7 +4492,7 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
                         pointer_current = "candidate-c"
                     with self.assertRaises(maintenance_evidence.EvidenceError):
                         maintenance_evidence._validate_transaction_context(
-                            app, pointer_current, "previous-b", changed, systemd,
+                            app, pointer_current, "previous-b", changed, None,
                         )
         journal_row = json.dumps({
             "__REALTIME_TIMESTAMP": "1791763200000000",
@@ -4407,9 +4542,10 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
             app.mkdir()
             evidence = self._evidence_path(app)
             with (
-                mock.patch.object(maintenance_evidence, "_validate_evidence", return_value={"pointers": {"current": "current-a", "previous": "previous-b"}, "receipts": {"operation_sha256": "b" * 64, "systemd_sha256": "c" * 64}, "unit": self._properties(maintenance_evidence.UNIT), "timer": self._properties(maintenance_evidence.TIMER)}),
+                mock.patch.object(maintenance_evidence, "_validate_evidence", return_value={"pointers": {"current": "current-a", "previous": "previous-b"}, "receipts": {"operation_sha256": "b" * 64, "systemd_sha256": None, "companion_present": False, "candidate_source_sha": "d" * 40}, "unit": self._properties(maintenance_evidence.UNIT), "timer": self._properties(maintenance_evidence.TIMER)}),
                 mock.patch.object(maintenance_evidence, "_pointer", side_effect=("current-a", "previous-b")),
-                mock.patch.object(maintenance_evidence, "_read_receipt", side_effect=(({}, "b" * 64), ({}, "c" * 64))),
+                mock.patch.object(maintenance_evidence, "_read_receipt", side_effect=(({}, "b" * 64), (None, None))),
+                mock.patch.object(maintenance_evidence, "_validate_transaction_context", return_value="d" * 40),
                 mock.patch.object(maintenance_evidence, "_systemd_properties", side_effect=self._properties),
                 mock.patch.object(maintenance_evidence, "_queued_jobs", return_value=[]),
                 mock.patch.object(maintenance_evidence, "_cgroup_members", return_value=[]),
@@ -4451,9 +4587,10 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
                     elif mutation == "unit-tuple-drift":
                         current_unit["ExecMainStatus"] = "18"
                     with (
-                        mock.patch.object(maintenance_evidence, "_validate_evidence", return_value={"pointers": {"current": "current-a", "previous": "previous-b"}, "receipts": {"operation_sha256": receipt_operation_sha, "systemd_sha256": "c" * 64}, "unit": evidence_unit, "timer": evidence_timer}),
+                        mock.patch.object(maintenance_evidence, "_validate_evidence", return_value={"pointers": {"current": "current-a", "previous": "previous-b"}, "receipts": {"operation_sha256": receipt_operation_sha, "systemd_sha256": None, "companion_present": False, "candidate_source_sha": "d" * 40}, "unit": evidence_unit, "timer": evidence_timer}),
                         mock.patch.object(maintenance_evidence, "_pointer", side_effect=("current-a", "previous-b")),
-                        mock.patch.object(maintenance_evidence, "_read_receipt", side_effect=(({}, "d" * 64), ({}, "c" * 64)) if mutation == "receipt" else (({}, receipt_operation_sha), ({}, "c" * 64))),
+                        mock.patch.object(maintenance_evidence, "_read_receipt", side_effect=(({}, "d" * 64), (None, None)) if mutation == "receipt" else (({}, receipt_operation_sha), (None, None))),
+                        mock.patch.object(maintenance_evidence, "_validate_transaction_context", return_value="d" * 40),
                         mock.patch.object(maintenance_evidence, "_systemd_properties", side_effect=lambda unit: current_unit if unit == maintenance_evidence.UNIT else current_timer),
                         mock.patch.object(maintenance_evidence, "_queued_jobs", return_value=[]),
                         mock.patch.object(maintenance_evidence, "_cgroup_members", return_value=[]),

@@ -761,7 +761,7 @@ jobs:
               return value
           manifest = json.loads(manifest_raw.decode("ascii"), object_pairs_hook=unique_object)
           required = {"schema", "kind", "repository", "workflow_path", "capture_run_id", "capture_run_attempt", "source_sha", "bundle_sha256", "security_run_id", "security_run_attempt", "recovery_run_id", "recovery_run_attempt", "publisher_run_id", "publisher_run_attempt", "recipient_certificate_sha256", "encryption", "ciphertext_sha256", "ciphertext_size"}
-          if (set(manifest) != required or manifest.get("schema") != 1 or manifest.get("kind") != "encrypted_maintenance_failure_evidence"
+          if (set(manifest) != required or manifest.get("schema") != 1 or manifest.get("kind") != "encrypted_maintenance_failure_report"
               or manifest.get("repository") != "StrayForest/old_sparky" or manifest.get("workflow_path") != ".github/workflows/platform-production-recovery-bootstrap-abort.yml"
               or manifest.get("capture_run_id") != capture_id or manifest.get("capture_run_attempt") != capture_attempt
               or manifest.get("source_sha") != source_sha or manifest.get("bundle_sha256") != bundle_sha
@@ -966,6 +966,7 @@ jobs:
           PY
           REMOTE
           timeout --foreground 300s scp -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$BUNDLE" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_bundle"
+          set +e
           timeout --foreground 300s ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$ROUTE_DIGEST' '$ACTION' '$EVIDENCE_SHA256' '$CAPTURE_RUN_ID' '$CAPTURE_RUN_ATTEMPT' '$ACTION_RUN_ID' '$ACTION_RUN_ATTEMPT' '$ACTION_CONFIRMATION'" <<'REMOTE'
           set -Eeuo pipefail
           umask 077
@@ -1184,6 +1185,11 @@ jobs:
             "$payload/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$generation/platform_maintenance_failure_evidence.py" reset_maintenance_failed --app-dir "$app_dir" --source-sha "$source_sha" --bundle-sha "$expected_sha" --evidence-sha256 "$evidence_sha" --capture-run-id "$capture_run_id" --capture-run-attempt "$capture_run_attempt" --security-run-id "$security_run_id" --security-run-attempt "$security_run_attempt"
           fi
           REMOTE
+          capture_remote_status="$?"
+          set -e
+          if [[ "$ACTION" != capture_maintenance_failure && "$capture_remote_status" -ne 0 ]]; then
+            exit "$capture_remote_status"
+          fi
           if [[ "$ACTION" == capture_maintenance_failure ]]; then
             /usr/bin/python3 -I -B - "$CAPTURE_EVIDENCE_PATH" <<'PY'
           import os, sys
@@ -1223,7 +1229,7 @@ jobs:
               raise SystemExit("maintenance capture recipient pin is invalid")
           payload = {
               "schema": 1,
-              "kind": "encrypted_maintenance_failure_evidence",
+              "kind": "encrypted_maintenance_failure_report",
               "repository": "StrayForest/old_sparky",
               "workflow_path": ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
               "capture_run_id": env["ACTION_RUN_ID"],
@@ -1241,7 +1247,10 @@ jobs:
               "ciphertext_sha256": ciphertext_sha,
               "ciphertext_size": int(ciphertext_size),
           }
-          if (not re.fullmatch(r"[0-9a-f]{40,64}", payload["source_sha"])
+          plaintext = json.loads(Path(os.environ["CAPTURE_EVIDENCE_PATH"]).read_text(encoding="ascii"))
+          if (not isinstance(plaintext, dict)
+              or plaintext.get("kind") not in {"maintenance_failure_evidence", "maintenance_failure_diagnostic"}
+              or not re.fullmatch(r"[0-9a-f]{40,64}", payload["source_sha"])
               or not re.fullmatch(r"[0-9a-f]{64}", payload["bundle_sha256"])
               or not re.fullmatch(r"[0-9a-f]{64}", ciphertext_sha)
               or not 1 <= payload["ciphertext_size"] <= 384 * 1024):
@@ -1252,13 +1261,17 @@ jobs:
               stream.write(raw); stream.flush(); os.fsync(stream.fileno())
           PY
             test "$plaintext_size" -le 262144 && test "$ciphertext_size" -le 393216
+            printf 'encrypted_artifact_ready=true\ncapture_remote_status=%s\n' "$capture_remote_status" >> "$GITHUB_OUTPUT"
             rm -f -- "$CAPTURE_EVIDENCE_PATH" "$RECIPIENT_CERT_PATH" "$RUNNER_TEMP/platform-maintenance-recipient-public.pem" "$RUNNER_TEMP/platform-cms-capability.der"
             test ! -e "$CAPTURE_EVIDENCE_PATH" && test ! -e "$RECIPIENT_CERT_PATH"
             printf 'MAINTENANCE_EVIDENCE status=encrypted ciphertext_sha256=%s recipient_certificate_sha256=%s\n' "$ciphertext_sha256" "$RECIPIENT_CERTIFICATE_FINGERPRINT"
+            if (( capture_remote_status != 0 )); then
+              exit "$capture_remote_status"
+            fi
           fi
 
       - name: Validate ciphertext-only capture artifact staging
-        if: ${{ inputs.action == 'capture_maintenance_failure' && success() }}
+        if: ${{ always() && inputs.action == 'capture_maintenance_failure' && steps.maintenance_action.outputs.encrypted_artifact_ready == 'true' }}
         shell: bash
         env:
           CAPTURE_EVIDENCE_PATH: ${{ runner.temp }}/platform-maintenance-evidence.json
@@ -1274,7 +1287,7 @@ jobs:
           test "$(stat -c %a "$CAPTURE_CIPHERTEXT_DIR/manifest.json")" = 600
 
       - name: Upload encrypted maintenance failure evidence
-        if: ${{ inputs.action == 'capture_maintenance_failure' && success() }}
+        if: ${{ always() && inputs.action == 'capture_maintenance_failure' && steps.maintenance_action.outputs.encrypted_artifact_ready == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-maintenance-failure-${{ github.run_id }}-${{ github.run_attempt }}

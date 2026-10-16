@@ -41,6 +41,22 @@ EVIDENCE_KEYS = {
     "host_id_sha256", "captured_at_utc", "app_dir", "pointers", "receipts",
     "unit", "timer", "queued_jobs", "cgroup_pids", "journal",
 }
+DIAGNOSTIC_KEYS = {
+    "schema", "kind", "source_sha", "bundle_sha256", "capture_run_id",
+    "capture_run_attempt", "security_run_id", "security_run_attempt",
+    "captured_at_utc", "stage", "error_code",
+}
+DIAGNOSTIC_STAGES = {
+    "transaction_receipt", "transaction_context", "host_identity",
+    "systemd_properties", "systemd_jobs", "cgroup", "journal",
+    "evidence_write", "capture_guard",
+}
+DIAGNOSTIC_CODES = {
+    "receipt_invalid", "receipt_binding_mismatch", "host_identity_unavailable",
+    "unit_properties_unavailable", "jobs_unavailable_or_malformed",
+    "cgroup_unavailable_or_malformed", "journal_unavailable_or_malformed",
+    "evidence_destination_invalid", "capture_guard_failed",
+}
 RUN_ID = re.compile(r"^[1-9][0-9]{0,31}$")
 SOURCE_SHA = re.compile(r"^[0-9a-f]{40,64}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -174,7 +190,7 @@ def decrypt_capture(
     if (
         set(manifest) != MANIFEST_KEYS
         or manifest.get("schema") != 1
-        or manifest.get("kind") != "encrypted_maintenance_failure_evidence"
+        or manifest.get("kind") != "encrypted_maintenance_failure_report"
         or manifest.get("repository") != "StrayForest/old_sparky"
         or manifest.get("workflow_path") != ".github/workflows/platform-production-recovery-bootstrap-abort.yml"
         or manifest.get("capture_run_id") != capture_run_id
@@ -279,17 +295,30 @@ def decrypt_capture(
             evidence = json.loads(raw.decode("ascii"), object_pairs_hook=_unique_object)
         except (UnicodeDecodeError, json.JSONDecodeError, DecryptError) as exc:
             raise DecryptError("decrypted evidence JSON is invalid") from exc
-        if (
-            not isinstance(evidence, dict)
-            or set(evidence) != EVIDENCE_KEYS
-            or evidence.get("schema") != 1
-            or evidence.get("kind") != "maintenance_failure_evidence"
-            or evidence.get("source_sha") != binding["source_sha"]
-            or evidence.get("bundle_sha256") != binding["bundle_sha256"]
-            or evidence.get("capture_run_id") != binding["capture_run_id"]
-            or evidence.get("capture_run_attempt") != binding["capture_run_attempt"]
-            or evidence.get("security_run_id") != binding["security_run_id"]
-            or evidence.get("security_run_attempt") != binding["security_run_attempt"]
+        common_binding = (
+            isinstance(evidence, dict)
+            and evidence.get("schema") == 1
+            and evidence.get("source_sha") == binding["source_sha"]
+            and evidence.get("bundle_sha256") == binding["bundle_sha256"]
+            and evidence.get("capture_run_id") == binding["capture_run_id"]
+            and evidence.get("capture_run_attempt") == binding["capture_run_attempt"]
+            and evidence.get("security_run_id") == binding["security_run_id"]
+            and evidence.get("security_run_attempt") == binding["security_run_attempt"]
+        )
+        evidence_kind = isinstance(evidence, dict) and evidence.get("kind") == "maintenance_failure_evidence"
+        diagnostic_kind = isinstance(evidence, dict) and evidence.get("kind") == "maintenance_failure_diagnostic"
+        diagnostic_valid = (
+            diagnostic_kind
+            and set(evidence) == DIAGNOSTIC_KEYS
+            and isinstance(evidence.get("captured_at_utc"), str)
+            and isinstance(evidence.get("stage"), str)
+            and evidence["stage"] in DIAGNOSTIC_STAGES
+            and isinstance(evidence.get("error_code"), str)
+            and evidence["error_code"] in DIAGNOSTIC_CODES
+        )
+        if not common_binding or not (
+            (evidence_kind and set(evidence) == EVIDENCE_KEYS)
+            or diagnostic_valid
         ):
             raise DecryptError("decrypted evidence source/run binding is invalid")
         output_descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)

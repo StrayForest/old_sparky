@@ -34,13 +34,28 @@ tuple, bundle digest, transaction receipts and host identity. This host copy
 is retained for reset and cause review; staging cleanup removes only the
 temporary transfer directory.
 
+The operation receipt is validated by the canonical release-transaction
+validator. In `recovery-restored`, its `systemd_state_before: null` permits the
+systemd companion receipt to be absent; evidence records that absence with a
+null companion digest and reset rechecks the same receipt presence and hash.
+When present, the companion is validated by its canonical reader and bound by
+operation ID, application path, pointers and identities. Its `operation` field
+is not compared to the operation receipt because the canonical writer uses
+`rollback` for the systemd-state receipt.
+
 The runner holds plaintext only in a private temporary file long enough to
 encrypt it. It uploads exactly two members: DER CMS ciphertext and a closed
-manifest with the source/run provenance, recipient certificate fingerprint,
-ciphertext SHA-256 digest and size, and algorithm profile. The public manifest,
-Actions output and logs contain no plaintext digest or size. No raw journal or
-plaintext JSON is printed or uploaded. The public artifact expires after one
-day. CMS encryption does not authenticate the sender; trust comes from the
+`encrypted_maintenance_failure_report` manifest with the source/run provenance,
+recipient certificate fingerprint, ciphertext SHA-256 digest and size, and
+algorithm profile. The encrypted plaintext is either the full
+`maintenance_failure_evidence` document or a closed
+`maintenance_failure_diagnostic` containing only source/run bindings, a fixed
+stage and fixed error code. When a guard fails after the bound host output path
+is established, the workflow encrypts and uploads that diagnostic, then still
+finishes with a failed Action conclusion. The public manifest, Actions output
+and logs contain no plaintext digest or size. No raw journal or plaintext JSON
+is printed or uploaded. The public artifact expires after one day. CMS
+encryption does not authenticate the sender; trust comes from the
 exact-source Actions run, the previously verified signed recovery
 producer/publisher chain, and the independently verified GitHub artifact
 metadata.
@@ -62,11 +77,13 @@ in a closed JSON file created under the protected `.git` evidence directory
 with mode `0600`. The local decrypt tool accepts the original archive and this
 independent binding file; it verifies the archive digest, exact two-member ZIP,
 closed manifest and every manifest field against the binding before CMS
-decryption. It then checks the authenticated plaintext schema and source/run
-binding, writes a new mode-`0600` no-replace file under `.git`, and reports the
-plaintext digest and size locally. The plaintext digest is therefore available
-for the later guarded reset input without publishing it in the artifact or
-Actions logs. The local plaintext is the durable cause-review copy. Runner
+decryption. It then checks the closed plaintext schema and source/run binding,
+writes a new mode-`0600` no-replace file under `.git`, and reports the
+plaintext digest and size locally. A diagnostic supports cause review only:
+the reset validator accepts only `maintenance_failure_evidence` with its full
+unit and transaction tuple. The plaintext digest is therefore available for
+the later guarded reset input without publishing it in the artifact or Actions
+logs. The local plaintext is the durable cause-review copy. Runner
 temporary plaintext, certificate, SSH material and staging files are removed
 on every exit path.
 

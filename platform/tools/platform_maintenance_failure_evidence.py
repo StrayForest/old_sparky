@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import stat
 import subprocess
 import sys
@@ -40,6 +41,65 @@ BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 
 class EvidenceError(ValueError):
     """A closed, non-sensitive evidence operation failure."""
+
+
+_TRANSACTION_VALIDATOR = runpy.run_path(
+    str(Path(__file__).resolve().with_name("platform_release_transaction.py"))
+)
+_SYSTEMD_RECEIPT_VALIDATOR = runpy.run_path(
+    str(Path(__file__).resolve().with_name("platform_release_systemd_state.py"))
+)
+
+
+DIAGNOSTIC_CODES = {
+    "transaction_receipt": "receipt_invalid",
+    "transaction_context": "receipt_binding_mismatch",
+    "host_identity": "host_identity_unavailable",
+    "systemd_properties": "unit_properties_unavailable",
+    "systemd_jobs": "jobs_unavailable_or_malformed",
+    "cgroup": "cgroup_unavailable_or_malformed",
+    "journal": "journal_unavailable_or_malformed",
+    "evidence_write": "evidence_destination_invalid",
+    "capture_guard": "capture_guard_failed",
+}
+
+
+def _diagnostic_class(error: BaseException) -> tuple[str, str]:
+    message = str(error)
+    if message.startswith("release operation receipt") or message.startswith("release transaction receipt"):
+        return "transaction_receipt", DIAGNOSTIC_CODES["transaction_receipt"]
+    if message.startswith("release transaction") or message.startswith("release pointer"):
+        return "transaction_context", DIAGNOSTIC_CODES["transaction_context"]
+    if message.startswith("production host"):
+        return "host_identity", DIAGNOSTIC_CODES["host_identity"]
+    if message.startswith("systemd properties"):
+        return "systemd_properties", DIAGNOSTIC_CODES["systemd_properties"]
+    if message.startswith("systemd jobs"):
+        return "systemd_jobs", DIAGNOSTIC_CODES["systemd_jobs"]
+    if message.startswith("maintenance cgroup"):
+        return "cgroup", DIAGNOSTIC_CODES["cgroup"]
+    if message.startswith("maintenance journal"):
+        return "journal", DIAGNOSTIC_CODES["journal"]
+    if message.startswith("maintenance evidence"):
+        return "evidence_write", DIAGNOSTIC_CODES["evidence_write"]
+    return "capture_guard", DIAGNOSTIC_CODES["capture_guard"]
+
+
+def _diagnostic_payload(args: argparse.Namespace, error: BaseException) -> dict[str, Any]:
+    stage, code = _diagnostic_class(error)
+    return {
+        "schema": 1,
+        "kind": "maintenance_failure_diagnostic",
+        "source_sha": args.source_sha,
+        "bundle_sha256": args.bundle_sha,
+        "capture_run_id": args.capture_run_id,
+        "capture_run_attempt": args.capture_run_attempt,
+        "security_run_id": args.security_run_id,
+        "security_run_attempt": args.security_run_attempt,
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "stage": stage,
+        "error_code": code,
+    }
 
 
 def _run(argv: list[str], *, maximum: int = MAX_JOURNAL_BYTES) -> subprocess.CompletedProcess[bytes]:
@@ -194,77 +254,59 @@ def _queued_jobs() -> list[dict[str, str]]:
 def _validate_transaction_context(
     app_dir: Path, current: str | None, previous: str | None,
     operation: dict[str, Any] | None, systemd: dict[str, Any] | None,
-) -> str:
-    if operation is None or systemd is None:
-        raise EvidenceError("release transaction receipts are required")
-    operation_keys = {
-        "operation_id", "version", "operation", "phase", "app_dir", "current_before",
-        "previous_before", "candidate_release", "shared_venv", "peer", "snapshot",
-        "transition", "shared_before", "peer_before", "current_before_identity",
-        "previous_before_identity", "candidate_identity", "remove_env_on_recovery",
-        "service_state_before", "service_enabled_before", "quiesced_services",
-        "timer_active_before", "timer_enabled_before", "systemd_state_before",
-        "profile_access_cache_purge_proof",
-    }
-    systemd_keys = {
-        "schema", "operation", "operation_id", "app_dir", "current_before",
-        "previous_before", "current_before_identity", "previous_before_identity",
-        "helper_digests", "units",
-    }
-    identity_keys = {"slug", "dev", "ino", "source_sha"}
-    slug = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
-    def valid_identity(value: Any, expected_slug: str | None) -> bool:
-        return (
-            isinstance(value, dict) and set(value) == identity_keys
-            and isinstance(value.get("slug"), str) and slug.fullmatch(value["slug"]) is not None
-            and (expected_slug is None or value["slug"] == expected_slug)
-            and type(value.get("dev")) is int and value["dev"] >= 0
-            and type(value.get("ino")) is int and value["ino"] > 0
-            and isinstance(value.get("source_sha"), str)
-            and re.fullmatch(r"[0-9a-f]{40}", value["source_sha"]) is not None
+) -> str | None:
+    if operation is None:
+        raise EvidenceError("release operation receipt is required")
+    try:
+        operation = _TRANSACTION_VALIDATOR["_validate_record"](
+            app_dir / "shared/.release-operation.json", operation,
         )
-    def release_name(value: Any, *, nullable: bool) -> str | None:
-        if value is None and nullable:
-            return None
-        if not isinstance(value, str):
-            raise EvidenceError("release transaction pointer is invalid")
-        path = Path(value)
-        if not path.is_absolute() or path.parent != app_dir / "releases" or slug.fullmatch(path.name) is None:
-            raise EvidenceError("release transaction path is invalid")
-        return path.name
-
+    except Exception as exc:
+        raise EvidenceError("release transaction receipt schema is invalid") from exc
+    companion_present = systemd is not None
     if (
-        set(operation) != operation_keys
-        or set(systemd) != systemd_keys
-        or operation.get("version") != 2
+        operation.get("version") != 2
         or operation.get("phase") != "recovery-restored"
         or operation.get("operation") not in {"install", "rollback"}
-        or not isinstance(operation.get("operation_id"), str)
-        or re.fullmatch(r"[0-9a-f]{32}", operation["operation_id"]) is None
         or operation.get("app_dir") != str(app_dir)
-        or systemd.get("schema") != 1
-        or systemd.get("operation") != operation.get("operation")
-        or systemd.get("operation_id") != operation.get("operation_id")
-        or systemd.get("app_dir") != str(app_dir)
+        or (not companion_present and operation.get("systemd_state_before") is not None)
     ):
         raise EvidenceError("release transaction receipt schema is not the expected restored state")
-    current_before = release_name(operation.get("current_before"), nullable=True)
-    previous_before = release_name(operation.get("previous_before"), nullable=True)
-    candidate = release_name(operation.get("candidate_release"), nullable=False)
+    current_before = Path(operation["current_before"]).name if operation.get("current_before") else None
+    previous_before = Path(operation["previous_before"]).name if operation.get("previous_before") else None
+    candidate_path = Path(operation["candidate_release"])
     if (
         current != current_before or previous != previous_before
-        or systemd.get("current_before") != operation.get("current_before")
-        or systemd.get("previous_before") != operation.get("previous_before")
-        or systemd.get("current_before_identity") != operation.get("current_before_identity")
-        or systemd.get("previous_before_identity") != operation.get("previous_before_identity")
-        or (operation["operation"] == "rollback" and candidate != current_before)
-        or (operation["operation"] == "install" and candidate in {current_before, previous_before})
-        or not valid_identity(operation.get("candidate_identity"), candidate)
-        or not (operation.get("current_before_identity") is None if current_before is None else valid_identity(operation.get("current_before_identity"), current_before))
-        or not (operation.get("previous_before_identity") is None if previous_before is None else valid_identity(operation.get("previous_before_identity"), previous_before))
+        or candidate_path.parent != app_dir / "releases"
     ):
         raise EvidenceError("release transaction receipt does not match restored pointers")
-    return operation["candidate_identity"]["source_sha"]
+    if companion_present:
+        try:
+            canonical_systemd = _SYSTEMD_RECEIPT_VALIDATOR["_read_receipt"](
+                app_dir / "shared/.release-systemd-state.json"
+            )
+        except Exception as exc:
+            raise EvidenceError("release transaction systemd receipt is invalid") from exc
+        if (
+            canonical_systemd != systemd
+            or systemd.get("operation_id") != operation.get("operation_id")
+            or systemd.get("app_dir") != str(app_dir)
+            or systemd.get("current_before") != operation.get("current_before")
+            or systemd.get("previous_before") != operation.get("previous_before")
+            or systemd.get("current_before_identity") != operation.get("current_before_identity")
+            or systemd.get("previous_before_identity") != operation.get("previous_before_identity")
+        ):
+            raise EvidenceError("release transaction systemd receipt binding is invalid")
+    if not _TRANSACTION_VALIDATOR["_lexists"](candidate_path):
+        return None
+    try:
+        candidate_identity = _TRANSACTION_VALIDATOR["_quarantine_release_identity"](candidate_path)
+    except Exception as exc:
+        raise EvidenceError("release candidate identity is invalid") from exc
+    candidate_source_sha = candidate_identity.get("source_sha") if isinstance(candidate_identity, dict) else None
+    if not isinstance(candidate_source_sha, str) or re.fullmatch(r"[0-9a-f]{40}", candidate_source_sha) is None:
+        raise EvidenceError("release candidate source identity is invalid")
+    return candidate_source_sha
 
 
 def _cgroup_members(control_group: str) -> list[int]:
@@ -448,9 +490,9 @@ def capture(
             "phase": operation.get("phase") if operation else None,
             "candidate_release": operation.get("candidate_release") if operation else None,
             "candidate_identity": operation.get("candidate_identity") if operation else None,
+            "candidate_source_sha": candidate_source_sha,
             "peer": operation.get("peer") if operation else None,
-            "operation_source_sha": candidate_source_sha,
-            "companion_present": True,
+            "companion_present": systemd is not None,
         },
         "unit": unit,
         "timer": timer,
@@ -525,7 +567,7 @@ def _validate_evidence(
         or not isinstance(value.get("receipts"), dict)
         or set(value["receipts"]) != {
             "operation_sha256", "systemd_sha256", "operation_id", "operation", "phase",
-            "candidate_release", "candidate_identity", "peer", "operation_source_sha",
+            "candidate_release", "candidate_identity", "candidate_source_sha", "peer",
             "companion_present",
         }
         or not isinstance(value.get("unit"), dict)
@@ -542,27 +584,25 @@ def _validate_evidence(
             "ExecMainExitTimestamp", "StateChangeTimestamp", "UnitFileState",
         }
         or any(item is not None and (not isinstance(item, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", item) is None) for item in value.get("pointers", {}).values())
-        or any(not HEX64.fullmatch(str(value.get("receipts", {}).get(key, ""))) for key in ("operation_sha256", "systemd_sha256"))
-        or value.get("receipts", {}).get("companion_present") is not True
+        or not HEX64.fullmatch(str(value.get("receipts", {}).get("operation_sha256", "")))
+        or (value.get("receipts", {}).get("companion_present") is True and not HEX64.fullmatch(str(value.get("receipts", {}).get("systemd_sha256", ""))))
+        or (value.get("receipts", {}).get("companion_present") is False and value.get("receipts", {}).get("systemd_sha256") is not None)
+        or type(value.get("receipts", {}).get("companion_present")) is not bool
         or value.get("receipts", {}).get("operation") not in {"install", "rollback"}
         or value.get("receipts", {}).get("phase") != "recovery-restored"
         or not isinstance(value.get("receipts", {}).get("operation_id"), str)
         or re.fullmatch(r"[0-9a-f]{32}", value["receipts"]["operation_id"]) is None
         or not isinstance(value.get("receipts", {}).get("candidate_release"), str)
         or not isinstance(value.get("receipts", {}).get("candidate_identity"), dict)
-        or value.get("receipts", {}).get("operation_source_sha") != value.get("receipts", {}).get("candidate_identity", {}).get("source_sha")
         or not isinstance(value.get("receipts", {}).get("peer"), str)
-        or set(value["receipts"]["candidate_identity"]) != {"slug", "dev", "ino", "source_sha"}
-        or value["receipts"]["candidate_identity"].get("slug") != Path(value["receipts"]["candidate_release"]).name
+        or set(value["receipts"]["candidate_identity"]) != {"dev", "ino"}
         or type(value["receipts"]["candidate_identity"].get("dev")) is not int
         or value["receipts"]["candidate_identity"].get("dev") < 0
         or type(value["receipts"]["candidate_identity"].get("ino")) is not int
         or value["receipts"]["candidate_identity"].get("ino") <= 0
-        or not isinstance(value["receipts"]["operation_source_sha"], str)
-        or re.fullmatch(r"[0-9a-f]{40}", value["receipts"]["operation_source_sha"]) is None
+        or (value["receipts"].get("candidate_source_sha") is not None and (not isinstance(value["receipts"].get("candidate_source_sha"), str) or re.fullmatch(r"[0-9a-f]{40}", value["receipts"]["candidate_source_sha"]) is None))
         or not isinstance(value["receipts"]["candidate_release"], str)
         or Path(value["receipts"]["candidate_release"]).parent != Path(value["app_dir"]) / "releases"
-        or (value["receipts"]["operation"] == "rollback" and value["pointers"]["current"] != value["receipts"]["candidate_identity"]["slug"])
         or len(value["journal"]) > 100
         or any(not isinstance(row, dict) or set(row) != {"realtime_timestamp", "priority", "message"} or not all(isinstance(row[key], str) for key in row) or len(row["message"]) > 4096 for row in value["journal"])
         or value.get("unit", {}).get("ActiveState") != "failed"
@@ -602,10 +642,14 @@ def reset_failed(
     receipts = evidence_value["receipts"]
     if current_operation_sha != receipts.get("operation_sha256") or current_systemd_sha != receipts.get("systemd_sha256"):
         raise EvidenceError("release receipts changed after evidence capture")
-    if (current_operation is None) != (current_systemd is None):
-        raise EvidenceError("release transaction receipt pair changed")
-    if current_operation and current_systemd and current_operation.get("operation_id") != current_systemd.get("operation_id"):
-        raise EvidenceError("release transaction receipt identity changed")
+    if current_operation is None or (current_systemd is not None) != receipts.get("companion_present"):
+        raise EvidenceError("release transaction receipt presence changed")
+    candidate_source_sha = _validate_transaction_context(
+        app_dir, evidence_value["pointers"].get("current"),
+        evidence_value["pointers"].get("previous"), current_operation, current_systemd,
+    )
+    if candidate_source_sha != receipts.get("candidate_source_sha"):
+        raise EvidenceError("release candidate source changed after evidence capture")
     unit = _systemd_properties(UNIT)
     timer = _systemd_properties(TIMER)
     jobs = _queued_jobs()
@@ -649,6 +693,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args: argparse.Namespace | None = None
+    output: Path | None = None
     try:
         args = _parser().parse_args(argv)
         if args.action == "capture_maintenance_failure":
@@ -679,8 +725,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         print("MAINTENANCE_RESET schema=1 status=complete unit=deadlock-maintenance.service")
         return 0
-    except (EvidenceError, OSError, UnicodeError) as exc:
-        print(f"MAINTENANCE_EVIDENCE schema=1 status=failed error_class={type(exc).__name__}", file=sys.stderr)
+    except Exception as exc:
+        diagnostic_written = False
+        if args is not None and args.action == "capture_maintenance_failure" and output is not None:
+            try:
+                payload = _diagnostic_payload(args, exc)
+                raw = (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+                _atomic_private_file(output, raw)
+                diagnostic_written = True
+            except Exception:
+                pass
+        if diagnostic_written:
+            stage, code = _diagnostic_class(exc)
+            print(f"MAINTENANCE_EVIDENCE schema=1 status=diagnostic stage={stage} error_code={code} private=true", file=sys.stderr)
+        else:
+            print("MAINTENANCE_EVIDENCE schema=1 status=failed error_code=capture_guard_failed", file=sys.stderr)
         return 1
 
 
