@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import stat
+import signal
 import sys
 import tempfile
 import textwrap
@@ -136,6 +138,288 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
         shared = temporary / "shared"
         shared.mkdir()
         return shared / ".release-operation.json", shared / ".release-systemd-state.json"
+
+    @staticmethod
+    def _root_owned_stat(metadata: os.stat_result) -> os.stat_result:
+        values = list(metadata)
+        values[4] = 0
+        values[5] = 0
+        return os.stat_result(
+            tuple(values),
+            {
+                "st_atime_ns": metadata.st_atime_ns,
+                "st_mtime_ns": metadata.st_mtime_ns,
+                "st_ctime_ns": metadata.st_ctime_ns,
+            },
+        )
+
+    @staticmethod
+    def _genuine_diagnostic_fixture(root: Path) -> dict[str, object]:
+        app_dir = root / "platform-app"
+        releases = app_dir / "releases"
+        shared = app_dir / "shared"
+        releases.mkdir(parents=True)
+        shared.mkdir()
+        current = releases / "gha-current-9ceaf09ab7ba"
+        previous = releases / "gha-previous-f1154c7dba4f"
+        candidate = releases / "gha-candidate-2067f42029d8"
+        helper_source = Path(systemd_state.__file__).read_bytes()
+        source_by_release = {
+            current: probe.DIAGNOSTIC_TARGET_SOURCE_SHA,
+            previous: "f1154c7dba4f57bf52f7d7544e97d924c732be94",
+            candidate: "2067f42029d8ad5820909b5833c7ee4b9119725e",
+        }
+        for release, source_sha in source_by_release.items():
+            tools = release / "tools"
+            tools.mkdir(parents=True)
+            (release / "RELEASE.json").write_text(
+                json.dumps({"source_git_commit": source_sha}, sort_keys=True) + "\n",
+                encoding="ascii",
+            )
+            for relative in systemd_state.HELPER_RELATIVE_PATHS:
+                helper = release / relative
+                helper.parent.mkdir(parents=True, exist_ok=True)
+                helper.write_bytes(
+                    helper_source
+                    if relative == "tools/platform_release_systemd_state.py"
+                    else b"#!/bin/sh\nexit 0\n"
+                )
+                helper.chmod(0o755)
+        current_link = app_dir / "current"
+        previous_link = app_dir / "previous"
+        current_link.symlink_to(current)
+        previous_link.symlink_to(previous)
+        transaction = shared / ".release-operation.json"
+
+        def identity(path: Path) -> dict[str, int]:
+            metadata = path.lstat()
+            return {"dev": metadata.st_dev, "ino": metadata.st_ino}
+
+        operation_id = "c" * 32
+        transaction_record = {
+            "operation_id": operation_id,
+            "version": 2,
+            "operation": "install",
+            "phase": "recovery-restored",
+            "app_dir": str(app_dir),
+            "current_before": str(current),
+            "previous_before": str(previous),
+            "candidate_release": str(candidate),
+            "shared_venv": str(shared / "venv"),
+            "peer": str(shared / ".venv-install-candidate"),
+            "snapshot": str(candidate / ".rollback"),
+            "transition": "exchange",
+            "shared_before": None,
+            "peer_before": identity(candidate),
+            "current_before_identity": identity(current),
+            "previous_before_identity": identity(previous),
+            "candidate_identity": identity(candidate),
+            "remove_env_on_recovery": False,
+            "service_state_before": {
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+            },
+            "service_enabled_before": {
+                "deadlock-api": "enabled",
+                "deadlock-worker": "disabled",
+                "deadlock-web": "enabled",
+            },
+            "quiesced_services": ["deadlock-api", "deadlock-worker", "deadlock-web"],
+            "timer_active_before": True,
+            "timer_enabled_before": "enabled",
+            "systemd_state_before": None,
+            "profile_access_cache_purge_proof": None,
+        }
+        transaction.write_text(json.dumps(transaction_record, sort_keys=True) + "\n", encoding="ascii")
+        transaction.chmod(0o600)
+        systemctl = root / "systemctl"
+        systemctl.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        systemctl.chmod(0o755)
+        return {
+            "app_dir": app_dir,
+            "current": current,
+            "previous": previous,
+            "candidate": candidate,
+            "current_link": current_link,
+            "previous_link": previous_link,
+            "shared": shared,
+            "transaction": transaction,
+            "companion": shared / ".release-systemd-state.json",
+            "systemctl": systemctl,
+            "operation_id": operation_id,
+        }
+
+    @staticmethod
+    def _tree_snapshot(root: Path) -> dict[str, tuple[str, int, int, int, int, int]]:
+        snapshot: dict[str, tuple[str, int, int, int, int, int]] = {}
+        for path in sorted(root.rglob("*")):
+            relative = str(path.relative_to(root))
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                content = "link:" + os.readlink(path)
+            elif stat.S_ISREG(metadata.st_mode):
+                content = hashlib.sha256(path.read_bytes()).hexdigest()
+            else:
+                content = "directory"
+            snapshot[relative] = (
+                content,
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_mtime_ns,
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+            )
+        return snapshot
+
+    @staticmethod
+    def _private_detail(emitted: BytesIO) -> tuple[dict[str, object], dict[str, object]]:
+        marker_line = emitted.getvalue().decode("ascii").strip()
+        marker = json.loads(marker_line.removeprefix("RUNTIME_PRIVATE_CONTEXT "))
+        return marker, json.loads(base64.b64decode(marker["output_b64"]))
+
+    def _run_genuine_diagnostic(
+        self,
+        fixture: dict[str, object],
+        *,
+        fail_query: tuple[str, str] | None = None,
+        failure: BaseException | None = None,
+        responses: dict[tuple[str, str], list[tuple[int, str] | BaseException]] | None = None,
+        deadline_on_call: tuple[str, str, int] | None = None,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object], list[tuple[str, str]]]:
+        root = Path(fixture["app_dir"]).parent
+        actual_identity = (os.geteuid(), os.getegid())
+        actual_uid = actual_identity[0]
+        systemctl = Path(fixture["systemctl"])
+        calls: list[tuple[str, str]] = []
+        diagnostic_phase = [False]
+        query_counts: dict[tuple[str, str], int] = {}
+
+        def state_for(query: str, unit: str) -> tuple[int, str]:
+            expected = {
+                "deadlock-api.service": ("active", "enabled"),
+                "deadlock-worker.service": ("inactive", "disabled"),
+                "deadlock-web.service": ("active", "enabled"),
+                "deadlock-cloudflare-ips.timer": ("active", "enabled"),
+            }
+            active, enabled = expected.get(unit, ("inactive", "enabled"))
+            if diagnostic_phase[0] and fail_query == (query, unit):
+                if failure is not None:
+                    raise failure
+                return (3, "failed") if query == "is-active" else (1, "disabled")
+            if query == "is-active":
+                return (0 if active == "active" else 3, active)
+            return (0 if enabled in {"enabled", "static"} else 1, enabled)
+
+        real_run = subprocess.run
+
+        def external_boundary(argv, *args, **kwargs):
+            if isinstance(argv, (list, tuple)) and argv and argv[0] == str(systemctl):
+                action, unit = str(argv[1]), str(argv[2])
+                calls.append((action, unit))
+                call_number = query_counts.get((action, unit), 0) if diagnostic_phase[0] else -1
+                if diagnostic_phase[0]:
+                    query_counts[(action, unit)] = call_number + 1
+                if (
+                    diagnostic_phase[0]
+                    and deadline_on_call == (action, unit, call_number)
+                ) or (
+                    diagnostic_phase[0]
+                    and fail_query == (action, unit)
+                    and isinstance(failure, probe.ProbeDeadlineExceeded)
+                ):
+                    signal.raise_signal(signal.SIGALRM)
+                sequence = (responses or {}).get((action, unit), [])
+                if diagnostic_phase[0] and call_number < len(sequence):
+                    response = sequence[call_number]
+                    if isinstance(response, BaseException):
+                        raise response
+                    returncode, output = response
+                else:
+                    returncode, output = state_for(action, unit)
+                return SimpleNamespace(returncode=returncode, stdout=output + "\n")
+            return real_run(argv, *args, **kwargs)
+
+        real_lstat = Path.lstat
+        real_fstat = os.fstat
+
+        def fixture_path(path: Path) -> bool:
+            try:
+                return path.resolve(strict=False).is_relative_to(root.resolve())
+            except OSError:
+                return False
+
+        def trusted_lstat(path: Path, *args, **kwargs):
+            metadata = real_lstat(path, *args, **kwargs)
+            return self._root_owned_stat(metadata) if fixture_path(path) else metadata
+
+        def trusted_fstat(fd: int):
+            metadata = real_fstat(fd)
+            try:
+                opened_path = Path(f"/proc/self/fd/{fd}").resolve(strict=True)
+            except OSError:
+                return metadata
+            return self._root_owned_stat(metadata) if opened_path.is_relative_to(root.resolve()) else metadata
+
+        emitted = BytesIO()
+        real_loader = probe._load_pinned_module
+
+        def load_target_helper(expected_sha256: str):
+            module = real_loader(expected_sha256)
+            module.SYSTEMCTL = str(systemctl)
+            module.SYSTEMCTL_PATH = str(systemctl)
+            return module
+
+        with (
+            patch.object(Path, "lstat", new=trusted_lstat),
+            patch.object(os, "fstat", new=trusted_fstat),
+            patch.object(subprocess, "run", side_effect=external_boundary),
+            patch.object(systemd_state, "SYSTEMCTL", str(systemctl)),
+            patch.object(systemd_state, "SYSTEMCTL_PATH", str(systemctl)),
+            patch.object(probe, "APP_DIR", Path(fixture["app_dir"])),
+            patch.object(probe, "SHARED_DIR", Path(fixture["shared"])),
+            patch.object(probe, "TRANSACTION", Path(fixture["transaction"])),
+            patch.object(probe, "SYSTEMD_RECEIPT", Path(fixture["companion"])),
+            patch.object(probe, "CURRENT_LINK", Path(fixture["current_link"])),
+            patch.object(probe, "SYSTEMD_MODULE", Path(fixture["current_link"]) / "tools/platform_release_systemd_state.py"),
+            patch.object(probe, "_load_pinned_module", side_effect=load_target_helper),
+            patch.object(probe, "_private_capture_requested", return_value=True),
+            patch.object(probe, "_private_report_owner_uid", return_value=actual_uid),
+            patch.object(probe, "_trusted_state_owner", return_value=(0, 0)),
+            patch.object(probe.sys, "stderr", SimpleNamespace(buffer=emitted)),
+        ):
+            # Receipt creation is fixture setup; the diagnostic itself runs
+            # with the real process identity and only trusted path metadata.
+            with patch.object(os, "geteuid", return_value=0):
+                systemd_state.capture_transaction(
+                    Path(fixture["companion"]),
+                    transaction=Path(fixture["transaction"]),
+                    app_dir=Path(fixture["app_dir"]),
+                    require_helper_manifest=True,
+                    helper_release=Path(fixture["current"]),
+                )
+            if fixture.get("corrupt_receipt_binding"):
+                receipt_path = Path(fixture["companion"])
+                receipt_record = json.loads(receipt_path.read_text(encoding="ascii"))
+                receipt_record["operation_id"] = "d" * 32
+                receipt_path.write_text(json.dumps(receipt_record, sort_keys=True) + "\n", encoding="ascii")
+                receipt_path.chmod(0o600)
+            calls.clear()
+            before = self._tree_snapshot(root)
+            diagnostic_phase[0] = True
+            # This fixture bypasses only the production root-identity gate;
+            # the process remains unprivileged and all path checks still run
+            # through the trusted metadata adapter above.
+            with patch.object(probe.os, "geteuid", return_value=0):
+                result = probe.probe(
+                    hashlib.sha256(Path(systemd_state.__file__).read_bytes()).hexdigest(),
+                    diagnostic_systemd_state=True,
+                )
+            after = self._tree_snapshot(root)
+        marker, detail = self._private_detail(emitted)
+        self.assertEqual(before, after, "diagnostic capture changed fixture state")
+        self.assertTrue(all(action in {"is-active", "is-enabled"} for action, _ in calls))
+        return result, marker, detail, calls
 
     def _run(
         self,
@@ -347,30 +631,9 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
 
     def test_diagnostic_systemd_state_emits_private_success_without_runtime_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            transaction, companion = self._paths(Path(directory))
-            companion.write_text("fixture", encoding="ascii")
-            fake = FakeSystemdState(
-                operation="rollback", transaction_operation="install",
-                phase="recovery-restored",
-            )
-            fake.OWNED_UNITS = systemd_state.OWNED_UNITS
-            emitted = BytesIO()
-            with (
-                patch.object(probe, "_private_capture_requested", return_value=True),
-                patch.object(probe.sys, "stderr", SimpleNamespace(buffer=emitted)),
-                patch.object(
-                    probe,
-                    "_runtime_payload_integrity",
-                    side_effect=AssertionError("diagnostic route must skip the payload gate"),
-                ),
-            ):
-                result = self._run(
-                    fake,
-                    transaction,
-                    companion,
-                    diagnostic_systemd_state=True,
-                    release_source=probe.DIAGNOSTIC_TARGET_SOURCE_SHA,
-                )
+            root = Path(directory)
+            fixture = self._genuine_diagnostic_fixture(root)
+            result, marker, detail, calls = self._run_genuine_diagnostic(fixture)
 
             self.assertEqual(
                 result,
@@ -382,21 +645,8 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                     "diagnostic_systemd_state_returncode": 0,
                 },
             )
-            self.assertEqual(fake.events.count("validate"), 1)
-            self.assertEqual(fake.events.count("verify"), 1)
-            self.assertNotIn("restore", fake.events)
-            transaction_record = json.loads(transaction.read_text(encoding="ascii"))
-            self.assertEqual(transaction_record["operation"], "install")
-            self.assertEqual(transaction_record["phase"], "recovery-restored")
-            self.assertTrue(transaction_record["current_before"])
-            self.assertTrue(transaction_record["previous_before"])
-            self.assertEqual(fake._read_receipt(companion)["operation"], "rollback")
-            marker_line = emitted.getvalue().decode("ascii").strip()
-            self.assertTrue(marker_line.startswith("RUNTIME_PRIVATE_CONTEXT "))
-            marker = json.loads(marker_line.removeprefix("RUNTIME_PRIVATE_CONTEXT "))
             self.assertEqual(marker["component"], "systemd_state_probe")
             self.assertEqual(marker["returncode"], 0)
-            detail = json.loads(base64.b64decode(marker["output_b64"]))
             self.assertTrue(detail["collection_completed"])
             self.assertEqual(detail["validate_status"], "passed")
             self.assertEqual(detail["verify_status"], "passed")
@@ -404,82 +654,258 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             self.assertFalse(detail["historical_cause_proven"])
             self.assertEqual(len(detail["expected_units"]), 13)
             self.assertEqual(detail["expected_units"], detail["observed_units"])
+            self.assertEqual(fixture["current"].name, "gha-current-9ceaf09ab7ba")
+            self.assertEqual(fixture["candidate"].name, "gha-candidate-2067f42029d8")
+            transaction = json.loads(Path(fixture["transaction"]).read_text(encoding="ascii"))
+            receipt = json.loads(Path(fixture["companion"]).read_text(encoding="ascii"))
+            self.assertEqual((transaction["operation"], transaction["phase"]), ("install", "recovery-restored"))
+            self.assertEqual(receipt["operation"], "rollback")
+            self.assertEqual(transaction["current_before"], str(fixture["current"]))
+            self.assertEqual(transaction["previous_before"], str(fixture["previous"]))
+            self.assertNotEqual(transaction["current_before"], transaction["candidate_release"])
+            self.assertEqual(
+                json.loads((Path(fixture["current"]) / "RELEASE.json").read_text(encoding="ascii"))["source_git_commit"],
+                probe.DIAGNOSTIC_TARGET_SOURCE_SHA,
+            )
+            self.assertEqual(
+                json.loads((Path(fixture["previous"]) / "RELEASE.json").read_text(encoding="ascii"))["source_git_commit"],
+                "f1154c7dba4f57bf52f7d7544e97d924c732be94",
+            )
+            self.assertEqual(
+                json.loads((Path(fixture["candidate"]) / "RELEASE.json").read_text(encoding="ascii"))["source_git_commit"],
+                "2067f42029d8ad5820909b5833c7ee4b9119725e",
+            )
+            self.assertEqual(stat.S_IMODE(Path(fixture["transaction"]).stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(Path(fixture["companion"]).stat().st_mode), 0o600)
+            self.assertEqual(len(calls), 52)  # collector + canonical verify
+            self.assertEqual(probe.probe.__kwdefaults__["diagnostic_systemd_state"], False)
             self.assertNotIn("expected_units", json.dumps(result))
-
 
     def test_diagnostic_systemd_state_preserves_bounded_private_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            transaction, companion = self._paths(Path(directory))
-            companion.write_text("fixture", encoding="ascii")
-            fake = FakeSystemdState(operation="rollback")
-            fake.OWNED_UNITS = systemd_state.OWNED_UNITS
-            fake.snapshot_active = "inactive"
-            emitted = BytesIO()
-            with (
-                patch.object(probe, "_private_capture_requested", return_value=True),
-                patch.object(probe.sys, "stderr", SimpleNamespace(buffer=emitted)),
-            ):
-                result = self._run(
-                    fake,
-                    transaction,
-                    companion,
-                    diagnostic_systemd_state=True,
-                    release_source=probe.DIAGNOSTIC_TARGET_SOURCE_SHA,
-                )
+            root = Path(directory)
+            fixture = self._genuine_diagnostic_fixture(root)
+            result, marker, detail, calls = self._run_genuine_diagnostic(
+                fixture,
+                fail_query=("is-active", systemd_state.OWNED_UNITS[0]),
+            )
 
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["failed_check"], "diagnostic_mismatch")
             self.assertEqual(result["diagnostic_systemd_state"], "mismatch")
             self.assertEqual(result["diagnostic_systemd_state_returncode"], 1)
-            marker_line = emitted.getvalue().decode("ascii").strip()
-            marker = json.loads(marker_line.removeprefix("RUNTIME_PRIVATE_CONTEXT "))
             self.assertEqual(marker["component"], "systemd_state_probe")
             self.assertEqual(marker["returncode"], 1)
-            detail = json.loads(base64.b64decode(marker["output_b64"]))
             self.assertTrue(detail["collection_completed"])
             self.assertEqual(detail["verify_status"], "failed")
             self.assertEqual(detail["current_facts_status"], "mismatch")
-            self.assertEqual(detail["mismatch_count"], 13)
-            self.assertEqual(detail["observed_units"][0]["active"], "inactive")
+            self.assertEqual(detail["mismatch_count"], 1)
+            self.assertEqual(detail["observed_units"][0]["active"], "failed")
+            self.assertEqual(detail["failure_phase"], "unit_active")
+            self.assertEqual(detail["failure_check"], "unit_active")
+            self.assertEqual(detail["failure_reason"], "unsupported_state")
+            self.assertEqual(detail["failure_class"], "StateError")
+            self.assertEqual(detail["failure_unit"], systemd_state.OWNED_UNITS[0])
+            self.assertEqual(detail["failure_query"], "active")
+            self.assertEqual(detail["failure_rc"], 3)
             self.assertFalse(detail["historical_cause_proven"])
-            self.assertNotIn("inactive", json.dumps(result))
+            self.assertEqual(len(calls), 27)  # complete collection, then verify short-circuits
+            self.assertNotIn(systemd_state.OWNED_UNITS[0], json.dumps(result))
+
+            changing_observation = {
+                ("is-active", systemd_state.OWNED_UNITS[0]): [(3, "failed"), (0, "active")]
+            }
+            fixture = self._genuine_diagnostic_fixture(root / "verify-pass-after-mismatch")
+            result, _marker, detail, _calls = self._run_genuine_diagnostic(
+                fixture,
+                responses=changing_observation,
+            )
+            self.assertEqual(result["diagnostic_systemd_state"], "mismatch")
+            self.assertEqual(detail["current_facts_status"], "mismatch")
+            self.assertEqual(detail["verify_status"], "passed")
+            self.assertEqual(detail["failure_reason"], "unsupported_state")
+            self.assertEqual(detail["failure_unit"], systemd_state.OWNED_UNITS[0])
+            self.assertEqual(detail["failure_phase"], "unit_active")
+            self.assertEqual(detail["failure_rc"], 3)
 
     def test_diagnostic_systemd_state_fails_closed_for_unbound_source(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            transaction, companion = self._paths(Path(directory))
-            companion.write_text("fixture", encoding="ascii")
-            fake = FakeSystemdState(operation="rollback")
-            fake.OWNED_UNITS = systemd_state.OWNED_UNITS
-            emitted = BytesIO()
-            with (
-                patch.object(probe, "_private_capture_requested", return_value=True),
-                patch.object(probe.sys, "stderr", SimpleNamespace(buffer=emitted)),
-            ):
-                result = self._run(
-                    fake,
-                    transaction,
-                    companion,
-                    diagnostic_systemd_state=True,
-                    release_source="b" * 40,
+        cases = (
+            ("receipt_binding", None, None, "receipt", "existing_receipt_validate"),
+            (
+                "query_oserror",
+                ("is-active", systemd_state.OWNED_UNITS[0]),
+                OSError("private systemctl detail"),
+                "unit_active",
+                "unit_active",
+            ),
+            (
+                "query_timeout",
+                ("is-active", systemd_state.OWNED_UNITS[0]),
+                subprocess.TimeoutExpired("systemctl", 30),
+                "unit_active",
+                "unit_active",
+            ),
+            (
+                "collection_malformed",
+                None,
+                None,
+                "unit_active",
+                "unit_active",
+            ),
+            (
+                "alarm_deadline",
+                ("is-active", systemd_state.OWNED_UNITS[1]),
+                probe.ProbeDeadlineExceeded(),
+                "unit_active",
+                "unit_active",
+            ),
+            (
+                "verify_oserror",
+                None,
+                None,
+                "verify",
+                "systemd_verify",
+            ),
+            (
+                "verify_timeout",
+                None,
+                None,
+                "verify",
+                "systemd_verify",
+            ),
+            (
+                "verify_malformed",
+                None,
+                None,
+                "verify",
+                "systemd_verify",
+            ),
+            (
+                "verify_unsupported",
+                None,
+                None,
+                "verify",
+                "systemd_verify",
+            ),
+            (
+                "verify_alarm_deadline",
+                None,
+                None,
+                "verify",
+                "systemd_verify",
+            ),
+        )
+        for name, fail_query, failure, expected_phase, expected_check in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                fixture = self._genuine_diagnostic_fixture(Path(directory))
+                if name == "receipt_binding":
+                    fixture["corrupt_receipt_binding"] = True
+                alarm_handler_before = signal.getsignal(signal.SIGALRM)
+                first_unit = systemd_state.OWNED_UNITS[0]
+                verify_responses = {
+                    "verify_oserror": [(0, "active"), OSError("private verify output")],
+                    "verify_timeout": [(0, "active"), subprocess.TimeoutExpired("systemctl", 30)],
+                    "verify_malformed": [(0, "active"), (0, "active\ninactive")],
+                    "verify_unsupported": [(0, "active"), (3, "failed")],
+                    "verify_alarm_deadline": [(0, "active")],
+                }
+                response_map = (
+                    {("is-active", first_unit): verify_responses[name]}
+                    if name in verify_responses
+                    else None
+                )
+                if name == "collection_malformed":
+                    response_map = {
+                        ("is-active", first_unit): [(0, "active\ninactive")]
+                    }
+                result, marker, detail, calls = self._run_genuine_diagnostic(
+                    fixture,
+                    fail_query=fail_query,
+                    failure=failure,
+                    responses=response_map,
+                    deadline_on_call=("is-active", first_unit, 1)
+                    if name == "verify_alarm_deadline"
+                    else None,
                 )
 
-            self.assertEqual(result["status"], "failed")
-            self.assertEqual(result["diagnostic_systemd_state"], "unavailable")
-            self.assertEqual(result["diagnostic_systemd_state_returncode"], "unavailable")
-            detail = json.loads(
-                base64.b64decode(
-                    json.loads(
-                        emitted.getvalue().decode("ascii").strip().removeprefix("RUNTIME_PRIVATE_CONTEXT ")
-                    )["output_b64"]
-                )
-            )
-            self.assertEqual(detail["validate_status"], "passed")
-            self.assertEqual(detail["verify_status"], "unavailable")
-            self.assertFalse(detail["collection_completed"])
-            self.assertEqual(detail["expected_units"], [])
-            self.assertEqual(detail["observed_units"], [])
-            self.assertNotIn("unit_snapshot", fake.events)
-            self.assertNotIn("verify", fake.events)
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["diagnostic_systemd_state"], "unavailable")
+                self.assertEqual(result["diagnostic_systemd_state_returncode"], 1)
+                self.assertEqual(marker["returncode"], 1)
+                self.assertEqual(detail["historical_cause_proven"], False)
+                self.assertEqual(detail["failure_phase"], expected_phase)
+                self.assertEqual(detail["failure_check"], expected_check)
+                if name == "receipt_binding":
+                    self.assertEqual(detail["validate_status"], "failed")
+                    self.assertFalse(detail["collection_completed"])
+                    self.assertEqual(detail["failure_reason"], "receipt_state_invalid")
+                    self.assertEqual(calls, [])
+                else:
+                    self.assertEqual(detail["validate_status"], "passed")
+                    if name.startswith("verify_"):
+                        self.assertTrue(detail["collection_completed"])
+                        self.assertEqual(detail["current_facts_status"], "matched")
+                        self.assertEqual(detail["verify_status"], "unavailable" if name == "verify_alarm_deadline" else "failed")
+                        self.assertEqual(detail["failure_phase"], "verify")
+                        self.assertEqual(detail["failure_check"], "systemd_verify")
+                        self.assertEqual(detail["failure_unit"], first_unit)
+                        self.assertEqual(detail["failure_query"], "active")
+                        self.assertEqual(len(calls), 27)
+                        if name == "verify_oserror":
+                            self.assertEqual(detail["failure_class"], "oserror")
+                            self.assertEqual(detail["failure_reason"], "command_error")
+                            self.assertEqual(detail["failure_rc"], "unavailable")
+                        elif name == "verify_timeout":
+                            self.assertEqual(detail["failure_class"], "TimeoutExpired")
+                            self.assertEqual(detail["failure_reason"], "timeout")
+                            self.assertEqual(detail["failure_rc"], "unavailable")
+                        elif name == "verify_malformed":
+                            self.assertEqual(detail["failure_class"], "StateError")
+                            self.assertEqual(detail["failure_reason"], "malformed_output")
+                            self.assertEqual(detail["failure_rc"], 0)
+                        elif name == "verify_unsupported":
+                            self.assertEqual(detail["failure_class"], "StateError")
+                            self.assertEqual(detail["failure_reason"], "unsupported_state")
+                            self.assertEqual(detail["failure_rc"], 3)
+                        else:
+                            self.assertEqual(detail["failure_class"], "timeout")
+                            self.assertEqual(detail["failure_reason"], "timeout")
+                            self.assertEqual(detail["failure_rc"], "unavailable")
+                            self.assertEqual(signal.getsignal(signal.SIGALRM), alarm_handler_before)
+                            self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+                    else:
+                        self.assertFalse(detail["collection_completed"])
+                        expected_unit = fail_query[1] if fail_query is not None else first_unit
+                        self.assertEqual(detail["failure_unit"], expected_unit)
+                        self.assertEqual(detail["failure_query"], "active")
+                        self.assertEqual(len(detail["observed_units"]), 1)
+                        self.assertEqual(detail["verify_status"], "unavailable")
+                        self.assertEqual(
+                            calls,
+                            [
+                                ("is-active", first_unit),
+                                ("is-enabled", first_unit),
+                                ("is-active", expected_unit),
+                            ]
+                            if name == "alarm_deadline"
+                            else [("is-active", first_unit)],
+                        )
+                    if name == "query_oserror":
+                        self.assertEqual(detail["failure_class"], "oserror")
+                        self.assertEqual(detail["failure_reason"], "command_error")
+                    elif name == "query_timeout":
+                        self.assertEqual(detail["failure_class"], "TimeoutExpired")
+                        self.assertEqual(detail["failure_reason"], "timeout")
+                    elif name == "collection_malformed":
+                        self.assertEqual(detail["failure_class"], "StateError")
+                        self.assertEqual(detail["failure_reason"], "malformed_output")
+                        self.assertEqual(detail["failure_rc"], "unavailable")
+                    elif name == "alarm_deadline":
+                        self.assertEqual(detail["failure_class"], "timeout")
+                        self.assertEqual(detail["failure_reason"], "timeout")
+                        self.assertEqual(detail["failure_unit"], systemd_state.OWNED_UNITS[1])
+                        self.assertEqual(signal.getsignal(signal.SIGALRM), alarm_handler_before)
+                        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
     def test_existing_companion_uses_only_existing_read_validator(self) -> None:
         expected_files = {"platform/tools/helper.py": "a" * 64, "source-sha": "b" * 64}

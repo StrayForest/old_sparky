@@ -548,7 +548,8 @@ def _validate_systemd_diagnostic_payload(output: bytes, returncode: object) -> N
     keys = {
         "schema", "collection_completed", "validate_status", "verify_status",
         "current_facts_status", "mismatch_count", "historical_cause_proven",
-        "expected_units", "observed_units",
+        "expected_units", "observed_units", "failure_phase", "failure_check",
+        "failure_class", "failure_reason", "failure_unit", "failure_query", "failure_rc",
     }
     if (
         not isinstance(value, dict) or set(value) != keys or type(value.get("schema")) is not int or value.get("schema") != 1
@@ -563,40 +564,76 @@ def _validate_systemd_diagnostic_payload(output: bytes, returncode: object) -> N
         or type(value.get("mismatch_count")) is not int
         or not 0 <= value["mismatch_count"] <= len(_SYSTEMD_DIAGNOSTIC_UNITS)
         or type(returncode) is not int or returncode not in {0, 1}
+        or not isinstance(value.get("failure_phase"), str) or value["failure_phase"] not in {"none", "module", "systemctl_path", "transaction", "receipt", "binding", "unit_active", "unit_enabled", "verify"}
+        or not isinstance(value.get("failure_check"), str) or value["failure_check"] not in {"none", "diagnostic_receipt_absent", "systemctl_path", "transaction_read", "systemd_module_identity", "module_metadata", "module_open", "module_identity", "module_size", "module_changed", "module_import", "existing_receipt_transaction", "runtime_target_binding", "current_binding", "previous_binding", "existing_receipt_validate", "release_metadata", "helper_digests", "diagnostic_target_binding", "unit_active", "unit_enabled", "diagnostic_receipt_units", "unit_snapshot", "systemd_verify"}
+        or not isinstance(value.get("failure_class"), str) or value["failure_class"] not in {"none", "predicate", "oserror", "StateError", "ValueError", "TypeError", "TimeoutExpired", "timeout", "exception"}
+        or not isinstance(value.get("failure_reason"), str) or value["failure_reason"] not in {"none", "binding", "unsupported_state", "status_mismatch", "command_error", "malformed_output", "timeout", "receipt_state_invalid", "verify_mismatch", "verification_error"}
+        or not isinstance(value.get("failure_unit"), str) or value["failure_unit"] not in {"none", *_SYSTEMD_DIAGNOSTIC_UNITS}
+        or not isinstance(value.get("failure_query"), str) or value["failure_query"] not in {"none", "active", "enabled"}
+        or (value.get("failure_rc") != "unavailable" and (type(value.get("failure_rc")) is not int or not 0 <= value["failure_rc"] <= 255))
     ):
         raise DecryptError("systemd diagnostic payload fields are invalid")
+    failure = value["failure_reason"] != "none"
+    if (
+        (not failure and any(value[key] != expected for key, expected in (
+            ("failure_phase", "none"), ("failure_check", "none"), ("failure_class", "none"),
+            ("failure_unit", "none"), ("failure_query", "none"), ("failure_rc", "unavailable"),
+        )))
+        or (failure and (value["failure_phase"] == "none" or value["failure_check"] == "none" or value["failure_class"] == "none"))
+        or ((value["failure_unit"] == "none") != (value["failure_query"] == "none"))
+        or (value["failure_rc"] != "unavailable" and value["failure_unit"] == "none")
+        or (value["failure_reason"] in {"unsupported_state", "status_mismatch"} and (value["failure_unit"] == "none" or value["failure_rc"] == "unavailable"))
+        or (returncode == 0 and failure)
+    ):
+        raise DecryptError("systemd diagnostic failure context is inconsistent")
     expected = value["expected_units"]
     observed = value["observed_units"]
     if not isinstance(expected, list) or not isinstance(observed, list):
         raise DecryptError("systemd diagnostic unit snapshots are invalid")
-    if not value["collection_completed"]:
+    if len(expected) not in {0, len(_SYSTEMD_DIAGNOSTIC_UNITS)} or len(observed) > len(_SYSTEMD_DIAGNOSTIC_UNITS):
+        raise DecryptError("systemd diagnostic unit count is invalid")
+    for index, row in enumerate(expected):
         if (
-            expected or observed or value["current_facts_status"] != "unavailable"
-            or value["mismatch_count"] != 0 or returncode != 1
+            not isinstance(row, dict) or set(row) != {"unit", "active", "enabled"}
+            or row.get("unit") != _SYSTEMD_DIAGNOSTIC_UNITS[index]
+            or not isinstance(row.get("active"), str) or row["active"] not in {"active", "inactive"}
+            or not isinstance(row.get("enabled"), str) or row["enabled"] not in {"enabled", "disabled", "static"}
         ):
+            raise DecryptError("systemd expected unit row is invalid")
+    active_observations = {"active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance", "unknown", "empty", "other", "unavailable"}
+    enabled_observations = {"enabled", "disabled", "static", "indirect", "masked", "generated", "transient", "unknown", "empty", "other", "unavailable"}
+    for index, row in enumerate(observed):
+        if (
+            not isinstance(row, dict) or set(row) != {"unit", "active", "enabled"}
+            or row.get("unit") != _SYSTEMD_DIAGNOSTIC_UNITS[index]
+            or not isinstance(row.get("active"), str) or row["active"] not in active_observations
+            or not isinstance(row.get("enabled"), str) or row["enabled"] not in enabled_observations
+        ):
+            raise DecryptError("systemd observed unit row is invalid")
+    if not value["collection_completed"]:
+        if value["current_facts_status"] != "unavailable" or value["mismatch_count"] != 0 or returncode != 1:
             raise DecryptError("incomplete systemd diagnostic snapshot is inconsistent")
+        if expected and len(expected) != len(_SYSTEMD_DIAGNOSTIC_UNITS):
+            raise DecryptError("incomplete systemd expected snapshot is invalid")
     else:
         if len(expected) != len(_SYSTEMD_DIAGNOSTIC_UNITS) or len(observed) != len(_SYSTEMD_DIAGNOSTIC_UNITS):
             raise DecryptError("systemd diagnostic unit count is invalid")
-        for rows in (expected, observed):
-            for name, row in zip(_SYSTEMD_DIAGNOSTIC_UNITS, rows, strict=True):
-                if (
-                    not isinstance(row, dict) or set(row) != {"unit", "active", "enabled"}
-                    or row.get("unit") != name
-                    or not isinstance(row.get("active"), str)
-                    or row.get("active") not in {"active", "inactive"}
-                    or not isinstance(row.get("enabled"), str)
-                    or row.get("enabled") not in {"enabled", "disabled", "static", "indirect", "masked", "generated", "transient"}
-                ):
-                    raise DecryptError("systemd diagnostic unit row is invalid")
-        mismatch_count = sum(left != right for left, right in zip(expected, observed, strict=True))
-        facts_status = "mismatch" if mismatch_count else "matched"
-        if value["mismatch_count"] != mismatch_count or value["current_facts_status"] != facts_status:
-            raise DecryptError("systemd diagnostic mismatch summary is invalid")
+        comparable = all(row["active"] not in {"unknown", "empty", "other", "unavailable"} and row["enabled"] not in {"unknown", "empty", "other", "unavailable"} for row in observed)
+        if not comparable:
+            if value["current_facts_status"] != "unavailable" or value["mismatch_count"] != 0:
+                raise DecryptError("unsupported systemd observations are inconsistent")
+        else:
+            mismatch_count = sum(left != right for left, right in zip(expected, observed, strict=True))
+            facts_status = "mismatch" if mismatch_count else "matched"
+            if value["mismatch_count"] != mismatch_count or value["current_facts_status"] != facts_status:
+                raise DecryptError("systemd diagnostic mismatch summary is invalid")
     passed = (
         value["collection_completed"] and value["validate_status"] == "passed"
         and value["verify_status"] == "passed" and value["current_facts_status"] == "matched"
-        and value["mismatch_count"] == 0
+        and value["mismatch_count"] == 0 and value["failure_phase"] == "none"
+        and value["failure_check"] == "none" and value["failure_class"] == "none"
+        and value["failure_reason"] == "none" and value["failure_unit"] == "none"
+        and value["failure_query"] == "none" and value["failure_rc"] == "unavailable"
     )
     if (returncode == 0) != passed:
         raise DecryptError("systemd diagnostic result does not match its return code")

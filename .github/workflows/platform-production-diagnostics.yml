@@ -859,34 +859,49 @@ jobs:
               except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                   raise SystemExit(2) from exc
               unit_names = ["deadlock-api.service", "deadlock-worker.service", "deadlock-web.service", "deadlock-maintenance.service", "deadlock-maintenance.timer", "deadlock-logrotate.service", "deadlock-logrotate.timer", "deadlock-offsite-backup.service", "deadlock-offsite-backup.timer", "deadlock-cloudflare-ips.service", "deadlock-cloudflare-ips.timer", "deadlock-health-monitor.service", "deadlock-health-monitor.timer"]
-              state_keys = {"schema", "collection_completed", "validate_status", "verify_status", "current_facts_status", "mismatch_count", "historical_cause_proven", "expected_units", "observed_units"}
+              state_keys = {"schema", "collection_completed", "validate_status", "verify_status", "current_facts_status", "mismatch_count", "historical_cause_proven", "expected_units", "observed_units", "failure_phase", "failure_check", "failure_class", "failure_reason", "failure_unit", "failure_query", "failure_rc"}
+              phases = {"none", "module", "systemctl_path", "transaction", "receipt", "binding", "unit_active", "unit_enabled", "verify"}
+              checks = {"none", "diagnostic_receipt_absent", "systemctl_path", "transaction_read", "systemd_module_identity", "module_metadata", "module_open", "module_identity", "module_size", "module_changed", "module_import", "existing_receipt_transaction", "runtime_target_binding", "current_binding", "previous_binding", "existing_receipt_validate", "release_metadata", "helper_digests", "diagnostic_target_binding", "unit_active", "unit_enabled", "diagnostic_receipt_units", "unit_snapshot", "systemd_verify"}
+              classes = {"none", "predicate", "oserror", "StateError", "ValueError", "TypeError", "TimeoutExpired", "timeout", "exception"}
+              reasons = {"none", "binding", "unsupported_state", "status_mismatch", "command_error", "malformed_output", "timeout", "receipt_state_invalid", "verify_mismatch", "verification_error"}
               if type(state) is not dict or set(state) != state_keys or type(state["schema"]) is not int or state["schema"] != 1 or type(state["collection_completed"]) is not bool or state["historical_cause_proven"] is not False:
                   raise SystemExit(2)
               if not isinstance(state["validate_status"], str) or state["validate_status"] not in {"passed", "failed", "unavailable"} or not isinstance(state["verify_status"], str) or state["verify_status"] not in {"passed", "failed", "unavailable"} or not isinstance(state["current_facts_status"], str) or state["current_facts_status"] not in {"matched", "mismatch", "unavailable"}:
                   raise SystemExit(2)
+              if not isinstance(state["failure_phase"], str) or state["failure_phase"] not in phases or not isinstance(state["failure_check"], str) or state["failure_check"] not in checks or not isinstance(state["failure_class"], str) or state["failure_class"] not in classes or not isinstance(state["failure_reason"], str) or state["failure_reason"] not in reasons or not isinstance(state["failure_unit"], str) or state["failure_unit"] not in {"none", *unit_names} or not isinstance(state["failure_query"], str) or state["failure_query"] not in {"none", "active", "enabled"} or (state["failure_rc"] != "unavailable" and (type(state["failure_rc"]) is not int or not 0 <= state["failure_rc"] <= 255)):
+                  raise SystemExit(2)
+              failure = state["failure_reason"] != "none"
+              if (not failure and any(state[key] != expected for key, expected in (("failure_phase", "none"), ("failure_check", "none"), ("failure_class", "none"), ("failure_unit", "none"), ("failure_query", "none"), ("failure_rc", "unavailable")))) or (failure and (state["failure_phase"] == "none" or state["failure_check"] == "none" or state["failure_class"] == "none")) or ((state["failure_unit"] == "none") != (state["failure_query"] == "none")) or (state["failure_rc"] != "unavailable" and state["failure_unit"] == "none") or (state["failure_reason"] in {"unsupported_state", "status_mismatch"} and (state["failure_unit"] == "none" or state["failure_rc"] == "unavailable")) or (marker["returncode"] == 0 and failure):
+                  raise SystemExit(2)
               if type(state["mismatch_count"]) is not int or not 0 <= state["mismatch_count"] <= 13:
                   raise SystemExit(2)
-              for key in ("expected_units", "observed_units"):
-                  rows = state[key]
-                  if type(rows) is not list:
+              expected = state["expected_units"]
+              observed = state["observed_units"]
+              if type(expected) is not list or type(observed) is not list or len(expected) not in {0, 13} or len(observed) > 13:
+                  raise SystemExit(2)
+              for index, row in enumerate(expected):
+                  if type(row) is not dict or set(row) != {"unit", "active", "enabled"} or row["unit"] != unit_names[index] or not isinstance(row["active"], str) or row["active"] not in {"active", "inactive"} or not isinstance(row["enabled"], str) or row["enabled"] not in {"enabled", "disabled", "static"}:
                       raise SystemExit(2)
-                  if state["collection_completed"]:
-                      if len(rows) != len(unit_names):
-                          raise SystemExit(2)
-                      for expected_name, row in zip(unit_names, rows, strict=True):
-                          if type(row) is not dict or set(row) != {"unit", "active", "enabled"} or row["unit"] != expected_name:
-                              raise SystemExit(2)
-                          if not isinstance(row["active"], str) or row["active"] not in {"active", "inactive"} or not isinstance(row["enabled"], str) or row["enabled"] not in {"enabled", "disabled", "static", "indirect", "masked", "generated", "transient"}:
-                              raise SystemExit(2)
-                  elif rows:
+              active_values = {"active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance", "unknown", "empty", "other", "unavailable"}
+              enabled_values = {"enabled", "disabled", "static", "indirect", "masked", "generated", "transient", "unknown", "empty", "other", "unavailable"}
+              for index, row in enumerate(observed):
+                  if type(row) is not dict or set(row) != {"unit", "active", "enabled"} or row["unit"] != unit_names[index] or not isinstance(row["active"], str) or row["active"] not in active_values or not isinstance(row["enabled"], str) or row["enabled"] not in enabled_values:
+                      raise SystemExit(2)
+              if not state["collection_completed"]:
+                  if (expected and len(expected) != 13) or state["current_facts_status"] != "unavailable" or state["mismatch_count"] != 0:
                       raise SystemExit(2)
               if state["collection_completed"]:
-                  differences = sum(expected != observed for expected, observed in zip(state["expected_units"], state["observed_units"], strict=True))
-                  if differences != state["mismatch_count"] or state["current_facts_status"] != ("mismatch" if differences else "matched"):
+                  if len(expected) != 13 or len(observed) != 13:
                       raise SystemExit(2)
-              elif state["current_facts_status"] != "unavailable" or state["mismatch_count"] != 0:
-                  raise SystemExit(2)
-              state_passed = (state["collection_completed"] and state["validate_status"] == "passed" and state["verify_status"] == "passed" and state["current_facts_status"] == "matched" and state["mismatch_count"] == 0)
+                  comparable = all(row["active"] not in {"unknown", "empty", "other", "unavailable"} and row["enabled"] not in {"unknown", "empty", "other", "unavailable"} for row in observed)
+                  if not comparable:
+                      if state["current_facts_status"] != "unavailable" or state["mismatch_count"] != 0:
+                          raise SystemExit(2)
+                  else:
+                      differences = sum(left != right for left, right in zip(expected, observed, strict=True))
+                      if differences != state["mismatch_count"] or state["current_facts_status"] != ("mismatch" if differences else "matched"):
+                          raise SystemExit(2)
+              state_passed = (state["collection_completed"] and state["validate_status"] == "passed" and state["verify_status"] == "passed" and state["current_facts_status"] == "matched" and state["mismatch_count"] == 0 and state["failure_phase"] == "none" and state["failure_check"] == "none" and state["failure_class"] == "none" and state["failure_reason"] == "none" and state["failure_unit"] == "none" and state["failure_query"] == "none" and state["failure_rc"] == "unavailable")
               if (marker["returncode"] == 0) != state_passed:
                   raise SystemExit(2)
               if marker["returncode"] != 0 and marker["returncode"] != 1:

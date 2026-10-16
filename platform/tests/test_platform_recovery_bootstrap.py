@@ -1732,6 +1732,13 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 "historical_cause_proven": False,
                 "expected_units": diagnostic_rows,
                 "observed_units": diagnostic_rows,
+                "failure_phase": "none",
+                "failure_check": "none",
+                "failure_class": "none",
+                "failure_reason": "none",
+                "failure_unit": "none",
+                "failure_query": "none",
+                "failure_rc": "unavailable",
             }
             diagnostic_output = json.dumps(
                 systemd_diagnostic, sort_keys=True, separators=(",", ":"),

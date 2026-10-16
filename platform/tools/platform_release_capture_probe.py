@@ -63,6 +63,27 @@ _SYSTEMD_STATE_VALUES = frozenset(
     ("active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance", "unknown")
 )
 _SYSTEMD_ENABLED_VALUES = frozenset(("enabled", "disabled", "static", "indirect", "masked", "generated", "transient", "unknown"))
+_DIAGNOSTIC_PHASES = frozenset((
+    "none", "module", "systemctl_path", "transaction", "receipt", "binding",
+    "unit_active", "unit_enabled", "verify",
+))
+_DIAGNOSTIC_CHECKS = frozenset((
+    "none", "diagnostic_receipt_absent", "systemctl_path", "transaction_read",
+    "systemd_module_identity", "module_metadata", "module_open", "module_identity", "module_size", "module_changed", "module_import",
+    "existing_receipt_transaction", "runtime_target_binding", "current_binding",
+    "previous_binding", "existing_receipt_validate", "release_metadata",
+    "helper_digests", "diagnostic_target_binding", "unit_active", "unit_enabled",
+    "diagnostic_receipt_units", "unit_snapshot", "systemd_verify",
+))
+_DIAGNOSTIC_CLASSES = frozenset((
+    "none", "predicate", "oserror", "StateError", "ValueError", "TypeError",
+    "TimeoutExpired", "timeout", "exception",
+))
+_DIAGNOSTIC_REASONS = frozenset((
+    "none", "binding", "unsupported_state", "status_mismatch", "command_error",
+    "malformed_output", "timeout", "receipt_state_invalid", "verify_mismatch",
+    "verification_error",
+))
 
 
 def _safe_systemd_value(value: str, command: str) -> str:
@@ -70,6 +91,116 @@ def _safe_systemd_value(value: str, command: str) -> str:
         return "empty"
     known = _SYSTEMD_STATE_VALUES if command == "is-active" else _SYSTEMD_ENABLED_VALUES
     return value if value in known else "other"
+
+
+def _diagnostic_systemd_snapshot(
+    module: Any,
+    *,
+    deadline: float,
+    evidence: dict[str, object],
+) -> tuple[list[dict[str, object]], bool]:
+    """Collect bounded observations through the pinned helper's read-only CLI."""
+    units = getattr(module, "OWNED_UNITS", ())
+    if not isinstance(units, (tuple, list)) or len(units) != 13:
+        evidence.update(failure_phase="binding", failure_check="diagnostic_receipt_units", failure_class="StateError", failure_reason="binding")
+        return [], False
+    observed: list[dict[str, object]] = []
+    for unit in units:
+        row: dict[str, object] = {"unit": unit, "active": "unavailable", "enabled": "unavailable"}
+        for query, field in (("is-active", "active"), ("is-enabled", "enabled")):
+            if evidence["failure_reason"] == "none":
+                evidence["failure_phase"] = "unit_active" if field == "active" else "unit_enabled"
+                evidence["failure_check"] = "unit_active" if field == "active" else "unit_enabled"
+                evidence["failure_unit"] = unit
+                evidence["failure_query"] = field
+                evidence["failure_rc"] = "unavailable"
+            if time.monotonic() >= deadline:
+                if evidence["failure_reason"] == "none":
+                    evidence.update(
+                        failure_phase="unit_active" if field == "active" else "unit_enabled",
+                        failure_check="unit_active" if field == "active" else "unit_enabled",
+                        failure_class="timeout",
+                        failure_reason="timeout",
+                        failure_unit=unit,
+                        failure_query=field,
+                        failure_rc="unavailable",
+                    )
+                observed.append(row)
+                return observed, False
+            try:
+                returncode, value = module._run_systemctl(query, unit)
+            except ProbeDeadlineExceeded:
+                raise
+            except Exception as exc:
+                cause = exc.__cause__
+                if evidence["failure_reason"] == "none":
+                    malformed = (
+                        type(exc).__name__ == "StateError"
+                        and str(exc) == "systemd command returned multiple states"
+                    )
+                    evidence.update(
+                        failure_class=("TimeoutExpired" if isinstance(cause, subprocess.TimeoutExpired) else "oserror" if isinstance(cause, OSError) else "StateError" if type(exc).__name__ == "StateError" else "exception"),
+                        failure_reason=(
+                            "timeout" if isinstance(cause, subprocess.TimeoutExpired)
+                            else "malformed_output" if malformed
+                            else "command_error"
+                        ),
+                        failure_unit=unit,
+                        failure_query=field,
+                        failure_rc="unavailable",
+                    )
+                observed.append(row)
+                evidence["observed_units"] = list(observed)
+                return observed, False
+            state = _safe_systemd_value(value, query)
+            row[field] = state
+            supported = {"active", "inactive"} if field == "active" else {"enabled", "disabled", "static"}
+            expected_rc = (0 if state == "active" else 3) if field == "active" else (0 if state in {"enabled", "static"} else 1)
+            if evidence["failure_reason"] == "none":
+                if state not in supported:
+                    evidence.update(failure_class="StateError", failure_reason="unsupported_state", failure_unit=unit, failure_query=field, failure_rc=returncode)
+                elif returncode != expected_rc:
+                    evidence.update(failure_class="StateError", failure_reason="status_mismatch", failure_unit=unit, failure_query=field, failure_rc=returncode)
+                else:
+                    evidence.update(failure_unit="none", failure_query="none", failure_rc="unavailable")
+            evidence["observed_units"] = [*observed, row]
+        observed.append(row)
+    return observed, True
+
+
+def _diagnostic_systemd_snapshot_with_deadline(
+    module: Any,
+    *,
+    deadline: float,
+    evidence: dict[str, object],
+) -> tuple[list[dict[str, object]], bool]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        evidence.update(failure_phase="unit_active", failure_check="unit_active", failure_class="timeout", failure_reason="timeout", failure_rc="unavailable")
+        return [], False
+    previous_alarm_handler = signal.getsignal(signal.SIGALRM)
+
+    def deadline_expired(_signum: int, _frame: Any) -> None:
+        raise ProbeDeadlineExceeded
+
+    signal.signal(signal.SIGALRM, deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        return _diagnostic_systemd_snapshot(module, deadline=deadline, evidence=evidence)
+    except ProbeDeadlineExceeded:
+        if evidence["failure_reason"] == "none":
+            evidence.update(
+                failure_phase="unit_active",
+                failure_check="unit_active",
+                failure_class="timeout",
+                failure_reason="timeout",
+                failure_rc="unavailable",
+            )
+        rows = evidence.get("observed_units")
+        return (rows if isinstance(rows, list) else []), False
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_alarm_handler)
 
 
 def _systemd_failure_observation(
@@ -963,6 +1094,8 @@ def _receipt_snapshot_and_preflight(
         raise
     if diagnostic_evidence is not None:
         diagnostic_evidence["validate_status"] = "passed"
+        diagnostic_evidence["failure_phase"] = "binding"
+        diagnostic_evidence["failure_check"] = "none"
     if (
         record.get("operation") != "rollback"
         or record.get("operation_id") != operation_id
@@ -1036,22 +1169,7 @@ def _receipt_snapshot_and_preflight(
         "nginx_preflight": "not_applicable",
         "nginx_preflight_returncode": "unavailable",
     }
-    states = _unit_snapshot_with_deadline(
-        module,
-        deadline=readonly_deadline,
-        result=result,
-    )
     units = getattr(module, "OWNED_UNITS", ())
-    if (
-        not isinstance(states, list)
-        or not isinstance(units, (tuple, list))
-        or len(units) != 13
-        or len(states) != 13
-        or any(not isinstance(item, dict) or item.get("name") != unit or item.get("active") not in _SYSTEMD_STATE_VALUES or item.get("enabled") not in _SYSTEMD_ENABLED_VALUES for unit, item in zip(units, states, strict=True))
-    ):
-        raise ProbeFailure("unit_snapshot")
-    result["service_active_count"] = sum(item["active"] == "active" for item in states)
-    result["service_enabled_count"] = sum(item["enabled"] == "enabled" for item in states)
     if diagnostic_evidence is not None:
         expected_units = record.get("units")
         if (
@@ -1071,36 +1189,217 @@ def _receipt_snapshot_and_preflight(
             {"unit": item["name"], "active": item["active"], "enabled": item["enabled"]}
             for item in expected_units
         ]
-        observed_snapshot = [
-            {"unit": item["name"], "active": item["active"], "enabled": item["enabled"]}
-            for item in states
-        ]
-        mismatch_count = sum(
-            expected != observed
-            for expected, observed in zip(expected_snapshot, observed_snapshot, strict=True)
+        diagnostic_evidence["failure_phase"] = "unit_active"
+        diagnostic_evidence["failure_check"] = "none"
+        diagnostic_evidence["failure_class"] = "none"
+        diagnostic_evidence["failure_reason"] = "none"
+        observed_snapshot, collection_completed = _diagnostic_systemd_snapshot_with_deadline(
+            module,
+            deadline=readonly_deadline,
+            evidence=diagnostic_evidence,
         )
+        diagnostic_evidence["expected_units"] = expected_snapshot
+        diagnostic_evidence["observed_units"] = observed_snapshot
+        if not collection_completed:
+            diagnostic_evidence["collection_completed"] = False
+            diagnostic_evidence["current_facts_status"] = "unavailable"
+            diagnostic_evidence["mismatch_count"] = 0
+            return record, result, target_label, target_path
+        diagnostic_evidence["collection_completed"] = True
+        comparable = all(
+            row["active"] not in {"unknown", "empty", "other", "unavailable"}
+            and row["enabled"] not in {"unknown", "empty", "other", "unavailable"}
+            for row in observed_snapshot
+        )
+        mismatch_count = sum(expected != observed for expected, observed in zip(expected_snapshot, observed_snapshot, strict=True)) if comparable else 0
         diagnostic_evidence.update(
-            collection_completed=True,
             expected_units=expected_snapshot,
             observed_units=observed_snapshot,
             mismatch_count=mismatch_count,
-            current_facts_status="mismatch" if mismatch_count else "matched",
+            current_facts_status=("unavailable" if not comparable else "mismatch" if mismatch_count else "matched"),
         )
-        try:
-            _run(
-                "systemd_verify",
-                lambda: module.verify(
-                    SYSTEMD_RECEIPT,
-                    app_dir=APP_DIR,
-                    transaction=TRANSACTION,
-                    helper_release=validation_release,
-                ),
+        if comparable and mismatch_count and diagnostic_evidence["failure_reason"] == "none":
+            mismatch_index = next(
+                index for index, (expected, observed) in enumerate(zip(expected_snapshot, observed_snapshot, strict=True))
+                if expected != observed
             )
-        except ProbeFailure:
+            expected_row = expected_snapshot[mismatch_index]
+            observed_row = observed_snapshot[mismatch_index]
+            query = "active" if expected_row["active"] != observed_row["active"] else "enabled"
+            observed_value = observed_row[query]
+            query_returncode = (
+                (0 if observed_value == "active" else 3)
+                if query == "active"
+                else (0 if observed_value in {"enabled", "static"} else 1)
+            )
+            diagnostic_evidence.update(
+                failure_phase="unit_active" if query == "active" else "unit_enabled",
+                failure_check="unit_active" if query == "active" else "unit_enabled",
+                failure_class="StateError",
+                failure_reason="status_mismatch",
+                failure_unit=expected_row["unit"],
+                failure_query=query,
+                failure_rc=query_returncode,
+            )
+        verify_remaining = readonly_deadline - time.monotonic()
+        if verify_remaining <= 0:
+            diagnostic_evidence["verify_status"] = "unavailable"
+            if diagnostic_evidence["failure_reason"] == "none":
+                diagnostic_evidence.update(
+                    failure_phase="verify", failure_check="systemd_verify",
+                    failure_class="timeout", failure_reason="timeout",
+                )
+            return record, result, target_label, target_path
+        previous_verify_alarm_handler = signal.getsignal(signal.SIGALRM)
+        verify_observation: dict[str, object] = {}
+        original_subprocess = getattr(module, "subprocess", None)
+
+        def observed_subprocess_run(*args: object, **kwargs: object) -> Any:
+            argv = args[0] if args else kwargs.get("args")
+            if isinstance(argv, (tuple, list)) and len(argv) >= 3:
+                verify_observation.update(
+                    query="active" if argv[1] == "is-active" else "enabled" if argv[1] == "is-enabled" else "none",
+                    unit=argv[2],
+                    returncode="unavailable",
+                    reason="command_error",
+                    error_class="oserror",
+                )
+            try:
+                completed = original_subprocess.run(*args, **kwargs)
+            except ProbeDeadlineExceeded:
+                verify_observation.update(reason="timeout", error_class="timeout")
+                raise
+            except Exception as exc:
+                verify_observation.update(
+                    reason="timeout" if isinstance(exc, subprocess.TimeoutExpired) else "command_error",
+                    error_class="TimeoutExpired" if isinstance(exc, subprocess.TimeoutExpired) else "oserror" if isinstance(exc, OSError) else "exception",
+                )
+                raise
+            output = completed.stdout if isinstance(completed.stdout, str) else ""
+            normalized_output = output.strip()
+            command = verify_observation.get("query")
+            if "\n" in normalized_output or "\r" in normalized_output:
+                verify_observation.update(returncode=completed.returncode, reason="malformed_output", error_class="StateError")
+            elif command in {"active", "enabled"}:
+                field_value = _safe_systemd_value(normalized_output, "is-active" if command == "active" else "is-enabled")
+                supported_values = {"active", "inactive"} if command == "active" else {"enabled", "disabled", "static"}
+                expected_status = (0 if field_value == "active" else 3) if command == "active" else (0 if field_value in {"enabled", "static"} else 1)
+                if field_value not in supported_values:
+                    verify_observation.update(returncode=completed.returncode, reason="unsupported_state", error_class="StateError")
+                elif completed.returncode != expected_status:
+                    verify_observation.update(returncode=completed.returncode, reason="status_mismatch", error_class="StateError")
+                else:
+                    verify_observation.update(returncode=completed.returncode, reason="none", error_class="none")
+            return completed
+
+        def verify_systemd_state() -> None:
+            module.subprocess = types.SimpleNamespace(
+                **{**vars(original_subprocess), "run": observed_subprocess_run}
+            )
+            try:
+                try:
+                    module.verify(
+                        SYSTEMD_RECEIPT,
+                        app_dir=APP_DIR,
+                        transaction=TRANSACTION,
+                        helper_release=validation_release,
+                    )
+                except ProbeDeadlineExceeded:
+                    raise
+                except Exception as exc:
+                    cause = exc.__cause__
+                    observed_reason = verify_observation.get("reason", "none")
+                    if observed_reason == "none":
+                        observed_reason = (
+                            "timeout" if isinstance(exc, subprocess.TimeoutExpired) or isinstance(cause, subprocess.TimeoutExpired)
+                            else "command_error" if isinstance(exc, OSError) or isinstance(cause, OSError)
+                            else "verify_mismatch" if (
+                                type(exc).__name__ == "StateError"
+                                and verify_observation.get("query") in {"active", "enabled"}
+                            )
+                            else "verification_error"
+                        )
+                    observed_class = (
+                        "TimeoutExpired" if isinstance(exc, subprocess.TimeoutExpired) or isinstance(cause, subprocess.TimeoutExpired)
+                        else "oserror" if isinstance(exc, OSError) or isinstance(cause, OSError)
+                        else type(exc).__name__ if type(exc).__name__ in _DIAGNOSTIC_CLASSES
+                        else "exception"
+                    )
+                    verify_observation.update(reason=observed_reason, error_class=observed_class)
+                    raise ProbeFailure("systemd_verify", observed_class) from None
+            finally:
+                module.subprocess = original_subprocess
+
+        def verify_deadline_expired(_signum: int, _frame: Any) -> None:
+            raise ProbeDeadlineExceeded
+
+        signal.signal(signal.SIGALRM, verify_deadline_expired)
+        signal.setitimer(signal.ITIMER_REAL, verify_remaining)
+        try:
+            if diagnostic_evidence["failure_reason"] == "none":
+                diagnostic_evidence["failure_phase"] = "verify"
+                diagnostic_evidence["failure_check"] = "systemd_verify"
+            verify_systemd_state()
+        except ProbeDeadlineExceeded:
+            diagnostic_evidence["verify_status"] = "unavailable"
+            if diagnostic_evidence["failure_reason"] == "none":
+                diagnostic_evidence.update(
+                    failure_phase="verify",
+                    failure_check="systemd_verify",
+                    failure_class="timeout", failure_reason="timeout",
+                    failure_unit=verify_observation.get("unit", "none"),
+                    failure_query=verify_observation.get("query", "none"),
+                    failure_rc=verify_observation.get("returncode", "unavailable"),
+                )
+        except ProbeFailure as exc:
             diagnostic_evidence["verify_status"] = "failed"
+            if diagnostic_evidence["failure_reason"] == "none":
+                error_class = verify_observation.get("error_class", exc.error_class)
+                if error_class not in _DIAGNOSTIC_CLASSES:
+                    error_class = "exception"
+                reason = verify_observation.get("reason", "none")
+                if reason not in _DIAGNOSTIC_REASONS:
+                    reason = "verification_error"
+                if reason == "none":
+                    reason = "verify_mismatch"
+                diagnostic_evidence["failure_class"] = error_class
+                diagnostic_evidence["failure_reason"] = reason
+                diagnostic_evidence["failure_phase"] = "verify"
+                diagnostic_evidence["failure_check"] = "systemd_verify"
+                if reason in {"unsupported_state", "status_mismatch", "malformed_output", "command_error", "timeout"}:
+                    diagnostic_evidence["failure_unit"] = verify_observation.get("unit", "none")
+                    diagnostic_evidence["failure_query"] = verify_observation.get("query", "none")
+                    diagnostic_evidence["failure_rc"] = verify_observation.get("returncode", "unavailable")
+                else:
+                    diagnostic_evidence["failure_unit"] = "none"
+                    diagnostic_evidence["failure_query"] = "none"
+                    diagnostic_evidence["failure_rc"] = "unavailable"
         else:
             diagnostic_evidence["verify_status"] = "passed"
+            if diagnostic_evidence["failure_reason"] == "none":
+                diagnostic_evidence["failure_phase"] = "none"
+                diagnostic_evidence["failure_check"] = "none"
+                diagnostic_evidence["failure_class"] = "none"
+                diagnostic_evidence["failure_reason"] = "none"
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_verify_alarm_handler)
         return record, result, target_label, target_path
+    states = _unit_snapshot_with_deadline(
+        module,
+        deadline=readonly_deadline,
+        result=result,
+    )
+    if (
+        not isinstance(states, list)
+        or not isinstance(units, (tuple, list))
+        or len(units) != 13
+        or len(states) != 13
+        or any(not isinstance(item, dict) or item.get("name") != unit or item.get("active") not in _SYSTEMD_STATE_VALUES or item.get("enabled") not in _SYSTEMD_ENABLED_VALUES for unit, item in zip(units, states, strict=True))
+    ):
+        raise ProbeFailure("unit_snapshot")
+    result["service_active_count"] = sum(item["active"] == "active" for item in states)
+    result["service_enabled_count"] = sum(item["enabled"] == "enabled" for item in states)
     if target is None:
         result["nginx_preflight"] = "not_applicable"
         result["nginx_preflight_returncode"] = "unavailable"
@@ -1291,20 +1590,42 @@ def _diagnostic_systemd_probe(
         "historical_cause_proven": False,
         "expected_units": [],
         "observed_units": [],
+        "failure_phase": "module",
+        "failure_check": "none",
+        "failure_class": "none",
+        "failure_reason": "none",
+        "failure_unit": "none",
+        "failure_query": "none",
+        "failure_rc": "unavailable",
     }
     try:
         if not companion_present:
             raise ProbeFailure("diagnostic_receipt_absent")
         module = _load_pinned_module(expected_systemd_sha256)
+        evidence["failure_phase"] = "systemctl_path"
         _run("systemctl_path", lambda: module._validate_systemctl_path(module.SYSTEMCTL))
+        evidence["failure_phase"] = "transaction"
         transaction = _run("transaction_read", lambda: module._read_transaction(TRANSACTION, APP_DIR))
+        evidence["failure_phase"] = "receipt"
         _receipt_snapshot_and_preflight(
             module,
             transaction,
             deadline=deadline,
             diagnostic_evidence=evidence,
         )
-    except Exception:
+    except Exception as exc:
+        check = exc.check if isinstance(exc, ProbeFailure) else "none"
+        error_class = exc.error_class if isinstance(exc, ProbeFailure) else type(exc).__name__
+        evidence["failure_check"] = check if check in _DIAGNOSTIC_CHECKS else "none"
+        evidence["failure_class"] = error_class if error_class in _DIAGNOSTIC_CLASSES else "exception"
+        if evidence["failure_reason"] == "none":
+            evidence["failure_reason"] = (
+                "timeout" if evidence["failure_class"] in {"timeout", "TimeoutExpired"}
+                else "command_error" if evidence["failure_class"] in {"oserror", "OSError"}
+                else "receipt_state_invalid" if check == "existing_receipt_validate"
+                else "binding" if evidence["failure_phase"] in {"module", "systemctl_path", "transaction", "receipt", "binding"}
+                else "verification_error"
+            )
         state = "unavailable"
         public_report: dict[str, object] = {
             "schema": 1,
@@ -1313,7 +1634,7 @@ def _diagnostic_systemd_probe(
             "failed_check": "diagnostic_unavailable",
             "error_class": "predicate",
             "diagnostic_systemd_state": state,
-            "diagnostic_systemd_state_returncode": "unavailable",
+            "diagnostic_systemd_state_returncode": 1,
         }
         marker_returncode = 1
     else:
