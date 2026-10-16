@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools import platform_release_capture_probe as probe
+from tools import platform_decrypt_maintenance_evidence as diagnostics_decrypt
 from tools import platform_live_qa_runtime_install as runtime_installer
 from tools import platform_release_systemd_state as systemd_state
 
@@ -185,6 +186,11 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                     else b"#!/bin/sh\nexit 0\n"
                 )
                 helper.chmod(0o755)
+        # These are trusted source fixtures for the read-only checker invocation.
+        for relative in ("platform_health_monitor.py", "platform_disk_policy.py"):
+            (current / "tools" / relative).write_bytes(
+                (Path(probe.__file__).parent / relative).read_bytes()
+            )
         current_link = app_dir / "current"
         previous_link = app_dir / "previous"
         current_link.symlink_to(current)
@@ -286,6 +292,16 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
         failure: BaseException | None = None,
         responses: dict[tuple[str, str], list[tuple[int, str] | BaseException]] | None = None,
         deadline_on_call: tuple[str, str, int] | None = None,
+        health_ok: bool = True,
+        health_returncode: int | None = None,
+        health_stdout: bytes | None = None,
+        health_failure: BaseException | None = None,
+        health_property_failure: tuple[str, str, int] | None = None,
+        health_property_overrides: dict[str, str] | None = None,
+        health_jobs_output: bytes | None = None,
+        health_journal_output: bytes | None = None,
+        health_cgroup_contents: str | None = None,
+        health_jobs_unbounded: bool = False,
     ) -> tuple[dict[str, object], dict[str, object], dict[str, object], list[tuple[str, str]]]:
         root = Path(fixture["app_dir"]).parent
         actual_identity = (os.geteuid(), os.getegid())
@@ -294,6 +310,9 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
         calls: list[tuple[str, str]] = []
         diagnostic_phase = [False]
         query_counts: dict[tuple[str, str], int] = {}
+        health_commands: list[tuple[str, ...]] = []
+        health_invocations: list[tuple[tuple[str, ...], dict[str, object]]] = []
+        health_processes: list[subprocess.Popen[bytes]] = []
 
         def state_for(query: str, unit: str) -> tuple[int, str]:
             expected = {
@@ -315,7 +334,34 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
 
         def external_boundary(argv, *args, **kwargs):
             if isinstance(argv, (list, tuple)) and argv and argv[0] == str(systemctl):
-                action, unit = str(argv[1]), str(argv[2])
+                action = str(argv[1])
+                if action == "show":
+                    unit = str(argv[2])
+                    field = next(str(arg).split("=", 1)[1] for arg in argv if str(arg).startswith("--property="))
+                    health_commands.append(tuple(str(part) for part in argv))
+                    health_invocations.append((tuple(str(part) for part in argv), dict(kwargs)))
+                    values = {
+                        "Id": unit,
+                        "FragmentPath": f"/etc/systemd/system/{unit}",
+                        "LoadState": "loaded",
+                        "ActiveState": "active" if unit.endswith(".timer") else "active",
+                        "SubState": "waiting" if unit.endswith(".timer") else "running",
+                        "Result": "success",
+                        "ExecMainCode": "0",
+                        "ExecMainStatus": "0",
+                        "MainPID": "1234",
+                        "ControlPID": "0",
+                        "ControlGroup": "/system.slice/deadlock-health-monitor.service",
+                        "UnitFileState": "enabled",
+                        "ExecMainStartTimestamp": "Fri 2026-10-17 12:00:00 EEST",
+                        "ExecMainExitTimestamp": "",
+                        "LastTriggerUSec": "Fri 2026-10-17 12:00:00 EEST",
+                        "NextElapseUSecRealtime": "Fri 2026-10-17 13:00:00 EEST",
+                    }
+                    values.update(health_property_overrides or {})
+                    status = health_property_failure[2] if health_property_failure and health_property_failure[:2] == (unit, field) else 0
+                    return SimpleNamespace(returncode=status, stdout=values[field] + "\n")
+                unit = str(argv[2])
                 calls.append((action, unit))
                 call_number = query_counts.get((action, unit), 0) if diagnostic_phase[0] else -1
                 if diagnostic_phase[0]:
@@ -338,7 +384,73 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 else:
                     returncode, output = state_for(action, unit)
                 return SimpleNamespace(returncode=returncode, stdout=output + "\n")
+            if isinstance(argv, (list, tuple)) and len(argv) >= 3 and str(argv[1]) == "-B" and str(argv[2]).endswith("/platform_health_monitor.py"):
+                health_commands.append(tuple(str(part) for part in argv))
+                health_invocations.append((tuple(str(part) for part in argv), dict(kwargs)))
+                if health_failure is not None:
+                    raise health_failure
+                report = {
+                    "event": "platform_health_monitor",
+                    "timestamp": "2026-10-17T12:00:00+03:00",
+                    "ok": health_ok,
+                    "failed": [] if health_ok else ["disk"],
+                    "checks": [
+                        {"name": name, "ok": health_ok or name != "disk", "detail": {"free_gib": 6}}
+                        for name in probe.HEALTH_CHECK_NAMES
+                    ],
+                }
+                stdout = health_stdout if health_stdout is not None else json.dumps(report).encode("utf-8")
+                return subprocess.CompletedProcess(argv, 0 if health_returncode is None and health_ok else (1 if health_returncode is None else health_returncode), stdout=stdout, stderr=b"")
             return real_run(argv, *args, **kwargs)
+
+        real_popen = subprocess.Popen
+
+        def bounded_health_child(argv, *args, **kwargs):
+            command = tuple(str(part) for part in argv)
+            if command[:2] == (str(systemctl), "list-jobs"):
+                health_commands.append(command)
+                health_invocations.append((command, dict(kwargs)))
+                if health_jobs_unbounded:
+                    child_code = "import sys; block=b'X'*8192\nwhile True:\n sys.stdout.buffer.write(block); sys.stdout.buffer.flush()"
+                else:
+                    body = health_jobs_output if health_jobs_output is not None else b"No jobs running.\n"
+                    child_code = "import sys; sys.stdout.buffer.write(bytes.fromhex('" + body.hex() + "'))"
+            elif command and command[0] == "/usr/bin/journalctl":
+                health_commands.append(command)
+                health_invocations.append((command, dict(kwargs)))
+                if health_journal_output is None:
+                    rows = [
+                        {"__REALTIME_TIMESTAMP": str(1792231200000000 + index), "PRIORITY": "6", "MESSAGE": f"health check {index}"}
+                        for index in range(10)
+                    ]
+                    rows[-1]["MESSAGE"] = "Bearer super-secret-token"
+                    body = b"".join(json.dumps(row).encode("utf-8") + b"\n" for row in rows)
+                else:
+                    body = health_journal_output
+                child_code = "import sys; sys.stdout.buffer.write(bytes.fromhex('" + body.hex() + "'))"
+            elif len(command) >= 3 and command[1] == "-B" and command[2].endswith("/platform_health_monitor.py"):
+                health_commands.append(command)
+                health_invocations.append((command, dict(kwargs)))
+                if health_failure is not None:
+                    raise health_failure
+                report = {
+                    "event": "platform_health_monitor",
+                    "timestamp": "2026-10-17T12:00:00+03:00",
+                    "ok": health_ok,
+                    "failed": [] if health_ok else ["disk"],
+                    "checks": [
+                        {"name": name, "ok": health_ok or name != "disk", "detail": {"free_gib": 6}}
+                        for name in probe.HEALTH_CHECK_NAMES
+                    ],
+                }
+                body = health_stdout if health_stdout is not None else json.dumps(report).encode("utf-8")
+                returncode = 0 if health_returncode is None and health_ok else (1 if health_returncode is None else health_returncode)
+                child_code = "import sys; sys.stdout.buffer.write(bytes.fromhex('" + body.hex() + "')); sys.exit(" + str(returncode) + ")"
+            else:
+                return real_popen(argv, *args, **kwargs)
+            process = real_popen([sys.executable, "-c", child_code], *args, **kwargs)
+            health_processes.append(process)
+            return process
 
         real_lstat = Path.lstat
         real_fstat = os.fstat
@@ -361,6 +473,26 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 return metadata
             return self._root_owned_stat(metadata) if opened_path.is_relative_to(root.resolve()) else metadata
 
+        cgroup_root = root / "cgroup"
+        cgroup_dir = cgroup_root / "system.slice" / "deadlock-health-monitor.service"
+        cgroup_dir.mkdir(parents=True)
+        cgroup_file = cgroup_dir / "cgroup.procs"
+        cgroup_file.write_text(health_cgroup_contents if health_cgroup_contents is not None else "1234\n5678\n", encoding="ascii")
+        real_resolve = Path.resolve
+        real_open = os.open
+
+        def fixture_resolve(path: Path, *args, **kwargs):
+            if path == Path("/sys/fs/cgroup"):
+                return cgroup_root
+            if path == Path("/sys/fs/cgroup/system.slice/deadlock-health-monitor.service"):
+                return cgroup_dir
+            return real_resolve(path, *args, **kwargs)
+
+        def fixture_open(path, flags, *args, **kwargs):
+            if Path(path) == Path("/sys/fs/cgroup/system.slice/deadlock-health-monitor.service/cgroup.procs"):
+                return real_open(cgroup_file, flags, *args, **kwargs)
+            return real_open(path, flags, *args, **kwargs)
+
         emitted = BytesIO()
         real_loader = probe._load_pinned_module
 
@@ -372,8 +504,11 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
 
         with (
             patch.object(Path, "lstat", new=trusted_lstat),
+            patch.object(Path, "resolve", new=fixture_resolve),
             patch.object(os, "fstat", new=trusted_fstat),
+            patch.object(os, "open", new=fixture_open),
             patch.object(subprocess, "run", side_effect=external_boundary),
+            patch.object(subprocess, "Popen", side_effect=bounded_health_child),
             patch.object(systemd_state, "SYSTEMCTL", str(systemctl)),
             patch.object(systemd_state, "SYSTEMCTL_PATH", str(systemctl)),
             patch.object(probe, "APP_DIR", Path(fixture["app_dir"])),
@@ -416,7 +551,15 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                     diagnostic_systemd_state=True,
                 )
             after = self._tree_snapshot(root)
-        marker, detail = self._private_detail(emitted)
+            marker, detail = self._private_detail(emitted)
+        if fixture.get("corrupt_receipt_binding"):
+            self.assertEqual(health_commands, [])
+        else:
+            self.assertTrue(health_commands)
+        fixture["health_commands"] = health_commands
+        fixture["health_invocations"] = health_invocations
+        fixture["health_processes"] = health_processes
+        fixture["private_marker_bytes"] = emitted.getvalue()
         self.assertEqual(before, after, "diagnostic capture changed fixture state")
         self.assertTrue(all(action in {"is-active", "is-enabled"} for action, _ in calls))
         return result, marker, detail, calls
@@ -654,6 +797,79 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             self.assertFalse(detail["historical_cause_proven"])
             self.assertEqual(len(detail["expected_units"]), 13)
             self.assertEqual(detail["expected_units"], detail["observed_units"])
+            health = detail["health_monitor"]
+            self.assertEqual(
+                set(health),
+                {"schema", "collection_completed", "started_at_utc", "finished_at_utc", "target_source_sha", "service", "timer", "jobs", "cgroup", "journal", "checker", "failure_phase", "failure_check", "failure_class"},
+            )
+            self.assertTrue(health["collection_completed"], json.dumps(health, ensure_ascii=False))
+            self.assertEqual(health["target_source_sha"], probe.DIAGNOSTIC_TARGET_SOURCE_SHA)
+            self.assertEqual(health["service"]["status"], "passed")
+            self.assertEqual(health["timer"]["status"], "passed")
+            service_properties = health["service"]["properties"]
+            timer_properties = health["timer"]["properties"]
+            self.assertEqual(
+                set(service_properties),
+                set(probe.HEALTH_SERVICE_PROPERTIES),
+            )
+            self.assertEqual(
+                set(timer_properties),
+                set(probe.HEALTH_TIMER_PROPERTIES),
+            )
+            show_fields = [
+                next(part.split("=", 1)[1] for part in command if part.startswith("--property="))
+                for command in fixture["health_commands"]
+                if len(command) > 2 and command[1] == "show"
+            ]
+            self.assertEqual(
+                show_fields,
+                [*probe.HEALTH_SERVICE_PROPERTIES, *probe.HEALTH_TIMER_PROPERTIES],
+            )
+            self.assertTrue(all(code == 0 for code in health["service"]["returncodes"].values()))
+            self.assertTrue(all(code == 0 for code in health["timer"]["returncodes"].values()))
+            self.assertEqual(service_properties["ExecMainStartTimestamp"], "Fri 2026-10-17 12:00:00 EEST")
+            self.assertEqual(service_properties["ExecMainExitTimestamp"], "")
+            self.assertEqual(timer_properties["LastTriggerUSec"], "Fri 2026-10-17 12:00:00 EEST")
+            self.assertEqual(timer_properties["NextElapseUSecRealtime"], "Fri 2026-10-17 13:00:00 EEST")
+            self.assertEqual(service_properties["ControlGroup"], "/system.slice/deadlock-health-monitor.service")
+            self.assertEqual(health["jobs"], {"status": "passed", "returncode": 0, "count": 0, "rows": [], "truncated": False})
+            self.assertEqual(health["cgroup"]["pids"], [1234, 5678])
+            self.assertEqual(health["journal"]["total_entries"], 10)
+            self.assertEqual(len(health["journal"]["entries"]), probe.MAX_HEALTH_JOURNAL_ROWS)
+            self.assertNotIn("super-secret-token", json.dumps(health))
+            self.assertEqual(health["checker"]["status"], "reported")
+            self.assertEqual(set(health["service"]), {"status", "returncodes", "properties", "failed_property"})
+            self.assertEqual(set(health["timer"]), {"status", "returncodes", "properties", "failed_property"})
+            self.assertIsNone(health["service"]["failed_property"])
+            self.assertIsNone(health["timer"]["failed_property"])
+            self.assertEqual(set(health["jobs"]), {"status", "returncode", "count", "rows", "truncated"})
+            self.assertEqual(set(health["cgroup"]), {"status", "control_group", "count", "pids", "truncated"})
+            self.assertEqual(set(health["journal"]), {"status", "returncode", "total_entries", "entries", "truncated"})
+            self.assertEqual(set(health["checker"]), {"status", "returncode", "report"})
+            self.assertTrue(health["checker"]["report"]["ok"])
+            self.assertEqual(
+                hashlib.sha256((Path(fixture["current"]) / "tools/platform_health_monitor.py").read_bytes()).hexdigest(),
+                probe.DIAGNOSTIC_HEALTH_MONITOR_SHA256,
+            )
+            self.assertEqual(
+                hashlib.sha256((Path(fixture["current"]) / "tools/platform_disk_policy.py").read_bytes()).hexdigest(),
+                probe.DIAGNOSTIC_DISK_POLICY_SHA256,
+            )
+            checker = next(argv for argv in fixture["health_commands"] if argv[1:2] == ("-B",))
+            self.assertEqual(
+                checker,
+                (str(probe.SHARED_PYTHON), "-B", str(Path(fixture["current"]) / "tools/platform_health_monitor.py"), "--disk-min-free-gib", "5", "--disk-max-used-percent", "85"),
+            )
+            checker_kwargs = next(kwargs for argv, kwargs in fixture["health_invocations"] if argv == checker)
+            self.assertIs(checker_kwargs["stdin"], subprocess.DEVNULL)
+            self.assertIs(checker_kwargs["stdout"], subprocess.PIPE)
+            self.assertIs(checker_kwargs["stderr"], subprocess.PIPE)
+            self.assertTrue(checker_kwargs["close_fds"])
+            self.assertNotIn("start_new_session", checker_kwargs)
+            self.assertEqual(checker_kwargs["env"], {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"})
+            self.assertEqual(len(health["started_at_utc"]), 25)
+            self.assertEqual(len(health["finished_at_utc"]), 25)
+            self.assertTrue(all(argv[1] not in {"start", "stop", "restart", "reset-failed", "daemon-reload"} for argv in fixture["health_commands"] if argv and argv[0] == str(fixture["systemctl"])))
             self.assertEqual(fixture["current"].name, "gha-current-9ceaf09ab7ba")
             self.assertEqual(fixture["candidate"].name, "gha-candidate-2067f42029d8")
             transaction = json.loads(Path(fixture["transaction"]).read_text(encoding="ascii"))
@@ -680,6 +896,71 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             self.assertEqual(len(calls), 52)  # collector + canonical verify
             self.assertEqual(probe.probe.__kwdefaults__["diagnostic_systemd_state"], False)
             self.assertNotIn("expected_units", json.dumps(result))
+            self.assertNotIn("health_monitor", result)
+            self.assertNotIn("deadlock-health-monitor.service", json.dumps(result))
+
+            # Exercise every retained section at its current bound with valid
+            # Unicode and rows beyond each retention limit. The complete
+            # decoded private JSON remains within the 16 KiB capture contract.
+            fixture = self._genuine_diagnostic_fixture(root / "maximum-health-evidence")
+            long_unit = "u" + "x" * (128 - 1)
+            jobs_lines = ["JOB UNIT TYPE STATE"]
+            jobs_lines.extend(f"{index} {long_unit} start running" for index in range(1, 11))
+            jobs_lines.append("10 jobs listed.")
+            journal_rows = [
+                {
+                    "__REALTIME_TIMESTAMP": str(1792231200000000 + index),
+                    "PRIORITY": "6",
+                    "MESSAGE": ("x" * probe.MAX_HEALTH_JOURNAL_MESSAGE_CHARS) if index % 2 else "界" * 64,
+                }
+                for index in range(6)
+            ]
+            wide_value = "x" * probe.MAX_HEALTH_PROPERTY_VALUE_CHARS
+            wide_overrides = {
+                field: wide_value
+                for field in (*probe.HEALTH_SERVICE_PROPERTIES, *probe.HEALTH_TIMER_PROPERTIES)
+                if field not in {"Id", "LoadState", "ActiveState", "ControlGroup", "UnitFileState"}
+            }
+            checker_report = {
+                "event": "platform_health_monitor",
+                "timestamp": "2026-10-17T12:00:00+03:00",
+                "ok": True,
+                "failed": [],
+                "checks": [
+                    {"name": name, "ok": True, "detail": {"sample": "界" * 18}}
+                    for name in probe.HEALTH_CHECK_NAMES
+                ],
+            }
+            result, _marker, detail, _calls = self._run_genuine_diagnostic(
+                fixture,
+                health_property_overrides=wide_overrides,
+                health_jobs_output=("\n".join(jobs_lines) + "\n").encode("ascii"),
+                health_journal_output=b"".join(json.dumps(row, ensure_ascii=False).encode("utf-8") + b"\n" for row in journal_rows),
+                health_cgroup_contents="".join(f"{pid}\n" for pid in range(1000, 1040)),
+                health_stdout=json.dumps(checker_report, ensure_ascii=False).encode("utf-8"),
+            )
+            health = detail["health_monitor"]
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(len(health["jobs"]["rows"]), probe.MAX_HEALTH_JOB_ROWS)
+            self.assertEqual(health["jobs"]["count"], 10)
+            self.assertTrue(health["jobs"]["truncated"])
+            self.assertTrue(all(len(row["unit"]) <= 128 for row in health["jobs"]["rows"]))
+            self.assertEqual(health["cgroup"]["status"], "passed", json.dumps(health["cgroup"], ensure_ascii=False))
+            self.assertEqual(len(health["cgroup"]["pids"]), probe.MAX_HEALTH_CGROUP_PIDS)
+            self.assertEqual(health["cgroup"]["count"], 40)
+            self.assertTrue(health["cgroup"]["truncated"])
+            self.assertEqual(len(health["journal"]["entries"]), probe.MAX_HEALTH_JOURNAL_ROWS)
+            self.assertTrue(all(len(row["message"]) <= probe.MAX_HEALTH_JOURNAL_MESSAGE_CHARS for row in health["journal"]["entries"]))
+            self.assertTrue(all(len(json.dumps(row["message"], ensure_ascii=True, separators=(",", ":")).encode("ascii")) <= probe.MAX_HEALTH_JOURNAL_MESSAGE_JSON_BYTES for row in health["journal"]["entries"]))
+            self.assertTrue(health["journal"]["truncated"])
+            self.assertEqual(len(health["service"]["properties"]["FragmentPath"].encode("utf-8")), probe.MAX_HEALTH_PROPERTY_BYTES)
+            self.assertLessEqual(
+                len(json.dumps(health["checker"]["report"], ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")),
+                probe.MAX_HEALTH_CHECKER_REPORT_JSON_BYTES,
+            )
+            retained_private = base64.b64decode(_marker["output_b64"], validate=True)
+            self.assertLessEqual(len(retained_private), probe.MAX_PRIVATE_RETAINED_BYTES)
+            self.assertLessEqual(len(fixture["private_marker_bytes"]), diagnostics_decrypt.MAX_RUNTIME_REMOTE_STDERR_BYTES)
 
     def test_diagnostic_systemd_state_preserves_bounded_private_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -719,6 +1000,7 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             result, _marker, detail, _calls = self._run_genuine_diagnostic(
                 fixture,
                 responses=changing_observation,
+                health_ok=False,
             )
             self.assertEqual(result["diagnostic_systemd_state"], "mismatch")
             self.assertEqual(detail["current_facts_status"], "mismatch")
@@ -727,6 +1009,10 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             self.assertEqual(detail["failure_unit"], systemd_state.OWNED_UNITS[0])
             self.assertEqual(detail["failure_phase"], "unit_active")
             self.assertEqual(detail["failure_rc"], 3)
+            self.assertTrue(detail["health_monitor"]["collection_completed"], json.dumps(detail["health_monitor"], ensure_ascii=False))
+            self.assertEqual(detail["health_monitor"]["checker"]["status"], "reported")
+            self.assertFalse(detail["health_monitor"]["checker"]["report"]["ok"])
+            self.assertEqual(result["diagnostic_systemd_state"], "mismatch")
 
     def test_diagnostic_systemd_state_fails_closed_for_unbound_source(self) -> None:
         cases = (
@@ -839,7 +1125,17 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                     self.assertEqual(detail["validate_status"], "failed")
                     self.assertFalse(detail["collection_completed"])
                     self.assertEqual(detail["failure_reason"], "receipt_state_invalid")
+                    health = detail["health_monitor"]
+                    self.assertIsInstance(health["finished_at_utc"], str)
+                    self.assertEqual(health["failure_phase"], "binding")
+                    self.assertEqual(health["failure_check"], "target_release")
+                    self.assertEqual(health["failure_class"], "exception")
+                    diagnostics_decrypt._validate_systemd_diagnostic_payload(
+                        json.dumps(detail, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+                        marker["returncode"],
+                    )
                     self.assertEqual(calls, [])
+                    self.assertEqual(fixture["health_commands"], [])
                 else:
                     self.assertEqual(detail["validate_status"], "passed")
                     if name.startswith("verify_"):
@@ -899,13 +1195,66 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                     elif name == "collection_malformed":
                         self.assertEqual(detail["failure_class"], "StateError")
                         self.assertEqual(detail["failure_reason"], "malformed_output")
-                        self.assertEqual(detail["failure_rc"], "unavailable")
                     elif name == "alarm_deadline":
                         self.assertEqual(detail["failure_class"], "timeout")
                         self.assertEqual(detail["failure_reason"], "timeout")
                         self.assertEqual(detail["failure_unit"], systemd_state.OWNED_UNITS[1])
                         self.assertEqual(signal.getsignal(signal.SIGALRM), alarm_handler_before)
                         self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+        # Checker errors remain bounded health evidence and do not change a
+        # successful systemd state observation into a health-derived status.
+        checker_failures = (
+            ("unknown_returncode", {"health_returncode": 2}),
+            ("malformed_report", {"health_stdout": b"not-json"}),
+            ("oversized_report", {"health_stdout": b"x" * 4097}),
+            ("checker_timeout", {"health_failure": subprocess.TimeoutExpired("health-monitor", 30)}),
+        )
+        for case, kwargs in checker_failures:
+            with self.subTest(checker_case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = self._genuine_diagnostic_fixture(Path(directory))
+                result, _marker, detail, _calls = self._run_genuine_diagnostic(fixture, **kwargs)
+                self.assertEqual(result["status"], "passed")
+                health = detail["health_monitor"]
+                self.assertFalse(health["collection_completed"])
+                self.assertEqual(health["checker"]["status"], "unavailable")
+                self.assertEqual(health["failure_phase"], "checker")
+                self.assertEqual(health["failure_check"], "health_checker")
+                if case == "checker_timeout":
+                    self.assertEqual(health["failure_class"], "TimeoutExpired")
+
+        # A property failure retains the exact successful prefix and failing
+        # field/return code in the private nested evidence.
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._genuine_diagnostic_fixture(Path(directory))
+            _result, _marker, detail, _calls = self._run_genuine_diagnostic(
+                fixture,
+                health_property_failure=(probe.HEALTH_MONITOR_UNIT, "ActiveState", 7),
+            )
+            service = detail["health_monitor"]["service"]
+            self.assertEqual(service["status"], "unavailable")
+            self.assertEqual(service["failed_property"], "ActiveState")
+            self.assertEqual(set(service["properties"]), {"Id", "FragmentPath", "LoadState"})
+            self.assertEqual(service["returncodes"], {"Id": 0, "FragmentPath": 0, "LoadState": 0, "ActiveState": 7})
+            self.assertEqual(detail["health_monitor"]["failure_phase"], "properties")
+            self.assertEqual(detail["health_monitor"]["failure_check"], "service")
+
+        # Force the real bounded Popen/selector path over its cap. The child
+        # writes continuously, so the test verifies direct-child termination
+        # and reap rather than merely parsing a large completed buffer.
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._genuine_diagnostic_fixture(Path(directory))
+            _result, _marker, detail, _calls = self._run_genuine_diagnostic(
+                fixture,
+                health_jobs_unbounded=True,
+            )
+            health = detail["health_monitor"]
+            self.assertEqual(health["jobs"]["status"], "unavailable")
+            self.assertEqual(health["failure_phase"], "jobs")
+            self.assertEqual(health["failure_check"], "health_jobs")
+            self.assertEqual(health["failure_class"], "ValueError")
+            self.assertTrue(fixture["health_processes"])
+            self.assertIsNotNone(fixture["health_processes"][0].poll())
 
     def test_existing_companion_uses_only_existing_read_validator(self) -> None:
         expected_files = {"platform/tools/helper.py": "a" * 64, "source-sha": "b" * 64}

@@ -1722,6 +1722,50 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 {"unit": unit, "active": "inactive", "enabled": "disabled"}
                 for unit in diagnostic_units
             ]
+            health_names = (
+                "service:deadlock-api", "service:deadlock-worker", "service:deadlock-web",
+                "service:nginx", "api_ready", "disk", "memory", "backup", "certificate",
+            )
+            health_checks = [
+                {"name": name, "ok": True, "detail": {}}
+                for name in health_names
+            ]
+            service_properties = (
+                "Id", "FragmentPath", "LoadState", "ActiveState", "SubState", "Result",
+                "ExecMainCode", "ExecMainStatus", "MainPID", "ControlPID", "ControlGroup",
+                "UnitFileState", "ExecMainStartTimestamp", "ExecMainExitTimestamp",
+            )
+            timer_properties = (
+                "Id", "FragmentPath", "LoadState", "ActiveState", "SubState", "Result",
+                "LastTriggerUSec", "NextElapseUSecRealtime", "UnitFileState",
+            )
+            health_evidence = {
+                "schema": 1,
+                "collection_completed": True,
+                "started_at_utc": "2026-10-17T00:00:00+00:00",
+                "finished_at_utc": "2026-10-17T00:00:01+00:00",
+                "target_source_sha": "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d",
+                "service": {
+                    "status": "passed",
+                    "returncodes": {field: 0 for field in service_properties},
+                    "properties": {field: ("deadlock-health-monitor.service" if field == "Id" else "") for field in service_properties},
+                    "failed_property": None,
+                },
+                "timer": {
+                    "status": "passed",
+                    "returncodes": {field: 0 for field in timer_properties},
+                    "properties": {field: ("deadlock-health-monitor.timer" if field == "Id" else "") for field in timer_properties},
+                    "failed_property": None,
+                },
+                "jobs": {"status": "passed", "returncode": 0, "count": 0, "rows": [], "truncated": False},
+                "cgroup": {"status": "passed", "control_group": "/system.slice/deadlock-health-monitor.service", "count": 0, "pids": [], "truncated": False},
+                "journal": {"status": "passed", "returncode": 0, "total_entries": 1, "entries": [{"timestamp": "1781654400000000", "priority": "6", "message": "health check completed"}], "truncated": False},
+                "checker": {
+                    "status": "reported", "returncode": 0,
+                    "report": {"event": "platform_health_monitor", "timestamp": "2026-10-17T00:00:00+00:00", "ok": True, "failed": [], "checks": health_checks},
+                },
+                "failure_phase": "none", "failure_check": "none", "failure_class": "none",
+            }
             systemd_diagnostic = {
                 "schema": 1,
                 "collection_completed": True,
@@ -1739,6 +1783,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 "failure_unit": "none",
                 "failure_query": "none",
                 "failure_rc": "unavailable",
+                "health_monitor": health_evidence,
             }
             diagnostic_output = json.dumps(
                 systemd_diagnostic, sort_keys=True, separators=(",", ":"),
@@ -1821,6 +1866,51 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 self.assertEqual(
                     base64.b64decode(diagnostic_private["remote_stderr_b64"], validate=True),
                     diagnostic_marker,
+                )
+                early_stderr = PrivateStderr()
+                with (
+                    mock.patch.dict(os.environ, {
+                        "PLATFORM_RUNTIME_PRIVATE_CAPTURE": "1",
+                        "PLATFORM_RUNTIME_PRIVATE_ROUTE": "capture_probe",
+                    }),
+                    mock.patch.object(capture_probe.sys, "stderr", early_stderr),
+                ):
+                    early_public = capture_probe._diagnostic_systemd_probe(
+                        "0" * 64,
+                        companion_present=False,
+                        deadline=capture_probe.time.monotonic() + 30,
+                    )
+                self.assertEqual(early_public["diagnostic_systemd_state"], "unavailable")
+                early_marker = early_stderr.buffer.getvalue()
+                early_record = json.loads(early_marker.decode("ascii").split(" ", 1)[1])
+                early_detail = base64.b64decode(early_record["output_b64"], validate=True)
+                maintenance_decrypt._validate_systemd_diagnostic_payload(early_detail, 1)
+                early_detail_record = json.loads(early_detail.decode("utf-8"))
+                early_health = early_detail_record["health_monitor"]
+                self.assertEqual(early_health["failure_phase"], "binding")
+                self.assertEqual(early_health["failure_check"], "target_release")
+                self.assertIsInstance(early_health["finished_at_utc"], str)
+                early_remote_error = validator_root / "early-remote-error"
+                early_remote_error.write_bytes(early_marker)
+                early_private_payload = validator_root / "early-private-payload.json"
+                early_validated = subprocess.run(
+                    [sys.executable, "-I", "-c", embedded_diagnostic_validator, str(early_remote_error), "1"],
+                    capture_output=True, text=True, check=False, timeout=5,
+                    env={
+                        **os.environ,
+                        "PRIVATE_REMOTE_ERROR": str(early_remote_error),
+                        "PRIVATE_PAYLOAD": str(early_private_payload),
+                        "PRIVATE_ACTION_RUN_ID": "78901",
+                        "PRIVATE_ACTION_RUN_ATTEMPT": "1",
+                        "PRIVATE_WORKFLOW_SHA": "f" * 40,
+                        "PRIVATE_SOURCE_SHA": "f" * 40,
+                    },
+                )
+                self.assertEqual(early_validated.returncode, 0, early_validated.stdout + early_validated.stderr)
+                early_private = json.loads(early_private_payload.read_text(encoding="ascii"))
+                self.assertEqual(
+                    base64.b64decode(early_private["remote_stderr_b64"], validate=True),
+                    early_marker,
                 )
                 success_marker = json.loads(
                     diagnostic_marker.decode("ascii").split(" ", 1)[1]

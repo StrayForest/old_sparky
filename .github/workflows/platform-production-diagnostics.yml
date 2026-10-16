@@ -859,7 +859,7 @@ jobs:
               except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                   raise SystemExit(2) from exc
               unit_names = ["deadlock-api.service", "deadlock-worker.service", "deadlock-web.service", "deadlock-maintenance.service", "deadlock-maintenance.timer", "deadlock-logrotate.service", "deadlock-logrotate.timer", "deadlock-offsite-backup.service", "deadlock-offsite-backup.timer", "deadlock-cloudflare-ips.service", "deadlock-cloudflare-ips.timer", "deadlock-health-monitor.service", "deadlock-health-monitor.timer"]
-              state_keys = {"schema", "collection_completed", "validate_status", "verify_status", "current_facts_status", "mismatch_count", "historical_cause_proven", "expected_units", "observed_units", "failure_phase", "failure_check", "failure_class", "failure_reason", "failure_unit", "failure_query", "failure_rc"}
+              state_keys = {"schema", "collection_completed", "validate_status", "verify_status", "current_facts_status", "mismatch_count", "historical_cause_proven", "expected_units", "observed_units", "failure_phase", "failure_check", "failure_class", "failure_reason", "failure_unit", "failure_query", "failure_rc", "health_monitor"}
               phases = {"none", "module", "systemctl_path", "transaction", "receipt", "binding", "unit_active", "unit_enabled", "verify"}
               checks = {"none", "diagnostic_receipt_absent", "systemctl_path", "transaction_read", "systemd_module_identity", "module_metadata", "module_open", "module_identity", "module_size", "module_changed", "module_import", "existing_receipt_transaction", "runtime_target_binding", "current_binding", "previous_binding", "existing_receipt_validate", "release_metadata", "helper_digests", "diagnostic_target_binding", "unit_active", "unit_enabled", "diagnostic_receipt_units", "unit_snapshot", "systemd_verify"}
               classes = {"none", "predicate", "oserror", "StateError", "ValueError", "TypeError", "TimeoutExpired", "timeout", "exception"}
@@ -901,6 +901,76 @@ jobs:
                       differences = sum(left != right for left, right in zip(expected, observed, strict=True))
                       if differences != state["mismatch_count"] or state["current_facts_status"] != ("mismatch" if differences else "matched"):
                           raise SystemExit(2)
+              health = state["health_monitor"]
+              health_keys = {"schema", "collection_completed", "started_at_utc", "finished_at_utc", "target_source_sha", "service", "timer", "jobs", "cgroup", "journal", "checker", "failure_phase", "failure_check", "failure_class"}
+              if type(health) is not dict or set(health) != health_keys or type(health["schema"]) is not int or health["schema"] != 1 or type(health["collection_completed"]) is not bool or health["target_source_sha"] != "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d" or not isinstance(health["started_at_utc"], str) or not 1 <= len(health["started_at_utc"]) <= 64 or not isinstance(health["finished_at_utc"], str) or not 1 <= len(health["finished_at_utc"]) <= 64:
+                  raise SystemExit(2)
+              if len(json.dumps(health, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")) > 16 * 1024:
+                  raise SystemExit(2)
+              health_fields = {
+                  "service": ("deadlock-health-monitor.service", ["Id", "FragmentPath", "LoadState", "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus", "MainPID", "ControlPID", "ControlGroup", "UnitFileState", "ExecMainStartTimestamp", "ExecMainExitTimestamp"]),
+                  "timer": ("deadlock-health-monitor.timer", ["Id", "FragmentPath", "LoadState", "ActiveState", "SubState", "Result", "LastTriggerUSec", "NextElapseUSecRealtime", "UnitFileState"]),
+              }
+              for label, (unit_name, fields) in health_fields.items():
+                  item = health[label]
+                  if type(item) is not dict or set(item) != {"status", "returncodes", "properties", "failed_property"} or item["status"] not in {"passed", "unavailable"} or type(item["returncodes"]) is not dict or type(item["properties"]) is not dict:
+                      raise SystemExit(2)
+                  if item["status"] == "passed":
+                      if item["failed_property"] is not None or set(item["returncodes"]) != set(fields) or set(item["properties"]) != set(fields) or item["properties"].get("Id") != unit_name or any(type(rc) is not int or rc != 0 for rc in item["returncodes"].values()) or any(not isinstance(v, str) or not v.isascii() or len(v.encode("utf-8")) > 64 or any(ord(ch) < 32 for ch in v) for v in item["properties"].values()):
+                          raise SystemExit(2)
+                  else:
+                      failed_property = item["failed_property"]
+                      if failed_property is not None and (not isinstance(failed_property, str) or failed_property not in fields) or not set(item["returncodes"]) <= set(fields) or not set(item["properties"]) <= set(fields) or set(item["properties"]) - set(item["returncodes"]):
+                          raise SystemExit(2)
+                      if failed_property is None and (item["returncodes"] or item["properties"]) or isinstance(failed_property, str) and failed_property in item["properties"]:
+                          raise SystemExit(2)
+                      if any(type(rc) is not int or not 0 <= rc <= 255 for rc in item["returncodes"].values()) or any(rc != 0 for field, rc in item["returncodes"].items() if field != failed_property):
+                          raise SystemExit(2)
+              jobs = health["jobs"]
+              if type(jobs) is not dict or set(jobs) != {"status", "returncode", "count", "rows", "truncated"} or jobs["status"] not in {"passed", "unavailable"} or type(jobs["count"]) is not int or not 0 <= jobs["count"] <= 100000 or type(jobs["rows"]) is not list or len(jobs["rows"]) > 8 or type(jobs["truncated"]) is not bool:
+                  raise SystemExit(2)
+              if jobs["status"] == "passed":
+                  if jobs["returncode"] != 0 or jobs["count"] < len(jobs["rows"]) or jobs["truncated"] != (jobs["count"] > len(jobs["rows"])):
+                      raise SystemExit(2)
+              elif (jobs["returncode"] != "unavailable" and (type(jobs["returncode"]) is not int or not 1 <= jobs["returncode"] <= 255)) or jobs["rows"] or jobs["count"] != 0 or jobs["truncated"]:
+                  raise SystemExit(2)
+              for row in jobs["rows"]:
+                  if type(row) is not dict or set(row) != {"unit", "type", "state"} or any(not isinstance(row[k], str) or len(row[k]) > 128 for k in ("unit", "type", "state")):
+                      raise SystemExit(2)
+              cgroup = health["cgroup"]
+              if type(cgroup) is not dict or set(cgroup) != {"status", "control_group", "count", "pids", "truncated"} or cgroup["status"] not in {"passed", "unavailable"} or type(cgroup["count"]) is not int or not 0 <= cgroup["count"] <= 100000 or type(cgroup["pids"]) is not list or len(cgroup["pids"]) > 32 or type(cgroup["truncated"]) is not bool:
+                  raise SystemExit(2)
+              if cgroup["status"] == "passed":
+                  if not isinstance(cgroup["control_group"], str) or len(cgroup["control_group"].encode("utf-8")) > 128 or not cgroup["control_group"].startswith("/") or cgroup["count"] < len(cgroup["pids"]) or cgroup["truncated"] != (cgroup["count"] > len(cgroup["pids"])) or any(type(pid) is not int or pid <= 0 for pid in cgroup["pids"]):
+                      raise SystemExit(2)
+              elif cgroup["control_group"] != "unavailable" or cgroup["pids"] or cgroup["count"] != 0 or cgroup["truncated"]:
+                  raise SystemExit(2)
+              journal = health["journal"]
+              if type(journal) is not dict or set(journal) != {"status", "returncode", "total_entries", "entries", "truncated"} or journal["status"] not in {"passed", "unavailable"} or type(journal["total_entries"]) is not int or not 0 <= journal["total_entries"] <= 100 or type(journal["entries"]) is not list or len(journal["entries"]) > 4 or type(journal["truncated"]) is not bool:
+                  raise SystemExit(2)
+              if journal["status"] == "passed":
+                  if journal["returncode"] != 0 or journal["total_entries"] < len(journal["entries"]):
+                      raise SystemExit(2)
+              elif (journal["returncode"] != "unavailable" and (type(journal["returncode"]) is not int or not 1 <= journal["returncode"] <= 255)) or journal["entries"] or journal["total_entries"] != 0 or journal["truncated"]:
+                  raise SystemExit(2)
+              for row in journal["entries"]:
+                  if type(row) is not dict or set(row) != {"timestamp", "priority", "message"} or any(not isinstance(row[k], str) or len(row[k]) > max_len for k, max_len in (("timestamp", 24), ("priority", 2), ("message", 256))):
+                      raise SystemExit(2)
+                  if len(json.dumps(row["message"], ensure_ascii=True, separators=(",", ":")).encode("ascii")) > 384:
+                      raise SystemExit(2)
+              checker = health["checker"]
+              if type(checker) is not dict or set(checker) != {"status", "returncode", "report"} or checker["status"] not in {"reported", "unavailable"}:
+                  raise SystemExit(2)
+              if checker["status"] == "reported":
+                  report = checker["report"]
+                  names = ["service:deadlock-api", "service:deadlock-worker", "service:deadlock-web", "service:nginx", "api_ready", "disk", "memory", "backup", "certificate"]
+                  if type(checker["returncode"]) is not int or checker["returncode"] not in {0, 1} or type(report) is not dict or set(report) != {"event", "timestamp", "ok", "failed", "checks"} or report["event"] != "platform_health_monitor" or not isinstance(report["timestamp"], str) or len(report["timestamp"]) > 64 or type(report["ok"]) is not bool or type(report["failed"]) is not list or type(report["checks"]) is not list or [row.get("name") if type(row) is dict else None for row in report["checks"]] != names or any(type(row) is not dict or set(row) != {"name", "ok", "detail"} or type(row["ok"]) is not bool or type(row["detail"]) is not dict for row in report["checks"]) or report["failed"] != [row["name"] for row in report["checks"] if not row["ok"]] or report["ok"] != (not report["failed"]) or checker["returncode"] != (0 if report["ok"] else 1) or len(json.dumps(report, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")) > 2048:
+                      raise SystemExit(2)
+              elif checker["returncode"] != "unavailable" or checker["report"] is not None:
+                  raise SystemExit(2)
+              health_complete = all(health[k]["status"] in ({"reported"} if k == "checker" else {"passed"}) for k in ("service", "timer", "jobs", "cgroup", "journal", "checker"))
+              if health["collection_completed"] != health_complete or health["failure_phase"] not in {"none", "binding", "properties", "cgroup", "jobs", "journal", "checker", "deadline"} or health["failure_check"] not in {"none", "target_release", "service", "timer", "health_cgroup", "health_jobs", "health_journal", "health_checker", "health_monitor"} or health["failure_class"] not in {"none", "OSError", "StateError", "ValueError", "TimeoutExpired", "timeout", "JSONDecodeError", "exception"} or health_complete != (health["failure_phase"] == health["failure_check"] == health["failure_class"] == "none"):
+                  raise SystemExit(2)
               state_passed = (state["collection_completed"] and state["validate_status"] == "passed" and state["verify_status"] == "passed" and state["current_facts_status"] == "matched" and state["mismatch_count"] == 0 and state["failure_phase"] == "none" and state["failure_check"] == "none" and state["failure_class"] == "none" and state["failure_reason"] == "none" and state["failure_unit"] == "none" and state["failure_query"] == "none" and state["failure_rc"] == "unavailable")
               if (marker["returncode"] == 0) != state_passed:
                   raise SystemExit(2)

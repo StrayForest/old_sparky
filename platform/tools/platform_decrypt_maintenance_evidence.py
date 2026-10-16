@@ -538,6 +538,128 @@ _SYSTEMD_DIAGNOSTIC_UNITS = (
     "deadlock-cloudflare-ips.service", "deadlock-cloudflare-ips.timer",
     "deadlock-health-monitor.service", "deadlock-health-monitor.timer",
 )
+_HEALTH_SERVICE_PROPERTIES = (
+    "Id", "FragmentPath", "LoadState", "ActiveState", "SubState", "Result",
+    "ExecMainCode", "ExecMainStatus", "MainPID", "ControlPID", "ControlGroup",
+    "UnitFileState", "ExecMainStartTimestamp", "ExecMainExitTimestamp",
+)
+_HEALTH_TIMER_PROPERTIES = (
+    "Id", "FragmentPath", "LoadState", "ActiveState", "SubState", "Result",
+    "LastTriggerUSec", "NextElapseUSecRealtime", "UnitFileState",
+)
+
+
+def _validate_health_monitor_evidence(value: Any) -> None:
+    keys = {
+        "schema", "collection_completed", "started_at_utc", "finished_at_utc",
+        "target_source_sha", "service", "timer", "jobs", "cgroup", "journal",
+        "checker", "failure_phase", "failure_check", "failure_class",
+    }
+    if (
+        type(value) is not dict or set(value) != keys or type(value.get("schema")) is not int
+        or value.get("schema") != 1 or type(value.get("collection_completed")) is not bool
+        or value.get("target_source_sha") != "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+        or not isinstance(value.get("started_at_utc"), str) or not 1 <= len(value["started_at_utc"]) <= 64
+        or not isinstance(value.get("finished_at_utc"), str) or not 1 <= len(value["finished_at_utc"]) <= 64
+    ):
+        raise DecryptError("health monitor diagnostic fields are invalid")
+    if len(json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")) > MAX_RUNTIME_MARKER_OUTPUT_BYTES:
+        raise DecryptError("health monitor diagnostic exceeds the private marker bound")
+    units = (
+        ("service", "deadlock-health-monitor.service", _HEALTH_SERVICE_PROPERTIES),
+        ("timer", "deadlock-health-monitor.timer", _HEALTH_TIMER_PROPERTIES),
+    )
+    for key, expected_unit, fields in units:
+        item = value[key]
+        if type(item) is not dict or set(item) != {"status", "returncodes", "properties", "failed_property"}:
+            raise DecryptError("health monitor unit snapshot is invalid")
+        if item["status"] not in {"passed", "unavailable"} or type(item["returncodes"]) is not dict or type(item["properties"]) is not dict:
+            raise DecryptError("health monitor unit snapshot status is invalid")
+        if item["status"] == "passed":
+            if item["failed_property"] is not None or set(item["returncodes"]) != set(fields) or set(item["properties"]) != set(fields):
+                raise DecryptError("health monitor unit properties are incomplete")
+            if any(type(rc) is not int or rc != 0 for rc in item["returncodes"].values()):
+                raise DecryptError("health monitor property return code is invalid")
+            if item["properties"].get("Id") != expected_unit:
+                raise DecryptError("health monitor property unit identity is invalid")
+        else:
+            failed_property = item["failed_property"]
+            if failed_property is not None and (not isinstance(failed_property, str) or failed_property not in fields):
+                raise DecryptError("health monitor failed property is invalid")
+            if not set(item["returncodes"]) <= set(fields) or not set(item["properties"]) <= set(fields):
+                raise DecryptError("health monitor partial property set is invalid")
+            if set(item["properties"]) - set(item["returncodes"]):
+                raise DecryptError("health monitor partial property return codes are incomplete")
+            if failed_property is not None and failed_property in item["properties"]:
+                raise DecryptError("health monitor failed property unexpectedly has a value")
+            if failed_property is None and (item["returncodes"] or item["properties"]):
+                raise DecryptError("health monitor unassociated partial properties are invalid")
+            if any(type(rc) is not int or not 0 <= rc <= 255 for rc in item["returncodes"].values()):
+                raise DecryptError("health monitor partial property return code is invalid")
+            if any(rc != 0 for field, rc in item["returncodes"].items() if field != failed_property):
+                raise DecryptError("health monitor successful property return code is invalid")
+        if any(not isinstance(field, str) or not field.isascii() or len(field.encode("utf-8")) > 64 or any(ord(char) < 32 for char in field) for field in item["properties"].values()):
+            raise DecryptError("health monitor property value is invalid")
+    jobs = value["jobs"]
+    if type(jobs) is not dict or set(jobs) != {"status", "returncode", "count", "rows", "truncated"} or jobs["status"] not in {"passed", "unavailable"} or type(jobs["count"]) is not int or not 0 <= jobs["count"] <= 100000 or type(jobs["rows"]) is not list or len(jobs["rows"]) > 8 or type(jobs["truncated"]) is not bool:
+        raise DecryptError("health monitor job snapshot is invalid")
+    if jobs["status"] == "passed":
+        if jobs["returncode"] != 0 or jobs["count"] < len(jobs["rows"]) or jobs["truncated"] != (jobs["count"] > len(jobs["rows"])):
+            raise DecryptError("health monitor job summary is inconsistent")
+    elif (jobs["returncode"] != "unavailable" and (type(jobs["returncode"]) is not int or not 1 <= jobs["returncode"] <= 255)) or jobs["rows"] or jobs["count"] != 0 or jobs["truncated"]:
+        raise DecryptError("unavailable health monitor jobs contain partial fields")
+    for row in jobs["rows"]:
+        if type(row) is not dict or set(row) != {"unit", "type", "state"} or any(not isinstance(row[key], str) or len(row[key]) > 128 for key in ("unit", "type", "state")):
+            raise DecryptError("health monitor job row is invalid")
+    cgroup = value["cgroup"]
+    if type(cgroup) is not dict or set(cgroup) != {"status", "control_group", "count", "pids", "truncated"} or cgroup["status"] not in {"passed", "unavailable"} or type(cgroup["count"]) is not int or not 0 <= cgroup["count"] <= 100000 or type(cgroup["pids"]) is not list or len(cgroup["pids"]) > 32 or type(cgroup["truncated"]) is not bool:
+        raise DecryptError("health monitor cgroup snapshot is invalid")
+    if cgroup["status"] == "passed":
+        if not isinstance(cgroup["control_group"], str) or len(cgroup["control_group"].encode("utf-8")) > 128 or not cgroup["control_group"].startswith("/") or cgroup["count"] < len(cgroup["pids"]) or cgroup["truncated"] != (cgroup["count"] > len(cgroup["pids"])) or any(type(pid) is not int or pid <= 0 for pid in cgroup["pids"]):
+            raise DecryptError("health monitor cgroup facts are inconsistent")
+    elif cgroup["control_group"] != "unavailable" or cgroup["pids"] or cgroup["count"] != 0 or cgroup["truncated"]:
+        raise DecryptError("unavailable health monitor cgroup contains partial fields")
+    journal = value["journal"]
+    if type(journal) is not dict or set(journal) != {"status", "returncode", "total_entries", "entries", "truncated"} or journal["status"] not in {"passed", "unavailable"} or type(journal["total_entries"]) is not int or not 0 <= journal["total_entries"] <= 100 or type(journal["entries"]) is not list or len(journal["entries"]) > 4 or type(journal["truncated"]) is not bool:
+        raise DecryptError("health monitor journal snapshot is invalid")
+    if journal["status"] == "passed":
+        if journal["returncode"] != 0 or journal["total_entries"] < len(journal["entries"]):
+            raise DecryptError("health monitor journal summary is inconsistent")
+    elif (journal["returncode"] != "unavailable" and (type(journal["returncode"]) is not int or not 1 <= journal["returncode"] <= 255)) or journal["entries"] or journal["total_entries"] != 0 or journal["truncated"]:
+        raise DecryptError("unavailable health monitor journal contains partial fields")
+    for row in journal["entries"]:
+        if type(row) is not dict or set(row) != {"timestamp", "priority", "message"} or any(not isinstance(row[key], str) or len(row[key]) > limit for key, limit in (("timestamp", 24), ("priority", 2), ("message", 256))):
+            raise DecryptError("health monitor journal row is invalid")
+        if len(json.dumps(row["message"], ensure_ascii=True, separators=(",", ":")).encode("ascii")) > 384:
+            raise DecryptError("health monitor journal message exceeds its bound")
+    checker = value["checker"]
+    if type(checker) is not dict or set(checker) != {"status", "returncode", "report"} or checker["status"] not in {"reported", "unavailable"}:
+        raise DecryptError("health monitor checker result is invalid")
+    if checker["status"] == "reported":
+        report = checker["report"]
+        names = ("service:deadlock-api", "service:deadlock-worker", "service:deadlock-web", "service:nginx", "api_ready", "disk", "memory", "backup", "certificate")
+        if (
+            type(checker["returncode"]) is not int or checker["returncode"] not in {0, 1}
+            or type(report) is not dict or set(report) != {"event", "timestamp", "ok", "failed", "checks"}
+            or report["event"] != "platform_health_monitor" or not isinstance(report["timestamp"], str) or len(report["timestamp"]) > 64
+            or type(report["ok"]) is not bool or type(report["failed"]) is not list or type(report["checks"]) is not list
+            or [row.get("name") if type(row) is dict else None for row in report["checks"]] != list(names)
+            or any(type(row) is not dict or set(row) != {"name", "ok", "detail"} or type(row["ok"]) is not bool or type(row["detail"]) is not dict for row in report["checks"])
+            or report["failed"] != [row["name"] for row in report["checks"] if not row["ok"]]
+            or report["ok"] != (not report["failed"])
+            or checker["returncode"] != (0 if report["ok"] else 1)
+            or len(json.dumps(report, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")) > 2048
+        ):
+            raise DecryptError("health monitor checker report is inconsistent")
+    elif checker["returncode"] != "unavailable" or checker["report"] is not None:
+        raise DecryptError("unavailable health monitor checker contains a report")
+    complete = all(value[key]["status"] in ({"reported"} if key == "checker" else {"passed"}) for key in ("service", "timer", "jobs", "cgroup", "journal", "checker"))
+    if value["collection_completed"] != complete:
+        raise DecryptError("health monitor collection status is inconsistent")
+    if value["failure_phase"] not in {"none", "binding", "properties", "cgroup", "jobs", "journal", "checker", "deadline"} or value["failure_check"] not in {"none", "target_release", "service", "timer", "health_cgroup", "health_jobs", "health_journal", "health_checker", "health_monitor"} or value["failure_class"] not in {"none", "OSError", "StateError", "ValueError", "TimeoutExpired", "timeout", "JSONDecodeError", "exception"}:
+        raise DecryptError("health monitor failure context is invalid")
+    if complete != (value["failure_phase"] == value["failure_check"] == value["failure_class"] == "none"):
+        raise DecryptError("health monitor failure context is inconsistent")
 
 
 def _validate_systemd_diagnostic_payload(output: bytes, returncode: object) -> None:
@@ -550,6 +672,7 @@ def _validate_systemd_diagnostic_payload(output: bytes, returncode: object) -> N
         "current_facts_status", "mismatch_count", "historical_cause_proven",
         "expected_units", "observed_units", "failure_phase", "failure_check",
         "failure_class", "failure_reason", "failure_unit", "failure_query", "failure_rc",
+        "health_monitor",
     }
     if (
         not isinstance(value, dict) or set(value) != keys or type(value.get("schema")) is not int or value.get("schema") != 1
@@ -637,6 +760,7 @@ def _validate_systemd_diagnostic_payload(output: bytes, returncode: object) -> N
     )
     if (returncode == 0) != passed:
         raise DecryptError("systemd diagnostic result does not match its return code")
+    _validate_health_monitor_evidence(value["health_monitor"])
 
 
 def _validate_runtime_marker(remote_stderr: bytes, route: str) -> None:

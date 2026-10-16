@@ -135,6 +135,23 @@ action; a successful current-state comparison is not evidence of the earlier
 failure's cause. Its bounded private marker uses the existing API-bound CMS
 transport and is not accepted by the reset validator.
 
+The same diagnostic route may collect a fixed, read-only health-monitor
+snapshot for the exact bound 9ce release: service and timer properties,
+execution and timer timestamps, queued jobs, service cgroup PIDs, a bounded
+redacted journal window, and the release-pinned health-checker report. The
+checker runs with the installed production arguments, including the unchanged
+5 GiB minimum-free and 85% maximum-used disk thresholds. Its `ok` result is an
+observation, independent of collection completion and systemd receipt
+comparison; failed checks do not cause a reset, start, stop, or recovery
+action. The private snapshot remains under the same CMS/API binding and the
+public report exposes no unit properties, journal text, PIDs, or checker
+details.
+Its retained JSON stays within the existing 16 KiB decoded marker cap. Jobs,
+cgroup PIDs, journal messages, and checker output use fixed per-section bounds;
+subprocess output is read through capped pipes and over-cap direct children
+are terminated and reaped. Property-query failure retains only the bounded
+successful prefix and failed fixed property/return code.
+
 The local command is
 `python3 platform/tools/platform_decrypt_maintenance_evidence.py --artifact-archive <archive.zip> --binding-json <protected-binding.json> --private-key <0600-private-key.pem> --certificate <matching-certificate.pem> --destination <new-git-private-evidence.json> --git-dir <repository/.git>`.
 

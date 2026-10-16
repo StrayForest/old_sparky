@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime
 import hashlib
 import json
 import os
@@ -31,7 +32,40 @@ MAX_STATE_BYTES = 64 * 1024
 MAX_PRIVATE_RETAINED_BYTES = 16 * 1024
 MAX_PRIVATE_TOTAL_VALUE = 2**63 - 1
 MAX_MODULE_BYTES = 2 * 1024 * 1024
+MAX_HEALTH_REPORT_BYTES = 4096
+MAX_HEALTH_JOURNAL_BYTES = 96 * 1024
+MAX_HEALTH_PROPERTY_BYTES = 64
+MAX_HEALTH_PROPERTY_VALUE_CHARS = 64
+MAX_HEALTH_JOB_ROWS = 8
+MAX_HEALTH_CGROUP_BYTES = 4 * 1024
+MAX_HEALTH_CGROUP_PIDS = 32
+MAX_HEALTH_JOURNAL_ROWS = 4
+MAX_HEALTH_JOURNAL_MESSAGE_CHARS = 256
+MAX_HEALTH_JOURNAL_MESSAGE_JSON_BYTES = 384
+MAX_HEALTH_CHECKER_REPORT_JSON_BYTES = 2048
 DIAGNOSTIC_TARGET_SOURCE_SHA = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+DIAGNOSTIC_HEALTH_MONITOR_SHA256 = "2ab138fc827e954acb19ff800395704c67239779165df4e516502ba3749dbb0a"
+DIAGNOSTIC_DISK_POLICY_SHA256 = "55b2a91129826d372f977057fe04470650af3af84d6a58b11059e863f40d88f2"
+HEALTH_MONITOR_UNIT = "deadlock-health-monitor.service"
+HEALTH_MONITOR_TIMER = "deadlock-health-monitor.timer"
+HEALTH_CHECK_NAMES = (
+    "service:deadlock-api", "service:deadlock-worker", "service:deadlock-web",
+    "service:nginx", "api_ready", "disk", "memory", "backup", "certificate",
+)
+HEALTH_SERVICE_PROPERTIES = (
+    "Id", "FragmentPath", "LoadState", "ActiveState", "SubState", "Result",
+    "ExecMainCode", "ExecMainStatus", "MainPID", "ControlPID", "ControlGroup",
+    "UnitFileState", "ExecMainStartTimestamp", "ExecMainExitTimestamp",
+)
+HEALTH_TIMER_PROPERTIES = (
+    "Id", "FragmentPath", "LoadState", "ActiveState", "SubState", "Result",
+    "LastTriggerUSec", "NextElapseUSecRealtime", "UnitFileState",
+)
+HEALTH_SECRET_PATTERN = re.compile(
+    r"(?i)\b(password|passwd|token|secret|authorization|cookie|api[_-]?key)"
+    r"(\s*[:=]\s*|\s+)([^\s,;]+)"
+)
+HEALTH_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 HEALTH_URLS = (
     ("api_live", "http://127.0.0.1:8010/api/v1/health/live"),
     ("api_ready", "http://127.0.0.1:8010/api/v1/health/ready"),
@@ -57,6 +91,12 @@ class ProbeFailure(Exception):
 
 class ProbeDeadlineExceeded(Exception):
     pass
+
+
+class HealthCommandFailure(Exception):
+    def __init__(self, returncode: int) -> None:
+        super().__init__("read-only health command returned nonzero")
+        self.returncode = returncode
 
 
 _SYSTEMD_STATE_VALUES = frozenset(
@@ -198,6 +238,437 @@ def _diagnostic_systemd_snapshot_with_deadline(
             )
         rows = evidence.get("observed_units")
         return (rows if isinstance(rows, list) else []), False
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_alarm_handler)
+
+
+def _health_monitor_initial_evidence() -> dict[str, object]:
+    return {
+        "schema": 1,
+        "collection_completed": False,
+        "started_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+        "finished_at_utc": None,
+        "target_source_sha": DIAGNOSTIC_TARGET_SOURCE_SHA,
+        "service": {"status": "unavailable", "returncodes": {}, "properties": {}, "failed_property": None},
+        "timer": {"status": "unavailable", "returncodes": {}, "properties": {}, "failed_property": None},
+        "jobs": {"status": "unavailable", "returncode": "unavailable", "count": 0, "rows": [], "truncated": False},
+        "cgroup": {"status": "unavailable", "control_group": "unavailable", "count": 0, "pids": [], "truncated": False},
+        "journal": {"status": "unavailable", "returncode": "unavailable", "total_entries": 0, "entries": [], "truncated": False},
+        "checker": {"status": "unavailable", "returncode": "unavailable", "report": None},
+        "failure_phase": "none",
+        "failure_check": "none",
+        "failure_class": "none",
+    }
+
+
+def _finalize_skipped_health_monitor(evidence: dict[str, object]) -> None:
+    health = evidence.get("health_monitor")
+    if not isinstance(health, dict) or health.get("finished_at_utc") is not None:
+        return
+    if health.get("failure_phase") == "none":
+        # A failed outer binding means the target checker was deliberately not
+        # run. Record that as unavailable without attributing a host condition.
+        health.update(
+            failure_phase="binding",
+            failure_check="target_release",
+            failure_class="exception",
+        )
+    health["finished_at_utc"] = datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _health_failure(evidence: dict[str, object], phase: str, check: str, error: BaseException | None = None) -> None:
+    if evidence["failure_phase"] != "none":
+        return
+    class_name = type(error).__name__ if error is not None else "StateError"
+    if class_name == "ProbeDeadlineExceeded":
+        class_name = "timeout"
+    if class_name not in {"OSError", "StateError", "ValueError", "TimeoutExpired", "timeout", "JSONDecodeError"}:
+        class_name = "exception"
+    evidence.update(failure_phase=phase, failure_check=check, failure_class=class_name)
+
+
+def _health_command(
+    argv: list[str], *, deadline: float, maximum: int, timeout_seconds: float = 15.0,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProbeDeadlineExceeded
+    timeout_seconds = min(timeout_seconds, remaining)
+    command_deadline = time.monotonic() + timeout_seconds
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env or {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
+        close_fds=True,
+        bufsize=0,
+    )
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    if any(stream is None for stream in streams.values()):
+        _terminate_health_child(process)
+        raise OSError("health command streams are unavailable")
+    limits = {"stdout": maximum, "stderr": 4096}
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    selector = selectors.DefaultSelector()
+    try:
+        for name, stream in streams.items():
+            assert stream is not None
+            descriptor = stream.fileno()
+            os.set_blocking(descriptor, False)
+            selector.register(descriptor, selectors.EVENT_READ, name)
+        while selector.get_map() or process.poll() is None:
+            remaining = min(deadline, command_deadline) - time.monotonic()
+            if remaining <= 0:
+                _terminate_health_child(process)
+                if command_deadline <= deadline:
+                    raise subprocess.TimeoutExpired(argv, timeout_seconds)
+                raise ProbeDeadlineExceeded
+            for key, _ in selector.select(min(remaining, 0.1)):
+                try:
+                    chunk = os.read(key.fd, 8192)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                name = key.data
+                if len(captured[name]) + len(chunk) > limits[name]:
+                    _terminate_health_child(process)
+                    raise ValueError("bounded health command output exceeded")
+                captured[name].extend(chunk)
+        returncode = process.wait(timeout=0)
+        return subprocess.CompletedProcess(
+            argv, returncode, stdout=bytes(captured["stdout"]), stderr=bytes(captured["stderr"]),
+        )
+    except BaseException:
+        if process.poll() is None:
+            _terminate_health_child(process)
+        raise
+    finally:
+        selector.close()
+        for stream in streams.values():
+            if stream is not None:
+                stream.close()
+
+
+def _terminate_health_child(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=0.25)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        # The non-foreground outer GNU timeout owns this process group and is
+        # the final hard cap; do not claim cleanup or continue until wait has
+        # reaped the direct child.
+        process.wait()
+    if process.poll() is None:
+        raise OSError("health command child was not reaped")
+
+
+def _health_unit_properties(
+    module: Any, unit: str, fields: tuple[str, ...], *, deadline: float,
+    evidence: dict[str, object],
+) -> None:
+    values = evidence["properties"]
+    returncodes = evidence["returncodes"]
+    assert isinstance(values, dict) and isinstance(returncodes, dict)
+    for field in fields:
+        evidence["failed_property"] = field
+        if time.monotonic() >= deadline:
+            raise ProbeDeadlineExceeded
+        status, value = module._run_systemctl(
+            "show", unit, f"--property={field}", "--value",
+        )
+        if type(status) is not int or not 0 <= status <= 255:
+            raise ValueError("systemd property return code is invalid")
+        returncodes[field] = status
+        if status != 0 or not value.isascii() or len(value.encode("utf-8", "strict")) > MAX_HEALTH_PROPERTY_BYTES or len(value) > MAX_HEALTH_PROPERTY_VALUE_CHARS or any(ord(char) < 32 for char in value):
+            raise ValueError("systemd property query failed or malformed")
+        values[field] = value
+        evidence["failed_property"] = None
+
+
+def _health_jobs(module: Any, *, deadline: float) -> dict[str, object]:
+    result = _health_command(
+        [module.SYSTEMCTL_PATH, "list-jobs", "--no-pager", "--all"],
+        deadline=deadline,
+        maximum=32 * 1024,
+    )
+    if result.returncode != 0:
+        raise HealthCommandFailure(result.returncode)
+    try:
+        output = result.stdout.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("systemd jobs output is malformed") from exc
+    if result.stdout == b"No jobs running.\n":
+        return {"status": "passed", "returncode": result.returncode, "count": 0, "rows": [], "truncated": False}
+    lines = output.splitlines()
+    if not lines or lines[0].split() != ["JOB", "UNIT", "TYPE", "STATE"]:
+        raise ValueError("systemd jobs header is malformed")
+    rows: list[dict[str, str]] = []
+    expected_count: int | None = None
+    for line in lines[1:]:
+        fields = line.split()
+        if len(fields) == 3 and fields[1] in {"job", "jobs"} and fields[2] == "listed." and fields[0].isdecimal():
+            if expected_count is not None:
+                raise ValueError("systemd jobs summary is duplicated")
+            expected_count = int(fields[0])
+            continue
+        if (
+            len(fields) != 4 or not fields[0].isdecimal()
+            or re.fullmatch(r"[A-Za-z0-9_.@:-]{1,128}", fields[1]) is None
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", fields[2]) is None
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", fields[3]) is None
+        ):
+            raise ValueError("systemd jobs row is malformed")
+        if len(rows) < MAX_HEALTH_JOB_ROWS:
+            rows.append({"unit": fields[1], "type": fields[2], "state": fields[3]})
+    if expected_count is None or expected_count != sum(1 for line in lines[1:] if len(line.split()) == 4):
+        raise ValueError("systemd jobs summary is malformed")
+    return {
+        "status": "passed", "returncode": result.returncode,
+        "count": expected_count, "rows": rows, "truncated": expected_count > len(rows),
+    }
+
+
+def _health_cgroup(control_group: str) -> dict[str, object]:
+    if (
+        not isinstance(control_group, str) or not control_group.startswith("/")
+        or ".." in Path(control_group).parts or "\x00" in control_group
+    ):
+        raise ValueError("health monitor cgroup identity is invalid")
+    root = Path("/sys/fs/cgroup")
+    directory = root / control_group.lstrip("/")
+    directory.resolve(strict=True).relative_to(root.resolve(strict=True))
+    descriptor = os.open(directory / "cgroup.procs", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        raw = os.read(descriptor, MAX_HEALTH_CGROUP_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > MAX_HEALTH_CGROUP_BYTES:
+        raise ValueError("health monitor cgroup output exceeded bound")
+    text = raw.decode("ascii", "strict")
+    pids: list[int] = []
+    total = 0
+    for item in text.splitlines():
+        if not item.isdecimal() or len(item) > 10:
+            raise ValueError("health monitor cgroup output is malformed")
+        total += 1
+        if len(pids) < MAX_HEALTH_CGROUP_PIDS:
+            pids.append(int(item))
+    return {
+        "status": "passed", "control_group": control_group[:256],
+        "count": total, "pids": pids, "truncated": total > len(pids),
+    }
+
+
+def _health_journal(module: Any, *, deadline: float) -> dict[str, object]:
+    result = _health_command(
+        [
+            "/usr/bin/journalctl", "--unit", HEALTH_MONITOR_UNIT,
+            "--output=json", "--quiet", "--no-pager", "--lines=100",
+        ],
+        deadline=deadline,
+        maximum=MAX_HEALTH_JOURNAL_BYTES,
+    )
+    if result.returncode != 0:
+        raise HealthCommandFailure(result.returncode)
+    entries: list[dict[str, str]] = []
+    entry_truncated: list[bool] = []
+    try:
+        lines = result.stdout.splitlines()
+        if len(lines) > 100:
+            raise ValueError("health monitor journal row count exceeded")
+        for line in lines:
+            item = json.loads(line.decode("utf-8", "strict"))
+            if type(item) is not dict:
+                raise ValueError("health monitor journal row is malformed")
+            message = str(item.get("MESSAGE", ""))
+            message = HEALTH_BEARER_PATTERN.sub("Bearer [REDACTED]", HEALTH_SECRET_PATTERN.sub(r"\1\2[REDACTED]", message))
+            retained_message = ""
+            for character in message[:MAX_HEALTH_JOURNAL_MESSAGE_CHARS]:
+                candidate = retained_message + character
+                encoded_candidate = json.dumps(candidate, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+                if len(encoded_candidate) > MAX_HEALTH_JOURNAL_MESSAGE_JSON_BYTES:
+                    break
+                retained_message = candidate
+            entries.append({
+                "timestamp": str(item.get("__REALTIME_TIMESTAMP", ""))[:24],
+                "priority": str(item.get("PRIORITY", ""))[:2],
+                "message": retained_message,
+            })
+            entry_truncated.append(retained_message != message)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("health monitor journal output is malformed") from exc
+    total = len(entries)
+    retained = entries[-MAX_HEALTH_JOURNAL_ROWS:]
+    retained_truncated = entry_truncated[-MAX_HEALTH_JOURNAL_ROWS:]
+    return {
+        "status": "passed", "returncode": result.returncode,
+        "total_entries": total, "entries": retained,
+        "truncated": total > len(retained) or any(retained_truncated),
+    }
+
+
+def _health_checker_report(target: Path, *, deadline: float) -> dict[str, object]:
+    checker = target / "tools/platform_health_monitor.py"
+    disk_policy = target / "tools/platform_disk_policy.py"
+    checker_bytes, _checker_metadata = _safe_module_bytes(checker)
+    disk_bytes, _disk_metadata = _safe_module_bytes(disk_policy)
+    if hashlib.sha256(checker_bytes).hexdigest() != DIAGNOSTIC_HEALTH_MONITOR_SHA256:
+        raise ProbeFailure("health_checker_identity")
+    if hashlib.sha256(disk_bytes).hexdigest() != DIAGNOSTIC_DISK_POLICY_SHA256:
+        raise ProbeFailure("health_disk_policy_identity")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProbeDeadlineExceeded
+    try:
+        result = _health_command(
+            [
+                str(SHARED_PYTHON), "-B", str(checker),
+                "--disk-min-free-gib", "5", "--disk-max-used-percent", "85",
+            ],
+            deadline=deadline,
+            maximum=MAX_HEALTH_REPORT_BYTES,
+            timeout_seconds=90,
+            env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
+        )
+    except subprocess.TimeoutExpired:
+        raise
+    if len(result.stdout) > MAX_HEALTH_REPORT_BYTES or result.returncode not in {0, 1}:
+        raise ValueError("health monitor report exceeded its contract")
+    try:
+        report = json.loads(result.stdout.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("health monitor report is malformed") from exc
+    if (
+        type(report) is not dict or set(report) != {"event", "timestamp", "ok", "failed", "checks"}
+        or report.get("event") != "platform_health_monitor"
+        or not isinstance(report.get("timestamp"), str) or len(report["timestamp"]) > 64
+        or type(report.get("ok")) is not bool
+        or type(report.get("failed")) is not list
+        or type(report.get("checks")) is not list
+        or [row.get("name") if type(row) is dict else None for row in report["checks"]] != list(HEALTH_CHECK_NAMES)
+        or report["failed"] != [row["name"] for row in report["checks"] if type(row) is dict and not row.get("ok")]
+        or result.returncode != (0 if report["ok"] else 1)
+        or report["ok"] != (not report["failed"])
+    ):
+        raise ValueError("health monitor report fields are invalid")
+    for row in report["checks"]:
+        if type(row) is not dict or set(row) != {"name", "ok", "detail"} or type(row.get("name")) is not str or type(row.get("ok")) is not bool or type(row.get("detail")) is not dict:
+            raise ValueError("health monitor check report is invalid")
+    if len(json.dumps(report, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")) > MAX_HEALTH_CHECKER_REPORT_JSON_BYTES:
+        raise ValueError("health monitor report detail exceeded bound")
+    return {"status": "reported", "returncode": result.returncode, "report": report}
+
+
+def _collect_health_monitor_evidence(
+    module: Any, target: Path | None, *, deadline: float,
+    evidence: dict[str, object] | None = None,
+) -> dict[str, object]:
+    evidence = evidence if evidence is not None else _health_monitor_initial_evidence()
+    if (
+        target is None or target.parent != APP_DIR / "releases"
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", target.name) is None
+    ):
+        _health_failure(evidence, "binding", "target_release")
+        evidence["finished_at_utc"] = datetime.now(UTC).isoformat(timespec="seconds")
+        return evidence
+    unit_rows = (
+        ("service", HEALTH_MONITOR_UNIT, HEALTH_SERVICE_PROPERTIES),
+        ("timer", HEALTH_MONITOR_TIMER, HEALTH_TIMER_PROPERTIES),
+    )
+    for label, unit, fields in unit_rows:
+        unit_evidence = evidence[label]
+        assert isinstance(unit_evidence, dict)
+        try:
+            _health_unit_properties(module, unit, fields, deadline=deadline, evidence=unit_evidence)
+            unit_evidence["status"] = "passed"
+        except ProbeDeadlineExceeded as exc:
+            _health_failure(evidence, "properties", label, exc)
+            break
+        except Exception as exc:
+            _health_failure(evidence, "properties", label, exc)
+            unit_evidence["status"] = "unavailable"
+            break
+    service = evidence["service"]
+    control_group = service.get("properties", {}).get("ControlGroup", "") if isinstance(service, dict) else ""
+    if isinstance(control_group, str) and control_group:
+        try:
+            evidence["cgroup"] = _health_cgroup(control_group)
+        except ProbeDeadlineExceeded:
+            raise
+        except Exception as exc:
+            _health_failure(evidence, "cgroup", "health_cgroup", exc)
+    else:
+        _health_failure(evidence, "cgroup", "health_cgroup")
+    try:
+        evidence["jobs"] = _health_jobs(module, deadline=deadline)
+    except HealthCommandFailure as exc:
+        _health_failure(evidence, "jobs", "health_jobs", ValueError("systemd jobs query failed"))
+        jobs = evidence["jobs"]
+        assert isinstance(jobs, dict)
+        jobs["returncode"] = exc.returncode
+    except ProbeDeadlineExceeded:
+        raise
+    except Exception as exc:
+        _health_failure(evidence, "jobs", "health_jobs", exc)
+    try:
+        evidence["journal"] = _health_journal(module, deadline=deadline)
+    except HealthCommandFailure as exc:
+        _health_failure(evidence, "journal", "health_journal", ValueError("health monitor journal query failed"))
+        journal = evidence["journal"]
+        assert isinstance(journal, dict)
+        journal["returncode"] = exc.returncode
+    except ProbeDeadlineExceeded:
+        raise
+    except Exception as exc:
+        _health_failure(evidence, "journal", "health_journal", exc)
+    try:
+        evidence["checker"] = _health_checker_report(target, deadline=deadline)
+    except ProbeDeadlineExceeded:
+        raise
+    except Exception as exc:
+        _health_failure(evidence, "checker", "health_checker", exc)
+    evidence["collection_completed"] = all(
+        isinstance(evidence[key], dict) and evidence[key].get("status") in {"passed", "reported"}
+        for key in ("service", "timer", "jobs", "cgroup", "journal", "checker")
+    )
+    evidence["finished_at_utc"] = datetime.now(UTC).isoformat(timespec="seconds")
+    return evidence
+
+
+def _collect_health_monitor_evidence_with_deadline(
+    module: Any, target: Path | None, *, deadline: float,
+) -> dict[str, object]:
+    evidence = _health_monitor_initial_evidence()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _health_failure(evidence, "deadline", "health_monitor", ProbeDeadlineExceeded())
+        evidence["finished_at_utc"] = datetime.now(UTC).isoformat(timespec="seconds")
+        return evidence
+    previous_alarm_handler = signal.getsignal(signal.SIGALRM)
+
+    def deadline_expired(_signum: int, _frame: Any) -> None:
+        raise ProbeDeadlineExceeded
+
+    signal.signal(signal.SIGALRM, deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        return _collect_health_monitor_evidence(module, target, deadline=deadline, evidence=evidence)
+    except ProbeDeadlineExceeded as exc:
+        _health_failure(evidence, "deadline", "health_monitor", exc)
+        evidence["finished_at_utc"] = datetime.now(UTC).isoformat(timespec="seconds")
+        return evidence
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_alarm_handler)
@@ -1065,6 +1536,13 @@ def _receipt_snapshot_and_preflight(
         raise ProbeFailure("existing_receipt_transaction")
     validation_release = Path(validation_path)
     target = Path(target_path) if target_path is not None else None
+
+    def collect_health_monitor() -> None:
+        if diagnostic_evidence is not None:
+            diagnostic_evidence["health_monitor"] = _collect_health_monitor_evidence(
+                module, target, deadline=readonly_deadline,
+            )
+
     try:
         app_metadata = APP_DIR.lstat()
     except OSError:
@@ -1204,6 +1682,7 @@ def _receipt_snapshot_and_preflight(
             diagnostic_evidence["collection_completed"] = False
             diagnostic_evidence["current_facts_status"] = "unavailable"
             diagnostic_evidence["mismatch_count"] = 0
+            collect_health_monitor()
             return record, result, target_label, target_path
         diagnostic_evidence["collection_completed"] = True
         comparable = all(
@@ -1249,6 +1728,7 @@ def _receipt_snapshot_and_preflight(
                     failure_phase="verify", failure_check="systemd_verify",
                     failure_class="timeout", failure_reason="timeout",
                 )
+            collect_health_monitor()
             return record, result, target_label, target_path
         previous_verify_alarm_handler = signal.getsignal(signal.SIGALRM)
         verify_observation: dict[str, object] = {}
@@ -1384,6 +1864,7 @@ def _receipt_snapshot_and_preflight(
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous_verify_alarm_handler)
+        collect_health_monitor()
         return record, result, target_label, target_path
     states = _unit_snapshot_with_deadline(
         module,
@@ -1597,6 +2078,7 @@ def _diagnostic_systemd_probe(
         "failure_unit": "none",
         "failure_query": "none",
         "failure_rc": "unavailable",
+        "health_monitor": _health_monitor_initial_evidence(),
     }
     try:
         if not companion_present:
@@ -1614,6 +2096,7 @@ def _diagnostic_systemd_probe(
             diagnostic_evidence=evidence,
         )
     except Exception as exc:
+        _finalize_skipped_health_monitor(evidence)
         check = exc.check if isinstance(exc, ProbeFailure) else "none"
         error_class = exc.error_class if isinstance(exc, ProbeFailure) else type(exc).__name__
         evidence["failure_check"] = check if check in _DIAGNOSTIC_CHECKS else "none"
