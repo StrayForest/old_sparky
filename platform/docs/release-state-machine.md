@@ -2,7 +2,7 @@
 
 - Status: Active release design
 - Owner: Production operator and platform maintainers
-- Last reviewed: 2026-09-29
+- Last reviewed: 2026-10-16
 
 This document owns the end-to-end release transaction. The normal production
 path is `tools/platform_release_deploy.sh`; the low-level installer is a
@@ -233,6 +233,36 @@ release remain unchanged; only its rollback entrypoint is replaced by the
 compatibility handoff needed for the normal cross-release boundary.
 
 ## Failure behavior
+
+### Read-only systemd capture-precondition probe
+
+After a signed recovery reports a closed `capture_transaction` failure, an
+operator may use the separate diagnostics workflow to identify a current
+pre-write predicate. First bind `dev` to a successful exact-SHA
+`Platform security and build` push run, then dispatch:
+
+```bash
+gh workflow run platform-production-diagnostics.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev \
+  -f mode=capture-probe
+```
+
+The mode uses the existing production SSH identity and pinned host key, stages
+its source-pinned helper in a private root-owned `/run` directory, and holds
+the canonical release lock while it reads transaction, pointer, helper,
+receipt and owned-unit state. It also returns fixed HTTP health results for
+the local API live/ready endpoints, local web endpoint and public origin. It
+does not invoke receipt capture or clear operations, change pointers or units,
+or mutate database/cache state. It removes the temporary helper only after
+its recorded identity and digest still match; a cleanup failure is reported
+and must be investigated without manual deletion.
+
+`capture_predicate=prewrite_predicates_passed` means the current read-only
+getters passed; it does not prove why an earlier receipt write failed.
+`capture_predicate=existing_receipt_valid` means the existing receipt passed
+its validator. Any failed check or transport result is diagnostic only; retain
+the original transaction and evidence and follow the documented recovery path.
 
 - A failure before `staged` is recovered from the pre-quiesce transaction by
   the transaction tool. The original

@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-09
+- Last reviewed: 2026-10-16
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -371,7 +371,7 @@ succeeds. A reconciliation timeout retains the candidate and receipt for
 retry. The normal activation path owns the reviewed
 health, Cloudflare and maintenance timer enablement, and installs the
 off-site-backup unit/timer without silently enabling off-site backup before its
-manual restore-drill gate.
+manual restore-drill gate. See the [read-only systemd capture-precondition probe](release-state-machine.md#read-only-systemd-capture-precondition-probe) before retrying a receipt-capture failure.
 
 New shared venvs and pip code use a local `umask 022` subshell so API/worker
 identities can traverse/read them; outer `umask 077` protects receipts, temp files and service envs.

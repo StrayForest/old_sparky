@@ -2,6 +2,15 @@ name: Platform production diagnostics
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Diagnostic mode
+        type: choice
+        options:
+          - existing
+          - capture-probe
+        default: existing
+        required: true
 
 permissions:
   contents: read
@@ -18,6 +27,28 @@ jobs:
     env:
       TARGET_SHA: ${{ github.sha }}
     steps:
+      - name: Checkout exact diagnostic source
+        if: ${{ inputs.mode == 'capture-probe' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Bind read-only probe source
+        if: ${{ inputs.mode == 'capture-probe' }}
+        shell: bash
+        env:
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/dev" ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ && "$(git rev-parse HEAD)" == "$TARGET_SHA" ]]
+          probe_sha256="$(sha256sum platform/tools/platform_release_capture_probe.py | awk '{print $1}')"
+          [[ "$(wc -c < platform/tools/platform_release_capture_probe.py)" -le 524288 ]]
+          systemd_sha256="$(sha256sum platform/tools/platform_release_systemd_state.py | awk '{print $1}')"
+          [[ "$probe_sha256" =~ ^[0-9a-f]{64}$ && "$systemd_sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'PROBE_SHA256=%s\nSYSTEMD_SHA256=%s\n' "$probe_sha256" "$systemd_sha256" >> "$GITHUB_ENV"
+
       - name: Configure SSH
         shell: bash
         env:
@@ -55,6 +86,7 @@ jobs:
           printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Verify latest patch distribution
+        if: ${{ inputs.mode != 'capture-probe' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -142,6 +174,7 @@ jobs:
           rm -f -- "$remote_log" "$remote_error"
 
       - name: Verify ru-v10 four-patch translation regression set
+        if: ${{ inputs.mode != 'capture-probe' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -359,12 +392,222 @@ jobs:
           printf '%s\n' "$public_line"
           rm -f -- "$remote_log" "$remote_error"
 
+      - name: Stage read-only probe in a private task directory
+        if: ${{ inputs.mode == 'capture-probe' }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          dir_identity="$(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT'")" <<'REMOTE_STAGE'
+          set -euo pipefail
+          run_id="$1"; run_attempt="$2"
+          [[ "$run_id" =~ ^[0-9]+$ && "$run_attempt" =~ ^[0-9]+$ ]]
+          probe_dir="/run/oldsparky-capture-probe-$run_id-$run_attempt"
+          mkdir -m 0700 -- "$probe_dir"
+          cleanup_created_dir() {
+            if [[ -d "$probe_dir" && ! -L "$probe_dir" \
+              && "$(stat -c '%u:%g:%a:%h' "$probe_dir" 2>/dev/null || true)" == "0:0:700:2" ]]; then
+              rmdir -- "$probe_dir" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_created_dir EXIT
+          dir_metadata="$(stat -c '%u:%g:%a:%h:%d:%i' "$probe_dir")"
+          [[ "$dir_metadata" =~ ^0:0:700:2:([0-9]+):([0-9]+)$ ]]
+          printf '%s:%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+          trap - EXIT
+          REMOTE_STAGE
+          [[ "$dir_identity" =~ ^[0-9]+:[0-9]+$ ]]
+          printf 'CAPTURE_PROBE_DIR_ID=%s\n' "$dir_identity" >> "$GITHUB_ENV"
+          scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
+            "$GITHUB_WORKSPACE/platform/tools/platform_release_capture_probe.py" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST:$probe_dir/probe.py"
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "chmod 0600 -- '$probe_dir/probe.py'"
+
+      - name: Read-only systemd capture precondition probe
+        if: ${{ inputs.mode == 'capture-probe' }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          remote_log="$RUNNER_TEMP/platform-production-capture-probe.log"
+          remote_error="$RUNNER_TEMP/platform-production-capture-probe-error.log"
+          umask 077
+          : >"$remote_log"
+          : >"$remote_error"
+          chmod 600 "$remote_log" "$remote_error"
+          set +e
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- '$TARGET_SHA' '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT' '$CAPTURE_PROBE_DIR_ID' '$PROBE_SHA256' '$SYSTEMD_SHA256'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
+          set -Eeuo pipefail
+          target_sha="$1"
+          run_id="$2"
+          run_attempt="$3"
+          probe_dir_identity="$4"
+          probe_sha256="$5"
+          systemd_sha256="$6"
+          [[ "$target_sha" =~ ^[0-9a-f]{40}$ && "$run_id" =~ ^[0-9]+$ && "$run_attempt" =~ ^[0-9]+$ ]]
+          [[ "$probe_dir_identity" =~ ^[0-9]+:[0-9]+$ ]]
+          [[ "$probe_sha256" =~ ^[0-9a-f]{64}$ && "$systemd_sha256" =~ ^[0-9a-f]{64}$ ]]
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          tools="$current/tools"
+          probe_dir="/run/oldsparky-capture-probe-$run_id-$run_attempt"
+          probe_path="$probe_dir/probe.py"
+          test "$(id -u)" = 0 || exit 1
+          test -d "$runtime" && test ! -L "$runtime"
+          test -d "$runtime/shared" && test ! -L "$runtime/shared"
+          test -d "$runtime/releases" && test ! -L "$runtime/releases"
+          test -L "$current" && test "$(stat -c %u "$current")" = 0
+          release="$(readlink -f "$current")"
+          test -d "$release" && test ! -L "$release"
+          test "$(dirname "$release")" = "$runtime/releases"
+          test -d "$tools" && test ! -L "$tools"
+          test -d "$probe_dir" && test ! -L "$probe_dir"
+          test "$(stat -c '%d:%i' "$probe_dir")" = "$probe_dir_identity"
+          test "$(stat -c '%u:%g:%a:%h' "$probe_dir")" = "0:0:700:2"
+          test -f "$probe_path" && test ! -L "$probe_path"
+          chmod 0600 -- "$probe_path"
+          test "$(stat -c '%u:%g:%a:%h' "$probe_path")" = "0:0:600:1"
+          test "$(stat -c %s "$probe_path")" -le 524288
+          test "$(sha256sum "$probe_path" | awk '{print $1}')" = "$probe_sha256"
+          probe_metadata="$(stat -c '%d:%i:%u:%g:%a:%h' "$probe_path")"
+          probe_directory_metadata="$(stat -c '%d:%i:%u:%g:%a' "$probe_dir")"
+          cleanup_probe() {
+            if [[ -f "$probe_path" && ! -L "$probe_path" \
+              && "$(stat -c '%d:%i:%u:%g:%a:%h' "$probe_path" 2>/dev/null || true)" == "$probe_metadata" \
+              && "$(sha256sum "$probe_path" 2>/dev/null | awk '{print $1}' || true)" == "$probe_sha256" ]]; then
+              rm -- "$probe_path"
+            fi
+            if [[ -d "$probe_dir" && ! -L "$probe_dir" \
+              && "$(stat -c '%d:%i:%u:%g:%a' "$probe_dir" 2>/dev/null || true)" == "$probe_directory_metadata" ]]; then
+              rmdir -- "$probe_dir" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_probe EXIT
+          lock_helper="$tools/platform_release_lock.sh"
+          test -f "$lock_helper" && test ! -L "$lock_helper"
+          source "$lock_helper"
+          platform_release_lock_open || { echo 'PRODUCTION_CAPTURE_PROBE schema=1 status=failed failed_check=release_lock error_class=lock' >&2; exit 1; }
+          trap 'platform_release_lock_close; cleanup_probe' EXIT
+          [[ "$target_sha" =~ ^[0-9a-f]{40,64}$ ]]
+          export PYTHONDONTWRITEBYTECODE=1
+          timeout --foreground 480s /usr/bin/python3 -I -B "$probe_path" "$probe_sha256" "$systemd_sha256"
+          REMOTE
+          remote_status=$?
+          set -e
+          /usr/bin/python3 - "$remote_log" "$remote_status" <<'PY'
+          import json, sys
+          from pathlib import Path
+          fallback = {"schema": 1, "kind": "release_capture_probe", "status": "failed", "failed_check": "remote_or_transport", "error_class": "remote"}
+          try:
+              path = Path(sys.argv[1])
+              if path.stat().st_size > 8192:
+                  raise ValueError
+              lines = [line for line in path.read_text(encoding="ascii").splitlines() if line]
+              if len(lines) != 1:
+                  raise ValueError
+              report = json.loads(lines[0])
+              common = {"schema", "kind", "status", "health"}
+              health_keys = {"api_live", "api_ready", "web_local", "public"}
+              if type(report) is not dict or report.get("schema") != 1 or report.get("kind") != "release_capture_probe":
+                  raise ValueError
+              health = report.get("health")
+              if type(health) is not dict or set(health) != health_keys or any(type(value) is not bool for value in health.values()):
+                  raise ValueError
+              if report.get("status") == "failed":
+                  if set(report) != common | {"failed_check", "error_class"}:
+                      raise ValueError
+                  units = ("deadlock-api.service", "deadlock-worker.service", "deadlock-web.service", "deadlock-maintenance.service", "deadlock-maintenance.timer", "deadlock-logrotate.service", "deadlock-logrotate.timer", "deadlock-offsite-backup.service", "deadlock-offsite-backup.timer", "deadlock-cloudflare-ips.service", "deadlock-cloudflare-ips.timer", "deadlock-health-monitor.service", "deadlock-health-monitor.timer")
+                  checks = {"root", "probe_identity", "systemd_module_identity", "module_metadata", "module_open", "module_identity", "module_size", "module_changed", "module_import", "release_metadata", "companion_metadata", "companion_lstat", "companion_recheck", "companion_changed", "systemctl_path", "transaction_read", "install_operation", "active_overrides", "current_binding", "previous_binding", "helper_digests", "helper_release_binding", "capture_context", "receipt_absence", "existing_receipt_validate", "unit_snapshot", "internal"}
+                  checks |= {"unit_" + verb + "_" + unit.replace(".", "_") for unit in units for verb in ("active", "enabled")}
+                  classes = {"permission", "predicate", "oserror", "input", "StateError", "ValueError", "TypeError", "JSONDecodeError", "TimeoutExpired", "exception"}
+                  if report["failed_check"] not in checks or report["error_class"] not in classes:
+                      raise ValueError
+                  safe = {key: report[key] for key in ("schema", "kind", "status", "failed_check", "error_class", "health")}
+              elif report.get("status") == "passed":
+                  keys = common | {"capture_predicate", "receipt_present", "current_bound", "previous_bound", "service_active_count", "service_enabled_count"}
+                  if set(report) != keys or report["capture_predicate"] not in {"existing_receipt_valid", "prewrite_predicates_passed"}:
+                      raise ValueError
+                  if type(report["receipt_present"]) is not bool:
+                      raise ValueError
+                  for key in ("current_bound", "previous_bound"):
+                      if report[key] is not None and type(report[key]) is not bool:
+                          raise ValueError
+                  for key in ("service_active_count", "service_enabled_count"):
+                      if report[key] is not None and (type(report[key]) is not int or not 0 <= report[key] <= 13):
+                          raise ValueError
+                  safe = {key: report[key] for key in sorted(keys)}
+                  if sys.argv[2] != "0":
+                      safe = {"schema": 1, "kind": "release_capture_probe", "status": "failed", "failed_check": "remote_or_transport", "error_class": "remote", "health": health}
+              else:
+                  raise ValueError
+              print("PRODUCTION_CAPTURE_PROBE " + json.dumps(safe, sort_keys=True, separators=(",", ":")))
+          except Exception:
+              print("PRODUCTION_CAPTURE_PROBE " + json.dumps(fallback, sort_keys=True, separators=(",", ":")))
+          PY
+          rm -f -- "$remote_log" "$remote_error"
+          (( remote_status == 0 ))
+
       - name: Remove production SSH material
         id: cleanup_ssh
         if: ${{ always() }}
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          remote_cleanup_status=0
+          if [[ "${{ inputs.mode }}" == "capture-probe" && -n "${SSH_DIR:-}" \
+            && -f "$SSH_DIR/config" && -n "${CAPTURE_PROBE_DIR_ID:-}" \
+            && -n "${PROBE_SHA256:-}" ]]; then
+            [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+            [[ "$CAPTURE_PROBE_DIR_ID" =~ ^[0-9]+:[0-9]+$ && "$PROBE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            set +e
+            ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+              -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              "bash -s -- '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT' '$CAPTURE_PROBE_DIR_ID' '$PROBE_SHA256'" <<'REMOTE_CLEANUP'
+          set -euo pipefail
+          run_id="$1"; run_attempt="$2"; expected_dir_id="$3"; expected_sha="$4"
+          [[ "$run_id" =~ ^[0-9]+$ && "$run_attempt" =~ ^[0-9]+$ ]]
+          [[ "$expected_dir_id" =~ ^[0-9]+:[0-9]+$ && "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+          probe_dir="/run/oldsparky-capture-probe-$run_id-$run_attempt"
+          probe_path="$probe_dir/probe.py"
+          [[ -e "$probe_dir" || -L "$probe_dir" ]] || exit 0
+          [[ -d "$probe_dir" && ! -L "$probe_dir" ]]
+          [[ "$(stat -c '%d:%i' "$probe_dir")" == "$expected_dir_id" ]]
+          [[ "$(stat -c '%u:%g:%a' "$probe_dir")" == "0:0:700" ]]
+          if [[ -e "$probe_path" || -L "$probe_path" ]]; then
+            [[ -f "$probe_path" && ! -L "$probe_path" ]]
+            [[ "$(stat -c '%u:%g:%a:%h' "$probe_path")" == "0:0:600:1" ]]
+            [[ "$(stat -c %s "$probe_path")" -le 524288 ]]
+            [[ "$(sha256sum "$probe_path" | awk '{print $1}')" == "$expected_sha" ]]
+            probe_file_id="$(stat -c '%d:%i:%u:%g:%a:%h' "$probe_path")"
+            [[ "$(stat -c '%d:%i:%u:%g:%a:%h' "$probe_path")" == "$probe_file_id" ]]
+            [[ "$(sha256sum "$probe_path" | awk '{print $1}')" == "$expected_sha" ]]
+            rm -- "$probe_path"
+          fi
+          rmdir -- "$probe_dir"
+          REMOTE_CLEANUP
+            remote_cleanup_status=$?
+            set -e
+          fi
           ssh_dir="$RUNNER_TEMP/platform-production-diagnostics-ssh"
           test "$ssh_dir" = "$RUNNER_TEMP/platform-production-diagnostics-ssh"
           if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
@@ -392,3 +635,6 @@ jobs:
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
+          if (( remote_cleanup_status != 0 )); then
+            exit "$remote_cleanup_status"
+          fi
