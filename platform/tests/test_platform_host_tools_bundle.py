@@ -2478,9 +2478,14 @@ with log_path.open("a", encoding="utf-8") as log:
     log.write(" ".join(command) + "\\n")
 remote_path = command[-1] if command else ""
 if command[0] == "/usr/bin/id":
-    print("0")
+    print(os.environ.get("FAKE_REMOTE_UID", "0"))
 elif command[0] == "/usr/bin/test":
-    pass
+    if (
+        os.environ.get("FAKE_MISSING_GENERATION") == "1"
+        and command[1:2] == ["-d"]
+        and remote_path.endswith("/" + os.environ["FAKE_SOURCE_SHA"])
+    ):
+        raise SystemExit(1)
 elif command[0] == "/usr/bin/stat":
     format_value = command[2]
     if format_value == "%a":
@@ -2493,7 +2498,11 @@ elif command[0] == "/usr/bin/stat":
             else "555"
         )
     elif remote_path.endswith("/" + os.environ["FAKE_SOURCE_SHA"]):
-        print("directory:0:0:2:555")
+        print(
+            "directory:0:0:2:755"
+            if os.environ.get("FAKE_WRONG_GENERATION_METADATA") == "1"
+            else "directory:0:0:2:555"
+        )
     else:
         mode = (
             "444"
@@ -2505,6 +2514,8 @@ elif command[0] == "/usr/bin/stat":
 elif command[0] == "/usr/bin/sha256sum":
     local_path = Path(os.environ["FAKE_GENERATION"]) / Path(remote_path).name
     digest = hashlib.sha256(local_path.read_bytes()).hexdigest()
+    if os.environ.get("FAKE_WRONG_PAYLOAD_HASH") == "1":
+        digest = "0" * 64
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"digest:{local_path.name}\\n")
     print(f"{digest}  {remote_path}")
@@ -2553,6 +2564,10 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
                     "FAKE_SSH_LOG": str(ssh_log),
                     "FAKE_GENERATION": str(generation_root),
                     "FAKE_SOURCE_SHA": SOURCE_SHA,
+                    "FAKE_REMOTE_UID": "0",
+                    "FAKE_MISSING_GENERATION": "0",
+                    "FAKE_WRONG_GENERATION_METADATA": "0",
+                    "FAKE_WRONG_PAYLOAD_HASH": "0",
                     "PATH": f"{fake_bin}:{env['PATH']}",
                 }
             )
@@ -2588,6 +2603,9 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
             )
             self.assertEqual(len(mode_records), len(expected_names))
             self.assertEqual(set(mode_records), expected_names)
+            self.assertIn("HOST_CAPABILITY_CHECK remote_identity_root PASS", completed.stdout)
+            self.assertIn("HOST_CAPABILITY_CHECK generation_directory_exists PASS", completed.stdout)
+            self.assertIn("HOST_CAPABILITY_CHECK generation_metadata PASS", completed.stdout)
             inventory_records = [
                 line.removeprefix("inventory:")
                 for line in log_lines
@@ -2601,6 +2619,49 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
             # dispatcher while proving the read-only verifier is detached.
             self.assertIn('production-prepare-artifact < "$input_path"', workflow)
             self.assertIn('production-deploy < "$input_path"', workflow)
+
+            def run_diagnostic_case(**overrides: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+                original = {key: env[key] for key in overrides}
+                env.update(overrides)
+                ssh_log.write_text("", encoding="utf-8")
+                try:
+                    result = run_block(shell_block)
+                    calls = ssh_log.read_text(encoding="utf-8").splitlines()
+                finally:
+                    env.update(original)
+                return result, calls
+
+            nonroot, nonroot_calls = run_diagnostic_case(FAKE_REMOTE_UID="1000")
+            self.assertNotEqual(nonroot.returncode, 0)
+            self.assertIn("HOST_CAPABILITY_CHECK remote_identity_root FAIL", nonroot.stderr)
+            self.assertNotIn("HOST_CAPABILITY_CHECK generation_directory_exists", nonroot.stdout)
+            self.assertTrue(any("/usr/bin/id -u" in call for call in nonroot_calls))
+            self.assertFalse(any("/usr/bin/test -d" in call for call in nonroot_calls))
+
+            missing, missing_calls = run_diagnostic_case(FAKE_MISSING_GENERATION="1")
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("HOST_CAPABILITY_CHECK remote_identity_root PASS", missing.stdout)
+            self.assertIn("HOST_CAPABILITY_CHECK generation_directory_exists FAIL", missing.stderr)
+            self.assertNotIn("HOST_CAPABILITY_CHECK generation_not_symlink", missing.stdout)
+            self.assertFalse(any("/usr/bin/stat" in call for call in missing_calls))
+
+            bad_metadata, metadata_calls = run_diagnostic_case(
+                FAKE_WRONG_GENERATION_METADATA="1"
+            )
+            self.assertNotEqual(bad_metadata.returncode, 0)
+            self.assertIn("HOST_CAPABILITY_CHECK generation_metadata FAIL", bad_metadata.stderr)
+            self.assertFalse(any("/usr/bin/sha256sum" in call for call in metadata_calls))
+
+            bad_hash, hash_calls = run_diagnostic_case(FAKE_WRONG_PAYLOAD_HASH="1")
+            self.assertNotEqual(bad_hash.returncode, 0)
+            self.assertRegex(
+                bad_hash.stderr,
+                r"HOST_CAPABILITY_CHECK payload_\d{2}_digest FAIL",
+            )
+            self.assertEqual(
+                sum("/usr/bin/sha256sum" in call for call in hash_calls),
+                1,
+            )
 
             # Re-run the active block with only the protective ``-n`` removed.
             # The adversarial fake consumes one sidecar row per SSH call, so

@@ -1248,10 +1248,27 @@ jobs:
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
+          capability_check_pass() {
+            printf 'HOST_CAPABILITY_CHECK %s PASS\n' "$1"
+          }
+          capability_check_fail() {
+            printf 'HOST_CAPABILITY_CHECK %s FAIL\n' "$1" >&2
+            exit 1
+          }
+          capability_check_command() {
+            local check_id=$1
+            shift
+            if "$@"; then
+              capability_check_pass "$check_id"
+            else
+              capability_check_fail "$check_id"
+            fi
+          }
           if [[ -z "${PROD_SSH_HOST:-}" || -z "${PROD_SSH_USER:-}" || -z "${PROD_SSH_KEY:-}" ]]; then
             echo "Production SSH configuration is incomplete." >&2
-            exit 1
+            capability_check_fail ssh_configuration
           fi
+          capability_check_pass ssh_configuration
           ssh_dir="$RUNNER_TEMP/platform-host-capability-ssh"
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
@@ -1266,7 +1283,12 @@ jobs:
             fi
             rm -f -- "$ssh_scan_attempt"; printf 'Production SSH host-key acquisition attempt %s/2 failed\n' "$ssh_attempt" >&2; (( ssh_attempt == 2 )) || sleep 0.5
           done
-          test "$ssh_scan_ok" = 1 || { echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2; exit 1; }
+          if test "$ssh_scan_ok" = 1; then
+            capability_check_pass ssh_host_key
+          else
+            echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2
+            capability_check_fail ssh_host_key
+          fi
           install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
           {
             printf '%s\n' 'Host *'
@@ -1282,50 +1304,76 @@ jobs:
             /usr/bin/timeout --foreground --signal=TERM --kill-after=5s 60s \
               "${remote[@]}" "$@"
           }
-          test "$(run_remote_readonly /usr/bin/id -u | tr -d '\r\n')" = 0
-          [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$generation" = "/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA" ]]
-          run_remote_readonly /usr/bin/test -d "$generation"
-          run_remote_readonly /usr/bin/test ! -L "$generation"
-          test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation")" = "directory:0:0:2:555"
+          capability_check_command remote_identity_root test "$(run_remote_readonly /usr/bin/id -u | tr -d '\r\n')" = 0
+          if [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]; then capability_check_pass host_tools_sha_format; else capability_check_fail host_tools_sha_format; fi
+          if [[ "$generation" = "/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA" ]]; then capability_check_pass generation_path_binding; else capability_check_fail generation_path_binding; fi
+          capability_check_command generation_directory_exists run_remote_readonly /usr/bin/test -d "$generation"
+          capability_check_command generation_not_symlink run_remote_readonly /usr/bin/test ! -L "$generation"
+          capability_check_command generation_metadata test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation")" = "directory:0:0:2:555"
           contract_dir="$RUNNER_TEMP/host-tools-download/contract"
-          expected_payload_count="$(wc -l < "$contract_dir/files.sha256" | tr -d ' ')"
-          expected_mode_payload_count="$(wc -l < "$contract_dir/files.modes" | tr -d ' ')"
-          test "$expected_payload_count" -gt 0
-          test "$expected_mode_payload_count" -eq "$expected_payload_count"
+          if expected_payload_count="$(wc -l < "$contract_dir/files.sha256" | tr -d ' ')"; then
+            capability_check_pass payload_digest_count_read
+          else
+            capability_check_fail payload_digest_count_read
+          fi
+          if expected_mode_payload_count="$(wc -l < "$contract_dir/files.modes" | tr -d ' ')"; then
+            capability_check_pass payload_mode_count_read
+          else
+            capability_check_fail payload_mode_count_read
+          fi
+          capability_check_command payload_digest_count_nonzero test "$expected_payload_count" -gt 0
+          capability_check_command payload_mode_count_matches test "$expected_mode_payload_count" -eq "$expected_payload_count"
           digest_count=0
           while read -r expected_hash expected_path; do
-            [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]
-            [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^capabilities\.txt$|^manifest\.json$ ]]
+            printf -v row_id '%02d' "$((digest_count + 1))"
+            if [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]; then capability_check_pass "payload_${row_id}_hash_format"; else capability_check_fail "payload_${row_id}_hash_format"; fi
+            if [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^capabilities\.txt$|^manifest\.json$ ]]; then capability_check_pass "payload_${row_id}_path_format"; else capability_check_fail "payload_${row_id}_path_format"; fi
             remote_path="$generation/$expected_path"
-            run_remote_readonly /usr/bin/test -f "$remote_path"
-            run_remote_readonly /usr/bin/test ! -L "$remote_path"
+            capability_check_command "payload_${row_id}_exists" run_remote_readonly /usr/bin/test -f "$remote_path"
+            capability_check_command "payload_${row_id}_not_symlink" run_remote_readonly /usr/bin/test ! -L "$remote_path"
             case "$expected_path" in
               capabilities.txt|manifest.json) expected_mode=444 ;;
               *) expected_mode=555 ;;
             esac
-            test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_path")" = "regular file:0:0:1:$expected_mode"
-            remote_digest="$(run_remote_readonly /usr/bin/sha256sum -- "$remote_path")"
-            test "${remote_digest%% *}" = "$expected_hash"
+            capability_check_command "payload_${row_id}_metadata" test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_path")" = "regular file:0:0:1:$expected_mode"
+          if remote_digest="$(run_remote_readonly /usr/bin/sha256sum -- "$remote_path")"; then
+            capability_check_pass "payload_${row_id}_digest_read"
+          else
+            capability_check_fail "payload_${row_id}_digest_read"
+          fi
+            capability_check_command "payload_${row_id}_digest" test "${remote_digest%% *}" = "$expected_hash"
             digest_count=$((digest_count + 1))
           done < "$contract_dir/files.sha256"
-          test "$digest_count" -eq "$expected_payload_count"
-          IFS= read -r expected_manifest_hash < "$contract_dir/manifest.sha256"
-          IFS= read -r expected_capabilities_hash < "$contract_dir/capabilities.sha256"
-          test "$(run_remote_readonly /usr/bin/sha256sum -- "$generation/manifest.json")" = "$expected_manifest_hash  $generation/manifest.json"
-          test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/manifest.json")" = "regular file:0:0:1:444"
-          test "$(run_remote_readonly /usr/bin/sha256sum -- "$generation/capabilities.txt")" = "$expected_capabilities_hash  $generation/capabilities.txt"
-          test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/capabilities.txt")" = "regular file:0:0:1:444"
+          capability_check_command payload_digest_count_matches test "$digest_count" -eq "$expected_payload_count"
+          if IFS= read -r expected_manifest_hash < "$contract_dir/manifest.sha256"; then
+            capability_check_pass manifest_digest_read
+          else
+            capability_check_fail manifest_digest_read
+          fi
+          if IFS= read -r expected_capabilities_hash < "$contract_dir/capabilities.sha256"; then
+            capability_check_pass capabilities_digest_read
+          else
+            capability_check_fail capabilities_digest_read
+          fi
+          capability_check_command manifest_digest test "$(run_remote_readonly /usr/bin/sha256sum -- "$generation/manifest.json")" = "$expected_manifest_hash  $generation/manifest.json"
+          capability_check_command manifest_metadata test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/manifest.json")" = "regular file:0:0:1:444"
+          capability_check_command capabilities_digest test "$(run_remote_readonly /usr/bin/sha256sum -- "$generation/capabilities.txt")" = "$expected_capabilities_hash  $generation/capabilities.txt"
+          capability_check_command capabilities_metadata test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/capabilities.txt")" = "regular file:0:0:1:444"
           declare -A expected_entries=([capabilities.txt]=1 [manifest.json]=1)
           mode_count=0
           while read -r expected_mode expected_path; do
             remote_path="$generation/$expected_path"
-            remote_mode="$(run_remote_readonly /usr/bin/stat -c '%a' -- "$remote_path")"
-            test "$remote_mode" = "$expected_mode"
+            printf -v row_id '%02d' "$((mode_count + 1))"
+            if remote_mode="$(run_remote_readonly /usr/bin/stat -c '%a' -- "$remote_path")"; then
+              capability_check_pass "mode_${row_id}_read"
+            else
+              capability_check_fail "mode_${row_id}_read"
+            fi
+            capability_check_command "mode_${row_id}_matches" test "$remote_mode" = "$expected_mode"
             expected_entries["$expected_path"]=1
             mode_count=$((mode_count + 1))
           done < "$contract_dir/files.modes"
-          test "$mode_count" -eq "$expected_payload_count"
+          capability_check_command mode_count_matches test "$mode_count" -eq "$expected_payload_count"
           printf '%s\n' "Verified host-tools remote digest entries: $digest_count"
           printf '%s\n' "Verified host-tools remote mode entries: $mode_count"
           expected_entry_count="${#expected_entries[@]}"
@@ -1334,25 +1382,36 @@ jobs:
           # NUL-delimited find output is base64-wrapped before it crosses the
           # SSH boundary.  This preserves dotfiles and makes newline/control
           # names observable instead of allowing line-oriented ambiguity.
-          run_remote_readonly /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -print0 \
-            | /usr/bin/base64 -w 0 > "$inventory_encoded"
-          test "$(stat -c '%F:%h' -- "$inventory_encoded")" = "regular file:1"
-          test "$(stat -c '%s' -- "$inventory_encoded")" -le 16384
-          /usr/bin/base64 --decode "$inventory_encoded" > "$inventory_file"
-          test "$(stat -c '%F:%h' -- "$inventory_file")" = "regular file:1"
+          if run_remote_readonly /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -print0 \
+            | /usr/bin/base64 -w 0 > "$inventory_encoded"; then
+            capability_check_pass inventory_fetch
+          else
+            capability_check_fail inventory_fetch
+          fi
+          capability_check_command inventory_encoded_metadata test "$(stat -c '%F:%h' -- "$inventory_encoded")" = "regular file:1"
+          capability_check_command inventory_encoded_size_bound test "$(stat -c '%s' -- "$inventory_encoded")" -le 16384
+          if /usr/bin/base64 --decode "$inventory_encoded" > "$inventory_file"; then
+            capability_check_pass inventory_decode
+          else
+            capability_check_fail inventory_decode
+          fi
+          capability_check_command inventory_file_metadata test "$(stat -c '%F:%h' -- "$inventory_file")" = "regular file:1"
           mapfile -d '' -t remote_names < "$inventory_file"
-          test "${#remote_names[@]}" -eq "$expected_entry_count"
+          capability_check_command inventory_entry_count test "${#remote_names[@]}" -eq "$expected_entry_count"
           declare -A seen_entries=()
+          inventory_name_count=0
           for remote_path in "${remote_names[@]}"; do
-            [[ "$remote_path" == "$generation/"* ]]
+            inventory_name_count=$((inventory_name_count + 1))
+            printf -v row_id '%02d' "$inventory_name_count"
+            if [[ "$remote_path" == "$generation/"* ]]; then capability_check_pass "inventory_${row_id}_generation_prefix"; else capability_check_fail "inventory_${row_id}_generation_prefix"; fi
             relative_path="${remote_path#"$generation/"}"
-            [[ "$relative_path" =~ ^[A-Za-z0-9_.-]+$ ]]
-            [[ -n "${expected_entries[$relative_path]+present}" ]]
-            [[ -z "${seen_entries[$relative_path]+present}" ]]
+            if [[ "$relative_path" =~ ^[A-Za-z0-9_.-]+$ ]]; then capability_check_pass "inventory_${row_id}_name_format"; else capability_check_fail "inventory_${row_id}_name_format"; fi
+            if [[ -n "${expected_entries[$relative_path]+present}" ]]; then capability_check_pass "inventory_${row_id}_expected_member"; else capability_check_fail "inventory_${row_id}_expected_member"; fi
+            if [[ -z "${seen_entries[$relative_path]+present}" ]]; then capability_check_pass "inventory_${row_id}_unique_member"; else capability_check_fail "inventory_${row_id}_unique_member"; fi
             seen_entries["$relative_path"]=1
             unset "expected_entries[$relative_path]"
           done
-          test "${#expected_entries[@]}" -eq 0
+          capability_check_command inventory_no_missing_members test "${#expected_entries[@]}" -eq 0
           printf '%s\n' "HOST_TOOLS_GENERATION=$generation" >> "$GITHUB_ENV"
           printf '%s\n' "HOST_TOOLS_SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
