@@ -60,6 +60,11 @@ on:
         description: "Optional pinned recipient certificate for encrypted runtime failure context"
         required: false
         type: string
+      source_bound_liveqa_reuse:
+        description: "Allow the recovery helper to reuse only the exact already-active source-bound LiveQA payload"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -91,6 +96,7 @@ jobs:
       FAILED_DEPLOY_RUN_ATTEMPT: ${{ inputs.failed_deploy_run_attempt }}
       EXPECTED_CANDIDATES_JSON: ${{ inputs.expected_candidates_json }}
       PROTECTED_RELEASES_JSON: ${{ inputs.protected_releases_json }}
+      SOURCE_BOUND_LIVEQA_REUSE: ${{ inputs.source_bound_liveqa_reuse }}
       SECURITY_WORKFLOW: Platform security and build
       SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
       SECURITY_JOB: Verification contract
@@ -128,11 +134,14 @@ jobs:
                 echo "Private failure recipient input is outside its bound" >&2
                 exit 1
               fi
+              [[ "$SOURCE_BOUND_LIVEQA_REUSE" == true || "$SOURCE_BOUND_LIVEQA_REUSE" == false ]] \
+                || { echo "Source-bound LiveQA reuse choice is invalid" >&2; exit 1; }
               ;;
             quarantine_populated_quiesce:QUARANTINE-POPULATED-QUIESCE)
               [[ "$FAILED_DEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
                 && "$FAILED_DEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ \
-                && -z "$EXPECTED_CANDIDATES_JSON$PROTECTED_RELEASES_JSON$RECIPIENT_CERTIFICATE_B64" ]] \
+                && -z "$EXPECTED_CANDIDATES_JSON$PROTECTED_RELEASES_JSON$RECIPIENT_CERTIFICATE_B64" \
+                && "$SOURCE_BOUND_LIVEQA_REUSE" == false ]] \
                 || { echo "Exact failed deployment run and attempt are required" >&2; exit 1; }
               ;;
             prune_task_releases:PRUNE-TASK-RELEASES)
@@ -140,6 +149,8 @@ jobs:
                 || { echo "Exact reviewed release sets are required" >&2; exit 1; }
               test -z "$RECIPIENT_CERTIFICATE_B64" \
                 || { echo "Private failure recipient is only supported for recover_pending" >&2; exit 1; }
+              test "$SOURCE_BOUND_LIVEQA_REUSE" = false \
+                || { echo "Source-bound LiveQA reuse is only supported for recover_pending" >&2; exit 1; }
               ;;
             *) echo "Refusing recovery without exact action confirmation" >&2; exit 1 ;;
           esac
@@ -639,6 +650,210 @@ jobs:
           fi
           printf 'capture_enabled=1\nrecipient_certificate_path=%s\n' "$certificate" >> "$GITHUB_OUTPUT"
 
+      - name: Validate exact source-bound LiveQA artifact before production access
+        id: source_bound_liveqa
+        if: ${{ inputs.recovery_action == 'recover_pending' && inputs.source_bound_liveqa_reuse }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          repo="StrayForest/old_sparky"
+          source_sha="9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+          run_id="38185744516"
+          run_attempt="1"
+          artifact_id="11719716640"
+          artifact_name="platform-release-artifact-38185744516-1"
+          archive_sha="9509ff1fe8a4a7520b20a7b1f62bafa90758d32a50d071f02cb25f7110bc7617"
+          tar_sha="2f305c4f85a2a9b6e5a12739fb02f04e823a8327925f0019032e2d32203f2c62"
+          tar_name="gha-38185744516-1-9ceaf09ab7ba.tar.gz"
+          root="$RUNNER_TEMP/platform-source-bound-liveqa-reuse"
+          mkdir -m 700 -- "$root"
+          test -d "$root" && test ! -L "$root"
+          api="$GITHUB_API_URL/repos/$repo"
+          gh_header=(--header "Authorization: Bearer ${GH_TOKEN:?}" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            "${gh_header[@]}" "$api/actions/runs/$run_id/attempts/$run_attempt" --output "$root/run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            "${gh_header[@]}" "$api/actions/runs/$run_id/attempts/$run_attempt/artifacts?per_page=100&page=1" --output "$root/artifacts.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            "${gh_header[@]}" "$api/actions/artifacts/$artifact_id" --output "$root/artifact.json"
+          /usr/bin/python3 -I - "$root" <<'PY'
+          import json
+          from pathlib import Path
+          import stat
+          import sys
+
+          root = Path(sys.argv[1])
+          def read(name):
+              path = root / name
+              metadata = path.lstat()
+              if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                      or metadata.st_size > 256 * 1024):
+                  raise SystemExit("source-bound artifact metadata response is unsafe")
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          run = read("run.json")
+          if (not isinstance(run, dict) or run.get("id") != 38185744516
+                  or run.get("run_attempt") != 1
+                  or run.get("head_sha") != "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+                  or run.get("head_branch") != "dev"
+                  or run.get("path") != ".github/workflows/platform-production-deploy.yml"
+                  or run.get("status") != "completed" or run.get("conclusion") != "success"):
+              raise SystemExit("exact source-bound release run is not successful")
+
+          payload = read("artifacts.json")
+          rows = payload.get("artifacts") if isinstance(payload, dict) else None
+          if (not isinstance(rows, list) or type(payload.get("total_count")) is not int
+                  or payload["total_count"] != len(rows) or len(rows) > 100):
+              raise SystemExit("source-bound release artifact listing is incomplete")
+          selected = [row for row in rows if isinstance(row, dict)
+                      and row.get("id") == 11719716640]
+          if len(selected) != 1:
+              raise SystemExit("exact source-bound release artifact is missing")
+          item = selected[0]
+          workflow_run = item.get("workflow_run")
+          if (item.get("name") != "platform-release-artifact-38185744516-1"
+                  or item.get("expired") is not False
+                  or item.get("size_in_bytes") != 72347458
+                  or item.get("digest") != "sha256:9509ff1fe8a4a7520b20a7b1f62bafa90758d32a50d071f02cb25f7110bc7617"
+                  or not isinstance(workflow_run, dict)
+                  or workflow_run.get("id") != 38185744516
+                  or workflow_run.get("head_sha") != "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+                  or ("run_attempt" in workflow_run and workflow_run.get("run_attempt") != 1)):
+              raise SystemExit("source-bound artifact metadata does not match its exact run")
+
+          metadata = read("artifact.json")
+          if (not isinstance(metadata, dict) or metadata.get("id") != 11719716640
+                  or metadata.get("name") != "platform-release-artifact-38185744516-1"
+                  or metadata.get("expired") is not False
+                  or metadata.get("size_in_bytes") != 72347458
+                  or metadata.get("digest") != "sha256:9509ff1fe8a4a7520b20a7b1f62bafa90758d32a50d071f02cb25f7110bc7617"):
+              raise SystemExit("source-bound artifact detail metadata is inconsistent")
+          PY
+          archive_zip="$root/release-artifact.zip"
+          install -m 600 /dev/null "$archive_zip"
+          curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 300 --retry 2 --retry-delay 1 --retry-all-errors \
+            "${gh_header[@]}" "$api/actions/artifacts/$artifact_id/zip" --output "$archive_zip"
+          test "$(stat -c '%h:%a:%s' "$archive_zip")" = "1:600:72347458"
+          test "$(sha256sum "$archive_zip" | awk '{print $1}')" = "$archive_sha"
+          tar_path="$root/$tar_name"
+          checksum_path="$root/$tar_name.sha256"
+          receipt_path="$root/attestation-receipt.json"
+          /usr/bin/python3 -I - "$archive_zip" "$tar_path" "$checksum_path" "$receipt_path" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import zipfile
+          import shutil
+          import sys
+
+          archive_path, tar_name, checksum_name, receipt_name = map(Path, sys.argv[1:])
+          expected_tar = "gha-38185744516-1-9ceaf09ab7ba.tar.gz"
+          expected_tar_sha = "2f305c4f85a2a9b6e5a12739fb02f04e823a8327925f0019032e2d32203f2c62"
+          expected_archive_sha = "9509ff1fe8a4a7520b20a7b1f62bafa90758d32a50d071f02cb25f7110bc7617"
+          expected_source = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+          archive_digest = hashlib.sha256()
+          with archive_path.open("rb") as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                  archive_digest.update(chunk)
+          if archive_digest.hexdigest() != expected_archive_sha:
+              raise SystemExit("source-bound artifact archive digest changed")
+          if archive_path.stat().st_size != 72347458:
+              raise SystemExit("source-bound artifact archive size changed")
+          with zipfile.ZipFile(archive_path) as archive:
+              infos = archive.infolist()
+              names = [info.filename for info in infos]
+              required = {"RELEASE.provenance.json", expected_tar, expected_tar + ".sha256"}
+              if len(infos) != 3 or len(names) != len(set(names)) or set(names) != required:
+                  raise SystemExit("source-bound artifact member set is invalid")
+              selected = {}
+              for info in infos:
+                  mode = (info.external_attr >> 16) & 0o177777
+                  if (info.create_system != 3 or info.is_dir() or not stat.S_ISREG(mode)
+                          or stat.S_IMODE(mode) != 0o644):
+                      raise SystemExit("source-bound artifact member metadata is unsafe")
+                  expected_size = 72374083 if info.filename == expected_tar else (104 if info.filename.endswith(".sha256") else 224)
+                  if info.file_size != expected_size:
+                      raise SystemExit("source-bound artifact member size is invalid")
+                  selected[info.filename] = info
+              provenance = json.loads(archive.read(selected["RELEASE.provenance.json"]).decode("ascii"))
+              if (not isinstance(provenance, dict)
+                      or set(provenance) != {"artifact_file", "artifact_sha256", "schema", "source_git_commit"}
+                      or provenance != {"artifact_file": expected_tar, "artifact_sha256": expected_tar_sha,
+                                        "schema": 1, "source_git_commit": expected_source}):
+                  raise SystemExit("source-bound release provenance is invalid")
+              sidecar = archive.read(selected[expected_tar + ".sha256"])
+              if sidecar != f"{expected_tar_sha}  {expected_tar}\n".encode("ascii"):
+                  raise SystemExit("source-bound release checksum sidecar is invalid")
+              descriptor = os.open(tar_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+              digest = hashlib.sha256()
+              count = 0
+              with os.fdopen(descriptor, "wb") as output, archive.open(selected[expected_tar]) as source:
+                  while chunk := source.read(1024 * 1024):
+                      count += len(chunk)
+                      if count > 72374083:
+                          raise SystemExit("source-bound release archive expanded past its bound")
+                      digest.update(chunk)
+                      output.write(chunk)
+                  output.flush()
+                  os.fsync(output.fileno())
+              if count != 72374083 or digest.hexdigest() != expected_tar_sha:
+                  raise SystemExit("source-bound release tar digest is invalid")
+              for path, content in ((checksum_name, sidecar),):
+                  descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  with os.fdopen(descriptor, "wb") as output:
+                      output.write(content)
+                      output.flush()
+                      os.fsync(output.fileno())
+          PY
+          install -m 600 /dev/null "$root/attestation-certificate.json"
+          install -m 600 /dev/null "$root/attestation-signer.json"
+          GH_TOKEN="$GH_TOKEN" /usr/bin/gh attestation verify "$tar_path" --repo "$repo" \
+            --cert-identity "https://github.com/StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev" \
+            --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --source-ref refs/heads/dev --source-digest "$source_sha" --format json \
+            > "$root/attestation-certificate.json"
+          GH_TOKEN="$GH_TOKEN" /usr/bin/gh attestation verify "$tar_path" --repo "$repo" \
+            --signer-workflow StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml \
+            --source-ref refs/heads/dev --source-digest "$source_sha" --format json \
+            > "$root/attestation-signer.json"
+          /usr/bin/python3 -I - "$receipt_path" <<'PY'
+          import json
+          import os
+          import sys
+          destination = sys.argv[1]
+          payload = {
+              "schema": 1,
+              "repository": "StrayForest/old_sparky",
+              "run_id": 38185744516,
+              "run_attempt": 1,
+              "artifact_id": 11719716640,
+              "artifact_name": "platform-release-artifact-38185744516-1",
+              "artifact_zip_sha256": "9509ff1fe8a4a7520b20a7b1f62bafa90758d32a50d071f02cb25f7110bc7617",
+              "tar_sha256": "2f305c4f85a2a9b6e5a12739fb02f04e823a8327925f0019032e2d32203f2c62",
+              "source_sha": "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d",
+              "release_slug": "gha-38185744516-1-9ceaf09ab7ba",
+              "source_ref": "refs/heads/dev",
+              "policies": [
+                  {"id": "certificate_identity_issuer", "result": "passed"},
+                  {"id": "signer_workflow", "result": "passed"},
+              ],
+          }
+          raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "wb") as stream:
+              stream.write(raw)
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+          printf 'enabled=1\nartifact_tar_path=%s\nchecksum_path=%s\nattestation_receipt_path=%s\nartifact_tar_sha256=%s\nartifact_zip_sha256=%s\nattestation_receipt_sha256=%s\n' \
+            "$tar_path" "$checksum_path" "$receipt_path" "$tar_sha" "$archive_sha" "$(sha256sum "$receipt_path" | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+
       - name: Validate production SSH inputs
         shell: bash
         env:
@@ -688,11 +903,38 @@ jobs:
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           BUNDLE_PATH: ${{ steps.provenance.outputs.bundle_path }}
           BUNDLE_SHA: ${{ steps.provenance.outputs.bundle_sha }}
+          SOURCE_REUSE_ENABLED: ${{ steps.source_bound_liveqa.outputs.enabled }}
+          SOURCE_REUSE_TAR_PATH: ${{ steps.source_bound_liveqa.outputs.artifact_tar_path }}
+          SOURCE_REUSE_CHECKSUM_PATH: ${{ steps.source_bound_liveqa.outputs.checksum_path }}
+          SOURCE_REUSE_RECEIPT_PATH: ${{ steps.source_bound_liveqa.outputs.attestation_receipt_path }}
+          SOURCE_REUSE_TAR_SHA: ${{ steps.source_bound_liveqa.outputs.artifact_tar_sha256 }}
+          SOURCE_REUSE_RECEIPT_SHA: ${{ steps.source_bound_liveqa.outputs.attestation_receipt_sha256 }}
         run: |
           set -euo pipefail
           test -f "$BUNDLE_PATH" && test ! -L "$BUNDLE_PATH"
           test "$(stat -c '%h:%a' "$BUNDLE_PATH")" = "1:600"
           test "$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')" = "$BUNDLE_SHA"
+          reuse_enabled="${SOURCE_REUSE_ENABLED:-0}"
+          if [[ -z "$reuse_enabled" ]]; then reuse_enabled=0; fi
+          [[ "$reuse_enabled" == 0 || "$reuse_enabled" == 1 ]]
+          source_reuse_tar="/tmp/oldsparky-recovery-liveqa-9ceaf09ab7ba4bf5c5e636865106910eaa034c8d.tar.gz"
+          source_reuse_checksum="$source_reuse_tar.sha256"
+          source_reuse_receipt="/tmp/oldsparky-recovery-liveqa-9ceaf09ab7ba4bf5c5e636865106910eaa034c8d-attestation.json"
+          if [[ "$reuse_enabled" == 1 ]]; then
+            test -f "$SOURCE_REUSE_TAR_PATH" && test ! -L "$SOURCE_REUSE_TAR_PATH"
+            test "$(stat -c '%h:%a:%s' "$SOURCE_REUSE_TAR_PATH")" = "1:600:72374083"
+            test "$(sha256sum "$SOURCE_REUSE_TAR_PATH" | awk '{print $1}')" = "2f305c4f85a2a9b6e5a12739fb02f04e823a8327925f0019032e2d32203f2c62"
+            test -f "$SOURCE_REUSE_CHECKSUM_PATH" && test ! -L "$SOURCE_REUSE_CHECKSUM_PATH"
+            test "$(stat -c '%h:%a:%s' "$SOURCE_REUSE_CHECKSUM_PATH")" = "1:600:104"
+            test "$SOURCE_REUSE_TAR_SHA" = "2f305c4f85a2a9b6e5a12739fb02f04e823a8327925f0019032e2d32203f2c62"
+            test "$(sha256sum "$SOURCE_REUSE_CHECKSUM_PATH" | awk '{print $1}')" = "$(sha256sum "$SOURCE_REUSE_TAR_PATH.sha256" | awk '{print $1}')"
+            test -f "$SOURCE_REUSE_RECEIPT_PATH" && test ! -L "$SOURCE_REUSE_RECEIPT_PATH"
+            test "$(stat -c '%h:%a' "$SOURCE_REUSE_RECEIPT_PATH")" = "1:600"
+            test "$(sha256sum "$SOURCE_REUSE_RECEIPT_PATH" | awk '{print $1}')" = "$SOURCE_REUSE_RECEIPT_SHA"
+            [[ "$SOURCE_REUSE_RECEIPT_SHA" =~ ^[0-9a-f]{64}$ ]]
+          else
+            test -z "$SOURCE_REUSE_TAR_PATH$SOURCE_REUSE_CHECKSUM_PATH$SOURCE_REUSE_RECEIPT_PATH$SOURCE_REUSE_TAR_SHA$SOURCE_REUSE_RECEIPT_SHA"
+          fi
           ssh_common=(
             -F /dev/null
             -o BatchMode=yes
@@ -726,6 +968,7 @@ jobs:
             [[ "$(stat -c '%F:%u:%g:%h:%a' "$stage" 2>/dev/null)" == "directory:0:0:2:700" ]] || exit 0
             [[ "$(stat -c '%d:%i' "$stage" 2>/dev/null)" == "$expected_identity" ]] || exit 0
             rm -f -- "$stage/bundle.zip" || true
+            rm -f -- "$stage/gha-38185744516-1-9ceaf09ab7ba.tar.gz" "$stage/gha-38185744516-1-9ceaf09ab7ba.tar.gz.sha256" "$stage/attestation-receipt.json" || true
             rmdir -- "$stage" || true
           fi
           CLEANUP
@@ -739,11 +982,19 @@ jobs:
           [[ "$remote_stage" =~ ^/tmp/oldsparky-recovery-upload\.[A-Za-z0-9]{6}$ ]]
           [[ "$remote_stage_identity" =~ ^[0-9]+:[0-9]+$ ]]
           timeout --foreground 300s scp -p "${ssh_common[@]}" "$BUNDLE_PATH" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_stage/bundle.zip"
-          timeout --foreground 300s ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$remote_stage_identity' '$BUNDLE_SHA'" <<'REMOTE'
+          if [[ "$reuse_enabled" == 1 ]]; then
+            timeout --foreground 300s scp -p "${ssh_common[@]}" \
+              "$SOURCE_REUSE_TAR_PATH" "$SOURCE_REUSE_CHECKSUM_PATH" "$SOURCE_REUSE_RECEIPT_PATH" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_stage/"
+          fi
+          timeout --foreground 300s ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$remote_stage_identity' '$BUNDLE_SHA' '$reuse_enabled' '${SOURCE_REUSE_TAR_SHA:-}' '$SOURCE_REUSE_RECEIPT_SHA'" <<'REMOTE'
           set -Eeuo pipefail
           stage="$1"
           expected_identity="$2"
           expected="$3"
+          reuse_enabled="$4"
+          expected_tar_sha="$5"
+          expected_receipt_sha="$6"
           [[ "$stage" =~ ^/tmp/oldsparky-recovery-upload\.[A-Za-z0-9]{6}$ ]]
           [[ "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]]
           [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
@@ -755,6 +1006,56 @@ jobs:
           test -f "$bundle" && test ! -L "$bundle"
           test "$(stat -c '%u:%h:%a' "$bundle")" = "0:1:600"
           test "$(sha256sum "$bundle" | awk '{print $1}')" = "$expected"
+          [[ "$reuse_enabled" == 0 || "$reuse_enabled" == 1 ]]
+          if [[ "$reuse_enabled" == 1 ]]; then
+            [[ "$expected_tar_sha" == "2f305c4f85a2a9b6e5a12739fb02f04e823a8327925f0019032e2d32203f2c62" ]]
+            [[ "$expected_receipt_sha" =~ ^[0-9a-f]{64}$ ]]
+            tar_stage="$stage/gha-38185744516-1-9ceaf09ab7ba.tar.gz"
+            checksum_stage="$stage/gha-38185744516-1-9ceaf09ab7ba.tar.gz.sha256"
+            receipt_stage="$stage/attestation-receipt.json"
+            for candidate in "$tar_stage" "$checksum_stage" "$receipt_stage"; do
+              test -f "$candidate" && test ! -L "$candidate"
+              test "$(stat -c '%u:%h:%a' "$candidate" 2>/dev/null)" = "0:1:600"
+            done
+            test "$(stat -c '%s' "$tar_stage")" = "72374083"
+            test "$(sha256sum "$tar_stage" | awk '{print $1}')" = "$expected_tar_sha"
+            test "$(stat -c '%s' "$checksum_stage")" = "104"
+            test "$(cat "$checksum_stage")" = "2f305c4f85a2a9b6e5a12739fb02f04e823a8327925f0019032e2d32203f2c62  gha-38185744516-1-9ceaf09ab7ba.tar.gz"
+            test "$(sha256sum "$receipt_stage" | awk '{print $1}')" = "$expected_receipt_sha"
+            final_dir="/tmp/oldsparky-source-bound-liveqa-proof"
+            final_tar="$final_dir/gha-38185744516-1-9ceaf09ab7ba.tar.gz"
+            final_checksum="$final_tar.sha256"
+            final_receipt="$final_dir/attestation-receipt.json"
+            if [[ -e "$final_dir" || -L "$final_dir" ]]; then
+              test -d "$final_dir" && test ! -L "$final_dir"
+              test "$(stat -c '%F:%u:%g:%h:%a' "$final_dir")" = "directory:0:0:2:700"
+              test "$(find "$final_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | tr '\n' ',')" = "attestation-receipt.json,gha-38185744516-1-9ceaf09ab7ba.tar.gz,gha-38185744516-1-9ceaf09ab7ba.tar.gz.sha256,"
+              test -f "$final_tar" && test ! -L "$final_tar" && test "$(stat -c '%u:%h:%a:%s' "$final_tar")" = "0:1:600:72374083"
+              test -f "$final_checksum" && test ! -L "$final_checksum" && test "$(stat -c '%u:%h:%a:%s' "$final_checksum")" = "0:1:600:104"
+              test -f "$final_receipt" && test ! -L "$final_receipt" && test "$(stat -c '%u:%h:%a' "$final_receipt")" = "0:1:600"
+              test "$(sha256sum "$final_tar" | awk '{print $1}')" = "$expected_tar_sha"
+              test "$(sha256sum "$final_checksum" | awk '{print $1}')" = "$(sha256sum "$checksum_stage" | awk '{print $1}')"
+              test "$(sha256sum "$final_receipt" | awk '{print $1}')" = "$expected_receipt_sha"
+              rm -f -- "$tar_stage" "$checksum_stage" "$receipt_stage"
+            else
+              proof_stage="$(mktemp -d --tmpdir=/tmp oldsparky-source-bound-proof.XXXXXX)"
+              chmod 700 "$proof_stage"
+              test "$(stat -c '%F:%u:%g:%h:%a' "$proof_stage")" = "directory:0:0:2:700"
+              mv -- "$tar_stage" "$proof_stage/gha-38185744516-1-9ceaf09ab7ba.tar.gz"
+              mv -- "$checksum_stage" "$proof_stage/gha-38185744516-1-9ceaf09ab7ba.tar.gz.sha256"
+              mv -- "$receipt_stage" "$proof_stage/attestation-receipt.json"
+              chmod 600 "$proof_stage/gha-38185744516-1-9ceaf09ab7ba.tar.gz" "$proof_stage/gha-38185744516-1-9ceaf09ab7ba.tar.gz.sha256" "$proof_stage/attestation-receipt.json"
+              mv -- "$proof_stage" "$final_dir"
+            fi
+          else
+            [[ -z "$expected_tar_sha$expected_receipt_sha" ]]
+            for proof_input in \
+              "$stage/gha-38185744516-1-9ceaf09ab7ba.tar.gz" \
+              "$stage/gha-38185744516-1-9ceaf09ab7ba.tar.gz.sha256" \
+              "$stage/attestation-receipt.json"; do
+              test ! -e "$proof_input" && test ! -L "$proof_input"
+            done
+          fi
           final="/tmp/oldsparky-recovery-bundle-$expected.zip"
           if [[ -e "$final" || -L "$final" ]]; then
             test -f "$final" && test ! -L "$final"
@@ -793,6 +1094,7 @@ jobs:
           EXPECTED_CANDIDATES_CSV: ${{ steps.provenance.outputs.expected_candidates_csv }}
           PROTECTED_RELEASES_CSV: ${{ steps.provenance.outputs.protected_releases_csv }}
           EXPECTED_CANDIDATE_COUNT: ${{ steps.provenance.outputs.expected_candidate_count }}
+          SOURCE_BOUND_LIVEQA_ENABLED: ${{ steps.source_bound_liveqa.outputs.enabled }}
           RUNTIME_PRIVATE_CAPTURE: ${{ steps.runtime_failure_recipient.outputs.capture_enabled }}
           RECIPIENT_CERTIFICATE_PATH: ${{ steps.runtime_failure_recipient.outputs.recipient_certificate_path }}
         run: |
@@ -804,6 +1106,8 @@ jobs:
           expected_candidates_csv="${EXPECTED_CANDIDATES_CSV:-}"
           protected_releases_csv="${PROTECTED_RELEASES_CSV:-}"
           expected_candidate_count="${EXPECTED_CANDIDATE_COUNT:-}"
+          source_bound_liveqa_enabled="${SOURCE_BOUND_LIVEQA_ENABLED:-0}"
+          [[ "$source_bound_liveqa_enabled" == 0 || "$source_bound_liveqa_enabled" == 1 ]]
           runtime_private_capture="${RUNTIME_PRIVATE_CAPTURE:-0}"
           [[ "$runtime_private_capture" == 0 || "$runtime_private_capture" == 1 ]]
           if [[ "$runtime_private_capture" == 1 ]]; then
@@ -888,8 +1192,8 @@ jobs:
           if not 1 <= len(markers) <= 5:
               raise SystemExit(1)
           allowed_guards = {"argument", "privilege", "lock", "layout", "tooling", "systemd_state", "transaction_state", "legacy_liveqa_authority", "liveqa_runtime", "nginx", "runtime"}
-          allowed_components = {"systemd_state_validate", "runtime_reconcile", "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload", "systemd_restore_enabled", "runtime_guard"}
-          order = ["systemd_state_validate", "runtime_reconcile", "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload", "systemd_restore_enabled"]
+          allowed_components = {"systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile", "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload", "systemd_restore_enabled", "runtime_guard"}
+          order = ["systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile", "systemd_units", "nginx_apply", "nginx_config_test", "nginx_reload", "systemd_restore_enabled"]
           previous_order = -1
           seen = set()
           for raw_marker in markers:
@@ -1012,7 +1316,7 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "PLATFORM_RUNTIME_PRIVATE_CAPTURE='$runtime_private_capture' PLATFORM_RUNTIME_PRIVATE_ROUTE='recover_pending' bash -s -- '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$PUBLISHER_RUN_ID' '$PUBLISHER_RUN_ATTEMPT' '$PUBLISHER_WORKFLOW_SHA' '$PUBLISHER_JOB_ID' '$ROUTE_DIGEST' '$RECOVERY_ACTION' '$failed_deploy_run_id' '$failed_deploy_run_attempt' '$failed_deploy_source_sha' '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT' '$EXPECTED_CANDIDATES_CSV' '$PROTECTED_RELEASES_CSV' '$EXPECTED_CANDIDATE_COUNT'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
+            "PLATFORM_RUNTIME_PRIVATE_CAPTURE='$runtime_private_capture' PLATFORM_RUNTIME_PRIVATE_ROUTE='recover_pending' bash -s -- '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$PUBLISHER_RUN_ID' '$PUBLISHER_RUN_ATTEMPT' '$PUBLISHER_WORKFLOW_SHA' '$PUBLISHER_JOB_ID' '$ROUTE_DIGEST' '$RECOVERY_ACTION' '$failed_deploy_run_id' '$failed_deploy_run_attempt' '$failed_deploy_source_sha' '$GITHUB_RUN_ID' '$GITHUB_RUN_ATTEMPT' '$EXPECTED_CANDIDATES_CSV' '$PROTECTED_RELEASES_CSV' '$EXPECTED_CANDIDATE_COUNT' '$source_bound_liveqa_enabled'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
           recovery_stage=remote_identity
           report_recovery_failure() {
@@ -1025,7 +1329,7 @@ jobs:
           trap report_recovery_failure EXIT
 
           recovery_stage=argument_count
-          test "$#" -eq 22
+          test "$#" -eq 23
           runtime=/opt/oldsparky/platform
           recovery_stage=remote_identity
           test "$(id -u)" -eq 0 || { echo "Production recovery must run as root" >&2; exit 1; }
@@ -1051,6 +1355,7 @@ jobs:
           expected_candidates_csv="${20}"
           protected_releases_csv="${21}"
           expected_candidate_count="${22}"
+          source_bound_liveqa_enabled="${23}"
           recovery_stage=bundle_sha
           [[ "$bundle_sha" =~ ^[0-9a-f]{64}$ ]]
           recovery_stage=source_sha
@@ -1079,6 +1384,24 @@ jobs:
           [[ "$route_digest" =~ ^[0-9a-f]{64}$ ]]
           recovery_stage=recovery_action
           [[ "$recovery_action" == recover_pending || "$recovery_action" == quarantine_populated_quiesce || "$recovery_action" == prune_task_releases ]]
+          recovery_stage=source_bound_liveqa
+          [[ "$source_bound_liveqa_enabled" == 0 || "$source_bound_liveqa_enabled" == 1 ]]
+          if [[ "$source_bound_liveqa_enabled" == 1 ]]; then
+            [[ "$recovery_action" == recover_pending ]]
+            proof_dir=/tmp/oldsparky-source-bound-liveqa-proof
+            proof_tar="$proof_dir/gha-38185744516-1-9ceaf09ab7ba.tar.gz"
+            proof_checksum="$proof_tar.sha256"
+            proof_receipt="$proof_dir/attestation-receipt.json"
+            [[ -d "$proof_dir" && ! -L "$proof_dir" ]]
+            [[ "$(stat -c '%F:%u:%g:%h:%a' "$proof_dir")" == directory:0:0:2:700 ]]
+            for proof_input in "$proof_tar" "$proof_checksum" "$proof_receipt"; do
+              [[ -f "$proof_input" && ! -L "$proof_input" ]]
+              [[ "$(stat -c '%u:%h:%a' "$proof_input")" == 0:1:600 ]]
+            done
+            [[ "$(stat -c '%s' "$proof_tar")" == 72374083 ]]
+            [[ "$(sha256sum "$proof_tar" | awk '{print $1}')" == 2f305c4f85a2a9b6e5a12739fb02f04e823a8327925f0019032e2d32203f2c62 ]]
+            [[ "$(cat "$proof_checksum")" == '2f305c4f85a2a9b6e5a12739fb02f04e823a8327925f0019032e2d32203f2c62  gha-38185744516-1-9ceaf09ab7ba.tar.gz' ]]
+          fi
           recovery_stage=recovery_action_run_id
           [[ "$recovery_action_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
           recovery_stage=recovery_action_run_attempt
@@ -1286,6 +1609,8 @@ jobs:
             "platform_release_systemd_state.py:444" \
             "platform_release_transaction.py:444" \
             "platform_release_retention.py:444" \
+            "platform_release_capture_probe.py:444" \
+            "platform_release_active_artifact_proof.py:444" \
             "platform_recover_pending.sh:555"; do
             helper_name="${helper_spec%%:*}"
             helper_mode="${helper_spec##*:}"
@@ -1319,8 +1644,11 @@ jobs:
             for slug in "${protected_releases[@]}"; do args+=(--protected-release "$slug"); done
             "$trusted_generation/platform_recover_pending.sh" "${args[@]}"
           else
-            "$trusted_generation/platform_recover_pending.sh" \
-              --app-dir "$runtime" --systemctl /usr/bin/systemctl
+            recovery_args=(--app-dir "$runtime" --systemctl /usr/bin/systemctl)
+            if [[ "$source_bound_liveqa_enabled" == 1 ]]; then
+              recovery_args+=(--source-bound-liveqa-reuse)
+            fi
+            "$trusted_generation/platform_recover_pending.sh" "${recovery_args[@]}"
           fi
           remote_status="$?"
           set -e
@@ -1334,7 +1662,7 @@ jobs:
                 printf '%s\n' 'RECOVERY_PRIVATE_FAILURE status=unavailable' >&2
               fi
             fi
-            safe_stage="$(grep -E '^RECOVERY_STAGE schema=1 status=failed stage=(remote_identity|argument_count|bundle_sha|source_sha|security_run_id|security_run_attempt|recovery_run_id|recovery_run_attempt|recovery_job_id|recovery_workflow_sha|publisher_run_id|publisher_run_attempt|publisher_workflow_sha|publisher_job_id|route_digest|bundle_input|staging|provenance|bootstrap_extract|generation_install|generation_validate|install_stage_cleanup|quiesce_recovery)$' "$remote_error" | tail -n 1 | sed -E 's/^RECOVERY_STAGE schema=1 status=failed stage=//' || true)"
+            safe_stage="$(grep -E '^RECOVERY_STAGE schema=1 status=failed stage=(remote_identity|argument_count|bundle_sha|source_sha|security_run_id|security_run_attempt|recovery_run_id|recovery_run_attempt|recovery_job_id|recovery_workflow_sha|publisher_run_id|publisher_run_attempt|publisher_workflow_sha|publisher_job_id|route_digest|bundle_input|staging|provenance|bootstrap_extract|generation_install|generation_validate|install_stage_cleanup|source_bound_liveqa|quiesce_recovery)$' "$remote_error" | tail -n 1 | sed -E 's/^RECOVERY_STAGE schema=1 status=failed stage=//' || true)"
             if [[ -z "$safe_stage" ]]; then safe_stage=transport_or_unclassified; fi
             safe_class=unavailable
             safe_check=""

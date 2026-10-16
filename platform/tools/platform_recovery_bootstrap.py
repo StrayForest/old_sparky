@@ -140,6 +140,8 @@ RECOVERY_FILES = (
     "platform_recover_pending.sh",
     "platform_release_retention.py",
     "platform_maintenance_failure_evidence.py",
+    "platform_release_capture_probe.py",
+    "platform_release_active_artifact_proof.py",
 )
 
 

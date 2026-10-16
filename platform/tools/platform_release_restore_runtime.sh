@@ -25,6 +25,11 @@ NGINX_CONFIG_TIMEOUT_SECONDS=30
 LIVE_QA_RUNTIME_INSTALLER=""
 ROLLBACK_RECONCILE_TRANSACTION=""
 PRESERVE_LEGACY_LIVE_QA=0
+SOURCE_BOUND_LIVEQA_REUSE=0
+SOURCE_BOUND_LIVEQA_DIR="/tmp/oldsparky-source-bound-liveqa-proof"
+SOURCE_BOUND_LIVEQA_TAR="$SOURCE_BOUND_LIVEQA_DIR/gha-38185744516-1-9ceaf09ab7ba.tar.gz"
+SOURCE_BOUND_LIVEQA_CHECKSUM="$SOURCE_BOUND_LIVEQA_TAR.sha256"
+SOURCE_BOUND_LIVEQA_RECEIPT="$SOURCE_BOUND_LIVEQA_DIR/attestation-receipt.json"
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
 RUNTIME_PRIVATE_CAPTURE="${PLATFORM_RUNTIME_PRIVATE_CAPTURE:-0}"
@@ -134,6 +139,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --preserve-legacy-live-qa)
       PRESERVE_LEGACY_LIVE_QA=1
+      shift
+      ;;
+    --source-bound-liveqa-reuse)
+      SOURCE_BOUND_LIVEQA_REUSE=1
       shift
       ;;
     --skip-smoke)
@@ -331,6 +340,24 @@ else
     exit 1
   fi
 fi
+if [[ "$SOURCE_BOUND_LIVEQA_REUSE" -eq 1 ]]; then
+  if [[ "$APP_DIR" != "/opt/oldsparky/platform" || -z "$SYSTEMD_STATE" \
+    || -z "$TRANSACTION_STATE" || "$PRESERVE_LEGACY_LIVE_QA" -ne 0 \
+    || "$PREPARE_RUNTIME" -ne 1 || "$RUN_RESTART" -ne 1 ]]; then
+    public_status failed liveqa_runtime >&2
+    exit 1
+  fi
+  proof_metadata="$(stat -c '%F:%u:%g:%h:%a' "$TOOLS_DIR/platform_release_active_artifact_proof.py" 2>/dev/null || true)"
+  [[ "$proof_metadata" == "regular file:0:0:1:444" ]] || {
+    public_status failed liveqa_runtime >&2
+    exit 1
+  }
+  proof_directory_metadata="$(stat -c '%F:%u:%g:%h:%a' "$SOURCE_BOUND_LIVEQA_DIR" 2>/dev/null || true)"
+  [[ "$proof_directory_metadata" == "directory:0:0:2:700" ]] || {
+    public_status failed liveqa_runtime >&2
+    exit 1
+  }
+fi
 prepare_runtime_private() {
   # Restoring unit files is a data-plane operation.  The installer defaults
   # to enable/start for a first activation, so every rollback/recovery call
@@ -355,7 +382,7 @@ run_private_command() {
   fi
 
   case "$component" in
-    systemd_state_validate|runtime_reconcile|systemd_units|nginx_apply|nginx_config_test|nginx_reload|systemd_restore_enabled) ;;
+    systemd_state_validate|runtime_artifact_proof|runtime_reconcile|systemd_units|nginx_apply|nginx_config_test|nginx_reload|systemd_restore_enabled) ;;
     *) return 1 ;;
   esac
   marker_path="$(mktemp --tmpdir=/tmp "oldsparky-runtime-${component}.XXXXXX")" || return 1
@@ -378,7 +405,7 @@ while True:
     if len(raw) > 16384:
         del raw[:-16384]
 if route != "recover_pending" or component not in {
-    "systemd_state_validate", "runtime_reconcile", "systemd_units", "nginx_apply",
+    "systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile", "systemd_units", "nginx_apply",
     "nginx_config_test", "nginx_reload", "systemd_restore_enabled",
 }:
     raise SystemExit("private runtime context is invalid")
@@ -456,13 +483,57 @@ if [[ "$PRESERVE_LEGACY_LIVE_QA" -eq 0 \
   # Rollback/recovery uses this same path, so reconcile the digest-bound
   # generation before units, Nginx, readiness or smoke can observe the restored
   # release. The canonical release lock remains held here.
-  if [[ -n "$ROLLBACK_RECONCILE_TRANSACTION" ]]; then
-    run_private_command runtime_reconcile "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
-      reconcile --app-dir "$APP_DIR" \
-      --rollback-transaction "$ROLLBACK_RECONCILE_TRANSACTION"
-  else
-    run_private_command runtime_reconcile "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
-      reconcile --app-dir "$APP_DIR"
+  reuse_active_liveqa=0
+  if [[ "$SOURCE_BOUND_LIVEQA_REUSE" -eq 1 ]]; then
+    if run_private_command runtime_artifact_proof "$SHARED_VENV/bin/python" -I -B - \
+      "$TOOLS_DIR/platform_release_active_artifact_proof.py" \
+      "$APP_DIR" "$SOURCE_BOUND_LIVEQA_TAR" "$SOURCE_BOUND_LIVEQA_CHECKSUM" \
+      "$SOURCE_BOUND_LIVEQA_RECEIPT" <<'PY'
+import re
+import runpy
+import sys
+from pathlib import Path
+
+module_path, app_dir, artifact_tar, checksum_path, receipt_path = sys.argv[1:]
+namespace = runpy.run_path(module_path)
+verify = namespace.get("verify_active_release_artifact")
+if not callable(verify):
+    raise SystemExit(1)
+try:
+    result = verify(
+        Path(app_dir), Path(artifact_tar), Path(checksum_path), Path(receipt_path),
+        deadline_seconds=600,
+    )
+except namespace.get("ActiveArtifactProofError", RuntimeError) as error:
+    code = getattr(error, "code", "refused")
+    if not isinstance(code, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None:
+        code = "refused"
+    print(f"SOURCE_BOUND_LIVEQA_PROOF status=refused code={code}", file=sys.stderr)
+    raise SystemExit(1)
+if (not isinstance(result, dict) or result.get("schema") != 1
+        or result.get("status") != "passed"
+        or result.get("proof") != "active_signed_artifact_reuse"
+        or result.get("source_sha") != "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"):
+    raise SystemExit(1)
+PY
+    then
+      reuse_active_liveqa=1
+    else
+      # An explicit reuse request is a strict proof route. Do not fall through
+      # to the known failing installer when the signed-artifact proof refuses.
+      public_status failed liveqa_runtime >&2
+      exit 1
+    fi
+  fi
+  if [[ "$reuse_active_liveqa" -ne 1 ]]; then
+    if [[ -n "$ROLLBACK_RECONCILE_TRANSACTION" ]]; then
+      run_private_command runtime_reconcile "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+        reconcile --app-dir "$APP_DIR" \
+        --rollback-transaction "$ROLLBACK_RECONCILE_TRANSACTION"
+    else
+      run_private_command runtime_reconcile "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+        reconcile --app-dir "$APP_DIR"
+    fi
   fi
 fi
 

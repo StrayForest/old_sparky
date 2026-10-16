@@ -221,6 +221,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_recover_retained_report
     test_platform_redis_lifecycle
     test_platform_release_audit_hardening
+    test_platform_release_active_artifact_proof
     test_platform_release_build_diagnostics
     test_platform_release_build_contract
     test_platform_release_capture_probe
@@ -383,6 +384,7 @@ TOOL_MODULES = frozenset(
         "test_platform_production_config",
         "test_platform_production_qa_contract",
         "test_platform_r2_smoke",
+        "test_platform_release_active_artifact_proof",
         "test_platform_release_capture_probe",
         "test_platform_secret_artifact_boundary",
         "test_platform_secret_scan",
@@ -494,12 +496,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 169,
-    "module_digest": "b1aa9ccddf2570c2c220f76b6342119655f6147b679af5fddb7ac1b520369811",
-    "test_count": 1968,
-    "test_id_digest": "e9a8aa2831f4e10083311cc26eaa260c606d8da0859f609a691cec8729ad8d78",
-    "backend_test_count": 1896,
-    "backend_test_id_digest": "23c30be0ec663405e9e62daff9c4e1eddd7853a9be1b496e715685d1c9d23c24",
+    "module_count": 170,
+    "module_digest": "514ecaf735c3c338cc9d1759bdeadea72fbafdc819d17a6fe2d031dce6f684f6",
+    "test_count": 1977,
+    "test_id_digest": "3d6725cbee2bb999c55e4d218eef531a0ca9869ce20de8df75a6ccfbc6a5ff5d",
+    "backend_test_count": 1905,
+    "backend_test_id_digest": "daa5843977663db371008fb4c31ddcde105f2886ae8c10507c46285733ce3000",
     "verification_test_count": 72,
     "verification_test_id_digest": "3c52523e15a19be1b10831e2a505af8e7a711e7b9d667246e1198598c947a7c0",
     "verification_classifier_test_count": 38,
@@ -526,10 +528,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "352037af9727673f603088d4e996f0e8d67f1682abbf24ddf5eb6ed225968517",
     },
     "backend-tool-contract": {
-        "module_count": 51,
-        "module_digest": "391a46ecc337106196651409eb2c093f3777284055e158c4819b9a9bdd217956",
-        "test_count": 502,
-        "test_id_digest": "8fdb4fd241b554ac5726cfe7bdd7b71d9ad8215f6f4ba1ecf73eeff53fff14ee",
+        "module_count": 52,
+        "module_digest": "88caec1d7501a955a7d663309dcffb8ed6b0c178445690524f3597b9a892f2c4",
+        "test_count": 508,
+        "test_id_digest": "0ab26a0c73fe413fbda82672ad29c97185e0999b819534e181b9ab41fcbb5c12",
     },
     "backend-integration": {
         "module_count": 41,
@@ -540,8 +542,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 26,
         "module_digest": "210efce670a082b8360377da86457b71db79310b02abffc0d3849445b073748a",
-        "test_count": 618,
-        "test_id_digest": "3e3fd37a3dcf9e676b222e515f13e64f9cfcc654aad69317320b706a495ffb74",
+        "test_count": 621,
+        "test_id_digest": "5fe93cbb0d1662984560097f7a6dba10a4fa3cadc588f1b666476386c4320778",
     },
     "performance-contract": {
         "module_count": 11,

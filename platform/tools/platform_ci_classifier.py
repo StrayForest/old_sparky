@@ -160,6 +160,8 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         ".github/workflows/platform-production-release-recover.yml",
         ".github/workflows/platform-production-autodeploy.yml",
         "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_release_capture_probe.py",
+        "platform/tools/platform_release_active_artifact_proof.py",
         "platform/tools/platform_maintenance_failure_evidence.py",
         "platform/tools/platform_decrypt_maintenance_evidence.py",
         "platform/tools/platform_tournament_list_read_model_recovery.py",

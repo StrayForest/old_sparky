@@ -552,7 +552,8 @@ def _validate_runtime_marker(remote_stderr: bytes, route: str) -> None:
             "systemd_unit_snapshot": "stderr",
         },
         "recover_pending": {
-            "systemd_state_validate": "combined", "runtime_reconcile": "combined",
+            "systemd_state_validate": "combined", "runtime_artifact_proof": "combined",
+            "runtime_reconcile": "combined",
             "systemd_units": "combined", "nginx_apply": "combined",
             "nginx_config_test": "combined", "nginx_reload": "combined",
             "systemd_restore_enabled": "combined", "runtime_guard": "guard",
@@ -565,7 +566,8 @@ def _validate_runtime_marker(remote_stderr: bytes, route: str) -> None:
     previous_order = -1
     seen: set[str] = set()
     order = [
-        "systemd_state_validate", "runtime_reconcile", "systemd_units", "nginx_apply",
+        "systemd_state_validate", "runtime_artifact_proof", "runtime_reconcile",
+        "systemd_units", "nginx_apply",
         "nginx_config_test", "nginx_reload", "systemd_restore_enabled",
     ]
     for marker_line in marker_lines:

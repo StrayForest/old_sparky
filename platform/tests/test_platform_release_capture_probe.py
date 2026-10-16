@@ -340,6 +340,122 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 details = result["private_detail"]
                 self.assertEqual((details["missing_count"], details["extra_count"], details["changed_count"]), (missing, extra, changed))
 
+        mismatch_sha = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+        mismatch_target = Path("/releases/immutable-candidate")
+        mismatch_manifest = {
+            "source_sha": mismatch_sha,
+            "release_slug": mismatch_target.name,
+            "files": {"runtime/actual.py": "b" * 64},
+            "payload_tree_sha256": "d" * 64,
+        }
+        mismatch_installer = SimpleNamespace(
+            _active_release=lambda _app_dir: (mismatch_target, mismatch_sha, mismatch_target.name),
+            _read_manifest=lambda: mismatch_manifest,
+            _validate_runtime_source=lambda _root, *, source_sha: {"version": 1},
+            verify=lambda _app_dir, _source_sha: mismatch_manifest,
+        )
+        with patch.object(probe, "APP_DIR", Path("/opt/oldsparky/platform")), patch.object(
+            probe, "_load_pinned_runtime_installer", return_value=mismatch_installer
+        ), patch.object(
+            probe, "_expected_liveqa_payload_tree", return_value=("c" * 64, {"runtime/expected.py": "a" * 64})
+        ):
+            evidence, failed_stage, private_detail = probe._runtime_payload_integrity(
+                mismatch_target,
+                source_sha=mismatch_sha,
+                expected_helper_sha256="e" * 64,
+                deadline=probe.time.monotonic() + 30,
+            )
+        self.assertEqual(failed_stage, "runtime_expected_tree")
+        self.assertEqual(evidence["runtime_payload_verify"], "passed")
+        self.assertEqual(evidence["runtime_expected_tree"], "failed")
+        self.assertEqual(private_detail["reason"], "expected_tree_mismatch")
+
+        source_sha = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+        cache_source_files = {
+            "platform/tools/__init__.py": "a" * 64,
+            **{
+                f"platform/tools/module_{index:02d}.py": f"{index:064x}"
+                for index in range(57)
+            },
+        }
+        cache_missing = [
+            f"platform/tools/__pycache__/module_{index:02d}.cpython-312.pyc"
+            for index in range(57)
+        ]
+        cache_expected_files = {
+            **cache_source_files,
+            **{path: "c" * 64 for path in cache_missing},
+        }
+        cache_manifest = {
+            "source_sha": source_sha,
+            "release_slug": mismatch_target.name,
+            "files": dict(cache_source_files),
+            "payload_tree_sha256": "d" * 64,
+        }
+        cache_installer = SimpleNamespace(
+            _active_release=lambda _app_dir: (mismatch_target, source_sha, mismatch_target.name),
+            _read_manifest=lambda: cache_manifest,
+            _validate_runtime_source=lambda _root, *, source_sha: {"version": 1},
+            verify=lambda _app_dir, _source_sha: cache_manifest,
+        )
+        self.assertTrue(
+            probe._all_missing_python_bytecode(
+                cache_missing, cache_source_files, source_sha=source_sha
+            )
+        )
+        self.assertFalse(
+            probe._all_missing_python_bytecode(
+                [*cache_missing, "platform/tools/helper.py"],
+                cache_source_files,
+                source_sha=source_sha,
+            )
+        )
+        self.assertFalse(
+            probe._all_missing_python_bytecode(
+                ["platform/tools/__pycache__/unpaired.cpython-311.pyc"],
+                cache_source_files,
+                source_sha=source_sha,
+            )
+        )
+        with patch.object(probe, "APP_DIR", Path("/opt/oldsparky/platform")), patch.object(
+            probe, "_load_pinned_runtime_installer", return_value=cache_installer
+        ), patch.object(
+            probe,
+            "_expected_liveqa_payload_tree",
+            return_value=("c" * 64, cache_expected_files),
+        ):
+            cache_evidence, cache_stage, cache_detail = probe._runtime_payload_integrity(
+                mismatch_target,
+                source_sha=source_sha,
+                expected_helper_sha256="e" * 64,
+                deadline=probe.time.monotonic() + 30,
+            )
+        self.assertEqual(cache_stage, "runtime_expected_tree")
+        self.assertEqual(cache_evidence["runtime_payload_verify"], "passed")
+        self.assertEqual(cache_detail["missing_count"], 57)
+        self.assertEqual(len(cache_detail["missing"]), 57)
+        self.assertFalse(cache_detail["missing_paths_truncated"])
+        self.assertTrue(cache_detail["all_missing_python_bytecode"])
+        self.assertEqual(cache_detail["missing_paths_source_sha"], mismatch_sha)
+        many_missing = {
+            f"platform/tools/module_{index:02d}.py": f"{index:064x}"
+            for index in range(70)
+        }
+        matches, bounded = probe._compare_expected_payload(
+            "c" * 64,
+            many_missing,
+            {"files": {}, "payload_tree_sha256": "d" * 64},
+        )
+        self.assertFalse(matches)
+        bounded_detail = bounded["private_detail"]
+        self.assertEqual(bounded_detail["missing_count"], 70)
+        self.assertEqual(len(bounded_detail["missing"]), 64)
+        self.assertTrue(bounded_detail["missing_paths_truncated"])
+        self.assertLessEqual(
+            len(json.dumps(bounded_detail, separators=(",", ":")).encode("ascii")),
+            15 * 1024,
+        )
+
         source_sha = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
         for runtime_version in (1, 2):
             with self.subTest(runtime_version=runtime_version), tempfile.TemporaryDirectory() as directory:
@@ -347,14 +463,19 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 release = root / "release"
                 (release / "tools").mkdir(parents=True)
                 (release / "apps/platform_api/empty/nested").mkdir(parents=True)
+                (release / "apps/platform_api/__pycache__").mkdir()
                 (release / "deploy").mkdir()
                 (release / "tools/helper.py").write_bytes(b"pinned helper\n")
                 (release / "apps/platform_api/app.py").write_bytes(b"immutable API source\n")
+                (release / "apps/platform_api/__pycache__/app.cpython-312.pyc").write_bytes(b"generated source cache\n")
                 (release / "deploy/policy").write_bytes(b"policy\n")
                 runtime_source = release / "liveqa-runtime"
                 (runtime_source / "web/tests/empty").mkdir(parents=True)
+                (runtime_source / "web/__pycache__").mkdir()
                 (runtime_source / "node/bin").mkdir(parents=True)
                 (runtime_source / "web/package-lock.json").write_bytes(b"lock\n")
+                (runtime_source / "web/runtime.py").write_bytes(b"runtime source\n")
+                (runtime_source / "web/__pycache__/runtime.cpython-312.pyc").write_bytes(b"runtime cache\n")
                 (runtime_source / "web/tests/smoke.spec").write_bytes(b"runtime v" + str(runtime_version).encode() + b"\n")
                 sandbox_rel = runtime_installer.RUNTIME_SANDBOX_RELATIVE
                 sandbox_path = runtime_source / sandbox_rel
@@ -423,6 +544,46 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                             runtime_manifest=runtime_manifest,
                             deadline=probe.time.monotonic() + 30,
                         )
+                        self.assertNotIn(
+                            "platform/apps/platform_api/__pycache__/app.cpython-312.pyc",
+                            expected_files,
+                        )
+                        self.assertIn(
+                            "runtime/web/__pycache__/runtime.cpython-312.pyc",
+                            expected_files,
+                        )
+                        legacy_patch = patch.object(
+                            runtime_installer, "SOURCE_TREE_CACHE_POLICY", None
+                        )
+                        with legacy_patch:
+                            _, legacy_files = probe._expected_liveqa_payload_tree(
+                                runtime_installer,
+                                release=release,
+                                source_sha=source_sha,
+                                runtime_provider=provider,
+                                runtime_manifest=runtime_manifest,
+                                deadline=probe.time.monotonic() + 30,
+                            )
+                        self.assertIn(
+                            "platform/apps/platform_api/__pycache__/app.cpython-312.pyc",
+                            legacy_files,
+                        )
+                        unknown_policy = patch.object(
+                            runtime_installer, "SOURCE_TREE_CACHE_POLICY", "unknown-policy"
+                        )
+                        with unknown_policy, self.assertRaises(probe.ProbeFailure) as failure:
+                            probe._expected_liveqa_payload_tree(
+                                runtime_installer,
+                                release=release,
+                                source_sha=source_sha,
+                                runtime_provider=provider,
+                                runtime_manifest=runtime_manifest,
+                                deadline=probe.time.monotonic() + 30,
+                            )
+                        self.assertEqual(
+                            (failure.exception.check, failure.exception.error_class),
+                            ("runtime_expected_tree", "cache_policy"),
+                        )
                         payload = root / "payload"
                         for relative in ("platform", "platform/tools", "platform/apps", "platform/apps/platform_api", "platform/apps/platform_api/empty", "platform/apps/platform_api/empty/nested", "runtime", "runtime/web", "runtime/web/tests", "runtime/web/tests/empty", "runtime/node", "runtime/node/bin", "runtime/browsers", "runtime/browsers/chromium-1228", "runtime/browsers/chromium-1228/chrome-linux64"):
                             (payload / relative).mkdir(parents=True, exist_ok=True)
@@ -431,6 +592,8 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                             "platform/apps/platform_api/app.py": release / "apps/platform_api/app.py",
                             "platform/deploy/policy": release / "deploy/policy",
                             "runtime/web/package-lock.json": runtime_source / "web/package-lock.json",
+                            "runtime/web/runtime.py": runtime_source / "web/runtime.py",
+                            "runtime/web/__pycache__/runtime.cpython-312.pyc": runtime_source / "web/__pycache__/runtime.cpython-312.pyc",
                             "runtime/web/tests/smoke.spec": runtime_source / "web/tests/smoke.spec",
                         }
                         if runtime_version == 1:
@@ -479,6 +642,10 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                         "runtime/node/bin",
                     }
                 )
+                self.assertNotIn(
+                    "platform/apps/platform_api/__pycache__", expected_directories
+                )
+                self.assertIn("runtime/web/__pycache__", expected_directories)
                 actual_directories = {
                     path.relative_to(payload).as_posix()
                     for path in payload.rglob("*")

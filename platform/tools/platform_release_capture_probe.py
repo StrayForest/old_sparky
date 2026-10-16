@@ -264,11 +264,34 @@ def _expected_liveqa_payload_tree(
         check_deadline()
         module._validate_source_tree(source.parent, source.name)
         directories.add(destination)
-        for path in source.rglob("*"):
+        cache_policy = getattr(module, "SOURCE_TREE_CACHE_POLICY", None)
+        if cache_policy is not None and cache_policy != "paired-python-bytecode-v1":
+            raise ProbeFailure("runtime_expected_tree", "cache_policy")
+        source_paths = tuple(source.rglob("*"))
+        source_files = {
+            path.relative_to(source).as_posix(): path
+            for path in source_paths
+            if stat.S_ISREG(module._metadata(path).st_mode)
+        }
+        for path in source_paths:
             check_deadline()
             relative = path.relative_to(source).as_posix()
             target_relative = f"{destination}/{relative}"
             metadata = module._metadata(path)
+            if cache_policy == "paired-python-bytecode-v1" and "__pycache__" in PurePosixPath(relative).parts:
+                parts = PurePosixPath(relative).parts
+                if parts.count("__pycache__") != 1:
+                    raise ProbeFailure("runtime_expected_tree", "cache_policy")
+                if stat.S_ISDIR(metadata.st_mode) and parts[-1] == "__pycache__":
+                    continue
+                paired_source = module._source_tree_cache_relative(relative)
+                if (
+                    paired_source is None
+                    or paired_source not in source_files
+                    or not stat.S_ISREG(module._metadata(source_files[paired_source]).st_mode)
+                ):
+                    raise ProbeFailure("runtime_expected_tree", "cache_policy")
+                continue
             if stat.S_ISDIR(metadata.st_mode):
                 directories.add(target_relative)
                 continue
@@ -417,7 +440,7 @@ def _compare_expected_payload(
     }
     if matches:
         return True, evidence
-    evidence["private_detail"] = {
+    detail: dict[str, object] = {
         "schema": 1,
         "reason": "expected_tree_mismatch",
         "expected_tree_sha256": expected_digest,
@@ -425,13 +448,64 @@ def _compare_expected_payload(
         "expected_file_count": len(expected_files),
         "actual_file_count": len(actual_files),
         "missing_count": len(missing),
-        "missing": [item[:256] for item in missing[:8]],
         "extra_count": len(extra),
         "extra": [item[:256] for item in extra[:8]],
         "changed_count": len(changed),
         "changed": [item[:256] for item in changed[:8]],
     }
+    # Preserve the complete missing set when it fits the existing encrypted
+    # component budget. Never imply that a partial path list is exhaustive.
+    retained: list[str] = []
+    for relative in missing[:64]:
+        if len(relative) > 512:
+            break
+        candidate = [*retained, relative]
+        detail["missing"] = candidate
+        if len(json.dumps(detail, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")) > 15 * 1024:
+            detail["missing"] = retained
+            break
+        retained = candidate
+    detail["missing"] = retained
+    detail["missing_paths_truncated"] = len(retained) != len(missing)
+    evidence["private_detail"] = detail
     return False, evidence
+
+
+def _all_missing_python_bytecode(
+    missing: list[str],
+    expected_files: dict[str, str],
+    *,
+    source_sha: str,
+) -> bool:
+    """Prove every missing expected file is paired bytecode in the bound tree."""
+    if re.fullmatch(r"[0-9a-f]{40,64}", source_sha) is None:
+        return False
+    if not missing or len(missing) > 64:
+        return False
+    for relative in missing:
+        path = PurePosixPath(relative)
+        parts = path.parts
+        if "__pycache__" not in parts or not relative.endswith(".pyc"):
+            return False
+        cache_index = parts.index("__pycache__")
+        if cache_index == 0 or cache_index != len(parts) - 2:
+            return False
+        filename = parts[-1]
+        stem = filename[:-4]
+        tagged = False
+        for marker in (".cpython-", ".pypy-"):
+            if marker in stem:
+                stem = stem.split(marker, 1)[0]
+                tagged = True
+                break
+        if not tagged and (stem.endswith(".opt-1") or stem.endswith(".opt-2")):
+            stem = stem.rsplit(".opt-", 1)[0]
+        source_name = "__init__.py" if stem == "__init__" else f"{stem}.py"
+        source_relative = PurePosixPath(*parts[:cache_index], source_name).as_posix()
+        digest = expected_files.get(source_relative)
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            return False
+    return True
 
 
 def _runtime_payload_integrity(
@@ -482,7 +556,21 @@ def _runtime_payload_integrity(
         manifest,
     )
     if not matches:
-        return evidence, "failed", evidence.pop("private_detail")
+        detail = evidence.pop("private_detail")
+        if (
+            isinstance(detail, dict)
+            and detail.get("missing_count", 0) > 0
+            and detail.get("missing_paths_truncated") is False
+        ):
+            missing = detail.get("missing")
+            if isinstance(missing, list) and len(missing) == detail.get("missing_count"):
+                detail["all_missing_python_bytecode"] = _all_missing_python_bytecode(
+                    missing,
+                    expected_files,
+                    source_sha=source_sha,
+                )
+                detail["missing_paths_source_sha"] = source_sha
+        return evidence, "runtime_expected_tree", detail
     return evidence, None, None
 
 

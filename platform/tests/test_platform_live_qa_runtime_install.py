@@ -24,6 +24,7 @@ assert SPEC is not None and SPEC.loader is not None
 runtime = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runtime)
 ORIGINAL_VALIDATE_RUNTIME_SOURCE = runtime._validate_runtime_source
+ORIGINAL_VALIDATE_PAYLOAD = runtime._validate_payload
 SAFE_ENV_SCRIPT = SCRIPT.with_name("platform_safe_env_exec.py")
 SAFE_ENV_SPEC = importlib.util.spec_from_file_location(
     "platform_safe_env_exec_runtime_install_tested", SAFE_ENV_SCRIPT
@@ -35,6 +36,97 @@ SAFE_ENV_SPEC.loader.exec_module(safe_env)
 
 @unittest.skipUnless(os.geteuid() == 0, "installer contract requires root-owned test paths")
 class LiveQaRuntimeInstallTests(unittest.TestCase):
+    @staticmethod
+    def _source_tree_fixture(root: Path, *, cache_relative: str | None = None) -> Path:
+        source = root / "checkout" / "apps" / "platform_api"
+        package = source / "pkg"
+        package.mkdir(mode=0o755, parents=True)
+        (package / "module.py").write_bytes(b"VALUE = 1\n")
+        (package / "module.py").chmod(0o444)
+        if cache_relative is not None:
+            cache_path = source / cache_relative
+            cache_path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            cache_path.write_bytes(b"generated cache fixture\n")
+            cache_path.chmod(0o444)
+            for directory in sorted(source.rglob("*")):
+                if directory.is_dir():
+                    directory.chmod(0o755)
+        return source
+
+    def test_source_tree_cache_projection_omits_paired_bytecode_and_cache_only_directories(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            source = self._source_tree_fixture(
+                root,
+                cache_relative="pkg/__pycache__/module.cpython-312.pyc",
+            )
+            destination = root / "payload"
+            copied = runtime._copy_tree(
+                source,
+                destination,
+                exclude_source_tree_caches=True,
+            )
+            self.assertEqual(copied, {"pkg/module.py": hashlib.sha256(b"VALUE = 1\n").hexdigest()})
+            self.assertTrue((destination / "pkg/module.py").is_file())
+            self.assertFalse((destination / "pkg/__pycache__").exists())
+            self.assertEqual(
+                runtime._source_tree_cache_relative("__pycache__/module.cpython-312.pyc"),
+                "module.py",
+            )
+
+    def test_source_tree_cache_projection_refuses_unpaired_and_nested_cache_members(self) -> None:
+        cases = (
+            "pkg/__pycache__/orphan.cpython-312.pyc",
+            "pkg/__pycache__/nested/__pycache__/module.cpython-312.pyc",
+        )
+        for cache_relative in cases:
+            with self.subTest(cache_relative=cache_relative), tempfile.TemporaryDirectory(dir="/root") as temporary:
+                root = Path(temporary)
+                source = self._source_tree_fixture(root, cache_relative=cache_relative)
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._copy_tree(
+                        source,
+                        root / "payload",
+                        exclude_source_tree_caches=True,
+                    )
+
+    def test_runtime_cache_copy_stays_exact_and_manifest_rejects_injected_payload_cache(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            runtime_source = root / "runtime-source"
+            package = runtime_source / "pkg"
+            cache = package / "__pycache__" / "module.cpython-312.pyc"
+            cache.parent.mkdir(mode=0o755, parents=True)
+            (package / "module.py").write_bytes(b"VALUE = 2\n")
+            (package / "module.py").chmod(0o444)
+            cache.write_bytes(b"runtime artifact bytes\n")
+            cache.chmod(0o444)
+            copied_to = root / "runtime-copy"
+            copied = runtime._copy_tree(runtime_source, copied_to)
+            self.assertEqual(copied["pkg/__pycache__/module.cpython-312.pyc"], hashlib.sha256(cache.read_bytes()).hexdigest())
+            self.assertEqual(
+                (copied_to / "pkg/__pycache__/module.cpython-312.pyc").read_bytes(),
+                cache.read_bytes(),
+            )
+            with self.assertRaises(runtime.InstallerError):
+                runtime._copy_tree(
+                    runtime_source,
+                    root / "runtime-filtered",
+                    exclude_source_tree_caches=True,
+                )
+
+            source_sha = "e" * 40
+            with self.runtime_tree(root, source_sha) as (app_dir, release, _trusted, _payload_root):
+                manifest = runtime.install(app_dir, release)
+                injected = Path(str(manifest["payload"])) / "platform/apps/platform_api/__pycache__/injected.cpython-312.pyc"
+                injected.parent.mkdir(mode=0o555, parents=True)
+                injected.parent.chmod(0o555)
+                injected.write_bytes(b"unexpected cache bytes\n")
+                injected.chmod(0o444)
+                with mock.patch.object(runtime, "_validate_payload", new=ORIGINAL_VALIDATE_PAYLOAD):
+                    with self.assertRaisesRegex(runtime.InstallerError, "payload digest"):
+                        runtime.verify(app_dir, source_sha)
+
     def _engine_provider_fixture(self, root: Path) -> tuple[Path, dict[str, str], str]:
         engine = root / "runtime"
         paths = [

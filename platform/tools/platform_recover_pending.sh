@@ -20,6 +20,7 @@ RECOVERY_RUN_ID=""
 RECOVERY_RUN_ATTEMPT=""
 EXPECTED_CANDIDATES=()
 PROTECTED_RELEASES=()
+SOURCE_BOUND_LIVEQA_REUSE=0
 
 public_status() {
   local status="$1" class="${2:-recovery}"
@@ -75,6 +76,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       PROTECTED_RELEASES+=("$2"); shift 2
       ;;
+    --source-bound-liveqa-reuse)
+      SOURCE_BOUND_LIVEQA_REUSE=1
+      shift
+      ;;
     --systemctl)
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       SYSTEMCTL_BIN="$2"; shift 2
@@ -116,6 +121,11 @@ case "$RECOVERY_ACTION" in
     ;;
   *) public_status failed argument >&2; exit 1 ;;
 esac
+
+if [[ "$SOURCE_BOUND_LIVEQA_REUSE" -eq 1 && "$RECOVERY_ACTION" != "recover_pending" ]]; then
+  public_status failed argument >&2
+  exit 1
+fi
 
 [[ "$EUID" -eq 0 ]] || { public_status failed privilege >&2; exit 1; }
 [[ "$APP_DIR" == /* && "$APP_DIR" != "/" ]] || { public_status failed argument >&2; exit 1; }
@@ -160,6 +170,8 @@ validate_generation_helper platform_release_restore_runtime.sh 555
 validate_generation_helper platform_release_systemd_state.py 444
 validate_generation_helper platform_release_transaction.py 444
 validate_generation_helper platform_release_retention.py 444
+validate_generation_helper platform_release_capture_probe.py 444
+validate_generation_helper platform_release_active_artifact_proof.py 444
 /usr/bin/python3 -I -B "$TOOLS_DIR/platform_recovery_bootstrap.py" \
   validate-generation --generation "$TOOLS_DIR" --bundle-sha "$GENERATION_SHA" \
   --capability "$RECOVERY_CAPABILITY" \
@@ -1047,10 +1059,15 @@ PY
 
 # Release-specific installers are data-plane inputs. The immutable systemd
 # helper has already verified their recorded digest manifest before this call.
+source_bound_args=()
+if [[ "$SOURCE_BOUND_LIVEQA_REUSE" -eq 1 ]]; then
+  source_bound_args+=(--source-bound-liveqa-reuse)
+fi
 PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$RESTORE_TOOL" \
   --app-dir "$APP_DIR" --release "$current_release" \
   --systemd-state "$SYSTEMD_STATE" --transaction "$STATE" \
   --live-qa-runtime-installer "$current_release/tools/platform_live_qa_runtime_install.py" \
+  "${source_bound_args[@]}" \
   --systemctl "$SYSTEMCTL_BIN" --expected-csp-mode enforce \
   --edge-origin https://127.0.0.1 --edge-host old-sparky.com \
   --public-edge-origin https://old-sparky.com

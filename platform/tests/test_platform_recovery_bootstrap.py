@@ -128,6 +128,9 @@ RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES = frozenset(
         "platform/tools/platform_deploy_baseline.py",
         "platform/tools/platform_baseline_runtime_proof.py",
         "platform/tools/platform_host_tools_bundle.py",
+        "platform/tests/test_platform_release_active_artifact_proof.py",
+        "platform/tools/platform_release_active_artifact_proof.py",
+        "platform/tools/platform_release_capture_probe.py",
         "platform/tools/platform_validate_release_artifact.py",
         "platform/tools/platform_workflow_provenance.py",
     }
@@ -2297,6 +2300,78 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn('"$NGINX_TOOL" --apply --reload --json', runtime_restore)
         self.assertIn('RUNTIME_PRIVATE_CAPTURE="${PLATFORM_RUNTIME_PRIVATE_CAPTURE:-0}"', runtime_restore)
         self.assertIn('prepare_runtime_private >/dev/null 2>/dev/null', runtime_restore)
+
+        private_runner = "run_private_command() {" + runtime_restore.split(
+            "run_private_command() {", 1
+        )[1].split("\n}\n", 1)[0] + "\n}\n"
+        reuse_start = runtime_restore.index("  reuse_active_liveqa=0\n")
+        reuse_end = runtime_restore.index(
+            "\nfi\n\n# Keep all direct systemctl", reuse_start
+        )
+        reuse_flow = "if true; then\n" + runtime_restore[reuse_start:reuse_end] + "\nfi"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shared = root / "shared"
+            (shared / "bin").mkdir(parents=True)
+            fake_python = shared / "bin" / "python"
+            fake_python.write_text(
+                "#!/usr/bin/env bash\n"
+                'printf "%s\\n" "$*" >>"$EVENTS"\n'
+                'case "$*" in\n'
+                '  *platform_release_active_artifact_proof.py*) exit "$PROOF_STATUS" ;;\n'
+                '  *reconcile*) exit "$RECONCILE_STATUS" ;;\n'
+                '  *) exit 91 ;;\n'
+                'esac\n',
+                encoding="ascii",
+            )
+            fake_python.chmod(0o700)
+            base = [
+                "set -euo pipefail",
+                'RUNTIME_PRIVATE_CAPTURE="0"',
+                'RUNTIME_PRIVATE_ROUTE="recover_pending"',
+                f"SHARED_VENV={shlex.quote(str(shared))}",
+                f"APP_DIR={shlex.quote('/opt/oldsparky/platform')}",
+                f"TOOLS_DIR={shlex.quote(str(root / 'tools'))}",
+                f"SOURCE_BOUND_LIVEQA_TAR={shlex.quote(str(root / 'artifact.tar'))}",
+                f"SOURCE_BOUND_LIVEQA_CHECKSUM={shlex.quote(str(root / 'artifact.tar.sha256'))}",
+                f"SOURCE_BOUND_LIVEQA_RECEIPT={shlex.quote(str(root / 'receipt.json'))}",
+                f"LIVE_QA_RUNTIME_INSTALLER={shlex.quote(str(root / 'installer.py'))}",
+                'ROLLBACK_RECONCILE_TRANSACTION=""',
+                'public_status() { printf "%s\\n" "$*" >&2; }',
+                private_runner,
+            ]
+            for enabled, proof_status, expected_calls, expected_status in (
+                ("0", "0", 1, 0),  # default route remains the old reconcile path
+                ("1", "0", 1, 0),  # proof pass skips reconcile entirely
+                ("1", "9", 1, 1),  # proof refusal fails closed before reconcile
+            ):
+                with self.subTest(reuse=enabled, proof=proof_status):
+                    events = root / "reuse-events"
+                    events.unlink(missing_ok=True)
+                    command = "\n".join((
+                        *base,
+                        f"export EVENTS={shlex.quote(str(events))}",
+                        f"export PROOF_STATUS={proof_status}",
+                        'export RECONCILE_STATUS="0"',
+                        f"SOURCE_BOUND_LIVEQA_REUSE={enabled}",
+                        reuse_flow,
+                    ))
+                    result = subprocess.run(
+                        ["bash", "-c", command], capture_output=True, text=True,
+                        check=False, timeout=8,
+                    )
+                    self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
+                    calls = events.read_text(encoding="ascii").splitlines()
+                    self.assertEqual(len(calls), expected_calls)
+                    if enabled == "0":
+                        self.assertIn("reconcile", calls[0])
+                        self.assertNotIn("platform_release_active_artifact_proof.py", calls[0])
+                    elif proof_status == "0":
+                        self.assertIn("platform_release_active_artifact_proof.py", calls[0])
+                        self.assertNotIn("reconcile", calls[0])
+                    else:
+                        self.assertIn("platform_release_active_artifact_proof.py", calls[0])
+                        self.assertNotIn("reconcile", "\n".join(calls))
 
         function = runtime_restore.split("run_private_command() {", 1)[1].split("\n}\n", 1)[0]
         script = "run_private_command() {" + function + "\n}\n"
