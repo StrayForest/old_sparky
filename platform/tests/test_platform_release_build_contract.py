@@ -2596,6 +2596,14 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('generation_name="$bundle_sha"', recover)
         self.assertIn("trusted_generation=\"$runtime/shared/.release-recovery/generations/$generation_name\"", recover)
         self.assertIn("platform_recover_pending.sh", recover)
+        self.assertIn(
+            '"${gh_header[@]}" "$api/actions/runs/$run_id/artifacts?per_page=100&page=1"',
+            recover,
+        )
+        self.assertNotIn(
+            '"${gh_header[@]}" "$api/actions/runs/$run_id/attempts/$run_attempt/artifacts?',
+            recover,
+        )
         extraction_match = re.search(
             r'''/usr/bin/python3 -I - "\$bundle_path" "\$install_stage" "\$source_sha" <<'PY'\n(?P<script>.*?)\n          PY\n          recovery_stage=generation_install''',
             recover,

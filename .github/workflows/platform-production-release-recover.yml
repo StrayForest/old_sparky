@@ -676,7 +676,7 @@ jobs:
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             "${gh_header[@]}" "$api/actions/runs/$run_id/attempts/$run_attempt" --output "$root/run.json"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
-            "${gh_header[@]}" "$api/actions/runs/$run_id/attempts/$run_attempt/artifacts?per_page=100&page=1" --output "$root/artifacts.json"
+            "${gh_header[@]}" "$api/actions/runs/$run_id/artifacts?per_page=100&page=1" --output "$root/artifacts.json"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             "${gh_header[@]}" "$api/actions/artifacts/$artifact_id" --output "$root/artifact.json"
           /usr/bin/python3 -I - "$root" <<'PY'
