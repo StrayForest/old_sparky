@@ -1868,6 +1868,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     diagnostic_marker,
                 )
                 early_stderr = PrivateStderr()
+                early_stderr.buffer = io.BytesIO()
                 with (
                     mock.patch.dict(os.environ, {
                         "PLATFORM_RUNTIME_PRIVATE_CAPTURE": "1",
