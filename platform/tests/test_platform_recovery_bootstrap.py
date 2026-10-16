@@ -769,6 +769,159 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         end = source.index("          }\n", start) + len("          }\n")
         return cls._set_assignment(textwrap.dedent(source[start:end]), "expected")
 
+    @classmethod
+    def _run_reset_capture_artifact_fetch_contract(cls, workflow: str) -> None:
+        fetch = workflow.split(
+            "- name: Fetch and validate exact encrypted capture artifact", 1
+        )[1].split("\n      - name:", 1)[0]
+        script = textwrap.dedent(fetch.split("run: |\n", 1)[1])
+        env_line = next(
+            line for line in fetch.splitlines() if line.strip().startswith("BUNDLE_SHA:")
+        )
+        reference = env_line.split("${{ steps.", 1)[1].split(" }}", 1)[0]
+        step_name, output_name = reference.split(".outputs.", 1)
+
+        source_sha = "a" * 40
+        bundle_sha = "b" * 64
+        ciphertext = b"closed CMS test ciphertext"
+        manifest = {
+            "schema": 1,
+            "kind": "encrypted_maintenance_failure_report",
+            "repository": "StrayForest/old_sparky",
+            "workflow_path": ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+            "capture_run_id": "56789",
+            "capture_run_attempt": "1",
+            "source_sha": source_sha,
+            "bundle_sha256": bundle_sha,
+            "security_run_id": "12345",
+            "security_run_attempt": "1",
+            "recovery_run_id": "23456",
+            "recovery_run_attempt": "1",
+            "publisher_run_id": "34567",
+            "publisher_run_attempt": "1",
+            "recipient_certificate_sha256": "c" * 64,
+            "encryption": "CMS-EnvelopedData/AES-256-GCM/RSA-OAEP-SHA-256",
+            "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+            "ciphertext_size": len(ciphertext),
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixtures = root / "fixtures"
+            bin_dir = root / "bin"
+            runner_temp = root / "runner-temp"
+            for directory in (fixtures, bin_dir, runner_temp):
+                directory.mkdir()
+            run_record = {
+                "id": 56789,
+                "run_attempt": 1,
+                "name": "Platform production recovery bootstrap abort",
+                "path": manifest["workflow_path"],
+                "head_branch": "dev",
+                "head_sha": source_sha,
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+            }
+            (fixtures / "run.json").write_text(
+                json.dumps(run_record), encoding="utf-8"
+            )
+            archive_path = fixtures / "capture.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for name, data in (
+                    ("manifest.json", json.dumps(manifest, separators=(",", ":")).encode("ascii")),
+                    ("evidence.cms", ciphertext),
+                ):
+                    member = zipfile.ZipInfo(name)
+                    member.create_system = 3
+                    member.external_attr = (stat.S_IFREG | 0o600) << 16
+                    archive.writestr(member, data)
+            archive_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            artifact_listing = {
+                "total_count": 1,
+                "artifacts": [
+                    {
+                        "id": 901,
+                        "name": "platform-maintenance-failure-56789-1",
+                        "expired": False,
+                        "digest": f"sha256:{archive_digest}",
+                        "size_in_bytes": archive_path.stat().st_size,
+                        "workflow_run": {
+                            "id": 56789,
+                            "head_sha": source_sha,
+                            "run_attempt": 1,
+                        },
+                    }
+                ],
+            }
+            (fixtures / "artifacts.json").write_text(
+                json.dumps(artifact_listing), encoding="utf-8"
+            )
+            curl = bin_dir / "curl"
+            curl.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, shutil, sys\n"
+                "args = sys.argv[1:]\n"
+                "url = next(arg for arg in args if arg.startswith('https://'))\n"
+                "output = args[args.index('--output') + 1]\n"
+                "root = os.environ['CURL_FIXTURES']\n"
+                "if url.endswith('/actions/runs/56789/attempts/1'):\n"
+                "    source = os.path.join(root, 'run.json')\n"
+                "elif url.endswith('/actions/runs/56789/artifacts?per_page=100&page=1'):\n"
+                "    source = os.path.join(root, 'artifacts.json')\n"
+                "elif url.endswith('/actions/artifacts/901/zip'):\n"
+                "    source = os.path.join(root, 'capture.zip')\n"
+                "else:\n"
+                "    raise SystemExit('unexpected fake API path')\n"
+                "shutil.copyfile(source, output)\n",
+                encoding="utf-8",
+            )
+            curl.chmod(0o755)
+            github_output = root / "github-output"
+            github_output.touch(mode=0o600)
+            step_outputs = {
+                "evidence": {"source_sha": source_sha},
+                "bundle": {"bundle_sha": bundle_sha},
+            }
+            bundle_output = step_outputs.get(step_name, {}).get(output_name, "")
+            environment = {
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                "CURL_FIXTURES": str(fixtures),
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_OUTPUT": str(github_output),
+                "GITHUB_API_URL": "https://api.github.test",
+                "REPOSITORY": "StrayForest/old_sparky",
+                "GH_TOKEN": "fixture-token",
+                "CAPTURE_RUN_ID": "56789",
+                "CAPTURE_RUN_ATTEMPT": "1",
+                "EXPECTED_EVIDENCE_SHA256": "d" * 64,
+                "SOURCE_SHA": source_sha,
+                "BUNDLE_SHA": bundle_output,
+                "SECURITY_RUN_ID": "12345",
+                "SECURITY_RUN_ATTEMPT": "1",
+                "RECOVERY_RUN_ID": "23456",
+                "RECOVERY_RUN_ATTEMPT": "1",
+                "PUBLISHER_RUN_ID": "34567",
+                "PUBLISHER_RUN_ATTEMPT": "1",
+                "RECIPIENT_CERTIFICATE_SHA256": "c" * 64,
+            }
+            result = subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-e", "-u", "-o", "pipefail", "-c", script],
+                env=environment,
+                cwd=root,
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise AssertionError(
+                    "extracted reset capture-artifact fetch failed: "
+                    f"stdout={result.stdout!r} stderr={result.stderr!r}"
+                )
+            output_text = github_output.read_text(encoding="ascii")
+            if reference != "bundle.outputs.bundle_sha" or "artifact_id=901\n" not in output_text or f"artifact_digest={archive_digest}\n" not in output_text:
+                raise AssertionError("reset fetch did not bind the exact bundle and capture artifact outputs")
+
     def test_fixed_entrypoint_has_only_abort_retained_capability(self) -> None:
         script = (TOOLS / "platform_abort_retained_only.sh").read_text(encoding="utf-8")
         self.assertIn("abort_retained_only", script)
@@ -952,6 +1105,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
 
     def test_manual_abort_validates_artifacts_before_secrets_and_uses_bundle_only(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-abort.yml").read_text(encoding="utf-8")
+        self._run_reset_capture_artifact_fetch_contract(workflow)
         evidence = workflow.index("Validate exact successful security run")
         secrets = workflow.index("secrets.PROD_SSH_HOST")
         self.assertLess(evidence, secrets)

@@ -676,7 +676,7 @@ jobs:
           CAPTURE_RUN_ATTEMPT: ${{ inputs.capture_run_attempt }}
           EXPECTED_EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
           SOURCE_SHA: ${{ steps.evidence.outputs.source_sha }}
-          BUNDLE_SHA: ${{ steps.evidence.outputs.bundle_sha }}
+          BUNDLE_SHA: ${{ steps.bundle.outputs.bundle_sha }}
           SECURITY_RUN_ID: ${{ inputs.security_run_id }}
           SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
           RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
