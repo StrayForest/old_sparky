@@ -126,11 +126,15 @@ jobs:
           timer_file=""
           timer_dir=""
           retention_file=""
+          retention_preview_file=""
+          liveqa_preview_file=""
           cleanup_private_files() {
             [[ -z "$backup_file" ]] || rm -f -- "$backup_file"
             [[ -z "$timer_file" ]] || rm -f -- "$timer_file"
             [[ -z "$timer_dir" ]] || rmdir -- "$timer_dir" 2>/dev/null || true
             [[ -z "$retention_file" ]] || rm -f -- "$retention_file"
+            [[ -z "$retention_preview_file" ]] || rm -f -- "$retention_preview_file"
+            [[ -z "$liveqa_preview_file" ]] || rm -f -- "$liveqa_preview_file"
           }
           trap cleanup_private_files EXIT
 
@@ -618,6 +622,364 @@ jobs:
             report_failure backup_check producer_failed "$backup_rc"
           elif [[ "$backup_assessment" != ok ]]; then
             report_failure backup_check verification_incomplete 1
+          fi
+
+          # Keep the two read-only candidate previews independent of the
+          # aggregate maintenance dry-run. A pending recovery receipt can make
+          # the LiveQA guard refuse its preview; that must not discard the
+          # release-retention inventory, and neither preview authorizes apply.
+          retention_preview_file="$(mktemp)"
+          CURRENT_STAGE=release_retention_preview
+          set +e
+          timeout --foreground 180s "$python_bin" -I -B - \
+            release "$runtime" "$current_id" "$previous_id" \
+            >"$retention_preview_file" 2>/dev/null <<'PY'
+          import contextlib
+          import io
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          MAX_CANDIDATES = 32
+          runtime = Path(sys.argv[2])
+          expected_current = sys.argv[3]
+          expected_previous = sys.argv[4]
+
+          def unavailable(error_class):
+              return {
+                  "schema": 1,
+                  "kind": "release_retention_preview",
+                  "status": "unavailable",
+                  "error_class": error_class,
+                  "keep": 5,
+                  "min_age_days": 0,
+                  "current_release_id": expected_current,
+                  "previous_release_id": expected_previous,
+                  "protected_release_ids": [],
+                  "retained_count": None,
+                  "candidate_count": None,
+                  "reclaimable_bytes": None,
+                  "truncated": False,
+                  "candidates": [],
+              }
+
+          try:
+              current = (runtime / "current").resolve(strict=True)
+              previous = (runtime / "previous").resolve(strict=True)
+              releases = (runtime / "releases").resolve(strict=True)
+              if (
+                  current.parent != releases
+                  or previous.parent != releases
+                  or current.name != expected_current
+                  or previous.name != expected_previous
+              ):
+                  raise ValueError
+              path = current / "tools/platform_release_retention.py"
+              named = path.lstat()
+              if (
+                  not stat.S_ISREG(named.st_mode)
+                  or named.st_uid != 0
+                  or named.st_nlink != 1
+                  or stat.S_IMODE(named.st_mode) & 0o022
+                  or named.st_size <= 0
+                  or named.st_size > 256 * 1024
+              ):
+                  raise ValueError
+              spec = importlib.util.spec_from_file_location("_storage_release_retention", path)
+              if spec is None or spec.loader is None:
+                  raise ValueError
+              module = importlib.util.module_from_spec(spec)
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (opened.st_dev, opened.st_ino, opened.st_size) != (named.st_dev, named.st_ino, named.st_size):
+                      raise ValueError
+                  source = bytearray()
+                  while len(source) <= named.st_size:
+                      chunk = os.read(descriptor, min(65536, named.st_size + 1 - len(source)))
+                      if not chunk:
+                          break
+                      source.extend(chunk)
+                  after = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              after_named = path.lstat()
+              if (
+                  len(source) != named.st_size
+                  or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                  != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                  or (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns)
+                  != (after_named.st_dev, after_named.st_ino, after_named.st_size, after_named.st_mtime_ns)
+              ):
+                  raise ValueError
+              sys.modules[spec.name] = module
+              with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                  exec(compile(source, str(path), "exec", dont_inherit=True), module.__dict__)
+              plan = module.build_retention_plan(
+                  runtime,
+                  keep=5,
+                  min_age_days=0,
+              )
+              if (
+                  (runtime / "current").resolve(strict=True) != current
+                  or (runtime / "previous").resolve(strict=True) != previous
+              ):
+                  raise ValueError
+              candidates = [
+                  {
+                      "release_id": entry.path.name,
+                      "modified_at_utc": entry.modified_at.isoformat().replace("+00:00", "Z"),
+                      "size_bytes": entry.size_bytes,
+                      "device": entry.device,
+                      "inode": entry.inode,
+                  }
+                  for entry in plan.candidates[:MAX_CANDIDATES]
+              ]
+              if (
+                  (runtime / "current").resolve(strict=True) != current
+                  or (runtime / "previous").resolve(strict=True) != previous
+              ):
+                  raise ValueError
+              truncated = len(plan.candidates) > MAX_CANDIDATES
+              result = {
+                  "schema": 1,
+                  "kind": "release_retention_preview",
+                  "status": "incomplete" if truncated else "complete",
+                  "error_class": "none",
+                  "keep": 5,
+                  "min_age_days": 0,
+                  "current_release_id": current.name,
+                  "previous_release_id": previous.name,
+                  "protected_release_ids": sorted(item.path.name for item in plan.protected),
+                  "retained_count": len(plan.retained),
+                  "candidate_count": len(plan.candidates),
+                  "reclaimable_bytes": plan.reclaimable_bytes,
+                  "truncated": truncated,
+                  "candidates": candidates,
+              }
+          except OSError:
+              result = unavailable("io")
+          except (RuntimeError, ValueError):
+              result = unavailable("guard_refusal")
+          except Exception:
+              result = unavailable("inspection_error")
+          print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+          PY
+          retention_preview_rc=$?
+          set -e
+          if (( retention_preview_rc == 0 )); then
+            cat -- "$retention_preview_file"
+          else
+            preview_class=inspection_error
+            (( retention_preview_rc == 124 )) && preview_class=timeout
+            printf '{"schema":1,"kind":"release_retention_preview","status":"unavailable","error_class":"%s","keep":5,"min_age_days":0,"current_release_id":"%s","previous_release_id":"%s","protected_release_ids":[],"retained_count":null,"candidate_count":null,"reclaimable_bytes":null,"truncated":false,"candidates":[]}\n' \
+              "$preview_class" "$current_id" "$previous_id"
+          fi
+
+          liveqa_preview_file="$(mktemp)"
+          CURRENT_STAGE=liveqa_cache_preview
+          set +e
+          timeout --foreground 180s "$python_bin" -I -B - \
+            liveqa "$runtime" "$current_id" "$previous_id" \
+            >"$liveqa_preview_file" 2>/dev/null <<'PY'
+          import contextlib
+          import io
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          MAX_CANDIDATES = 32
+          runtime = Path(sys.argv[2])
+          expected_current = sys.argv[3]
+          expected_previous = sys.argv[4]
+
+          def unavailable(error_class):
+              return {
+                  "schema": 1,
+                  "kind": "liveqa_cache_preview",
+                  "status": "unavailable",
+                  "error_class": error_class,
+                  "keep": 1,
+                  "protected_count": None,
+                  "retained_count": None,
+                  "candidate_count": None,
+                  "tombstone_count": None,
+                  "candidate_logical_bytes": None,
+                  "tombstone_logical_bytes": None,
+                  "truncated": False,
+                  "candidates": [],
+                  "tombstones": [],
+              }
+
+          try:
+              current = (runtime / "current").resolve(strict=True)
+              previous = (runtime / "previous").resolve(strict=True)
+              releases = (runtime / "releases").resolve(strict=True)
+              if (
+                  current.parent != releases
+                  or previous.parent != releases
+                  or current.name != expected_current
+                  or previous.name != expected_previous
+              ):
+                  raise ValueError
+              path = current / "tools/platform_live_qa_guard.py"
+              named = path.lstat()
+              if (
+                  not stat.S_ISREG(named.st_mode)
+                  or named.st_uid != 0
+                  or named.st_nlink != 1
+                  or stat.S_IMODE(named.st_mode) & 0o022
+                  or named.st_size <= 0
+                  or named.st_size > 8 * 1024 * 1024
+              ):
+                  raise ValueError
+              spec = importlib.util.spec_from_file_location("_storage_live_qa_guard", path)
+              if spec is None or spec.loader is None:
+                  raise ValueError
+              module = importlib.util.module_from_spec(spec)
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (opened.st_dev, opened.st_ino, opened.st_size) != (named.st_dev, named.st_ino, named.st_size):
+                      raise ValueError
+                  source = bytearray()
+                  while len(source) <= named.st_size:
+                      chunk = os.read(descriptor, min(65536, named.st_size + 1 - len(source)))
+                      if not chunk:
+                          break
+                      source.extend(chunk)
+                  after = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              after_named = path.lstat()
+              if (
+                  len(source) != named.st_size
+                  or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                  != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                  or (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns)
+                  != (after_named.st_dev, after_named.st_ino, after_named.st_size, after_named.st_mtime_ns)
+              ):
+                  raise ValueError
+              sys.modules[spec.name] = module
+              with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                  exec(compile(source, str(path), "exec", dont_inherit=True), module.__dict__)
+              plan = module.prune_runtime_cache(
+                  apply=False,
+                  keep=1,
+                  app_dir=runtime,
+              )
+              if (
+                  (runtime / "current").resolve(strict=True) != current
+                  or (runtime / "previous").resolve(strict=True) != previous
+              ):
+                  raise ValueError
+              def logical_bytes(root, expected_fingerprint):
+                  total = 0
+                  root_metadata = root.lstat()
+                  root_device = root_metadata.st_dev
+                  if (root_metadata.st_dev, root_metadata.st_ino, root_metadata.st_size,
+                      root_metadata.st_mtime_ns, root_metadata.st_ctime_ns) != expected_fingerprint:
+                      raise ValueError
+                  pending = [root]
+                  while pending:
+                      directory = pending.pop()
+                      with os.scandir(directory) as entries:
+                          for entry in entries:
+                              info = entry.stat(follow_symlinks=False)
+                              if info.st_dev != root_device:
+                                  raise ValueError
+                              if stat.S_ISDIR(info.st_mode):
+                                  pending.append(Path(entry.path))
+                              elif stat.S_ISREG(info.st_mode):
+                                  if info.st_size > module.MAX_ZIP_MEMBER_BYTES:
+                                      raise ValueError
+                                  total += info.st_size
+                                  if total > module.MAX_ZIP_UNCOMPRESSED_BYTES:
+                                      raise ValueError
+                              elif not stat.S_ISLNK(info.st_mode):
+                                  raise ValueError
+                  after = root.lstat()
+                  if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                      after.st_ctime_ns) != expected_fingerprint:
+                      raise ValueError
+                  return total
+              candidate_rows = []
+              candidate_bytes = 0
+              for entry in plan.candidates:
+                  size = logical_bytes(entry.path, entry.fingerprint)
+                  candidate_bytes += size
+                  if len(candidate_rows) < MAX_CANDIDATES:
+                      candidate_rows.append({
+                          "cache_id": entry.path.name,
+                          "commit": entry.commit,
+                          "device": entry.fingerprint[0],
+                          "inode": entry.fingerprint[1],
+                          "root_size_bytes": entry.fingerprint[2],
+                          "modified_at_ns": entry.fingerprint[3],
+                          "changed_at_ns": entry.fingerprint[4],
+                          "logical_file_bytes": size,
+                      })
+              tombstone_rows = []
+              tombstone_bytes = 0
+              for item in plan.tombstones:
+                  size = logical_bytes(item.path, item.fingerprint)
+                  tombstone_bytes += size
+                  if len(candidate_rows) + len(tombstone_rows) < MAX_CANDIDATES:
+                      tombstone_rows.append({
+                          "tombstone_id": item.path.name,
+                          "commit": item.commit,
+                          "device": item.fingerprint[0],
+                          "inode": item.fingerprint[1],
+                          "root_size_bytes": item.fingerprint[2],
+                          "modified_at_ns": item.fingerprint[3],
+                          "changed_at_ns": item.fingerprint[4],
+                          "logical_file_bytes": size,
+                      })
+              if (
+                  (runtime / "current").resolve(strict=True) != current
+                  or (runtime / "previous").resolve(strict=True) != previous
+              ):
+                  raise ValueError
+              truncated = len(plan.candidates) + len(plan.tombstones) > MAX_CANDIDATES
+              result = {
+                  "schema": 1,
+                  "kind": "liveqa_cache_preview",
+                  "status": "incomplete" if truncated else "complete",
+                  "error_class": "none",
+                  "keep": 1,
+                  "protected_count": len(plan.protected),
+                  "retained_count": len(plan.retained),
+                  "candidate_count": len(plan.candidates),
+                  "tombstone_count": len(plan.tombstones),
+                  "candidate_logical_bytes": candidate_bytes,
+                  "tombstone_logical_bytes": tombstone_bytes,
+                  "truncated": truncated,
+                  "candidates": candidate_rows,
+                  "tombstones": tombstone_rows,
+              }
+          except OSError:
+              result = unavailable("io")
+          except (RuntimeError, ValueError):
+              result = unavailable("guard_refusal")
+          except Exception:
+              result = unavailable("inspection_error")
+          print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+          PY
+          liveqa_preview_rc=$?
+          set -e
+          if (( liveqa_preview_rc == 0 )); then
+            cat -- "$liveqa_preview_file"
+          else
+            preview_class=inspection_error
+            (( liveqa_preview_rc == 124 )) && preview_class=timeout
+            printf '{"schema":1,"kind":"liveqa_cache_preview","status":"unavailable","error_class":"%s","keep":1,"protected_count":null,"retained_count":null,"candidate_count":null,"tombstone_count":null,"candidate_logical_bytes":null,"tombstone_logical_bytes":null,"truncated":false,"candidates":[],"tombstones":[]}\n' \
+              "$preview_class"
           fi
 
           CURRENT_STAGE=retention_tempfile

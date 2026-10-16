@@ -2009,6 +2009,18 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("os.fstat(descriptor)", workflow)
         self.assertIn("named = lock_path.lstat()", workflow)
         self.assertIn("CURRENT_STAGE=retention_dry_run", workflow)
+        release_preview = workflow.index("CURRENT_STAGE=release_retention_preview")
+        liveqa_preview = workflow.index("CURRENT_STAGE=liveqa_cache_preview")
+        aggregate_retention = workflow.index("CURRENT_STAGE=retention_dry_run")
+        self.assertLess(release_preview, liveqa_preview)
+        self.assertLess(liveqa_preview, aggregate_retention)
+        self.assertIn('timeout --foreground 180s "$python_bin" -I -B -', workflow)
+        self.assertIn('"$runtime" "$current_id" "$previous_id"', workflow)
+        self.assertIn("MAX_CANDIDATES = 32", workflow)
+        self.assertIn("module.build_retention_plan(\n                  runtime,\n                  keep=5,\n                  min_age_days=0,", workflow)
+        self.assertIn("module.prune_runtime_cache(\n                  apply=False,\n                  keep=1,\n                  app_dir=runtime,", workflow)
+        self.assertIn('"kind": "release_retention_preview"', workflow)
+        self.assertIn('"kind": "liveqa_cache_preview"', workflow)
         self.assertIn('retention_rc=$?', workflow)
         self.assertIn('outcome":"threshold"', workflow)
         self.assertIn('outcome":"bounded_error_class"', workflow)
@@ -2358,7 +2370,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         trap_line = next(
             line for line in remote_script.splitlines() if line.startswith("trap ")
         )
-        caller_start = workflow.index("          CURRENT_STAGE=retention_tempfile\n")
+        caller_start = workflow.index('          retention_preview_file="$(mktemp)"\n')
         caller_end = workflow.index(
             "          printf '{\"schema\":1,\"kind\":\"collection_status\"",
             caller_start,
@@ -2379,24 +2391,112 @@ class ReleaseHardeningContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            tools = root / "tools"
-            tools.mkdir()
-            producer = tools / "platform_storage_maintenance.py"
+            runtime = root / "platform"
+            releases = runtime / "releases"
+            active_release = releases / "release-current"
+            previous_release = releases / "release-previous"
+            active_tools = active_release / "tools"
+            active_tools.mkdir(parents=True)
+            (previous_release / "tools").mkdir(parents=True)
+            runtime.mkdir(exist_ok=True)
+            releases.mkdir(exist_ok=True)
+            (runtime / "current").symlink_to(active_release, target_is_directory=True)
+            (runtime / "previous").symlink_to(previous_release, target_is_directory=True)
+            producer = active_tools / "platform_storage_maintenance.py"
+            release_helper = active_tools / "platform_release_retention.py"
+            liveqa_helper = active_tools / "platform_live_qa_guard.py"
+            cache_candidate = root / "private-cache-candidate"
+            cache_candidate.mkdir()
+            (cache_candidate / "payload.bin").write_bytes(b"safe test fixture")
+            cache_metadata = cache_candidate.lstat()
+            cache_fingerprint = (
+                cache_metadata.st_dev,
+                cache_metadata.st_ino,
+                cache_metadata.st_size,
+                cache_metadata.st_mtime_ns,
+                cache_metadata.st_ctime_ns,
+            )
 
-            def run_caller(output: str) -> subprocess.CompletedProcess[str]:
+            release_module = textwrap.dedent(
+                """
+                import datetime
+                from pathlib import Path
+                from types import SimpleNamespace
+
+                def build_retention_plan(app_dir, *, keep, min_age_days):
+                    assert Path(app_dir).name == 'platform'
+                    assert keep == 5 and min_age_days == 0
+                    candidate = SimpleNamespace(
+                        path=Path('/private/release-candidate'),
+                        modified_at=datetime.datetime(
+                            2026, 10, 17, tzinfo=datetime.timezone.utc
+                        ),
+                        size_bytes=23,
+                        device=11,
+                        inode=22,
+                    )
+                    protected = [
+                        SimpleNamespace(path=Path('release-current')),
+                        SimpleNamespace(path=Path('release-previous')),
+                    ]
+                    return SimpleNamespace(
+                        candidates=[candidate], protected=protected,
+                        retained=protected, reclaimable_bytes=23,
+                    )
+                """
+            )
+            liveqa_module = textwrap.dedent(
+                f"""
+                from pathlib import Path
+                from types import SimpleNamespace
+
+                MAX_ZIP_MEMBER_BYTES = 1048576
+                MAX_ZIP_UNCOMPRESSED_BYTES = 1048576
+
+                def _walk_nofollow(root):
+                    return [root / 'payload.bin']
+
+                def prune_runtime_cache(*, apply, keep, app_dir):
+                    assert Path(app_dir).name == 'platform'
+                    assert apply is False and keep == 1
+                    candidate = SimpleNamespace(
+                        path=Path({str(cache_candidate)!r}),
+                        commit='a' * 40,
+                        fingerprint={cache_fingerprint!r},
+                    )
+                    return SimpleNamespace(
+                        protected=[object()], retained=[], candidates=[candidate],
+                        tombstones=[],
+                    )
+                """
+            )
+
+            def run_caller(
+                output: str,
+                *,
+                release_source: str = release_module,
+                liveqa_source: str = liveqa_module,
+            ) -> subprocess.CompletedProcess[str]:
                 producer.write_text(
                     "import sys\n"
                     f"print({output!r})\n"
                     "sys.exit(1)\n",
                     encoding="utf-8",
                 )
+                release_helper.write_text(release_source, encoding="utf-8")
+                liveqa_helper.write_text(liveqa_source, encoding="utf-8")
+                release_helper.chmod(0o600)
+                liveqa_helper.chmod(0o600)
                 prefix = "\n".join(
                     (
                         "set -Eeuo pipefail",
                         "CURRENT_STAGE=identity",
                         trap_line,
                         f"python_bin={shlex.quote(sys.executable)}",
-                        f"current={shlex.quote(str(root))}",
+                        f"runtime={shlex.quote(str(runtime))}",
+                        f"current={shlex.quote(str(runtime / 'current'))}",
+                        "current_id=release-current",
+                        "previous_id=release-previous",
                         f"summary_tool={shlex.quote(str(summary_tool))}",
                         "",
                     )
@@ -2408,8 +2508,34 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     check=False,
                 )
 
+            pointer_snapshot = (
+                os.readlink(runtime / "current"),
+                os.readlink(runtime / "previous"),
+            )
+            cache_snapshot = (
+                cache_candidate.stat().st_ino,
+                cache_candidate.stat().st_mtime_ns,
+                (cache_candidate / "payload.bin").stat().st_ino,
+                (cache_candidate / "payload.bin").stat().st_size,
+            )
             unhealthy = run_caller(json.dumps(unhealthy_report))
             self.assertEqual(unhealthy.returncode, 1, unhealthy.stderr)
+            self.assertEqual(
+                pointer_snapshot,
+                (
+                    os.readlink(runtime / "current"),
+                    os.readlink(runtime / "previous"),
+                ),
+            )
+            self.assertEqual(
+                cache_snapshot,
+                (
+                    cache_candidate.stat().st_ino,
+                    cache_candidate.stat().st_mtime_ns,
+                    (cache_candidate / "payload.bin").stat().st_ino,
+                    (cache_candidate / "payload.bin").stat().st_size,
+                ),
+            )
             records = [json.loads(line) for line in unhealthy.stdout.splitlines()]
             summary = next(
                 item for item in records if item.get("kind") == "storage_retention"
@@ -2430,6 +2556,158 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             self.assertEqual(failure["stage"], "retention_threshold")
             self.assertEqual(failure["exit_code"], 1)
             self.assertNotIn("must-not-appear-in-evidence", unhealthy.stdout)
+            previews = {
+                item["kind"]: item
+                for item in records
+                if item.get("kind")
+                in {"release_retention_preview", "liveqa_cache_preview"}
+            }
+            self.assertEqual(
+                set(previews),
+                {"release_retention_preview", "liveqa_cache_preview"},
+                unhealthy.stdout,
+            )
+            release_preview_record = previews["release_retention_preview"]
+            self.assertEqual(
+                set(release_preview_record),
+                {
+                    "schema", "kind", "status", "error_class", "keep",
+                    "min_age_days", "current_release_id", "previous_release_id",
+                    "protected_release_ids", "retained_count", "candidate_count",
+                    "reclaimable_bytes", "truncated", "candidates",
+                },
+            )
+            self.assertEqual(release_preview_record["status"], "complete")
+            self.assertEqual(release_preview_record["keep"], 5)
+            self.assertEqual(release_preview_record["min_age_days"], 0)
+            self.assertEqual(
+                release_preview_record["current_release_id"], "release-current"
+            )
+            self.assertEqual(
+                release_preview_record["previous_release_id"], "release-previous"
+            )
+            self.assertEqual(release_preview_record["candidate_count"], 1)
+            self.assertEqual(release_preview_record["reclaimable_bytes"], 23)
+            self.assertEqual(
+                release_preview_record["candidates"],
+                [
+                    {
+                        "release_id": "release-candidate",
+                        "modified_at_utc": "2026-10-17T00:00:00Z",
+                        "size_bytes": 23,
+                        "device": 11,
+                        "inode": 22,
+                    }
+                ],
+            )
+            liveqa_preview_record = previews["liveqa_cache_preview"]
+            self.assertEqual(
+                set(liveqa_preview_record),
+                {
+                    "schema", "kind", "status", "error_class", "keep",
+                    "protected_count", "retained_count", "candidate_count",
+                    "tombstone_count", "candidate_logical_bytes",
+                    "tombstone_logical_bytes", "truncated", "candidates",
+                    "tombstones",
+                },
+            )
+            self.assertEqual(liveqa_preview_record["status"], "complete", liveqa_preview_record)
+            self.assertEqual(liveqa_preview_record["keep"], 1)
+            self.assertEqual(liveqa_preview_record["protected_count"], 1)
+            self.assertEqual(liveqa_preview_record["candidate_count"], 1)
+            self.assertEqual(
+                liveqa_preview_record["candidate_logical_bytes"],
+                len(b"safe test fixture"),
+            )
+            self.assertEqual(
+                liveqa_preview_record["candidates"][0]["cache_id"],
+                cache_candidate.name,
+            )
+            self.assertEqual(liveqa_preview_record["candidates"][0]["commit"], "a" * 40)
+            self.assertNotIn(str(root), unhealthy.stdout)
+            self.assertNotIn(str(cache_candidate), unhealthy.stdout)
+            self.assertNotIn("/private/release-candidate", unhealthy.stdout)
+
+            bounded_release_source = release_module.replace(
+                "candidates=[candidate], protected=protected,",
+                "candidates=[candidate] * 33, protected=protected,",
+            )
+            bounded_liveqa_source = liveqa_module.replace(
+                "protected=[object()], retained=[], candidates=[candidate],",
+                "protected=[object()], retained=[], candidates=[candidate] * 33,",
+            )
+            bounded = run_caller(
+                json.dumps(unhealthy_report),
+                release_source=bounded_release_source,
+                liveqa_source=bounded_liveqa_source,
+            )
+            bounded_records = [
+                json.loads(line) for line in bounded.stdout.splitlines()
+            ]
+            bounded_release = next(
+                item for item in bounded_records
+                if item.get("kind") == "release_retention_preview"
+            )
+            bounded_liveqa = next(
+                item for item in bounded_records
+                if item.get("kind") == "liveqa_cache_preview"
+            )
+            self.assertEqual(bounded_release["status"], "incomplete")
+            self.assertTrue(bounded_release["truncated"])
+            self.assertEqual(bounded_release["candidate_count"], 33)
+            self.assertEqual(len(bounded_release["candidates"]), 32)
+            self.assertEqual(bounded_liveqa["status"], "incomplete")
+            self.assertTrue(bounded_liveqa["truncated"])
+            self.assertEqual(bounded_liveqa["candidate_count"], 33)
+            self.assertEqual(len(bounded_liveqa["candidates"]), 32)
+
+            sentinel = "private-helper-error-must-stay-private"
+            failing_release = release_module.replace(
+                "def build_retention_plan(app_dir, *, keep, min_age_days):",
+                "def build_retention_plan(app_dir, *, keep, min_age_days):\n    raise RuntimeError(" + repr(sentinel) + ")",
+            )
+            release_failure = run_caller(
+                json.dumps(unhealthy_report), release_source=failing_release
+            )
+            release_failure_records = [
+                json.loads(line) for line in release_failure.stdout.splitlines()
+            ]
+            release_failed_preview = next(
+                item for item in release_failure_records
+                if item.get("kind") == "release_retention_preview"
+            )
+            liveqa_success_preview = next(
+                item for item in release_failure_records
+                if item.get("kind") == "liveqa_cache_preview"
+            )
+            self.assertEqual(release_failed_preview["status"], "unavailable")
+            self.assertEqual(release_failed_preview["error_class"], "guard_refusal")
+            self.assertEqual(liveqa_success_preview["status"], "complete")
+            self.assertNotIn(sentinel, release_failure.stdout)
+
+            sentinel = "private-liveqa-error-must-stay-private"
+            failing_liveqa = liveqa_module.replace(
+                "def prune_runtime_cache(*, apply, keep, app_dir):",
+                "def prune_runtime_cache(*, apply, keep, app_dir):\n    raise RuntimeError(" + repr(sentinel) + ")",
+            )
+            liveqa_failure = run_caller(
+                json.dumps(unhealthy_report), liveqa_source=failing_liveqa
+            )
+            liveqa_failure_records = [
+                json.loads(line) for line in liveqa_failure.stdout.splitlines()
+            ]
+            release_success_preview = next(
+                item for item in liveqa_failure_records
+                if item.get("kind") == "release_retention_preview"
+            )
+            liveqa_failed_preview = next(
+                item for item in liveqa_failure_records
+                if item.get("kind") == "liveqa_cache_preview"
+            )
+            self.assertEqual(release_success_preview["status"], "complete")
+            self.assertEqual(liveqa_failed_preview["status"], "unavailable")
+            self.assertEqual(liveqa_failed_preview["error_class"], "guard_refusal")
+            self.assertNotIn(sentinel, liveqa_failure.stdout)
 
             malformed = run_caller("not-json")
             self.assertNotEqual(malformed.returncode, 0, malformed.stderr)
