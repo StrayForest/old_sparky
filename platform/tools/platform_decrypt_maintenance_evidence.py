@@ -545,7 +545,12 @@ def _validate_runtime_marker(remote_stderr: bytes, route: str) -> None:
         "total_bytes", "truncated", "retained",
     }
     expected_components = {
-        "capture_probe": {"nginx_preflight": "stderr"},
+        "capture_probe": {
+            "nginx_preflight": "stderr",
+            "runtime_payload_verify": "stderr",
+            "runtime_expected_tree": "stderr",
+            "systemd_unit_snapshot": "stderr",
+        },
         "recover_pending": {
             "systemd_state_validate": "combined", "runtime_reconcile": "combined",
             "systemd_units": "combined", "nginx_apply": "combined",

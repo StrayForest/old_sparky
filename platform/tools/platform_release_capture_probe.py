@@ -7,9 +7,10 @@ import base64
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -51,6 +52,10 @@ class ProbeFailure(Exception):
         self.error_class = error_class
         self.systemd_observation = systemd_observation
         self.safe_fields = safe_fields or {}
+
+
+class ProbeDeadlineExceeded(Exception):
+    pass
 
 
 _SYSTEMD_STATE_VALUES = frozenset(
@@ -192,6 +197,293 @@ def _load_pinned_module(expected_sha256: str) -> Any:
     ):
         raise ProbeFailure("module_changed")
     return module
+
+
+def _load_pinned_runtime_installer(path: Path, expected_sha256: str) -> Any:
+    source, metadata = _safe_module_bytes(path)
+    digest = hashlib.sha256(source).hexdigest()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None or digest != expected_sha256:
+        raise ProbeFailure("runtime_installer_identity")
+    module = types.ModuleType("_release_liveqa_runtime_installer_pinned")
+    module.__file__ = str(path)
+    module.__verified_sha256__ = digest
+    try:
+        exec(compile(source, str(path), "exec"), module.__dict__)
+    except Exception as exc:
+        safe_class = type(exc).__name__
+        raise ProbeFailure(
+            "runtime_installer_import",
+            safe_class if safe_class in {"ImportError", "OSError", "SyntaxError"} else "exception",
+        ) from None
+    after, opened = _safe_module_bytes(path)
+    if (
+        hashlib.sha256(after).hexdigest() != digest
+        or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+    ):
+        raise ProbeFailure("runtime_installer_changed")
+    return module
+
+
+def _expected_liveqa_payload_tree(
+    module: Any,
+    *,
+    release: Path,
+    source_sha: str,
+    runtime_provider: dict[str, object] | None,
+    deadline: float,
+    runtime_manifest: dict[str, object] | None = None,
+) -> tuple[str, dict[str, str]]:
+    """Recompute install's deterministic payload tree from its pinned inputs."""
+
+    files: dict[str, str] = {}
+    directories: set[str] = {"platform", "platform/tools", "runtime"}
+    total_bytes = 0
+
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise ProbeFailure("runtime_expected_tree", "timeout")
+
+    def add_file(relative: str, source: Path, *, sandbox: bool = False) -> None:
+        nonlocal total_bytes
+        check_deadline()
+        metadata = module._regular(source, allow_sandbox=sandbox)
+        total_bytes += metadata.st_size
+        if len(files) >= module.MAX_FILES or total_bytes > module.MAX_RUNTIME_BYTES:
+            raise ProbeFailure("runtime_expected_tree", "bound")
+        files[relative] = (
+            module._sandbox_digest(source)
+            if sandbox
+            else module._digest_regular(source)
+        )
+        parent = PurePosixPath(relative).parent
+        while str(parent) != ".":
+            directories.add(parent.as_posix())
+            parent = parent.parent
+
+    def add_tree(source: Path, destination: str) -> None:
+        check_deadline()
+        module._validate_source_tree(source.parent, source.name)
+        directories.add(destination)
+        for path in source.rglob("*"):
+            check_deadline()
+            relative = path.relative_to(source).as_posix()
+            target_relative = f"{destination}/{relative}"
+            metadata = module._metadata(path)
+            if stat.S_ISDIR(metadata.st_mode):
+                directories.add(target_relative)
+                continue
+            add_file(target_relative, path)
+
+    if module.SHA_PATTERN.fullmatch(source_sha) is None:
+        raise ProbeFailure("runtime_target_binding")
+    for tool in module.TOOL_FILES:
+        add_file(f"platform/tools/{tool}", release / "tools" / tool)
+    for tree in module.SOURCE_TREES:
+        add_tree(release / tree, f"platform/{tree}")
+    for relative in module.SOURCE_FILES:
+        add_file(f"platform/{relative}", release / relative)
+
+    runtime_source = release / "liveqa-runtime"
+    if runtime_manifest is None:
+        runtime_manifest = module._validate_runtime_source(
+            runtime_source,
+            source_sha=source_sha,
+        )
+    runtime_version = runtime_manifest.get("version")
+    if runtime_version not in {1, 2}:
+        raise ProbeFailure("runtime_expected_tree", "manifest")
+    for path in runtime_source.rglob("*"):
+        check_deadline()
+        relative = path.relative_to(runtime_source).as_posix()
+        target_relative = f"runtime/{relative}"
+        metadata = module._metadata(path)
+        if stat.S_ISDIR(metadata.st_mode):
+            directories.add(target_relative)
+            continue
+        add_file(
+            target_relative,
+            path,
+            sandbox=(
+                runtime_version == 1
+                and relative == module.RUNTIME_SANDBOX_RELATIVE.as_posix()
+            ),
+        )
+
+    if runtime_version == 2:
+        if runtime_provider is None:
+            raise ProbeFailure("runtime_expected_tree", "provider")
+        provider_record = {**runtime_provider, "source_sha": source_sha}
+        provider_raw = (
+            json.dumps(
+                provider_record,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+        files["runtime-provider.json"] = hashlib.sha256(provider_raw).hexdigest()
+        total_bytes += len(provider_raw)
+    elif runtime_provider is not None:
+        raise ProbeFailure("runtime_expected_tree", "provider")
+
+    source_raw = (source_sha + "\n").encode("ascii")
+    files["source-sha"] = hashlib.sha256(source_raw).hexdigest()
+    total_bytes += len(source_raw)
+    if len(files) > module.MAX_FILES or total_bytes > module.MAX_RUNTIME_BYTES:
+        raise ProbeFailure("runtime_expected_tree", "bound")
+
+    digest = hashlib.sha256()
+    for relative in sorted(files.keys() | directories, key=module._runtime_path_order_key):
+        check_deadline()
+        digest.update(relative.encode("utf-8") + b"\0")
+        if relative in directories:
+            digest.update(b"d\0")
+        else:
+            digest.update(b"f\0" + bytes.fromhex(files[relative]))
+    return digest.hexdigest(), files
+
+
+def _private_runtime_detail(component: str, detail: dict[str, object]) -> None:
+    raw = json.dumps(detail, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
+    stream = tempfile.TemporaryFile(mode="w+b")
+    try:
+        stream.write(raw)
+        stream.flush()
+        _emit_private_runtime_context(
+            stream,
+            component=component,
+            returncode=1,
+            total_bytes=len(raw),
+            position=len(raw),
+            retained_bytes=len(raw),
+        )
+    finally:
+        stream.close()
+
+
+def _unit_snapshot_with_deadline(
+    module: Any,
+    *,
+    deadline: float,
+    result: dict[str, object],
+) -> list[dict[str, object]]:
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+        raise ProbeFailure("unit_snapshot", "timeout")
+    previous_alarm_handler = signal.getsignal(signal.SIGALRM)
+
+    def deadline_expired(_signum: int, _frame: Any) -> None:
+        raise ProbeDeadlineExceeded
+
+    signal.signal(signal.SIGALRM, deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, remaining_seconds)
+    try:
+        return _run("unit_snapshot", lambda: module._unit_snapshot(None))
+    except ProbeDeadlineExceeded:
+        if _private_capture_requested():
+            _private_runtime_detail(
+                "systemd_unit_snapshot",
+                {"schema": 1, "reason": "read_only_unit_snapshot_deadline"},
+            )
+        raise ProbeFailure("unit_snapshot", "timeout") from None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_alarm_handler)
+
+
+def _compare_expected_payload(
+    expected_digest: str,
+    expected_files: dict[str, str],
+    manifest: dict[str, object],
+) -> tuple[bool, dict[str, object]]:
+    actual_files = manifest.get("files")
+    if not isinstance(actual_files, dict):
+        raise ProbeFailure("runtime_expected_tree", "manifest")
+    missing = sorted(set(expected_files) - set(actual_files))
+    extra = sorted(set(actual_files) - set(expected_files))
+    changed = sorted(
+        relative
+        for relative in expected_files.keys() & actual_files.keys()
+        if expected_files[relative] != actual_files[relative]
+    )
+    actual_digest = manifest.get("payload_tree_sha256")
+    matches = not missing and not extra and not changed and actual_digest == expected_digest
+    evidence = {
+        "runtime_payload_verify": "passed",
+        "runtime_payload_verify_returncode": 0,
+        "runtime_expected_tree": "passed" if matches else "failed",
+        "runtime_expected_tree_returncode": 0 if matches else 1,
+    }
+    if matches:
+        return True, evidence
+    evidence["private_detail"] = {
+        "schema": 1,
+        "reason": "expected_tree_mismatch",
+        "expected_tree_sha256": expected_digest,
+        "actual_tree_sha256": actual_digest if isinstance(actual_digest, str) else "unavailable",
+        "expected_file_count": len(expected_files),
+        "actual_file_count": len(actual_files),
+        "missing_count": len(missing),
+        "missing": [item[:256] for item in missing[:8]],
+        "extra_count": len(extra),
+        "extra": [item[:256] for item in extra[:8]],
+        "changed_count": len(changed),
+        "changed": [item[:256] for item in changed[:8]],
+    }
+    return False, evidence
+
+
+def _runtime_payload_integrity(
+    target: Path,
+    *,
+    source_sha: str,
+    expected_helper_sha256: str,
+    deadline: float,
+) -> tuple[dict[str, object], str | None, dict[str, object] | None]:
+    helper_path = target / "tools/platform_live_qa_runtime_install.py"
+    installer = _load_pinned_runtime_installer(helper_path, expected_helper_sha256)
+    release, active_source, release_slug = installer._active_release(APP_DIR)
+    if release != target or active_source != source_sha:
+        raise ProbeFailure("runtime_target_binding")
+    manifest = installer._read_manifest()
+    if (
+        manifest.get("source_sha") != source_sha
+        or manifest.get("release_slug") != release_slug
+    ):
+        raise ProbeFailure("runtime_target_binding")
+    runtime_manifest = installer._validate_runtime_source(
+        target / "liveqa-runtime",
+        source_sha=source_sha,
+    )
+    provider: dict[str, object] | None = None
+    if runtime_manifest.get("version") == 2:
+        provider = installer._runtime_provider_payload(
+            APP_DIR,
+            expected_manifest=runtime_manifest,
+        )
+    else:
+        # For v1, verify() is the canonical read-only path that binds the
+        # active manifest, payload tree and all trusted entrypoints.
+        manifest = installer.verify(APP_DIR, source_sha)
+    if time.monotonic() >= deadline:
+        raise ProbeFailure("runtime_expected_tree", "timeout")
+    expected_digest, expected_files = _expected_liveqa_payload_tree(
+        installer,
+        release=target,
+        source_sha=source_sha,
+        runtime_provider=provider,
+        runtime_manifest=runtime_manifest,
+        deadline=deadline,
+    )
+    matches, evidence = _compare_expected_payload(
+        expected_digest,
+        expected_files,
+        manifest,
+    )
+    if not matches:
+        return evidence, "failed", evidence.pop("private_detail")
+    return evidence, None, None
 
 
 def _verify_release_source(release: Path, module: Any) -> str:
@@ -356,7 +648,7 @@ def _emit_private_runtime_context(
     stream: Any,
     *,
     route: str = "capture_probe",
-    component: str = "nginx_preflight",
+    component: str,
     returncode: int | str,
     total_bytes: int | str,
     position: int,
@@ -403,7 +695,12 @@ def _append_private_tail(stream: Any, position: int, retained_bytes: int, chunk:
     )
 
 
-def _run_private_preflight(argv: list[str], env: dict[str, str]) -> tuple[int | str, int, Any, int, int, bool]:
+def _run_private_preflight(
+    argv: list[str],
+    env: dict[str, str],
+    *,
+    timeout_seconds: int = 60,
+) -> tuple[int | str, int, Any, int, int, bool]:
     stream = tempfile.TemporaryFile(mode="w+b")
     metadata = os.fstat(stream.fileno())
     if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid():
@@ -428,7 +725,7 @@ def _run_private_preflight(argv: list[str], env: dict[str, str]) -> tuple[int | 
     retained_bytes = 0
     total_bytes = 0
     timed_out = False
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + timeout_seconds
     drain_deadline: float | None = None
     try:
         while selector.get_map():
@@ -489,8 +786,9 @@ def _run_private_preflight(argv: list[str], env: dict[str, str]) -> tuple[int | 
 
 
 def _receipt_snapshot_and_preflight(
-    module: Any, transaction: tuple[object, ...]
+    module: Any, transaction: tuple[object, ...], *, deadline: float
 ) -> tuple[dict[str, object], dict[str, object], str, str | None]:
+    readonly_deadline = deadline
     (operation_id, operation, current_before, previous_before, _current_identity, _previous_identity, _active_overrides) = transaction
     transaction_record = _read_stable_state(TRANSACTION, "transaction_read")
     if (
@@ -547,6 +845,18 @@ def _receipt_snapshot_and_preflight(
     nginx_digest = actual_helpers.get("tools/platform_install_nginx.py") if isinstance(actual_helpers, dict) else None
     if not isinstance(nginx_digest, str) or manifest.get("tools/platform_install_nginx.py") != nginx_digest:
         raise ProbeFailure("runtime_target_binding")
+    runtime_installer_relative = "tools/platform_live_qa_runtime_install.py"
+    runtime_installer_digest = (
+        actual_helpers.get(runtime_installer_relative)
+        if isinstance(actual_helpers, dict)
+        else None
+    )
+    if target is not None and (
+        validation_release != target
+        or not isinstance(runtime_installer_digest, str)
+        or manifest.get(runtime_installer_relative) != runtime_installer_digest
+    ):
+        raise ProbeFailure("runtime_target_binding")
     result: dict[str, object] = {
         "capture_predicate": "existing_receipt_valid",
         "receipt_present": True,
@@ -555,8 +865,18 @@ def _receipt_snapshot_and_preflight(
         "runtime_target": target.name if target is not None else None,
         "runtime_target_source": source_sha if target is not None else None,
         "runtime_target_helper_sha256": nginx_digest if target is not None else None,
+        "runtime_payload_verify": "not_applicable",
+        "runtime_payload_verify_returncode": "unavailable",
+        "runtime_expected_tree": "not_applicable",
+        "runtime_expected_tree_returncode": "unavailable",
+        "nginx_preflight": "not_applicable",
+        "nginx_preflight_returncode": "unavailable",
     }
-    states = _run("unit_snapshot", lambda: module._unit_snapshot(None))
+    states = _unit_snapshot_with_deadline(
+        module,
+        deadline=readonly_deadline,
+        result=result,
+    )
     units = getattr(module, "OWNED_UNITS", ())
     if (
         not isinstance(states, list)
@@ -573,7 +893,88 @@ def _receipt_snapshot_and_preflight(
         result["nginx_preflight_returncode"] = "unavailable"
         return record, result, target_label, target_path
     env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "PLATFORM_APP_DIR": str(APP_DIR), "PYTHONDONTWRITEBYTECODE": "1"}
+
+    integrity_status = "runtime_payload_verify"
+    integrity_private_detail: dict[str, object] | None = None
+    previous_alarm_handler = signal.getsignal(signal.SIGALRM)
+    remaining_integrity_seconds = readonly_deadline - time.monotonic()
+    if remaining_integrity_seconds <= 0:
+        raise ProbeFailure("runtime_payload_verify", "child_failure", safe_fields=result)
+
+    def integrity_deadline_expired(_signum: int, _frame: Any) -> None:
+        raise ProbeDeadlineExceeded
+
+    signal.signal(signal.SIGALRM, integrity_deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, remaining_integrity_seconds)
+    try:
+        integrity, failed_stage, private_detail = _runtime_payload_integrity(
+            target,
+            source_sha=source_sha,
+            expected_helper_sha256=runtime_installer_digest,
+            deadline=readonly_deadline,
+        )
+        result.update(integrity)
+        if failed_stage is not None:
+            integrity_status = failed_stage
+            integrity_private_detail = private_detail
+            raise ProbeFailure(failed_stage, "child_failure", safe_fields=result)
+    except ProbeDeadlineExceeded:
+        result["runtime_payload_verify"] = "timeout"
+        result["runtime_payload_verify_returncode"] = "unavailable"
+        if _private_capture_requested():
+            _private_runtime_detail(
+                "runtime_payload_verify",
+                {"schema": 1, "reason": "read_only_validation_timeout"},
+            )
+        raise ProbeFailure("runtime_payload_verify", "child_failure", safe_fields=result) from None
+    except ProbeFailure as exc:
+        failed_check = exc.check
+        if failed_check == "runtime_expected_tree":
+            state = "timeout" if exc.error_class == "timeout" else "failed"
+            result["runtime_expected_tree"] = state
+            result["runtime_expected_tree_returncode"] = "unavailable" if state == "timeout" else 1
+            integrity_status = "runtime_expected_tree"
+        else:
+            result["runtime_payload_verify"] = "timeout" if exc.error_class == "timeout" else "failed"
+            result["runtime_payload_verify_returncode"] = "unavailable" if exc.error_class == "timeout" else 1
+            integrity_status = "runtime_payload_verify"
+        if _private_capture_requested():
+            _private_runtime_detail(
+                integrity_status,
+                integrity_private_detail
+                or {
+                    "schema": 1,
+                    "reason": "read_only_validation_failed",
+                    "failed_check": failed_check,
+                    "error_class": exc.error_class,
+                },
+            )
+        raise ProbeFailure(integrity_status, "child_failure", safe_fields=result) from None
+    except Exception as exc:
+        result["runtime_payload_verify"] = "failed"
+        result["runtime_payload_verify_returncode"] = 1
+        if _private_capture_requested():
+            _private_runtime_detail(
+                "runtime_payload_verify",
+                {
+                    "schema": 1,
+                    "reason": "read_only_validation_exception",
+                    "exception_class": type(exc).__name__[:96],
+                    "message": str(exc)[:4096],
+                },
+            )
+        raise ProbeFailure("runtime_payload_verify", "child_failure", safe_fields=result) from None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_alarm_handler)
+
     private_capture = _private_capture_requested()
+    remaining_seconds = int(readonly_deadline - time.monotonic())
+    if remaining_seconds <= 15:
+        result["nginx_preflight"] = "timeout"
+        result["nginx_preflight_returncode"] = "unavailable"
+        raise ProbeFailure("nginx_preflight", "child_failure", safe_fields=result)
+    nginx_timeout = min(60, remaining_seconds - 15)
     argv = [str(SHARED_PYTHON), str(target / "tools/platform_install_nginx.py"), "--json"]
     private_stderr = None
     private_total = 0
@@ -581,7 +982,7 @@ def _receipt_snapshot_and_preflight(
     private_retained = 0
     try:
         if private_capture:
-            returncode, private_total, private_stderr, private_position, private_retained, timed_out = _run_private_preflight(argv, env)
+            returncode, private_total, private_stderr, private_position, private_retained, timed_out = _run_private_preflight(argv, env, timeout_seconds=nginx_timeout)
             if timed_out:
                 result["nginx_preflight"] = "timeout"
                 result["nginx_preflight_returncode"] = "unavailable"
@@ -592,7 +993,7 @@ def _receipt_snapshot_and_preflight(
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=60,
+                timeout=nginx_timeout,
                 check=False,
                 env=env,
             )
@@ -610,6 +1011,7 @@ def _receipt_snapshot_and_preflight(
             if private_capture and returncode != 0:
                 _emit_private_runtime_context(
                     private_stderr,
+                    component="nginx_preflight",
                     returncode=returncode,
                     total_bytes=private_total,
                     position=private_position,
@@ -627,6 +1029,8 @@ def _run(check: str, operation: Any) -> Any:
     try:
         return operation()
     except ProbeFailure:
+        raise
+    except ProbeDeadlineExceeded:
         raise
     except OSError:
         raise ProbeFailure(check, "oserror") from None
@@ -659,6 +1063,7 @@ def _health() -> dict[str, bool]:
 
 
 def probe(expected_systemd_sha256: str) -> dict[str, object]:
+    readonly_deadline = time.monotonic() + 480
     if os.geteuid() != 0:
         raise ProbeFailure("root", "permission")
     try:
@@ -675,7 +1080,11 @@ def probe(expected_systemd_sha256: str) -> dict[str, object]:
     if companion_present:
         _run("systemctl_path", lambda: module._validate_systemctl_path(module.SYSTEMCTL))
         transaction = _run("transaction_read", lambda: module._read_transaction(TRANSACTION, APP_DIR))
-        _receipt, receipt_result, _target_label, _target_path = _receipt_snapshot_and_preflight(module, transaction)
+        _receipt, receipt_result, _target_label, _target_path = _receipt_snapshot_and_preflight(
+            module,
+            transaction,
+            deadline=readonly_deadline,
+        )
         return {
             "schema": 1,
             "kind": "release_capture_probe",
@@ -827,6 +1236,8 @@ def probe(expected_systemd_sha256: str) -> dict[str, object]:
         "previous_bound": bool(previous_before),
         "service_active_count": active_count,
         "service_enabled_count": enabled_count,
+        "runtime_payload_verify": "not_applicable",
+        "runtime_payload_verify_returncode": "unavailable",
     }
 
 

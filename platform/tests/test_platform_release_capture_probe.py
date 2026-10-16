@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 from io import BytesIO
 import json
 import os
@@ -14,11 +15,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools import platform_release_capture_probe as probe
+from tools import platform_live_qa_runtime_install as runtime_installer
 from tools import platform_release_systemd_state as systemd_state
 
 
 class FakeSystemdState:
     SYSTEMCTL = "/usr/bin/systemctl"
+    subprocess = subprocess
 
     def __init__(self, *, fail_query: tuple[str, str] | None = None, operation: str = "install", transaction_operation: str | None = None, phase: str = "rollback-runtime-pending") -> None:
         self.events: list[str] = []
@@ -52,6 +55,7 @@ class FakeSystemdState:
         return {
             "tools/platform_release_systemd_state.py": self.__verified_sha256__,
             "tools/platform_install_nginx.py": "c" * 64,
+            "tools/platform_live_qa_runtime_install.py": "d" * 64,
         }
 
     def _release_context(self, app_dir: Path, current: str, previous: str):
@@ -70,8 +74,14 @@ class FakeSystemdState:
             "current_before": str(path.parents[1] / "releases" / "old"),
             "previous_before": str(path.parents[1] / "releases" / "pending"),
             "helper_digests": {
-                "current_before": {"tools/platform_install_nginx.py": "c" * 64},
-                "previous_before": {"tools/platform_install_nginx.py": "c" * 64},
+                "current_before": {
+                    "tools/platform_install_nginx.py": "c" * 64,
+                    "tools/platform_live_qa_runtime_install.py": "d" * 64,
+                },
+                "previous_before": {
+                    "tools/platform_install_nginx.py": "c" * 64,
+                    "tools/platform_live_qa_runtime_install.py": "d" * 64,
+                },
             },
         }
 
@@ -306,6 +316,213 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             self.assertEqual(caught.exception.check, "unit_enabled_deadlock-api_service")
 
     def test_existing_companion_uses_only_existing_read_validator(self) -> None:
+        expected_files = {"platform/tools/helper.py": "a" * 64, "source-sha": "b" * 64}
+        matches, result = probe._compare_expected_payload(
+            "c" * 64,
+            expected_files,
+            {"files": dict(expected_files), "payload_tree_sha256": "c" * 64},
+        )
+        self.assertTrue(matches)
+        self.assertEqual(result["runtime_expected_tree"], "passed")
+        for actual_files, actual_digest, missing, extra, changed in (
+            ({"source-sha": "b" * 64}, "c" * 64, 1, 0, 0),
+            ({**expected_files, "runtime/extra": "d" * 64}, "e" * 64, 0, 1, 0),
+            ({**expected_files, "source-sha": "e" * 64}, "e" * 64, 0, 0, 1),
+        ):
+            with self.subTest(expected_tree=(missing, extra, changed)):
+                matches, result = probe._compare_expected_payload(
+                    "c" * 64,
+                    expected_files,
+                    {"files": actual_files, "payload_tree_sha256": actual_digest},
+                )
+                self.assertFalse(matches)
+                self.assertEqual(result["runtime_expected_tree"], "failed")
+                details = result["private_detail"]
+                self.assertEqual((details["missing_count"], details["extra_count"], details["changed_count"]), (missing, extra, changed))
+
+        source_sha = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+        for runtime_version in (1, 2):
+            with self.subTest(runtime_version=runtime_version), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                release = root / "release"
+                (release / "tools").mkdir(parents=True)
+                (release / "apps/platform_api/empty/nested").mkdir(parents=True)
+                (release / "deploy").mkdir()
+                (release / "tools/helper.py").write_bytes(b"pinned helper\n")
+                (release / "apps/platform_api/app.py").write_bytes(b"immutable API source\n")
+                (release / "deploy/policy").write_bytes(b"policy\n")
+                runtime_source = release / "liveqa-runtime"
+                (runtime_source / "web/tests/empty").mkdir(parents=True)
+                (runtime_source / "node/bin").mkdir(parents=True)
+                (runtime_source / "web/package-lock.json").write_bytes(b"lock\n")
+                (runtime_source / "web/tests/smoke.spec").write_bytes(b"runtime v" + str(runtime_version).encode() + b"\n")
+                sandbox_rel = runtime_installer.RUNTIME_SANDBOX_RELATIVE
+                sandbox_path = runtime_source / sandbox_rel
+                sandbox_path.parent.mkdir(parents=True, exist_ok=True)
+                sandbox_bytes = b"fixture sandbox\n"
+                if runtime_version == 1:
+                    sandbox_path.write_bytes(sandbox_bytes)
+                    sandbox_path.chmod(0o4755)
+                if runtime_version == 2:
+                    (runtime_source / "node/bin/node").write_bytes(b"node\n")
+                for path in release.rglob("*"):
+                    if path.is_dir():
+                        path.chmod(0o555)
+                    elif path != sandbox_path:
+                        path.chmod(0o444)
+
+                original_metadata = runtime_installer._metadata
+
+                def trusted_fixture_metadata(path: Path):
+                    actual = original_metadata(path)
+                    return SimpleNamespace(
+                        st_dev=actual.st_dev,
+                        st_ino=actual.st_ino,
+                        st_mode=actual.st_mode,
+                        st_uid=0,
+                        st_gid=0,
+                        st_nlink=actual.st_nlink,
+                        st_size=actual.st_size,
+                        st_mtime_ns=actual.st_mtime_ns,
+                    )
+
+                provider = None
+                runtime_manifest = {"version": runtime_version}
+                patchers = [
+                    patch.object(runtime_installer, "TOOL_FILES", ("helper.py",)),
+                    patch.object(runtime_installer, "SOURCE_TREES", ("apps/platform_api",)),
+                    patch.object(runtime_installer, "SOURCE_FILES", ("deploy/policy",)),
+                    patch.object(runtime_installer, "_metadata", side_effect=trusted_fixture_metadata),
+                ]
+                if runtime_version == 1:
+                    patchers.extend(
+                        [
+                            patch.object(runtime_installer, "CHROMIUM_SANDBOX_SIZE", len(sandbox_bytes)),
+                            patch.object(runtime_installer, "CHROMIUM_SANDBOX_SHA256", hashlib.sha256(sandbox_bytes).hexdigest()),
+                        ]
+                    )
+                else:
+                    provider = {
+                        "version": 1,
+                        "provider_sha": "a" * 40,
+                        "engine_tree_sha256": "b" * 64,
+                        "node_version": "26.3.1",
+                        "package_lock_sha256": "c" * 64,
+                        "engine_files": {"node/bin/node": "d" * 64},
+                    }
+                with patchers[0], patchers[1], patchers[2], patchers[3]:
+                    extra = patchers[4:] if len(patchers) > 4 else []
+                    for patcher in extra:
+                        patcher.start()
+                    try:
+                        expected_digest, expected_files = probe._expected_liveqa_payload_tree(
+                            runtime_installer,
+                            release=release,
+                            source_sha=source_sha,
+                            runtime_provider=provider,
+                            runtime_manifest=runtime_manifest,
+                            deadline=probe.time.monotonic() + 30,
+                        )
+                        payload = root / "payload"
+                        for relative in ("platform", "platform/tools", "platform/apps", "platform/apps/platform_api", "platform/apps/platform_api/empty", "platform/apps/platform_api/empty/nested", "runtime", "runtime/web", "runtime/web/tests", "runtime/web/tests/empty", "runtime/node", "runtime/node/bin", "runtime/browsers", "runtime/browsers/chromium-1228", "runtime/browsers/chromium-1228/chrome-linux64"):
+                            (payload / relative).mkdir(parents=True, exist_ok=True)
+                        source_map = {
+                            "platform/tools/helper.py": release / "tools/helper.py",
+                            "platform/apps/platform_api/app.py": release / "apps/platform_api/app.py",
+                            "platform/deploy/policy": release / "deploy/policy",
+                            "runtime/web/package-lock.json": runtime_source / "web/package-lock.json",
+                            "runtime/web/tests/smoke.spec": runtime_source / "web/tests/smoke.spec",
+                        }
+                        if runtime_version == 1:
+                            source_map["runtime/" + sandbox_rel.as_posix()] = sandbox_path
+                        else:
+                            source_map["runtime/node/bin/node"] = runtime_source / "node/bin/node"
+                            provider_record = {**provider, "source_sha": source_sha}
+                            generated = (json.dumps(provider_record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+                            (payload / "runtime-provider.json").write_bytes(generated)
+                        for relative, source in source_map.items():
+                            target = payload / relative
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(source.read_bytes())
+                            target.chmod(0o4755 if relative == "runtime/" + sandbox_rel.as_posix() else 0o444)
+                        (payload / "source-sha").write_text(source_sha + "\n", encoding="ascii")
+                        (payload / "source-sha").chmod(0o444)
+                        for path in sorted(payload.rglob("*"), reverse=True):
+                            if path.is_dir():
+                                path.chmod(0o555)
+                        payload.chmod(0o555)
+                        tree_digest, actual_files = runtime_installer._tree_digest(
+                            payload,
+                            sandbox_relative=runtime_installer.CHROMIUM_SANDBOX_RELATIVE,
+                        )
+                        matches, evidence = probe._compare_expected_payload(
+                            expected_digest,
+                            expected_files,
+                            {"files": actual_files, "payload_tree_sha256": tree_digest},
+                        )
+                    finally:
+                        for patcher in reversed(extra):
+                            patcher.stop()
+                self.assertEqual(actual_files, expected_files)
+                expected_directories = {"platform", "platform/tools", "runtime"}
+                for relative in expected_files:
+                    parent = Path(relative).parent
+                    while str(parent) != ".":
+                        expected_directories.add(parent.as_posix())
+                        parent = parent.parent
+                expected_directories.update(
+                    {
+                        "platform/apps/platform_api/empty",
+                        "platform/apps/platform_api/empty/nested",
+                        "runtime/web/tests/empty",
+                        "runtime/node",
+                        "runtime/node/bin",
+                    }
+                )
+                actual_directories = {
+                    path.relative_to(payload).as_posix()
+                    for path in payload.rglob("*")
+                    if path.is_dir()
+                }
+                expected_directories.update(
+                    {
+                        "runtime/browsers",
+                        "runtime/browsers/chromium-1228",
+                        "runtime/browsers/chromium-1228/chrome-linux64",
+                    }
+                )
+                self.assertEqual(actual_directories, expected_directories)
+                reconstructed_digest = hashlib.sha256()
+                for relative in sorted(expected_files.keys() | expected_directories, key=runtime_installer._runtime_path_order_key):
+                    reconstructed_digest.update(relative.encode("utf-8") + b"\0")
+                    if relative in expected_directories:
+                        reconstructed_digest.update(b"d\0")
+                    else:
+                        reconstructed_digest.update(b"f\0" + bytes.fromhex(expected_files[relative]))
+                self.assertEqual(reconstructed_digest.hexdigest(), tree_digest)
+                self.assertTrue(matches, evidence)
+                self.assertEqual(expected_digest, tree_digest)
+                self.assertIn("source-sha", expected_files)
+                self.assertEqual("runtime-provider.json" in expected_files, runtime_version == 2)
+                self.assertEqual("runtime/" + sandbox_rel.as_posix() in expected_files, runtime_version == 1)
+                self.assertNotIn("platform/apps/platform_api/empty/nested", expected_files)
+                self.assertNotIn("runtime/web/tests/empty", expected_files)
+
+        private_details: list[tuple[str, dict[str, object]]] = []
+        slow_module = SimpleNamespace(_unit_snapshot=lambda _overrides: probe.time.sleep(0.2))
+        with patch.object(probe, "_private_capture_requested", return_value=True), patch.object(
+            probe,
+            "_private_runtime_detail",
+            side_effect=lambda component, detail: private_details.append((component, detail)),
+        ):
+            with self.assertRaises(probe.ProbeFailure) as caught:
+                probe._unit_snapshot_with_deadline(
+                    slow_module,
+                    deadline=probe.time.monotonic() + 0.02,
+                    result={},
+                )
+        self.assertEqual((caught.exception.check, caught.exception.error_class), ("unit_snapshot", "timeout"))
+        self.assertEqual(private_details[0][0], "systemd_unit_snapshot")
         with tempfile.TemporaryDirectory() as directory:
             transaction, companion = self._paths(Path(directory))
             companion.write_text("fixture", encoding="ascii")
@@ -320,6 +537,19 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 probe,
                 "_private_capture_requested",
                 return_value=False,
+            ), patch.object(
+                probe,
+                "_runtime_payload_integrity",
+                return_value=(
+                    {
+                        "runtime_payload_verify": "passed",
+                        "runtime_payload_verify_returncode": 0,
+                        "runtime_expected_tree": "passed",
+                        "runtime_expected_tree_returncode": 0,
+                    },
+                    None,
+                    None,
+                ),
             ), patch.object(
                 probe,
                 "_read_stable_state",
@@ -339,6 +569,8 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             self.assertEqual(result["runtime_target"], "old")
             self.assertEqual(result["runtime_target_source"], "a" * 40)
             self.assertEqual(result["runtime_target_helper_sha256"], "c" * 64)
+            self.assertEqual(result["runtime_payload_verify"], "passed")
+            self.assertEqual(result["runtime_expected_tree"], "passed")
             self.assertEqual(result["nginx_preflight"], "passed")
             self.assertEqual(result["nginx_preflight_returncode"], 0)
             self.assertEqual(result["service_active_count"], 13)
@@ -376,6 +608,19 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 return_value=False,
             ), patch.object(
                 probe,
+                "_runtime_payload_integrity",
+                return_value=(
+                    {
+                        "runtime_payload_verify": "passed",
+                        "runtime_payload_verify_returncode": 0,
+                        "runtime_expected_tree": "passed",
+                        "runtime_expected_tree_returncode": 0,
+                    },
+                    None,
+                    None,
+                ),
+            ), patch.object(
+                probe,
                 "_read_stable_state",
                 return_value={
                     "operation_id": "a" * 32,
@@ -405,6 +650,19 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 probe,
                 "_private_capture_requested",
                 return_value=False,
+            ), patch.object(
+                probe,
+                "_runtime_payload_integrity",
+                return_value=(
+                    {
+                        "runtime_payload_verify": "passed",
+                        "runtime_payload_verify_returncode": 0,
+                        "runtime_expected_tree": "passed",
+                        "runtime_expected_tree_returncode": 0,
+                    },
+                    None,
+                    None,
+                ),
             ), patch.object(
                 probe,
                 "_read_stable_state",
@@ -440,6 +698,20 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                     probe,
                     "_run_private_preflight",
                     return_value=(17, len(private_text), private_output, 0, len(private_text), False),
+                ),
+                patch.object(
+                    probe,
+                    "_runtime_payload_integrity",
+                    return_value=(
+                        {
+                            "runtime_payload_verify": "passed",
+                            "runtime_payload_verify_returncode": 0,
+                            "runtime_expected_tree": "passed",
+                            "runtime_expected_tree_returncode": 0,
+                        },
+                        None,
+                        None,
+                    ),
                 ),
                 patch.object(probe.sys, "stderr", SimpleNamespace(buffer=emitted)),
                 patch.object(
@@ -572,9 +844,48 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
         self.assertIn("platform_release_lock_open", probe_path)
         self.assertIn("platform_release_lock_close", probe_path)
         self.assertIn("platform_release_capture_probe.py", workflow)
+        self.assertIn("runtime_expected_tree", workflow)
         self.assertIn('set(observation) != {"command", "unit", "result", "returncode", "state"}', workflow)
         self.assertIn('result_class == "unsupported_state"', workflow)
         self.assertIn('result_class == "malformed_output"', workflow)
+        encrypt_step = workflow.split(
+            "      - name: Encrypt private read-only preflight failure context", 1
+        )[1].split("\n      - name: Upload encrypted runtime failure context", 1)[0]
+        self.assertIn('if [[ ! -s "$remote_error" ]]; then exit 0; fi', encrypt_step)
+        encrypt_script = textwrap.dedent(encrypt_step.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner_temp = root / "runner"
+            runner_temp.mkdir()
+            remote_error = runner_temp / "platform-production-capture-probe-error.log"
+            github_output = root / "github-output"
+            for payload, expected_rc in ((b"", 0), (b"ordinary ssh diagnostic without private marker\n", 2)):
+                with self.subTest(remote_error_size=len(payload)):
+                    github_output.unlink(missing_ok=True)
+                    remote_error.write_bytes(payload)
+                    remote_error.chmod(0o600)
+                    result = subprocess.run(
+                        ["bash", "-c", encrypt_script],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        env={
+                            **os.environ,
+                            "RUNNER_TEMP": str(runner_temp),
+                            "GITHUB_OUTPUT": str(github_output),
+                            "GITHUB_RUN_ID": "12345",
+                            "GITHUB_RUN_ATTEMPT": "1",
+                            "GITHUB_SHA": "a" * 40,
+                            "TARGET_SHA": "a" * 40,
+                            "RECIPIENT_CERTIFICATE_PATH": str(root / "unused-recipient.pem"),
+                        },
+                    )
+                    self.assertEqual(result.returncode, expected_rc, result.stderr)
+                    self.assertEqual(
+                        github_output.read_text(encoding="ascii"),
+                        "private_failure_ready=false\n",
+                    )
+                    self.assertFalse((runner_temp / "platform-release-runtime-failure").exists())
         self._assert_probe_validator_rejects_inconsistent_systemd_observation(workflow)
         for forbidden in (
             "home_content.refresh_home_content",
@@ -628,6 +939,27 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                     parsed.get("failed_check") == "remote_or_transport",
                     not accepted,
                 )
+            with self.assertRaises(probe.ProbeFailure) as timeout_failure:
+                probe._unit_snapshot_with_deadline(
+                    SimpleNamespace(_unit_snapshot=lambda _overrides: probe.time.sleep(0.2)),
+                    deadline=probe.time.monotonic() + 0.02,
+                    result={},
+                )
+            timeout_report = {
+                **base,
+                "failed_check": timeout_failure.exception.check,
+                "error_class": timeout_failure.exception.error_class,
+            }
+            report_path.write_text(json.dumps(timeout_report), encoding="ascii")
+            result = subprocess.run(
+                [sys.executable, "-c", validator, str(report_path), "1"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            parsed = json.loads(result.stdout.removeprefix("PRODUCTION_CAPTURE_PROBE ").strip())
+            self.assertEqual(parsed["failed_check"], "unit_snapshot")
+            self.assertEqual(parsed["error_class"], "timeout")
             failed_preflight = {
                 "schema": 1,
                 "kind": "release_capture_probe",
@@ -644,6 +976,10 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 "runtime_target_helper_sha256": "b" * 64,
                 "service_active_count": 13,
                 "service_enabled_count": 12,
+                "runtime_payload_verify": "passed",
+                "runtime_payload_verify_returncode": 0,
+                "runtime_expected_tree": "passed",
+                "runtime_expected_tree_returncode": 0,
                 "nginx_preflight": "failed",
                 "nginx_preflight_returncode": 17,
             }
@@ -668,6 +1004,37 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             )
             parsed = json.loads(result.stdout.removeprefix("PRODUCTION_CAPTURE_PROBE ").strip())
             self.assertEqual(parsed["failed_check"], "remote_or_transport")
+            successful_probe = {
+                "schema": 1,
+                "kind": "release_capture_probe",
+                "status": "passed",
+                "health": base["health"],
+                "capture_predicate": "existing_receipt_valid",
+                "receipt_present": True,
+                "current_bound": True,
+                "previous_bound": True,
+                "service_active_count": 13,
+                "service_enabled_count": 12,
+                "runtime_target": "gha-123-1-abcdef012345",
+                "runtime_target_source": "a" * 40,
+                "runtime_target_helper_sha256": "b" * 64,
+                "runtime_payload_verify": "passed",
+                "runtime_payload_verify_returncode": 0,
+                "runtime_expected_tree": "passed",
+                "runtime_expected_tree_returncode": 0,
+                "nginx_preflight": "passed",
+                "nginx_preflight_returncode": 0,
+            }
+            report_path.write_text(json.dumps(successful_probe), encoding="ascii")
+            result = subprocess.run(
+                [sys.executable, "-c", validator, str(report_path), "0"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            parsed = json.loads(result.stdout.removeprefix("PRODUCTION_CAPTURE_PROBE ").strip())
+            self.assertEqual(parsed["status"], "passed")
+            self.assertEqual(parsed["runtime_expected_tree"], "passed")
 
     def _assert_capture_probe_stage_feeds_heredoc_to_ssh_before_copy(self) -> None:
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/platform-production-diagnostics.yml").read_text(encoding="utf-8")
@@ -732,15 +1099,31 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0]["command"], "bash -s -- '12345' '1'")
             self.assertIn("mkdir -m 0700 -- \"$probe_dir\"", calls[0]["body"])
-            self.assertEqual(calls[1]["command"], "chmod 0600 -- '/run/oldsparky-capture-probe-12345-1/probe.py'")
+            self.assertEqual(calls[1]["command"], "chmod 0600 -- '/run/oldsparky-capture-probe-12345-1/probe.py' '/run/oldsparky-capture-probe-12345-1/platform_release_lock.sh'")
             self.assertEqual(calls[1]["body"], "")
             copy_calls = [json.loads(line) for line in scp_calls.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(len(copy_calls), 1)
+            self.assertEqual(len(copy_calls), 2)
             self.assertEqual(
                 copy_calls[0][-1],
                 "operator@host.invalid:/run/oldsparky-capture-probe-12345-1/probe.py",
             )
+            self.assertEqual(
+                copy_calls[1][-1],
+                "operator@host.invalid:/run/oldsparky-capture-probe-12345-1/platform_release_lock.sh",
+            )
             self.assertIn("CAPTURE_PROBE_DIR_ID=2049:123", github_env.read_text(encoding="utf-8"))
+        capture_step = workflow.split("      - name: Read-only systemd capture precondition probe", 1)[1].split(
+            "      - name: Validate structured production capture report", 1
+        )[0]
+        self.assertIn("bash -c 'set -euo pipefail; lock=", capture_step)
+        self.assertIn("/usr/bin/sha256sum -- \\\"\\$lock\\\"", capture_step)
+        self.assertIn('exec bash \\\"\\$lock\\\" --run /usr/bin/bash -s -- \\\"\\$@\\\"', capture_step)
+        self.assertIn("timeout --signal=TERM --kill-after=30s 560s", capture_step)
+        self.assertNotIn("timeout --foreground", capture_step)
+        capture_script = textwrap.dedent(capture_step.split("        run: |\n", 1)[1])
+        syntax = subprocess.run(["bash", "-n"], input=capture_script, text=True, capture_output=True, check=False)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        self.assertIn("timeout-minutes: 15", workflow)
 
     def _assert_remote_cleanup_failure_still_removes_local_ssh_material(self) -> None:
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/platform-production-diagnostics.yml").read_text(encoding="utf-8")
