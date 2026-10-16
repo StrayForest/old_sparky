@@ -2837,7 +2837,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         ):
             self.assertIn(stage, recovery_failure)
         self.assertIn(
-            "stage=(remote_identity|argument_count|bundle_sha|source_sha|security_run_id|security_run_attempt|recovery_run_id|recovery_run_attempt|recovery_job_id|recovery_workflow_sha|publisher_run_id|publisher_run_attempt|publisher_workflow_sha|publisher_job_id|route_digest|bundle_input|staging|provenance|bootstrap_extract|generation_install|generation_validate|install_stage_cleanup|quiesce_recovery)$",
+            "stage=(remote_identity|argument_count|bundle_sha|source_sha|security_run_id|security_run_attempt|recovery_run_id|recovery_run_attempt|recovery_job_id|recovery_workflow_sha|publisher_run_id|publisher_run_attempt|publisher_workflow_sha|publisher_job_id|route_digest|bundle_input|staging|provenance|bootstrap_extract|generation_install|generation_validate|install_stage_cleanup|source_bound_liveqa|quiesce_recovery)$",
             recovery_failure,
         )
         self.assertIn("transport_or_unclassified", recovery_failure)
@@ -2868,7 +2868,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             '"$(stat -c \'%u:%h:%a\' "$bundle")" = "0:1:600"',
             recovery_transfer,
         )
-        self.assertEqual(recovery_transfer.count("directory:0:0:2:700"), 3)
+        self.assertEqual(recovery_transfer.count("directory:0:0:2:700"), 6)
         self.assertIn("remote_stage_identity=\"\"", recovery_transfer)
         self.assertIn("remote_stage_result=", recovery_transfer)
         self.assertIn(

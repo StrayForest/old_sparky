@@ -127,6 +127,56 @@ def _trusted_pointer_owner(current: Path):
         yield
 
 
+def _trusted_capture_module_bytes(path: Path) -> tuple[bytes, SimpleNamespace]:
+    """Stub only root ownership for the pinned capture-module fixture."""
+    before = path.lstat()
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) & 0o022
+        or before.st_size > capture_probe.MAX_MODULE_BYTES
+    ):
+        proof._fail("test_fixture_module_metadata")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        def identity(item):
+            return (
+                item.st_dev,
+                item.st_ino,
+                item.st_size,
+                item.st_uid,
+                item.st_gid,
+                item.st_nlink,
+                item.st_mode,
+            )
+        if identity(opened) != identity(before):
+            proof._fail("test_fixture_module_changed")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(
+            descriptor, min(65536, capture_probe.MAX_MODULE_BYTES + 1 - size)
+        ):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > capture_probe.MAX_MODULE_BYTES:
+                proof._fail("test_fixture_module_size")
+        after = os.fstat(descriptor)
+        if (
+            identity(after) != identity(opened)
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            proof._fail("test_fixture_module_changed")
+        return b"".join(chunks), _stat_view(opened, uid=0, gid=0)
+    finally:
+        os.close(descriptor)
+
+
 def _receipt(**overrides: object) -> dict[str, object]:
     value: dict[str, object] = {
         "schema": 1,
@@ -249,12 +299,13 @@ def validate_archive(artifact, *, release_slug, expected_source_commit):
         raise ValueError('release identity')
     return payload
 """
-            files.update({
+            added_files = {
                 "RELEASE.json": release_payload,
                 "tools/platform_validate_release_artifact.py": validator_source,
                 "tools/platform_live_qa_runtime_install.py": b"# fixture runtime boundary\n",
-            })
-            for relative, content in files.items():
+            }
+            files.update(added_files)
+            for relative, content in added_files.items():
                 path = release / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(content)
@@ -289,6 +340,7 @@ def validate_archive(artifact, *, release_slug, expected_source_commit):
             ).encode("ascii")
             files["tools/platform_live_qa_runtime_install.py"] = installer_source
             installer_path = release / "tools/platform_live_qa_runtime_install.py"
+            installer_path.chmod(0o644)
             installer_path.write_bytes(installer_source)
             installer_path.chmod(0o444)
             _write_tiny_archive(artifact, files)
@@ -330,6 +382,13 @@ def validate_archive(artifact, *, release_slug, expected_source_commit):
                     )
                 return result
 
+            load_capture_probe = proof._load_capture_probe
+
+            def load_trusted_capture_probe(*, deadline: float):
+                module = load_capture_probe(deadline=deadline)
+                module._safe_module_bytes = _trusted_capture_module_bytes
+                return module
+
             before_tree = tree_fingerprint()
             with (
                 patch.multiple(
@@ -346,6 +405,7 @@ def validate_archive(artifact, *, release_slug, expected_source_commit):
                 ),
                 _trusted_nonroot_metadata(),
                 _trusted_pointer_owner(current),
+                patch.object(proof, "_load_capture_probe", side_effect=load_trusted_capture_probe),
             ):
                 result = proof.verify_active_release_artifact(
                     app_dir, artifact, checksum, receipt, deadline_seconds=30
