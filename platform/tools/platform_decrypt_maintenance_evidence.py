@@ -48,9 +48,9 @@ DIAGNOSTIC_KEYS = {
     "captured_at_utc", "stage", "error_code",
 }
 DIAGNOSTIC_PRIVATE_CAUSE_KEYS = {
-    "command", "unit", "reason", "error_message", "exception_class", "returncode",
-    "missing_properties", "extra_properties", "stdout_b64", "stdout_truncated",
-    "stderr_b64", "stderr_truncated",
+    "command", "getter", "unit", "reason", "error_message", "exception_class",
+    "cause_class", "cause_message", "returncode", "missing_fields", "extra_fields",
+    "stdout_b64", "stdout_truncated", "stderr_b64", "stderr_truncated",
 }
 SERVICE_PROPERTIES = {
     "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus",
@@ -105,49 +105,73 @@ def _parse_json(raw: bytes, *, maximum: int) -> dict[str, Any]:
 def _valid_private_diagnostic_cause(value: Any) -> bool:
     if not isinstance(value, dict) or set(value) != DIAGNOSTIC_PRIVATE_CAUSE_KEYS:
         return False
-    expected_messages = {
-        "command_error": "systemd properties command failed",
-        "output_too_large": "systemd properties output exceeded its bound",
-        "nonzero_exit": "systemd properties could not be read",
-        "invalid_utf8": "systemd properties are malformed",
-        "malformed_output": "systemd properties are malformed",
-        "missing_properties": "systemd properties are incomplete",
+    reasons = {
+        "none": {"exception"},
+        "systemctl_show": {
+            "command_error", "output_too_large", "nonzero_exit", "invalid_utf8",
+            "malformed_output", "missing_properties",
+        },
+        "systemctl_list_jobs": {
+            "command_error", "output_too_large", "nonzero_exit", "invalid_utf8",
+            "malformed_header", "duplicate_summary", "malformed_row",
+            "missing_summary", "count_mismatch", "unexpected_zero_table",
+        },
+        "journalctl_unit": {
+            "command_error", "output_too_large", "nonzero_exit",
+            "malformed_entry", "too_many_entries",
+        },
+        "cgroup_read": {
+            "invalid_identity", "unavailable", "output_too_large", "invalid_ascii",
+            "malformed_pid", "too_many_members",
+        },
     }
-    expected_classes = {
-        "command_error": {"OSError", "TimeoutExpired"},
-        "output_too_large": {"EvidenceError"},
-        "nonzero_exit": {"EvidenceError"},
-        "invalid_utf8": {"UnicodeDecodeError"},
-        "malformed_output": {"EvidenceError"},
-        "missing_properties": {"EvidenceError"},
+    command = value.get("command")
+    getter_by_command = {
+        "none": set(DIAGNOSTIC_STAGES),
+        "systemctl_show": {"systemd_properties"},
+        "systemctl_list_jobs": {"systemd_jobs"},
+        "journalctl_unit": {"journal"},
+        "cgroup_read": {"cgroup"},
+    }
+    text_pattern = re.compile(r"^[A-Za-z][A-Za-z0-9_.]{0,79}$")
+    unit_allowed = {
+        "none": {"none"},
+        "systemctl_show": {"service", "timer"},
+        "systemctl_list_jobs": {"none"},
+        "journalctl_unit": {"service"},
+        "cgroup_read": {"service"},
     }
     if (
-        value.get("command") != "systemctl_show"
-        or value.get("unit") not in {"service", "timer"}
-        or value.get("reason") not in expected_messages
-        or value.get("error_message") != expected_messages.get(value.get("reason"))
-        or value.get("exception_class") not in expected_classes.get(value.get("reason"), set())
+        command not in reasons
+        or value.get("getter") not in getter_by_command.get(command, set())
+        or value.get("unit") not in unit_allowed.get(command, set())
+        or value.get("reason") not in reasons.get(command, set())
+        or not isinstance(value.get("error_message"), str)
+        or not 1 <= len(value["error_message"]) <= 1024
+        or not isinstance(value.get("exception_class"), str)
+        or text_pattern.fullmatch(value["exception_class"]) is None
+        or (
+            value.get("cause_class") is not None
+            and (not isinstance(value["cause_class"], str) or text_pattern.fullmatch(value["cause_class"]) is None)
+        )
+        or (
+            value.get("cause_message") is not None
+            and (not isinstance(value["cause_message"], str) or len(value["cause_message"]) > 1024)
+        )
+        or ((value.get("cause_class") is None) != (value.get("cause_message") is None))
         or (value.get("returncode") is not None and (type(value["returncode"]) is not int or not -255 <= value["returncode"] <= 255))
         or type(value.get("stdout_truncated")) is not bool
         or type(value.get("stderr_truncated")) is not bool
     ):
         return False
-    allowed = SERVICE_PROPERTIES if value["unit"] == "service" else TIMER_PROPERTIES
-    missing = value.get("missing_properties")
-    extra = value.get("extra_properties")
+    missing = value.get("missing_fields")
+    extra = value.get("extra_fields")
     if (
-        not isinstance(missing, list) or len(missing) > len(SERVICE_PROPERTIES)
-        or any(not isinstance(item, str) or item not in allowed for item in missing)
+        not isinstance(missing, list) or len(missing) > 32
+        or any(not isinstance(item, str) or len(item) > 128 for item in missing)
         or missing != sorted(set(missing))
-        or not isinstance(extra, list) or len(extra) > 1
-        or any(
-            not isinstance(item, str)
-            or (
-                item != "invalid_property_name"
-                and (item in allowed or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", item) is None)
-            )
-            for item in extra
-        )
+        or not isinstance(extra, list) or len(extra) > 32
+        or any(not isinstance(item, str) or len(item) > 128 for item in extra)
         or extra != sorted(set(extra))
     ):
         return False
@@ -395,8 +419,7 @@ def decrypt_capture(
             and (
                 "private_cause" not in evidence
                 or (
-                    evidence.get("stage") == "systemd_properties"
-                    and _valid_private_diagnostic_cause(evidence["private_cause"])
+                    _valid_private_diagnostic_cause(evidence["private_cause"])
                 )
             )
         )

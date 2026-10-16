@@ -50,16 +50,23 @@ recipient certificate fingerprint, ciphertext SHA-256 digest and size, and
 algorithm profile. The encrypted plaintext is either the full
 `maintenance_failure_evidence` document or a closed
 `maintenance_failure_diagnostic` containing source/run bindings, a fixed stage
-and error code, and—only for a systemd property failure—a bounded private cause
-record. That record identifies the fixed service or timer query, its closed
-failure class and return code, missing or extra fixed properties, and bounded
-base64 stdout/stderr. It remains inside CMS ciphertext; it is never written to
-the public manifest, Actions output or logs. The service query uses the fixed
+and error code, plus a bounded private cause record for any failed capture
+getter. The record identifies the fixed getter and command (or `none` for a
+non-command failure), actual exception class/message, return code where
+available, missing or unexpected fields where relevant, and bounded base64
+stdout/stderr. It remains inside CMS ciphertext; it is never written to the
+public manifest, Actions output or logs. The systemd property parser uses the fixed
 12-field Service/Unit property set. The timer query uses the five fields
 exposed by its Timer/Unit interfaces: `ActiveState`, `SubState`, `Result`,
 `StateChangeTimestamp`, and `UnitFileState`. `ControlGroup` is service-only;
 timer evidence does not query it. Cgroup membership is read from the
 maintenance service's `ControlGroup` and remains part of the reset fence.
+For `systemctl list-jobs --no-pager --all`, the exact `No jobs running.` line
+is the empty-queue form; a nonempty queue must use the strict table and count
+summary. In systemd v255, `--output=json` itself suppresses the human-readable
+empty-status marker; explicit `--quiet` remains in the fixed invocation. The
+journal parser remains strict JSON and reports any nonzero command result,
+including one with partial JSON output.
 When a guard fails after the bound host output path is established, the
 workflow encrypts and uploads that diagnostic, then still finishes with a
 failed Action conclusion. The public manifest, Actions output and logs contain

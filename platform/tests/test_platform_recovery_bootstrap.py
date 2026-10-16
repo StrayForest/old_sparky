@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import argparse
 import base64
 from contextlib import ExitStack
 import hashlib
@@ -1454,33 +1455,28 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 set(github_output.read_text(encoding="ascii").splitlines()),
                 {"encrypted_artifact_ready=true", "capture_remote_status=0"},
             )
-            diagnostic = {
-                "schema": 1,
-                "kind": "maintenance_failure_diagnostic",
-                "source_sha": "a" * 40,
-                "bundle_sha256": "b" * 64,
-                "capture_run_id": "56789",
-                "capture_run_attempt": "1",
-                "security_run_id": "12345",
-                "security_run_attempt": "1",
-                "captured_at_utc": "2026-10-16T00:00:00Z",
-                "stage": "systemd_properties",
-                "error_code": "unit_properties_unavailable",
-                "private_cause": {
-                    "command": "systemctl_show",
-                    "unit": "timer",
-                    "reason": "malformed_output",
-                    "error_message": "systemd properties are malformed",
-                    "exception_class": "EvidenceError",
-                    "returncode": 0,
-                    "missing_properties": [],
-                    "extra_properties": ["ExecMainStatus"],
-                    "stdout_b64": base64.b64encode(b"ExecMainStatus=0\n").decode("ascii"),
-                    "stdout_truncated": False,
-                    "stderr_b64": base64.b64encode(b"private interface detail").decode("ascii"),
-                    "stderr_truncated": False,
-                },
-            }
+            with mock.patch.object(
+                maintenance_evidence,
+                "_run",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, b"unexpected list-jobs output\n", b"private list-jobs stderr",
+                ),
+            ):
+                with self.assertRaises(maintenance_evidence.EvidenceError) as jobs_error:
+                    maintenance_evidence._queued_jobs()
+            diagnostic_args = argparse.Namespace(
+                source_sha="a" * 40,
+                bundle_sha="b" * 64,
+                capture_run_id="56789",
+                capture_run_attempt="1",
+                security_run_id="12345",
+                security_run_attempt="1",
+            )
+            diagnostic = maintenance_evidence._diagnostic_payload(
+                diagnostic_args, jobs_error.exception,
+            )
+            self.assertEqual(diagnostic["stage"], "systemd_jobs")
+            self.assertEqual(diagnostic["error_code"], "jobs_unavailable_or_malformed")
             evidence_fixture.write_text(json.dumps(diagnostic), encoding="ascii")
             diagnostic_path = root / "diagnostic.json"
             diagnostic_dir = root / "diagnostic-artifact"
@@ -1535,12 +1531,80 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 )
             self.assertEqual(json.loads(decrypted_diagnostic.read_text(encoding="ascii")), diagnostic)
             self.assertTrue(maintenance_decrypt._valid_private_diagnostic_cause(diagnostic["private_cause"]))
+            self.assertEqual(diagnostic["private_cause"]["command"], "systemctl_list_jobs")
+            self.assertEqual(diagnostic["private_cause"]["reason"], "malformed_header")
+            self.assertEqual(
+                base64.b64decode(diagnostic["private_cause"]["stderr_b64"]),
+                b"private list-jobs stderr",
+            )
             invalid_cause = dict(diagnostic["private_cause"], unit="unknown")
             self.assertFalse(maintenance_decrypt._valid_private_diagnostic_cause(invalid_cause))
+            with mock.patch.object(Path, "lstat", side_effect=PermissionError("permission denied")):
+                with self.assertRaises(maintenance_evidence.EvidenceError) as pointer_error:
+                    maintenance_evidence._pointer(root / "app", "current")
+            generic_diagnostic = maintenance_evidence._diagnostic_payload(
+                diagnostic_args, pointer_error.exception,
+            )
+            self.assertEqual(generic_diagnostic["stage"], "transaction_context")
+            self.assertEqual(generic_diagnostic["private_cause"]["command"], "none")
+            self.assertEqual(generic_diagnostic["private_cause"]["getter"], "transaction_context")
+            self.assertEqual(generic_diagnostic["private_cause"]["cause_class"], "PermissionError")
+            evidence_fixture.write_text(json.dumps(generic_diagnostic), encoding="ascii")
+            generic_dir = root / "generic-diagnostic-artifact"
+            generic_destination = root / "generic-diagnostic.json"
+            generic_output = root / "generic-diagnostic-github-output"
+            shutil.copyfile(certificate_path, action_certificate)
+            action_certificate.chmod(0o600)
+            generic_result = subprocess.run(
+                ["bash", "-c", action_script],
+                env={
+                    **environment,
+                    "CAPTURE_EVIDENCE_PATH": str(generic_destination),
+                    "CAPTURE_CIPHERTEXT_DIR": str(generic_dir),
+                    "GITHUB_OUTPUT": str(generic_output),
+                    "FAKE_CAPTURE_FAILURE": "1",
+                },
+                capture_output=True, text=True, check=False, timeout=20,
+            )
+            self.assertNotEqual(generic_result.returncode, 0, generic_result.stdout + generic_result.stderr)
+            self.assertTrue((generic_dir / "evidence.cms").is_file())
+            generic_manifest_bytes = (generic_dir / "manifest.json").read_bytes()
+            self.assertTrue(1 <= len(generic_manifest_bytes) <= 8192, generic_result.stderr)
+            generic_archive = private_dir / "generic-diagnostic-capture.zip"
+            with zipfile.ZipFile(generic_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", (generic_dir / "manifest.json").read_bytes())
+                archive.writestr("evidence.cms", (generic_dir / "evidence.cms").read_bytes())
+            generic_archive.chmod(0o600)
+            generic_binding = dict(binding)
+            generic_binding["artifact_digest"] = f"sha256:{hashlib.sha256(generic_archive.read_bytes()).hexdigest()}"
+            generic_binding_path = private_dir / "generic-diagnostic-binding.json"
+            generic_binding_path.write_text(json.dumps(generic_binding), encoding="ascii")
+            generic_binding_path.chmod(0o600)
+            generic_decrypted = private_dir / "generic-decrypted-diagnostic.json"
+            with mock.patch.object(
+                maintenance_decrypt, "RECIPIENT_CERTIFICATE_SHA256", certificate_fingerprint,
+            ):
+                generic_sha, _ = maintenance_decrypt.decrypt_capture(
+                    artifact_archive=generic_archive,
+                    binding_json=generic_binding_path,
+                    private_key=local_key,
+                    certificate=local_certificate,
+                    destination=generic_decrypted,
+                    git_dir=git_dir,
+                )
+            self.assertEqual(json.loads(generic_decrypted.read_text(encoding="ascii")), generic_diagnostic)
+            self.assertTrue(maintenance_decrypt._valid_private_diagnostic_cause(generic_diagnostic["private_cause"]))
+            with self.assertRaises(maintenance_evidence.EvidenceError):
+                maintenance_evidence._validate_evidence(
+                    generic_decrypted, generic_sha,
+                    source_sha="a" * 40, bundle_sha="b" * 64,
+                    capture_run_id="56789", capture_run_attempt="1",
+                    security_run_id="12345", security_run_attempt="1",
+                )
             ssh_calls = [
                 json.loads(line) for line in ssh_log.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(ssh_calls), 8)
+            self.assertEqual(len(ssh_calls), 12)
             self.assertTrue(all(call["body"] for call in ssh_calls))
             self.assertEqual(ssh_calls[0]["args"][-1], "bash -s")
             self.assertEqual(
@@ -1572,7 +1636,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             scp_calls = [
                 json.loads(line) for line in scp_log.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(scp_calls), 4)
+            self.assertEqual(len(scp_calls), 6)
             self.assertEqual(scp_calls[0]["source"], environment["BUNDLE"])
             self.assertEqual(
                 scp_calls[0]["destination"],
@@ -4410,7 +4474,7 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
             with self.assertRaises(maintenance_evidence.EvidenceError) as caught:
                 maintenance_evidence._systemd_properties(maintenance_evidence.TIMER)
         self.assertEqual(caught.exception.private_cause["reason"], "missing_properties")
-        self.assertEqual(caught.exception.private_cause["missing_properties"], ["UnitFileState"])
+        self.assertEqual(caught.exception.private_cause["missing_fields"], ["UnitFileState"])
 
         extra_property = timer_output + b"ExecMainStatus=0\n"
         with mock.patch.object(
@@ -4421,7 +4485,7 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
                 maintenance_evidence._systemd_properties(maintenance_evidence.TIMER)
         extra_cause = caught.exception.private_cause
         self.assertEqual(extra_cause["reason"], "malformed_output")
-        self.assertEqual(extra_cause["extra_properties"], ["ExecMainStatus"])
+        self.assertEqual(extra_cause["extra_fields"], ["ExecMainStatus"])
         self.assertTrue(maintenance_decrypt._valid_private_diagnostic_cause(extra_cause))
 
     def test_capture_writes_private_digest_bound_evidence_without_printing_journal(self) -> None:
@@ -4607,8 +4671,43 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
         self.assertNotIn("qwerty", entries[0]["message"])
         self.assertNotIn("SECRET", str(entries))
         self.assertNotIn("private stderr", str(entries))
+        with mock.patch.object(
+            maintenance_evidence.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"No jobs running.\n", b""),
+        ) as jobs_command:
+            self.assertEqual(maintenance_evidence._queued_jobs(), [])
+        self.assertEqual(
+            jobs_command.call_args.args[0],
+            [maintenance_evidence.SYSTEMCTL, "list-jobs", "--no-pager", "--all"],
+        )
+        self.assertEqual(jobs_command.call_args.kwargs["stderr"], subprocess.PIPE)
+        with mock.patch.object(
+            maintenance_evidence,
+            "_run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as journal_run:
+            self.assertEqual(maintenance_evidence._journal(), [])
+        self.assertEqual(
+            journal_run.call_args.args[0],
+            [maintenance_evidence.JOURNALCTL, "--unit", maintenance_evidence.UNIT,
+             "--lines=100", "--output=json", "--no-pager", "--quiet", "--since=-24 hours"],
+        )
+        with mock.patch.object(
+            maintenance_evidence,
+            "_run",
+            return_value=subprocess.CompletedProcess([], 1, journal_row + b"\n", b"private partial failure"),
+        ):
+            with self.assertRaises(maintenance_evidence.EvidenceError) as journal_error:
+                maintenance_evidence._journal()
+        self.assertEqual(journal_error.exception.private_cause["reason"], "nonzero_exit")
+        self.assertEqual(journal_error.exception.private_cause["returncode"], 1)
+        self.assertEqual(
+            base64.b64decode(journal_error.exception.private_cause["stderr_b64"]),
+            b"private partial failure",
+        )
         for output, expected in (
-            (b"JOB UNIT TYPE STATE\n0 jobs listed.\n", []),
+            (b"No jobs running.\n", []),
             (b"JOB UNIT TYPE STATE\n1 deadlock-maintenance.service start waiting\n1 job listed.\n", [{"unit": "deadlock-maintenance.service", "job_type": "start", "job_state": "waiting"}]),
         ):
             with self.subTest(systemd_jobs=output):
@@ -4627,6 +4726,28 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
                 ):
                     with self.assertRaises(maintenance_evidence.EvidenceError):
                         maintenance_evidence._queued_jobs()
+        malformed_table = b"JOB UNIT TYPE STATE\n0 jobs listed.\n"
+        with mock.patch.object(
+            maintenance_evidence,
+            "_run",
+            return_value=subprocess.CompletedProcess([], 0, malformed_table, b"private stderr"),
+        ):
+            with self.assertRaises(maintenance_evidence.EvidenceError) as caught:
+                maintenance_evidence._queued_jobs()
+        self.assertEqual(caught.exception.private_cause["reason"], "unexpected_zero_table")
+        self.assertEqual(caught.exception.private_cause["command"], "systemctl_list_jobs")
+        self.assertEqual(base64.b64decode(caught.exception.private_cause["stderr_b64"]), b"private stderr")
+        self.assertTrue(maintenance_decrypt._valid_private_diagnostic_cause(caught.exception.private_cause))
+        with mock.patch.object(
+            maintenance_evidence,
+            "_run",
+            return_value=subprocess.CompletedProcess([], 7, b"partial stdout", b"private exit detail"),
+        ):
+            with self.assertRaises(maintenance_evidence.EvidenceError) as caught:
+                maintenance_evidence._queued_jobs()
+        self.assertEqual(caught.exception.private_cause["reason"], "nonzero_exit")
+        self.assertEqual(caught.exception.private_cause["returncode"], 7)
+        self.assertEqual(base64.b64decode(caught.exception.private_cause["stdout_b64"]), b"partial stdout")
 
     def test_reset_rechecks_evidence_and_invokes_only_fixed_reset_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

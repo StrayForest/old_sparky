@@ -41,6 +41,7 @@ MAX_PRIVATE_COMMAND_OUTPUT = 4096
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_JOURNAL_BYTES = 128 * 1024
 MAX_EVIDENCE_BYTES = 256 * 1024
+MAX_PRIVATE_TEXT = 1024
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_SHA = re.compile(r"^[0-9a-f]{40,64}$")
 UNIT_STATES = {"active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance", "unknown"}
@@ -115,7 +116,11 @@ def _diagnostic_payload(args: argparse.Namespace, error: BaseException) -> dict[
         "captured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "stage": stage,
         "error_code": code,
-        **({"private_cause": error.private_cause} if isinstance(error, EvidenceError) and error.private_cause else {}),
+        "private_cause": (
+            error.private_cause
+            if isinstance(error, EvidenceError) and error.private_cause
+            else _fallback_private_cause(error, getter=stage)
+        ),
     }
 
 
@@ -125,39 +130,28 @@ def _bounded_command_output(value: bytes | None) -> tuple[str, bool]:
     return base64.b64encode(bounded).decode("ascii"), len(raw) > len(bounded)
 
 
-def _systemd_cause(
-    *, unit: str, reason: str, returncode: int | None = None,
-    exception_class: str | None = None, missing: list[str] | None = None,
+def _private_cause(
+    *, command: str, getter: str, reason: str, error_message: str,
+    exception_class: str = "EvidenceError", unit: str = "none",
+    cause: BaseException | None = None,
+    returncode: int | None = None, missing: list[str] | None = None,
     extra: list[str] | None = None, stdout: bytes | None = None,
     stderr: bytes | None = None,
 ) -> dict[str, Any]:
-    error_messages = {
-        "command_error": "systemd properties command failed",
-        "output_too_large": "systemd properties output exceeded its bound",
-        "nonzero_exit": "systemd properties could not be read",
-        "invalid_utf8": "systemd properties are malformed",
-        "malformed_output": "systemd properties are malformed",
-        "missing_properties": "systemd properties are incomplete",
-    }
-    default_exception_classes = {
-        "command_error": "OSError",
-        "output_too_large": "EvidenceError",
-        "nonzero_exit": "EvidenceError",
-        "invalid_utf8": "UnicodeDecodeError",
-        "malformed_output": "EvidenceError",
-        "missing_properties": "EvidenceError",
-    }
     stdout_b64, stdout_truncated = _bounded_command_output(stdout)
     stderr_b64, stderr_truncated = _bounded_command_output(stderr)
     return {
-        "command": "systemctl_show",
-        "unit": "service" if unit == UNIT else "timer",
+        "command": command,
+        "getter": getter,
+        "unit": unit,
         "reason": reason,
-        "error_message": error_messages[reason],
-        "exception_class": exception_class or default_exception_classes[reason],
-        "returncode": returncode,
-        "missing_properties": sorted(missing or []),
-        "extra_properties": sorted(extra or []),
+        "error_message": str(error_message)[:MAX_PRIVATE_TEXT],
+        "exception_class": str(exception_class)[:80],
+        "cause_class": type(cause).__name__[:80] if cause is not None else None,
+        "cause_message": str(cause)[:MAX_PRIVATE_TEXT] if cause is not None else None,
+        "returncode": returncode if type(returncode) is int and -255 <= returncode <= 255 else None,
+        "missing_fields": sorted(missing or [])[:32],
+        "extra_fields": sorted(extra or [])[:32],
         "stdout_b64": stdout_b64,
         "stdout_truncated": stdout_truncated,
         "stderr_b64": stderr_b64,
@@ -165,44 +159,108 @@ def _systemd_cause(
     }
 
 
+def _fallback_private_cause(error: BaseException, *, getter: str) -> dict[str, Any]:
+    return _private_cause(
+        command="none", getter=getter, reason="exception",
+        error_message=str(error) or type(error).__name__,
+        exception_class=type(error).__name__, cause=error.__cause__,
+    )
+
+
+def _systemd_cause(
+    *, unit: str, reason: str, error_message: str | None = None,
+    returncode: int | None = None, exception_class: str | None = None,
+    missing: list[str] | None = None, extra: list[str] | None = None,
+    stdout: bytes | None = None, stderr: bytes | None = None,
+) -> dict[str, Any]:
+    messages = {
+        "command_error": "systemd properties command failed",
+        "output_too_large": "systemd properties output exceeded its bound",
+        "nonzero_exit": "systemd properties could not be read",
+        "invalid_utf8": "systemd properties are malformed",
+        "malformed_output": "systemd properties are malformed",
+        "missing_properties": "systemd properties are incomplete",
+    }
+    return _private_cause(
+        command="systemctl_show", getter="systemd_properties",
+        unit="service" if unit == UNIT else "timer", reason=reason,
+        error_message=error_message or messages[reason],
+        exception_class=exception_class or ("UnicodeDecodeError" if reason == "invalid_utf8" else "EvidenceError"),
+        returncode=returncode, missing=missing, extra=extra,
+        stdout=stdout, stderr=stderr,
+    )
+
+
+def _command_cause(
+    *, command: str, getter: str, reason: str, message: str,
+    result: subprocess.CompletedProcess[bytes] | None = None,
+    exception_class: str = "EvidenceError", unit: str = "none",
+    missing: list[str] | None = None, extra: list[str] | None = None,
+    cause: BaseException | None = None,
+) -> dict[str, Any]:
+    return _private_cause(
+        command=command, getter=getter, unit=unit, reason=reason,
+        error_message=message, exception_class=exception_class, cause=cause,
+        returncode=result.returncode if result is not None else None,
+        stdout=result.stdout if result is not None else None,
+        stderr=result.stderr if result is not None else None,
+        missing=missing, extra=extra,
+    )
+
+
+def _argv_identity(argv: list[str]) -> tuple[str, str, str]:
+    if len(argv) >= 3 and argv[:2] == [SYSTEMCTL, "show"] and argv[2] in SYSTEMD_PROPERTIES_BY_UNIT:
+        return "systemctl_show", "systemd_properties", "service" if argv[2] == UNIT else "timer"
+    if argv == [SYSTEMCTL, "list-jobs", "--no-pager", "--all"]:
+        return "systemctl_list_jobs", "systemd_jobs", "none"
+    if argv == [JOURNALCTL, "--unit", UNIT, "--lines=100", "--output=json", "--no-pager", "--quiet", "--since=-24 hours"]:
+        return "journalctl_unit", "journal", "service"
+    if argv == [SYSTEMCTL, "reset-failed", UNIT]:
+        return "systemctl_reset_failed", "reset", "service"
+    return "none", "capture_guard", "none"
+
+
 def _run(
     argv: list[str], *, maximum: int = MAX_JOURNAL_BYTES,
-    private_systemd_unit: str | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    stderr_target = subprocess.PIPE if private_systemd_unit is not None else subprocess.DEVNULL
+    command, getter, command_unit = _argv_identity(argv)
     try:
         result = subprocess.run(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=stderr_target,
+            stderr=subprocess.PIPE,
             check=False,
             timeout=15,
             env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        if private_systemd_unit is not None:
-            stdout = exc.stdout if isinstance(exc.stdout, bytes) else None
-            stderr = exc.stderr if isinstance(exc.stderr, bytes) else None
-            raise EvidenceError(
-                "systemd properties command failed",
-                private_cause=_systemd_cause(
-                    unit=private_systemd_unit, reason="command_error",
-                    exception_class="TimeoutExpired" if isinstance(exc, subprocess.TimeoutExpired) else "OSError",
-                    stdout=stdout, stderr=stderr,
-                ),
-            ) from exc
-        raise EvidenceError("fixed evidence command failed") from exc
+        stdout = exc.stdout if isinstance(exc.stdout, bytes) else None
+        stderr = exc.stderr if isinstance(exc.stderr, bytes) else None
+        message = {
+            "systemctl_show": "systemd properties command failed",
+            "systemctl_list_jobs": "systemd jobs command failed",
+            "journalctl_unit": "maintenance journal command failed",
+        }.get(command, "fixed evidence command failed")
+        cause = _private_cause(
+            command=command, getter=getter, unit=command_unit,
+            reason="command_error", error_message=str(exc) or message,
+            exception_class="TimeoutExpired" if isinstance(exc, subprocess.TimeoutExpired) else "OSError",
+            cause=exc, stdout=stdout, stderr=stderr,
+        )
+        raise EvidenceError(message, private_cause=cause) from exc
     if len(result.stdout) > maximum:
-        if private_systemd_unit is not None:
-            raise EvidenceError(
-                "systemd properties output exceeded its bound",
-                private_cause=_systemd_cause(
-                    unit=private_systemd_unit, reason="output_too_large",
-                    returncode=result.returncode, stdout=result.stdout, stderr=result.stderr,
-                ),
-            )
-        raise EvidenceError("fixed evidence command output exceeded its bound")
+        message = {
+            "systemctl_show": "systemd properties output exceeded its bound",
+            "systemctl_list_jobs": "systemd jobs output exceeded its bound",
+            "journalctl_unit": "maintenance journal output exceeded its bound",
+        }.get(command, "fixed evidence command output exceeded its bound")
+        cause = _private_cause(
+            command=command, getter=getter, unit=command_unit,
+            reason="output_too_large", error_message=message,
+            returncode=result.returncode, stdout=result.stdout, stderr=result.stderr,
+        )
+        raise EvidenceError(message, private_cause=cause)
     return result
 
 
@@ -295,7 +353,6 @@ def _systemd_properties(unit: str) -> dict[str, str]:
     result = _run(
         [SYSTEMCTL, "show", unit, "--no-pager", *(f"--property={field}" for field in fields)],
         maximum=16 * 1024,
-        private_systemd_unit=unit,
     )
     if result.returncode != 0:
         raise EvidenceError(
@@ -349,24 +406,70 @@ def _systemd_properties(unit: str) -> dict[str, str]:
 def _queued_jobs() -> list[dict[str, str]]:
     result = _run([SYSTEMCTL, "list-jobs", "--no-pager", "--all"], maximum=32 * 1024)
     if result.returncode != 0:
-        raise EvidenceError("systemd jobs could not be read")
-    lines = result.stdout.decode("utf-8", "strict").splitlines()
+        message = "systemd jobs could not be read"
+        raise EvidenceError(message, private_cause=_command_cause(
+            command="systemctl_list_jobs", getter="systemd_jobs", reason="nonzero_exit",
+            message=message, result=result,
+        ))
+    try:
+        decoded = result.stdout.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        message = "systemd jobs output is not valid UTF-8"
+        raise EvidenceError(message, private_cause=_command_cause(
+            command="systemctl_list_jobs", getter="systemd_jobs", reason="invalid_utf8",
+            message=message, result=result, exception_class=type(exc).__name__, cause=exc,
+        )) from exc
+    if result.stdout == b"No jobs running.\n":
+        return []
+    lines = decoded.splitlines()
     if not lines or lines[0].split() != ["JOB", "UNIT", "TYPE", "STATE"]:
-        raise EvidenceError("systemd jobs output is malformed")
+        message = "systemd jobs output is malformed"
+        header = lines[0].split() if lines else []
+        expected = ["JOB", "UNIT", "TYPE", "STATE"]
+        raise EvidenceError(message, private_cause=_command_cause(
+            command="systemctl_list_jobs", getter="systemd_jobs", reason="malformed_header",
+            message=message, result=result,
+            missing=[item for item in expected if item not in header],
+            extra=[item for item in header if item not in expected],
+        ))
     jobs: list[dict[str, str]] = []
     listed_count: int | None = None
     for line in lines[1:]:
         fields = line.split()
         if len(fields) == 3 and fields[1] in {"job", "jobs"} and fields[2] == "listed." and fields[0].isdecimal():
             if listed_count is not None:
-                raise EvidenceError("systemd jobs summary is malformed")
+                message = "systemd jobs summary is malformed"
+                raise EvidenceError(message, private_cause=_command_cause(
+                    command="systemctl_list_jobs", getter="systemd_jobs", reason="duplicate_summary",
+                    message=message, result=result,
+                ))
             listed_count = int(fields[0])
             continue
         if len(fields) != 4 or not fields[0].isdecimal() or not re.fullmatch(r"[A-Za-z0-9_.@:-]{1,255}", fields[1]) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", fields[2]) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", fields[3]):
-            raise EvidenceError("systemd job row is malformed")
+            message = "systemd job row is malformed"
+            raise EvidenceError(message, private_cause=_command_cause(
+                command="systemctl_list_jobs", getter="systemd_jobs", reason="malformed_row",
+                message=message, result=result,
+            ))
         jobs.append({"unit": fields[1], "job_type": fields[2], "job_state": fields[3]})
-    if listed_count is None or listed_count != len(jobs):
-        raise EvidenceError("systemd jobs summary does not match rows")
+    if listed_count is None:
+        message = "systemd jobs summary is missing"
+        raise EvidenceError(message, private_cause=_command_cause(
+            command="systemctl_list_jobs", getter="systemd_jobs", reason="missing_summary",
+            message=message, result=result, missing=["summary"],
+        ))
+    if listed_count == 0:
+        message = "systemd jobs zero table is not the expected empty-queue form"
+        raise EvidenceError(message, private_cause=_command_cause(
+            command="systemctl_list_jobs", getter="systemd_jobs", reason="unexpected_zero_table",
+            message=message, result=result,
+        ))
+    if listed_count != len(jobs):
+        message = "systemd jobs summary does not match rows"
+        raise EvidenceError(message, private_cause=_command_cause(
+            command="systemctl_list_jobs", getter="systemd_jobs", reason="count_mismatch",
+            message=message, result=result,
+        ))
     return jobs
 
 
@@ -432,38 +535,81 @@ def _cgroup_members(control_group: str) -> list[int]:
     if control_group == "":
         return []
     if not control_group or control_group == "/" or ".." in Path(control_group).parts:
-        raise EvidenceError("maintenance cgroup identity is invalid")
+        message = "maintenance cgroup identity is invalid"
+        raise EvidenceError(message, private_cause=_private_cause(
+            command="cgroup_read", getter="cgroup", unit="service",
+            reason="invalid_identity", error_message=message,
+        ))
     root = Path("/sys/fs/cgroup")
     directory = root / control_group.lstrip("/")
     try:
         directory.resolve(strict=True).relative_to(root.resolve(strict=True))
-        raw = (directory / "cgroup.procs").read_text(encoding="ascii")
+        with (directory / "cgroup.procs").open("rb") as stream:
+            raw_bytes = stream.read(16 * 1024 + 1)
     except FileNotFoundError:
         return []
     except (OSError, ValueError) as exc:
-        raise EvidenceError("maintenance cgroup state is unavailable") from exc
-    if len(raw) > 16 * 1024:
-        raise EvidenceError("maintenance cgroup state exceeded its bound")
+        message = "maintenance cgroup state is unavailable"
+        raise EvidenceError(message, private_cause=_private_cause(
+            command="cgroup_read", getter="cgroup", unit="service",
+            reason="unavailable", error_message=message,
+            exception_class=type(exc).__name__, cause=exc,
+        )) from exc
+    if len(raw_bytes) > 16 * 1024:
+        message = "maintenance cgroup state exceeded its bound"
+        raise EvidenceError(message, private_cause=_private_cause(
+            command="cgroup_read", getter="cgroup", unit="service",
+            reason="output_too_large", error_message=message, stdout=raw_bytes,
+        ))
+    try:
+        raw = raw_bytes.decode("ascii", "strict")
+    except UnicodeDecodeError as exc:
+        message = "maintenance cgroup state is malformed"
+        raise EvidenceError(message, private_cause=_private_cause(
+            command="cgroup_read", getter="cgroup", unit="service",
+            reason="invalid_ascii", error_message=message,
+            exception_class=type(exc).__name__, cause=exc, stdout=raw_bytes,
+        )) from exc
     members: list[int] = []
     for item in raw.splitlines():
         if not item.isdecimal() or len(item) > 10:
-            raise EvidenceError("maintenance cgroup state is malformed")
+            message = "maintenance cgroup state is malformed"
+            raise EvidenceError(message, private_cause=_private_cause(
+                command="cgroup_read", getter="cgroup", unit="service",
+                reason="malformed_pid", error_message=message, stdout=raw_bytes,
+            ))
         members.append(int(item))
     if len(members) > 256:
-        raise EvidenceError("maintenance cgroup member count exceeded its bound")
+        message = "maintenance cgroup member count exceeded its bound"
+        raise EvidenceError(message, private_cause=_private_cause(
+            command="cgroup_read", getter="cgroup", unit="service",
+            reason="too_many_members", error_message=message, stdout=raw_bytes,
+        ))
     return members
 
 
 def _journal() -> list[dict[str, Any]]:
     result = _run(
-        [JOURNALCTL, "--unit", UNIT, "--lines=100", "--output=json", "--no-pager", "--since=-24 hours"],
+        [JOURNALCTL, "--unit", UNIT, "--lines=100", "--output=json", "--no-pager", "--quiet", "--since=-24 hours"],
         maximum=MAX_JOURNAL_BYTES,
     )
-    if result.returncode not in (0, 1):
-        raise EvidenceError("maintenance journal could not be read")
+    if result.returncode != 0:
+        message = "maintenance journal could not be read"
+        raise EvidenceError(message, private_cause=_command_cause(
+            command="journalctl_unit", getter="journal", reason="nonzero_exit",
+            message=message, result=result,
+        ))
     entries: list[dict[str, Any]] = []
     for line in result.stdout.splitlines():
-        row = _strict_json(line, label="maintenance journal entry")
+        try:
+            row = _strict_json(line, label="maintenance journal entry")
+        except Exception as exc:
+            message = "maintenance journal entry is malformed"
+            raise EvidenceError(message, private_cause=_command_cause(
+                command="journalctl_unit", getter="journal", reason="malformed_entry",
+                message=message, result=result,
+                exception_class=type(exc).__name__, cause=exc,
+            )) from exc
         # Journal messages are retained only in the private evidence artifact.
         # Never write them to stdout, Actions logs, or a committed file.
         entry = {
@@ -473,7 +619,11 @@ def _journal() -> list[dict[str, Any]]:
         }
         entries.append(entry)
     if len(entries) > 100:
-        raise EvidenceError("maintenance journal row count exceeded its bound")
+        message = "maintenance journal row count exceeded its bound"
+        raise EvidenceError(message, private_cause=_command_cause(
+            command="journalctl_unit", getter="journal", reason="too_many_entries",
+            message=message, result=result,
+        ))
     return entries
 
 
