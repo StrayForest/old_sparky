@@ -1283,12 +1283,7 @@ jobs:
             fi
             rm -f -- "$ssh_scan_attempt"; printf 'Production SSH host-key acquisition attempt %s/2 failed\n' "$ssh_attempt" >&2; (( ssh_attempt == 2 )) || sleep 0.5
           done
-          if test "$ssh_scan_ok" = 1; then
-            capability_check_pass ssh_host_key
-          else
-            echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2
-            capability_check_fail ssh_host_key
-          fi
+          test "$ssh_scan_ok" = 1 || { echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2; exit 1; }
           install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
           {
             printf '%s\n' 'Host *'
