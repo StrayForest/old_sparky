@@ -31,10 +31,68 @@ HEALTH_URLS = (
 
 
 class ProbeFailure(Exception):
-    def __init__(self, check: str, error_class: str = "predicate") -> None:
+    def __init__(
+        self,
+        check: str,
+        error_class: str = "predicate",
+        systemd_observation: dict[str, object] | None = None,
+    ) -> None:
         super().__init__(check)
         self.check = check
         self.error_class = error_class
+        self.systemd_observation = systemd_observation
+
+
+_SYSTEMD_STATE_VALUES = frozenset(
+    ("active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance", "unknown")
+)
+_SYSTEMD_ENABLED_VALUES = frozenset(("enabled", "disabled", "static", "indirect", "masked", "generated", "transient", "unknown"))
+
+
+def _safe_systemd_value(value: str, command: str) -> str:
+    if not value:
+        return "empty"
+    known = _SYSTEMD_STATE_VALUES if command == "is-active" else _SYSTEMD_ENABLED_VALUES
+    return value if value in known else "other"
+
+
+def _systemd_failure_observation(
+    command: str,
+    unit: str,
+    result: tuple[int, str] | None,
+    error: BaseException | None,
+) -> dict[str, object]:
+    if result is not None:
+        status, value = result
+        state = _safe_systemd_value(value, command)
+        supported = {"active", "inactive"} if command == "is-active" else {"enabled", "disabled", "static"}
+        return {
+            "command": command,
+            "unit": unit,
+            "result": (
+                "unsupported_state"
+                if state not in supported
+                else "status_mismatch"
+                if (command == "is-active" and ((state == "active" and status != 0) or (state == "inactive" and status != 3)))
+                or (command == "is-enabled" and ((state in {"enabled", "static"} and status != 0) or (state == "disabled" and status != 1)))
+                else "state_error"
+            ),
+            "returncode": status if type(status) is int and 0 <= status <= 255 else "unavailable",
+            "state": state,
+        }
+    error_text = str(error) if error is not None else ""
+    result_class = (
+        "malformed_output"
+        if type(error).__name__ == "StateError" and error_text == "systemd command returned multiple states"
+        else "command_error"
+    )
+    return {
+        "command": command,
+        "unit": unit,
+        "result": result_class,
+        "returncode": "unavailable",
+        "state": "multiple" if result_class == "malformed_output" else "command_error",
+    }
 
 
 def _safe_module_bytes(path: Path) -> tuple[bytes, os.stat_result]:
@@ -318,8 +376,10 @@ def probe(expected_systemd_sha256: str) -> dict[str, object]:
         raise ProbeFailure("receipt_absence")
 
     failed_query: list[str] = []
+    systemd_query: dict[str, object] = {}
     original_active = module._read_active
     original_enabled = module._read_enabled
+    original_run_systemctl = getattr(module, "_run_systemctl", None)
 
     def read_active(unit: str) -> str:
         failed_query[:] = ["active", unit]
@@ -329,17 +389,47 @@ def probe(expected_systemd_sha256: str) -> dict[str, object]:
         failed_query[:] = ["enabled", unit]
         return original_enabled(unit)
 
+    def run_systemctl(*args: str) -> tuple[int, str]:
+        if (
+            len(args) == 2
+            and args[0] in {"is-active", "is-enabled"}
+            and args[1] in module.OWNED_UNITS
+        ):
+            try:
+                result = original_run_systemctl(*args)
+            except Exception as exc:
+                systemd_query.clear()
+                systemd_query.update(command=args[0], unit=args[1], error=exc)
+                raise
+            systemd_query.clear()
+            systemd_query.update(command=args[0], unit=args[1], result=result)
+            return result
+        return original_run_systemctl(*args)
+
     module._read_active = read_active
     module._read_enabled = read_enabled
+    if callable(original_run_systemctl):
+        module._run_systemctl = run_systemctl
     try:
         unit_snapshot = _run("unit_snapshot", lambda: module._unit_snapshot(active_overrides))
     except ProbeFailure as exc:
         if failed_query:
             exc.check = "unit_" + failed_query[0] + "_" + failed_query[1].replace(".", "_")
+            if systemd_query.get("command") == ("is-active" if failed_query[0] == "active" else "is-enabled") and systemd_query.get("unit") == failed_query[1]:
+                result = systemd_query.get("result")
+                error = systemd_query.get("error")
+                exc.systemd_observation = _systemd_failure_observation(
+                    str(systemd_query["command"]),
+                    str(systemd_query["unit"]),
+                    result if isinstance(result, tuple) and len(result) == 2 else None,
+                    error if isinstance(error, BaseException) else None,
+                )
         raise
     finally:
         module._read_active = original_active
         module._read_enabled = original_enabled
+        if callable(original_run_systemctl):
+            module._run_systemctl = original_run_systemctl
     capture_result = "prewrite_predicates_passed"
     active_count = sum(item["active"] == "active" for item in unit_snapshot)
     enabled_count = sum(item["enabled"] == "enabled" for item in unit_snapshot)
@@ -390,6 +480,8 @@ def main() -> int:
             "error_class": exc.error_class,
             "health": _health(),
         }
+        if exc.systemd_observation is not None:
+            report["systemd_observation"] = exc.systemd_observation
     except Exception:
         report = {
             "schema": 1,

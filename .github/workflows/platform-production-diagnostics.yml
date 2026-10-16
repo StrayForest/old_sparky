@@ -533,7 +533,7 @@ jobs:
               if type(health) is not dict or set(health) != health_keys or any(type(value) is not bool for value in health.values()):
                   raise ValueError
               if report.get("status") == "failed":
-                  if set(report) != common | {"failed_check", "error_class"}:
+                  if set(report) not in (common | {"failed_check", "error_class"}, common | {"failed_check", "error_class", "systemd_observation"}):
                       raise ValueError
                   units = ("deadlock-api.service", "deadlock-worker.service", "deadlock-web.service", "deadlock-maintenance.service", "deadlock-maintenance.timer", "deadlock-logrotate.service", "deadlock-logrotate.timer", "deadlock-offsite-backup.service", "deadlock-offsite-backup.timer", "deadlock-cloudflare-ips.service", "deadlock-cloudflare-ips.timer", "deadlock-health-monitor.service", "deadlock-health-monitor.timer")
                   checks = {"root", "probe_identity", "systemd_module_identity", "module_metadata", "module_open", "module_identity", "module_size", "module_changed", "module_import", "release_metadata", "companion_metadata", "companion_lstat", "companion_recheck", "companion_changed", "systemctl_path", "transaction_read", "install_operation", "active_overrides", "current_binding", "previous_binding", "helper_digests", "helper_release_binding", "capture_context", "receipt_absence", "existing_receipt_validate", "unit_snapshot", "internal"}
@@ -541,7 +541,49 @@ jobs:
                   classes = {"permission", "predicate", "oserror", "input", "StateError", "ValueError", "TypeError", "JSONDecodeError", "TimeoutExpired", "exception"}
                   if report["failed_check"] not in checks or report["error_class"] not in classes:
                       raise ValueError
+                  if "systemd_observation" in report:
+                      observation = report["systemd_observation"]
+                      if report["error_class"] != "StateError" or type(observation) is not dict or set(observation) != {"command", "unit", "result", "returncode", "state"}:
+                          raise ValueError
+                      command = observation["command"]
+                      unit = observation["unit"]
+                      result_class = observation["result"]
+                      returncode = observation["returncode"]
+                      state = observation["state"]
+                      if unit not in units or command not in {"is-active", "is-enabled"}:
+                          raise ValueError
+                      expected_check = "unit_" + ("active" if command == "is-active" else "enabled") + "_" + unit.replace(".", "_")
+                      if report["failed_check"] != expected_check:
+                          raise ValueError
+                      active_states = {"active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance", "unknown", "empty", "other", "multiple", "command_error"}
+                      enabled_states = {"enabled", "disabled", "static", "indirect", "masked", "generated", "transient", "unknown", "empty", "other", "multiple", "command_error"}
+                      if state not in (active_states if command == "is-active" else enabled_states):
+                          raise ValueError
+                      if returncode != "unavailable" and (type(returncode) is not int or not 0 <= returncode <= 255):
+                          raise ValueError
+                      if result_class == "unsupported_state":
+                          supported = {"active", "inactive"} if command == "is-active" else {"enabled", "disabled", "static"}
+                          if state in supported or state in {"multiple", "command_error"}:
+                              raise ValueError
+                      elif result_class == "status_mismatch":
+                          supported = {"active", "inactive"} if command == "is-active" else {"enabled", "disabled", "static"}
+                          if state not in supported:
+                              raise ValueError
+                          if returncode != "unavailable":
+                              expected = {"active": 0, "inactive": 3, "enabled": 0, "disabled": 1, "static": 0}[state]
+                              if returncode == expected:
+                                  raise ValueError
+                      elif result_class == "malformed_output":
+                          if state != "multiple" or returncode != "unavailable":
+                              raise ValueError
+                      elif result_class == "command_error":
+                          if state != "command_error" or returncode != "unavailable":
+                              raise ValueError
+                      else:
+                          raise ValueError
                   safe = {key: report[key] for key in ("schema", "kind", "status", "failed_check", "error_class", "health")}
+                  if "systemd_observation" in report:
+                      safe["systemd_observation"] = report["systemd_observation"]
               elif report.get("status") == "passed":
                   keys = common | {"capture_predicate", "receipt_present", "current_bound", "previous_bound", "service_active_count", "service_enabled_count"}
                   if set(report) != keys or report["capture_predicate"] not in {"existing_receipt_valid", "prewrite_predicates_passed"}:

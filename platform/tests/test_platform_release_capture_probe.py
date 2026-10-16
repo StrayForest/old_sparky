@@ -4,9 +4,11 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools import platform_release_capture_probe as probe
@@ -174,6 +176,82 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             self.assertEqual(len([event for event in events if event[0] == "active"]), len(systemd_state.OWNED_UNITS) - 1)
             self.assertEqual(len([event for event in events if event[0] == "enabled"]), len(systemd_state.OWNED_UNITS))
             self.assertTrue(all(unit in systemd_state.OWNED_UNITS for _, unit in events))
+        self._assert_actual_pinned_active_getter_reports_only_closed_failure_observation()
+
+    def _assert_actual_pinned_active_getter_reports_only_closed_failure_observation(self) -> None:
+        cases = (
+            ("failed", 3, "unsupported_state", "failed", 3),
+            ("active", 3, "status_mismatch", "active", 3),
+            ("active", -1, "status_mismatch", "active", "unavailable"),
+            ("active\ninactive", 3, "malformed_output", "multiple", "unavailable"),
+            ("raw private command output", OSError("raw private command output"), "command_error", "command_error", "unavailable"),
+        )
+        target = "deadlock-maintenance.service"
+        for stdout, returncode, expected_result, expected_state, expected_rc in cases:
+            with self.subTest(expected_result=expected_result), tempfile.TemporaryDirectory() as directory:
+                transaction, companion = self._paths(Path(directory))
+                app_dir = transaction.parents[1]
+                releases = app_dir / "releases"
+                releases.mkdir()
+                old_release = releases / "old"
+                old_release.mkdir()
+                (old_release / "RELEASE.json").write_text(
+                    '{"source_git_commit":"' + "a" * 40 + '"}\n', encoding="ascii"
+                )
+                current_link = app_dir / "current"
+                current_link.symlink_to(old_release)
+                overrides = {unit: "active" for unit in systemd_state.OWNED_UNITS if unit != target}
+                transaction_data = ("a" * 32, "install", str(old_release), "", {}, {}, overrides)
+                state_tool = systemd_state
+                state_tool.__verified_sha256__ = "b" * 64
+                systemctl_calls: list[tuple[str, ...]] = []
+
+                def fake_systemctl(args, **kwargs):
+                    call = tuple(args[1:])
+                    systemctl_calls.append(call)
+                    if call == ("is-active", target):
+                        if isinstance(returncode, BaseException):
+                            raise returncode
+                        return SimpleNamespace(returncode=returncode, stdout=stdout)
+                    if call[0] == "is-enabled":
+                        return SimpleNamespace(returncode=0, stdout="enabled\n")
+                    self.fail(f"unexpected systemctl query: {call!r}")
+
+                with (
+                    patch.object(probe, "APP_DIR", app_dir),
+                    patch.object(probe, "CURRENT_LINK", current_link),
+                    patch.object(probe, "TRANSACTION", transaction),
+                    patch.object(probe, "SYSTEMD_RECEIPT", companion),
+                    patch.object(probe, "_load_pinned_module", return_value=state_tool),
+                    patch.object(state_tool, "_validate_systemctl_path", side_effect=lambda value: value),
+                    patch.object(state_tool, "_read_transaction", return_value=transaction_data),
+                    patch.object(
+                        state_tool,
+                        "_helper_digests",
+                        return_value={"tools/platform_release_systemd_state.py": "b" * 64},
+                    ),
+                    patch.object(state_tool, "_release_context", return_value=True),
+                    patch.object(state_tool.subprocess, "run", side_effect=fake_systemctl),
+                    patch.object(probe, "_health", return_value={"api_live": True, "api_ready": True, "web_local": True, "public": True}),
+                    patch.object(probe.os, "geteuid", return_value=0),
+                ):
+                    with self.assertRaises(probe.ProbeFailure) as caught:
+                        probe.probe("b" * 64)
+
+                self.assertEqual(caught.exception.check, "unit_active_deadlock-maintenance_service")
+                self.assertEqual(caught.exception.error_class, "StateError")
+                self.assertEqual(
+                    caught.exception.systemd_observation,
+                    {
+                        "command": "is-active",
+                        "unit": target,
+                        "result": expected_result,
+                        "returncode": expected_rc,
+                        "state": expected_state,
+                    },
+                )
+                self.assertEqual(systemctl_calls.count(("is-active", target)), 1)
+                self.assertNotIn("raw private command output", json.dumps(caught.exception.systemd_observation))
 
     def test_enabled_query_failure_reports_exact_unit_and_getter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -248,6 +326,10 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
         self.assertIn("platform_release_lock_open", probe_path)
         self.assertIn("platform_release_lock_close", probe_path)
         self.assertIn("platform_release_capture_probe.py", workflow)
+        self.assertIn('set(observation) != {"command", "unit", "result", "returncode", "state"}', workflow)
+        self.assertIn('result_class == "unsupported_state"', workflow)
+        self.assertIn('result_class == "malformed_output"', workflow)
+        self._assert_probe_validator_rejects_inconsistent_systemd_observation(workflow)
         for forbidden in (
             "home_content.refresh_home_content",
             "capture_transaction",
@@ -260,6 +342,46 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
             self.assertNotIn(forbidden, probe_path)
         self._assert_capture_probe_stage_feeds_heredoc_to_ssh_before_copy()
         self._assert_remote_cleanup_failure_still_removes_local_ssh_material()
+
+    def _assert_probe_validator_rejects_inconsistent_systemd_observation(self, workflow: str) -> None:
+        validator = workflow.split(
+            '          /usr/bin/python3 - "$remote_log" "$remote_status" <<\'PY\'\n', 1
+        )[1].split("\n          PY\n", 1)[0]
+        validator = textwrap.dedent(validator)
+        base = {
+            "schema": 1,
+            "kind": "release_capture_probe",
+            "status": "failed",
+            "failed_check": "unit_active_deadlock-maintenance_service",
+            "error_class": "StateError",
+            "health": {"api_live": True, "api_ready": True, "web_local": True, "public": True},
+        }
+        cases = (
+            ({"command": "is-active", "unit": "deadlock-maintenance.service", "result": "status_mismatch", "returncode": 3, "state": "active"}, True, "StateError"),
+            ({"command": "is-active", "unit": "deadlock-maintenance.service", "result": "status_mismatch", "returncode": 0, "state": "active"}, False, "StateError"),
+            ({"command": "is-active", "unit": "deadlock-maintenance.service", "result": "status_mismatch", "returncode": "unavailable", "state": "active"}, True, "StateError"),
+            ({"command": "is-active", "unit": "deadlock-maintenance.service", "result": "unsupported_state", "returncode": 3, "state": "multiple"}, False, "StateError"),
+            ({"command": "is-active", "unit": "deadlock-maintenance.service", "result": "status_mismatch", "returncode": 3, "state": "active"}, False, "exception"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "report.json"
+            for observation, accepted, error_class in cases:
+                with self.subTest(observation=observation):
+                    report_path.write_text(
+                        json.dumps({**base, "error_class": error_class, "systemd_observation": observation}), encoding="ascii"
+                    )
+                    result = subprocess.run(
+                        [sys.executable, "-c", validator, str(report_path), "1"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    output = result.stdout.removeprefix("PRODUCTION_CAPTURE_PROBE ").strip()
+                    parsed = json.loads(output)
+                    self.assertEqual(
+                        parsed.get("failed_check") == "remote_or_transport",
+                        not accepted,
+                    )
 
     def _assert_capture_probe_stage_feeds_heredoc_to_ssh_before_copy(self) -> None:
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/platform-production-diagnostics.yml").read_text(encoding="utf-8")
