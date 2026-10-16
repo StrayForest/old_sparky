@@ -120,6 +120,15 @@ def _loaded_unit_properties(argv: tuple[str, ...] | None = None) -> str:
     return "".join(f"{key}={value}\n" for key, value in properties.items())
 
 
+def _legacy_preserve_maintenance_argv() -> tuple[str, ...]:
+    argv = list(evidence.EXPECTED_MAINTENANCE_ARGV)
+    manifest_index = argv.index("--protected-backup-manifest")
+    del argv[manifest_index : manifest_index + 2]
+    argv[argv.index("15", argv.index("--backup-keep"))] = "14"
+    argv.insert(3, "--preserve-existing-backups")
+    return tuple(argv)
+
+
 class MaintenanceQaEvidenceTests(unittest.TestCase):
     def test_closed_qa_reports_reject_inconsistent_counts_and_bindings(self) -> None:
         target_sha = "a" * 40
@@ -323,6 +332,112 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                 archive_buffer.getvalue(), "live-launch-sanitized.json"
             )
 
+    def test_protected_rotation_report_requires_bound_closed_proof(self) -> None:
+        archive_name = "platformdb-20261016T120000Z.dump"
+        archive_digest = "b" * 64
+        manifest_digest = "a" * 64
+
+        def report_fixture() -> dict[str, object]:
+            proof = {
+                "manifest": {"before": {"digest": manifest_digest}},
+                "verified_selection": {
+                    "selected_order": [
+                        {
+                            "dump_file": archive_name,
+                            "claimed_sha256": archive_digest,
+                            "claimed_size_bytes": 4096,
+                        }
+                    ]
+                },
+                "removed_pair_count": 2,
+            }
+            return {
+                "mode": "apply",
+                "ok": False,
+                "backup": {
+                    "status": "completed",
+                    "created": True,
+                    "restore_verified": True,
+                    "alembic_revision_verified": True,
+                    "checksum_present": True,
+                    "rotation_mode": "rotate-existing",
+                    "format_version": 2,
+                    "archive_name": archive_name,
+                    "archive_sha256": archive_digest,
+                    "size_bytes": 4096,
+                    "removed_count": 4,
+                    "protected_retention_proof": proof,
+                },
+            }
+
+        valid = report_fixture()
+        with patch.object(
+            evidence.backup_restore_drill,
+            "valid_protected_retention_proof",
+            return_value=True,
+        ) as proof_validator:
+            evidence.validate_protected_retention_report(valid, manifest_digest)
+        proof_validator.assert_called_once_with(
+            valid["backup"]["protected_retention_proof"],
+            requested_keep=evidence.PROTECTED_BACKUP_KEEP,
+            new_dump_file=archive_name,
+        )
+
+        invalid_cases = (
+            (
+                "manifest snapshot mismatch",
+                lambda candidate: candidate["backup"]["protected_retention_proof"][
+                    "manifest"
+                ]["before"].update(digest="c" * 64),
+                manifest_digest,
+            ),
+            (
+                "archive digest mismatch",
+                lambda candidate: candidate["backup"]["protected_retention_proof"][
+                    "verified_selection"
+                ]["selected_order"][0].update(claimed_sha256="c" * 64),
+                manifest_digest,
+            ),
+            (
+                "archive size mismatch",
+                lambda candidate: candidate["backup"]["protected_retention_proof"][
+                    "verified_selection"
+                ]["selected_order"][0].update(claimed_size_bytes=4095),
+                manifest_digest,
+            ),
+            (
+                "removed path count mismatch",
+                lambda candidate: candidate["backup"].update(removed_count=3),
+                manifest_digest,
+            ),
+            (
+                "snapshot input malformed",
+                lambda candidate: None,
+                "not-a-digest",
+            ),
+        )
+        for case, mutate, expected_digest in invalid_cases:
+            candidate = report_fixture()
+            mutate(candidate)
+            with self.subTest(case=case), patch.object(
+                evidence.backup_restore_drill,
+                "valid_protected_retention_proof",
+                return_value=True,
+            ), self.assertRaises(evidence.EvidenceError):
+                evidence.validate_protected_retention_report(
+                    candidate, expected_digest
+                )
+
+        rejected_proof = report_fixture()
+        with patch.object(
+            evidence.backup_restore_drill,
+            "valid_protected_retention_proof",
+            return_value=False,
+        ), self.assertRaises(evidence.EvidenceError):
+            evidence.validate_protected_retention_report(
+                rejected_proof, manifest_digest
+            )
+
     def test_qa_identity_is_rejected_before_any_api_request(self) -> None:
         for case, run_id, attempt in (
             ("zero-run-id", "0", "1"),
@@ -346,7 +461,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                         )
                     build_opener.assert_not_called()
 
-    def test_loaded_maintenance_unit_requires_exact_preserve_argv_and_limits(self) -> None:
+    def test_loaded_maintenance_unit_requires_exact_protected_rotation_argv_and_limits(self) -> None:
         source_bytes = (
             REPO_ROOT / "platform/deploy/systemd/deadlock-maintenance.service"
         ).read_bytes()
@@ -354,13 +469,18 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
         validate = evidence._validate_maintenance_unit_bytes
         validate(source_bytes, source_bytes, installed_path, _loaded_unit_properties())
 
-        rotating_argv = tuple(
-            value
-            for value in evidence.EXPECTED_MAINTENANCE_ARGV
-            if value != "--preserve-existing-backups"
-        )
         invalid_outputs = (
-            ("stale-rotating-unit", _loaded_unit_properties(rotating_argv)),
+            ("legacy-preserve-unit", _loaded_unit_properties(_legacy_preserve_maintenance_argv())),
+            (
+                "missing-manifest",
+                _loaded_unit_properties(
+                    tuple(
+                        value
+                        for value in evidence.EXPECTED_MAINTENANCE_ARGV
+                        if value != "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json"
+                    )
+                ),
+            ),
             (
                 "extra-argv",
                 _loaded_unit_properties(
@@ -415,11 +535,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
         source_bytes = (
             REPO_ROOT / "platform/deploy/systemd/deadlock-maintenance.service"
         ).read_bytes()
-        rotating_argv = tuple(
-            value
-            for value in evidence.EXPECTED_MAINTENANCE_ARGV
-            if value != "--preserve-existing-backups"
-        )
+        legacy_argv = _legacy_preserve_maintenance_argv()
 
         with tempfile.TemporaryDirectory(prefix="maintenance-unit-preflight-") as temporary:
             root = Path(temporary)
@@ -479,7 +595,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             environment = {
                 **os.environ,
                 "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-                "FIXTURE_SYSTEMCTL_OUTPUT": _loaded_unit_properties(rotating_argv),
+                "FIXTURE_SYSTEMCTL_OUTPUT": _loaded_unit_properties(legacy_argv),
                 "FIXTURE_START_MARKER": str(marker),
             }
             completed = subprocess.run(

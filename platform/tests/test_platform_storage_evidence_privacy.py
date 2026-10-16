@@ -89,6 +89,12 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
                     "restore_verified": True,
                     "alembic_revision_verified": True,
                     "removed": ["operator@example.test"],
+                    "protected_retention_proof": {
+                        "manifest_path": "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json",
+                        "protected_dump_files": ["platformdb-20261012T120000Z.dump"],
+                        "inventory": [{"dump_identity": [1, 2, 3], "claimed_sha256": "b" * 64}],
+                        "digest": "c" * 64,
+                    },
                     "error": "ssh -i /root/.ssh/id_ed25519 operator@example.test",
                 }
             ),
@@ -105,6 +111,11 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(service["error_class"], "failure")
         self.assertEqual(backup["removed_count"], 1)
         self.assertTrue(backup["restore_verified"])
+        self.assertNotIn("protected_retention_proof", backup)
+        self.assertNotIn("platformdb-20261012T120000Z.dump", serialized(backup))
+        self.assertNotIn("/opt/oldsparky/platform/shared/backup-retention", serialized(backup))
+        self.assertNotIn("b" * 64, serialized(backup))
+        self.assertNotIn("c" * 64, serialized(backup))
 
     def test_retention_summary_keeps_numeric_recovery_audit_only(self) -> None:
         report = summarize_retention(

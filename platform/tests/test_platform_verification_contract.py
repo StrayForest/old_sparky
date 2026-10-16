@@ -65,6 +65,7 @@ from tools.platform_verify import (
     _validated_privileged_environment,
     _verification_contract_commands,
     dispatch,
+    dispatch_ci,
     registry_payload,
 )
 from tools.platform_test_runner import (
@@ -597,6 +598,86 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertEqual(failure_result.testsRun, 1)
         self.assertEqual(failure_result.between_case_cleanup_failures, 1)
         self.assertFalse(failure_result.wasSuccessful())
+
+        runner_environment = {
+            "PLATFORM_ENVIRONMENT": "test",
+            "PLATFORM_DB_SCHEMA": "platform",
+            "PLATFORM_DATABASE_URL": (
+                "postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test"
+            ),
+            "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+        }
+
+        def run_profile(contour: str, *, fail_cleanup: bool = False) -> tuple[int, list[str], int]:
+            profile_events: list[str] = []
+            tests: list[unittest.TestCase] = []
+            catalog_cases: list[CatalogTestCase] = []
+            test_count = 2 if fail_cleanup else 1
+            for index in range(test_count):
+                def record_case(position: int = index) -> None:
+                    profile_events.append(f"case-{position}")
+
+                synthetic_test = unittest.FunctionTestCase(
+                    record_case,
+                    description=f"{contour}-case-{index}",
+                )
+                tests.append(synthetic_test)
+                catalog_cases.append(
+                    CatalogTestCase(
+                        test_id=synthetic_test.id(),
+                        module="synthetic_runner_contract",
+                        class_name="SyntheticCase",
+                        method_name=f"case_{index}",
+                        line=index + 1,
+                        is_async=False,
+                        contour="backend-unit" if contour == "backend" else contour,
+                    )
+                )
+
+            def cleanup_rate_limits() -> None:
+                profile_events.append("cleanup")
+                if fail_cleanup:
+                    raise RuntimeError("synthetic cleanup failure")
+
+            with (
+                patch.dict(os.environ, runner_environment, clear=True),
+                patch("tools.platform_test_runner._require_root_identity"),
+                patch("tools.platform_test_runner._privileged_preflight"),
+                patch("tools.platform_test_runner.verification_resource_lock", return_value=nullcontext()),
+                patch("tools.platform_test_runner._require_integration_resources_ready") as resource_preflight,
+                patch("tools.platform_test_runner._select_cases", return_value=tuple(catalog_cases)),
+                patch(
+                    "tools.platform_test_runner._load_suite",
+                    return_value=unittest.TestSuite(tests),
+                ),
+                patch(
+                    "tools.platform_test_runner._clear_integration_auth_rate_limit_keys",
+                    side_effect=cleanup_rate_limits,
+                ),
+                patch("tools.platform_test_runner._teardown_test_resources"),
+                patch("builtins.print"),
+            ):
+                status = test_runner_main(["--contour", contour, "--quiet"])
+            return status, profile_events, resource_preflight.call_count
+
+        for contour in ("backend", "backend-integration"):
+            with self.subTest(contour=contour):
+                status, profile_events, preflight_count = run_profile(contour)
+                self.assertEqual(status, 0)
+                self.assertEqual(profile_events, ["case-0", "cleanup"])
+                self.assertEqual(preflight_count, 1)
+
+        unrelated_status, unrelated_events, unrelated_preflight = run_profile("backend-unit")
+        self.assertEqual(unrelated_status, 0)
+        self.assertEqual(unrelated_events, ["case-0"])
+        self.assertEqual(unrelated_preflight, 0)
+
+        failure_status, failure_events, failure_preflight = run_profile(
+            "backend", fail_cleanup=True
+        )
+        self.assertEqual(failure_status, 1)
+        self.assertEqual(failure_events, ["case-0", "cleanup"])
+        self.assertEqual(failure_preflight, 1)
 
     def test_migration_target_validator_is_loopback_test_only(self) -> None:
         target = validate_disposable_migration_target(
@@ -2465,6 +2546,94 @@ except lock.VerificationLockError as exc:
                 expected_head="test-head",
             )
         )
+
+        safe_environment = {
+            "PLATFORM_PYTHON_BIN": "/venv/bin/python",
+            "PLATFORM_ENVIRONMENT": "test",
+            "PLATFORM_DB_SCHEMA": "platform",
+            "PLATFORM_DATABASE_URL": (
+                "postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test"
+            ),
+            "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+        }
+        safe_settings = {
+            "platform_environment": "test",
+            "platform_db_schema": "platform",
+            "platform_database_url": safe_environment["PLATFORM_DATABASE_URL"],
+            "platform_redis_url": safe_environment["PLATFORM_REDIS_URL"],
+        }
+        aggregate_order: list[str] = []
+
+        def record_gate(gate_id: str) -> int:
+            aggregate_order.append(gate_id)
+            return 0
+
+        def record_upgrade(label: str, command: list[str], **kwargs: object) -> int:
+            aggregate_order.append("schema-upgrade")
+            self.assertEqual(label, "ci-backend-database-bootstrap")
+            self.assertEqual(
+                command,
+                ["/venv/bin/python", "-m", "alembic", "upgrade", "head"],
+            )
+            self.assertEqual(kwargs["env"], safe_environment)
+            self.assertEqual(kwargs["timeout_seconds"], MIGRATION_SUBPROCESS_TIMEOUT_SECONDS)
+            return 0
+
+        with (
+            patch("tools.platform_verify.CI_GATE_IDS", ("migration", "backend")),
+            patch("tools.platform_verify.dispatch", side_effect=record_gate),
+            patch(
+                "tools.platform_verify._validated_privileged_environment",
+                return_value=(safe_environment, safe_settings),
+            ),
+            patch("tools.platform_verify._privileged_runner_python", return_value="/venv/bin/python"),
+            patch("tools.platform_verify._run", side_effect=record_upgrade),
+            patch("tools.platform_verification_lock.verification_resource_lock", return_value=nullcontext()),
+        ):
+            self.assertEqual(dispatch_ci(), 0)
+        self.assertEqual(aggregate_order, ["migration", "schema-upgrade", "backend"])
+
+        failed_order: list[str] = []
+
+        def record_failed_gate(gate_id: str) -> int:
+            failed_order.append(gate_id)
+            return 0
+
+        with (
+            patch("tools.platform_verify.CI_GATE_IDS", ("migration", "backend")),
+            patch("tools.platform_verify.dispatch", side_effect=record_failed_gate),
+            patch(
+                "tools.platform_verify._validated_privileged_environment",
+                return_value=(safe_environment, safe_settings),
+            ),
+            patch("tools.platform_verify._privileged_runner_python", return_value="/venv/bin/python"),
+            patch("tools.platform_verify._run", return_value=17) as failed_upgrade,
+            patch("tools.platform_verification_lock.verification_resource_lock", return_value=nullcontext()),
+        ):
+            self.assertEqual(dispatch_ci(), 17)
+        self.assertEqual(failed_order, ["migration"])
+        failed_upgrade.assert_called_once()
+
+        unsafe_settings = {
+            **safe_settings,
+            "platform_environment": "production",
+            "platform_database_url": "postgresql://u:p@127.0.0.1:5432/platformdb",
+        }
+        unsafe_order: list[str] = []
+
+        with (
+            patch("tools.platform_verify.CI_GATE_IDS", ("migration", "backend")),
+            patch("tools.platform_verify.dispatch", side_effect=lambda gate_id: unsafe_order.append(gate_id) or 0),
+            patch(
+                "tools.platform_verify._validated_privileged_environment",
+                return_value=(safe_environment, unsafe_settings),
+            ),
+            patch("tools.platform_verify._run") as unsafe_upgrade,
+            self.assertRaises(VerificationError),
+        ):
+            dispatch_ci()
+        self.assertEqual(unsafe_order, ["migration"])
+        unsafe_upgrade.assert_not_called()
         missing_seed = _integration_preflight_error(
             migration_heads=["test-head"],
             role_slugs={"admin"},

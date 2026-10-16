@@ -377,6 +377,12 @@ def parse_args() -> argparse.Namespace:
         "--web-artifact-dir", type=Path, default=DEFAULT_WEB_ARTIFACT_DIR
     )
     parser.add_argument("--backup-keep", type=int, default=14)
+    parser.add_argument(
+        "--protected-backup-manifest",
+        type=Path,
+        default=None,
+        help="Private schema-1 list of exact backup dump basenames to preserve during rotation.",
+    )
     parser.add_argument("--backup-max-age-hours", type=float, default=24.0)
     parser.add_argument("--release-keep", type=int, default=5)
     parser.add_argument("--test-artifact-max-age-days", type=int, default=7)
@@ -491,6 +497,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--backup-max-age-hours must be finite and positive")
     if args.backup_only and args.skip_backup:
         parser.error("--backup-only cannot be combined with --skip-backup")
+    if args.protected_backup_manifest is not None and (
+        args.skip_backup
+        or args.verify_existing_backup_only
+        or args.authorization_probe_only
+        or args.purge_profile_access_cache_after_restore
+    ):
+        parser.error("--protected-backup-manifest requires a backup-creating maintenance mode")
     if args.preserve_existing_backups and not args.apply:
         parser.error("--preserve-existing-backups requires --apply")
     if args.preserve_existing_backups and (
@@ -980,6 +993,7 @@ def run_backup(
     max_age_hours: float = 24.0,
     rotate_existing: bool = True,
     private_failure_diagnostics: bool = False,
+    protected_backup_manifest: Path | None = None,
 ) -> dict[str, Any]:
     if not math.isfinite(max_age_hours) or max_age_hours <= 0:
         raise ValueError("backup max age must be finite and positive")
@@ -991,6 +1005,7 @@ def run_backup(
         dump_only=False,
         rotate_existing=rotate_existing,
         private_scratch_diagnostics=private_failure_diagnostics,
+        protected_backup_manifest=protected_backup_manifest,
     )
 
     def raise_command_failure(exc: Exception) -> None:
@@ -1068,6 +1083,13 @@ def run_backup(
         raise BackupCommandFailure()
     if result.get("restore_verified") is not True or check_result.get("restore_verified") is not True:
         raise RuntimeError("Platform backup was not restore-verified.")
+    if protected_backup_manifest is not None and rotate_existing:
+        if (
+            result.get("rotation_mode") != "rotate-existing"
+            or result.get("alembic_revision_verified") is not True
+            or check_result.get("alembic_revision_verified") is not True
+        ):
+            raise RuntimeError("Protected backup retention requires fresh restore and Alembic proof.")
     archive_name = result.get("dump_file")
     if (
         not isinstance(archive_name, str)
@@ -1084,7 +1106,42 @@ def run_backup(
     size_bytes = result.get("size_bytes")
     if type(size_bytes) is not int or size_bytes <= 0:
         raise RuntimeError("Platform backup size is invalid.")
-    return {
+    retention_proof = result.get("protected_retention_proof")
+    if protected_backup_manifest is not None and rotate_existing:
+        if not backup_restore_drill.valid_protected_retention_proof(
+            retention_proof,
+            requested_keep=keep,
+            new_dump_file=archive_name,
+        ):
+            raise RuntimeError("Protected backup retention proof is missing or invalid.")
+        removed_paths = result.get("removed")
+        proof_removed_pairs = retention_proof.get("removed_pairs")
+        if (
+            not isinstance(removed_paths, list)
+            or not isinstance(proof_removed_pairs, list)
+            or any(
+                not isinstance(row, dict)
+                or not isinstance(row.get("dump_file"), str)
+                or not isinstance(row.get("sidecar_file"), str)
+                for row in proof_removed_pairs
+            )
+        ):
+            raise RuntimeError("Protected backup removal evidence is invalid.")
+        expected_removed_paths = {
+            str(backup_args.output_dir / filename)
+            for row in proof_removed_pairs
+            for filename in (row.get("dump_file"), row.get("sidecar_file"))
+        }
+        if (
+            len(removed_paths) != 2 * len(proof_removed_pairs)
+            or any(not isinstance(path, str) for path in removed_paths)
+            or len(set(removed_paths)) != len(removed_paths)
+            or set(removed_paths) != expected_removed_paths
+        ):
+            raise RuntimeError("Protected backup removal paths do not match the private proof.")
+    elif retention_proof is not None:
+        raise RuntimeError("Protected backup retention proof is unexpected for this backup mode.")
+    report = {
         "created": True,
         "archive_name": archive_name,
         "format_version": format_version,
@@ -1134,6 +1191,9 @@ def run_backup(
         else None,
         "preexisting_archives_preserved": result.get("preexisting_archives_preserved") is True,
     }
+    if protected_backup_manifest is not None and rotate_existing:
+        report["protected_retention_proof"] = retention_proof
+    return report
 
 
 RESTORE_PURGE_SERVICES = ("deadlock-api.service", "deadlock-worker.service")
@@ -2404,6 +2464,9 @@ def _plan_and_maybe_apply(
                     rotate_existing=not getattr(
                         args, "preserve_existing_backups", False
                     ),
+                    protected_backup_manifest=getattr(
+                        args, "protected_backup_manifest", None
+                    ),
                 ),
             }
         apply_release_plan(production_plan, app_dir=app_dir)
@@ -2729,6 +2792,9 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                             rotate_existing=False,
                             private_failure_diagnostics=getattr(
                                 args, "private_backup_diagnostics", False
+                            ),
+                            protected_backup_manifest=getattr(
+                                args, "protected_backup_manifest", None
                             ),
                         ),
                     },

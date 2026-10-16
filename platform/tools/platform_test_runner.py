@@ -498,10 +498,10 @@ def _teardown_privileged_redis_resource(
 def _clear_integration_auth_rate_limit_keys() -> None:
     """Remove only authentication rate-limit keys between integration cases.
 
-    The caller is the serial backend-integration result hook, so the canonical
-    verification lock remains held. Revalidating the fixed test target here
-    keeps cleanup fail-closed if process environment state changes after the
-    contour preflight.
+    The caller is the serial backend aggregate or backend-integration result
+    hook, so the canonical verification lock remains held. Revalidating the
+    fixed test target here keeps cleanup fail-closed if process environment
+    state changes after the contour preflight.
     """
 
     try:
@@ -1315,7 +1315,7 @@ def _run_contour(args: argparse.Namespace) -> int:
             )
             suite = _load_suite(_flatten_ids(cases))
             runner = TimingRunner(verbosity=0 if args.quiet else 2)
-            if args.contour == "backend-integration":
+            if args.contour in {BACKEND_AGGREGATE, "backend-integration"}:
                 runner.between_case_cleanup = _clear_integration_auth_rate_limit_keys
             result = runner.run(suite)
             if result.timed_out:

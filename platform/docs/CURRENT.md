@@ -2,11 +2,18 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-15
+- Last reviewed: 2026-10-16
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
-## Diagnostic checkpoint — 2026-10-15
+## Current operational checkpoint — 2026-10-16
+
+- Source `2a433ffaeaa3b3a1a4f509bf47100c78b20be4d9` is published to `dev`; production still runs source `9ceaf09ab7ba4bf5c5e636865106910eaa034c8d` with the previous release at `f1154c7dba4f57bf52f7d7544e97d924c732be94`. The bound backup create for the dev source failed the existing disk-reserve guard. It produced no new successful backup/restore/Alembic receipt, so the automatic production deployment did not run.
+- One separately reviewed release-only retention operation removed an inactive production release and recovered about 1.76 GB of available space. Protected current/previous releases, QA/provider roots and backup data remained intact. The post-cleanup available-space observation was 8,068,706,304 bytes; it is historical and is not a new backup-admission result.
+- A named-pair backup-retention feature and fixed-unit/report binding are being prepared in the local worktree; they are not yet published or deployed. The source-tree maintenance unit opts into a private manifest protecting named pairs alongside the latest `max(keep, 15)` verified pairs. No-manifest callers remain unchanged, and backup-only preserves every prior complete pair. See the [named backup retention policy](backup-retention-protection.md).
+- The external load matrix remains 5/11 with no new profile credit. The remaining six profiles, separate CPU check and final QA are incomplete. Human-visible Chrome/authentication/Turnstile QA remains **NOT RUN** because no QA owner was available for this checkpoint. No follow-on backup, deployment or load run has occurred.
+
+## Historical diagnostic checkpoint — 2026-10-15
 
 - The latest Ready Vote matrix and first backup-attribution results are summarized in the [2026-10-14 performance checkpoint](../performance/README.md#performance-and-backup-checkpoint-2026-10-14); subsequent backup and cleanup outcomes are in the [2026-10-15 follow-up](../performance/README.md#backup-and-restore-follow-up-2026-10-15). Backup runs `38662792582` and `38666349694` failed the unchanged 1 GiB reserve guard with observed deficits of 0.75 MiB and 4.77 MiB. The paired scratch PostgreSQL `shared_buffers=32MB` candidate did not produce a restore-verified backup and has been reverted to 64 MiB; no measured saving or causal comparison is established.
 - Security run `38671815760`, attempt 2, passed all 18 jobs for source `16d956c63c1b0360d147b7916c9e513fe9b4876c` (16 success, 2 expected skips). The bound backup run `38722295410`, attempt 1, failed the unchanged 1 GiB reserve guard during `restore_platform`: `MemAvailable` was 1,066,323,968 bytes, 7,417,856 bytes below threshold. The later bound create `38738894181`, attempt 1, also failed the unchanged guard (`MemAvailable=1,063,047,168`, 10,694,656-byte deficit); its cleanup is confirmed and its restore/Alembic result remains UNKNOWN. It produced a partial private phase attribution: `pg_wal` grew to 150,994,944 bytes across nine segments, alongside 157,286,400 allocated bytes in `base`, before the last guard sample. These point observations are not an atomic peak or proof of a sole cause. No backup pair was produced, the automatic deploy child was not dispatched, and all 20 original pairs/four protected roots remain preserved. A scratch-only 64 MiB `max_wal_size` / 32 MiB `min_wal_size` source experiment is under review; it is not deployed or restore-verified. Full measurements and limits are in the [2026-10-15 performance follow-up](../performance/README.md#backup-and-restore-follow-up-2026-10-15).
@@ -79,7 +86,7 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-Current next step: finish exact-SHA CI and the documented host-tools provisioning/release path for the pending external-load observer before any new production QA. Run `38071042340` ended with a runtime-budget-failed client envelope; request and origin totals are unavailable, so app/origin attribution remains unknown. Accepted fixture cleanup is still unproven. After the source is released, use the new bounded diagnostics to verify cleanup for that exact run before considering another production profile. The failed run has no performance acceptance or final-matrix credit.
+Current next step: complete the named-pair retention implementation and its owner tests, then run the applicable verification registry and publish through exact-SHA CI. Before the next backup or production profile, take a fresh capacity/admission observation and require a restore-verified backup plus Alembic confirmation where applicable; production continues only through the automatic release chain. The 11-profile matrix remains at 5/11, with the remaining six profiles, CPU validation and final live QA outstanding. No performance credit follows from storage cleanup.
 The historical production performance stage completed on 2026-09-07 against deployed SHA `bba3fb278e348906a6942aee8462b758c3d616ef`. The measurement
 boundary and retained-load runtime contour were corrected, then the exact
 13-profile matrix was rerun with the original contracts, thresholds and

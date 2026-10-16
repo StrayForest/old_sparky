@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime, timedelta
 import errno
 import fcntl
@@ -312,6 +313,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(args.backup_max_age_hours, 24.0)
         self.assertFalse(args.backup_only)
         self.assertFalse(args.preserve_existing_backups)
+        self.assertIsNone(args.protected_backup_manifest)
         self.assertFalse(args.evict_pinned_build_node_cache)
         self.assertIsNone(args.eviction_run_id)
 
@@ -612,6 +614,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             keep=14,
             max_age_hours=24.0,
             rotate_existing=False,
+            protected_backup_manifest=None,
         )
         release_retention.assert_called_once()
         artifact_retention.assert_called_once()
@@ -1154,6 +1157,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.root / "runtime" / "platform" / "shared" / "backups",
         )
         self.assertEqual(create_args.keep, 14)
+        self.assertIsNone(create_args.protected_backup_manifest)
         self.assertIs(create_args.dump_only, False)
         self.assertIs(create_args.rotate_existing, True)
         self.assertIs(create_args.private_scratch_diagnostics, False)
@@ -1636,6 +1640,157 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     )
                 self.assertIsNone(rejected_error.exception.scratch_allocation_attribution)
 
+    def test_protected_backup_proof_is_required_and_forwarded_privately(self) -> None:
+        archive_name = "platformdb-20261012T120000Z.dump"
+        manifest = Path("/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json")
+        proof = {
+            "schema_version": 1,
+            "private_marker": "must remain in the raw report",
+            "removed_pair_count": 0,
+            "removed_pairs": [],
+        }
+        create_result = {
+            "ok": True,
+            "dump_file": archive_name,
+            "format_version": 2,
+            "size_bytes": 123,
+            "duration_seconds": 4.5,
+            "restore_verified": True,
+            "alembic_revision_verified": True,
+            "sha256": "a" * 64,
+            "restored_table_count": 12,
+            "removed": [],
+            "rotation_mode": "rotate-existing",
+            "protected_retention_proof": proof,
+        }
+        check_result = {
+            "ok": True,
+            "restore_verified": True,
+            "alembic_revision_verified": True,
+            "age_hours": 0.25,
+        }
+        with (
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "create_backup",
+                return_value=create_result,
+            ),
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "check_latest_backup",
+                return_value=check_result,
+            ),
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "valid_protected_retention_proof",
+                return_value=True,
+            ) as validate_proof,
+        ):
+            report = maintenance.run_backup(
+                self.root / "runtime" / "platform",
+                keep=14,
+                protected_backup_manifest=manifest,
+            )
+
+        validate_proof.assert_called_once_with(
+            proof,
+            requested_keep=14,
+            new_dump_file=archive_name,
+        )
+        self.assertIs(report["protected_retention_proof"], proof)
+        self.assertNotIn("protected_backup_manifest", report)
+        self.assertNotIn(str(manifest), json.dumps(report))
+
+        mismatched_removals = {**create_result, "removed": ["/tmp/unrelated.dump"]}
+        with (
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "create_backup",
+                return_value=mismatched_removals,
+            ),
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "check_latest_backup",
+                return_value=check_result,
+            ),
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "valid_protected_retention_proof",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "removal paths do not match"):
+                maintenance.run_backup(
+                    self.root / "runtime" / "platform",
+                    keep=14,
+                    protected_backup_manifest=manifest,
+                )
+
+        missing_proof = {**create_result}
+        missing_proof.pop("protected_retention_proof")
+        with (
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "create_backup",
+                return_value=missing_proof,
+            ),
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "check_latest_backup",
+                return_value=check_result,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "proof is missing or invalid"):
+                maintenance.run_backup(
+                    self.root / "runtime" / "platform",
+                    keep=14,
+                    protected_backup_manifest=manifest,
+                )
+
+    def test_full_maintenance_forwards_protected_manifest_to_backup_drill(self) -> None:
+        app_dir = self.root / "runtime" / "platform"
+        self.add_runtime_release(app_dir, "release-current")
+        self.add_runtime_release(app_dir, "release-previous")
+        (app_dir / "current").symlink_to(app_dir / "releases" / "release-current")
+        (app_dir / "previous").symlink_to(app_dir / "releases" / "release-previous")
+        manifest = self.root / "private-protected-backups.json"
+        args = self.maintenance_args(app_dir)
+        args.skip_backup = False
+        args.protected_backup_manifest = manifest
+
+        with (
+            mock.patch.object(
+                maintenance, "run_backup", return_value={"restore_verified": True}
+            ) as backup,
+            mock.patch.object(maintenance, "apply_release_plan"),
+            mock.patch.object(maintenance, "apply_artifact_retention_plan"),
+        ):
+            maintenance._plan_and_maybe_apply(
+                args, app_dir=app_dir, source_release_dir=self.release_dir
+            )
+
+        backup.assert_called_once_with(
+            app_dir,
+            keep=14,
+            max_age_hours=24.0,
+            rotate_existing=True,
+            protected_backup_manifest=manifest,
+        )
+
+    def test_manifest_flag_requires_a_backup_creating_maintenance_mode(self) -> None:
+        invalid = (
+            ["--protected-backup-manifest", "/private/manifest.json", "--skip-backup"],
+            ["--protected-backup-manifest", "/private/manifest.json", "--verify-existing-backup-only"],
+            ["--protected-backup-manifest", "/private/manifest.json", "--authorization-probe-only"],
+        )
+        for options in invalid:
+            with self.subTest(options=options), mock.patch.object(
+                maintenance.sys,
+                "argv",
+                ["platform_storage_maintenance.py", *options],
+            ), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                maintenance.parse_args()
+
     def test_backup_failure_prevents_retention_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
         (app_dir / "shared").mkdir(parents=True)
@@ -1851,6 +2006,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             max_age_hours=24.0,
             rotate_existing=False,
             private_failure_diagnostics=False,
+            protected_backup_manifest=None,
         )
         load_live_qa_guard.assert_not_called()
         retention_plan.assert_not_called()
@@ -2314,12 +2470,16 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "ExecStart=/opt/oldsparky/platform/shared/venv/bin/python "
                 "/opt/oldsparky/platform/current/tools/"
                 "platform_storage_maintenance.py --apply "
-                "--preserve-existing-backups --backup-keep 14 "
+                "--protected-backup-manifest "
+                "/opt/oldsparky/platform/shared/backup-retention/"
+                "protected-dump-files.json --backup-keep 15 "
                 "--release-keep 5 --test-artifact-max-age-days 7 "
                 "--screenshot-max-age-days 30 --failed-build-max-age-days 1 "
                 "--minimum-free-gib 5 --maximum-used-percent 85"
             ],
         )
+        self.assertIn("--protected-backup-manifest", service)
+        self.assertNotIn("--preserve-existing-backups", service)
         self.assertNotIn("prune-runtime-cache", service)
         retention = (
             REPO_ROOT / "platform/tools/platform_release_retention.py"
@@ -5844,15 +6004,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                             "created": True,
                             "restore_verified": True,
                             "alembic_revision_verified": True,
-                            "rotation_mode": "preserve-existing",
-                            "preexisting_archives_preserved": True,
-                            "preexisting_archive_count": 0,
-                            "preexisting_sidecar_count": 0,
-                            "postexisting_archive_count": 1,
-                            "removed": [],
+                            "rotation_mode": "rotate-existing",
+                            "protected_retention_proof": {"status": "pass"},
                             "removed_count": 0,
-                            "preexisting_archive_inventory_sha256": "a" * 64,
-                            "postexisting_archive_inventory_sha256": "a" * 64,
                         },
                         "private": "/root/private-maintenance-report.json",
                     }
@@ -5882,7 +6036,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertNotIn("private-maintenance-report", bound.stdout)
 
             altered = json.loads(report.read_text(encoding="utf-8"))
-            altered["backup"]["rotation_mode"] = "rotate-existing"
+            altered["backup"]["rotation_mode"] = "preserve-existing"
             report.write_text(json.dumps(altered), encoding="utf-8")
             report.chmod(0o600)
             refused_policy = subprocess.run(
@@ -5895,8 +6049,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertNotEqual(refused_policy.returncode, 0)
             self.assertNotIn("private-maintenance-report", refused_policy.stderr)
 
-            altered["backup"]["rotation_mode"] = "preserve-existing"
-            altered["backup"]["postexisting_archive_count"] = 0
+            altered["backup"]["rotation_mode"] = "rotate-existing"
+            altered["backup"]["protected_retention_proof"]["status"] = "failed"
             report.write_text(json.dumps(altered), encoding="utf-8")
             report.chmod(0o600)
             refused_count = subprocess.run(
@@ -5908,6 +6062,20 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
             self.assertNotEqual(refused_count.returncode, 0)
             self.assertNotIn("private-maintenance-report", refused_count.stderr)
+
+            altered["backup"]["protected_retention_proof"]["status"] = "pass"
+            altered["backup"]["removed_count"] = -1
+            report.write_text(json.dumps(altered), encoding="utf-8")
+            report.chmod(0o600)
+            refused_removal_count = subprocess.run(
+                [sys.executable, "-I", "-", *arguments],
+                input=binder,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(refused_removal_count.returncode, 0)
+            self.assertNotIn("private-maintenance-report", refused_removal_count.stderr)
 
             stale_start = completed_at + timedelta(seconds=10)
             stale_end = stale_start + timedelta(seconds=10)
@@ -6048,7 +6216,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertLess(report_health, timer_enable)
         self.assertIn("timer_rollback_unverified", workflow)
         self.assertIn('timer_active_after" == inactive && "$timer_enabled_after" == disabled', workflow)
-        self.assertIn('"rotation_mode") != "preserve-existing"', workflow)
+        self.assertIn('"rotation_mode") != "rotate-existing"', workflow)
+        self.assertIn(
+            '"backup_retention_status": "protected_plus_latest_verified"',
+            workflow,
+        )
         unit_preflight = workflow.index("validate-maintenance-unit")
         service_start = workflow.index("if systemctl start deadlock-maintenance.service; then")
         self.assertLess(unit_preflight, service_start)

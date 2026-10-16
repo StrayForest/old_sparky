@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import datetime as dt
 import fcntl
 import hashlib
@@ -1181,6 +1182,108 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             encoding="utf-8",
         )
         return dump_path, metadata_path
+
+    @staticmethod
+    def _write_protected_backup_manifest(
+        path: pathlib.Path, dump_names: list[str]
+    ) -> pathlib.Path:
+        path.write_text(
+            json.dumps(
+                {"schema_version": 1, "protected_dump_files": dump_names},
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    def _create_protected_backup(
+        self,
+        output_dir: pathlib.Path,
+        manifest: pathlib.Path,
+        *,
+        keep: int,
+        restore_result: int = 12,
+    ) -> dict[str, Any]:
+        args = argparse.Namespace(
+            env_file=output_dir.parent / ".env.platform",
+            output_dir=output_dir,
+            keep=keep,
+            dump_only=False,
+            rotate_existing=True,
+            protected_backup_manifest=manifest,
+            private_scratch_diagnostics=False,
+        )
+        with self._project_manifest_owner(manifest, 0):
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    {"PLATFORM_DATABASE_URL": "postgresql://platform_user@localhost/platformdb"},
+                ),
+                mock.patch.object(backup_drill, "load_env", return_value={}),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
+                mock.patch.object(
+                    backup_drill,
+                    "_run_isolated_restore_drill",
+                    return_value=restore_result,
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "utc_now",
+                    return_value=dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC),
+                ),
+            ):
+                return backup_drill.create_backup(args)
+
+    @contextlib.contextmanager
+    def _project_manifest_owner(self, path: pathlib.Path, uid: int):
+        """Project only UID for this synthetic manifest; keep real stat identity."""
+
+        original_path_lstat = pathlib.Path.lstat
+        original_fstat = os.fstat
+        manifest_info = original_path_lstat(path)
+
+        def with_uid(info: os.stat_result) -> types.SimpleNamespace:
+            return types.SimpleNamespace(
+                **{
+                    field: (uid if field == "st_uid" else getattr(info, field))
+                    for field in (
+                        "st_dev",
+                        "st_ino",
+                        "st_mode",
+                        "st_uid",
+                        "st_gid",
+                        "st_nlink",
+                        "st_size",
+                        "st_mtime_ns",
+                        "st_ctime_ns",
+                    )
+                }
+            )
+
+        def projected_lstat(candidate: pathlib.Path):
+            info = original_path_lstat(candidate)
+            if candidate == path:
+                return with_uid(info)
+            return info
+
+        def projected_fstat(descriptor: int):
+            info = original_fstat(descriptor)
+            if (info.st_dev, info.st_ino) == (manifest_info.st_dev, manifest_info.st_ino):
+                return with_uid(info)
+            return info
+
+        with (
+            mock.patch.object(pathlib.Path, "lstat", autospec=True, side_effect=projected_lstat),
+            mock.patch.object(backup_drill.os, "fstat", side_effect=projected_fstat),
+        ):
+            yield
 
     def _assert_latest_verification_preflight_rejects(
         self,
@@ -5196,18 +5299,35 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
     def test_prune_unverified_backups_keeps_verified_archive(self) -> None:
         with mock.patch.object(backup_drill.sys, "argv", ["platform_backup_restore_drill.py"]):
-            self.assertTrue(backup_drill.parse_args().rotate_existing)
+            defaults = backup_drill.parse_args()
+            self.assertTrue(defaults.rotate_existing)
+            self.assertIsNone(defaults.protected_backup_manifest)
         with mock.patch.object(
             backup_drill.sys,
             "argv",
             ["platform_backup_restore_drill.py", "--preserve-existing"],
         ):
             self.assertFalse(backup_drill.parse_args().rotate_existing)
+        with (
+            mock.patch.object(
+                backup_drill.sys,
+                "argv",
+                [
+                    "platform_backup_restore_drill.py",
+                    "--protected-backup-manifest",
+                    "/private/manifest.json",
+                    "--check-latest",
+                ],
+            ),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            backup_drill.parse_args()
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
-            verified_dump = output_dir / "platformdb-verified.dump"
-            failed_dump = output_dir / "platformdb-failed.dump"
+            verified_dump = output_dir / "platformdb-20200101T000000Z.dump"
+            failed_dump = output_dir / "platformdb-20200102T000000Z.dump"
             verified_dump.write_bytes(b"verified")
             failed_dump.write_bytes(b"failed")
             verified_metadata = verified_dump.with_suffix(".json")
@@ -5231,6 +5351,680 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertFalse(failed_dump.exists())
             self.assertFalse(failed_metadata.exists())
             self.assertEqual(len(removed), 2)
+
+    def test_unverified_prune_rejects_untrusted_dump_paths_before_any_unlink(self) -> None:
+        unsafe_names = (
+            "../sentinel.dump",
+            "{absolute}",
+            "platformdb-20200101T000000Z.dump",
+        )
+        for unsafe_name in unsafe_names:
+            with self.subTest(unsafe_name=unsafe_name), tempfile.TemporaryDirectory() as temporary_dir:
+                root = pathlib.Path(temporary_dir)
+                output_dir = root / "backups"
+                output_dir.mkdir()
+                sentinel = root / "sentinel.dump"
+                sentinel.write_bytes(b"outside sentinel")
+                unrelated_dump, unrelated_metadata = self._write_backup_pair(
+                    output_dir,
+                    "platformdb-20200101T000000Z.dump",
+                    b"unrelated backup",
+                    restore_verified=False,
+                )
+                candidate_dump, candidate_metadata = self._write_backup_pair(
+                    output_dir,
+                    "platformdb-20200102T000000Z.dump",
+                    b"unverified candidate",
+                    restore_verified=False,
+                )
+                dump_value = str(sentinel) if unsafe_name == "{absolute}" else unsafe_name
+                candidate_document = json.loads(candidate_metadata.read_text(encoding="utf-8"))
+                candidate_document["dump_file"] = dump_value
+                candidate_metadata.write_text(json.dumps(candidate_document), encoding="utf-8")
+                before_sentinel = sentinel.read_bytes()
+
+                with self.assertRaisesRegex(RuntimeError, "mismatched dump name"):
+                    backup_drill.prune_unverified_backups(
+                        output_dir,
+                        preserve_metadata=output_dir / "not-current.json",
+                    )
+
+                self.assertEqual(sentinel.read_bytes(), before_sentinel)
+                self.assertTrue(unrelated_dump.exists())
+                self.assertTrue(unrelated_metadata.exists())
+                self.assertTrue(candidate_dump.exists())
+                self.assertTrue(candidate_metadata.exists())
+
+    def test_named_protection_is_union_with_latest_fifteen_verified_and_preserves_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            verified_names: list[str] = []
+            for index in range(18):
+                dump_name = f"platformdb-202001{index + 1:02d}T000000Z.dump"
+                dump_path, _metadata_path = self._write_backup_pair(
+                    output_dir, dump_name, f"verified-{index}".encode()
+                )
+                timestamp = 1_600_000_000 + index
+                os.utime(dump_path, (timestamp, timestamp))
+                os.utime(dump_path.with_suffix(".json"), (timestamp, timestamp))
+                verified_names.append(dump_name)
+            unverified_name = "platformdb-20200201T000000Z.dump"
+            self._write_backup_pair(
+                output_dir, unverified_name, b"protected-unverified", restore_verified=False
+            )
+            unknown_name = "platformdb-20200202T000000Z.dump"
+            unknown_dump = output_dir / unknown_name
+            unknown_dump.write_bytes(b"protected-unknown")
+            unknown_dump.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "dump_file": unknown_name,
+                        "size_bytes": unknown_dump.stat().st_size,
+                        "sha256": hashlib.sha256(unknown_dump.read_bytes()).hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            protected = frozenset({verified_names[0], unverified_name, unknown_name})
+
+            removed_unverified = backup_drill.prune_unverified_backups(
+                output_dir,
+                preserve_metadata=output_dir / "not-current.json",
+                protected_dump_files=protected,
+            )
+            removed_verified = backup_drill.prune_backups(
+                output_dir, keep=15, protected_dump_files=protected, verified_only=True
+            )
+
+            retained_verified = {path.name for path in output_dir.glob("*.dump")} & set(verified_names)
+            self.assertEqual(retained_verified, set(verified_names[-15:]) | {verified_names[0]})
+            self.assertTrue((output_dir / unverified_name).exists())
+            self.assertTrue((output_dir / unverified_name.replace(".dump", ".json")).exists())
+            self.assertTrue(unknown_dump.exists())
+            self.assertTrue(unknown_dump.with_suffix(".json").exists())
+            self.assertEqual(len(removed_unverified), 0)
+            self.assertEqual(len(removed_verified), 4)
+
+    def test_protected_rotation_emits_ordered_identity_proof_and_rejects_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            output_dir = root / "backups"
+            output_dir.mkdir()
+            verified_names: list[str] = []
+            for index in range(17):
+                name = f"platformdb-202001{index + 1:02d}T000000Z.dump"
+                dump_path, sidecar_path = self._write_backup_pair(
+                    output_dir, name, f"verified-{index}".encode()
+                )
+                verified_names.append(name)
+                # The first four establish a sub-float mtime ordering and a
+                # deterministic equal-nanosecond basename tie at the retention edge.
+                base_ns = 1_700_000_000_000_000_000
+                timestamp_ns = (
+                    base_ns - 1_000_000_000
+                    if index == 0
+                    else base_ns + 10
+                    if index in {1, 3}
+                    else base_ns
+                    if index == 2
+                    else base_ns + index * 1_000_000_000
+                )
+                os.utime(dump_path, ns=(timestamp_ns, timestamp_ns))
+                os.utime(sidecar_path, ns=(timestamp_ns, timestamp_ns))
+
+            unverified_name = "platformdb-20200201T000000Z.dump"
+            self._write_backup_pair(
+                output_dir,
+                unverified_name,
+                b"protected-unverified",
+                restore_verified=False,
+            )
+            unknown_name = "platformdb-20200202T000000Z.dump"
+            unknown_dump, unknown_sidecar = self._write_backup_pair(
+                output_dir,
+                unknown_name,
+                b"protected-unknown",
+                restore_verified=False,
+            )
+            unknown_metadata = json.loads(unknown_sidecar.read_text(encoding="utf-8"))
+            unknown_metadata.pop("restore_verified")
+            unknown_sidecar.write_text(json.dumps(unknown_metadata), encoding="utf-8")
+            unverified_removed_name = "platformdb-20200203T000000Z.dump"
+            self._write_backup_pair(
+                output_dir,
+                unverified_removed_name,
+                b"unverified-removal",
+                restore_verified=False,
+            )
+            unknown_removed_name = "platformdb-20200204T000000Z.dump"
+            _unknown_removed_dump, unknown_removed_sidecar = self._write_backup_pair(
+                output_dir,
+                unknown_removed_name,
+                b"unknown-removal",
+                restore_verified=False,
+            )
+            unknown_removed_metadata = json.loads(
+                unknown_removed_sidecar.read_text(encoding="utf-8")
+            )
+            unknown_removed_metadata.pop("restore_verified")
+            unknown_removed_sidecar.write_text(
+                json.dumps(unknown_removed_metadata), encoding="utf-8"
+            )
+            truthy_unknown_name = "platformdb-20200205T000000Z.dump"
+            _truthy_unknown_dump, truthy_unknown_sidecar = self._write_backup_pair(
+                output_dir,
+                truthy_unknown_name,
+                b"truthy-unknown",
+                restore_verified=False,
+            )
+            truthy_unknown_metadata = json.loads(
+                truthy_unknown_sidecar.read_text(encoding="utf-8")
+            )
+            truthy_unknown_metadata["restore_verified"] = "false"
+            truthy_unknown_sidecar.write_text(
+                json.dumps(truthy_unknown_metadata), encoding="utf-8"
+            )
+            protected_names = [verified_names[0], unverified_name, unknown_name]
+            manifest = self._write_protected_backup_manifest(
+                root / "protected.json", protected_names
+            )
+            dump_body_inventory_reads: list[pathlib.Path] = []
+            real_inventory_file = backup_drill._inventory_file
+
+            def record_inventory_file(path: pathlib.Path):
+                if path.suffix == ".dump":
+                    dump_body_inventory_reads.append(path)
+                return real_inventory_file(path)
+
+            with mock.patch.object(
+                backup_drill, "_inventory_file", side_effect=record_inventory_file
+            ):
+                result = self._create_protected_backup(
+                    output_dir, manifest, keep=5
+                )
+
+            proof = result["protected_retention_proof"]
+            self.assertEqual(result["rotation_mode"], "rotate-existing")
+            self.assertEqual(proof["requested_keep"], 5)
+            self.assertEqual(proof["effective_verified_keep"], 15)
+            selection = proof["verified_selection"]
+            self.assertEqual(selection["available_count"], 18)
+            self.assertEqual(selection["retained_count"], 15)
+            self.assertTrue(
+                backup_drill.valid_protected_retention_proof(
+                    proof,
+                    requested_keep=5,
+                    new_dump_file=result["dump_file"],
+                )
+            )
+            self.assertEqual(
+                [row["dump_file"] for row in selection["candidate_order"][:4]],
+                [verified_names[0], verified_names[2], verified_names[1], verified_names[3]],
+            )
+            self.assertEqual(
+                [row["dump_file"] for row in selection["selected_order"]],
+                [row["dump_file"] for row in selection["candidate_order"][-15:]],
+            )
+            self.assertIn(result["dump_file"], {row["dump_file"] for row in selection["selected_order"]})
+            self.assertEqual(selection["selected_order"], selection["retained_after"])
+            self.assertEqual(
+                proof["protected_pairs"]["before"], proof["protected_pairs"]["after"]
+            )
+            protected_status = {
+                row["dump_file"]: row["restore_verified"]
+                for row in proof["protected_pairs"]["after"]
+            }
+            self.assertEqual(protected_status[unverified_name], "false")
+            self.assertEqual(protected_status[unknown_name], "unknown")
+            self.assertTrue(unknown_dump.exists())
+            self.assertNotIn("restore_verified", json.loads(unknown_sidecar.read_text()))
+            self.assertTrue((output_dir / truthy_unknown_name).exists())
+            self.assertTrue(truthy_unknown_sidecar.exists())
+            self.assertEqual(
+                {row["dump_file"] for row in proof["removed_pairs"]},
+                {
+                    verified_names[1],
+                    verified_names[2],
+                    unverified_removed_name,
+                    unknown_removed_name,
+                },
+            )
+            removed_by_name = {
+                row["dump_file"]: row for row in proof["removed_pairs"]
+            }
+            self.assertEqual(
+                removed_by_name[unverified_removed_name]["restore_status_class"],
+                "false",
+            )
+            self.assertEqual(
+                removed_by_name[unknown_removed_name]["restore_status_class"],
+                "missing",
+            )
+            self.assertEqual(
+                removed_by_name[unverified_removed_name]["reason"], "unverified"
+            )
+            self.assertEqual(
+                removed_by_name[verified_names[1]]["reason"], "verified-retention"
+            )
+            self.assertEqual(
+                proof["removed_pairs_digest"],
+                backup_drill._retention_domain_digest(
+                    "backup-retention-removals", proof["removed_pairs"]
+                ),
+            )
+            self.assertEqual(proof["protected_removed_count"], 0)
+            self.assertEqual(dump_body_inventory_reads, [])
+
+            for mutation in (
+                "reordered",
+                "digest",
+                "count",
+                "eligibility",
+                "malformed_reason",
+            ):
+                with self.subTest(mutation=mutation):
+                    tampered = json.loads(json.dumps(proof))
+                    if mutation == "reordered":
+                        tampered["verified_selection"]["selected_order"].reverse()
+                    elif mutation == "digest":
+                        tampered["verified_selection"]["selected_after_digest"] = "0" * 64
+                    elif mutation == "count":
+                        tampered["verified_selection"]["available_count"] += 1
+                    elif mutation == "eligibility":
+                        unverified_row = next(
+                            row
+                            for row in tampered["removed_pairs"]
+                            if row["reason"] == "unverified"
+                        )
+                        unverified_row["restore_status_class"] = "truthy_or_unsupported"
+                        tampered["removed_pairs_digest"] = backup_drill._retention_domain_digest(
+                            "backup-retention-removals", tampered["removed_pairs"]
+                        )
+                    else:
+                        unverified_row = next(
+                            row
+                            for row in tampered["removed_pairs"]
+                            if row["reason"] == "unverified"
+                        )
+                        unverified_row["reason"] = []
+                        tampered["removed_pairs_digest"] = backup_drill._retention_domain_digest(
+                            "backup-retention-removals", tampered["removed_pairs"]
+                        )
+                    self.assertFalse(
+                        backup_drill.valid_protected_retention_proof(
+                            tampered,
+                            requested_keep=5,
+                            new_dump_file=result["dump_file"],
+                        )
+                    )
+
+    def test_protected_rotation_keeps_fewer_than_the_effective_minimum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            output_dir = root / "backups"
+            output_dir.mkdir()
+            names = []
+            for index in range(2):
+                name = f"platformdb-2020010{index + 1}T000000Z.dump"
+                dump, sidecar = self._write_backup_pair(output_dir, name, b"verified")
+                old_ns = 1_600_000_000_000_000_000 + index * 1_000_000_000
+                os.utime(dump, ns=(old_ns, old_ns))
+                os.utime(sidecar, ns=(old_ns, old_ns))
+                names.append(name)
+            manifest = self._write_protected_backup_manifest(
+                root / "protected.json", [names[0]]
+            )
+
+            result = self._create_protected_backup(output_dir, manifest, keep=4)
+            selection = result["protected_retention_proof"]["verified_selection"]
+
+            self.assertEqual(selection["available_count"], 3)
+            self.assertEqual(selection["retained_count"], 3)
+            self.assertEqual(
+                {row["dump_file"] for row in selection["selected_order"]},
+                set(names) | {result["dump_file"]},
+            )
+            self.assertEqual(result["removed"], [])
+
+    def test_protected_manifest_or_pair_drift_stops_before_pruning(self) -> None:
+        for drift in ("manifest", "pair"):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as temporary_dir:
+                root = pathlib.Path(temporary_dir)
+                output_dir = root / "backups"
+                output_dir.mkdir()
+                protected_name = "platformdb-20200101T000000Z.dump"
+                _dump, sidecar = self._write_backup_pair(
+                    output_dir, protected_name, b"protected"
+                )
+                manifest = self._write_protected_backup_manifest(
+                    root / "protected.json", [protected_name]
+                )
+
+                def mutate_after_restore(*_args: object, **_kwargs: object) -> int:
+                    if drift == "manifest":
+                        manifest.write_text(
+                            json.dumps(
+                                {"schema_version": 1, "protected_dump_files": [protected_name]},
+                                indent=1,
+                            ),
+                            encoding="utf-8",
+                        )
+                        manifest.chmod(0o600)
+                    else:
+                        metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+                        metadata["sha256"] = "a" * 64
+                        sidecar.write_text(json.dumps(metadata), encoding="utf-8")
+                    return 12
+
+                prune_unverified = mock.Mock()
+                prune_verified = mock.Mock()
+                args = argparse.Namespace(
+                    env_file=root / ".env.platform",
+                    output_dir=output_dir,
+                    keep=14,
+                    dump_only=False,
+                    rotate_existing=True,
+                    protected_backup_manifest=manifest,
+                    private_scratch_diagnostics=False,
+                )
+                with self._project_manifest_owner(manifest, 0):
+                    with (
+                        mock.patch.dict(
+                            backup_drill.os.environ,
+                            {"PLATFORM_DATABASE_URL": "postgresql://platform_user@localhost/platformdb"},
+                        ),
+                        mock.patch.object(backup_drill, "load_env", return_value={}),
+                        mock.patch.object(backup_drill, "require_commands"),
+                        mock.patch.object(
+                            backup_drill,
+                            "run_disk_guarded_command",
+                            side_effect=self._fake_guarded_dump,
+                        ),
+                        mock.patch.object(backup_drill, "require_restore_headroom"),
+                        mock.patch.object(
+                            backup_drill,
+                            "_run_isolated_restore_drill",
+                            side_effect=mutate_after_restore,
+                        ),
+                        mock.patch.object(
+                            backup_drill,
+                            "prune_unverified_backups",
+                            prune_unverified,
+                        ),
+                        mock.patch.object(
+                            backup_drill, "prune_backups", prune_verified
+                        ),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "changed during restore verification"):
+                            backup_drill.create_backup(args)
+                prune_unverified.assert_not_called()
+                prune_verified.assert_not_called()
+
+        for prune_kind in ("unverified", "verified"):
+            with (
+                self.subTest(prune_kind=prune_kind),
+                tempfile.TemporaryDirectory() as temporary_dir,
+            ):
+                output_dir = pathlib.Path(temporary_dir) / "backups"
+                output_dir.mkdir()
+                preserve_metadata = output_dir / "current-backup.json"
+                if prune_kind == "unverified":
+                    target_name = "platformdb-20200101T000000Z.dump"
+                    target_dump, target_sidecar = self._write_backup_pair(
+                        output_dir,
+                        target_name,
+                        b"unverified-to-prune",
+                        restore_verified=False,
+                    )
+                    expected_unverified = backup_drill._unverified_backup_candidate_order(
+                        output_dir,
+                        preserve_metadata=preserve_metadata,
+                        protected_dump_files=frozenset(),
+                    )
+                    self.assertEqual(
+                        [row["pair"]["dump_file"] for row in expected_unverified],
+                        [target_name],
+                    )
+                    expected_verified: tuple[dict[str, Any], ...] = ()
+                else:
+                    target_name = "platformdb-20200101T000000Z.dump"
+                    newer_name = "platformdb-20200102T000000Z.dump"
+                    target_dump, target_sidecar = self._write_backup_pair(
+                        output_dir, target_name, b"old-verified"
+                    )
+                    newer_dump, newer_sidecar = self._write_backup_pair(
+                        output_dir, newer_name, b"new-verified"
+                    )
+                    old_ns = 1_600_000_000_000_000_000
+                    new_ns = old_ns + 1_000_000_000
+                    os.utime(target_dump, ns=(old_ns, old_ns))
+                    os.utime(target_sidecar, ns=(old_ns, old_ns))
+                    os.utime(newer_dump, ns=(new_ns, new_ns))
+                    os.utime(newer_sidecar, ns=(new_ns, new_ns))
+                    expected_verified = backup_drill._verified_backup_candidate_order(
+                        output_dir
+                    )
+                    self.assertEqual(expected_verified[0]["dump_file"], target_name)
+                    expected_unverified = ()
+
+                real_pair_row = backup_drill._backup_retention_pair_row
+                pair_row_checks = 0
+
+                def mutate_sidecar_after_pair_check(
+                    candidate_dir: pathlib.Path, dump_name: str
+                ) -> dict[str, Any]:
+                    nonlocal pair_row_checks
+                    row = real_pair_row(candidate_dir, dump_name)
+                    if dump_name == target_name:
+                        pair_row_checks += 1
+                        if pair_row_checks == 2:
+                            metadata = json.loads(target_sidecar.read_text(encoding="utf-8"))
+                            metadata["sha256"] = "b" * 64
+                            target_sidecar.write_text(json.dumps(metadata), encoding="utf-8")
+                    return row
+
+                with mock.patch.object(
+                    backup_drill,
+                    "_backup_retention_pair_row",
+                    side_effect=mutate_sidecar_after_pair_check,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "sidecar changed before retention"):
+                        if prune_kind == "unverified":
+                            backup_drill.prune_unverified_backups(
+                                output_dir,
+                                preserve_metadata=preserve_metadata,
+                                expected_candidate_order=expected_unverified,
+                            )
+                        else:
+                            backup_drill.prune_backups(
+                                output_dir,
+                                keep=1,
+                                verified_only=True,
+                                expected_verified_order=expected_verified,
+                            )
+
+                self.assertEqual(pair_row_checks, 2)
+                self.assertTrue(target_dump.exists())
+                self.assertTrue(target_sidecar.exists())
+
+    def test_unconfigured_pruning_keeps_historical_keep_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            old = output_dir / "platformdb-old.dump"
+            middle = output_dir / "platformdb-middle.dump"
+            newest = output_dir / "platformdb-newest.dump"
+            for index, path in enumerate((old, middle, newest)):
+                path.write_bytes(b"archive")
+                os.utime(path, (1_600_000_000 + index, 1_600_000_000 + index))
+            removed = backup_drill.prune_backups(output_dir, keep=2)
+            self.assertEqual(removed, [str(old)])
+            self.assertFalse(old.exists())
+            self.assertTrue(middle.exists())
+            self.assertTrue(newest.exists())
+
+    def test_invalid_or_incomplete_named_manifest_fails_before_database_or_pruning(self) -> None:
+        valid_name = "platformdb-20200101T000000Z.dump"
+        invalid_documents = (
+            {"schema_version": 1, "protected_dump_files": [valid_name, valid_name]},
+            {"schema_version": 1, "protected_dump_files": ["../outside.dump"]},
+        )
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            output_dir = root / "backups"
+            output_dir.mkdir()
+            manifest = root / "protected.json"
+            for document in invalid_documents:
+                with self.subTest(document=document):
+                    manifest.write_text(json.dumps(document), encoding="utf-8")
+                    manifest.chmod(0o600)
+                    with self._project_manifest_owner(manifest, 0):
+                        with mock.patch.object(
+                            backup_drill, "load_env", side_effect=AssertionError("database path reached")
+                        ), mock.patch.object(backup_drill, "prune_backups") as prune:
+                            with self.assertRaises(RuntimeError):
+                                backup_drill.create_backup(
+                                    argparse.Namespace(
+                                        env_file=root / ".env",
+                                        output_dir=output_dir,
+                                        keep=14,
+                                        dump_only=True,
+                                        rotate_existing=True,
+                                        protected_backup_manifest=manifest,
+                                    )
+                                )
+                    prune.assert_not_called()
+
+            self._write_protected_backup_manifest(manifest, [valid_name])
+            with self._project_manifest_owner(manifest, 0):
+                with mock.patch.object(
+                    backup_drill, "load_env", side_effect=AssertionError("database path reached")
+                ) as load_env, mock.patch.object(backup_drill, "prune_backups") as prune:
+                    with self.assertRaisesRegex(RuntimeError, "missing or unsafe"):
+                        backup_drill.create_backup(
+                            argparse.Namespace(
+                                env_file=root / ".env",
+                                output_dir=output_dir,
+                                keep=14,
+                                dump_only=True,
+                                rotate_existing=True,
+                                protected_backup_manifest=manifest,
+                            )
+                        )
+            load_env.assert_not_called()
+            prune.assert_not_called()
+
+            dump_path, metadata_path = self._write_backup_pair(
+                output_dir, valid_name, b"protected"
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["size_bytes"] += 1
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with self._project_manifest_owner(manifest, 0):
+                with mock.patch.object(
+                    backup_drill, "load_env", side_effect=AssertionError("database path reached")
+                ) as load_env:
+                    with self.assertRaisesRegex(RuntimeError, "incomplete or mismatched"):
+                        backup_drill.create_backup(
+                            argparse.Namespace(
+                                env_file=root / ".env",
+                                output_dir=output_dir,
+                                keep=14,
+                                dump_only=True,
+                                rotate_existing=True,
+                                protected_backup_manifest=manifest,
+                            )
+                        )
+            load_env.assert_not_called()
+            self.assertTrue(dump_path.exists())
+
+    def test_named_manifest_rejects_non_private_or_symlink_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            manifest = self._write_protected_backup_manifest(
+                root / "manifest.json", ["platformdb-20200101T000000Z.dump"]
+            )
+            with self.assertRaisesRegex(RuntimeError, "missing or unsafe"):
+                backup_drill._load_protected_backup_manifest(root / "absent.json")
+            manifest.chmod(0o640)
+            with self._project_manifest_owner(manifest, 0):
+                with self.assertRaisesRegex(RuntimeError, "unsafe metadata"):
+                    backup_drill._load_protected_backup_manifest(manifest)
+            manifest.chmod(0o600)
+            with self._project_manifest_owner(manifest, os.geteuid() + 1):
+                with self.assertRaisesRegex(RuntimeError, "unsafe metadata"):
+                    backup_drill._load_protected_backup_manifest(manifest)
+            link = root / "linked.json"
+            link.symlink_to(manifest)
+            with self.assertRaisesRegex(RuntimeError, "missing or unsafe"):
+                backup_drill._load_protected_backup_manifest(link)
+            hardlink = root / "hardlinked.json"
+            os.link(manifest, hardlink)
+            with self._project_manifest_owner(manifest, 0):
+                with self.assertRaisesRegex(RuntimeError, "unsafe metadata"):
+                    backup_drill._load_protected_backup_manifest(manifest)
+
+    def test_restore_failure_with_named_protection_does_not_prune(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            output_dir = root / "backups"
+            output_dir.mkdir()
+            old_dump, old_metadata = self._write_backup_pair(
+                output_dir, "platformdb-20200101T000000Z.dump", b"retained"
+            )
+            manifest = self._write_protected_backup_manifest(
+                root / "protected.json", [old_dump.name]
+            )
+
+            def write_dump(command: list[str], **_kwargs: object) -> None:
+                dump_path = pathlib.Path(command[command.index("--file") + 1])
+                dump_path.write_bytes(b"new dump bytes")
+
+            args = argparse.Namespace(
+                env_file=root / ".env",
+                output_dir=output_dir,
+                keep=14,
+                dump_only=False,
+                rotate_existing=True,
+                protected_backup_manifest=manifest,
+                private_scratch_diagnostics=False,
+            )
+            with self._project_manifest_owner(manifest, 0):
+                with (
+                    mock.patch.object(
+                        backup_drill,
+                        "load_env",
+                        return_value={
+                            "PLATFORM_DATABASE_URL": (
+                                "postgresql://u:p@127.0.0.1:5432/platformdb"
+                            )
+                        },
+                    ),
+                    mock.patch.dict(
+                        backup_drill.os.environ,
+                        {
+                            "PLATFORM_DATABASE_URL": (
+                                "postgresql://u:p@127.0.0.1:5432/platformdb"
+                            )
+                        },
+                    ),
+                    mock.patch.object(backup_drill, "require_restore_headroom"),
+                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(backup_drill, "run_disk_guarded_command", side_effect=write_dump),
+                    mock.patch.object(
+                        backup_drill,
+                        "_run_isolated_restore_drill",
+                        side_effect=RuntimeError("synthetic restore failure"),
+                    ),
+                    mock.patch.object(backup_drill, "prune_unverified_backups") as prune_unverified,
+                    mock.patch.object(backup_drill, "prune_backups") as prune_verified,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "synthetic restore failure"):
+                        backup_drill.create_backup(args)
+
+            prune_unverified.assert_not_called()
+            prune_verified.assert_not_called()
+            self.assertEqual(old_dump.read_bytes(), b"retained")
+            self.assertTrue(old_metadata.exists())
 
     def test_restore_failure_does_not_prune_existing_backups(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -6112,7 +6906,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             old_verified: list[pathlib.Path] = []
             base_time = dt.datetime(2026, 9, 1, tzinfo=dt.UTC).timestamp()
             for index in range(16):
-                dump = output_dir / f"platformdb-verified-{index:02}.dump"
+                timestamp = dt.datetime(2026, 9, 1, tzinfo=dt.UTC) + dt.timedelta(seconds=index)
+                dump = output_dir / f"platformdb-{timestamp.strftime('%Y%m%dT%H%M%SZ')}.dump"
                 sidecar = dump.with_suffix(".json")
                 dump.write_bytes(f"old-{index}".encode())
                 sidecar.write_text(
@@ -6123,7 +6918,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 os.utime(dump, (old_time, old_time))
                 os.utime(sidecar, (old_time, old_time))
                 old_verified.append(dump)
-            failed_dump = output_dir / "platformdb-unverified.dump"
+            failed_dump = output_dir / "platformdb-20260901T000100Z.dump"
             failed_metadata = failed_dump.with_suffix(".json")
             failed_dump.write_bytes(b"old-unverified")
             failed_metadata.write_text(
@@ -6185,6 +6980,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 result = backup_drill.create_backup(args)
 
             self.assertEqual(result["rotation_mode"], "rotate-existing")
+            self.assertNotIn("protected_retention_proof", result)
             self.assertEqual(
                 events, ["directory-fsync", "prune-unverified", "prune-backups"]
             )
@@ -6192,7 +6988,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertFalse(failed_dump.exists())
             self.assertFalse(failed_metadata.exists())
             self.assertEqual(
-                len(tuple(output_dir.glob("platformdb-verified-*.dump"))),
+                sum(dump.exists() for dump in old_verified),
                 13,
             )
             self.assertEqual(

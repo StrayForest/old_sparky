@@ -34,6 +34,7 @@ WORKFLOW_DIR = PLATFORM_ROOT.parent / ".github" / "workflows"
 sys.path.insert(0, str(TOOLS_DIR))
 import platform_safe_env_exec as safe_env  # noqa: E402
 from tools import platform_nginx_error_summary  # noqa: E402
+from tools import platform_maintenance_qa_evidence  # noqa: E402
 from tools import platform_media_migration_diagnostics_summary  # noqa: E402
 from tools import platform_web_runtime_diagnostics_summary  # noqa: E402
 from tools import platform_install_nginx  # noqa: E402
@@ -2514,6 +2515,24 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             "\n          CURRENT_STAGE=postchecks\n", service_start
         )
         service_caller = textwrap.dedent(workflow[service_start:service_end])
+        snapshot_start = service_caller.find("snapshot-protected-backup-manifest")
+        self.assertGreaterEqual(snapshot_start, 0)
+        self.assertLess(
+            snapshot_start,
+            service_caller.index("systemctl start deadlock-maintenance.service"),
+        )
+        snapshot_block_start = service_caller.rfind(
+            "if ! protected_manifest_before_digest=", 0, snapshot_start
+        )
+        snapshot_block_end = service_caller.index("service_state_before=", snapshot_start)
+        self.assertGreaterEqual(snapshot_block_start, 0)
+        service_caller = (
+            service_caller[:snapshot_block_start]
+            + "protected_manifest_before_digest="
+            + shlex.quote("a" * 64)
+            + "\n"
+            + service_caller[snapshot_block_end:]
+        )
         report_failure_start = workflow.index(
             "          if (( report_binding_status != 0 )); then", service_end
         )
@@ -2701,6 +2720,14 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     TOOLS_DIR / "platform_workflow_provenance.py",
                     current_release_tools / "platform_workflow_provenance.py",
                 )
+                for helper_name in (
+                    "platform_backup_restore_drill.py",
+                    "platform_disk_policy.py",
+                ):
+                    shutil.copyfile(
+                        TOOLS_DIR / helper_name,
+                        current_release_tools / helper_name,
+                    )
                 installed_summary_tool = current_release_tools / summary_tool.name
                 shutil.copyfile(summary_tool, installed_summary_tool)
 
@@ -2709,6 +2736,15 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 calls = root / "invocation-count"
                 started = root / "service-started"
                 systemctl = mock_bin / "systemctl"
+                expected_maintenance_argv = (
+                    platform_maintenance_qa_evidence.EXPECTED_MAINTENANCE_ARGV
+                )
+                mocked_exec_start = (
+                    f"ExecStart={{ path={expected_maintenance_argv[0]} ; "
+                    f"argv[]={' '.join(expected_maintenance_argv)} ; "
+                    "ignore_errors=no ; start_time= ; stop_time= ; pid=0 ; "
+                    "code=(null) ; status=0/SUCCESS }"
+                )
                 unit_properties = "\n".join(
                     (
                         "FragmentPath=/etc/systemd/system/deadlock-maintenance.service",
@@ -2716,7 +2752,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                         "NeedDaemonReload=no",
                         "ActiveState=inactive",
                         "SubState=dead",
-                        "ExecStart={ path=/opt/oldsparky/platform/shared/venv/bin/python ; argv[]=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_storage_maintenance.py --apply --preserve-existing-backups --backup-keep 14 --release-keep 5 --test-artifact-max-age-days 7 --screenshot-max-age-days 30 --failed-build-max-age-days 1 --minimum-free-gib 5 --maximum-used-percent 85 ; ignore_errors=no ; start_time= ; stop_time= ; pid=0 ; code=(null) ; status=0/SUCCESS }",
+                        mocked_exec_start,
                         "CPUQuotaPerSecUSec=500ms",
                         "MemoryMax=536870912",
                         "TimeoutStartUSec=30min",

@@ -27,6 +27,8 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import platform_backup_restore_drill as backup_restore_drill
+
 from platform_workflow_provenance import (
     ProvenanceError,
     validate_workflow_run,
@@ -43,9 +45,17 @@ MAX_API_BYTES = 4 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_UNPACKED_BYTES = 1024 * 1024
 MAX_REPORT_BYTES = 128 * 1024
+MAX_MAINTENANCE_REPORT_BYTES = 256 * 1024
 RUN_ID_RE = re.compile(r"[1-9][0-9]{0,31}\Z")
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+BACKUP_DUMP_RE = re.compile(r"platformdb-[0-9]{8}T[0-9]{6}Z\.dump\Z")
+MAINTENANCE_REPORT_RE = re.compile(r"platform-maintenance-[0-9]{8}T[0-9]{6}Z\.json\Z")
+PROTECTED_BACKUP_MANIFEST_PATH = Path(
+    "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json"
+)
+MAINTENANCE_REPORT_DIRECTORY = Path("/opt/oldsparky/platform/shared/maintenance")
+PROTECTED_BACKUP_KEEP = 15
 UNIT_PROPERTY_KEYS = frozenset(
     {
         "FragmentPath",
@@ -73,9 +83,10 @@ EXPECTED_MAINTENANCE_ARGV = (
     "/opt/oldsparky/platform/shared/venv/bin/python",
     "/opt/oldsparky/platform/current/tools/platform_storage_maintenance.py",
     "--apply",
-    "--preserve-existing-backups",
+    "--protected-backup-manifest",
+    "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json",
     "--backup-keep",
-    "14",
+    "15",
     "--release-keep",
     "5",
     "--test-artifact-max-age-days",
@@ -179,6 +190,169 @@ def _strict_json(raw: bytes) -> dict[str, Any]:
     if not isinstance(value, dict):
         _fail()
     return value
+
+
+def protected_backup_manifest_snapshot_digest() -> str:
+    """Return only the digest of the exact private manifest snapshot."""
+
+    snapshot = backup_restore_drill._protected_backup_manifest_snapshot(
+        PROTECTED_BACKUP_MANIFEST_PATH
+    )
+    digest = snapshot.get("digest") if isinstance(snapshot, dict) else None
+    if not isinstance(digest, str) or DIGEST_RE.fullmatch(digest) is None:
+        _fail()
+    return digest
+
+
+def _read_private_maintenance_report(path_value: str) -> dict[str, Any]:
+    if (
+        not isinstance(path_value, str)
+        or "\x00" in path_value
+        or len(path_value) > 512
+    ):
+        _fail()
+    path = Path(path_value)
+    if (
+        path.parent != MAINTENANCE_REPORT_DIRECTORY
+        or MAINTENANCE_REPORT_RE.fullmatch(path.name) is None
+    ):
+        _fail()
+    try:
+        parent = path.parent.lstat()
+        resolved_parent = path.parent.resolve(strict=True)
+        named = path.lstat()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError:
+        _fail()
+    try:
+        if (
+            resolved_parent != path.parent
+            or not stat.S_ISDIR(parent.st_mode)
+            or stat.S_ISLNK(parent.st_mode)
+            or parent.st_uid != 0
+            or parent.st_gid != 0
+            or stat.S_IMODE(parent.st_mode) & 0o022
+        ):
+            _fail()
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size <= 0
+            or before.st_size > MAX_MAINTENANCE_REPORT_BYTES
+            or (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            _fail()
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            block = os.read(
+                descriptor,
+                min(8192, MAX_MAINTENANCE_REPORT_BYTES + 1 - total),
+            )
+            if not block:
+                break
+            total += len(block)
+            if total > MAX_MAINTENANCE_REPORT_BYTES:
+                _fail()
+            chunks.append(block)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+        identity_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_gid",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if (
+            total != before.st_size
+            or any(getattr(before, field) != getattr(after, field) for field in identity_fields)
+            or any(getattr(after, field) != getattr(current, field) for field in identity_fields)
+        ):
+            _fail()
+    finally:
+        os.close(descriptor)
+    return _strict_json(b"".join(chunks))
+
+
+def validate_protected_retention_report(
+    report: dict[str, Any], expected_manifest_digest: str
+) -> None:
+    """Bind private rotation evidence to the pre-service manifest snapshot."""
+
+    if (
+        not isinstance(report, dict)
+        or report.get("mode") != "apply"
+        or type(report.get("ok")) is not bool
+        or not isinstance(expected_manifest_digest, str)
+        or DIGEST_RE.fullmatch(expected_manifest_digest) is None
+    ):
+        _fail()
+    backup = report.get("backup")
+    if not isinstance(backup, dict):
+        _fail()
+    archive_name = backup.get("archive_name")
+    archive_sha256 = backup.get("archive_sha256")
+    archive_size = backup.get("size_bytes")
+    proof = backup.get("protected_retention_proof")
+    if (
+        backup.get("status") != "completed"
+        or backup.get("created") is not True
+        or backup.get("restore_verified") is not True
+        or backup.get("alembic_revision_verified") is not True
+        or backup.get("checksum_present") is not True
+        or backup.get("rotation_mode") != "rotate-existing"
+        or type(backup.get("format_version")) is not int
+        or backup["format_version"] != 2
+        or not isinstance(archive_name, str)
+        or BACKUP_DUMP_RE.fullmatch(archive_name) is None
+        or not isinstance(archive_sha256, str)
+        or DIGEST_RE.fullmatch(archive_sha256) is None
+        or type(archive_size) is not int
+        or archive_size <= 0
+        or not backup_restore_drill.valid_protected_retention_proof(
+            proof,
+            requested_keep=PROTECTED_BACKUP_KEEP,
+            new_dump_file=archive_name,
+        )
+    ):
+        _fail()
+    manifest = proof.get("manifest")
+    selection = proof.get("verified_selection")
+    removed_pair_count = proof.get("removed_pair_count")
+    if (
+        not isinstance(manifest, dict)
+        or not isinstance(manifest.get("before"), dict)
+        or manifest["before"].get("digest") != expected_manifest_digest
+        or not isinstance(selection, dict)
+        or not isinstance(selection.get("selected_order"), list)
+        or type(removed_pair_count) is not int
+        or type(backup.get("removed_count")) is not int
+        or backup["removed_count"] != 2 * removed_pair_count
+    ):
+        _fail()
+    matching_archive = [
+        row
+        for row in selection["selected_order"]
+        if isinstance(row, dict) and row.get("dump_file") == archive_name
+    ]
+    if (
+        len(matching_archive) != 1
+        or matching_archive[0].get("claimed_sha256") != archive_sha256
+        or matching_archive[0].get("claimed_size_bytes") != archive_size
+    ):
+        _fail()
 
 
 def _positive_id(value: object) -> int:
@@ -889,6 +1063,30 @@ def verify_qa_evidence(
 
 def main(argv: list[str] | None = None) -> int:
     actual_argv = sys.argv[1:] if argv is None else argv
+    if actual_argv[:1] == ["snapshot-protected-backup-manifest"]:
+        snapshot_parser = argparse.ArgumentParser(description=__doc__)
+        snapshot_parser.add_argument("mode")
+        snapshot_parser.parse_args(actual_argv)
+        try:
+            print(protected_backup_manifest_snapshot_digest())
+        except Exception:
+            print("MAINTENANCE_RETENTION_MANIFEST schema=1 status=unavailable", file=sys.stderr)
+            return 1
+        return 0
+    if actual_argv[:1] == ["validate-protected-retention-report"]:
+        retention_parser = argparse.ArgumentParser(description=__doc__)
+        retention_parser.add_argument("mode")
+        retention_parser.add_argument("report_path")
+        retention_parser.add_argument("manifest_digest")
+        args = retention_parser.parse_args(actual_argv)
+        try:
+            report = _read_private_maintenance_report(args.report_path)
+            validate_protected_retention_report(report, args.manifest_digest)
+        except Exception:
+            print("MAINTENANCE_RETENTION_PROOF schema=1 status=unavailable", file=sys.stderr)
+            return 1
+        print("MAINTENANCE_RETENTION_PROOF schema=1 status=verified")
+        return 0
     if actual_argv[:1] == ["validate-maintenance-unit"]:
         unit_parser = argparse.ArgumentParser(description=__doc__)
         unit_parser.add_argument("mode")

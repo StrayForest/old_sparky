@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-09-29
+- Last reviewed: 2026-10-16
 
 ## Runtime checks
 
@@ -48,7 +48,7 @@ Maintenance keeps:
 | --- | --- |
 | production releases | newest 5; always protect `current` and `previous` |
 | local release artifacts | newest 5 matching release groups |
-| verified DB backups | all pairs preserved by installed full maintenance |
+| verified DB backups | generic callers retain their existing default; backup-only preserves all complete pairs; the canonical unit in this source tree opts into fixed-manifest rotation, protecting named pairs plus the newest `max(keep, 15)` verified pairs ([policy](backup-retention-protection.md)) |
 | Playwright results on the production/pre-production host | 7 days |
 | GitHub Actions Playwright and CI evidence artifacts | 14 days |
 | trusted live-QA generations | protect the active/current/previous source SHAs; remove only older inactive generations after exact identity checks |
@@ -58,7 +58,7 @@ Maintenance keeps:
 | Nginx/system text logs | rotate at 50 MiB, keep 7 compressed files |
 | failed-login `btmp` | rotate at 16 MiB, keep 2 uncompressed files |
 
-It never deletes shared env/runtimes, upload staging, current/previous releases, active/source-protected live-QA generations or caches, business rows or canonical reports; backup failure stops pruning. Full maintenance preserves every backup pair while running other retention; backup-only also preserves pairs but skips other retention, and generic callers retain configured rotation (see the [backup and restore runbook](backup-restore-runbook.md)).
+It never deletes shared env/runtimes, upload staging, current/previous releases, active/source-protected live-QA generations or caches, business rows or canonical reports; backup failure stops pruning. The canonical unit in this source tree uses the fixed protected-pair manifest while running other retention. Backup-only preserves complete pairs but skips other retention; generic callers retain their existing rotation (see the [backup and restore runbook](backup-restore-runbook.md)). The currently deployed unit remains unchanged until the reviewed source is released; see the [named backup retention policy](backup-retention-protection.md).
 Live-QA cache pruning holds the machine-wide lock, requires an idle browser cgroup and user, accepts only root-owned non-symlink `runtime-<40 lowercase hex>` trees, retains the newest valid unprotected fallback, and treats keep as a hard cap rather than an age window.
 Health monitoring and storage maintenance share one conservative hard gate: available free space must be at least 5 GiB and conservative use (`total - available`, including filesystem-reserved headroom) must be at most 85%; exact 5 GiB and 85% boundaries pass, and 80% is not a failure threshold.
 The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it.
@@ -123,7 +123,7 @@ Preview live-QA runtime cache retention (also machine-locked and idle-gated):
   prune-runtime-cache --keep 1
 ```
 
-The preview is dry-run unless `--apply` and takes release then live-QA locks; the installed full service preserves backups while running other retention and health checks. Growth is unbounded; unchanged 5 GiB/85% gates fail closed, and this rollout enables the timer only through the source-bound workflow after load/CPU/live-QA evidence passes. After each run, follow `.agents/skills/platform-storage-retention/SKILL.md` for exact cleanup; never use broad deletion.
+The preview is dry-run unless `--apply` and takes release then live-QA locks; the maintenance unit in this source tree uses the fixed named-pair policy while running other retention and health checks. Growth is bounded by its named-plus-recent policy and unchanged 5 GiB/85% gates. The rollout enables the timer only through the source-bound workflow after load/CPU/live-QA evidence passes. After each run, follow `.agents/skills/platform-storage-retention/SKILL.md` for exact cleanup; never use broad deletion.
 
 ## Prepared media and R2
 

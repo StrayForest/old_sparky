@@ -314,6 +314,13 @@ jobs:
           fi
           test "$(readlink -f "$current")" = "$current_before" \
             || fail_with_status maintenance_unit_contract_unavailable 2
+          if ! protected_manifest_before_digest="$(/usr/bin/python3 -I \
+            "$maintenance_unit_validator" snapshot-protected-backup-manifest \
+            2>/dev/null)"; then
+            fail_with_status protected_manifest_snapshot_unavailable 2
+          fi
+          [[ "$protected_manifest_before_digest" =~ ^[0-9a-f]{64}$ ]] \
+            || fail_with_status protected_manifest_snapshot_unavailable 2
           service_state_before="$(systemctl show deadlock-maintenance.service \
             --property=ActiveState --value --no-pager 2>/dev/null)" \
             || fail "Maintenance service state producer failed."
@@ -460,6 +467,7 @@ jobs:
                   production = payload.get("production_releases")
                   protected = production.get("protected") if isinstance(production, dict) else None
                   backup = payload.get("backup")
+                  proof = backup.get("protected_retention_proof") if isinstance(backup, dict) else None
                   if (
                       not isinstance(protected, list)
                       or current_id not in protected
@@ -469,21 +477,11 @@ jobs:
                       or backup.get("created") is not True
                       or backup.get("restore_verified") is not True
                       or backup.get("alembic_revision_verified") is not True
-                      or backup.get("rotation_mode") != "preserve-existing"
-                      or backup.get("preexisting_archives_preserved") is not True
-                      or type(backup.get("preexisting_archive_count")) is not int
-                      or backup["preexisting_archive_count"] < 0
-                      or type(backup.get("preexisting_sidecar_count")) is not int
-                      or backup["preexisting_sidecar_count"] != backup["preexisting_archive_count"]
-                      or type(backup.get("postexisting_archive_count")) is not int
-                      or backup["postexisting_archive_count"] != backup["preexisting_archive_count"] + 1
-                      or backup.get("removed") != []
+                      or backup.get("rotation_mode") != "rotate-existing"
+                      or not isinstance(proof, dict)
+                      or proof.get("status") != "pass"
                       or type(backup.get("removed_count")) is not int
-                      or backup.get("removed_count") != 0
-                      or not isinstance(backup.get("preexisting_archive_inventory_sha256"), str)
-                      or not re.fullmatch(r"[0-9a-f]{64}", backup["preexisting_archive_inventory_sha256"])
-                      or backup.get("preexisting_archive_inventory_sha256")
-                         != backup.get("postexisting_archive_inventory_sha256")
+                      or backup["removed_count"] < 0
                   ):
                       continue
                   report_started = datetime.fromisoformat(
@@ -520,6 +518,12 @@ jobs:
           [[ "$report_name" =~ ^platform-maintenance-[0-9]{8}T[0-9]{6}Z\.json$ ]] \
             || fail "Bound maintenance report name is invalid."
           latest_report="$report_dir/$report_name"
+          CURRENT_STAGE=retention_proof
+          if ! /usr/bin/python3 -I "$maintenance_unit_validator" \
+            validate-protected-retention-report "$latest_report" \
+            "$protected_manifest_before_digest" >/dev/null 2>&1; then
+            fail_with_status protected_retention_proof_unavailable 2
+          fi
           CURRENT_STAGE=retention_summary
           retention_summary_file="$(mktemp)"
           trap 'rm -f -- "$retention_summary_file"' EXIT
@@ -529,7 +533,6 @@ jobs:
           maintenance_result="$(/usr/bin/python3 -I - \
             "$retention_summary_file" "$service_status" <<'PY'
           import json
-          import re
           from pathlib import Path
           import sys
 
@@ -544,21 +547,9 @@ jobs:
               raise SystemExit(2)
           if backup.get("created") is not True or backup.get("alembic_revision_verified") is not True:
               raise SystemExit(2)
-          preexisting_archives = backup.get("preexisting_archive_count")
-          preexisting_sidecars = backup.get("preexisting_sidecar_count")
-          postexisting_archives = backup.get("postexisting_archive_count")
           if (
-              backup.get("rotation_mode") != "preserve-existing"
-              or backup.get("preexisting_archives_preserved") is not True
-              or type(preexisting_archives) is not int or preexisting_archives < 0
-              or type(preexisting_sidecars) is not int or preexisting_sidecars != preexisting_archives
-              or type(postexisting_archives) is not int or postexisting_archives != preexisting_archives + 1
-              or type(backup.get("removed_count")) is not int
-              or backup.get("removed_count") != 0
-              or not isinstance(backup.get("preexisting_archive_inventory_sha256"), str)
-              or not re.fullmatch(r"[0-9a-f]{64}", backup["preexisting_archive_inventory_sha256"])
-              or backup.get("preexisting_archive_inventory_sha256")
-                 != backup.get("postexisting_archive_inventory_sha256")
+              backup.get("rotation_mode") != "rotate-existing"
+              or backup.get("checksum_present") is not True
           ):
               raise SystemExit(2)
           free_bytes = disk.get("free_bytes")
@@ -585,8 +576,7 @@ jobs:
               "status": status,
               "error_class": error_class,
               "service_exit_code": service_status,
-              "backup_preservation_status": "verified",
-              "preexisting_backup_count": preexisting_archives,
+              "backup_retention_status": "protected_plus_latest_verified",
               "minimum_free_bytes": minimum_free,
               "maximum_used_percent": maximum_used,
               "free_bytes": free_bytes,

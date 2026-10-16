@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-15
+- Last reviewed: 2026-10-16
 
 ## Local verified backup
 
@@ -21,7 +21,7 @@ inside the private cluster. SQL restore and validation use a passwordless
 Production PostgreSQL is never used as the restore target. The disposable
 cluster is stopped and its unit and mount are confirmed gone before a verified
 backup pair is published. Ordinary rotating maintenance retains 14 verified
-copies; backup-only preserve-existing mode keeps every complete pair.
+copies; backup-only preserve-existing mode keeps every complete pair; see [named backup retention](backup-retention-protection.md) for opt-in rotation.
 
 The lock-aware storage-maintenance path calls backup creation and freshness
 verification in-process, avoiding a second Python interpreter during the
@@ -210,23 +210,23 @@ removes only the exact newly published inodes and leaves pre-existing pairs
 untouched; failure to confirm that rollback is reported as an integrity error.
 
 Backup-only preserves every complete archive/metadata pair that exists before
-the run; it does not apply the 14-copy rotation limit. Under the ordered
-maintenance locks, it validates that each sidecar names the matching dump and
-records its exact size and SHA-256. The preservation inventory hashes both
-files and binds their paths, inode identities, modes, link counts, sizes and
-modification times. The operation checks that inventory before publishing and
-afterward, confirms exactly one new complete pair, and fails closed on an
-orphan, mismatch or change. It never deletes a pre-existing pair. The
-installed full-maintenance service also runs with
-`--preserve-existing-backups`: it preserves every pre-existing pair and adds
-one restore-verified pair while continuing the other retention and health
-checks. Its configured `--backup-keep 14` remains part of the CLI contract but
-does not delete backups in this mode. Disk use can grow without a fixed upper
-bound; the unchanged 5 GiB/85% disk gate fails maintenance closed rather than
-rotating backups when storage is low. Generic full-maintenance callers that do
-not opt into this service policy retain the existing rotation behavior. The
-low-level backup CLI retains its historical rotation default; the lock-aware
-backup-only caller explicitly selects preservation.
+the run; it does not apply the ordinary 14-copy rotation limit. The
+lock-aware backup-only caller does not need a separate preservation flag.
+Generic full-maintenance callers without a protected manifest retain the
+existing rotation behavior. The canonical maintenance unit in this source
+tree opts into the fixed private manifest described in the [named backup
+retention policy](backup-retention-protection.md), with `--backup-keep 15`.
+It retains the named pairs plus the newest `max(keep, 15)` pairs whose
+sidecars explicitly mark restore verification true. The production host still
+runs the previously published unit until this source passes its release
+chain. The low-level backup CLI retains its historical default.
+
+Manifest input and listed pairs are checked before DB work; the manifest and
+pair identities are rechecked around pruning. The private proof records each
+deleted pair's pre-delete identities, sidecar claims, reason and falsey
+restore-status class where applicable. It does not hash dump payloads. Drift
+fails closed, but pruning that already began is not transactional. Public
+summaries omit manifest names, paths and proof digests.
 
 For a reviewed `dev` release, an operator may run the same guarded backup
 through GitHub Actions without opening a direct production shell. The backup

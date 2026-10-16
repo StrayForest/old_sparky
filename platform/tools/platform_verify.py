@@ -952,14 +952,67 @@ def dispatch(gate_id: str, arguments: Sequence[str] = ()) -> int:
     return _dispatch_deterministic(gate_id, arguments)
 
 
+def _prepare_ci_backend_database() -> int:
+    """Recreate the migrated disposable schema after migration cleanup."""
+
+    child_env, resource_settings = _validated_privileged_environment()
+    if child_env.get("PLATFORM_TEST_AGGREGATE_ONLY") == "1":
+        raise VerificationError(
+            "CI database preparation is unavailable in aggregate-only manifest mode"
+        )
+    try:
+        try:
+            from tools.platform_migration_support import (
+                MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
+                validate_disposable_migration_target,
+            )
+            from tools.platform_verification_lock import (
+                VerificationLockError,
+                verification_resource_lock,
+            )
+        except ModuleNotFoundError:  # Direct execution from platform/tools.
+            from platform_migration_support import (
+                MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
+                validate_disposable_migration_target,
+            )
+            from platform_verification_lock import (  # type: ignore[no-redef]
+                VerificationLockError,
+                verification_resource_lock,
+            )
+
+        validate_disposable_migration_target(
+            resource_settings.get("platform_database_url"),
+            environment=resource_settings.get("platform_environment"),
+            schema=resource_settings.get("platform_db_schema"),
+        )
+        python = _privileged_runner_python(child_env)
+        with verification_resource_lock("migration"):
+            return _run(
+                "ci-backend-database-bootstrap",
+                [python, "-m", "alembic", "upgrade", "head"],
+                env=child_env,
+                timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+    except VerificationLockError as exc:
+        raise VerificationError(
+            "CI backend database preparation could not acquire its migration lock"
+        ) from exc
+    except VerificationError:
+        raise
+    except Exception as exc:
+        raise VerificationError(
+            "CI backend database preparation is unsafe or unavailable"
+        ) from exc
+
+
 def dispatch_ci() -> int:
     """Run the deterministic aggregate and refuse production-only contours."""
 
     if any(not GATES_BY_ID[gate_id].deterministic for gate_id in CI_GATE_IDS):
         raise VerificationError("CI aggregate contains a non-deterministic gate.")
-    # A local host may provide one shared platformdb_test/Redis pair. Bootstrap
-    # its schema before the backend aggregate; the contour lock then keeps the
-    # migration and resource-bearing backend contours mutually exclusive.
+    # The migration scenario always clears its disposable schema in its
+    # finally block. Reapply the source head before backend preflight, using
+    # the same validated test target and migration lock.
     ordered_gate_ids = (
         "migration",
         "backend",
@@ -969,6 +1022,10 @@ def dispatch_ci() -> int:
         status = dispatch(gate_id)
         if status:
             return status
+        if gate_id == "migration":
+            status = _prepare_ci_backend_database()
+            if status:
+                return status
     return 0
 
 

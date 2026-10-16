@@ -30,6 +30,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
 | Missing immutable LiveQA engine provider | [Provider recovery runbook](liveqa-provider-recovery.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |
+| Named backup-pair rotation and rollback | [Named backup retention](backup-retention-protection.md) |
 | Exceptional fallback runtime cache compaction | [Fallback cache compaction](fallback-runtime-cache-compaction-runbook.md) |
 | Services, storage, media and performance | [Operations runbook](operations-runbook.md) |
 | Retained-load cleanup and hermetic web verification | [Retained-load and web verification](retained-load-and-web-verification.md) |

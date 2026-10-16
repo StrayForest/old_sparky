@@ -427,6 +427,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 json={"return_to": f"/{self.prefix}/provider-failure"},
                 headers=same_origin_request_headers(client),
             )
+        self.assertEqual(started.status_code, 200, "Steam login start should succeed")
         return_to = parse_qs(urlparse(started.json()["authorization_url"]).query)[
             "openid.return_to"
         ][0]
@@ -457,6 +458,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 json={"return_to": f"/{self.prefix}/rate-limited"},
                 headers=same_origin_request_headers(client),
             )
+        self.assertEqual(started.status_code, 200, "Steam login start should succeed")
         return_to = parse_qs(urlparse(started.json()["authorization_url"]).query)[
             "openid.return_to"
         ][0]
