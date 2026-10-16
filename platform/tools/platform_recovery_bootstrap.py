@@ -59,11 +59,15 @@ CAPABILITY = "abort_retained_only"
 RECOVER_PENDING_CAPABILITY = "recover_pending"
 QUARANTINE_POPULATED_QUIESCE_CAPABILITY = "quarantine_populated_quiesce"
 PRUNE_TASK_RELEASES_CAPABILITY = "prune_task_releases"
+CAPTURE_MAINTENANCE_FAILURE_CAPABILITY = "capture_maintenance_failure"
+RESET_MAINTENANCE_FAILED_CAPABILITY = "reset_maintenance_failed"
 RECOVERY_CAPABILITIES = [
     CAPABILITY,
     RECOVER_PENDING_CAPABILITY,
     QUARANTINE_POPULATED_QUIESCE_CAPABILITY,
     PRUNE_TASK_RELEASES_CAPABILITY,
+    CAPTURE_MAINTENANCE_FAILURE_CAPABILITY,
+    RESET_MAINTENANCE_FAILED_CAPABILITY,
 ]
 ENTRYPOINT = "platform_abort_retained_only.sh"
 MEMBER_ROOT = "platform-recovery-bootstrap"
@@ -135,6 +139,7 @@ RECOVERY_FILES = (
     "platform_live_qa_runtime_install.py",
     "platform_recover_pending.sh",
     "platform_release_retention.py",
+    "platform_maintenance_failure_evidence.py",
 )
 
 

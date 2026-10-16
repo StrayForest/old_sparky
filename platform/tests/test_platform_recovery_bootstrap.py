@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from tools import platform_recovery_bootstrap as recovery
+from tools import platform_maintenance_failure_evidence as maintenance_evidence
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
@@ -260,6 +261,8 @@ class RecoveryBootstrapBundleTests(unittest.TestCase):
                 "recover_pending",
                 "quarantine_populated_quiesce",
                 "prune_task_releases",
+                "capture_maintenance_failure",
+                "reset_maintenance_failed",
             ],
         )
 
@@ -1086,6 +1089,30 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         )
         self.assertIn("platform_recovery_bootstrap.py\" install", workflow)
         self.assertIn("platform_abort_retained_only.sh", workflow)
+        self.assertIn("platform_maintenance_failure_evidence.py", workflow)
+        self.assertIn("platform-maintenance-failure-${{ github.run_id }}-${{ github.run_attempt }}", workflow)
+        self.assertGreaterEqual(workflow.count("github.event.repository.visibility"), 2)
+        self.assertIn("test \"$REPOSITORY_VISIBILITY\" = private", workflow)
+        self.assertIn("retention-days: 1", workflow)
+        self.assertIn('size_in_bytes"] <= 1024 * 1024', workflow)
+        self.assertIn('os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW', workflow)
+        self.assertIn('"UnitFileState"', workflow)
+        self.assertIn('UnitFileState") not in {"disabled", "masked"}', workflow)
+        self.assertIn('payload.get("unit", {}).get("MainPID") != "0"', workflow)
+        self.assertNotIn('ExecMainStatus") != "3"', workflow)
+        self.assertIn("EXPECTED_EVIDENCE_SHA256", workflow)
+        self.assertIn("--capability \"$action\"", workflow)
+        self.assertIn("reset_maintenance_failed", workflow)
+        self.assertIn("capture_maintenance_failure", workflow)
+        self.assertIn("gh attestation verify", workflow)
+        maintenance_helper = (
+            TOOLS / "platform_maintenance_failure_evidence.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('[SYSTEMCTL, "reset-failed", UNIT]', maintenance_helper)
+        self.assertNotIn('[SYSTEMCTL, "start", UNIT]', maintenance_helper)
+        self.assertNotIn('[SYSTEMCTL, "restart", UNIT]', maintenance_helper)
+        self.assertIn("_validate_evidence(", maintenance_helper)
+        self.assertIn("host_id_sha256", maintenance_helper)
         self.assertIn("platform_release_lock.sh\" --run", workflow)
         self.assertNotIn("git checkout", workflow)
         self.assertNotIn("platform_release_deploy", workflow)
@@ -3807,6 +3834,225 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             self.assertIn(
                 "platform/tools/platform_recovery_bootstrap.py", representation
             )
+
+
+class MaintenanceFailureEvidenceTests(unittest.TestCase):
+    def _properties(self, unit: str) -> dict[str, str]:
+        return {
+            "ActiveState": "failed" if unit == maintenance_evidence.UNIT else "inactive",
+            "SubState": "failed" if unit == maintenance_evidence.UNIT else "dead",
+            "Result": "signal" if unit == maintenance_evidence.UNIT else "success",
+            "ExecMainCode": "killed" if unit == maintenance_evidence.UNIT else "exited",
+            "ExecMainStatus": "17" if unit == maintenance_evidence.UNIT else "0",
+            "MainPID": "0",
+            "ExecMainPID": "4321" if unit == maintenance_evidence.UNIT else "0",
+            "ControlGroup": "",
+            "ExecMainStartTimestamp": "Mon 2026-10-12 01:00:00 UTC",
+            "ExecMainExitTimestamp": "Mon 2026-10-12 01:00:01 UTC",
+            "StateChangeTimestamp": "Mon 2026-10-12 01:00:01 UTC",
+            "UnitFileState": "disabled" if unit == maintenance_evidence.TIMER else "enabled",
+        }
+
+    def test_capture_writes_private_digest_bound_evidence_without_printing_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app"
+            app.mkdir()
+            (app / "releases").mkdir()
+            (app / "shared").mkdir()
+            output = root / "evidence.json"
+            def capture_properties(unit: str) -> dict[str, str]:
+                properties = self._properties(unit)
+                if unit == maintenance_evidence.TIMER:
+                    properties["ActiveState"] = "active"
+                    properties["UnitFileState"] = "enabled"
+                return properties
+            with (
+                mock.patch.object(maintenance_evidence, "_pointer", side_effect=("current-a", "previous-b")),
+                mock.patch.object(maintenance_evidence, "_read_receipt", side_effect=(({"operation_id": "a" * 32, "operation": "install", "phase": "capture"}, "b" * 64), ({"operation_id": "a" * 32}, "c" * 64))),
+                mock.patch.object(maintenance_evidence, "_validate_transaction_context", return_value="d" * 40),
+                mock.patch.object(maintenance_evidence, "_systemd_properties", side_effect=capture_properties),
+                mock.patch.object(maintenance_evidence, "_queued_jobs", return_value=[{"unit": "other.service", "job_type": "start", "job_state": "waiting"}]),
+                mock.patch.object(maintenance_evidence, "_cgroup_members", return_value=[4321]),
+                mock.patch.object(maintenance_evidence, "_journal", return_value=[{"message": "private failure detail"}]),
+                mock.patch("builtins.print") as printed,
+            ):
+                digest, evidence = maintenance_evidence.capture(
+                    app_dir=app,
+                    source_sha="a" * 40,
+                    bundle_sha="b" * 64,
+                    output=output,
+                    capture_run_id="12345",
+                    capture_run_attempt="1",
+                    security_run_id="12340",
+                    security_run_attempt="2",
+                )
+            raw = output.read_bytes()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), digest)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            self.assertEqual(evidence["journal"][0]["message"], "private failure detail")
+            self.assertEqual(evidence["unit"]["ExecMainStatus"], "17")
+            self.assertEqual(evidence["unit"]["ExecMainPID"], "4321")
+            self.assertEqual(evidence["timer"]["ActiveState"], "active")
+            self.assertEqual(evidence["timer"]["UnitFileState"], "enabled")
+            self.assertEqual(evidence["queued_jobs"][0]["unit"], "other.service")
+            self.assertEqual(evidence["cgroup_pids"], [4321])
+            printed.assert_not_called()
+            releases = app / "releases"
+            current, previous, candidate = (releases / name for name in ("current-a", "previous-b", "candidate-c"))
+            current.mkdir(parents=True)
+            previous.mkdir()
+            candidate.mkdir()
+            def identity(path: Path) -> dict[str, object]:
+                return {"slug": path.name, "dev": 1, "ino": 2, "source_sha": "d" * 40}
+            operation = {
+                "operation_id": "a" * 32, "version": 2, "operation": "install", "phase": "recovery-restored",
+                "app_dir": str(app), "current_before": str(current), "previous_before": str(previous),
+                "candidate_release": str(candidate), "shared_venv": str(app / "shared/venv"),
+                "peer": str(app / "shared/peer"), "snapshot": str(candidate / ".rollback/shared-venv-before-install"),
+                "transition": "none", "shared_before": None, "peer_before": None,
+                "current_before_identity": identity(current), "previous_before_identity": identity(previous),
+                "candidate_identity": identity(candidate), "remove_env_on_recovery": False,
+                "service_state_before": None, "service_enabled_before": None, "quiesced_services": None,
+                "timer_active_before": False, "timer_enabled_before": "disabled", "systemd_state_before": {},
+                "profile_access_cache_purge_proof": None,
+            }
+            systemd = {
+                "schema": 1, "operation": "install", "operation_id": "a" * 32, "app_dir": str(app),
+                "current_before": str(current), "previous_before": str(previous),
+                "current_before_identity": identity(current), "previous_before_identity": identity(previous),
+                "helper_digests": {}, "units": [],
+            }
+            self.assertEqual(
+                maintenance_evidence._validate_transaction_context(
+                    app, "current-a", "previous-b", operation, systemd,
+                ),
+                "d" * 40,
+            )
+            for mutation in ("phase", "pointers"):
+                with self.subTest(receipt_case=mutation):
+                    changed = dict(operation)
+                    pointer_current = "current-a"
+                    if mutation == "phase":
+                        changed["phase"] = "prepared"
+                    else:
+                        pointer_current = "candidate-c"
+                    with self.assertRaises(maintenance_evidence.EvidenceError):
+                        maintenance_evidence._validate_transaction_context(
+                            app, pointer_current, "previous-b", changed, systemd,
+                        )
+        journal_row = json.dumps({
+            "__REALTIME_TIMESTAMP": "1791763200000000",
+            "PRIORITY": "3",
+            "MESSAGE": "password=hunter token:abc123 Bearer qwerty auth",
+            "_ENVIRONMENT": "SECRET=must-not-be-captured",
+        }).encode("utf-8")
+        with mock.patch.object(
+            maintenance_evidence,
+            "_run",
+            return_value=subprocess.CompletedProcess(
+                [], 0, journal_row + b"\n", b"private stderr",
+            ),
+        ):
+            entries = maintenance_evidence._journal()
+        self.assertEqual(set(entries[0]), {"realtime_timestamp", "priority", "message"})
+        self.assertNotIn("hunter", entries[0]["message"])
+        self.assertNotIn("abc123", entries[0]["message"])
+        self.assertNotIn("qwerty", entries[0]["message"])
+        self.assertNotIn("SECRET", str(entries))
+        self.assertNotIn("private stderr", str(entries))
+        for output, expected in (
+            (b"JOB UNIT TYPE STATE\n0 jobs listed.\n", []),
+            (b"JOB UNIT TYPE STATE\n1 deadlock-maintenance.service start waiting\n1 job listed.\n", [{"unit": "deadlock-maintenance.service", "job_type": "start", "job_state": "waiting"}]),
+        ):
+            with self.subTest(systemd_jobs=output):
+                with mock.patch.object(
+                    maintenance_evidence,
+                    "_run",
+                    return_value=subprocess.CompletedProcess([], 0, output, b""),
+                ):
+                    self.assertEqual(maintenance_evidence._queued_jobs(), expected)
+        for malformed in (b"", b"garbage\n", b"JOB UNIT TYPE STATE\nmalformed\n", b"JOB UNIT TYPE STATE\n0 jobs listed.\n1 job listed.\n"):
+            with self.subTest(malformed_jobs=malformed):
+                with mock.patch.object(
+                    maintenance_evidence,
+                    "_run",
+                    return_value=subprocess.CompletedProcess([], 0, malformed, b""),
+                ):
+                    with self.assertRaises(maintenance_evidence.EvidenceError):
+                        maintenance_evidence._queued_jobs()
+
+    def test_reset_rechecks_evidence_and_invokes_only_fixed_reset_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app"
+            app.mkdir()
+            evidence = root / "evidence.json"
+            with (
+                mock.patch.object(maintenance_evidence, "_validate_evidence", return_value={"pointers": {"current": "current-a", "previous": "previous-b"}, "receipts": {"operation_sha256": "b" * 64, "systemd_sha256": "c" * 64}, "unit": self._properties(maintenance_evidence.UNIT), "timer": self._properties(maintenance_evidence.TIMER)}),
+                mock.patch.object(maintenance_evidence, "_pointer", side_effect=("current-a", "previous-b")),
+                mock.patch.object(maintenance_evidence, "_read_receipt", side_effect=(({}, "b" * 64), ({}, "c" * 64))),
+                mock.patch.object(maintenance_evidence, "_systemd_properties", side_effect=self._properties),
+                mock.patch.object(maintenance_evidence, "_queued_jobs", return_value=[]),
+                mock.patch.object(maintenance_evidence, "_cgroup_members", return_value=[]),
+                mock.patch.object(maintenance_evidence, "_run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as run,
+            ):
+                maintenance_evidence.reset_failed(
+                    app_dir=app,
+                    source_sha="a" * 40,
+                    bundle_sha="b" * 64,
+                    evidence=evidence,
+                    evidence_sha="c" * 64,
+                    capture_run_id="12345",
+                    capture_run_attempt="1",
+                    security_run_id="12340",
+                    security_run_attempt="2",
+                )
+            run.assert_called_once_with(
+                ["/usr/bin/systemctl", "reset-failed", "deadlock-maintenance.service"],
+                maximum=4096,
+            )
+
+    def test_reset_refuses_receipt_drift_before_systemd_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app"
+            app.mkdir()
+            for mutation in ("receipt", "live-main-pid", "enabled-timer", "unit-tuple-drift"):
+                with self.subTest(reset_guard=mutation):
+                    evidence_unit = self._properties(maintenance_evidence.UNIT)
+                    evidence_timer = self._properties(maintenance_evidence.TIMER)
+                    current_unit = dict(evidence_unit)
+                    current_timer = dict(evidence_timer)
+                    receipt_operation_sha = "b" * 64
+                    if mutation == "live-main-pid":
+                        current_unit["MainPID"] = "88"
+                    elif mutation == "enabled-timer":
+                        current_timer["UnitFileState"] = "enabled"
+                    elif mutation == "unit-tuple-drift":
+                        current_unit["ExecMainStatus"] = "18"
+                    with (
+                        mock.patch.object(maintenance_evidence, "_validate_evidence", return_value={"pointers": {"current": "current-a", "previous": "previous-b"}, "receipts": {"operation_sha256": receipt_operation_sha, "systemd_sha256": "c" * 64}, "unit": evidence_unit, "timer": evidence_timer}),
+                        mock.patch.object(maintenance_evidence, "_pointer", side_effect=("current-a", "previous-b")),
+                        mock.patch.object(maintenance_evidence, "_read_receipt", side_effect=(({}, "d" * 64), ({}, "c" * 64)) if mutation == "receipt" else (({}, receipt_operation_sha), ({}, "c" * 64))),
+                        mock.patch.object(maintenance_evidence, "_systemd_properties", side_effect=lambda unit: current_unit if unit == maintenance_evidence.UNIT else current_timer),
+                        mock.patch.object(maintenance_evidence, "_queued_jobs", return_value=[]),
+                        mock.patch.object(maintenance_evidence, "_cgroup_members", return_value=[]),
+                        mock.patch.object(maintenance_evidence, "_run") as run,
+                    ):
+                        with self.assertRaises(maintenance_evidence.EvidenceError):
+                            maintenance_evidence.reset_failed(
+                                app_dir=app,
+                                source_sha="a" * 40,
+                                bundle_sha="b" * 64,
+                                evidence=root / "evidence.json",
+                                evidence_sha="e" * 64,
+                                capture_run_id="12345",
+                                capture_run_attempt="1",
+                                security_run_id="12340",
+                                security_run_attempt="2",
+                            )
+                    run.assert_not_called()
 
 
 if __name__ == "__main__":

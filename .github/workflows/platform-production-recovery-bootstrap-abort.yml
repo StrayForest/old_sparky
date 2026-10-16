@@ -3,6 +3,15 @@ name: Platform production recovery bootstrap abort
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: "Fixed recovery action"
+        required: true
+        type: choice
+        default: abort_retained_only
+        options:
+          - abort_retained_only
+          - capture_maintenance_failure
+          - reset_maintenance_failed
       security_run_id:
         description: "Exact successful Platform security and build run ID"
         required: true
@@ -28,8 +37,20 @@ on:
         required: true
         type: string
       confirmation:
-        description: "Type ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY"
+        description: "Type the exact confirmation token for the selected action"
         required: true
+        type: string
+      capture_run_id:
+        description: "Exact successful capture action run ID (reset only)"
+        required: false
+        type: string
+      capture_run_attempt:
+        description: "Exact capture action attempt (reset only)"
+        required: false
+        type: string
+      evidence_sha256:
+        description: "SHA-256 of the private immutable capture artifact (reset only)"
+        required: false
         type: string
 
 # This is the only manual execution path for the immutable recovery bootstrap.
@@ -59,6 +80,10 @@ jobs:
       PUBLISHER_RUN_ID: ${{ inputs.publisher_run_id }}
       PUBLISHER_RUN_ATTEMPT: ${{ inputs.publisher_run_attempt }}
       ABORT_CONFIRMATION: ${{ inputs.confirmation }}
+      ACTION: ${{ inputs.action }}
+      CAPTURE_RUN_ID: ${{ inputs.capture_run_id }}
+      CAPTURE_RUN_ATTEMPT: ${{ inputs.capture_run_attempt }}
+      EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
       SECURITY_WORKFLOW: Platform security and build
       SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
       SECURITY_JOB: Verification contract
@@ -78,7 +103,22 @@ jobs:
           [[ "$RECOVERY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$PUBLISHER_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$PUBLISHER_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
-          test "$ABORT_CONFIRMATION" = "ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY"
+          case "$ACTION" in
+            abort_retained_only)
+              test "$ABORT_CONFIRMATION" = "ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY"
+              ;;
+            capture_maintenance_failure)
+              test "$ABORT_CONFIRMATION" = "CAPTURE-MAINTENANCE-FAILURE"
+              test -z "$CAPTURE_RUN_ID" && test -z "$CAPTURE_RUN_ATTEMPT" && test -z "$EVIDENCE_SHA256"
+              ;;
+            reset_maintenance_failed)
+              test "$ABORT_CONFIRMATION" = "RESET-MAINTENANCE-FAILED"
+              [[ "$CAPTURE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+              [[ "$CAPTURE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+              [[ "$EVIDENCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+              ;;
+            *) exit 1 ;;
+          esac
 
       - name: Validate exact successful security run, route artifact and evidence
         id: evidence
@@ -336,6 +376,14 @@ jobs:
           SOURCE_SHA: ${{ steps.evidence.outputs.source_sha }}
           RECOVERY_WORKFLOW_SHA: ${{ steps.evidence.outputs.recovery_workflow_sha }}
           ROUTE_DIGEST: ${{ steps.evidence.outputs.route_digest }}
+          ACTION: ${{ inputs.action }}
+          ACTION_CONFIRMATION: ${{ inputs.confirmation }}
+          EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
+          CAPTURE_EVIDENCE_PATH: ${{ runner.temp }}/platform-maintenance-evidence.json
+          CAPTURE_RUN_ID: ${{ inputs.capture_run_id }}
+          CAPTURE_RUN_ATTEMPT: ${{ inputs.capture_run_attempt }}
+          ACTION_RUN_ID: ${{ github.run_id }}
+          ACTION_RUN_ATTEMPT: ${{ github.run_attempt }}
           RECOVERY_BUILD_JOB_ID: ${{ steps.evidence.outputs.recovery_job_id }}
           PUBLISHER_RUN_ID: ${{ steps.evidence.outputs.publisher_run_id }}
           PUBLISHER_RUN_ATTEMPT: ${{ steps.evidence.outputs.publisher_run_attempt }}
@@ -450,7 +498,7 @@ jobs:
           evidence = one(root / "evidence.zip", evidence_name)
           bundle = one(root / "bundle.zip", bundle_name)
           payload = json.loads(evidence.read_text(encoding="ascii"))
-          if set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "bundle_artifact_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance", "publisher_workflow_sha", "publisher_run_id", "publisher_run_attempt", "publisher_job_id", "publisher_bundle_name", "publisher_bundle_artifact_id", "publisher_bundle_artifact_sha256"} or payload.get("schema") != 3 or payload.get("capability") != "recovery_bootstrap" or payload.get("capabilities") != ["abort_retained_only", "recover_pending"] or payload.get("deployable") is not False:
+          if set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "bundle_artifact_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance", "publisher_workflow_sha", "publisher_run_id", "publisher_run_attempt", "publisher_job_id", "publisher_bundle_name", "publisher_bundle_artifact_id", "publisher_bundle_artifact_sha256"} or payload.get("schema") != 3 or payload.get("capability") != "recovery_bootstrap" or payload.get("capabilities") != ["abort_retained_only", "recover_pending", "quarantine_populated_quiesce", "prune_task_releases", "capture_maintenance_failure", "reset_maintenance_failed"] or payload.get("deployable") is not False:
               raise SystemExit("recovery evidence schema is not closed")
           if not isinstance(payload.get("bundle_name"), str) or payload["bundle_name"] != bundle.name or payload.get("publisher_bundle_name") != os.environ["PUBLISHER_BUNDLE_NAME"] or payload.get("publisher_bundle_artifact_id") != os.environ["PUBLISHER_BUNDLE_ARTIFACT_ID"] or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_sha256"))) or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_artifact_sha256"))) or payload.get("publisher_bundle_artifact_sha256") != os.environ["PUBLISHER_BUNDLE_ARTIFACT_SHA256"]:
               raise SystemExit("recovery evidence bundle identity is invalid")
@@ -571,6 +619,134 @@ jobs:
               raise SystemExit("attestation certificate/source/run/subject policy failed")
           PY
 
+      - name: Fetch and validate exact private capture evidence
+        if: ${{ inputs.action == 'reset_maintenance_failed' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CAPTURE_RUN_ID: ${{ inputs.capture_run_id }}
+          CAPTURE_RUN_ATTEMPT: ${{ inputs.capture_run_attempt }}
+          EXPECTED_EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
+          SOURCE_SHA: ${{ steps.evidence.outputs.source_sha }}
+          BUNDLE_SHA: ${{ steps.evidence.outputs.bundle_sha }}
+          SECURITY_RUN_ID: ${{ inputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$CAPTURE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$CAPTURE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$EXPECTED_EVIDENCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          metadata="$RUNNER_TEMP/platform-maintenance-capture"
+          install -d -m 700 "$metadata"
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/runs/$CAPTURE_RUN_ID/attempts/$CAPTURE_RUN_ATTEMPT" --output "$metadata/run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/runs/$CAPTURE_RUN_ID/artifacts?per_page=100&page=1" --output "$metadata/artifacts.json"
+          /usr/bin/python3 -I -B - "$metadata" "$RUNNER_TEMP" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib, json, os, re, sys, zipfile
+          from pathlib import Path
+          root, runner_temp, output = map(Path, sys.argv[1:])
+          env = os.environ
+          run = json.loads((root / "run.json").read_text(encoding="utf-8"))
+          if any((run.get("id") != int(env["CAPTURE_RUN_ID"]), run.get("run_attempt") != int(env["CAPTURE_RUN_ATTEMPT"]), run.get("name") != "Platform production recovery bootstrap abort", run.get("path") != ".github/workflows/platform-production-recovery-bootstrap-abort.yml", run.get("head_branch") != "dev", run.get("head_sha") != env["SOURCE_SHA"], run.get("event") != "workflow_dispatch", run.get("status") != "completed", run.get("conclusion") != "success")):
+              raise SystemExit("capture run provenance is not exact")
+          listing = json.loads((root / "artifacts.json").read_text(encoding="utf-8"))
+          rows = listing.get("artifacts") if isinstance(listing, dict) else None
+          if not isinstance(rows, list) or type(listing.get("total_count")) is not int or listing["total_count"] != len(rows) or len(rows) > 100:
+              raise SystemExit("capture artifact page is incomplete")
+          name = f"platform-maintenance-failure-{env['CAPTURE_RUN_ID']}-{env['CAPTURE_RUN_ATTEMPT']}"
+          matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(env["CAPTURE_RUN_ID"]) and row["workflow_run"].get("head_sha") == env["SOURCE_SHA"] and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(env["CAPTURE_RUN_ATTEMPT"]))]
+          if (len(matches) != 1 or type(matches[0].get("id")) is not int or matches[0]["id"] <= 0
+              or type(matches[0].get("size_in_bytes")) is not int or not 1 <= matches[0]["size_in_bytes"] <= 1024 * 1024):
+              raise SystemExit("exact private capture artifact is missing or duplicated")
+          digest = matches[0].get("digest")
+          if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+              raise SystemExit("capture artifact digest is invalid")
+          with output.open("a", encoding="ascii") as stream:
+              stream.write(f"artifact_id={matches[0]['id']}\nartifact_digest={digest.removeprefix('sha256:')}\n")
+          PY
+          artifact_id="$(awk -F= '$1=="artifact_id" {print $2}' "$GITHUB_OUTPUT" | tail -n 1)"
+          curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 1 --retry-all-errors \
+            --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/artifacts/$artifact_id/zip" --output "$metadata/capture.zip"
+          test "$(stat -c %s "$metadata/capture.zip")" -le 1048576
+          expected_archive_digest="$(awk -F= '$1=="artifact_digest" {print $2}' "$GITHUB_OUTPUT" | tail -n 1)"
+          test "$(sha256sum "$metadata/capture.zip" | awk '{print $1}')" = "$expected_archive_digest"
+          /usr/bin/python3 -I -B - "$metadata/capture.zip" "$RUNNER_TEMP/platform-maintenance-evidence.json" "$EXPECTED_EVIDENCE_SHA256" "$SOURCE_SHA" "$BUNDLE_SHA" "$CAPTURE_RUN_ID" "$CAPTURE_RUN_ATTEMPT" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" <<'PY'
+          import hashlib, json, os, re, stat, sys, zipfile
+          from pathlib import Path
+          archive, destination = map(Path, sys.argv[1:3])
+          expected_digest, source_sha, bundle_sha, capture_id, capture_attempt, security_id, security_attempt = sys.argv[3:]
+          with zipfile.ZipFile(archive) as bundle:
+              entries = bundle.infolist()
+              mode = (entries[0].external_attr >> 16) & 0o177777 if len(entries) == 1 else 0
+              if len(entries) != 1 or entries[0].filename != "platform-maintenance-evidence.json" or entries[0].file_size > 256 * 1024 or entries[0].flag_bits & 0x1 or entries[0].is_dir() or not stat.S_ISREG(mode):
+                  raise SystemExit("capture artifact archive is not closed")
+              raw = bundle.read(entries[0])
+          if hashlib.sha256(raw).hexdigest() != expected_digest:
+              raise SystemExit("private capture evidence digest does not match")
+          payload = json.loads(raw.decode("ascii"))
+          required = {"schema", "kind", "source_sha", "bundle_sha256", "capture_run_id", "capture_run_attempt", "security_run_id", "security_run_attempt", "host_id_sha256", "captured_at_utc", "app_dir", "pointers", "receipts", "unit", "timer", "queued_jobs", "cgroup_pids", "journal"}
+          if set(payload) != required or payload.get("schema") != 1 or payload.get("kind") != "maintenance_failure_evidence" or payload.get("source_sha") != source_sha or payload.get("bundle_sha256") != bundle_sha or payload.get("capture_run_id") != capture_id or payload.get("capture_run_attempt") != capture_attempt or payload.get("security_run_id") != security_id or payload.get("security_run_attempt") != security_attempt or payload.get("app_dir") != "/opt/oldsparky/platform" or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("host_id_sha256"))):
+              raise SystemExit("capture evidence identity or schema is invalid")
+          receipt = payload.get("receipts")
+          receipt_keys = {"operation_sha256", "systemd_sha256", "operation_id", "operation", "phase", "candidate_release", "candidate_identity", "peer", "operation_source_sha", "companion_present"}
+          unit_keys = {"ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus", "MainPID", "ExecMainPID", "ControlGroup", "ExecMainStartTimestamp", "ExecMainExitTimestamp", "StateChangeTimestamp", "UnitFileState"}
+          slug = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+          optional_sha = lambda item: item is None or isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item) is not None
+          optional_slug = lambda item: item is None or isinstance(item, str) and slug.fullmatch(item) is not None
+          if (not isinstance(payload.get("pointers"), dict) or set(payload["pointers"]) != {"current", "previous"} or any(not optional_slug(item) for item in payload["pointers"].values())
+              or not isinstance(receipt, dict) or set(receipt) != receipt_keys
+              or not isinstance(receipt.get("operation_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", receipt["operation_sha256"])
+              or not isinstance(receipt.get("systemd_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", receipt["systemd_sha256"])
+              or receipt.get("companion_present") is not True
+              or receipt.get("operation") not in {"install", "rollback"} or receipt.get("phase") != "recovery-restored"
+              or not isinstance(receipt.get("operation_id"), str) or not re.fullmatch(r"[0-9a-f]{32}", receipt["operation_id"])
+              or not isinstance(receipt.get("candidate_release"), str)
+              or not isinstance(receipt.get("candidate_identity"), dict)
+              or Path(receipt["candidate_release"]).parent != Path(payload["app_dir"]) / "releases"
+              or Path(receipt["candidate_release"]).name != receipt.get("candidate_identity", {}).get("slug")
+              or set(receipt["candidate_identity"]) != {"slug", "dev", "ino", "source_sha"}
+              or not isinstance(receipt["candidate_identity"].get("slug"), str) or slug.fullmatch(receipt["candidate_identity"]["slug"]) is None
+              or type(receipt["candidate_identity"].get("dev")) is not int or receipt["candidate_identity"]["dev"] < 0
+              or type(receipt["candidate_identity"].get("ino")) is not int or receipt["candidate_identity"]["ino"] <= 0
+              or not isinstance(receipt.get("operation_source_sha"), str) or not re.fullmatch(r"[0-9a-f]{40}", receipt["operation_source_sha"])
+              or receipt["candidate_identity"].get("source_sha") != receipt["operation_source_sha"]
+              or not isinstance(receipt.get("peer"), str) or len(receipt["peer"]) > 4096 or any(ord(ch) < 32 for ch in receipt["peer"])
+              or (receipt["operation"] == "rollback" and payload["pointers"]["current"] != receipt["candidate_identity"]["slug"])
+              or (receipt["operation"] == "install" and receipt["candidate_identity"]["slug"] in set(payload["pointers"].values()))
+              or not isinstance(payload.get("unit"), dict) or set(payload["unit"]) != unit_keys
+              or not isinstance(payload.get("timer"), dict) or set(payload["timer"]) != unit_keys
+              or any(not isinstance(value, str) or len(value) > 512 for value in (*payload["unit"].values(), *payload["timer"].values()))
+              or not isinstance(payload.get("journal"), list) or len(payload["journal"]) > 100
+              or any(not isinstance(row, dict) or set(row) != {"realtime_timestamp", "priority", "message"} or any(not isinstance(row.get(key), str) for key in row) or len(row["message"]) > 4096 for row in payload["journal"])
+              or not isinstance(payload.get("queued_jobs"), list) or len(payload["queued_jobs"]) > 256
+              or any(not isinstance(row, dict) or set(row) != {"unit", "job_type", "job_state"} or not isinstance(row.get("unit"), str) or re.fullmatch(r"[A-Za-z0-9_.@:-]{1,255}", row["unit"]) is None or any(not isinstance(row.get(key), str) or len(row[key]) > 255 for key in ("job_type", "job_state")) for row in payload["queued_jobs"])
+              or not isinstance(payload.get("cgroup_pids"), list) or len(payload["cgroup_pids"]) > 256
+              or any(type(pid) is not int or pid < 0 for pid in payload["cgroup_pids"])):
+              raise SystemExit("capture evidence transaction or field schema is invalid")
+          if payload.get("unit", {}).get("ActiveState") != "failed" or payload.get("unit", {}).get("MainPID") != "0" or payload.get("timer", {}).get("ActiveState") != "inactive" or payload.get("timer", {}).get("UnitFileState") not in {"disabled", "masked"} or payload.get("queued_jobs") != [] or payload.get("cgroup_pids") != []:
+              raise SystemExit("capture evidence does not authorize the reset workflow")
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "wb") as stream:
+              stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+          PY
+          echo "MAINTENANCE_EVIDENCE status=bound sha256=$EXPECTED_EVIDENCE_SHA256"
+      - name: Confirm private repository evidence boundary before host access
+        shell: bash
+        env:
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$REPOSITORY_VISIBILITY" = private
+
       - name: Validate production SSH inputs
         shell: bash
         env:
@@ -612,7 +788,8 @@ jobs:
           chmod 600 "$ssh_dir/known_hosts"
           echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
-      - name: Install immutable generation and execute only retained abort
+      - name: Execute one exact signed recovery capability
+        id: maintenance_action
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -627,8 +804,23 @@ jobs:
           RECOVERY_JOB_ID: ${{ steps.evidence.outputs.recovery_job_id }}
           RECOVERY_WORKFLOW_SHA: ${{ steps.evidence.outputs.recovery_workflow_sha }}
           ROUTE_DIGEST: ${{ steps.evidence.outputs.route_digest }}
+          ACTION: ${{ inputs.action }}
+          ACTION_CONFIRMATION: ${{ inputs.confirmation }}
+          EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
+          CAPTURE_EVIDENCE_PATH: ${{ runner.temp }}/platform-maintenance-evidence.json
+          CAPTURE_RUN_ID: ${{ inputs.capture_run_id }}
+          CAPTURE_RUN_ATTEMPT: ${{ inputs.capture_run_attempt }}
+          ACTION_RUN_ID: ${{ github.run_id }}
+          ACTION_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          umask 077
+          case "$ACTION" in
+            abort_retained_only) test "$ACTION_CONFIRMATION" = "ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY" ;;
+            capture_maintenance_failure) test "$ACTION_CONFIRMATION" = "CAPTURE-MAINTENANCE-FAILURE" ;;
+            reset_maintenance_failed) test "$ACTION_CONFIRMATION" = "RESET-MAINTENANCE-FAILED" ;;
+            *) exit 1 ;;
+          esac
           remote_stage="$(
             timeout --foreground 300s ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s" <<'REMOTE'
           set -Eeuo pipefail
@@ -733,11 +925,16 @@ jobs:
           PY
           REMOTE
           timeout --foreground 300s scp -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$BUNDLE" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_bundle"
-          timeout --foreground 300s ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$ROUTE_DIGEST'" <<'REMOTE'
+          if [[ "$ACTION" == reset_maintenance_failed ]]; then
+            test -f "$CAPTURE_EVIDENCE_PATH"
+            test "$(sha256sum "$CAPTURE_EVIDENCE_PATH" | awk '{print $1}')" = "$EVIDENCE_SHA256"
+            timeout --foreground 300s scp -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$CAPTURE_EVIDENCE_PATH" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_stage/evidence.upload"
+          fi
+          timeout --foreground 300s ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$ROUTE_DIGEST' '$ACTION' '$EVIDENCE_SHA256' '$CAPTURE_RUN_ID' '$CAPTURE_RUN_ATTEMPT' '$ACTION_RUN_ID' '$ACTION_RUN_ATTEMPT' '$ACTION_CONFIRMATION'" <<'REMOTE'
           set -Eeuo pipefail
           umask 077
-          stage="$1"; expected_sha="$2"; source_sha="$3"; security_run_id="$4"; security_run_attempt="$5"; recovery_run_id="$6"; recovery_run_attempt="$7"; recovery_job_id="$8"; recovery_workflow_sha="$9"; route_digest="${10}"; bundle="$stage/bundle.zip"; app_dir=/opt/oldsparky/platform
-          test "$#" -eq 10
+          stage="$1"; expected_sha="$2"; source_sha="$3"; security_run_id="$4"; security_run_attempt="$5"; recovery_run_id="$6"; recovery_run_attempt="$7"; recovery_job_id="$8"; recovery_workflow_sha="$9"; route_digest="${10}"; action="${11}"; evidence_sha="${12}"; capture_run_id="${13}"; capture_run_attempt="${14}"; action_run_id="${15}"; action_run_attempt="${16}"; action_confirmation="${17}"; bundle="$stage/bundle.zip"; app_dir=/opt/oldsparky/platform
+          test "$#" -eq 17
           [[ "$stage" =~ ^/tmp/oldsparky-recovery-bootstrap\.[A-Za-z0-9]{6}$ ]]
           [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
           [[ "$source_sha" =~ ^[0-9a-f]{40,64}$ ]]
@@ -748,6 +945,12 @@ jobs:
           [[ "$recovery_job_id" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$recovery_workflow_sha" =~ ^[0-9a-f]{40,64}$ ]]
           [[ "$route_digest" =~ ^[0-9a-f]{64}$ ]]
+          case "$action" in
+            abort_retained_only) test "$action_confirmation" = "ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY" ;;
+            capture_maintenance_failure) test "$action_confirmation" = "CAPTURE-MAINTENANCE-FAILURE"; [[ "$action_run_id" =~ ^[1-9][0-9]{0,31}$ ]]; [[ "$action_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]] ;;
+            reset_maintenance_failed) test "$action_confirmation" = "RESET-MAINTENANCE-FAILED"; [[ "$evidence_sha" =~ ^[0-9a-f]{64}$ ]]; [[ "$capture_run_id" =~ ^[1-9][0-9]{0,31}$ ]]; [[ "$capture_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]] ;;
+            *) exit 1 ;;
+          esac
           test "$(id -u)" -eq 0
           validate_stage_dir() {
             /usr/bin/python3 -I -B - "$1" <<'PY'
@@ -790,6 +993,9 @@ jobs:
             local status="$?"
             trap - EXIT
             set +e
+            if (( status == 0 )) && [[ "$action" == capture_maintenance_failure ]]; then
+              exit 0
+            fi
             local cleanup_status=0
             if [[ -L "$stage" ]]; then
               rm -f -- "$stage" || cleanup_status="$?"
@@ -812,6 +1018,27 @@ jobs:
             exit "$cleanup_status"
           }
           trap cleanup_stage EXIT
+          if [[ "$action" == reset_maintenance_failed ]]; then
+            /usr/bin/python3 -I -B - "$stage/evidence.upload" "$evidence_sha" <<'PY'
+          import hashlib
+          import os
+          import stat
+          import sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          metadata = os.lstat(path)
+          raw = path.read_bytes()
+          if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+              or metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_nlink != 1
+              or stat.S_IMODE(metadata.st_mode) & 0o022 or metadata.st_size > 256 * 1024
+              or len(raw) != metadata.st_size or hashlib.sha256(raw).hexdigest() != sys.argv[2]):
+              raise SystemExit('private maintenance evidence upload is unsafe')
+          PY
+            test ! -e "$stage/evidence.json" && test ! -L "$stage/evidence.json"
+            chmod 600 "$stage/evidence.upload"
+            mv -- "$stage/evidence.upload" "$stage/evidence.json"
+            validate_stage_file "$stage/evidence.json" 600
+          fi
           validate_stage_dir "$stage"
           validate_stage_file "$bundle" 600
           test "$(sha256sum "$bundle" | awk '{print $1}')" = "$expected_sha"
@@ -839,6 +1066,7 @@ jobs:
               "platform-recovery-bootstrap/platform_release_transaction.py",
               "platform-recovery-bootstrap/platform_release_systemd_state.py",
               "platform-recovery-bootstrap/platform_recover_pending.sh",
+              "platform-recovery-bootstrap/platform_maintenance_failure_evidence.py",
           }
           with zipfile.ZipFile(bundle) as source:
               infos = source.infolist()
@@ -895,7 +1123,7 @@ jobs:
                           pass
                       raise
           PY
-          for name in manifest.json platform_abort_retained_only.sh platform_live_qa_guard.py platform_live_qa_runtime_install.py platform_recovery_bootstrap.py platform_release_retention.py platform_release_lock.sh platform_release_restore_runtime.sh platform_release_systemd_state.py platform_release_transaction.py platform_recover_pending.sh; do
+          for name in manifest.json platform_abort_retained_only.sh platform_live_qa_guard.py platform_live_qa_runtime_install.py platform_recovery_bootstrap.py platform_release_retention.py platform_release_lock.sh platform_release_restore_runtime.sh platform_release_systemd_state.py platform_release_transaction.py platform_recover_pending.sh platform_maintenance_failure_evidence.py; do
             if [[ "$name" == *.sh ]]; then
               validate_stage_file "$payload/$name" 555
             else
@@ -928,11 +1156,52 @@ jobs:
               stream.flush()
               os.fsync(stream.fileno())
           PY
-          "$payload/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$payload/platform_recovery_bootstrap.py" install --bundle "$bundle" --app-dir "$app_dir" --expected-bundle-sha "$expected_sha" --source-sha "$source_sha" --provenance "$provenance_path" --capability abort_retained_only
+          "$payload/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$payload/platform_recovery_bootstrap.py" install --bundle "$bundle" --app-dir "$app_dir" --expected-bundle-sha "$expected_sha" --source-sha "$source_sha" --provenance "$provenance_path" --capability "$action"
           generation="$app_dir/shared/.release-recovery/generations/$expected_sha"
-          test -x "$generation/platform_abort_retained_only.sh"
-          exec "$generation/platform_abort_retained_only.sh" --app-dir "$app_dir"
+          if [[ "$action" == abort_retained_only ]]; then
+            test -x "$generation/platform_abort_retained_only.sh"
+            exec "$generation/platform_abort_retained_only.sh" --app-dir "$app_dir"
+          fi
+          test -f "$generation/platform_maintenance_failure_evidence.py"
+          if [[ "$action" == capture_maintenance_failure ]]; then
+            "$payload/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$generation/platform_maintenance_failure_evidence.py" capture_maintenance_failure --app-dir "$app_dir" --source-sha "$source_sha" --bundle-sha "$expected_sha" --output "$stage/maintenance-evidence.json" --capture-run-id "$action_run_id" --capture-run-attempt "$action_run_attempt" --security-run-id "$security_run_id" --security-run-attempt "$security_run_attempt"
+          else
+            "$payload/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$generation/platform_maintenance_failure_evidence.py" reset_maintenance_failed --app-dir "$app_dir" --source-sha "$source_sha" --bundle-sha "$expected_sha" --evidence "$stage/evidence.json" --evidence-sha256 "$evidence_sha" --capture-run-id "$capture_run_id" --capture-run-attempt "$capture_run_attempt" --security-run-id "$security_run_id" --security-run-attempt "$security_run_attempt"
+          fi
           REMOTE
+          if [[ "$ACTION" == capture_maintenance_failure ]]; then
+            /usr/bin/python3 -I -B - "$CAPTURE_EVIDENCE_PATH" <<'PY'
+          import os, sys
+          fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          os.close(fd)
+          PY
+            timeout --foreground 300s scp -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_stage/maintenance-evidence.json" "$CAPTURE_EVIDENCE_PATH"
+            test -f "$CAPTURE_EVIDENCE_PATH" && test ! -L "$CAPTURE_EVIDENCE_PATH"
+            chmod 600 "$CAPTURE_EVIDENCE_PATH"
+            evidence_sha256="$(sha256sum "$CAPTURE_EVIDENCE_PATH" | awk '{print $1}')"
+            [[ "$evidence_sha256" =~ ^[0-9a-f]{64}$ ]]
+            printf 'MAINTENANCE_EVIDENCE status=downloaded sha256=%s private=true\n' "$evidence_sha256"
+            printf 'evidence_sha256=%s\n' "$evidence_sha256" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Recheck private repository evidence boundary before upload
+        if: ${{ inputs.action == 'capture_maintenance_failure' && success() }}
+        shell: bash
+        env:
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$REPOSITORY_VISIBILITY" = private
+
+      - name: Upload private maintenance failure evidence
+        if: ${{ inputs.action == 'capture_maintenance_failure' && success() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-maintenance-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-maintenance-evidence.json
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Remove production SSH material
         if: ${{ always() }}

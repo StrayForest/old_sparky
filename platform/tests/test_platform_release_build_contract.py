@@ -1936,11 +1936,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         candidate_path = ".github/workflows/platform-host-tools-candidate.yml"
         shared_path = ".github/workflows/platform-production-autodeploy.yml"
         recovery_only_path = "platform/tools/platform_recovery_bootstrap.py"
+        recovery_evidence_path = "platform/tools/platform_maintenance_failure_evidence.py"
         app_path = "platform/tools/platform_build_release.sh"
         self.assertIn(candidate_path, CANDIDATE_PACKAGING_FILES)
         self.assertIn(shared_path, CANDIDATE_PACKAGING_FILES)
         self.assertIn(shared_path, RECOVERY_BOOTSTRAP_FILES)
         self.assertIn(recovery_only_path, RECOVERY_BOOTSTRAP_FILES)
+        self.assertIn(recovery_evidence_path, RECOVERY_BOOTSTRAP_FILES)
 
         def write_archive(root: Path, manifest: dict[str, object]) -> Path:
             archive = root / f"manifest-{len(list(root.glob('manifest-*.zip')))}.zip"
