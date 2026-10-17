@@ -232,7 +232,7 @@ gh workflow run platform-live-user-qa.yml \
 Dispatch only after the exact deployed `dev` SHA is confirmed. The workflow
 creates no fixture until the release lock, active-SHA check, host-installed
 supervisor/helper, bundle and browser preflight checks pass.
-
+The workflow accepts a bounded dispatcher diagnostic only when its fixed schema and child exit code agree. Early-failure `stage` and `check` values are closed enums; the sanitizer publishes no exception text, paths, environment values or stderr. Failures before the trusted Python dispatcher starts—including SSH or sudo setup—remain unclassified. SSH exit 255 is also unclassified because it can represent either a remote child status or an SSH error. Diagnostics do not change failure status or fixture cleanup, and cannot establish the cause of historical runs.
 The launch workflow validates `base_url`, `provision` and the optional marker
 with the canonical bounded-ASCII workflow-input parser before it creates any
 SSH key file or performs keyscan. It hands the accepted values to the remote

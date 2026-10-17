@@ -168,10 +168,46 @@ LIVE_QA_DIAGNOSTIC_LINE_MAX_BYTES = 512
 LIVE_QA_DIAGNOSTIC_RE = re.compile(
     rb"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(?P<kind>none|playwright_cli_usage|"
     rb"node_module_missing|browser_executable_missing|browser_launch_error|"
-    rb"child_timeout|cleanup_failure|unclassified) stdout_bytes=(?P<stdout_bytes>[0-9]{1,16}) "
+    rb"child_timeout|cleanup_failure|unclassified|dispatch_failure)"
+    rb"(?: stage=(?P<stage>validation|identity|trusted_generation|dispatch) "
+    rb"check=(?P<check>input_shape|source_binding|source_binding_io|source_binding_schema|"
+    rb"source_binding_recheck|root_uid|generation_manifest|trusted_entry|"
+    rb"active_manifest|bundle_mailbox|wrapper|release_lock|dispatch))? "
+    rb"stdout_bytes=(?P<stdout_bytes>[0-9]{1,16}) "
     rb"stderr_bytes=(?P<stderr_bytes>[0-9]{1,16}) "
     rb"truncated=(?P<truncated>true|false) child_exit=(?P<child_exit>[0-9]{1,3})\n"
 )
+LIVE_QA_DISPATCH_FAILURE_CHECKS = {
+    "validation": frozenset(
+        {"input_shape", "source_binding", "source_binding_io", "source_binding_schema", "source_binding_recheck"}
+    ),
+    "identity": frozenset({"root_uid"}),
+    "trusted_generation": frozenset(
+        {"generation_manifest", "trusted_entry", "active_manifest", "bundle_mailbox", "wrapper"}
+    ),
+    "dispatch": frozenset({"release_lock", "dispatch"}),
+}
+
+
+def _valid_live_qa_diagnostic(line: bytes, child_status: int) -> bool:
+    match = LIVE_QA_DIAGNOSTIC_RE.fullmatch(line)
+    if match is None or int(match.group("child_exit")) != child_status:
+        return False
+    if match.group("kind") != b"dispatch_failure":
+        return match.group("stage") is None and match.group("check") is None
+    stage = match.group("stage")
+    check = match.group("check")
+    return (
+        stage is not None
+        and check is not None
+        and check.decode("ascii") in LIVE_QA_DISPATCH_FAILURE_CHECKS.get(
+            stage.decode("ascii"), frozenset()
+        )
+        and child_status in {1, 2}
+        and match.group("stdout_bytes") == b"0"
+        and match.group("stderr_bytes") == b"0"
+        and match.group("truncated") == b"false"
+    )
 LIVE_LAUNCH_CHECK_IDS = frozenset(
     {
         "none",
@@ -1026,8 +1062,7 @@ def _run_live_user_qa_sudo(
                             if line.startswith(b"LIVE_QA_CHILD_DIAGNOSTIC "):
                                 diagnostic_count += 1
                                 if len(line) <= LIVE_QA_DIAGNOSTIC_LINE_MAX_BYTES:
-                                    match = LIVE_QA_DIAGNOSTIC_RE.fullmatch(line)
-                                    diagnostic = line if match is not None else None
+                                    diagnostic = line if LIVE_QA_DIAGNOSTIC_RE.fullmatch(line) else None
                                 else:
                                     diagnostic = None
                             elif line.startswith(b"LIVE_BROWSER_COUNTS "):
@@ -1054,8 +1089,7 @@ def _run_live_user_qa_sudo(
                             line_too_long.add(key.fd)
         child_status = process.returncode if process.returncode is not None else 2
         if diagnostic_count == 1 and diagnostic is not None:
-            match = LIVE_QA_DIAGNOSTIC_RE.fullmatch(diagnostic)
-            if match is not None and int(match.group("child_exit")) == child_status:
+            if _valid_live_qa_diagnostic(diagnostic, child_status):
                 sys.stdout.buffer.write(diagnostic)
                 sys.stdout.buffer.flush()
         counts_valid = browser_counts_count == 1 and browser_counts is not None

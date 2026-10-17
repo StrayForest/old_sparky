@@ -3244,14 +3244,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             def output(self) -> bytes:
                 return self.buffer.getvalue() + self.text.getvalue().encode("ascii")
 
-        def invoke(child_stdout: bytes) -> tuple[int, bytes]:
+        def invoke(child_stdout: bytes, child_exit: int = 0) -> tuple[int, bytes]:
             capture = Capture()
 
             def local_child(_command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
                 script = (
                     "import sys; "
                     f"sys.stdout.buffer.write({child_stdout!r}); "
-                    "sys.stdout.flush(); sys.stderr.write('secret-sentinel\\n')"
+                    f"sys.stdout.flush(); sys.stderr.write('secret-sentinel\\n'); raise SystemExit({child_exit})"
                 )
                 return real_popen(
                     [sys.executable, "-c", script],
@@ -3271,6 +3271,25 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn(count, output)
         self.assertIn(b"LIVE_USER_QA_SUCCESS\n", output)
         self.assertNotIn(b"secret-sentinel", output)
+
+        early_dispatch = (
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "
+            b"stage=trusted_generation check=generation_manifest "
+            b"stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=1\n"
+        )
+        dispatch_status, dispatch_output = invoke(early_dispatch, child_exit=1)
+        self.assertEqual(dispatch_status, 1)
+        self.assertEqual(dispatch_output, early_dispatch)
+        self.assertNotIn(b"secret-sentinel", dispatch_output)
+
+        for invalid_diagnostic in (
+            early_dispatch.replace(b"stage=trusted_generation", b"stage=unknown"),
+            early_dispatch.replace(b"child_exit=1", b"child_exit=2"),
+            early_dispatch.replace(b"stderr_bytes=0", b"stderr_bytes=21"),
+        ):
+            invalid_status, invalid_output = invoke(invalid_diagnostic, child_exit=1)
+            self.assertEqual(invalid_status, 1)
+            self.assertEqual(invalid_output, b"")
 
         for invalid_output in (
             diagnostic,
@@ -3292,6 +3311,28 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(skipped_status, 0)
         self.assertIn(all_skipped, skipped_output)
         self.assertNotIn(b"LIVE_USER_QA_SUCCESS", skipped_output)
+
+    def test_live_user_dispatch_reports_only_fixed_early_preflight_boundary(self) -> None:
+        dispatch = platform_live_user_qa_dispatch
+        source_sha = "a" * 40
+        app_sha = "b" * 40
+        output = StringIO()
+        with (
+            patch.object(dispatch, "_source_binding_context", return_value=(app_sha, {}, None)),
+            patch.object(dispatch.os, "geteuid", return_value=0),
+            patch.object(dispatch, "_verify_install", side_effect=RuntimeError("private-path-secret")),
+            patch.object(dispatch.sys, "stdout", output),
+        ):
+            status = dispatch.main(["run-locked", source_sha])
+
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output.getvalue(),
+            "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "
+            "stage=trusted_generation check=generation_manifest "
+            "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=1\n",
+        )
+        self.assertNotIn("private-path-secret", output.getvalue())
 
     def test_live_user_inline_handoff_verifier_authenticates_and_fails_closed(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-live-user-qa.yml").read_text(
@@ -3763,6 +3804,61 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertEqual(
                 no_cause_report["error_class_counts"],
                 {"unclassified_child_or_dispatch_failure": 1},
+            )
+
+            dispatch_failure = (
+                "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "
+                "stage=trusted_generation check=generation_manifest "
+                "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=1\n"
+            )
+            raw.write_text(dispatch_failure, encoding="ascii")
+            dispatch_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "1", runner_sha, app_sha, binding_digest],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(dispatch_run.returncode, 0, dispatch_run.stderr)
+            dispatch_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(dispatch_report["status"], "failed")
+            self.assertEqual(dispatch_report["failure_origin"], "dispatcher")
+            self.assertEqual(dispatch_report["test_count"], None)
+            self.assertIsNone(dispatch_report["browser_counts"])
+            self.assertEqual(dispatch_report["error_class_counts"], {"live_user_dispatch_failure": 1})
+            self.assertEqual(
+                dispatch_report["child_diagnostic"]["stage"], "trusted_generation"
+            )
+            self.assertEqual(
+                dispatch_report["child_diagnostic"]["check"], "generation_manifest"
+            )
+
+            for invalid_marker in (
+                dispatch_failure.replace("stage=trusted_generation", "stage=untrusted"),
+                dispatch_failure.replace("child_exit=1", "child_exit=2"),
+            ):
+                raw.write_text(invalid_marker, encoding="ascii")
+                invalid_run = subprocess.run(
+                    [sys.executable, "-c", sanitizer, str(raw), str(report), "1", runner_sha, app_sha, binding_digest],
+                    check=False, capture_output=True, text=True,
+                )
+                self.assertEqual(invalid_run.returncode, 0, invalid_run.stderr)
+                invalid_report = json.loads(report.read_text(encoding="utf-8"))
+                self.assertEqual(invalid_report["status"], "error")
+                self.assertEqual(invalid_report["failure_origin"], "unclassified")
+                self.assertIsNone(invalid_report["child_diagnostic"])
+                self.assertIsNone(invalid_report["test_count"])
+
+            raw.write_text("", encoding="ascii")
+            transport_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "255", runner_sha, app_sha, binding_digest],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(transport_run.returncode, 0, transport_run.stderr)
+            transport_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(
+                transport_report["failure_origin"], "ssh_exit_255_unclassified"
+            )
+            self.assertEqual(
+                transport_report["error_class_counts"],
+                {"ssh_exit_255_unclassified": 1},
             )
 
     def test_all_wrappers_disable_xtrace_before_any_work(self) -> None:

@@ -53,6 +53,28 @@ MARKER_RE = re.compile(r"^liveqa-[a-z0-9-]{6,56}$")
 LIVE_LAUNCH_FAILURE_STAGES = frozenset(
     {"validation", "identity", "trusted_generation", "dispatch"}
 )
+LIVE_USER_QA_FAILURE_CHECKS = {
+    "validation": frozenset(
+        {
+            "input_shape",
+            "source_binding",
+            "source_binding_io",
+            "source_binding_schema",
+            "source_binding_recheck",
+        }
+    ),
+    "identity": frozenset({"root_uid"}),
+    "trusted_generation": frozenset(
+        {
+            "generation_manifest",
+            "trusted_entry",
+            "active_manifest",
+            "bundle_mailbox",
+            "wrapper",
+        }
+    ),
+    "dispatch": frozenset({"release_lock", "dispatch"}),
+}
 UUID_RE = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 EMAIL_RE = re.compile(
     r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
@@ -729,6 +751,27 @@ def _emit_live_launch_failure(
     )
 
 
+def _emit_live_user_qa_dispatch_failure(
+    *, mode: str, source_sha: str, stage: str, check: str, child_exit: int
+) -> None:
+    """Emit only a closed stage/check marker for early live-user QA failures."""
+
+    if (
+        mode not in {"direct-user", "run-locked"}
+        or SHA_RE.fullmatch(source_sha) is None
+        or stage not in LIVE_USER_QA_FAILURE_CHECKS
+        or check not in LIVE_USER_QA_FAILURE_CHECKS[stage]
+        or type(child_exit) is not int
+        or child_exit not in {1, 2}
+    ):
+        return
+    print(
+        "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "
+        f"stage={stage} check={check} stdout_bytes=0 stderr_bytes=0 "
+        f"truncated=false child_exit={child_exit}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if arguments and SHA_RE.fullmatch(arguments[0]):
@@ -757,6 +800,11 @@ def main(argv: list[str] | None = None) -> int:
             suffix = tail[:2] if tail and tail[0] == "--source-binding-base64" else []
             payload_args = tail[2:] if suffix else (tail if mode == "run" else [])
             if (mode in {"resolve", "verify", "run-locked"} and tail and not suffix):
+                if mode == "run-locked" and SHA_RE.fullmatch(runner_sha):
+                    _emit_live_user_qa_dispatch_failure(
+                        mode=mode, source_sha=runner_sha, stage="validation",
+                        check="input_shape", child_exit=2,
+                    )
                 return 2
             base_url = "https://old-sparky.com"
             provision = "false"
@@ -775,12 +823,22 @@ def main(argv: list[str] | None = None) -> int:
                 source_sha=runner_sha, stage="validation", child_exit=2,
                 check="source_binding",
             )
+        else:
+            _emit_live_user_qa_dispatch_failure(
+                mode=mode, source_sha=runner_sha, stage="validation",
+                check="source_binding", child_exit=2,
+            )
         return 2
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         if mode == "run-launch":
             _emit_live_launch_failure(
                 source_sha=runner_sha, stage="validation", child_exit=1,
                 check="source_binding_io",
+            )
+        else:
+            _emit_live_user_qa_dispatch_failure(
+                mode=mode, source_sha=runner_sha, stage="validation",
+                check="source_binding_io", child_exit=1,
             )
         return 1
     if mode == "run-launch" and (
@@ -803,6 +861,11 @@ def main(argv: list[str] | None = None) -> int:
                     source_sha=runner_sha, stage="identity", child_exit=1,
                     check="root_uid",
                 )
+            else:
+                _emit_live_user_qa_dispatch_failure(
+                    mode=mode, source_sha=runner_sha, stage="identity",
+                    check="root_uid", child_exit=1,
+                )
             return 1
         launch_stage = "trusted_generation"
         launch_check = "generation_manifest"
@@ -824,6 +887,8 @@ def main(argv: list[str] | None = None) -> int:
                 [] if encoded_binding is None
                 else ["--source-binding-base64", encoded_binding]
             )
+            launch_stage = "dispatch"
+            launch_check = "dispatch"
             os.execve(
                 str(RELEASE_LOCK_EXEC),
                 [
@@ -893,6 +958,11 @@ def main(argv: list[str] | None = None) -> int:
                         source_sha=runner_sha, stage="dispatch", child_exit=1,
                         check="release_lock",
                     )
+                else:
+                    _emit_live_user_qa_dispatch_failure(
+                        mode=mode, source_sha=runner_sha, stage="dispatch",
+                        check="release_lock", child_exit=1,
+                    )
                 return 1
             launch_stage = "dispatch"
             launch_check = "release_lock"
@@ -908,6 +978,8 @@ def main(argv: list[str] | None = None) -> int:
         launch_stage = "trusted_generation"
         launch_check = "trusted_entry"
         _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
+        if mode != "run-launch":
+            launch_check = "active_manifest"
         manifest = _read_manifest(app_target_sha)
         payload = Path(str(manifest["payload"]))
         encoded_digest = (
@@ -955,8 +1027,10 @@ def main(argv: list[str] | None = None) -> int:
                 environment,
             )
             return 0
+        launch_check = "bundle_mailbox"
         _validate_bundle_and_mailbox()
         wrapper = payload / "platform/tools/platform_live_user_qa.sh"
+        launch_check = "wrapper"
         _regular(wrapper, mode=0o555, maximum=MAX_PAYLOAD_FILE_BYTES)
         environment = {
             "HOME": "/root",
@@ -971,6 +1045,8 @@ def main(argv: list[str] | None = None) -> int:
             "PLAYWRIGHT_LIVE_BASE_URL": "https://old-sparky.com",
             "PLATFORM_LIVE_QA_INSTALL_ROOT": str(payload),
         }
+        launch_stage = "dispatch"
+        launch_check = "dispatch"
         os.execve(str(wrapper), [str(wrapper), *payload_args], environment)
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError):
         if mode == "run-launch":
@@ -979,6 +1055,14 @@ def main(argv: list[str] | None = None) -> int:
                 stage=launch_stage,
                 child_exit=1,
                 check=launch_check,
+            )
+        else:
+            _emit_live_user_qa_dispatch_failure(
+                mode=mode,
+                source_sha=runner_sha,
+                stage=launch_stage,
+                check=launch_check,
+                child_exit=1,
             )
         return 1
     return 0
