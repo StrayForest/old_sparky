@@ -2567,7 +2567,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         expected_recovery_capabilities = (
             '["abort_retained_only", "recover_pending", '
             '"quarantine_populated_quiesce", "prune_task_releases", '
-            '"capture_maintenance_failure", "reset_maintenance_failed"]'
+            '"prune_quarantined_candidate", "capture_maintenance_failure", '
+            '"reset_maintenance_failed"]'
         )
         self.assertEqual(recover.count(expected_recovery_capabilities), 2)
         recover_provenance = recover.index(
@@ -2591,7 +2592,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn(
             '[[ "$recovery_action" == recover_pending || '
             '"$recovery_action" == quarantine_populated_quiesce || '
-            '"$recovery_action" == prune_task_releases ]]',
+            '"$recovery_action" == prune_task_releases || '
+            '"$recovery_action" == prune_quarantined_candidate ]]',
             recover,
         )
         self.assertIn('generation_name="$bundle_sha"', recover)

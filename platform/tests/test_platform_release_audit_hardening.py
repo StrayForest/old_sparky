@@ -348,7 +348,8 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn(
             '[[ "$recovery_action" == recover_pending || '
             '"$recovery_action" == quarantine_populated_quiesce || '
-            '"$recovery_action" == prune_task_releases ]]',
+            '"$recovery_action" == prune_task_releases || '
+            '"$recovery_action" == prune_quarantined_candidate ]]',
             recover_workflow,
         )
         self.assertIn("generation_name=\"$bundle_sha\"", recover_workflow)
