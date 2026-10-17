@@ -1584,19 +1584,59 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertIn("- 6379:6379", privileged_job.group("body"))
         self.assertIn('--health-cmd="redis-cli ping"', privileged_job.group("body"))
         privileged_body = privileged_job.group("body")
-        self.assertNotIn("Run focused scratch restore diagnostic", privileged_body)
+        self.assertIn("Run synthetic restore diagnostic first on feature dispatches", privileged_body)
         self.assertNotIn("platform-backup-scratch-diagnostic", privileged_body)
         self.assertNotIn("Require focused scratch restore diagnostic", privileged_body)
         workflow_data = yaml.safe_load(workflow)
+        privileged_steps = workflow_data["jobs"]["backend-privileged"]["steps"]
+        focused_step = next(
+            step for step in privileged_steps
+            if step.get("name") == "Run synthetic restore diagnostic first on feature dispatches"
+        )
+        self.assertEqual(
+            focused_step["if"],
+            "${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'standard' && github.ref != 'refs/heads/dev' }}",
+        )
+        self.assertIn(
+            "--focused tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_synthetic_pg16_restore_diagnostic_under_root",
+            focused_step["run"],
+        )
+        self.assertNotIn("continue-on-error", focused_step)
+        focused_cleanup = next(
+            step for step in privileged_steps
+            if step.get("name") == "Remove only the focused synthetic reports before the full contour"
+        )
+        self.assertIn(
+            "synthetic-restore-diagnostic.json",
+            focused_cleanup["run"],
+        )
+        self.assertIn(
+            "synthetic-restore-diagnostic-failure.json",
+            focused_cleanup["run"],
+        )
+        self.assertLess(privileged_steps.index(focused_step), privileged_steps.index(focused_cleanup))
         full_step = next(
-            step for step in workflow_data["jobs"]["backend-privileged"]["steps"]
+            step for step in privileged_steps
             if step.get("name") == "Run serial privileged catalog contour exactly once as root"
         )
+        self.assertLess(privileged_steps.index(focused_cleanup), privileged_steps.index(full_step))
+        self.assertIn("success()", full_step["if"])
+        self.assertIn("steps.synthetic_restore_first.outcome != 'failure'", full_step["if"])
         self.assertIn("platform_verify.py backend-privileged", full_step["run"])
         self.assertIn("--manifest ci-backend/backend-privileged/manifest.json", full_step["run"])
         self.assertIn("--summary ci-backend/backend-privileged/summary.json", full_step["run"])
         self.assertIn("Upload backend privileged manifests", privileged_body)
         self.assertNotIn("continue-on-error", full_step)
+        self.assertEqual(
+            sum(step.get("name") == "Upload backend privileged manifests and synthetic restore diagnostics" for step in privileged_steps),
+            1,
+        )
+        upload_step = next(
+            step for step in privileged_steps
+            if step.get("name") == "Upload backend privileged manifests and synthetic restore diagnostics"
+        )
+        self.assertEqual(upload_step["if"], "${{ always() }}")
+        self.assertGreater(privileged_steps.index(upload_step), privileged_steps.index(full_step))
         restore_test = next(
             case for case in discover_test_cases()
             if case.module == "test_platform_backup_restore_drill"

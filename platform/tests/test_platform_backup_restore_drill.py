@@ -296,6 +296,13 @@ def _write_synthetic_restore_failure_artifact(
         unit_diagnostic
     ):
         raise RuntimeError("Synthetic restore failure unit summary failed validation.")
+    journal_diagnostic = getattr(
+        failure,
+        "scratch_unit_journal_diagnostic",
+        backup_drill._scratch_empty_journal_diagnostic("unavailable"),
+    )
+    if not backup_drill.valid_scratch_unit_journal_diagnostic(journal_diagnostic):
+        raise RuntimeError("Synthetic restore failure journal summary failed validation.")
     first_fault = getattr(failure, "scratch_first_fault", None)
     if first_fault is not None and not backup_drill.valid_scratch_first_fault(first_fault):
         raise RuntimeError("Synthetic restore failure site failed validation.")
@@ -362,6 +369,7 @@ def _write_synthetic_restore_failure_artifact(
         "failure_stage": "run_synthetic_restore_diagnostic",
         "scratch_first_fault": first_fault,
         "scratch_unit_diagnostic": unit_diagnostic,
+        "scratch_unit_journal_diagnostic": journal_diagnostic,
         "scratch_cleanup_status": cleanup_status,
         "stderr_diagnostic": _classify_synthetic_restore_stderr(
             stderr_suffix, complete=stderr_suffix_complete
@@ -1157,6 +1165,17 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "errno": None,
             }
             failure.scratch_unit_diagnostic = unit_diagnostic
+            failure.scratch_unit_journal_diagnostic = {
+                "schema": 1,
+                "status": "complete",
+                "bytes_read": 120,
+                "complete": True,
+                "records": 1,
+                "reason": "namespace_setup",
+                "namespace_kind": "mount",
+                "errno": "EACCES",
+                "target": "scratch_tmpfs",
+            }
             failure.scratch_cleanup_status = "confirmed"
             failure.scratch_unit_private_output = (synthetic_stdout, synthetic_stderr)
             failure.scratch_synthetic_stderr_tail = synthetic_stderr[
@@ -1194,6 +1213,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "failure_stage",
                     "scratch_first_fault",
                     "scratch_unit_diagnostic",
+                    "scratch_unit_journal_diagnostic",
                     "scratch_cleanup_status",
                     "stderr_diagnostic",
                 },
@@ -1207,6 +1227,10 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertEqual(failure_artifact["failure_stage"], "run_synthetic_restore_diagnostic")
             self.assertEqual(
                 failure_artifact["scratch_unit_diagnostic"], unit_diagnostic
+            )
+            self.assertEqual(
+                failure_artifact["scratch_unit_journal_diagnostic"],
+                failure.scratch_unit_journal_diagnostic,
             )
             self.assertEqual(
                 failure_artifact["scratch_first_fault"], failure.scratch_first_fault
@@ -2051,6 +2075,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             "sub_state": "dead",
             "result": "success",
             "exec_main_status": 0,
+            "exec_main_code": "exited",
             "start_token_sent": False,
             "completion_token_sent": False,
         }
@@ -2082,9 +2107,226 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             {**terminal_snapshot, "private_path": "/root/private"},
             {**terminal_snapshot, "start_token_sent": 1},
             {**terminal_snapshot, "active_state": "unknown-secret-state"},
+            {**terminal_snapshot, "exec_main_code": "private-status"},
         ):
             malformed = {**diagnostic, "terminal_snapshot": malformed_terminal}
             self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
+
+        unit_name = "oldsparky-backup-restore-" + ("a" * 24) + ".service"
+        mountpoint = pathlib.Path("/run/oldsparky-backup-restore-" + ("a" * 24))
+        journal_record = json.dumps(
+            {
+                "_SYSTEMD_UNIT": unit_name,
+                "MESSAGE": f"Failed to set up mount namespacing: {mountpoint}: Permission denied",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        journal_diagnostic = backup_drill._scratch_parse_unit_journal(
+            journal_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertTrue(backup_drill.valid_scratch_unit_journal_diagnostic(journal_diagnostic))
+        self.assertEqual(journal_diagnostic["reason"], "namespace_setup")
+        self.assertEqual(journal_diagnostic["namespace_kind"], "mount")
+        self.assertEqual(journal_diagnostic["errno"], "EACCES")
+        self.assertEqual(journal_diagnostic["target"], "scratch_tmpfs")
+
+        prefixed_target_record = json.dumps(
+            {
+                "_SYSTEMD_UNIT": unit_name,
+                "MESSAGE": "Failed to set up mount namespacing: /rooted/private: Permission denied",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        prefixed_target = backup_drill._scratch_parse_unit_journal(
+            prefixed_target_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertEqual(prefixed_target["target"], "unknown")
+        prefixed_failure_record = json.dumps(
+            {
+                "_SYSTEMD_UNIT": unit_name,
+                "MESSAGE": (
+                    "Wrapper observed Failed to set up mount namespacing: "
+                    f"{mountpoint}: Permission denied"
+                ),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        prefixed_failure = backup_drill._scratch_parse_unit_journal(
+            prefixed_failure_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertEqual(prefixed_failure["reason"], "unknown")
+        ambiguous_kind_record = json.dumps(
+            {
+                "_SYSTEMD_UNIT": unit_name,
+                "MESSAGE": (
+                    "Failed to set up mount namespacing and failed to set up user namespacing: "
+                    f"{mountpoint}: Permission denied"
+                ),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        ambiguous_kind = backup_drill._scratch_parse_unit_journal(
+            ambiguous_kind_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertEqual(ambiguous_kind["reason"], "namespace_setup")
+        self.assertEqual(ambiguous_kind["namespace_kind"], "unknown")
+
+        private_record = json.dumps(
+            {
+                "_SYSTEMD_UNIT": unit_name,
+                "MESSAGE": (
+                    "Failed at step NAMESPACE spawning "
+                    f"{mountpoint / 'platform_backup_restore_drill.py'}: Operation not permitted"
+                ),
+                "_HOSTNAME": "private-runner-name",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        private_diagnostic = backup_drill._scratch_parse_unit_journal(
+            private_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertEqual(private_diagnostic["reason"], "namespace_setup")
+        self.assertEqual(private_diagnostic["namespace_kind"], "unknown")
+        self.assertEqual(private_diagnostic["errno"], "EPERM")
+        self.assertEqual(private_diagnostic["target"], "source_script")
+        self.assertNotIn("private-runner-name", json.dumps(private_diagnostic))
+        self.assertNotIn(str(mountpoint), json.dumps(private_diagnostic))
+
+        unrelated_record = json.dumps(
+            {"_SYSTEMD_UNIT": "unrelated.service", "MESSAGE": "Failed at step NAMESPACE"}
+        ).encode("utf-8") + b"\n"
+        unrelated = backup_drill._scratch_parse_unit_journal(
+            unrelated_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertEqual(unrelated["reason"], "unknown")
+        ambiguous = backup_drill._scratch_parse_unit_journal(
+            journal_record + private_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertEqual(ambiguous["reason"], "unknown")
+        bounded = backup_drill._scratch_parse_unit_journal(
+            journal_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=False,
+            status="bounded",
+        )
+        self.assertEqual(bounded["status"], "bounded")
+        self.assertEqual(bounded["reason"], "unknown")
+        line = json.dumps(
+            {"_SYSTEMD_UNIT": unit_name, "MESSAGE": "informational"},
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        below_line_cap = line * backup_drill.SCRATCH_SYNTHETIC_JOURNAL_MAX_LINES
+        at_line_cap = line * backup_drill.SCRATCH_SYNTHETIC_JOURNAL_QUERY_LINES
+        self.assertEqual(
+            backup_drill._scratch_journal_capture_status(
+                below_line_cap, eof=True, returncode=0
+            ),
+            ("complete", True),
+        )
+        self.assertEqual(
+            backup_drill._scratch_journal_capture_status(
+                at_line_cap, eof=True, returncode=0
+            ),
+            ("bounded", False),
+        )
+        malformed = backup_drill._scratch_parse_unit_journal(
+            b"not-json\n",
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertEqual(malformed["status"], "malformed")
+        self.assertEqual(malformed["reason"], "unknown")
+
+        with mock.patch.object(
+            backup_drill.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as reset_failed:
+            backup_drill._scratch_reset_failed_unit(unit_name)
+        self.assertEqual(
+            reset_failed.call_args.args[0], ["systemctl", "reset-failed", unit_name]
+        )
+        with mock.patch.object(
+            backup_drill,
+            "_scratch_service_snapshot",
+            return_value={"properties": {"LoadState": "not-found"}, "load_state": "not-found"},
+        ) as snapshot_not_found:
+            self.assertEqual(
+                backup_drill._scratch_wait_unit_not_found(unit_name)["load_state"],
+                "not-found",
+            )
+        snapshot_not_found.assert_called_once_with(unit_name)
+        with (
+            mock.patch.object(backup_drill, "_scratch_reset_failed_unit") as reset_missing,
+            mock.patch.object(
+                backup_drill,
+                "_scratch_wait_unit_not_found",
+                return_value={"load_state": "not-found", "properties": {"LoadState": "not-found"}},
+            ) as wait_missing,
+        ):
+            unloaded = backup_drill._scratch_unload_synthetic_unit(
+                unit_name, {"load_state": "not-found"}
+            )
+        reset_missing.assert_not_called()
+        wait_missing.assert_called_once_with(unit_name)
+        self.assertEqual(unloaded["load_state"], "not-found")
+
+        cleanup_order: list[str] = []
+        with (
+            mock.patch.object(
+                backup_drill,
+                "_scratch_reset_failed_unit",
+                side_effect=lambda _unit: cleanup_order.append("reset"),
+            ) as reset_loaded,
+            mock.patch.object(
+                backup_drill,
+                "_scratch_wait_unit_not_found",
+                side_effect=lambda _unit: (
+                    cleanup_order.append("wait"),
+                    {"load_state": "not-found", "properties": {"LoadState": "not-found"}},
+                )[1],
+            ) as wait_loaded,
+        ):
+            loaded = backup_drill._scratch_unload_synthetic_unit(
+                unit_name, {"load_state": "loaded"}
+            )
+        reset_loaded.assert_called_once_with(unit_name)
+        wait_loaded.assert_called_once_with(unit_name)
+        self.assertEqual(cleanup_order, ["reset", "wait"])
+        self.assertEqual(loaded["load_state"], "not-found")
+        with self.assertRaisesRegex(RuntimeError, "unit identity"):
+            backup_drill._scratch_reset_failed_unit("platformdb.service")
 
         required_bytes = backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES
         guard_sites = (
@@ -2876,6 +3118,22 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         ):
             self.assertIn(required, command)
 
+        synthetic_command = backup_drill._scratch_unit_command(
+            mountpoint=mountpoint,
+            archive_path=None,
+            archive_stat=None,
+            archive_sha256=None,
+            timestamp_slug="20261013T010203Z",
+            unit_name="oldsparky-backup-restore-" + ("c" * 24) + ".service",
+            synthetic_restore_diagnostic=True,
+        )
+        self.assertNotIn("--collect", synthetic_command)
+        self.assertIn("--property=CollectMode=inactive", synthetic_command)
+        self.assertIn("--property=MemoryMax=" + str(backup_drill.SCRATCH_MEMORY_MAX_BYTES), synthetic_command)
+        self.assertIn("--property=MemorySwapMax=0", synthetic_command)
+        self.assertNotIn("--_scratch-archive", synthetic_command)
+        self.assertFalse(any("archive.dump" in item for item in synthetic_command))
+
     def _assert_scratch_unit_diagnostic_caps_and_private_envelope(self) -> None:
         required_memory = backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES
         available_memory = required_memory - 4096
@@ -3145,6 +3403,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             "sub_state": "dead",
             "result": "success",
             "exec_main_status": 0,
+            "exec_main_code": "exited",
             "start_token_sent": False,
             "completion_token_sent": False,
         }
@@ -4944,6 +5203,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             )
         self.assertIn("--property=MemoryMax=671088640", command)
         self.assertIn("--property=MemorySwapMax=0", command)
+        self.assertIn("--collect", command)
         self.assertIn("--property=RestrictAddressFamilies=AF_UNIX", command)
         self.assertIn("--property=PrivateNetwork=yes", command)
         self.assertIn("--property=OOMPolicy=kill", command)

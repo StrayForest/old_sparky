@@ -2,11 +2,11 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-17
+- Last reviewed: 2026-10-18
 
 ## Ephemeral synthetic restore diagnostic
 
-The privileged Security contour runs a fixed synthetic PG16 custom archive through three serial restores inside the verified scratch unit. The [test-suite governance](test-suite-governance.md) owns its fixture, equivalence checks, runner preflight and sanitized success metrics artifact. This diagnostic does not change production restore settings or prove full-restore capacity. On failure, sibling `synthetic-restore-diagnostic-failure.json` retains fixed reason enums, unit status and bounded stderr byte/hash metadata; `unknown` is not a cause and the failure artifact contains no successful three-arm metrics.
+The privileged Security contour runs a fixed synthetic PG16 custom archive through three serial restores inside the verified scratch unit. The [test-suite governance](test-suite-governance.md) owns its fixture, equivalence checks, runner preflight and sanitized success metrics artifact. A standard Security `workflow_dispatch` on a non-`dev` branch runs this exact test first; failure skips the full contour but still reaches its single artifact upload, while success removes only the two fixed synthetic reports and proceeds to the unchanged full contour. This early result is diagnostic-only and does not replace the required full `dev` gate. The diagnostic does not change production restore settings or prove full-restore capacity. On failure, sibling `synthetic-restore-diagnostic-failure.json` retains fixed unit status, bounded stderr byte/hash metadata, and a bounded exact-unit journal projection containing only closed reason/namespace/errno/target enums; raw journal messages are never exported. A failed synthetic unit is retained through evidence capture, then stopped, reset if still loaded, and required to become `not-found` before mount cleanup. `unknown` is not a cause and the failure artifact contains no successful three-arm metrics.
 
 ## Local verified backup
 

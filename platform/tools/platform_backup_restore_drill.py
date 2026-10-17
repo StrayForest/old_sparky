@@ -83,6 +83,10 @@ SCRATCH_STARTUP_SECONDS = 30
 SCRATCH_RUNTIME_SAMPLE_SECONDS = 0.25
 SCRATCH_SYNTHETIC_ARCHIVE_MAX_BYTES = 1024 * 1024
 SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS = 0.01
+SCRATCH_SYNTHETIC_JOURNAL_MAX_BYTES = 16 * 1024
+SCRATCH_SYNTHETIC_JOURNAL_MAX_LINES = 32
+SCRATCH_SYNTHETIC_JOURNAL_QUERY_LINES = SCRATCH_SYNTHETIC_JOURNAL_MAX_LINES + 1
+SCRATCH_SYNTHETIC_JOURNAL_TIMEOUT_SECONDS = 2.0
 SCRATCH_EARLY_EXIT_DRAIN_SECONDS = 2.0
 SCRATCH_EARLY_EXIT_DRAIN_BYTES = 1024 * 1024
 SCRATCH_PG_PORT = 55432
@@ -1358,6 +1362,25 @@ _SCRATCH_UNIT_RESULTS = {
     "watchdog", "start-limit-hit", "protocol", "exec-condition", "condition",
     "assert", "oom-kill", "other",
 }
+_SCRATCH_UNIT_EXEC_MAIN_CODES = {"exited", "killed", "dumped", "unknown", "none"}
+_SCRATCH_JOURNAL_STATUSES = {"complete", "bounded", "unavailable", "malformed"}
+_SCRATCH_JOURNAL_REASONS = {
+    "namespace_setup", "exec_failure", "unit_start_failure", "none", "unknown"
+}
+_SCRATCH_JOURNAL_NAMESPACE_KINDS = {
+    "mount", "user", "network", "ipc", "uts", "cgroup", "time", "none", "unknown"
+}
+_SCRATCH_JOURNAL_ERRNOS = {
+    "EACCES", "EPERM", "EINVAL", "ENOENT", "EBUSY", "ENOSPC", "ENOMEM", "EIO",
+    "none", "unknown",
+}
+_SCRATCH_JOURNAL_TARGETS = {
+    "scratch_tmpfs", "source_script", "source_policy", "archive", "shared_platform",
+    "postgres_data", "postgres_socket", "postgres_config", "root_home", "none", "unknown",
+}
+_SCRATCH_GENERATED_UNIT_RE = re.compile(
+    r"oldsparky-backup-restore-[0-9a-f]{24}\.service\Z"
+)
 
 
 def valid_scratch_unit_diagnostic(value: Any) -> bool:
@@ -1451,6 +1474,7 @@ def valid_scratch_terminal_snapshot(value: Any) -> bool:
     """Validate the bounded lifecycle-only snapshot captured before unit stop."""
     keys = {
         "load_state", "active_state", "sub_state", "result", "exec_main_status",
+        "exec_main_code",
         "start_token_sent", "completion_token_sent",
     }
     return (
@@ -1464,6 +1488,8 @@ def valid_scratch_terminal_snapshot(value: Any) -> bool:
         and value["sub_state"] in _SCRATCH_UNIT_SUBSTATES
         and type(value.get("result")) is str
         and value["result"] in _SCRATCH_UNIT_RESULTS
+        and type(value.get("exec_main_code")) is str
+        and value["exec_main_code"] in _SCRATCH_UNIT_EXEC_MAIN_CODES
         and (
             value.get("exec_main_status") is None
             or (type(value["exec_main_status"]) is int and 0 <= value["exec_main_status"] <= 255)
@@ -1485,16 +1511,375 @@ def _scratch_terminal_snapshot(
         if isinstance(exec_status_raw, str) and re.fullmatch(r"[0-9]{1,3}", exec_status_raw)
         else None
     )
+    exec_code_raw = properties.get("ExecMainCode")
+    exec_code = {
+        "1": "exited",
+        "2": "killed",
+        "3": "dumped",
+        "0": "none",
+    }.get(exec_code_raw, "unknown")
     value = {
         "load_state": properties.get("LoadState") if properties.get("LoadState") in _SCRATCH_UNIT_LOAD_STATES else "other",
         "active_state": properties.get("ActiveState") if properties.get("ActiveState") in _SCRATCH_UNIT_ACTIVE_STATES else "other",
         "sub_state": properties.get("SubState") if properties.get("SubState") in _SCRATCH_UNIT_SUBSTATES else "other",
         "result": properties.get("Result") if properties.get("Result") in _SCRATCH_UNIT_RESULTS else "other",
         "exec_main_status": exec_status,
+        "exec_main_code": exec_code,
         "start_token_sent": start_token_sent,
         "completion_token_sent": completion_token_sent,
     }
     return value if valid_scratch_terminal_snapshot(value) else None
+
+
+def valid_scratch_unit_journal_diagnostic(value: Any) -> bool:
+    keys = {
+        "schema", "status", "bytes_read", "complete", "records", "reason",
+        "namespace_kind", "errno", "target",
+    }
+    return (
+        isinstance(value, dict)
+        and set(value) == keys
+        and type(value.get("schema")) is int
+        and value["schema"] == 1
+        and type(value.get("status")) is str
+        and value["status"] in _SCRATCH_JOURNAL_STATUSES
+        and type(value.get("bytes_read")) is int
+        and 0 <= value["bytes_read"] <= SCRATCH_SYNTHETIC_JOURNAL_MAX_BYTES
+        and type(value.get("complete")) is bool
+        and (value["status"] == "complete") == value["complete"]
+        and type(value.get("records")) is int
+        and 0 <= value["records"] <= SCRATCH_SYNTHETIC_JOURNAL_MAX_LINES
+        and type(value.get("reason")) is str
+        and value["reason"] in _SCRATCH_JOURNAL_REASONS
+        and type(value.get("namespace_kind")) is str
+        and value["namespace_kind"] in _SCRATCH_JOURNAL_NAMESPACE_KINDS
+        and type(value.get("errno")) is str
+        and value["errno"] in _SCRATCH_JOURNAL_ERRNOS
+        and type(value.get("target")) is str
+        and value["target"] in _SCRATCH_JOURNAL_TARGETS
+        and (
+            value["reason"] != "none"
+            or (
+                value["namespace_kind"] == "none"
+                and value["errno"] == "none"
+                and value["target"] == "none"
+            )
+        )
+    )
+
+
+def _scratch_empty_journal_diagnostic(
+    status: str, *, bytes_read: int = 0, complete: bool = False, records: int = 0
+) -> dict[str, Any]:
+    diagnostic = {
+        "schema": 1,
+        "status": status,
+        "bytes_read": bytes_read,
+        "complete": complete,
+        "records": records,
+        "reason": "unknown",
+        "namespace_kind": "unknown",
+        "errno": "unknown",
+        "target": "unknown",
+    }
+    return diagnostic if valid_scratch_unit_journal_diagnostic(diagnostic) else {
+        "schema": 1,
+        "status": "unavailable",
+        "bytes_read": 0,
+        "complete": False,
+        "records": 0,
+        "reason": "unknown",
+        "namespace_kind": "unknown",
+        "errno": "unknown",
+        "target": "unknown",
+    }
+
+
+def _scratch_journal_target(message: str, mountpoint: pathlib.Path) -> str:
+    paths = (
+        (str(mountpoint / "platform_backup_restore_drill.py"), "source_script"),
+        (str(mountpoint / "platform_disk_policy.py"), "source_policy"),
+        (str(mountpoint / "archive.dump"), "archive"),
+        (str(mountpoint), "scratch_tmpfs"),
+        ("/opt/oldsparky/platform/shared", "shared_platform"),
+        ("/var/lib/postgresql", "postgres_data"),
+        ("/var/run/postgresql", "postgres_socket"),
+        ("/run/postgresql", "postgres_socket"),
+        ("/etc/postgresql", "postgres_config"),
+        ("/root", "root_home"),
+    )
+    path_characters = r"A-Za-z0-9._/-"
+    hits = [
+        (path, target)
+        for path, target in paths
+        if re.search(
+            rf"(?<![{path_characters}]){re.escape(path)}(?![{path_characters}])",
+            message,
+        )
+    ]
+    if not hits:
+        return "unknown"
+    specific_hits = [
+        (path, target)
+        for path, target in hits
+        if not any(
+            other_path.startswith(path.rstrip("/") + "/")
+            for other_path, _ in hits
+            if other_path != path
+        )
+    ]
+    return specific_hits[0][1] if len(specific_hits) == 1 else "unknown"
+
+
+def _scratch_journal_message_projection(
+    message: str, *, mountpoint: pathlib.Path
+) -> tuple[str, str, str, str] | None:
+    lowered = message.casefold()
+    namespace_start = re.match(
+        r"^failed to set up (mount|user|network|ipc|uts|cgroup|time) namespacing"
+        r"(?=\s*:|\s+and\s+failed to set up |$)",
+        lowered,
+    )
+    if namespace_start:
+        namespace_matches = re.findall(
+            r"\bfailed to set up (mount|user|network|ipc|uts|cgroup|time) namespacing"
+            r"(?=\s*:|\s+and\s+failed to set up |$)",
+            lowered,
+        )
+        namespace_kind = namespace_matches[0] if len(set(namespace_matches)) == 1 else "unknown"
+        reason = "namespace_setup"
+    elif re.match(r"^failed at step namespace(?:\s|$)", lowered):
+        namespace_kind = "unknown"
+        reason = "namespace_setup"
+    elif re.match(r"^failed at step exec(?:\s|$)", lowered):
+        namespace_kind = "none"
+        reason = "exec_failure"
+    elif re.match(r"^failed (?:to start|with result)\b", lowered):
+        namespace_kind = "none"
+        reason = "unit_start_failure"
+    else:
+        return None
+
+    errno_hits = [
+        name
+        for phrase, name in (
+            ("permission denied", "EACCES"),
+            ("operation not permitted", "EPERM"),
+            ("invalid argument", "EINVAL"),
+            ("no such file or directory", "ENOENT"),
+            ("device or resource busy", "EBUSY"),
+            ("no space left on device", "ENOSPC"),
+            ("cannot allocate memory", "ENOMEM"),
+            ("input/output error", "EIO"),
+        )
+        if phrase in lowered
+    ]
+    errno_name = errno_hits[0] if len(set(errno_hits)) == 1 else "unknown"
+    target = _scratch_journal_target(message, mountpoint)
+    return reason, namespace_kind, errno_name, target
+
+
+def _scratch_journal_capture_status(
+    raw: bytes, *, eof: bool, returncode: int | None
+) -> tuple[str, bool]:
+    if type(raw) is not bytes or len(raw) > SCRATCH_SYNTHETIC_JOURNAL_MAX_BYTES:
+        return "bounded", False
+    if not eof or returncode is None:
+        return "bounded", False
+    if returncode != 0:
+        return "unavailable", False
+    line_count = sum(bool(line) for line in raw.splitlines())
+    if line_count >= SCRATCH_SYNTHETIC_JOURNAL_QUERY_LINES:
+        return "bounded", False
+    return "complete", True
+
+
+def _scratch_parse_unit_journal(
+    raw: bytes,
+    *,
+    unit_name: str,
+    mountpoint: pathlib.Path,
+    complete: bool,
+    status: str,
+) -> dict[str, Any]:
+    if (
+        _SCRATCH_GENERATED_UNIT_RE.fullmatch(unit_name) is None
+        or type(raw) is not bytes
+        or len(raw) > SCRATCH_SYNTHETIC_JOURNAL_MAX_BYTES
+        or status not in _SCRATCH_JOURNAL_STATUSES
+        or type(complete) is not bool
+    ):
+        return _scratch_empty_journal_diagnostic("malformed", bytes_read=0)
+    if status != "complete" or not complete:
+        return _scratch_empty_journal_diagnostic(
+            "bounded" if status == "bounded" else "unavailable",
+            bytes_read=len(raw),
+        )
+
+    exact_records = 0
+    projections: set[tuple[str, str, str, str]] = set()
+    try:
+        for line in raw.splitlines(keepends=True):
+            if not line:
+                continue
+            if not line.endswith(b"\n"):
+                raise ValueError("incomplete journal record")
+            record = json.loads(line.decode("utf-8"))
+            if not isinstance(record, dict):
+                raise ValueError("journal record shape")
+            unit_fields = [
+                record[key]
+                for key in ("_SYSTEMD_UNIT", "UNIT", "OBJECT_SYSTEMD_UNIT")
+                if key in record
+            ]
+            if not unit_fields or any(value != unit_name for value in unit_fields):
+                continue
+            message = record.get("MESSAGE")
+            if not isinstance(message, str):
+                continue
+            exact_records += 1
+            if exact_records > SCRATCH_SYNTHETIC_JOURNAL_MAX_LINES:
+                raise ValueError("journal record count")
+            projection = _scratch_journal_message_projection(
+                message, mountpoint=mountpoint
+            )
+            if projection is not None:
+                projections.add(projection)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _scratch_empty_journal_diagnostic(
+            "malformed", bytes_read=len(raw), records=min(exact_records, SCRATCH_SYNTHETIC_JOURNAL_MAX_LINES)
+        )
+
+    if not projections:
+        return _scratch_empty_journal_diagnostic(
+            "complete", bytes_read=len(raw), complete=True, records=exact_records
+        )
+    specific_projections = {
+        item for item in projections if item[0] != "unit_start_failure"
+    }
+    if len(specific_projections) == 1:
+        reason, namespace_kind, errno_name, target = next(iter(specific_projections))
+    elif not specific_projections and len(projections) == 1:
+        reason, namespace_kind, errno_name, target = next(iter(projections))
+    else:
+        reason = namespace_kind = errno_name = target = "unknown"
+    diagnostic = {
+        "schema": 1,
+        "status": "complete",
+        "bytes_read": len(raw),
+        "complete": True,
+        "records": exact_records,
+        "reason": reason,
+        "namespace_kind": namespace_kind,
+        "errno": errno_name,
+        "target": target,
+    }
+    return diagnostic if valid_scratch_unit_journal_diagnostic(diagnostic) else (
+        _scratch_empty_journal_diagnostic("malformed", bytes_read=len(raw), records=exact_records)
+    )
+
+
+def _scratch_unit_journal_diagnostic(
+    unit_name: str, *, mountpoint: pathlib.Path
+) -> dict[str, Any]:
+    """Capture only bounded, exact-unit journal facts; never retain raw messages."""
+    if _SCRATCH_GENERATED_UNIT_RE.fullmatch(unit_name) is None:
+        return _scratch_empty_journal_diagnostic("malformed")
+    command = [
+        "journalctl", "--no-pager", "--quiet", "--output=json",
+        f"--lines={SCRATCH_SYNTHETIC_JOURNAL_QUERY_LINES}", f"--unit={unit_name}",
+    ]
+    environment = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "SYSTEMD_COLORS": "0",
+        "SYSTEMD_PAGER": "cat",
+    }
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
+    raw = bytearray()
+    complete = False
+    status = "unavailable"
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            cwd="/",
+            close_fds=True,
+            bufsize=0,
+        )
+        assert process.stdout is not None
+        os.set_blocking(process.stdout.fileno(), False)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + SCRATCH_SYNTHETIC_JOURNAL_TIMEOUT_SECONDS
+        eof = False
+        bounded = False
+        while not eof and time.monotonic() < deadline:
+            events = selector.select(min(0.1, max(0.0, deadline - time.monotonic())))
+            if not events:
+                if process.poll() is not None:
+                    # Drain through the pipe's EOF after journalctl exits.
+                    continue
+                continue
+            try:
+                chunk = os.read(
+                    process.stdout.fileno(),
+                    min(4096, SCRATCH_SYNTHETIC_JOURNAL_MAX_BYTES + 1 - len(raw)),
+                )
+            except BlockingIOError:
+                continue
+            if not chunk:
+                eof = True
+                break
+            raw.extend(chunk)
+            if len(raw) > SCRATCH_SYNTHETIC_JOURNAL_MAX_BYTES:
+                del raw[SCRATCH_SYNTHETIC_JOURNAL_MAX_BYTES:]
+                bounded = True
+                break
+        if eof:
+            return_code = process.wait(timeout=0.5)
+            status, complete = _scratch_journal_capture_status(
+                bytes(raw), eof=True, returncode=return_code
+            )
+        elif bounded:
+            status = "bounded"
+        else:
+            status = "bounded"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        status = "unavailable"
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if selector is not None:
+            try:
+                selector.close()
+            except Exception:
+                pass
+        if process is not None and process.stdout is not None:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+    return _scratch_parse_unit_journal(
+        bytes(raw),
+        unit_name=unit_name,
+        mountpoint=mountpoint,
+        complete=complete,
+        status=status,
+    )
 
 
 def _scratch_private_output_envelope(stdout: bytes, stderr: bytes) -> bytes:
@@ -6822,7 +7207,7 @@ def _scratch_unit_command(
         "--quiet",
         "--wait",
         "--pipe",
-        "--collect",
+        *([] if synthetic_restore_diagnostic else ["--collect"]),
         f"--unit={unit_name}",
         "--property=Type=exec",
         f"--property=TemporaryFileSystem={mountpoint}:rw,size={SCRATCH_TMPFS_BYTES},mode=0700",
@@ -6869,6 +7254,8 @@ def _scratch_unit_command(
         "--_scratch-timestamp-slug",
         timestamp_slug,
     ]
+    if synthetic_restore_diagnostic:
+        command.insert(command.index("--property=Type=exec"), "--property=CollectMode=inactive")
     if authorization_probe and synthetic_restore_diagnostic:
         raise ValueError("Scratch authorization probe and synthetic diagnostic are mutually exclusive.")
     if authorization_probe:
@@ -7084,7 +7471,9 @@ def _scratch_service_snapshot(unit_name: str) -> dict[str, Any]:
         "ControlGroup",
         "ExecMainPID",
         "InvocationID",
+        "ExecMainCode",
         "ExecMainStatus",
+        "CollectMode",
         "Result",
         "TemporaryFileSystem",
         "BindReadOnlyPaths",
@@ -7362,6 +7751,8 @@ def _scratch_expected_properties(
         raise RuntimeError("Scratch restore service has an unexpected writable-path override.")
     if properties.get("LoadState") != "loaded" or properties.get("ActiveState") != "active":
         raise RuntimeError("Scratch restore service is not active while it is being checked.")
+    if synthetic_restore_diagnostic and properties.get("CollectMode") != "inactive":
+        raise RuntimeError("Synthetic restore unit does not retain failed state for diagnosis.")
     control_group = properties.get("ControlGroup", "")
     if not control_group.startswith("/system.slice/") or ".." in pathlib.PurePosixPath(control_group).parts:
         raise RuntimeError("Scratch restore service cgroup is invalid.")
@@ -7453,6 +7844,48 @@ def _scratch_stop_unit(unit_name: str) -> None:
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("Scratch restore service could not be confirmed stopped.") from exc
+
+
+def _scratch_reset_failed_unit(unit_name: str) -> None:
+    if _SCRATCH_GENERATED_UNIT_RE.fullmatch(unit_name) is None:
+        raise RuntimeError("Scratch restore cleanup unit identity is invalid.")
+    completed = subprocess.run(
+        ["systemctl", "reset-failed", unit_name],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "SYSTEMD_PAGER": "cat"},
+        timeout=3,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("Scratch restore failed unit state could not be reset.")
+
+
+def _scratch_wait_unit_not_found(
+    unit_name: str, *, timeout_seconds: float = 2.0
+) -> dict[str, Any]:
+    if _SCRATCH_GENERATED_UNIT_RE.fullmatch(unit_name) is None:
+        raise RuntimeError("Scratch restore cleanup unit identity is invalid.")
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        snapshot = _scratch_service_snapshot(unit_name)
+        if snapshot.get("load_state") == "not-found":
+            return snapshot
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Scratch restore transient unit was not unloaded after reset.")
+        time.sleep(0.05)
+
+
+def _scratch_unload_synthetic_unit(
+    unit_name: str, snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    if _SCRATCH_GENERATED_UNIT_RE.fullmatch(unit_name) is None:
+        raise RuntimeError("Scratch restore cleanup unit identity is invalid.")
+    if not isinstance(snapshot, dict) or type(snapshot.get("load_state")) is not str:
+        raise RuntimeError("Scratch restore cleanup unit state is invalid.")
+    if snapshot["load_state"] != "not-found":
+        _scratch_reset_failed_unit(unit_name)
+    return _scratch_wait_unit_not_found(unit_name)
 
 
 def _run_isolated_restore_drill(
@@ -8093,6 +8526,28 @@ def _run_isolated_restore_drill(
                     )
                 except BaseException:
                     terminal_snapshot = None
+            if synthetic_restore_diagnostic and launch_started:
+                try:
+                    if early_exit_snapshot is None:
+                        early_exit_snapshot = _scratch_service_snapshot(unit_name)
+                except BaseException:
+                    pass
+                try:
+                    journal_diagnostic = _scratch_unit_journal_diagnostic(
+                        unit_name, mountpoint=mountpoint
+                    )
+                    if valid_scratch_unit_journal_diagnostic(journal_diagnostic):
+                        setattr(
+                            operation_error,
+                            "scratch_unit_journal_diagnostic",
+                            journal_diagnostic,
+                        )
+                except BaseException:
+                    setattr(
+                        operation_error,
+                        "scratch_unit_journal_diagnostic",
+                        _scratch_empty_journal_diagnostic("unavailable"),
+                    )
             authorization_stream = getattr(process, "stdin", None) if process is not None else None
             if authorization_stream is not None and not authorization_stream.closed:
                 try:
@@ -8292,14 +8747,21 @@ def _run_isolated_restore_drill(
                         _scratch_stop_unit(unit_name)
                         final_snapshot = _scratch_service_snapshot(unit_name)
                         final_props = final_snapshot["properties"]
-                    service_stopped = (
-                        final_props.get("LoadState") == "not-found"
-                        or (
-                            final_props.get("ActiveState") in {"inactive", "failed"}
-                            and final_props.get("ExecMainPID", "0") in {"", "0"}
-                            and final_props.get("ControlGroup", "") == ""
+                    if synthetic_restore_diagnostic:
+                        final_snapshot = _scratch_unload_synthetic_unit(
+                            unit_name, final_snapshot
                         )
-                    )
+                        final_props = final_snapshot["properties"]
+                        service_stopped = final_props.get("LoadState") == "not-found"
+                    else:
+                        service_stopped = (
+                            final_props.get("LoadState") == "not-found"
+                            or (
+                                final_props.get("ActiveState") in {"inactive", "failed"}
+                                and final_props.get("ExecMainPID", "0") in {"", "0"}
+                                and final_props.get("ControlGroup", "") == ""
+                            )
+                        )
                 except BaseException as cleanup_error:
                     final_cleanup_errors.append(cleanup_error)
             try:

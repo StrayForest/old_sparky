@@ -772,7 +772,33 @@ jobs:
           done
           test -f "$sharedir/extension/pg_trgm.control"
           printf 'Verified PostgreSQL 16 binaries in %s and pg_trgm under %s\n' "$bindir" "$sharedir"
+      - name: Run synthetic restore diagnostic first on feature dispatches
+        id: synthetic_restore_first
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'standard' && github.ref != 'refs/heads/dev' }}
+        run: >-
+          sudo -n env -i
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
+          GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
+          PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+          PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials
+          PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
+          PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
+          PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+          /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' &&
+          .venv_platform/bin/python tools/platform_test_runner.py --contour backend-privileged
+          --focused tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_synthetic_pg16_restore_diagnostic_under_root"
+      - name: Remove only the focused synthetic reports before the full contour
+        if: ${{ steps.synthetic_restore_first.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          sudo -n /bin/rm -f -- \
+            "$GITHUB_WORKSPACE/platform/ci-backend/backend-privileged/synthetic-restore-diagnostic.json" \
+            "$GITHUB_WORKSPACE/platform/ci-backend/backend-privileged/synthetic-restore-diagnostic-failure.json"
       - name: Run serial privileged catalog contour exactly once as root
+        if: ${{ success() && steps.synthetic_restore_first.outcome != 'failure' }}
         run: >-
           sudo -n env -i
           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
