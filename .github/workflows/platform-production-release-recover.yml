@@ -11,13 +11,14 @@ on:
           - recover_pending
           - quarantine_populated_quiesce
           - prune_task_releases
+          - prune_quarantined_candidate
         default: recover_pending
       failed_deploy_run_id:
-        description: "Exact failed Platform production deploy run (quarantine action only)"
+        description: "Exact failed Platform production deploy run (quarantine or quarantine-prune action only)"
         required: false
         type: string
       failed_deploy_run_attempt:
-        description: "Exact attempt for that failed deploy run (quarantine action only)"
+        description: "Exact attempt for that failed deploy run (quarantine or quarantine-prune action only)"
         required: false
         type: string
       expected_candidates_json:
@@ -144,6 +145,13 @@ jobs:
                 && "$SOURCE_BOUND_LIVEQA_REUSE" == false ]] \
                 || { echo "Exact failed deployment run and attempt are required" >&2; exit 1; }
               ;;
+            prune_quarantined_candidate:PRUNE-QUARANTINED-CANDIDATE)
+              [[ "$FAILED_DEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+                && "$FAILED_DEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ \
+                && -z "$EXPECTED_CANDIDATES_JSON$PROTECTED_RELEASES_JSON$RECIPIENT_CERTIFICATE_B64" \
+                && "$SOURCE_BOUND_LIVEQA_REUSE" == false ]] \
+                || { echo "Exact failed deployment run and attempt are required" >&2; exit 1; }
+              ;;
             prune_task_releases:PRUNE-TASK-RELEASES)
               test -n "$EXPECTED_CANDIDATES_JSON" && test -n "$PROTECTED_RELEASES_JSON" \
                 || { echo "Exact reviewed release sets are required" >&2; exit 1; }
@@ -181,7 +189,7 @@ jobs:
           PY
           )"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$RECOVERY_RUN_ID/attempts/$RECOVERY_RUN_ATTEMPT" --output "$metadata/recovery-run.json"
-          if [[ "$RECOVERY_ACTION" == "quarantine_populated_quiesce" ]]; then
+          if [[ "$RECOVERY_ACTION" == "quarantine_populated_quiesce" || "$RECOVERY_ACTION" == "prune_quarantined_candidate" ]]; then
             curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/workflows/platform-production-deploy.yml" --output "$metadata/failed-deploy-workflow.json"
             curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$FAILED_DEPLOY_RUN_ID/attempts/$FAILED_DEPLOY_RUN_ATTEMPT" --output "$metadata/failed-deploy-run.json"
             curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$FAILED_DEPLOY_RUN_ID/attempts/$FAILED_DEPLOY_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/failed-deploy-jobs.json"
@@ -254,7 +262,7 @@ jobs:
           ):
               raise SystemExit("exact recovery-bootstrap producer run is missing or invalid")
           failed_deploy_values = None
-          if os.environ["RECOVERY_ACTION"] == "quarantine_populated_quiesce":
+          if os.environ["RECOVERY_ACTION"] in {"quarantine_populated_quiesce", "prune_quarantined_candidate"}:
               failed_id = int(os.environ["FAILED_DEPLOY_RUN_ID"])
               failed_attempt = int(os.environ["FAILED_DEPLOY_RUN_ATTEMPT"])
               deploy_workflow = json.loads((root / "failed-deploy-workflow.json").read_text(encoding="utf-8"))
@@ -499,7 +507,7 @@ jobs:
           if (
               set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "bundle_artifact_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance", "publisher_workflow_sha", "publisher_run_id", "publisher_run_attempt", "publisher_job_id", "publisher_bundle_name", "publisher_bundle_artifact_id", "publisher_bundle_artifact_sha256"}
               or payload.get("schema") != 3 or payload.get("capability") != "recovery_bootstrap"
-              or payload.get("capabilities") != ["abort_retained_only", "recover_pending", "quarantine_populated_quiesce", "prune_task_releases", "capture_maintenance_failure", "reset_maintenance_failed"]
+              or payload.get("capabilities") != ["abort_retained_only", "recover_pending", "quarantine_populated_quiesce", "prune_task_releases", "prune_quarantined_candidate", "capture_maintenance_failure", "reset_maintenance_failed"]
               or payload.get("deployable") is not False
           ):
               raise SystemExit("recovery evidence schema is not closed")
@@ -1126,9 +1134,9 @@ jobs:
             local key="$1" value="$2"
             case "$key" in
               bundle_sha|route_digest) [[ "$value" =~ ^[0-9a-f]{64}$ ]] && return 0 ;;
-              source_sha) [[ "$value" =~ ^[0-9a-f]{40}$ ]] && return 0 ;;
+              source_sha|failed_deploy_source_sha) [[ "$value" =~ ^[0-9a-f]{40}$ ]] && return 0 ;;
               recovery_workflow_sha|publisher_workflow_sha) [[ "$value" =~ ^[0-9a-f]{40,64}$ ]] && return 0 ;;
-              security_run_id|security_run_attempt|recovery_run_id|recovery_run_attempt|recovery_job_id|publisher_run_id|publisher_run_attempt|publisher_job_id|expected_candidate_count)
+              security_run_id|security_run_attempt|recovery_run_id|recovery_run_attempt|recovery_job_id|publisher_run_id|publisher_run_attempt|publisher_job_id|expected_candidate_count|failed_deploy_run_id|failed_deploy_run_attempt)
                 [[ "$value" =~ ^[1-9][0-9]{0,31}$ ]] && return 0 ;;
             esac
             printf 'RECOVERY_INPUT_INVALID schema=1 key=%s\n' "$key" >&2
@@ -1148,6 +1156,12 @@ jobs:
           check_recovery_input publisher_job_id "${PUBLISHER_JOB_ID:-}"
           check_recovery_input route_digest "${ROUTE_DIGEST:-}"
           checked_input_count=13
+          if [[ "$RECOVERY_ACTION" == quarantine_populated_quiesce || "$RECOVERY_ACTION" == prune_quarantined_candidate ]]; then
+            check_recovery_input failed_deploy_run_id "${FAILED_DEPLOY_RUN_ID:-}"
+            check_recovery_input failed_deploy_run_attempt "${FAILED_DEPLOY_RUN_ATTEMPT:-}"
+            check_recovery_input failed_deploy_source_sha "${FAILED_DEPLOY_SOURCE_SHA:-}"
+            checked_input_count=16
+          fi
           if [[ "$RECOVERY_ACTION" == prune_task_releases ]]; then
             check_recovery_input expected_candidate_count "${EXPECTED_CANDIDATE_COUNT:-}"
             [[ "${EXPECTED_CANDIDATES_CSV:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}(,[A-Za-z0-9][A-Za-z0-9._-]{0,179})*$ ]] || input_errors=1
@@ -1389,7 +1403,7 @@ jobs:
           recovery_stage=route_digest
           [[ "$route_digest" =~ ^[0-9a-f]{64}$ ]]
           recovery_stage=recovery_action
-          [[ "$recovery_action" == recover_pending || "$recovery_action" == quarantine_populated_quiesce || "$recovery_action" == prune_task_releases ]]
+          [[ "$recovery_action" == recover_pending || "$recovery_action" == quarantine_populated_quiesce || "$recovery_action" == prune_task_releases || "$recovery_action" == prune_quarantined_candidate ]]
           recovery_stage=source_bound_liveqa
           [[ "$source_bound_liveqa_enabled" == 0 || "$source_bound_liveqa_enabled" == 1 ]]
           if [[ "$source_bound_liveqa_enabled" == 1 ]]; then
@@ -1413,7 +1427,7 @@ jobs:
           recovery_stage=recovery_action_run_attempt
           [[ "$recovery_action_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
           recovery_stage=failed_deploy_binding
-          if [[ "$recovery_action" == quarantine_populated_quiesce ]]; then
+          if [[ "$recovery_action" == quarantine_populated_quiesce || "$recovery_action" == prune_quarantined_candidate ]]; then
             [[ "$failed_deploy_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
             [[ "$failed_deploy_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
             [[ "$failed_deploy_source_sha" =~ ^[0-9a-f]{40}$ ]]
@@ -1542,7 +1556,7 @@ jobs:
               manifest = json.loads(manifest_raw.decode("ascii"), object_pairs_hook=unique_object)
               if (not isinstance(manifest, dict) or manifest.get("schema") != 1
                       or manifest.get("source_sha") != expected_source_sha
-                      or manifest.get("capabilities") != ["abort_retained_only", "recover_pending", "quarantine_populated_quiesce", "prune_task_releases", "capture_maintenance_failure", "reset_maintenance_failed"]):
+                      or manifest.get("capabilities") != ["abort_retained_only", "recover_pending", "quarantine_populated_quiesce", "prune_task_releases", "prune_quarantined_candidate", "capture_maintenance_failure", "reset_maintenance_failed"]):
                   raise SystemExit("immutable recovery manifest source is invalid")
               records = manifest.get("files")
               if not isinstance(records, list):
@@ -1642,6 +1656,17 @@ jobs:
               --recovery-run-id "$recovery_action_run_id" \
               --recovery-run-attempt "$recovery_action_run_attempt" \
               --app-dir "$runtime" --systemctl /usr/bin/systemctl
+          elif [[ "$recovery_action" == prune_quarantined_candidate ]]; then
+            "$trusted_generation/platform_recover_pending.sh" \
+              --action prune-quarantined-candidate \
+              --failed-deploy-run-id "$failed_deploy_run_id" \
+              --failed-deploy-run-attempt "$failed_deploy_run_attempt" \
+              --failed-deploy-source-sha "$failed_deploy_source_sha" \
+              --cleanup-run-id "$recovery_action_run_id" \
+              --cleanup-run-attempt "$recovery_action_run_attempt" \
+              --cleanup-source-sha "$source_sha" \
+              --bundle-sha "$generation_name" \
+              --app-dir "$runtime" --systemctl /usr/bin/systemctl
           elif [[ "$recovery_action" == prune_task_releases ]]; then
             IFS=, read -r -a expected_candidates <<<"$expected_candidates_csv"
             IFS=, read -r -a protected_releases <<<"$protected_releases_csv"
@@ -1688,6 +1713,13 @@ jobs:
                 && "$runtime_systemd_count" == 1 ]]; then
                 safe_check="$(grep -E '^RECOVERY_CHECK schema=1 status=failed check=(receipt_metadata|receipt_validate|capture_transaction|expected_receipt_current|verify_units|expected_unit_snapshot|unit_state|clear_receipt|receipt_absent)$' "$remote_error" | sed -E 's/^RECOVERY_CHECK schema=1 status=failed check=//')"
               fi
+              if [[ "$RECOVERY_ACTION" == prune_quarantined_candidate ]]; then
+                quarantine_prune_marker_count="$(grep -Ec '^RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=(pending_state|pointer_preflight|provider_preflight|health_preflight|transaction|receipt|pointer_postflight|provider_postflight|health_postflight|stability)$' "$remote_error" || true)"
+                if [[ "$quarantine_prune_marker_count" == 1 ]]; then
+                  quarantine_prune_stage="$(grep -E '^RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=(pending_state|pointer_preflight|provider_preflight|health_preflight|transaction|receipt|pointer_postflight|provider_postflight|health_postflight|stability)$' "$remote_error" | sed -E 's/^RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=//')"
+                  safe_check="quarantine_prune_${quarantine_prune_stage}"
+                fi
+              fi
             fi
             [[ "$remote_status" =~ ^[0-9]{1,3}$ ]] || remote_status=unknown
             if [[ -n "$safe_check" ]]; then
@@ -1711,6 +1743,11 @@ jobs:
             grep -Fqx "$quarantine_line" "$remote_log" \
               || { echo 'Quarantine recovery success receipt is missing' >&2; exit 1; }
             printf '%s\n' "$quarantine_line"
+          elif [[ "$RECOVERY_ACTION" == prune_quarantined_candidate ]]; then
+            quarantine_prune_line='RECOVERY_QUARANTINE_PRUNE schema=1 status=passed phase=deleted candidate_count=1'
+            grep -Fqx "$quarantine_prune_line" "$remote_log" \
+              || { echo 'Exact quarantine-prune success receipt is missing' >&2; exit 1; }
+            printf '%s\n' "$quarantine_prune_line"
           elif [[ "$RECOVERY_ACTION" == prune_task_releases ]]; then
             retention_receipts="$(grep -Ec "^PLATFORM_RETENTION schema=1 status=passed candidate_count=${EXPECTED_CANDIDATE_COUNT} deleted_count=${EXPECTED_CANDIDATE_COUNT} reclaimed_bytes=[0-9]+$" "$remote_log" || true)"
             [[ "$retention_receipts" == 1 ]] \

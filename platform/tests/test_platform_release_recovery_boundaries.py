@@ -1736,6 +1736,397 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual(inspection["api"], "active")
         self.assertEqual(inspection["web"], "active")
 
+    def _create_consumed_quarantine(self, *, run_id: str, source_sha: str) -> dict[str, object]:
+        failed_attempt = "1"
+        candidate_slug = f"gha-{run_id}-{failed_attempt}-{source_sha[:12]}"
+        current = self.add_release(f"prune-current-{run_id}")
+        previous = self.add_release(f"prune-previous-{run_id}")
+        candidate = self.releases / candidate_slug
+        candidate.mkdir(mode=0o755)
+        (candidate / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": source_sha}) + "\n", encoding="ascii"
+        )
+        (candidate / "RELEASE.json").chmod(0o444)
+        payload = candidate / "nested" / "evidence.txt"
+        payload.parent.mkdir(mode=0o755)
+        payload.write_bytes(b"receipt-bound quarantine evidence\n")
+        payload.chmod(0o444)
+        (self.app_dir / "current").symlink_to(current)
+        (self.app_dir / "previous").symlink_to(previous)
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--candidate-may-exist",
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=active",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "active",
+        )
+        quarantine_args = (
+            "--failed-deploy-run-id",
+            run_id,
+            "--failed-deploy-run-attempt",
+            failed_attempt,
+            "--failed-deploy-source-sha",
+            source_sha,
+            "--recovery-run-id",
+            "876543",
+            "--recovery-run-attempt",
+            "1",
+            "--bundle-sha",
+            "b" * 64,
+        )
+        self.run_transaction("quarantine-populated-quiesce", *quarantine_args)
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+            }
+        )
+        self.run_transaction("restore-quiesce", "--systemctl", str(systemctl))
+        self.run_transaction("mark-quarantine-services-restored", *quarantine_args)
+        self.run_transaction("consume-quarantined-quiesce", *quarantine_args)
+        quarantine_root = self.shared / transaction.QUARANTINE_DIR_NAME
+        return {
+            "run_id": run_id,
+            "failed_attempt": failed_attempt,
+            "source_sha": source_sha,
+            "candidate_slug": candidate_slug,
+            "current": current,
+            "previous": previous,
+            "payload_bytes": b"receipt-bound quarantine evidence\n",
+            "quarantine_root": quarantine_root,
+            "candidate": quarantine_root / candidate_slug,
+            "receipt": quarantine_root / f"{candidate_slug}.json",
+            "receipt_bytes": (quarantine_root / f"{candidate_slug}.json").read_bytes(),
+        }
+
+    def _prune_consumed_quarantine(
+        self,
+        fixture: dict[str, object],
+        *,
+        failed_attempt: str | None = None,
+        failed_source_sha: str | None = None,
+        cleanup_run_id: str = "987654",
+        cleanup_attempt: str = "1",
+        cleanup_source_sha: str = "c" * 40,
+        bundle_sha: str = "d" * 64,
+    ) -> dict[str, object]:
+        return transaction.prune_quarantined_candidate(
+            self.shared / STATE_NAME,
+            failed_deploy_run_id=cast(str, fixture["run_id"]),
+            failed_deploy_run_attempt=(
+                cast(str, fixture["failed_attempt"])
+                if failed_attempt is None
+                else failed_attempt
+            ),
+            failed_deploy_source_sha=(
+                cast(str, fixture["source_sha"])
+                if failed_source_sha is None
+                else failed_source_sha
+            ),
+            cleanup_run_id=cleanup_run_id,
+            cleanup_run_attempt=cleanup_attempt,
+            cleanup_source_sha=cleanup_source_sha,
+            bundle_sha=bundle_sha,
+        )
+
+    def test_prune_quarantined_candidate_deletes_only_consumed_target_and_replays(self) -> None:
+        fixture = self._create_consumed_quarantine(
+            run_id="567801", source_sha="a" * 40
+        )
+        candidate = cast(Path, fixture["candidate"])
+        receipt = cast(Path, fixture["receipt"])
+        quarantine_root = cast(Path, fixture["quarantine_root"])
+        receipt_bytes = cast(bytes, fixture["receipt_bytes"])
+        provider_like_release = self.add_release("provider-like-retained-release")
+        provider_sentinel = provider_like_release / "provider-identity.json"
+        provider_sentinel.write_text("keep provider bytes\n", encoding="ascii")
+        provider_sentinel.chmod(0o444)
+        provider_before = provider_sentinel.read_bytes()
+        pointers_before = (
+            (self.app_dir / "current").readlink(),
+            (self.app_dir / "previous").readlink(),
+        )
+
+        result = self._prune_consumed_quarantine(fixture)
+        intent_path = quarantine_root / f"{fixture['candidate_slug']}.prune.json"
+        intent = json.loads(intent_path.read_text(encoding="ascii"))
+        self.assertEqual(result["phase"], "deleted")
+        self.assertEqual(intent["phase"], "deleted")
+        self.assertEqual(stat.S_IMODE(intent_path.stat().st_mode), 0o600)
+        self.assertFalse(candidate.exists())
+        self.assertFalse(
+            (quarantine_root / transaction._quarantine_prune_stage_name(
+                cast(str, fixture["candidate_slug"]), "987654"
+            )).exists()
+        )
+        self.assertEqual(receipt.read_bytes(), receipt_bytes)
+        self.assertEqual(provider_sentinel.read_bytes(), provider_before)
+        self.assertEqual(
+            (
+                (self.app_dir / "current").readlink(),
+                (self.app_dir / "previous").readlink(),
+            ),
+            pointers_before,
+        )
+
+        tombstone_before = intent_path.read_bytes()
+        replay = self._prune_consumed_quarantine(fixture)
+        self.assertEqual(replay["phase"], "deleted")
+        self.assertEqual(intent_path.read_bytes(), tombstone_before)
+        self.assertEqual(receipt.read_bytes(), receipt_bytes)
+        self.assertEqual(provider_sentinel.read_bytes(), provider_before)
+
+    def test_prune_quarantined_candidate_rejects_mismatched_receipt_pending_and_pointers(self) -> None:
+        fixture = self._create_consumed_quarantine(
+            run_id="567802", source_sha="e" * 40
+        )
+        candidate = cast(Path, fixture["candidate"])
+        receipt = cast(Path, fixture["receipt"])
+        receipt_bytes = cast(bytes, fixture["receipt_bytes"])
+        evidence = candidate / "nested" / "evidence.txt"
+
+        with self.assertRaises(transaction.TransactionError):
+            self._prune_consumed_quarantine(fixture, failed_attempt="2")
+        with self.assertRaises(transaction.TransactionError):
+            self._prune_consumed_quarantine(fixture, failed_source_sha="f" * 40)
+        self.assertTrue(evidence.is_file())
+        self.assertEqual(receipt.read_bytes(), receipt_bytes)
+
+        intent_path = cast(Path, fixture["quarantine_root"]) / f"{fixture['candidate_slug']}.prune.json"
+        with (
+            mock.patch.object(
+                transaction,
+                "_rename_noreplace",
+                side_effect=transaction.TransactionError("simulated stop before staging"),
+            ),
+            self.assertRaisesRegex(transaction.TransactionError, "simulated stop before staging"),
+        ):
+            self._prune_consumed_quarantine(fixture)
+        planned_intent = intent_path.read_bytes()
+        changed_intent = json.loads(planned_intent.decode("ascii"))
+        changed_intent["candidate_file_count"] += 1
+        intent_path.write_text(
+            json.dumps(changed_intent, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="ascii",
+        )
+        intent_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            transaction.TransactionError, "U/F intent binding changed"
+        ):
+            self._prune_consumed_quarantine(fixture)
+        self.assertTrue(candidate.is_dir())
+        self.assertTrue(evidence.is_file())
+        self.assertEqual(receipt.read_bytes(), receipt_bytes)
+        intent_path.write_bytes(planned_intent)
+        intent_path.chmod(0o600)
+
+        consumed_receipt = json.loads(receipt_bytes.decode("ascii"))
+        consumed_receipt["phase"] = "services_restored"
+        receipt.write_text(
+            json.dumps(consumed_receipt, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="ascii",
+        )
+        receipt.chmod(0o600)
+        with self.assertRaises(transaction.TransactionError):
+            self._prune_consumed_quarantine(fixture)
+        self.assertTrue(evidence.is_file())
+        receipt.write_bytes(receipt_bytes)
+        receipt.chmod(0o600)
+
+        pending = self.shared / ".migration-state.json"
+        pending.write_text("pending\n", encoding="ascii")
+        with self.assertRaises(transaction.TransactionError):
+            self._prune_consumed_quarantine(fixture)
+        pending.unlink()
+
+        replacement = self.add_release("prune-pointer-replacement")
+        current_pointer = self.app_dir / "current"
+        current_pointer.unlink()
+        current_pointer.symlink_to(replacement)
+        with self.assertRaises(transaction.TransactionError):
+            self._prune_consumed_quarantine(fixture)
+        self.assertTrue(evidence.is_file())
+        current_pointer.unlink()
+        current_pointer.symlink_to(cast(Path, fixture["current"]))
+
+        receipt.write_bytes(b"{\"phase\":\"receipt_consumed\",\n")
+        receipt.chmod(0o600)
+        with self.assertRaises(transaction.TransactionError):
+            self._prune_consumed_quarantine(fixture)
+        self.assertTrue(evidence.is_file())
+        receipt.write_bytes(receipt_bytes)
+        receipt.chmod(0o600)
+
+        outside = self.root / "prune-symlink-target.txt"
+        outside.write_bytes(b"outside bytes stay untouched\n")
+        outside.chmod(0o444)
+        evidence.unlink()
+        evidence.symlink_to(outside)
+        with self.assertRaisesRegex(transaction.TransactionError, "special file"):
+            self._prune_consumed_quarantine(fixture)
+        self.assertEqual(outside.read_bytes(), b"outside bytes stay untouched\n")
+        self.assertEqual(receipt.read_bytes(), receipt_bytes)
+        evidence.unlink()
+        evidence.write_bytes(cast(bytes, fixture["payload_bytes"]))
+        evidence.chmod(0o444)
+
+    def test_prune_quarantined_candidate_refuses_tree_change_before_first_unlink(self) -> None:
+        fixture = self._create_consumed_quarantine(
+            run_id="567803", source_sha="1" * 40
+        )
+        receipt = cast(Path, fixture["receipt"])
+        receipt_bytes = cast(bytes, fixture["receipt_bytes"])
+        candidate = cast(Path, fixture["candidate"])
+        stage = cast(
+            Path,
+            cast(Path, fixture["quarantine_root"])
+            / transaction._quarantine_prune_stage_name(
+                cast(str, fixture["candidate_slug"]), "987654"
+            ),
+        )
+        evidence = candidate / "nested" / "evidence.txt"
+        original_rename = transaction._rename_noreplace
+
+        def rename_then_mutate(source: Path, destination: Path) -> None:
+            original_rename(source, destination)
+            staged_evidence = destination / "nested" / "evidence.txt"
+            staged_evidence.chmod(0o644)
+            staged_evidence.write_bytes(b"modified after durable intent\n")
+            staged_evidence.chmod(0o444)
+
+        with (
+            mock.patch.object(transaction, "_rename_noreplace", side_effect=rename_then_mutate),
+            self.assertRaisesRegex(transaction.TransactionError, "differs from consumed receipt"),
+        ):
+            self._prune_consumed_quarantine(fixture)
+        intent_path = cast(Path, fixture["quarantine_root"]) / f"{fixture['candidate_slug']}.prune.json"
+        intent = json.loads(intent_path.read_text(encoding="ascii"))
+        self.assertEqual(intent["phase"], "planned")
+        self.assertFalse(candidate.exists())
+        self.assertEqual(stage.stat().st_ino, intent["quarantine_ino"])
+        self.assertEqual((stage / "nested" / "evidence.txt").read_bytes(), b"modified after durable intent\n")
+        self.assertEqual(receipt.read_bytes(), receipt_bytes)
+        self.assertFalse(evidence.exists())
+        with self.assertRaisesRegex(transaction.TransactionError, "U/F intent binding changed"):
+            self._prune_consumed_quarantine(fixture, cleanup_source_sha="0" * 40)
+        self.assertEqual(stage.stat().st_ino, intent["quarantine_ino"])
+
+        staged_evidence = stage / "nested" / "evidence.txt"
+        staged_evidence.chmod(0o644)
+        staged_evidence.write_bytes(cast(bytes, fixture["payload_bytes"]))
+        staged_evidence.chmod(0o444)
+        result = self._prune_consumed_quarantine(fixture)
+        self.assertEqual(result["phase"], "deleted")
+        self.assertEqual(receipt.read_bytes(), receipt_bytes)
+
+    def test_prune_quarantined_candidate_resumes_interrupted_same_inode_delete(self) -> None:
+        fixture = self._create_consumed_quarantine(
+            run_id="567804", source_sha="2" * 40
+        )
+        receipt = cast(Path, fixture["receipt"])
+        receipt_bytes = cast(bytes, fixture["receipt_bytes"])
+        root = cast(Path, fixture["quarantine_root"])
+        stage = root / transaction._quarantine_prune_stage_name(
+            cast(str, fixture["candidate_slug"]), "987654"
+        )
+        original_inode: int | None = None
+
+        def interrupt_after_one_unlink(_root: Path, staged: Path, _intent: dict[str, object]) -> None:
+            nonlocal original_inode
+            original_inode = staged.stat().st_ino
+            (staged / "nested" / "evidence.txt").unlink()
+            raise transaction.TransactionError("simulated interruption after first unlink")
+
+        with mock.patch.object(
+            transaction,
+            "_quarantine_prune_delete_stage",
+            side_effect=interrupt_after_one_unlink,
+        ):
+            with self.assertRaisesRegex(transaction.TransactionError, "simulated interruption"):
+                self._prune_consumed_quarantine(fixture)
+        intent_path = root / f"{fixture['candidate_slug']}.prune.json"
+        self.assertEqual(json.loads(intent_path.read_text(encoding="ascii"))["phase"], "deleting")
+        self.assertEqual(stage.stat().st_ino, original_inode)
+        self.assertFalse((stage / "nested" / "evidence.txt").exists())
+        self.assertEqual(receipt.read_bytes(), receipt_bytes)
+
+        result = self._prune_consumed_quarantine(fixture, cleanup_attempt="2")
+        self.assertEqual(result["phase"], "deleted")
+        self.assertEqual(result["cleanup_run_attempt"], "2")
+        self.assertFalse(stage.exists())
+        self.assertEqual(receipt.read_bytes(), receipt_bytes)
+        tombstone_before = intent_path.read_bytes()
+        replay = self._prune_consumed_quarantine(fixture, cleanup_attempt="2")
+        self.assertEqual(replay["phase"], "deleted")
+        self.assertEqual(replay["cleanup_run_attempt"], "2")
+        self.assertEqual(intent_path.read_bytes(), tombstone_before)
+
+    def test_quarantine_prune_mount_and_cross_device_guards_fail_closed(self) -> None:
+        candidate = self.releases / "quarantine-prune-mountpoint"
+        candidate.mkdir(mode=0o755)
+        nested = candidate / "nested-mount"
+        nested.mkdir(mode=0o755)
+        mountinfo = self.root / "mountinfo-fixture"
+        mountinfo.write_text(
+            f"42 1 0:42 / {nested} rw - ext4 /dev/test rw\n", encoding="ascii"
+        )
+        with self.assertRaisesRegex(transaction.TransactionError, "contains a mountpoint"):
+            transaction._quarantine_assert_no_mounts(candidate, mountinfo_path=mountinfo)
+
+        requested_reads: list[int] = []
+
+        def bounded_mountinfo_read(_descriptor: int, amount: int) -> bytes:
+            requested_reads.append(amount)
+            return b"x" * amount
+
+        with mock.patch.object(transaction.os, "read", side_effect=bounded_mountinfo_read):
+            with self.assertRaisesRegex(transaction.TransactionError, "exceeds its bound"):
+                transaction._quarantine_assert_no_mounts(
+                    candidate, mountinfo_path=mountinfo
+                )
+        self.assertEqual(sum(requested_reads), 16 * 1024 * 1024 + 1)
+        self.assertEqual(requested_reads[-1], 1)
+
+        payload = candidate / "payload.bin"
+        payload.write_bytes(b"cross device")
+        metadata = payload.stat()
+
+        class CrossDeviceEntry:
+            path = str(payload)
+
+            @staticmethod
+            def stat(*, follow_symlinks: bool) -> os.stat_result:
+                return os.stat_result(
+                    (
+                        metadata.st_mode,
+                        metadata.st_ino,
+                        metadata.st_dev + 1,
+                        metadata.st_nlink,
+                        metadata.st_uid,
+                        metadata.st_gid,
+                        metadata.st_size,
+                        metadata.st_atime,
+                        metadata.st_mtime,
+                        metadata.st_ctime,
+                    )
+                )
+
+        with mock.patch.object(transaction.os, "scandir", return_value=[CrossDeviceEntry()]):
+            with self.assertRaisesRegex(transaction.TransactionError, "crosses filesystems"):
+                transaction._quarantine_tree_snapshot(candidate)
+        self.assertEqual(payload.read_bytes(), b"cross device")
+
     def test_quarantine_populated_quiesce_rejects_collision_and_pointer_change(self) -> None:
         source_sha = "c" * 40
         candidate_slug = f"gha-345678-1-{source_sha[:12]}"

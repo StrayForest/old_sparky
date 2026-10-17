@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-16
+- Last reviewed: 2026-10-17
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -400,7 +400,7 @@ The separate `quarantine_populated_quiesce` capability requires the recovery wor
 Under the release lock, the host binds the pending-receipt digest and pointer identities, then moves the root-owned candidate with same-filesystem no-replace semantics into private quarantine.
 The candidate remains untrusted evidence: recovery never executes or deletes it and does not claim signed-artifact equivalence.
 After snapshot restoration/readiness verification, it consumes only the matching quiesce receipt; the inspect action supports a bound retry after that receipt is consumed. Mismatches retain receipts and candidate bytes.
-Quarantine preserves storage use; later removal needs separate identity-bound retention authorization. Never invoke recovery helpers directly or normal deploy.
+Quarantine preserves storage use. A later, separate `prune_quarantined_candidate` recovery action may remove only the exact candidate whose original receipt is `receipt_consumed`; use the signed workflow and its exact failed-deployment tuple, never a caller-supplied slug or direct helper invocation. The action binds the immutable original receipt digest and F candidate identity to a new U cleanup run/bundle intent, checks current/previous releases and the protected LiveQA provider closure under both canonical locks, and requires no pending release sidecars/jobs plus stable service, Nginx and readiness checks. It stages the candidate by same-filesystem no-replace rename, rechecks its root-owned no-follow tree snapshot and mount boundaries, then deletes only that staged inode. The old quarantine receipt remains unchanged; a durable U-bound deleted intent makes exact replay a no-op, while an interrupted deletion resumes only that same staged inode. Any identity, provider, tree, pointer or health mismatch retains the remaining evidence for a later exact retry. See the [quarantine-pruning decision](adr/quarantined-candidate-pruning.md). Never invoke recovery helpers directly or normal deploy.
 
 For code/runtime rollback after reviewing database compatibility, the guarded
 abort restores recorded pointers/venv and never downgrades Alembic. Invoke only

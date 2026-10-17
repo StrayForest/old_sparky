@@ -18,6 +18,9 @@ FAILED_DEPLOY_RUN_ATTEMPT=""
 FAILED_DEPLOY_SOURCE_SHA=""
 RECOVERY_RUN_ID=""
 RECOVERY_RUN_ATTEMPT=""
+CLEANUP_RUN_ID=""
+CLEANUP_RUN_ATTEMPT=""
+CLEANUP_SOURCE_SHA=""
 EXPECTED_CANDIDATES=()
 PROTECTED_RELEASES=()
 SOURCE_BOUND_LIVEQA_REUSE=0
@@ -68,6 +71,18 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       RECOVERY_RUN_ATTEMPT="$2"; shift 2
       ;;
+    --cleanup-run-id)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      CLEANUP_RUN_ID="$2"; shift 2
+      ;;
+    --cleanup-run-attempt)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      CLEANUP_RUN_ATTEMPT="$2"; shift 2
+      ;;
+    --cleanup-source-sha)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      CLEANUP_SOURCE_SHA="$2"; shift 2
+      ;;
     --expected-candidate)
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       EXPECTED_CANDIDATES+=("$2"); shift 2
@@ -91,6 +106,11 @@ Usage: platform_recover_pending.sh --app-dir <path> [--systemctl <absolute-path>
          --failed-deploy-run-id <id> --failed-deploy-run-attempt <attempt>
          --failed-deploy-source-sha <sha> --recovery-run-id <id>
          --recovery-run-attempt <attempt> --app-dir <path>
+       platform_recover_pending.sh --action prune-quarantined-candidate
+         --failed-deploy-run-id <id> --failed-deploy-run-attempt <attempt>
+         --failed-deploy-source-sha <sha> --cleanup-run-id <id>
+         --cleanup-run-attempt <attempt> --cleanup-source-sha <sha>
+         --bundle-sha <sha> --app-dir <path>
        platform_recover_pending.sh --action prune-task-releases
          --expected-candidate <slug>... --protected-release <slug>...
 EOF
@@ -109,6 +129,19 @@ case "$RECOVERY_ACTION" in
       && "$FAILED_DEPLOY_SOURCE_SHA" =~ ^[0-9a-f]{40}$ \
       && "$RECOVERY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
       && "$RECOVERY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] \
+      || { public_status failed argument >&2; exit 1; }
+    ;;
+  prune-quarantined-candidate)
+    RECOVERY_CAPABILITY="prune_quarantined_candidate"
+    [[ "$FAILED_DEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+      && "$FAILED_DEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ \
+      && "$FAILED_DEPLOY_SOURCE_SHA" =~ ^[0-9a-f]{40}$ \
+      && "$CLEANUP_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+      && "$CLEANUP_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ \
+      && "$CLEANUP_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+      || { public_status failed argument >&2; exit 1; }
+    [[ -z "$RECOVERY_RUN_ID$RECOVERY_RUN_ATTEMPT" \
+      && ${#EXPECTED_CANDIDATES[@]} -eq 0 && ${#PROTECTED_RELEASES[@]} -eq 0 ]] \
       || { public_status failed argument >&2; exit 1; }
     ;;
   prune-task-releases)
@@ -172,6 +205,7 @@ validate_generation_helper platform_release_transaction.py 444
 validate_generation_helper platform_release_retention.py 444
 validate_generation_helper platform_release_capture_probe.py 444
 validate_generation_helper platform_release_active_artifact_proof.py 444
+validate_generation_helper platform_live_qa_runtime_install.py 444
 /usr/bin/python3 -I -B "$TOOLS_DIR/platform_recovery_bootstrap.py" \
   validate-generation --generation "$TOOLS_DIR" --bundle-sha "$GENERATION_SHA" \
   --capability "$RECOVERY_CAPABILITY" \
@@ -314,6 +348,156 @@ if [[ "${PLATFORM_RELEASE_LOCK_SUPERVISED:-}" != "1" ]]; then
 fi
 platform_release_lock_open || { public_status failed lock >&2; exit 3; }
 trap platform_release_lock_close EXIT
+
+if [[ "$RECOVERY_ACTION" == "prune-quarantined-candidate" ]]; then
+  [[ "$APP_DIR" == "/opt/oldsparky/platform" ]] \
+    || { public_status failed argument >&2; exit 1; }
+  platform_retained_load_lock_supervise "${ORIGINAL_ARGS[@]}" || {
+    lock_status=$?
+    if [[ "$lock_status" -eq "$PLATFORM_RELEASE_LOCK_CONFLICT_EXIT_CODE" ]]; then
+      public_status failed lock >&2
+      exit 3
+    fi
+    exit "$lock_status"
+  }
+  if [[ "${PLATFORM_RETAINED_LOAD_LOCK_SUPERVISED:-}" != "1" ]]; then
+    exit 0
+  fi
+  platform_retained_load_lock_open \
+    || { public_status failed lock >&2; exit 3; }
+  trap 'platform_retained_load_lock_close; platform_release_lock_close' EXIT
+
+  PUBLIC_RELEASE_SLUG="gha-${FAILED_DEPLOY_RUN_ID}-${FAILED_DEPLOY_RUN_ATTEMPT}-${FAILED_DEPLOY_SOURCE_SHA:0:12}"
+  PUBLIC_SOURCE_SHA="$FAILED_DEPLOY_SOURCE_SHA"
+  STATE="$APP_DIR/shared/.release-operation.json"
+  TRANSACTION_TOOL="$TOOLS_DIR/platform_release_transaction.py"
+  [[ ! -e "$STATE" && ! -L "$STATE" \
+    && ! -e "$APP_DIR/shared/.release-quiesce.json" \
+    && ! -L "$APP_DIR/shared/.release-quiesce.json" \
+    && ! -e "$APP_DIR/shared/.release-systemd-state.json" \
+    && ! -L "$APP_DIR/shared/.release-systemd-state.json" \
+    && ! -e "$APP_DIR/shared/.migration-pending.json" \
+    && ! -L "$APP_DIR/shared/.migration-pending.json" \
+    && ! -e "$APP_DIR/shared/.migration-state.json" \
+    && ! -L "$APP_DIR/shared/.migration-state.json" ]] \
+    || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=pending_state\n' >&2; public_status failed transaction >&2; exit 1; }
+
+  pointer_snapshot() {
+    local name target link_identity target_identity
+    for name in current previous; do
+      [[ -L "$APP_DIR/$name" ]] || return 1
+      target="$(readlink -f -- "$APP_DIR/$name")" || return 1
+      [[ "$(dirname -- "$target")" == "$APP_DIR/releases" \
+        && -d "$target" && ! -L "$target" ]] || return 1
+      link_identity="$(stat -c '%d:%i' -- "$APP_DIR/$name")" || return 1
+      target_identity="$(stat -c '%d:%i' -- "$target")" || return 1
+      printf '%s\t%s\t%s\t%s\n' "$name" "$target" "$link_identity" "$target_identity"
+    done
+  }
+  systemd_jobs_empty() {
+    local jobs
+    jobs="$(run_systemctl list-jobs --no-legend --no-pager)" || return 1
+    [[ -z "$jobs" ]]
+  }
+  provider_protection_snapshot() {
+    local snapshot
+    snapshot="$(/usr/bin/python3 -I -B - \
+      "$TOOLS_DIR/platform_live_qa_runtime_install.py" \
+      "$APP_DIR" "$FAILED_DEPLOY_SOURCE_SHA" <<'PY'
+import hashlib
+import json
+import runpy
+import sys
+from pathlib import Path
+
+try:
+    module = runpy.run_path(sys.argv[1])
+    protected = module["_protected_shas"](Path(sys.argv[2]))
+    if sys.argv[3] in protected:
+        raise SystemExit(2)
+    payload = json.dumps(sorted(protected), separators=(",", ":")).encode("ascii")
+    print(hashlib.sha256(payload).hexdigest())
+except Exception:
+    raise SystemExit(1)
+PY
+    )" || return 1
+    [[ "$snapshot" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$snapshot"
+  }
+  service_snapshot() {
+    local service invocation
+    for service in deadlock-api deadlock-worker deadlock-web; do
+      run_systemctl is-active --quiet "$service" || return 1
+      invocation="$(run_systemctl show --property=InvocationID --value "$service")" || return 1
+      [[ "$invocation" =~ ^[0-9a-f]{32}$ ]] || return 1
+      printf '%s\t%s\n' "$service" "$invocation"
+    done
+  }
+  verify_retention_health() {
+    local units
+    systemd_jobs_empty || return 1
+    units="$(service_snapshot)" || return 1
+    run_nginx_config_test || return 1
+    /usr/bin/curl --fail --silent --show-error --max-time 5 \
+      http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null || return 1
+    /usr/bin/curl --fail --silent --show-error --max-time 5 \
+      http://127.0.0.1:3000/ >/dev/null 2>/dev/null || return 1
+    printf '%s' "$units"
+  }
+  pointers_before="$(pointer_snapshot)" \
+    || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=pointer_preflight\n' >&2; public_status failed topology >&2; exit 1; }
+  provider_before="$(provider_protection_snapshot)" \
+    || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=provider_preflight\n' >&2; public_status failed retention >&2; exit 1; }
+  health_before="$(verify_retention_health)" \
+    || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=health_preflight\n' >&2; public_status failed service_state >&2; exit 1; }
+  prune_result="$(/usr/bin/python3 -I -B "$TRANSACTION_TOOL" prune-quarantined-candidate \
+    --state "$STATE" \
+    --failed-deploy-run-id "$FAILED_DEPLOY_RUN_ID" \
+    --failed-deploy-run-attempt "$FAILED_DEPLOY_RUN_ATTEMPT" \
+    --failed-deploy-source-sha "$FAILED_DEPLOY_SOURCE_SHA" \
+    --cleanup-run-id "$CLEANUP_RUN_ID" \
+    --cleanup-run-attempt "$CLEANUP_RUN_ATTEMPT" \
+    --cleanup-source-sha "$CLEANUP_SOURCE_SHA" \
+    --bundle-sha "$GENERATION_SHA" 2>/dev/null)" \
+    || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=transaction\n' >&2; public_status failed retention >&2; exit 1; }
+  receipt_check="$(/usr/bin/python3 -I - "$prune_result" "$PUBLIC_RELEASE_SLUG" <<'PY'
+import json
+import re
+import sys
+try:
+    value = json.loads(sys.argv[1])
+except (TypeError, ValueError):
+    raise SystemExit(1)
+if (
+    not isinstance(value, dict)
+    or set(value) != {"schema", "action", "phase", "candidate_slug", "original_receipt_sha256"}
+    or type(value.get("schema")) is not int or value["schema"] != 1
+    or value.get("action") != "prune_quarantined_candidate"
+    or value.get("phase") != "deleted"
+    or value.get("candidate_slug") != sys.argv[2]
+    or not isinstance(value.get("original_receipt_sha256"), str)
+    or re.fullmatch(r"[0-9a-f]{64}", value["original_receipt_sha256"]) is None
+):
+    raise SystemExit(1)
+print("valid")
+PY
+)" || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=receipt\n' >&2; public_status failed retention >&2; exit 1; }
+  [[ "$receipt_check" == valid ]] \
+    || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=receipt\n' >&2; public_status failed retention >&2; exit 1; }
+  pointers_after="$(pointer_snapshot)" \
+    || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=pointer_postflight\n' >&2; public_status failed topology >&2; exit 1; }
+  provider_after="$(provider_protection_snapshot)" \
+    || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=provider_postflight\n' >&2; public_status failed retention >&2; exit 1; }
+  health_after="$(verify_retention_health)" \
+    || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=health_postflight\n' >&2; public_status failed service_state >&2; exit 1; }
+  [[ "$pointers_after" == "$pointers_before" \
+    && "$provider_after" == "$provider_before" \
+    && "$health_after" == "$health_before" ]] \
+    || { printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=failed stage=stability\n' >&2; public_status failed topology >&2; exit 1; }
+  printf 'RECOVERY_QUARANTINE_PRUNE schema=1 status=passed phase=deleted candidate_count=1\n'
+  public_status passed recovery
+  exit 0
+fi
 
 STATE="$APP_DIR/shared/.release-operation.json"
 QUIESCE_STATE="$APP_DIR/shared/.release-quiesce.json"

@@ -271,6 +271,7 @@ class RecoveryBootstrapBundleTests(unittest.TestCase):
                 "recover_pending",
                 "quarantine_populated_quiesce",
                 "prune_task_releases",
+                "prune_quarantined_candidate",
                 "capture_maintenance_failure",
                 "reset_maintenance_failed",
             ],
@@ -2634,6 +2635,85 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     self.assertFalse(systemd_state.exists())
                     self.assertGreaterEqual(len(calls), 4)
 
+    def test_quarantined_candidate_prune_is_signed_f_bound_and_u_authorized(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
+        ).read_text(encoding="utf-8")
+        bootstrap = (TOOLS / "platform_recovery_bootstrap.py").read_text(encoding="utf-8")
+        wrapper = (TOOLS / "platform_recover_pending.sh").read_text(encoding="utf-8")
+        transaction = (TOOLS / "platform_release_transaction.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'PRUNE_QUARANTINED_CANDIDATE_CAPABILITY = "prune_quarantined_candidate"',
+            bootstrap,
+        )
+        self.assertIn("PRUNE_QUARANTINED_CANDIDATE_CAPABILITY,", bootstrap)
+        self.assertIn("- prune_quarantined_candidate", workflow)
+        self.assertIn(
+            "prune_quarantined_candidate:PRUNE-QUARANTINED-CANDIDATE)",
+            workflow,
+        )
+        inputs = workflow.split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertNotIn("failed_deploy_source_sha:", inputs)
+        self.assertNotIn("candidate_slug:", inputs)
+
+        action_case = workflow.split(
+            "prune_quarantined_candidate:PRUNE-QUARANTINED-CANDIDATE)", 1
+        )[1].split("prune_task_releases:PRUNE-TASK-RELEASES)", 1)[0]
+        self.assertIn("$FAILED_DEPLOY_RUN_ID", action_case)
+        self.assertIn("$FAILED_DEPLOY_RUN_ATTEMPT", action_case)
+        self.assertIn("$EXPECTED_CANDIDATES_JSON$PROTECTED_RELEASES_JSON", action_case)
+        self.assertIn('"$SOURCE_BOUND_LIVEQA_REUSE" == false', action_case)
+
+        self.assertIn(
+            'if [[ "$RECOVERY_ACTION" == "quarantine_populated_quiesce" || "$RECOVERY_ACTION" == "prune_quarantined_candidate" ]]; then',
+            workflow,
+        )
+        self.assertIn(
+            'if os.environ["RECOVERY_ACTION"] in {"quarantine_populated_quiesce", "prune_quarantined_candidate"}:',
+            workflow,
+        )
+        self.assertIn('failed_deploy_values = (failed_id, failed_attempt, failed_source)', workflow)
+        self.assertIn('stream.write(f"failed_deploy_source_sha={failed_source}\\n")', workflow)
+
+        for binding in (
+            '--action prune-quarantined-candidate',
+            '--failed-deploy-run-id "$failed_deploy_run_id"',
+            '--failed-deploy-run-attempt "$failed_deploy_run_attempt"',
+            '--failed-deploy-source-sha "$failed_deploy_source_sha"',
+            '--cleanup-run-id "$recovery_action_run_id"',
+            '--cleanup-run-attempt "$recovery_action_run_attempt"',
+            '--cleanup-source-sha "$source_sha"',
+            '--bundle-sha "$generation_name"',
+            'RECOVERY_QUARANTINE_PRUNE schema=1 status=passed phase=deleted candidate_count=1',
+        ):
+            self.assertIn(binding, workflow)
+        for stage in ("provider_preflight", "provider_postflight"):
+            self.assertIn(stage, workflow)
+        self.assertIn('recovery_stage=quiesce_recovery', workflow)
+
+        self.assertIn('RECOVERY_CAPABILITY="prune_quarantined_candidate"', wrapper)
+        for binding in (
+            'CLEANUP_RUN_ID="$2"',
+            'CLEANUP_RUN_ATTEMPT="$2"',
+            'CLEANUP_SOURCE_SHA="$2"',
+            'prune-quarantined-candidate)',
+            '--cleanup-run-id "$CLEANUP_RUN_ID"',
+            '--cleanup-run-attempt "$CLEANUP_RUN_ATTEMPT"',
+            '--cleanup-source-sha "$CLEANUP_SOURCE_SHA"',
+            '--bundle-sha "$GENERATION_SHA"',
+        ):
+            self.assertIn(binding, wrapper)
+        for binding in (
+            'def prune_quarantined_candidate(',
+            '"original_receipt_sha256": original_receipt_sha',
+            '"cleanup_run_id": cleanup_run_id',
+            '"cleanup_source_sha": cleanup_source_sha',
+            '"cleanup_bundle_sha": bundle_sha',
+            'receipt["phase"] != "receipt_consumed"',
+        ):
+            self.assertIn(binding, transaction)
+
     def test_recovery_attestation_resolves_workflow_sha_in_shell_scope(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
@@ -2710,6 +2790,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                         (
                             "set -euo pipefail",
                             "remote_status=1",
+                            "RECOVERY_ACTION=quarantine_populated_quiesce",
                             "runtime_private_capture=0",
                             f"remote_error={shlex.quote(str(error))}",
                             receiver,

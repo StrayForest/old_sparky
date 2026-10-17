@@ -43,6 +43,7 @@ SYSTEMD_STATE_NAME = ".release-systemd-state.json"
 QUIESCE_STATE_NAME = ".release-quiesce.json"
 QUARANTINE_DIR_NAME = ".release-quarantine"
 QUARANTINE_RECEIPT_SCHEMA = 1
+QUARANTINE_PRUNE_INTENT_SCHEMA = 1
 QUARANTINE_MAX_ENTRIES = 100_000
 QUARANTINE_MAX_BYTES = 8 * 1024 * 1024 * 1024
 STATE_VERSION = 2
@@ -574,6 +575,55 @@ def _safe_state_file(path: Path) -> os.stat_result:
     return metadata
 
 
+def _read_private_state_bytes(path: Path, *, label: str) -> bytes:
+    metadata = _safe_state_file(path)
+    if metadata.st_gid != 0:
+        raise TransactionError(f"{label} group ownership is unsafe")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _identity(opened) != _identity(metadata)
+            or opened.st_uid != 0
+            or opened.st_gid != 0
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size != metadata.st_size
+        ):
+            raise TransactionError(f"{label} changed before reading")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, 8192):
+            total += len(chunk)
+            if total > 64 * 1024:
+                raise TransactionError(f"{label} is too large")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            _identity(after) != _identity(opened)
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise TransactionError(f"{label} changed while reading")
+        raw = b"".join(chunks)
+        if len(raw) != opened.st_size:
+            raise TransactionError(f"{label} length changed while reading")
+        return raw
+    except OSError as exc:
+        raise TransactionError(f"{label} cannot be read safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _optional_safe_private_file(path: Path, *, label: str) -> os.stat_result | None:
     if not _lexists(path):
         return None
@@ -628,6 +678,7 @@ def _quarantine_tree_snapshot(root: Path) -> tuple[str, int, int, int]:
     root_meta = _safe_directory(root, label="candidate release")
     if root_meta.st_gid != 0:
         raise TransactionError("candidate release group ownership is unsafe")
+    root_device = root_meta.st_dev
     rows: list[tuple[bytes, bytes]] = [
         (
             b"",
@@ -653,6 +704,8 @@ def _quarantine_tree_snapshot(root: Path) -> tuple[str, int, int, int]:
                 info = entry.stat(follow_symlinks=False)
             except OSError as exc:
                 raise TransactionError("candidate release tree changed") from exc
+            if info.st_dev != root_device:
+                raise TransactionError("candidate release tree crosses filesystems")
             if info.st_uid != 0 or info.st_gid != 0:
                 raise TransactionError("candidate release tree ownership is unsafe")
             if stat.S_ISDIR(info.st_mode):
@@ -683,6 +736,7 @@ def _quarantine_tree_snapshot(root: Path) -> tuple[str, int, int, int]:
                 if (
                     not stat.S_ISREG(before.st_mode)
                     or _identity(before) != _identity(info)
+                    or before.st_dev != root_device
                     or before.st_nlink != 1
                     or before.st_uid != 0
                     or before.st_gid != 0
@@ -711,6 +765,61 @@ def _quarantine_tree_snapshot(root: Path) -> tuple[str, int, int, int]:
         tree_digest.update(row)
         tree_digest.update(b"\n")
     return tree_digest.hexdigest(), file_count, directory_count, total_bytes
+
+
+def _quarantine_assert_no_mounts(
+    root: Path,
+    *,
+    mountinfo_path: Path = Path("/proc/self/mountinfo"),
+) -> None:
+    """Reject mountpoints at or below a retained tree, including same-device binds."""
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            mountinfo_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        chunks: list[bytes] = []
+        total = 0
+        maximum = 16 * 1024 * 1024
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum:
+                raise TransactionError("quarantined candidate mount table exceeds its bound")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    except OSError as exc:
+        raise TransactionError("quarantined candidate mount table is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    lines = raw.splitlines()
+    if not lines:
+        raise TransactionError("quarantined candidate mount table is empty")
+    try:
+        root_bytes = os.path.normpath(os.fsencode(root.resolve(strict=True)))
+    except OSError as exc:
+        raise TransactionError("quarantined candidate path is unavailable") from exc
+    try:
+        for line in lines:
+            fields = line.split(b" ")
+            if len(fields) < 6:
+                raise TransactionError("quarantined candidate mount table is malformed")
+            mountpoint = re.sub(
+                rb"\\([0-7]{3})",
+                lambda match: bytes((int(match.group(1), 8),)),
+                fields[4],
+            )
+            mountpoint = os.path.normpath(mountpoint)
+            if os.path.commonpath((root_bytes, mountpoint)) == root_bytes:
+                raise TransactionError("quarantined candidate contains a mountpoint")
+    except ValueError as exc:
+        raise TransactionError("quarantined candidate mount table is malformed") from exc
 
 
 def _quarantine_root(shared: Path, releases: Path) -> Path:
@@ -2714,6 +2823,35 @@ QUARANTINE_RECEIPT_KEYS = {
 QUARANTINE_PHASES = frozenset(
     {"prepared", "quarantined", "services_restored", "receipt_consumed"}
 )
+QUARANTINE_PRUNE_INTENT_KEYS = {
+    "schema",
+    "action",
+    "phase",
+    "failed_deploy_run_id",
+    "failed_deploy_run_attempt",
+    "failed_deploy_source_sha",
+    "candidate_slug",
+    "original_receipt_sha256",
+    "original_recovery_run_id",
+    "original_recovery_run_attempt",
+    "original_recovery_bundle_sha",
+    "cleanup_run_id",
+    "cleanup_run_attempt",
+    "cleanup_source_sha",
+    "cleanup_bundle_sha",
+    "candidate_dev",
+    "candidate_ino",
+    "quarantine_dev",
+    "quarantine_ino",
+    "candidate_tree_sha256",
+    "candidate_file_count",
+    "candidate_directory_count",
+    "candidate_bytes",
+    "current_before",
+    "previous_before",
+    "stage_name",
+}
+QUARANTINE_PRUNE_PHASES = frozenset({"planned", "deleting", "deleted"})
 
 
 def _quarantine_values(
@@ -2751,12 +2889,23 @@ def _quarantine_receipt_path(root: Path, candidate_slug: str) -> Path:
     return root / f"{candidate_slug}.json"
 
 
-def _read_quarantine_receipt(path: Path) -> dict[str, object]:
+def _read_quarantine_receipt(
+    path: Path, *, raw: bytes | None = None
+) -> dict[str, object]:
     info = _safe_state_file(path)
     if info.st_size > 64 * 1024:
         raise TransactionError("quarantine receipt is too large")
     try:
-        value = json.loads(path.read_text(encoding="ascii"), object_pairs_hook=_strict_object)
+        payload = (
+            _read_private_state_bytes(path, label="quarantine receipt")
+            if raw is None
+            else raw
+        )
+        if len(payload) != info.st_size:
+            raise TransactionError("quarantine receipt changed while reading")
+        value = json.loads(payload.decode("ascii"), object_pairs_hook=_strict_object)
+    except TransactionError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise TransactionError("quarantine receipt is invalid") from exc
     if (
@@ -2991,6 +3140,566 @@ def _assert_quarantine_tree(root: Path, receipt: dict[str, object]) -> None:
         or byte_count != receipt["candidate_bytes"]
     ):
         raise TransactionError("quarantined candidate evidence changed")
+
+
+def _quarantine_prune_intent_path(root: Path, candidate_slug: str) -> Path:
+    return root / f"{candidate_slug}.prune.json"
+
+
+def _quarantine_prune_stage_name(candidate_slug: str, cleanup_run_id: str) -> str:
+    return f".{candidate_slug}.prune-{cleanup_run_id}"
+
+
+def _read_quarantine_prune_intent(path: Path) -> dict[str, object]:
+    raw = _read_private_state_bytes(path, label="quarantine prune intent")
+    try:
+        value = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise TransactionError("quarantine prune intent is invalid") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != QUARANTINE_PRUNE_INTENT_KEYS
+        or type(value.get("schema")) is not int
+        or value.get("schema") != QUARANTINE_PRUNE_INTENT_SCHEMA
+        or type(value.get("action")) is not str
+        or value.get("action") != "prune_quarantined_candidate"
+        or type(value.get("phase")) is not str
+        or value.get("phase") not in QUARANTINE_PRUNE_PHASES
+    ):
+        raise TransactionError("quarantine prune intent schema is invalid")
+    try:
+        _quarantine_values(
+            failed_deploy_run_id=cast(str, value["failed_deploy_run_id"]),
+            failed_deploy_run_attempt=cast(str, value["failed_deploy_run_attempt"]),
+            failed_deploy_source_sha=cast(str, value["failed_deploy_source_sha"]),
+            recovery_run_id=cast(str, value["original_recovery_run_id"]),
+            recovery_run_attempt=cast(str, value["original_recovery_run_attempt"]),
+            bundle_sha=cast(str, value["original_recovery_bundle_sha"]),
+        )
+    except (KeyError, TransactionError) as exc:
+        raise TransactionError("quarantine prune intent F binding is invalid") from exc
+    for key in ("cleanup_run_id", "cleanup_run_attempt"):
+        if (
+            type(value.get(key)) is not str
+            or re.fullmatch(r"[1-9][0-9]{0,31}", cast(str, value[key])) is None
+        ):
+            raise TransactionError("quarantine prune intent U run binding is invalid")
+    for key in ("cleanup_source_sha",):
+        if type(value.get(key)) is not str or re.fullmatch(r"[0-9a-f]{40}", cast(str, value[key])) is None:
+            raise TransactionError("quarantine prune intent U source is invalid")
+    for key in (
+        "original_receipt_sha256",
+        "cleanup_bundle_sha",
+        "candidate_tree_sha256",
+    ):
+        if type(value.get(key)) is not str or re.fullmatch(r"[0-9a-f]{64}", cast(str, value[key])) is None:
+            raise TransactionError("quarantine prune intent digest is invalid")
+    expected_slug = (
+        f"gha-{value['failed_deploy_run_id']}-{value['failed_deploy_run_attempt']}-"
+        f"{cast(str, value['failed_deploy_source_sha'])[:12]}"
+    )
+    if (
+        value.get("candidate_slug") != expected_slug
+        or value.get("stage_name")
+        != _quarantine_prune_stage_name(expected_slug, cast(str, value["cleanup_run_id"]))
+    ):
+        raise TransactionError("quarantine prune intent candidate path is invalid")
+    for key in (
+        "candidate_dev",
+        "candidate_ino",
+        "quarantine_dev",
+        "quarantine_ino",
+        "candidate_file_count",
+        "candidate_directory_count",
+        "candidate_bytes",
+    ):
+        if type(value.get(key)) is not int or value[key] < 0:
+            raise TransactionError("quarantine prune intent tree identity is invalid")
+    if value["candidate_ino"] <= 0 or value["quarantine_ino"] <= 0:
+        raise TransactionError("quarantine prune intent inode is invalid")
+    for key in ("current_before", "previous_before"):
+        identity = value.get(key)
+        if identity is not None and (
+            not isinstance(identity, dict)
+            or set(identity) != {"slug", "dev", "ino", "source_sha"}
+            or type(identity.get("slug")) is not str
+            or type(identity.get("dev")) is not int
+            or type(identity.get("ino")) is not int
+            or identity["dev"] < 0
+            or identity["ino"] <= 0
+            or type(identity.get("source_sha")) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", identity["source_sha"]) is None
+        ):
+            raise TransactionError("quarantine prune intent pointer binding is invalid")
+    return value
+
+
+def _write_quarantine_prune_intent(
+    path: Path, intent: dict[str, object], *, creating: bool
+) -> None:
+    if set(intent) != QUARANTINE_PRUNE_INTENT_KEYS:
+        raise TransactionError("quarantine prune intent fields are invalid")
+    root = path.parent
+    _safe_directory(root, label="recovery quarantine directory")
+    if creating and _lexists(path):
+        raise TransactionError("quarantine prune intent already exists")
+    temporary = root / f".{path.name}.{uuid4().hex}.tmp"
+    raw = (
+        json.dumps(intent, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("ascii")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(raw)
+            stream.flush()
+        os.fsync(descriptor)
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    try:
+        if creating:
+            os.link(temporary, path, follow_symlinks=False)
+        else:
+            prior = _read_quarantine_prune_intent(path)
+            compare = dict(intent)
+            compare["phase"] = prior["phase"]
+            compare["cleanup_run_attempt"] = prior["cleanup_run_attempt"]
+            allowed = {"planned": "deleting", "deleting": "deleted"}
+            if (
+                prior != compare
+                or int(cast(str, intent["cleanup_run_attempt"]))
+                < int(cast(str, prior["cleanup_run_attempt"]))
+                or (
+                    intent["phase"] != prior["phase"]
+                    and allowed.get(cast(str, prior["phase"])) != intent["phase"]
+                )
+            ):
+                raise TransactionError("quarantine prune intent binding or phase changed")
+            os.replace(temporary, path)
+        _fsync_directory(root)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _quarantine_prune_identity_matches(
+    path: Path, intent: dict[str, object]
+) -> os.stat_result:
+    metadata = _safe_directory(path, label="quarantine prune stage")
+    if (
+        metadata.st_dev != intent["quarantine_dev"]
+        or metadata.st_ino != intent["quarantine_ino"]
+    ):
+        raise TransactionError("quarantine prune stage identity changed")
+    return metadata
+
+
+def _quarantine_prune_snapshot_matches(
+    path: Path, intent: dict[str, object]
+) -> None:
+    metadata = _quarantine_prune_identity_matches(path, intent)
+    _quarantine_assert_no_mounts(path)
+    tree = _quarantine_tree_snapshot(path)
+    if (
+        metadata.st_dev != intent["candidate_dev"]
+        or metadata.st_ino != intent["candidate_ino"]
+        or tree
+        != (
+            intent["candidate_tree_sha256"],
+            intent["candidate_file_count"],
+            intent["candidate_directory_count"],
+            intent["candidate_bytes"],
+        )
+    ):
+        raise TransactionError("quarantine prune tree differs from consumed receipt")
+
+
+def _quarantine_prune_validate_remaining_tree(
+    path: Path, intent: dict[str, object]
+) -> None:
+    """Validate a possibly partially deleted, intent-bound staging inode."""
+    _quarantine_prune_identity_matches(path, intent)
+    _quarantine_assert_no_mounts(path)
+    _tree_sha, file_count, directory_count, total_bytes = _quarantine_tree_snapshot(path)
+    if (
+        file_count > intent["candidate_file_count"]
+        or directory_count > intent["candidate_directory_count"]
+        or total_bytes > intent["candidate_bytes"]
+    ):
+        raise TransactionError("quarantine prune retry tree exceeds its bound intent")
+
+
+def _quarantine_prune_delete_stage(
+    root: Path, stage: Path, intent: dict[str, object]
+) -> None:
+    """Delete only the bound staged inode, with no-follow dirfd traversal."""
+    _quarantine_prune_validate_remaining_tree(stage, intent)
+    parent_fd = -1
+    stage_fd = -1
+    try:
+        root_metadata = _safe_directory(root, label="recovery quarantine directory")
+        parent_fd = os.open(
+            root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_root = os.fstat(parent_fd)
+        if _identity(opened_root) != _identity(root_metadata):
+            raise TransactionError("recovery quarantine directory changed")
+        staged_metadata = os.stat(stage.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(staged_metadata.st_mode)
+            or staged_metadata.st_dev != intent["quarantine_dev"]
+            or staged_metadata.st_ino != intent["quarantine_ino"]
+        ):
+            raise TransactionError("quarantine prune stage identity changed")
+        stage_fd = os.open(
+            stage.name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        opened_stage = os.fstat(stage_fd)
+        if (
+            not stat.S_ISDIR(opened_stage.st_mode)
+            or opened_stage.st_dev != intent["quarantine_dev"]
+            or opened_stage.st_ino != intent["quarantine_ino"]
+            or opened_stage.st_uid != 0
+            or opened_stage.st_gid != 0
+        ):
+            raise TransactionError("quarantine prune stage changed before traversal")
+        for walk_root, directories, files, directory_fd in os.fwalk(
+            ".",
+            topdown=False,
+            follow_symlinks=False,
+            dir_fd=stage_fd,
+        ):
+            current = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or current.st_dev != intent["quarantine_dev"]
+                or current.st_uid != 0
+                or current.st_gid != 0
+                or (
+                    walk_root == "."
+                    and current.st_ino != intent["quarantine_ino"]
+                )
+            ):
+                raise TransactionError("quarantine prune directory changed")
+            os.fchmod(directory_fd, stat.S_IMODE(current.st_mode) | 0o700)
+            for filename in files:
+                try:
+                    entry = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(entry.st_mode)
+                        or entry.st_dev != intent["quarantine_dev"]
+                        or entry.st_uid != 0
+                        or entry.st_gid != 0
+                        or entry.st_nlink != 1
+                    ):
+                        raise TransactionError("quarantine prune file is unsafe")
+                    file_fd = os.open(
+                        filename,
+                        os.O_RDONLY
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        opened = os.fstat(file_fd)
+                        if (
+                            not stat.S_ISREG(opened.st_mode)
+                            or _identity(opened) != _identity(entry)
+                            or opened.st_dev != intent["quarantine_dev"]
+                            or opened.st_uid != 0
+                            or opened.st_gid != 0
+                            or opened.st_nlink != 1
+                        ):
+                            raise TransactionError("quarantine prune file changed")
+                    finally:
+                        os.close(file_fd)
+                    os.unlink(filename, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise TransactionError("quarantine prune file could not be removed") from exc
+            for dirname in directories:
+                try:
+                    entry = os.stat(dirname, dir_fd=directory_fd, follow_symlinks=False)
+                    if (
+                        not stat.S_ISDIR(entry.st_mode)
+                        or entry.st_dev != intent["quarantine_dev"]
+                        or entry.st_uid != 0
+                        or entry.st_gid != 0
+                        or entry.st_nlink < 2
+                    ):
+                        raise TransactionError("quarantine prune directory entry is unsafe")
+                    os.rmdir(dirname, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise TransactionError("quarantine prune directory could not be removed") from exc
+            os.fsync(directory_fd)
+        current_root = os.stat(stage.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current_root.st_mode)
+            or current_root.st_ino != intent["quarantine_ino"]
+            or current_root.st_dev != intent["quarantine_dev"]
+        ):
+            raise TransactionError("quarantine prune root changed before removal")
+        os.rmdir(stage.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        os.close(stage_fd)
+        stage_fd = -1
+    except TransactionError:
+        raise
+    except OSError as exc:
+        raise TransactionError("quarantine prune staged tree could not be removed") from exc
+    finally:
+        if stage_fd >= 0:
+            os.close(stage_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def prune_quarantined_candidate(
+    state: Path,
+    *,
+    failed_deploy_run_id: str,
+    failed_deploy_run_attempt: str,
+    failed_deploy_source_sha: str,
+    cleanup_run_id: str,
+    cleanup_run_attempt: str,
+    cleanup_source_sha: str,
+    bundle_sha: str,
+) -> dict[str, object]:
+    """Remove one receipt-consumed candidate using a separate U-bound intent."""
+    if (
+        not isinstance(failed_deploy_run_id, str)
+        or re.fullmatch(r"[1-9][0-9]{0,31}", failed_deploy_run_id) is None
+        or not isinstance(failed_deploy_run_attempt, str)
+        or re.fullmatch(r"[1-9][0-9]{0,31}", failed_deploy_run_attempt) is None
+        or not isinstance(failed_deploy_source_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", failed_deploy_source_sha) is None
+    ):
+        raise TransactionError("failed deployment F binding is invalid")
+    original_binding = {
+        "failed_deploy_run_id": failed_deploy_run_id,
+        "failed_deploy_run_attempt": failed_deploy_run_attempt,
+        "failed_deploy_source_sha": failed_deploy_source_sha,
+    }
+    for value, label in (
+        (cleanup_run_id, "cleanup run id"),
+        (cleanup_run_attempt, "cleanup run attempt"),
+    ):
+        if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,31}", value) is None:
+            raise TransactionError(f"{label} is invalid")
+    if re.fullmatch(r"[0-9a-f]{40}", cleanup_source_sha) is None:
+        raise TransactionError("cleanup source SHA is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", bundle_sha) is None:
+        raise TransactionError("cleanup bundle SHA is invalid")
+
+    shared = state.parent
+    app = shared.parent
+    releases = app / "releases"
+    if state != shared / STATE_NAME:
+        raise TransactionError("quarantine prune state path is invalid")
+    if any(
+        _lexists(shared / name)
+        for name in (
+            STATE_NAME,
+            QUIESCE_STATE_NAME,
+            SYSTEMD_STATE_NAME,
+            ".migration-pending.json",
+            ".migration-state.json",
+        )
+    ):
+        raise TransactionError("quarantine prune has a pending release sidecar")
+    _safe_directory(app, label="platform application directory")
+    _safe_directory(releases, label="platform releases directory")
+    root = _quarantine_root(shared, releases)
+    candidate_slug = (
+        f"gha-{failed_deploy_run_id}-{failed_deploy_run_attempt}-"
+        f"{failed_deploy_source_sha[:12]}"
+    )
+    receipt_path = _quarantine_receipt_path(root, candidate_slug)
+    receipt_raw = _read_private_state_bytes(receipt_path, label="quarantine receipt")
+    receipt = _read_quarantine_receipt(receipt_path, raw=receipt_raw)
+    if (
+        receipt["phase"] != "receipt_consumed"
+        or receipt["failed_deploy_run_id"] != original_binding["failed_deploy_run_id"]
+        or receipt["failed_deploy_run_attempt"] != original_binding["failed_deploy_run_attempt"]
+        or receipt["failed_deploy_source_sha"] != original_binding["failed_deploy_source_sha"]
+        or receipt["candidate_slug"] != candidate_slug
+        or receipt["quarantine_slug"] != candidate_slug
+    ):
+        raise TransactionError("quarantine receipt is not an exact consumed F receipt")
+    current_identity = _quarantine_release_identity(_read_pointer(app, "current"))
+    previous_identity = _quarantine_release_identity(_read_pointer(app, "previous"))
+    if (
+        current_identity != receipt["current_before"]
+        or previous_identity != receipt["previous_before"]
+    ):
+        raise TransactionError("release pointers changed since quarantine receipt")
+    for identity in (current_identity, previous_identity):
+        if identity is not None:
+            protected_release = releases / cast(str, identity["slug"])
+            try:
+                resolved_release = protected_release.resolve(strict=True)
+            except OSError as exc:
+                raise TransactionError("quarantine prune protected pointer is unavailable") from exc
+            if resolved_release.parent != releases or resolved_release != protected_release:
+                raise TransactionError("quarantine prune protected pointer is outside releases")
+
+    original_receipt_sha = hashlib.sha256(receipt_raw).hexdigest()
+    intent_path = _quarantine_prune_intent_path(root, candidate_slug)
+    candidate = root / candidate_slug
+    stage_name = _quarantine_prune_stage_name(candidate_slug, cleanup_run_id)
+    stage = root / stage_name
+    if _lexists(intent_path):
+        intent = _read_quarantine_prune_intent(intent_path)
+        for key, expected in {
+            "failed_deploy_run_id": failed_deploy_run_id,
+            "failed_deploy_run_attempt": failed_deploy_run_attempt,
+            "failed_deploy_source_sha": failed_deploy_source_sha,
+            "candidate_slug": candidate_slug,
+            "original_receipt_sha256": original_receipt_sha,
+            "original_recovery_run_id": receipt["recovery_run_id"],
+            "original_recovery_run_attempt": receipt["recovery_run_attempt"],
+            "original_recovery_bundle_sha": receipt["recovery_bundle_sha"],
+            "cleanup_run_id": cleanup_run_id,
+            "cleanup_source_sha": cleanup_source_sha,
+            "cleanup_bundle_sha": bundle_sha,
+            "candidate_dev": receipt["candidate_dev"],
+            "candidate_ino": receipt["candidate_ino"],
+            "quarantine_dev": receipt["quarantine_dev"],
+            "quarantine_ino": receipt["quarantine_ino"],
+            "candidate_tree_sha256": receipt["candidate_tree_sha256"],
+            "candidate_file_count": receipt["candidate_file_count"],
+            "candidate_directory_count": receipt["candidate_directory_count"],
+            "candidate_bytes": receipt["candidate_bytes"],
+            "current_before": current_identity,
+            "previous_before": previous_identity,
+            "stage_name": stage_name,
+        }.items():
+            if intent.get(key) != expected:
+                raise TransactionError("quarantine prune U/F intent binding changed")
+        if int(cleanup_run_attempt) < int(cast(str, intent["cleanup_run_attempt"])):
+            raise TransactionError("quarantine prune run attempt moved backwards")
+        if cleanup_run_attempt != intent["cleanup_run_attempt"] and intent["phase"] != "deleted":
+            intent["cleanup_run_attempt"] = cleanup_run_attempt
+            _write_quarantine_prune_intent(intent_path, intent, creating=False)
+    else:
+        if _lexists(candidate) is False or _lexists(stage):
+            raise TransactionError("quarantine prune candidate state is ambiguous")
+        _quarantine_assert_no_mounts(candidate)
+        candidate_meta = _safe_directory(candidate, label="quarantined candidate")
+        tree = _quarantine_tree_snapshot(candidate)
+        expected_tree = (
+            receipt["candidate_tree_sha256"],
+            receipt["candidate_file_count"],
+            receipt["candidate_directory_count"],
+            receipt["candidate_bytes"],
+        )
+        if (
+            candidate_meta.st_dev != receipt["quarantine_dev"]
+            or candidate_meta.st_ino != receipt["quarantine_ino"]
+            or candidate_meta.st_dev != receipt["candidate_dev"]
+            or candidate_meta.st_ino != receipt["candidate_ino"]
+            or tree != expected_tree
+        ):
+            raise TransactionError("quarantine prune candidate differs from consumed receipt")
+        intent = {
+            "schema": QUARANTINE_PRUNE_INTENT_SCHEMA,
+            "action": "prune_quarantined_candidate",
+            "phase": "planned",
+            "failed_deploy_run_id": failed_deploy_run_id,
+            "failed_deploy_run_attempt": failed_deploy_run_attempt,
+            "failed_deploy_source_sha": failed_deploy_source_sha,
+            "candidate_slug": candidate_slug,
+            "original_receipt_sha256": original_receipt_sha,
+            "original_recovery_run_id": receipt["recovery_run_id"],
+            "original_recovery_run_attempt": receipt["recovery_run_attempt"],
+            "original_recovery_bundle_sha": receipt["recovery_bundle_sha"],
+            "cleanup_run_id": cleanup_run_id,
+            "cleanup_run_attempt": cleanup_run_attempt,
+            "cleanup_source_sha": cleanup_source_sha,
+            "cleanup_bundle_sha": bundle_sha,
+            "candidate_dev": candidate_meta.st_dev,
+            "candidate_ino": candidate_meta.st_ino,
+            "quarantine_dev": receipt["quarantine_dev"],
+            "quarantine_ino": receipt["quarantine_ino"],
+            "candidate_tree_sha256": tree[0],
+            "candidate_file_count": tree[1],
+            "candidate_directory_count": tree[2],
+            "candidate_bytes": tree[3],
+            "current_before": current_identity,
+            "previous_before": previous_identity,
+            "stage_name": stage_name,
+        }
+        _write_quarantine_prune_intent(intent_path, intent, creating=True)
+
+    if intent["phase"] == "deleted":
+        if _lexists(candidate) or _lexists(stage):
+            raise TransactionError("deleted quarantine prune target reappeared")
+        if hashlib.sha256(_read_private_state_bytes(receipt_path, label="quarantine receipt")).hexdigest() != original_receipt_sha:
+            raise TransactionError("original quarantine receipt changed after pruning")
+        _assert_quarantine_pointers(app, receipt)
+        return intent
+
+    if intent["phase"] == "planned":
+        if _lexists(candidate) and not _lexists(stage):
+            _quarantine_prune_snapshot_matches(candidate, intent)
+            _rename_noreplace(candidate, stage)
+            _fsync_directory(root)
+        elif _lexists(stage) and not _lexists(candidate):
+            _quarantine_prune_snapshot_matches(stage, intent)
+        else:
+            raise TransactionError("planned quarantine prune staging state is ambiguous")
+        _quarantine_prune_snapshot_matches(stage, intent)
+        if (
+            hashlib.sha256(
+                _read_private_state_bytes(receipt_path, label="quarantine receipt")
+            ).hexdigest()
+            != original_receipt_sha
+        ):
+            raise TransactionError("original quarantine receipt changed before pruning")
+        _assert_quarantine_pointers(app, receipt)
+        intent["phase"] = "deleting"
+        _write_quarantine_prune_intent(intent_path, intent, creating=False)
+
+    if intent["phase"] != "deleting":
+        raise TransactionError("quarantine prune intent phase is invalid")
+    if _lexists(candidate):
+        raise TransactionError("quarantine prune candidate path reappeared")
+    if (
+        hashlib.sha256(
+            _read_private_state_bytes(receipt_path, label="quarantine receipt")
+        ).hexdigest()
+        != original_receipt_sha
+    ):
+        raise TransactionError("original quarantine receipt changed before deletion")
+    _assert_quarantine_pointers(app, receipt)
+    if _lexists(stage):
+        _quarantine_prune_validate_remaining_tree(stage, intent)
+        _quarantine_prune_delete_stage(root, stage, intent)
+    if _lexists(candidate) or _lexists(stage):
+        raise TransactionError("quarantine prune target remains after deletion")
+    if hashlib.sha256(_read_private_state_bytes(receipt_path, label="quarantine receipt")).hexdigest() != original_receipt_sha:
+        raise TransactionError("original quarantine receipt changed during pruning")
+    _assert_quarantine_pointers(app, receipt)
+    intent["phase"] = "deleted"
+    _write_quarantine_prune_intent(intent_path, intent, creating=False)
+    return intent
 
 
 def quarantine_populated_quiesce(
@@ -4186,6 +4895,15 @@ def _build_parser() -> argparse.ArgumentParser:
         quarantine_parser.add_argument("--recovery-run-id", required=True)
         quarantine_parser.add_argument("--recovery-run-attempt", required=True)
         quarantine_parser.add_argument("--bundle-sha", required=True)
+    prune_quarantine_parser = commands.add_parser("prune-quarantined-candidate")
+    prune_quarantine_parser.add_argument("--state", required=True, type=Path)
+    prune_quarantine_parser.add_argument("--failed-deploy-run-id", required=True)
+    prune_quarantine_parser.add_argument("--failed-deploy-run-attempt", required=True)
+    prune_quarantine_parser.add_argument("--failed-deploy-source-sha", required=True)
+    prune_quarantine_parser.add_argument("--cleanup-run-id", required=True)
+    prune_quarantine_parser.add_argument("--cleanup-run-attempt", required=True)
+    prune_quarantine_parser.add_argument("--cleanup-source-sha", required=True)
+    prune_quarantine_parser.add_argument("--bundle-sha", required=True)
     validate_service_snapshot_parser = commands.add_parser("validate-service-snapshot")
     validate_service_snapshot_parser.add_argument("--state", required=True, type=Path)
     validate_service_snapshot_parser.add_argument(
@@ -4383,6 +5101,30 @@ def main() -> int:
             print(
                 json.dumps(
                     projection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        elif args.command == "prune-quarantined-candidate":
+            intent = prune_quarantined_candidate(
+                args.state,
+                failed_deploy_run_id=args.failed_deploy_run_id,
+                failed_deploy_run_attempt=args.failed_deploy_run_attempt,
+                failed_deploy_source_sha=args.failed_deploy_source_sha,
+                cleanup_run_id=args.cleanup_run_id,
+                cleanup_run_attempt=args.cleanup_run_attempt,
+                cleanup_source_sha=args.cleanup_source_sha,
+                bundle_sha=args.bundle_sha,
+            )
+            print(
+                json.dumps(
+                    {
+                        "schema": intent["schema"],
+                        "action": intent["action"],
+                        "phase": intent["phase"],
+                        "candidate_slug": intent["candidate_slug"],
+                        "original_receipt_sha256": intent["original_receipt_sha256"],
+                    },
                     sort_keys=True,
                     separators=(",", ":"),
                 )

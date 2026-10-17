@@ -25,6 +25,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Release transaction and recovery | [Release state machine](release-state-machine.md) |
 | Candidate-bound forward migration safety | [Candidate forward migration guard ADR](adr/candidate-forward-migration-guard.md) |
 | Immutable retained-release recovery bootstrap | [Recovery bootstrap ADR](adr/recovery-bootstrap-retained-abort.md), [first-install systemd ADR](adr/first-install-systemd-activation.md) and [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap) |
+| Pruning one consumed quarantined candidate | [Signed quarantine-pruning ADR](adr/quarantined-candidate-pruning.md) and [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap) |
 | Failed maintenance service evidence and guarded reset | [Encrypted maintenance evidence transport ADR](adr/maintenance-failure-evidence-encryption.md), [maintenance failure capture and reset ADR](adr/maintenance-failure-capture-and-reset.md) and [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap) |
 | Report-only failed-deployment recovery | [Recovery bootstrap ADR](adr/recovery-bootstrap-retained-abort.md#operator-recovery-deployment-for-a-report-only-invalid-marker) and [deployment runbook](deployment-runbook.md#manual-workflow-fallback) |
 | Test-suite ownership and CI/live runners | [Test-suite governance](test-suite-governance.md) |
