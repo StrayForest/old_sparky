@@ -2592,6 +2592,89 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             malformed = {**diagnostic, "terminal_snapshot": malformed_terminal}
             self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
 
+        root = "/run/oldsparky-backup-restore-" + ("c" * 24)
+        synthetic_args = argparse.Namespace(
+            _scratch_restore_worker=True,
+            _scratch_authorization_probe=False,
+            _scratch_synthetic_restore_diagnostic=True,
+            _scratch_root=root,
+            _scratch_timestamp_slug="20261018T010203Z",
+            _scratch_archive=None,
+            _scratch_archive_dev=None,
+            _scratch_archive_ino=None,
+            _scratch_archive_size=None,
+            _scratch_archive_sha256=None,
+            as_json=False,
+            private_scratch_diagnostics=False,
+        )
+        worker_report = {"kind": "synthetic worker reached after authorization"}
+        worker_stdout = io.TextIOWrapper(io.BytesIO())
+        with (
+            mock.patch.object(backup_drill, "parse_args", return_value=synthetic_args),
+            mock.patch.object(
+                backup_drill, "_scratch_read_worker_token",
+                side_effect=[backup_drill.SCRATCH_START_TOKEN, backup_drill.SCRATCH_DONE_TOKEN],
+            ) as read_token,
+            mock.patch.object(backup_drill, "_scratch_mount_snapshot"),
+            mock.patch.object(backup_drill, "_scratch_cgroup_snapshot"),
+            mock.patch.object(backup_drill, "_raise_scratch_host_memory_reserve"),
+            mock.patch.object(backup_drill, "_scratch_synthetic_restore_diagnostic_worker", return_value=worker_report) as run_synthetic,
+            mock.patch.object(backup_drill.pathlib.Path, "is_dir", return_value=True),
+            mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+            mock.patch.object(backup_drill.sys, "stdin", io.BytesIO()),
+            mock.patch.object(backup_drill.sys, "stdout", worker_stdout),
+        ):
+            self.assertEqual(backup_drill.main(), 0)
+        self.assertEqual(
+            [call.args[1] for call in read_token.call_args_list],
+            [backup_drill.SCRATCH_START_TOKEN, backup_drill.SCRATCH_DONE_TOKEN],
+        )
+        run_synthetic.assert_called_once()
+        worker_stdout.flush()
+        self.assertEqual(
+            json.loads(worker_stdout.buffer.getvalue().decode("ascii")), worker_report
+        )
+
+        forbidden_archive_args = argparse.Namespace(
+            **{
+                **vars(synthetic_args),
+                "_scratch_archive": "/tmp/external.dump",
+            }
+        )
+        forbidden_stderr = io.StringIO()
+        with (
+            mock.patch.object(backup_drill, "parse_args", return_value=forbidden_archive_args),
+            mock.patch.object(
+                backup_drill, "_scratch_read_worker_token",
+                return_value=backup_drill.SCRATCH_START_TOKEN,
+            ),
+            mock.patch.object(backup_drill, "_scratch_mount_snapshot"),
+            mock.patch.object(backup_drill, "_scratch_cgroup_snapshot"),
+            mock.patch.object(backup_drill, "_raise_scratch_host_memory_reserve"),
+            mock.patch.object(backup_drill, "_scratch_synthetic_restore_diagnostic_worker") as forbidden_run,
+            mock.patch.object(backup_drill.pathlib.Path, "is_dir", return_value=True),
+            mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+            mock.patch.object(backup_drill.sys, "stdin", io.BytesIO()),
+            mock.patch.object(backup_drill.sys, "stderr", forbidden_stderr),
+        ):
+            self.assertEqual(backup_drill.main(), 1)
+        forbidden_run.assert_not_called()
+        self.assertIn("must not receive archive inputs", forbidden_stderr.getvalue())
+
+        normal_worker_args = argparse.Namespace(**{
+            **vars(synthetic_args),
+            "_scratch_synthetic_restore_diagnostic": False,
+        })
+        normal_stderr = io.StringIO()
+        with (
+            mock.patch.object(backup_drill, "parse_args", return_value=normal_worker_args),
+            mock.patch.object(backup_drill, "_scratch_worker_main") as normal_worker,
+            mock.patch.object(backup_drill.sys, "stderr", normal_stderr),
+        ):
+            self.assertEqual(backup_drill.main(), 1)
+        normal_worker.assert_not_called()
+        self.assertIn("worker input is incomplete", normal_stderr.getvalue())
+
         unit_name = "oldsparky-backup-restore-" + ("a" * 24) + ".service"
         mountpoint = pathlib.Path("/run/oldsparky-backup-restore-" + ("a" * 24))
         journal_record = json.dumps(
@@ -3351,6 +3434,161 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill.valid_scratch_first_fault(
                 {**controller_fault, "site": "worker_role_setup"}
             )
+        )
+
+        first_properties = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "ExecMainPID": "1234",
+            "InvocationID": "a" * 32,
+        }
+        single_mismatches = (
+            ("load_state", {"LoadState": "not-found"}),
+            ("active_state", {"ActiveState": "inactive"}),
+            ("exec_main_pid", {"ExecMainPID": "1235"}),
+            ("invocation_id", {"InvocationID": "b" * 32}),
+        )
+        for property_name, update in single_mismatches:
+            with self.subTest(identity_mismatch=property_name):
+                second_properties = {**first_properties, **update}
+                comparison = backup_drill._scratch_identity_snapshot_comparison(
+                    first_properties, second_properties
+                )
+                self.assertTrue(
+                    backup_drill.valid_scratch_identity_snapshot_comparison(comparison)
+                )
+                assert comparison is not None
+                self.assertEqual(
+                    [name for name, is_equal in comparison["equal"].items() if not is_equal],
+                    [property_name],
+                )
+                self.assertNotIn("1234", json.dumps(comparison))
+                self.assertNotIn("a" * 32, json.dumps(comparison))
+
+                production_failure = backup_drill._scratch_second_snapshot_identity_failure(
+                    first_properties,
+                    second_properties,
+                    expected_pid="1234",
+                    expected_invocation_id="a" * 32,
+                    synthetic_restore_diagnostic=False,
+                )
+                self.assertIsNotNone(production_failure)
+                self.assertFalse(
+                    hasattr(
+                        production_failure,
+                        "scratch_synthetic_identity_snapshot_comparison",
+                    )
+                )
+                synthetic_failure = backup_drill._scratch_second_snapshot_identity_failure(
+                    first_properties,
+                    second_properties,
+                    expected_pid="1234",
+                    expected_invocation_id="a" * 32,
+                    synthetic_restore_diagnostic=True,
+                )
+                self.assertIsNotNone(synthetic_failure)
+                synthetic_comparison = getattr(
+                    synthetic_failure,
+                    "scratch_synthetic_identity_snapshot_comparison",
+                    None,
+                )
+                self.assertEqual(synthetic_comparison, comparison)
+
+        self.assertIsNone(
+            backup_drill._scratch_second_snapshot_identity_failure(
+                first_properties,
+                first_properties,
+                expected_pid="1234",
+                expected_invocation_id="a" * 32,
+                synthetic_restore_diagnostic=True,
+            )
+        )
+
+        combined_second = {
+            **first_properties,
+            "LoadState": "error",
+            "ActiveState": "failed",
+            "ExecMainPID": "0",
+            "InvocationID": "unknown",
+        }
+        combined_comparison = backup_drill._scratch_identity_snapshot_comparison(
+            first_properties, combined_second
+        )
+        self.assertTrue(
+            backup_drill.valid_scratch_identity_snapshot_comparison(
+                combined_comparison
+            )
+        )
+        assert combined_comparison is not None
+        self.assertEqual(
+            combined_comparison["equal"],
+            {
+                "load_state": False,
+                "active_state": False,
+                "exec_main_pid": False,
+                "invocation_id": False,
+            },
+        )
+        self.assertFalse(
+            backup_drill.valid_scratch_identity_snapshot_comparison(
+                {
+                    **combined_comparison,
+                    "second": {**combined_comparison["second"], "active_state": "unknown-secret"},
+                }
+            )
+        )
+        self.assertFalse(
+            backup_drill.valid_scratch_identity_snapshot_comparison(
+                {
+                    **combined_comparison,
+                    "equal": {**combined_comparison["equal"], "exec_main_pid": 1},
+                }
+            )
+        )
+        identity_failure = RuntimeError("private unit mismatch")
+        identity_failure.scratch_synthetic_identity_snapshot_comparison = combined_comparison
+        identity_fault = backup_drill._scratch_first_fault(
+            identity_failure, origin="controller", site="controller_identity"
+        )
+        self.assertTrue(backup_drill.valid_scratch_first_fault(identity_fault))
+        assert identity_fault is not None
+        self.assertEqual(
+            identity_fault["synthetic_identity_snapshot_comparison"],
+            combined_comparison,
+        )
+        self.assertFalse(
+            backup_drill.valid_scratch_first_fault(
+                {
+                    **identity_fault,
+                    "synthetic_path_fixture_rejection": {
+                        "schema": 1,
+                        "target_index": 0,
+                        "parent_component_index": 1,
+                        "predicates": ["group_or_world_writable"],
+                    },
+                }
+            )
+        )
+        identity_frame = backup_drill._scratch_first_fault_frame(identity_fault)
+        self.assertIsNotNone(identity_frame)
+        assert identity_frame is not None
+        identity_report = {
+            "ok": False,
+            "error": "fixed private failure marker",
+            "scratch_first_fault": identity_fault,
+        }
+        identity_stdout = (
+            json.dumps(identity_report, ensure_ascii=False, indent=2).encode("utf-8")
+            + b"\n"
+        )
+        self.assertEqual(
+            backup_drill._parse_bound_scratch_first_fault(
+                identity_stdout,
+                identity_frame,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            ),
+            identity_fault,
         )
 
         frame = backup_drill._scratch_first_fault_frame(expected)

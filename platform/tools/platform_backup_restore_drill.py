@@ -148,6 +148,18 @@ _SCRATCH_SYNTHETIC_PATH_FIXTURE_PREDICATES = (
     "gid_mismatch",
     "group_or_world_writable",
 )
+_SCRATCH_IDENTITY_LOAD_STATES = frozenset(
+    {"loaded", "not-found", "masked", "error", "bad-setting", "merged", "stub", "other"}
+)
+_SCRATCH_IDENTITY_ACTIVE_STATES = frozenset(
+    {"active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "other"}
+)
+_SCRATCH_IDENTITY_COMPARISON_PROPERTIES = (
+    "load_state",
+    "active_state",
+    "exec_main_pid",
+    "invocation_id",
+)
 SCRATCH_SYNTHETIC_EXPECTED_ROWS = (
     (1, "alpha", "restore fixture alpha"),
     (2, "beta", "restore fixture beta"),
@@ -254,12 +266,142 @@ def valid_scratch_synthetic_path_fixture_rejection(value: Any) -> bool:
     return True
 
 
+def valid_scratch_identity_snapshot_comparison(value: Any) -> bool:
+    """Validate closed two-snapshot identity evidence without raw identifiers."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "first", "second", "equal"
+    }:
+        return False
+    if type(value.get("schema")) is not int or value["schema"] != 1:
+        return False
+    states: list[dict[str, Any]] = []
+    for name in ("first", "second"):
+        snapshot = value.get(name)
+        if not isinstance(snapshot, dict) or set(snapshot) != {
+            "load_state", "active_state", "exec_main_pid_present", "invocation_id_present"
+        }:
+            return False
+        if (
+            type(snapshot.get("load_state")) is not str
+            or snapshot["load_state"] not in _SCRATCH_IDENTITY_LOAD_STATES
+            or type(snapshot.get("active_state")) is not str
+            or snapshot["active_state"] not in _SCRATCH_IDENTITY_ACTIVE_STATES
+            or type(snapshot.get("exec_main_pid_present")) is not bool
+            or type(snapshot.get("invocation_id_present")) is not bool
+        ):
+            return False
+        states.append(snapshot)
+    first, second = states
+    if (
+        first["load_state"] != "loaded"
+        or first["active_state"] != "active"
+        or not first["exec_main_pid_present"]
+        or not first["invocation_id_present"]
+    ):
+        return False
+    equal = value.get("equal")
+    if not isinstance(equal, dict) or set(equal) != set(
+        _SCRATCH_IDENTITY_COMPARISON_PROPERTIES
+    ) or any(type(equal.get(key)) is not bool for key in _SCRATCH_IDENTITY_COMPARISON_PROPERTIES):
+        return False
+    if equal["load_state"] != (second["load_state"] == "loaded"):
+        return False
+    if equal["active_state"] != (second["active_state"] == "active"):
+        return False
+    if not second["exec_main_pid_present"] and equal["exec_main_pid"]:
+        return False
+    if not second["invocation_id_present"] and equal["invocation_id"]:
+        return False
+    return True
+
+
+def _scratch_identity_snapshot_comparison(
+    first_properties: dict[str, Any], second_properties: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Project the exact preauthorization identity comparison to closed fields."""
+    if not isinstance(first_properties, dict) or not isinstance(second_properties, dict):
+        return None
+
+    def state(value: Any, allowed: frozenset[str]) -> str:
+        return value if type(value) is str and value in allowed - {"other"} else "other"
+
+    first = {
+        "load_state": state(first_properties.get("LoadState"), _SCRATCH_IDENTITY_LOAD_STATES),
+        "active_state": state(first_properties.get("ActiveState"), _SCRATCH_IDENTITY_ACTIVE_STATES),
+        "exec_main_pid_present": (
+            type(first_properties.get("ExecMainPID")) is str
+            and first_properties["ExecMainPID"].isdecimal()
+            and first_properties["ExecMainPID"] not in {"", "0"}
+        ),
+        "invocation_id_present": (
+            type(first_properties.get("InvocationID")) is str
+            and re.fullmatch(r"[0-9a-f]{32}", first_properties["InvocationID"]) is not None
+        ),
+    }
+    second = {
+        "load_state": state(second_properties.get("LoadState"), _SCRATCH_IDENTITY_LOAD_STATES),
+        "active_state": state(second_properties.get("ActiveState"), _SCRATCH_IDENTITY_ACTIVE_STATES),
+        "exec_main_pid_present": (
+            type(second_properties.get("ExecMainPID")) is str
+            and second_properties["ExecMainPID"].isdecimal()
+            and second_properties["ExecMainPID"] not in {"", "0"}
+        ),
+        "invocation_id_present": (
+            type(second_properties.get("InvocationID")) is str
+            and re.fullmatch(r"[0-9a-f]{32}", second_properties["InvocationID"]) is not None
+        ),
+    }
+    comparison = {
+        "schema": 1,
+        "first": first,
+        "second": second,
+        "equal": {
+            "load_state": first_properties.get("LoadState") == second_properties.get("LoadState"),
+            "active_state": first_properties.get("ActiveState") == second_properties.get("ActiveState"),
+            "exec_main_pid": first_properties.get("ExecMainPID") == second_properties.get("ExecMainPID"),
+            "invocation_id": first_properties.get("InvocationID") == second_properties.get("InvocationID"),
+        },
+    }
+    return comparison if valid_scratch_identity_snapshot_comparison(comparison) else None
+
+
+def _scratch_second_snapshot_identity_failure(
+    first_properties: dict[str, Any],
+    second_properties: dict[str, Any],
+    *,
+    expected_pid: str,
+    expected_invocation_id: str,
+    synthetic_restore_diagnostic: bool,
+) -> RuntimeError | None:
+    """Apply the preauthorization identity guard and project synthetic failures only."""
+    if (
+        second_properties.get("LoadState") == "loaded"
+        and second_properties.get("ActiveState") == "active"
+        and second_properties.get("ExecMainPID") == expected_pid
+        and second_properties.get("InvocationID") == expected_invocation_id
+    ):
+        return None
+    failure = RuntimeError("Scratch restore unit identity changed before authorization.")
+    if synthetic_restore_diagnostic:
+        comparison = _scratch_identity_snapshot_comparison(
+            first_properties, second_properties
+        )
+        if comparison is not None:
+            setattr(
+                failure,
+                "scratch_synthetic_identity_snapshot_comparison",
+                comparison,
+            )
+    return failure
+
+
 def valid_scratch_first_fault(value: Any) -> bool:
     """Validate a closed first-fault projection without accepting raw details."""
     base_fields = {"schema", "origin", "site", "exception_kind", "errno"}
     if not isinstance(value, dict) or set(value) not in (
         base_fields,
         base_fields | {"synthetic_path_fixture_rejection"},
+        base_fields | {"synthetic_identity_snapshot_comparison"},
     ):
         return False
     if (
@@ -285,12 +427,22 @@ def valid_scratch_first_fault(value: Any) -> bool:
     if value["origin"] != expected_origin:
         return False
     path_rejection = value.get("synthetic_path_fixture_rejection")
+    identity_comparison = value.get("synthetic_identity_snapshot_comparison")
     if "synthetic_path_fixture_rejection" in value and (
         value["origin"] != "controller"
         or value["site"] != "controller_synthetic_path_fixture"
         or value["exception_kind"] != "runtime"
         or value["errno"] is not None
         or not valid_scratch_synthetic_path_fixture_rejection(path_rejection)
+    ):
+        return False
+    if "synthetic_identity_snapshot_comparison" in value and (
+        "synthetic_path_fixture_rejection" in value
+        or value["origin"] != "controller"
+        or value["site"] != "controller_identity"
+        or value["exception_kind"] != "runtime"
+        or value["errno"] is not None
+        or not valid_scratch_identity_snapshot_comparison(identity_comparison)
     ):
         return False
     if value["exception_kind"] in {"permission", "os_error"}:
@@ -357,8 +509,9 @@ def _scratch_exception_projection(error: BaseException) -> tuple[str, int | None
 
 def _scratch_first_fault(error: BaseException, *, origin: str, site: str) -> dict[str, Any] | None:
     path_rejection = getattr(error, "scratch_synthetic_path_fixture_rejection", None)
+    identity_comparison = getattr(error, "scratch_synthetic_identity_snapshot_comparison", None)
     if path_rejection is not None:
-        if not valid_scratch_synthetic_path_fixture_rejection(path_rejection):
+        if identity_comparison is not None or not valid_scratch_synthetic_path_fixture_rejection(path_rejection):
             return None
         exception_kind, errno = "runtime", None
     else:
@@ -372,6 +525,13 @@ def _scratch_first_fault(error: BaseException, *, origin: str, site: str) -> dic
     }
     if path_rejection is not None:
         value["synthetic_path_fixture_rejection"] = path_rejection
+    if identity_comparison is not None:
+        if not valid_scratch_identity_snapshot_comparison(identity_comparison):
+            return None
+        exception_kind, errno = "runtime", None
+        value["exception_kind"] = exception_kind
+        value["errno"] = errno
+        value["synthetic_identity_snapshot_comparison"] = identity_comparison
     return value if valid_scratch_first_fault(value) else None
 
 
@@ -8766,13 +8926,15 @@ def _run_isolated_restore_drill(
                             fault_site = "controller_identity"
                             second_snapshot = _scratch_service_snapshot(unit_name)
                             second_properties = second_snapshot.get("properties", {})
-                            if (
-                                second_properties.get("LoadState") != "loaded"
-                                or second_properties.get("ActiveState") != "active"
-                                or second_properties.get("ExecMainPID") != pid_text
-                                or second_properties.get("InvocationID") != invocation_id
-                            ):
-                                raise RuntimeError("Scratch restore unit identity changed before authorization.")
+                            identity_failure = _scratch_second_snapshot_identity_failure(
+                                properties,
+                                second_properties,
+                                expected_pid=pid_text,
+                                expected_invocation_id=invocation_id,
+                                synthetic_restore_diagnostic=synthetic_restore_diagnostic,
+                            )
+                            if identity_failure is not None:
+                                raise identity_failure
                             second_control_group = _scratch_expected_properties(
                                 second_snapshot,
                                 unit_name=unit_name,
@@ -9968,7 +10130,10 @@ def main() -> int:
                 args._scratch_root,
                 args._scratch_timestamp_slug,
             )
-            if not getattr(args, "_scratch_authorization_probe", False):
+            if not (
+                getattr(args, "_scratch_authorization_probe", False)
+                or getattr(args, "_scratch_synthetic_restore_diagnostic", False)
+            ):
                 required_worker_values += (
                     args._scratch_archive,
                     args._scratch_archive_dev,
