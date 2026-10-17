@@ -3428,7 +3428,7 @@ def _validate_protected_activation_recovery(
     state: Path, record: dict[str, object], *, phase: str
 ) -> None:
     """Accept only the bound 79/9ce/f115 install recovery topology."""
-    candidate = cast(Path, record["candidate_release"])
+    candidate = cast(Path, record["candidate_path"])
     current = cast(Path, record["current_before_path"])
     previous = cast(Path, record["previous_before_path"])
     shared = cast(Path, record["shared"])
@@ -3445,13 +3445,16 @@ def _validate_protected_activation_recovery(
         or _lexists(shared / SYSTEMD_STATE_NAME)
         or current_identity is None
         or current_identity["source_sha"] != PROTECTED_ACTIVATION_CURRENT_SHA
-        or current_identity != record["current_before_identity"]
+        or {"dev": current_identity["dev"], "ino": current_identity["ino"]}
+        != record["current_before_identity"]
         or previous_identity is None
         or previous_identity["source_sha"] != PROTECTED_ACTIVATION_PREVIOUS_SHA
-        or previous_identity != record["previous_before_identity"]
+        or {"dev": previous_identity["dev"], "ino": previous_identity["ino"]}
+        != record["previous_before_identity"]
         or candidate_identity is None
         or candidate_identity["source_sha"] != PROTECTED_ACTIVATION_CANDIDATE_SHA
-        or candidate_identity != record["candidate_identity"]
+        or {"dev": candidate_identity["dev"], "ino": candidate_identity["ino"]}
+        != record["candidate_identity"]
         or record["timer_active_before"] is not True
         or record["timer_enabled_before"] != "enabled"
     ):

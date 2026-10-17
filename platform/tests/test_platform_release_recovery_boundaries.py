@@ -95,12 +95,13 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "operation": "install",
             "phase": "filesystem-restored-services-pending",
             "candidate_release": candidate,
+            "candidate_path": candidate,
             "current_before_path": current,
             "previous_before_path": previous,
             "shared": shared,
-            "current_before_identity": identities[current],
-            "previous_before_identity": identities[previous],
-            "candidate_identity": identities[candidate],
+            "current_before_identity": {"dev": 1, "ino": 2},
+            "previous_before_identity": {"dev": 1, "ino": 3},
+            "candidate_identity": {"dev": 1, "ino": 4},
             "systemd_state_before": None,
             "timer_active_before": True,
             "timer_enabled_before": "enabled",
@@ -149,6 +150,68 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 transaction.restore_protected_activation_core_services(
                     state, systemctl="/usr/bin/systemctl"
                 )
+
+        self._assert_protected_activation_cli_reconstructs_serialized_paths()
+
+    def _assert_protected_activation_cli_reconstructs_serialized_paths(self) -> None:
+        current = self.add_release("protected-cli-current")
+        previous = self.add_release("protected-cli-previous")
+        def set_source_sha(release: Path, source_sha: str) -> None:
+            metadata = release / "RELEASE.json"
+            metadata.chmod(0o644)
+            metadata.write_text(
+                json.dumps({"source_git_commit": source_sha}) + "\n",
+                encoding="ascii",
+            )
+            metadata.chmod(0o444)
+
+        set_source_sha(current, transaction.PROTECTED_ACTIVATION_CURRENT_SHA)
+        set_source_sha(previous, transaction.PROTECTED_ACTIVATION_PREVIOUS_SHA)
+        candidate = self.create_wrapper_transaction(
+            current,
+            previous,
+            "protected-cli",
+            complete_snapshot=True,
+            service_states={
+                "deadlock-api": "active",
+                "deadlock-worker": "active",
+                "deadlock-web": "active",
+            },
+            timer_active=True,
+        )
+        set_source_sha(candidate, transaction.PROTECTED_ACTIVATION_CANDIDATE_SHA)
+        for expected, phase in (
+            ("staged", "migration-pending"),
+            ("migration-pending", "migration-applied"),
+            ("migration-applied", "activation-pending"),
+        ):
+            self.run_transaction("phase", "--expected", expected, "--phase", phase)
+        result = self.run_transaction(
+            "validate-protected-activation-recovery",
+            "--phase",
+            "activation-pending",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        serialized = json.loads((self.shared / STATE_NAME).read_text(encoding="ascii"))
+        self.assertIsInstance(serialized["candidate_release"], str)
+        loaded = transaction._load_record(self.shared / STATE_NAME)
+        self.assertIsInstance(loaded["candidate_path"], Path)
+        original_identity_reader = transaction._quarantine_release_identity
+        with mock.patch.object(
+            transaction,
+            "_quarantine_release_identity",
+            wraps=original_identity_reader,
+        ) as identity_reader:
+            transaction._validate_protected_activation_recovery(
+                self.shared / STATE_NAME,
+                loaded,
+                phase="activation-pending",
+            )
+        self.assertEqual(identity_reader.call_count, 3)
+        self.assertTrue(
+            all(isinstance(call.args[0], Path) for call in identity_reader.call_args_list)
+        )
 
     def test_health_monitor_wait_requires_fresh_success_after_restore(self) -> None:
         timer_properties = systemd_state._parse_show_fields(
