@@ -2312,6 +2312,47 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             systemd_state.SYSTEMCTL_PATH = str(systemctl)
             systemd_state.JOURNALCTL_PATH = str(journal)
             evidence_dir = self.shared / ".release-cloudflare-pending-reset-evidence"
+
+            def write_journal_records(entries: list[dict[str, str]]) -> None:
+                journal.write_text(
+                    "#!/usr/bin/env python3\nimport json\n"
+                    f"records={entries!r}\n"
+                    "for record in records: print(json.dumps(record,separators=(',',':')))\n",
+                    encoding="ascii",
+                )
+                journal.chmod(0o755)
+
+            initial_journal_record = systemd_state._invocation_guard_record(invocation)
+            self.assertIsNotNone(initial_journal_record)
+            canonical_record = {
+                "MESSAGE": "RELEASE_GUARD schema=1 status=failed class=pending_operation release_slug=unavailable source_sha=unavailable",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "__REALTIME_TIMESTAMP": timestamp_usec,
+            }
+            # Journald may serialize identical fields in a different order.
+            write_journal_records([dict(reversed(list(canonical_record.items())))])
+            reordered_journal_record = systemd_state._invocation_guard_record(invocation)
+            self.assertEqual(reordered_journal_record, initial_journal_record)
+
+            changed_record = {**canonical_record, "_HOSTNAME": "changed-host"}
+            write_journal_records([changed_record])
+            changed_journal_record = systemd_state._invocation_guard_record(invocation)
+            self.assertIsNotNone(changed_journal_record)
+            self.assertEqual(changed_journal_record[0], initial_journal_record[0])
+            self.assertNotEqual(changed_journal_record[1], initial_journal_record[1])
+
+            nonmarker_record = {
+                **canonical_record,
+                "MESSAGE": "unrelated same-invocation journal record",
+            }
+            write_journal_records([canonical_record, nonmarker_record])
+            self.assertEqual(systemd_state._invocation_guard_record(invocation), initial_journal_record)
+
+            write_journal_records([canonical_record, canonical_record])
+            self.assertIsNone(systemd_state._invocation_guard_record(invocation))
+            journal.write_text(original_journal, encoding="ascii")
+            journal.chmod(0o755)
+
             # A receipt-matching ordinary inactive/static unit is not an
             # incident. It must skip before consulting journal/timer guards.
             config["properties"][systemd_state.CLOUDFLARE_UNIT] = {
@@ -2438,6 +2479,40 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             config.pop("fail_service_show_after", None)
             config.pop("service_show_count", None)
             config_path.write_text(json.dumps(config), encoding="ascii")
+
+            # A parsed journal field changing between preflight and recheck
+            # must invalidate the binding even when the target marker remains.
+            journal_sequence_state = self.root / "cloudflare-journal-sequence-count"
+            journal_sequence_state.unlink(missing_ok=True)
+            first_record = canonical_record
+            second_record = {**canonical_record, "_HOSTNAME": "changed-during-recheck"}
+            journal.write_text(
+                "#!/usr/bin/env python3\nimport json\nfrom pathlib import Path\n"
+                f"state=Path({str(journal_sequence_state)!r})\n"
+                "count=int(state.read_text())+1 if state.exists() else 1\n"
+                "state.write_text(str(count))\n"
+                f"records={[first_record, second_record]!r}\n"
+                "print(json.dumps(records[min(count-1,len(records)-1)],separators=(',',':')))\n",
+                encoding="ascii",
+            )
+            journal.chmod(0o755)
+            before_journal_drift = [json.loads(line) for line in command_log.read_text().splitlines()]
+            with self.assertRaises(systemd_state.StateError):
+                systemd_state.reset_cloudflare_pending_guard(
+                    receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                    helper_release=current, attempt_nonce=attempt_nonce,
+                    expected_event_id=event_id_for(),
+                )
+            self.assertFalse(evidence_dir.exists())
+            after_journal_drift = [json.loads(line) for line in command_log.read_text().splitlines()]
+            self.assertEqual(
+                [entry for entry in after_journal_drift if entry and entry[0] in {"stop", "start", "reset-failed"}],
+                [entry for entry in before_journal_drift if entry and entry[0] in {"stop", "start", "reset-failed"}],
+            )
+            journal.write_text(original_journal, encoding="ascii")
+            journal.chmod(0o755)
+            journal_sequence_state.unlink(missing_ok=True)
+
             timer_status, timer_output = systemd_state._bounded_command(
                 [
                     str(systemctl), "show", systemd_state.CLOUDFLARE_TIMER, "--no-pager",

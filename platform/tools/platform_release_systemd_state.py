@@ -1291,8 +1291,18 @@ def _invocation_guard_record(invocation_id: str) -> tuple[datetime, bytes] | Non
             timestamp = entry.get("__REALTIME_TIMESTAMP")
             if not isinstance(timestamp, str) or re.fullmatch(r"[0-9]{1,20}", timestamp) is None:
                 return None
-            parsed = datetime.fromtimestamp(int(timestamp) / 1_000_000, timezone.utc)
-            matches.append((parsed, hashlib.sha256(line.encode("ascii")).digest()))
+            try:
+                parsed = datetime.fromtimestamp(int(timestamp) / 1_000_000, timezone.utc)
+                canonical = json.dumps(
+                    entry,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                ).encode("ascii")
+            except (OverflowError, OSError, TypeError, ValueError):
+                return None
+            matches.append((parsed, hashlib.sha256(canonical).digest()))
     if len(matches) != 1:
         return None
     return matches[0]

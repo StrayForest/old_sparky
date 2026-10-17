@@ -433,6 +433,10 @@ active/enabled, and the current invocation journal proves the fixed
 `pending_operation` guard exited 75. The unit source identity, zero PIDs,
 empty service cgroup, empty pair jobs, timer identity and a fresh timer horizon
 beyond the bounded recovery window are checked under the canonical lock. A
+matched journal entry is hashed from canonical sorted-key JSON after strict
+parsing; JSON object key-order variation does not change its identity, while
+any content change, extra matching entry or invalid record still refuses the
+exception. A
 per-event root-owned file is created with `O_EXCL` after those checks and before
 the timer stop; the helper must match its independently derived event ID to
 the wrapper's precomputed transaction/receipt/invocation binding before any
