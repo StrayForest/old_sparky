@@ -1023,32 +1023,53 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             "    with open(trace, 'a', encoding='ascii') as stream:\n"
             "        stream.write('main\\n')\n"
             "original_prove = module.prove\n"
-            "closed_refusals = {\n"
-            "    'current_pointer': 'pointer_binding', 'previous_pointer': 'pointer_binding',\n"
-            "    'candidate': 'pointer_binding',\n"
-            "    'transaction_identity': 'transaction_binding',\n"
-            "    'transaction_missing': 'transaction_binding',\n"
-            "    'transaction_state': 'transaction_binding',\n"
-            "    'release_identity': 'release_binding',\n"
-            "    'dependency_inputs': 'dependency_binding',\n"
-            "    'origin_receipt_binding': 'origin_proof',\n"
-            "    'origin_receipt_changed': 'origin_proof',\n"
-            "    'origin_receipt_metadata': 'origin_proof',\n"
-            "    'origin_receipt_schema': 'origin_proof',\n"
-            "    'origin_chain_cycle': 'origin_proof',\n"
-            "    'origin_chain_limit': 'origin_proof',\n"
-            "    'pip_state': 'pip_check', 'freeze': 'pip_freeze',\n"
-            "    'venv_directory': 'venv_metadata',\n"
-            "}\n"
+            "closed_refusals = {reason: reason for reason in (\n"
+            "    'activation_content', 'activation_context', 'activation_template',\n"
+            "    'base_python', 'bin_extra_cache', 'bin_extra_directory', 'bin_extra_link',\n"
+            "    'bin_file_set', 'bin_metadata', 'candidate', 'current_pointer',\n"
+            "    'data_script_set', 'dependency_inputs', 'directory_metadata', 'freeze',\n"
+            "    'generated_metadata', 'metadata', 'missing', 'origin_chain_cycle',\n"
+            "    'origin_chain_limit', 'origin_receipt_binding', 'origin_receipt_changed',\n"
+            "    'origin_receipt_metadata', 'origin_receipt_schema', 'pip_state',\n"
+            "    'previous_pointer', 'pyc_content', 'pyc_header', 'pyc_metadata',\n"
+            "    'pyc_parse', 'pyc_source', 'record_content', 'record_duplicate_target',\n"
+            "    'record_format', 'record_hash_format', 'record_incomplete',\n"
+            "    'record_metadata', 'record_missing', 'record_missing_file', 'record_path',\n"
+            "    'record_path_spelling', 'record_script', 'record_script_path',\n"
+            "    'release_identity', 'runtime_abi', 'script_generator', 'script_set',\n"
+            "    'site_packages', 'site_packages_metadata', 'transaction_identity',\n"
+            "    'transaction_missing', 'transaction_state', 'unrecorded_file',\n"
+            "    'unrecorded_metadata', 'venv_config', 'venv_directory', 'venv_python',\n"
+            "    'wheel_hash', 'wheel_metadata', 'wheel_record', 'wheel_record_duplicate',\n"
+            "    'wheel_record_path', 'wheel_record_scheme', 'wheel_set',\n"
+            ")}\n"
+            "helper_filename = str(Path(module.__file__).resolve())\n"
+            "helper_line_count = len(Path(helper_filename).read_text(encoding='utf-8').splitlines())\n"
+            "test_case = os.environ.get('PLATFORM_TEST_VENV_REUSE_CASE', '')\n"
+            "if test_case not in {'accepted', 'refused', 'proof-binding'}:\n"
+            "    raise SystemExit(65)\n"
+            "diagnostic_path = os.environ.get('PLATFORM_TEST_VENV_REUSE_DIAGNOSTIC', '')\n"
             "def traced_prove(*args, **kwargs):\n"
             "    try:\n"
             "        result = original_prove(*args, **kwargs)\n"
             "    except module.ReuseRefused as exc:\n"
-            "        reason = str(exc)\n"
-            "        label = 'proof_refusal:' + closed_refusals.get(reason, 'other')\n"
+            "        reason = exc.args[0] if len(exc.args) == 1 and type(exc.args[0]) is str else None\n"
+            "        label = 'proof_refusal:' + closed_refusals.get(reason, 'unknown')\n"
+            "        source_line = 0\n"
+            "        frame = exc.__traceback__\n"
+            "        while frame is not None:\n"
+            "            code = frame.tb_frame.f_code\n"
+            "            if code.co_filename == helper_filename and code.co_name != '_need':\n"
+            "                source_line = frame.tb_lineno\n"
+            "            frame = frame.tb_next\n"
+            "        if not 1 <= source_line <= helper_line_count:\n"
+            "            source_line = 0\n"
             "        if trace:\n"
             "            with open(trace, 'a', encoding='ascii') as stream:\n"
-            "                stream.write(label + '\\n')\n"
+            "                stream.write(label + ':line=' + str(source_line) + '\\n')\n"
+            "        if diagnostic_path:\n"
+            "            with open(diagnostic_path, 'x', encoding='ascii') as stream:\n"
+            "                stream.write('VENV_REUSE_TEST_DIAG case=' + test_case + ' reason=' + closed_refusals.get(reason, 'unknown') + ' line=' + str(source_line) + '\\n')\n"
             "        raise\n"
             "    except OSError:\n"
             "        if trace:\n"
@@ -1113,10 +1134,17 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 venv, activation_name
             ).items():
                 activation_path.write_bytes(content)
-                activation_path.chmod(mode)
+                # The reused activation scripts are root-owned readable data;
+                # do not inherit version-dependent template permission bits.
+                activation_path.chmod(0o644)
             before_venv = venv.stat()
             trace = self.root / f"reuse-cli-{case}.trace"
-            test_env = {"PLATFORM_TEST_VENV_REUSE_CLI_TRACE": str(trace)}
+            diagnostic = self.root / f"reuse-cli-{case}.diagnostic"
+            test_env = {
+                "PLATFORM_TEST_VENV_REUSE_CLI_TRACE": str(trace),
+                "PLATFORM_TEST_VENV_REUSE_CASE": case,
+                "PLATFORM_TEST_VENV_REUSE_DIAGNOSTIC": str(diagnostic),
+            }
             if tamper_proof:
                 test_env["PLATFORM_TEST_VENV_REUSE_TAMPER_PROOF"] = "1"
             with mock.patch.dict(os.environ, test_env):
@@ -1128,22 +1156,49 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                     check=False,
                 )
             candidate_after = self.releases_dir / f"strict-reuse-{case}-{BUILT_AT}"
+            safe_diagnostic = (
+                diagnostic.read_text(encoding="ascii").strip()
+                if diagnostic.exists()
+                else "no refusal diagnostic emitted"
+            )
+            diagnostic_context = f"\n{safe_diagnostic}"
             if corrupt_origin or tamper_proof:
                 safe_trace = trace.read_text(encoding="ascii")
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(safe_trace, "main\nproof_refusal:transaction_binding\n" if corrupt_origin else "main\nproof_pass\nproof_output_tampered\n")
-                self.assertIn("class=venv_policy stage=venv_policy_proof", result.stderr)
+                if corrupt_origin:
+                    trace_lines = safe_trace.splitlines()
+                    self.assertEqual(len(trace_lines), 2, diagnostic_context)
+                    self.assertEqual(trace_lines[0], "main")
+                    refusal_fields = trace_lines[1].split(":")
+                    self.assertEqual(refusal_fields[:2], ["proof_refusal", "transaction_identity"], diagnostic_context)
+                    self.assertEqual(len(refusal_fields), 3, diagnostic_context)
+                    self.assertTrue(refusal_fields[2].startswith("line="), diagnostic_context)
+                    source_line = int(refusal_fields[2][len("line="):])
+                    helper_line_count = len(
+                        (self.tools_dir / "platform_verify_venv_reuse_real.py")
+                        .read_text(encoding="utf-8")
+                        .splitlines()
+                    )
+                    self.assertGreaterEqual(source_line, 1, diagnostic_context)
+                    self.assertLessEqual(source_line, helper_line_count, diagnostic_context)
+                else:
+                    self.assertEqual(
+                        safe_trace,
+                        "main\nproof_pass\nproof_output_tampered\n",
+                        diagnostic_context,
+                    )
+                self.assertIn("class=venv_policy stage=venv_policy_proof", result.stderr, diagnostic_context)
                 self.assertEqual((self.app_dir / "current").resolve(), current)
                 self.assertEqual((self.app_dir / "previous").resolve().name, f"strict-previous-{case}")
                 self.assertEqual((venv.stat().st_dev, venv.stat().st_ino), (before_venv.st_dev, before_venv.st_ino))
                 self.assertFalse((candidate_after / ".rollback" / "venv-origin.json").exists())
             else:
                 safe_trace = trace.read_text(encoding="ascii")
-                self.assertEqual(safe_trace, "main\nproof_pass\n")
+                self.assertEqual(safe_trace, "main\nproof_pass\n", diagnostic_context)
                 self.assertEqual(
                     result.returncode,
                     0,
-                    result.stdout + result.stderr + f"\nclosed proof trace: {safe_trace}",
+                    result.stdout + result.stderr + f"\nclosed proof trace: {safe_trace}" + diagnostic_context,
                 )
                 self.assertEqual((self.app_dir / "current").resolve(), current)
                 self.assertEqual((self.app_dir / "previous").resolve().name, f"strict-previous-{case}")
@@ -1995,7 +2050,10 @@ else:
     def reset_app_tree(self) -> None:
         shutil.rmtree(self.app_dir)
         self.releases_dir.mkdir(parents=True)
+        self.app_dir.chmod(0o755)
+        self.releases_dir.chmod(0o755)
         self.shared_dir.mkdir()
+        self.shared_dir.chmod(0o755)
         (self.shared_dir / ".env.platform").write_text("PLATFORM_TESTING=1\n")
         (self.shared_dir / ".env.platform").chmod(0o600)
 
@@ -2385,8 +2443,10 @@ else:
     def add_installed_release(self, name: str) -> Path:
         release = self.releases_dir / name
         release.mkdir()
+        release.chmod(0o755)
         tools = release / "tools"
         tools.mkdir()
+        tools.chmod(0o755)
         for tool_name in RELEASE_HELPER_NAMES:
             tool = tools / tool_name
             tool.write_text("#!/usr/bin/env sh\nexit 0\n")
@@ -2427,12 +2487,14 @@ else:
             )
             policy.chmod(0o644)
         (release / "requirements-platform.txt").write_text("pip==26.1.2\n")
+        (release / "requirements-platform.txt").chmod(0o644)
         lock = release / "requirements-platform.lock.txt"
         freeze = release / "requirements-platform.freeze.txt"
         freeze.write_text("pip==26.1.2\n")
         freeze.chmod(0o444)
         wheelhouse = release / "wheelhouse"
         wheelhouse.mkdir()
+        wheelhouse.chmod(0o755)
         for relative in platform_validate_release_artifact.REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS:
             helper = release / relative
             helper.parent.mkdir(parents=True, exist_ok=True)
@@ -2447,11 +2509,13 @@ else:
         runtime_installer.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n")
         runtime_installer.chmod(0o755)
         pip_wheel = self.add_fake_pip_wheel(wheelhouse, result=pip_result)
+        pip_wheel.chmod(0o644)
         lock.write_text(
             "pip==26.1.2 --hash=sha256:"
             f"{hashlib.sha256(pip_wheel.read_bytes()).hexdigest()}\n"
         )
         lock.chmod(0o644)
+        self.normalize_artifact_fixture_modes(release)
         platform_validate_wheelhouse.create_manifest(
             wheelhouse,
             release / "requirements-platform.txt",
@@ -2490,9 +2554,35 @@ else:
 
         with tarfile.open(artifact, "w:gz") as archive:
             archive.add(release, arcname=slug, filter=archive_filter)
+        artifact.chmod(0o644)
         digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        Path(f"{artifact}.sha256").write_text(f"{digest}  {artifact.name}\n")
+        checksum = Path(f"{artifact}.sha256")
+        checksum.write_text(f"{digest}  {artifact.name}\n")
+        checksum.chmod(0o644)
         return artifact
+
+    def normalize_artifact_fixture_modes(self, release: Path) -> None:
+        """Make generated artifact inputs independent of the process umask."""
+
+        runtime = release / platform_validate_release_artifact.LIVE_QA_RUNTIME_ROOT
+        wheelhouse = release / "wheelhouse"
+        freeze = release / "requirements-platform.freeze.txt"
+        for path in (release, *release.rglob("*")):
+            if path == runtime or runtime in path.parents:
+                # add_liveqa_runtime assigns its closed read-only modes itself.
+                continue
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                continue
+            if path == wheelhouse:
+                path.chmod(0o755)
+            elif path == freeze:
+                path.chmod(0o444)
+            elif stat.S_ISDIR(metadata.st_mode):
+                path.chmod(0o755)
+            elif stat.S_ISREG(metadata.st_mode):
+                mode = stat.S_IMODE(metadata.st_mode)
+                path.chmod(0o755 if mode & 0o111 else 0o644)
 
     def add_liveqa_runtime(self, release: Path) -> None:
         """Build the smallest immutable runtime accepted by the artifact validator."""

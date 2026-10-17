@@ -1016,7 +1016,7 @@ test("unknown tournament slugs return a real 404 and noindex on initial navigati
   expect(navigation?.status()).toBe(404);
   await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
   await expectRobotsTag(page, /^noindex$/u);
-  await expectRawRobots(page, path, 404, /^noindex$/u);
+  await expectRawRobotsResponse(navigation, 404, /^noindex$/u);
 });
 
 test("unknown tournament detail and bracket stay 404 while the API is delayed", async ({ page }) => {
@@ -1043,9 +1043,9 @@ test("unknown tournament detail and bracket stay 404 while the API is delayed", 
 
 test("robots metadata stays singular across hydrated public, private, and missing navigation", async ({ page }) => {
   await authenticateTestUser(page);
-  await page.goto("/profile/lisalexy");
+  const profileNavigation = await page.goto("/profile/lisalexy");
   await expectRobotsTag(page, null);
-  await expectRawRobots(page, "/profile/lisalexy", 200, null);
+  await expectRawRobotsResponse(profileNavigation, 200, null);
 
   await page.getByRole("banner").getByRole("link", { name: "Турниры", exact: true }).click();
   await expect(page).toHaveURL(/\/tournaments$/u);
