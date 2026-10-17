@@ -2664,6 +2664,11 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("$FAILED_DEPLOY_RUN_ATTEMPT", action_case)
         self.assertIn("$EXPECTED_CANDIDATES_JSON$PROTECTED_RELEASES_JSON", action_case)
         self.assertIn('"$SOURCE_BOUND_LIVEQA_REUSE" == false', action_case)
+        self.assertNotIn('--bundle-sha "$generation_name"', action_case)
+        self.assertIn(
+            '--generation "$trusted_generation" --bundle-sha "$generation_name"',
+            workflow,
+        )
 
         self.assertIn(
             'if [[ "$RECOVERY_ACTION" == "quarantine_populated_quiesce" || "$RECOVERY_ACTION" == "prune_quarantined_candidate" ]]; then',
@@ -2684,7 +2689,6 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             '--cleanup-run-id "$recovery_action_run_id"',
             '--cleanup-run-attempt "$recovery_action_run_attempt"',
             '--cleanup-source-sha "$source_sha"',
-            '--bundle-sha "$generation_name"',
             'RECOVERY_QUARANTINE_PRUNE schema=1 status=passed phase=deleted candidate_count=1',
         ):
             self.assertIn(binding, workflow)
@@ -2693,6 +2697,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn('recovery_stage=quiesce_recovery', workflow)
 
         self.assertIn('RECOVERY_CAPABILITY="prune_quarantined_candidate"', wrapper)
+        self.assertIn('GENERATION_SHA="$(basename "$TOOLS_DIR")"', wrapper)
         for binding in (
             'CLEANUP_RUN_ID="$2"',
             'CLEANUP_RUN_ATTEMPT="$2"',

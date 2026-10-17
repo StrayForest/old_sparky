@@ -1665,7 +1665,6 @@ jobs:
               --cleanup-run-id "$recovery_action_run_id" \
               --cleanup-run-attempt "$recovery_action_run_attempt" \
               --cleanup-source-sha "$source_sha" \
-              --bundle-sha "$generation_name" \
               --app-dir "$runtime" --systemctl /usr/bin/systemctl
           elif [[ "$recovery_action" == prune_task_releases ]]; then
             IFS=, read -r -a expected_candidates <<<"$expected_candidates_csv"

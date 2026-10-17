@@ -1848,15 +1848,69 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         receipt = cast(Path, fixture["receipt"])
         quarantine_root = cast(Path, fixture["quarantine_root"])
         receipt_bytes = cast(bytes, fixture["receipt_bytes"])
+        generation_lock_marker = self.root / "prune-wrapper-release-lock-opened"
+        retained_test_lock = lock_support.create_test_lock(
+            "recovery-prune-retained"
+        )
+        retained_test_lock.acquire(nonblocking=True)
+        candidate_identity = (candidate.lstat().st_dev, candidate.lstat().st_ino)
+        candidate_tree = transaction._quarantine_tree_snapshot(candidate)
+        pointer_snapshot = (
+            (self.app_dir / "current").readlink(),
+            (self.app_dir / "previous").readlink(),
+        )
+        prune_intent = quarantine_root / f"{fixture['candidate_slug']}.prune.json"
+        prune_stage = quarantine_root / transaction._quarantine_prune_stage_name(
+            cast(str, fixture["candidate_slug"]), "567807"
+        )
+        try:
+            generation = self.install_recovery_generation(
+                release_lock_marker=generation_lock_marker,
+                retained_lock_path=retained_test_lock.path,
+            )
+            systemctl, systemctl_log = self.write_failing_systemctl(
+                "workflow-prune-wrapper-boundary"
+            )
+            workflow_args = self.workflow_prune_wrapper_args(
+                generation,
+                app_dir=self.app_dir,
+                systemctl=systemctl,
+            )
+            wrapper_result = self.run_script(
+                Path(workflow_args[0]),
+                *workflow_args[1:],
+                env={"PLATFORM_TEST_RELEASE_LOCK_MARKER": str(generation_lock_marker)},
+                check=False,
+            )
+
+            self.assertEqual(wrapper_result.returncode, 1, wrapper_result.stderr)
+            self.assertIn("class=argument", wrapper_result.stderr)
+            self.assertTrue(generation_lock_marker.is_file())
+            self.assertFalse(systemctl_log.exists())
+            self.assertEqual(
+                (candidate.lstat().st_dev, candidate.lstat().st_ino),
+                candidate_identity,
+            )
+            self.assertEqual(transaction._quarantine_tree_snapshot(candidate), candidate_tree)
+            self.assertEqual(receipt.read_bytes(), receipt_bytes)
+            self.assertFalse(prune_intent.exists())
+            self.assertFalse(prune_stage.exists())
+            self.assertEqual(
+                (
+                    (self.app_dir / "current").readlink(),
+                    (self.app_dir / "previous").readlink(),
+                ),
+                pointer_snapshot,
+            )
+        finally:
+            retained_test_lock.cleanup()
+
         provider_like_release = self.add_release("provider-like-retained-release")
         provider_sentinel = provider_like_release / "provider-identity.json"
         provider_sentinel.write_text("keep provider bytes\n", encoding="ascii")
         provider_sentinel.chmod(0o444)
         provider_before = provider_sentinel.read_bytes()
-        pointers_before = (
-            (self.app_dir / "current").readlink(),
-            (self.app_dir / "previous").readlink(),
-        )
+        pointers_before = pointer_snapshot
 
         result = self._prune_consumed_quarantine(fixture)
         intent_path = quarantine_root / f"{fixture['candidate_slug']}.prune.json"
@@ -7162,7 +7216,12 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "deployable": False,
         }
 
-    def install_recovery_generation(self) -> Path:
+    def install_recovery_generation(
+        self,
+        *,
+        release_lock_marker: Path | None = None,
+        retained_lock_path: Path | None = None,
+    ) -> Path:
         source_tools = self.root / "recovery-source" / "platform" / "tools"
         source_tools.mkdir(parents=True)
         for name in recovery.RECOVERY_FILES:
@@ -7170,7 +7229,33 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             destination = source_tools / name
             shutil.copy2(source, destination, follow_symlinks=False)
             destination.chmod(0o755 if name.endswith(".sh") else 0o644)
-        self.install_test_lock_helper(source_tools / "platform_release_lock.sh")
+        lock_helper = source_tools / "platform_release_lock.sh"
+        self.install_test_lock_helper(
+            lock_helper, retained_lock_path=retained_lock_path
+        )
+        if release_lock_marker is not None:
+            helper = lock_helper.read_text(encoding="utf-8")
+            supervised_open = (
+                '    platform_release_lock_supervisor_holds || return 1\n'
+                '    RELEASE_LOCK_FD=""\n'
+                '    PLATFORM_RELEASE_LOCK_FD_OWNED=0\n'
+                '    return 0\n'
+            )
+            self.assertEqual(helper.count(supervised_open), 1)
+            helper = helper.replace(
+                supervised_open,
+                supervised_open.replace(
+                    '    RELEASE_LOCK_FD=""\n',
+                    '    if [[ -n "${PLATFORM_TEST_RELEASE_LOCK_MARKER:-}" ]]; then\n'
+                    '      : > "$PLATFORM_TEST_RELEASE_LOCK_MARKER"\n'
+                    '    fi\n'
+                    '    RELEASE_LOCK_FD=""\n',
+                    1,
+                ),
+                1,
+            )
+            lock_helper.write_text(helper, encoding="utf-8")
+            lock_helper.chmod(0o755)
         bundle = self.root / "recovery-bundle.zip"
         summary = recovery.build_bundle(
             source_tools.parent.parent,
@@ -7185,6 +7270,64 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             expected_source_sha="a" * 40,
             expected_provenance=self.recovery_provenance(),
         )
+
+    def workflow_prune_wrapper_args(
+        self,
+        generation: Path,
+        *,
+        app_dir: Path,
+        systemctl: Path,
+    ) -> list[str]:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
+        ).read_text(encoding="utf-8")
+        branch = workflow.split(
+            'elif [[ "$recovery_action" == prune_quarantined_candidate ]]; then', 1
+        )[1].split(
+            'elif [[ "$recovery_action" == prune_task_releases ]]; then', 1
+        )[0]
+        invocation: list[str] = []
+        collecting = False
+        for line in branch.splitlines():
+            stripped = line.strip()
+            if not collecting:
+                if '"$trusted_generation/platform_recover_pending.sh"' not in stripped:
+                    continue
+                collecting = True
+            if not stripped:
+                continue
+            invocation.append(
+                stripped[:-1].rstrip() if stripped.endswith("\\") else stripped
+            )
+            if '--app-dir "$runtime" --systemctl /usr/bin/systemctl' in stripped:
+                break
+        self.assertTrue(collecting)
+        self.assertTrue(
+            invocation
+            and '--app-dir "$runtime" --systemctl /usr/bin/systemctl'
+            in invocation[-1]
+        )
+
+        command = " ".join(invocation)
+        substitutions = {
+            '"$trusted_generation/platform_recover_pending.sh"': shlex.quote(
+                str(generation / RECOVERY_WRAPPER.name)
+            ),
+            '"$failed_deploy_run_id"': "567801",
+            '"$failed_deploy_run_attempt"': "1",
+            '"$failed_deploy_source_sha"': "a" * 40,
+            '"$recovery_action_run_id"': "567807",
+            '"$recovery_action_run_attempt"': "1",
+            '"$source_sha"': "b" * 40,
+            '"$generation_name"': shlex.quote(generation.name),
+            '"$runtime"': shlex.quote(str(app_dir)),
+            "/usr/bin/systemctl": shlex.quote(str(systemctl)),
+        }
+        for source, replacement in substitutions.items():
+            command = command.replace(source, replacement)
+        args = shlex.split(command)
+        self.assertEqual(args[0], str(generation / RECOVERY_WRAPPER.name))
+        return args
 
     def create_wrapper_transaction(
         self,
@@ -8136,7 +8279,12 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertIn(needle, script)
         return script.replace(needle, f'TOOLS_DIR="{self.tools_dir}"', 1)
 
-    def install_test_lock_helper(self, destination: Path) -> None:
+    def install_test_lock_helper(
+        self,
+        destination: Path,
+        *,
+        retained_lock_path: Path | None = None,
+    ) -> None:
         """Install a test-local helper while retaining production validation."""
 
         helper = (REPO_ROOT / "platform/tools/platform_release_lock.sh").read_text(
@@ -8146,6 +8294,11 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "/run/lock/oldsparky-platform-release.lock",
             str(self.release_lock_path),
         )
+        if retained_lock_path is not None:
+            helper = helper.replace(
+                "/run/lock/oldsparky-retained-load-matrix.lock",
+                str(retained_lock_path),
+            )
         destination.write_text(helper, encoding="utf-8")
         destination.chmod(0o755)
 
