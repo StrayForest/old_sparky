@@ -1395,6 +1395,173 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertTrue(sentinel.is_file())
             self.assertEqual(sentinel.read_text(encoding="ascii"), "pre-existing")
 
+        original_opt_mode = 0o1777
+        tightened_opt_mode = original_opt_mode & ~0o022
+        current_opt_mode = original_opt_mode
+
+        def opt_info(mode: int, *, inode: int = 700) -> types.SimpleNamespace:
+            return types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | mode,
+                st_dev=11,
+                st_ino=inode,
+                st_uid=0,
+                st_gid=0,
+            )
+
+        original_lstat = pathlib.Path.lstat
+
+        def opt_lstat(path: pathlib.Path) -> os.stat_result:
+            if path == pathlib.Path("/opt"):
+                return opt_info(current_opt_mode)  # type: ignore[return-value]
+            return original_lstat(path)
+
+        def opt_fstat(descriptor: int) -> os.stat_result:
+            self.assertEqual(descriptor, 91)
+            return opt_info(current_opt_mode)  # type: ignore[return-value]
+
+        def opt_fchmod(descriptor: int, mode: int) -> None:
+            nonlocal current_opt_mode
+            self.assertEqual(descriptor, 91)
+            current_opt_mode = mode
+
+        with (
+            mock.patch.object(backup_drill.os, "open", return_value=91) as open_opt,
+            mock.patch.object(backup_drill.os, "set_inheritable") as set_inheritable,
+            mock.patch.object(backup_drill.os, "fstat", side_effect=opt_fstat),
+            mock.patch.object(backup_drill.os, "fchmod", side_effect=opt_fchmod) as fchmod,
+            mock.patch.object(backup_drill.os, "close") as close_opt,
+            mock.patch.object(
+                pathlib.Path, "lstat", autospec=True, side_effect=opt_lstat
+            ),
+        ):
+            lease = backup_drill._scratch_tighten_opt_parent_for_synthetic_path_fixture()
+            self.assertEqual(
+                lease,
+                (91, 11, 700, 0, 0, original_opt_mode, tightened_opt_mode),
+            )
+            self.assertEqual(current_opt_mode, tightened_opt_mode)
+            open_opt.assert_called_once_with(
+                "/opt",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            set_inheritable.assert_called_once_with(91, False)
+            self.assertEqual(
+                fchmod.call_args_list,
+                [
+                    mock.call(91, tightened_opt_mode),
+                ],
+            )
+            close_opt.assert_not_called()
+            assert lease is not None
+            backup_drill._scratch_finish_opt_parent_adjustment(lease, restore=True)
+            self.assertEqual(current_opt_mode, original_opt_mode)
+            self.assertEqual(
+                fchmod.call_args_list,
+                [
+                    mock.call(91, tightened_opt_mode),
+                    mock.call(91, original_opt_mode),
+                ],
+            )
+            close_opt.assert_called_once_with(91)
+
+        current_opt_mode = original_opt_mode
+
+        def fail_fchmod_without_changing_mode(descriptor: int, mode: int) -> None:
+            self.assertEqual((descriptor, mode), (91, tightened_opt_mode))
+            raise OSError("injected fchmod refusal before mode change")
+
+        with (
+            mock.patch.object(backup_drill.os, "open", return_value=91),
+            mock.patch.object(backup_drill.os, "set_inheritable"),
+            mock.patch.object(backup_drill.os, "fstat", side_effect=opt_fstat),
+            mock.patch.object(
+                backup_drill.os, "fchmod", side_effect=fail_fchmod_without_changing_mode
+            ) as fchmod,
+            mock.patch.object(backup_drill.os, "close") as close_opt,
+            mock.patch.object(
+                pathlib.Path, "lstat", autospec=True, side_effect=opt_lstat
+            ),
+        ):
+            with self.assertRaisesRegex(OSError, "injected fchmod refusal") as raised:
+                backup_drill._scratch_tighten_opt_parent_for_synthetic_path_fixture()
+            lease = getattr(raised.exception, "scratch_synthetic_opt_parent_adjustment")
+            self.assertEqual(current_opt_mode, original_opt_mode)
+            backup_drill._scratch_finish_opt_parent_adjustment(lease, restore=True)
+            self.assertEqual(current_opt_mode, original_opt_mode)
+            self.assertEqual(fchmod.call_count, 1)
+            close_opt.assert_called_once_with(91)
+
+        current_opt_mode = tightened_opt_mode
+        with (
+            mock.patch.object(backup_drill.os, "fstat", side_effect=opt_fstat),
+            mock.patch.object(backup_drill.os, "fchmod") as fchmod,
+            mock.patch.object(backup_drill.os, "close") as close_opt,
+            mock.patch.object(
+                pathlib.Path, "lstat", autospec=True, side_effect=opt_lstat
+            ),
+        ):
+            backup_drill._scratch_finish_opt_parent_adjustment(
+                (91, 11, 700, 0, 0, original_opt_mode, tightened_opt_mode),
+                restore=False,
+            )
+            self.assertEqual(current_opt_mode, tightened_opt_mode)
+            fchmod.assert_not_called()
+            close_opt.assert_called_once_with(91)
+
+        replacement_lease = (91, 11, 700, 0, 0, original_opt_mode, tightened_opt_mode)
+        changed_parent = opt_info(tightened_opt_mode, inode=701)
+        with (
+            mock.patch.object(backup_drill.os, "fstat", return_value=opt_info(tightened_opt_mode)),
+            mock.patch.object(backup_drill.os, "fchmod") as fchmod,
+            mock.patch.object(backup_drill.os, "close") as close_opt,
+            mock.patch.object(
+                pathlib.Path,
+                "lstat",
+                autospec=True,
+                side_effect=lambda path: (
+                    changed_parent
+                    if path == pathlib.Path("/opt")
+                    else original_lstat(path)
+                ),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "cleanup could not be confirmed"
+            ) as cleanup_error:
+                backup_drill._scratch_finish_opt_parent_adjustment(
+                    replacement_lease, restore=True
+                )
+            self.assertRegex(str(cleanup_error.exception.__cause__), "identity changed")
+            fchmod.assert_not_called()
+            close_opt.assert_called_once_with(91)
+
+        isolated_run_source = inspect.getsource(
+            backup_drill._run_isolated_restore_drill
+        )
+        fixture_setup_start = isolated_run_source.index(
+            'fault_site = "controller_synthetic_path_fixture"'
+        )
+        fixture_setup_end = isolated_run_source.index(
+            'fault_site = "controller_host_guard"', fixture_setup_start
+        )
+        fixture_setup = isolated_run_source[fixture_setup_start:fixture_setup_end]
+        prepare_position = fixture_setup.index(
+            "_scratch_prepare_synthetic_protected_paths()"
+        )
+        normal_unblock_position = fixture_setup.rindex(
+            "signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)"
+        )
+        self.assertLess(prepare_position, normal_unblock_position)
+        fixture_error_position = fixture_setup.index("except BaseException as fixture_error:")
+        fixture_lease_capture_position = fixture_setup.index(
+            '"scratch_synthetic_opt_parent_adjustment"', fixture_error_position
+        )
+        exception_unblock_position = fixture_setup.index(
+            "signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)",
+            fixture_lease_capture_position,
+        )
+        self.assertLess(fixture_lease_capture_position, exception_unblock_position)
+
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = pathlib.Path(temporary_dir)
             unverified = root / "unverified"

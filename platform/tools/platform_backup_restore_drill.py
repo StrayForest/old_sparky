@@ -8142,7 +8142,155 @@ def _scratch_remove_created_protected_path_directories(
         raise RuntimeError("Synthetic protected path fixture cleanup could not be confirmed.")
 
 
-def _scratch_prepare_synthetic_protected_paths() -> tuple[tuple[str, int, int], ...]:
+def _scratch_tighten_opt_parent_for_synthetic_path_fixture() -> tuple[int, int, int, int, int, int, int] | None:
+    """Temporarily remove write bits from the pinned /opt only for this fixture."""
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+    if any(not hasattr(os, flag) for flag in required_flags):
+        raise RuntimeError("Synthetic protected path fixture cannot safely pin /opt.")
+    descriptor: int | None = None
+    adjustment: tuple[int, int, int, int, int, int, int] | None = None
+    chmod_attempted = False
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        descriptor = os.open("/opt", flags)
+        os.set_inheritable(descriptor, False)
+        descriptor_info = os.fstat(descriptor)
+        path_info = pathlib.Path("/opt").lstat()
+        if (
+            not stat.S_ISDIR(descriptor_info.st_mode)
+            or stat.S_ISLNK(descriptor_info.st_mode)
+            or not stat.S_ISDIR(path_info.st_mode)
+            or stat.S_ISLNK(path_info.st_mode)
+            or descriptor_info.st_uid != 0
+            or descriptor_info.st_gid != 0
+            or path_info.st_uid != 0
+            or path_info.st_gid != 0
+            or (descriptor_info.st_dev, descriptor_info.st_ino)
+            != (path_info.st_dev, path_info.st_ino)
+        ):
+            raise RuntimeError("Synthetic protected path fixture /opt identity is unsafe.")
+        original_mode = stat.S_IMODE(descriptor_info.st_mode)
+        if not original_mode & 0o022:
+            os.close(descriptor)
+            return None
+        tightened_mode = original_mode & ~0o022
+        adjustment = (
+            descriptor,
+            descriptor_info.st_dev,
+            descriptor_info.st_ino,
+            descriptor_info.st_uid,
+            descriptor_info.st_gid,
+            original_mode,
+            tightened_mode,
+        )
+        # Publish the lease on any later error so the caller's unconditional
+        # cleanup can restore /opt after the synthetic fixture is removed.
+        chmod_attempted = True
+        os.fchmod(descriptor, tightened_mode)
+        tightened_fd_info = os.fstat(descriptor)
+        tightened_path_info = pathlib.Path("/opt").lstat()
+        if (
+            (tightened_fd_info.st_dev, tightened_fd_info.st_ino)
+            != (descriptor_info.st_dev, descriptor_info.st_ino)
+            or (tightened_path_info.st_dev, tightened_path_info.st_ino)
+            != (descriptor_info.st_dev, descriptor_info.st_ino)
+            or tightened_fd_info.st_uid != 0
+            or tightened_fd_info.st_gid != 0
+            or tightened_path_info.st_uid != 0
+            or tightened_path_info.st_gid != 0
+            or not stat.S_ISDIR(tightened_fd_info.st_mode)
+            or stat.S_ISLNK(tightened_fd_info.st_mode)
+            or not stat.S_ISDIR(tightened_path_info.st_mode)
+            or stat.S_ISLNK(tightened_path_info.st_mode)
+            or stat.S_IMODE(tightened_fd_info.st_mode) != tightened_mode
+            or stat.S_IMODE(tightened_path_info.st_mode) != tightened_mode
+        ):
+            raise RuntimeError("Synthetic protected path fixture /opt mode change is unsafe.")
+        return adjustment
+    except BaseException as exc:
+        if descriptor is not None:
+            if chmod_attempted and adjustment is not None:
+                setattr(exc, "scratch_synthetic_opt_parent_adjustment", adjustment)
+            else:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        raise
+
+
+def _scratch_finish_opt_parent_adjustment(
+    adjustment: tuple[int, int, int, int, int, int, int], *, restore: bool
+) -> None:
+    """Restore the exact pinned /opt mode after fixture cleanup, then close it."""
+    descriptor, device, inode, owner_uid, owner_gid, original_mode, tightened_mode = adjustment
+    if (
+        type(descriptor) is not int
+        or descriptor < 0
+        or any(type(value) is not int or value < 0 for value in (device, inode, owner_uid, owner_gid))
+        or not 0 <= original_mode <= 0o7777
+        or not 0 <= tightened_mode <= 0o7777
+        or tightened_mode != original_mode & ~0o022
+        or type(restore) is not bool
+    ):
+        raise RuntimeError("Synthetic protected path fixture /opt cleanup identity is invalid.")
+    cleanup_error: BaseException | None = None
+    try:
+        descriptor_info = os.fstat(descriptor)
+        path_info = pathlib.Path("/opt").lstat()
+        if (
+            not stat.S_ISDIR(descriptor_info.st_mode)
+            or stat.S_ISLNK(descriptor_info.st_mode)
+            or not stat.S_ISDIR(path_info.st_mode)
+            or stat.S_ISLNK(path_info.st_mode)
+            or (descriptor_info.st_dev, descriptor_info.st_ino) != (device, inode)
+            or (path_info.st_dev, path_info.st_ino) != (device, inode)
+            or descriptor_info.st_uid != owner_uid
+            or descriptor_info.st_gid != owner_gid
+            or path_info.st_uid != owner_uid
+            or path_info.st_gid != owner_gid
+        ):
+            raise RuntimeError("Synthetic protected path fixture /opt identity changed during cleanup.")
+        descriptor_mode = stat.S_IMODE(descriptor_info.st_mode)
+        path_mode = stat.S_IMODE(path_info.st_mode)
+        if descriptor_mode != path_mode or descriptor_mode not in {tightened_mode, original_mode}:
+            raise RuntimeError("Synthetic protected path fixture /opt mode changed during cleanup.")
+        if restore:
+            if descriptor_mode == tightened_mode and tightened_mode != original_mode:
+                os.fchmod(descriptor, original_mode)
+            restored_fd_info = os.fstat(descriptor)
+            restored_path_info = pathlib.Path("/opt").lstat()
+            if (
+                (restored_fd_info.st_dev, restored_fd_info.st_ino) != (device, inode)
+                or (restored_path_info.st_dev, restored_path_info.st_ino) != (device, inode)
+                or restored_fd_info.st_uid != owner_uid
+                or restored_fd_info.st_gid != owner_gid
+                or restored_path_info.st_uid != owner_uid
+                or restored_path_info.st_gid != owner_gid
+                or not stat.S_ISDIR(restored_fd_info.st_mode)
+                or stat.S_ISLNK(restored_fd_info.st_mode)
+                or not stat.S_ISDIR(restored_path_info.st_mode)
+                or stat.S_ISLNK(restored_path_info.st_mode)
+                or stat.S_IMODE(restored_fd_info.st_mode) != original_mode
+                or stat.S_IMODE(restored_path_info.st_mode) != original_mode
+            ):
+                raise RuntimeError("Synthetic protected path fixture /opt mode restore could not be confirmed.")
+        elif descriptor_mode != tightened_mode:
+            raise RuntimeError("Synthetic protected path fixture /opt remains unexpectedly writable.")
+    except BaseException as exc:
+        cleanup_error = exc
+    try:
+        os.close(descriptor)
+    except BaseException as exc:
+        if cleanup_error is None:
+            cleanup_error = exc
+    if cleanup_error is not None:
+        raise RuntimeError("Synthetic protected path fixture /opt cleanup could not be confirmed.") from cleanup_error
+
+
+def _scratch_prepare_synthetic_protected_paths() -> tuple[
+    tuple[tuple[str, int, int], ...], tuple[int, int, int, int, int, int, int] | None
+]:
     """Prepare the fixed namespace targets only on the ephemeral hosted runner."""
     if (
         os.geteuid() != 0
@@ -8151,9 +8299,32 @@ def _scratch_prepare_synthetic_protected_paths() -> tuple[tuple[str, int, int], 
         or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
     ):
         raise RuntimeError("Synthetic protected path fixture requires the root GitHub-hosted Linux runner.")
-    return _scratch_create_missing_protected_path_directories(
-        _scratch_synthetic_protected_path_targets(), owner_uid=0, owner_gid=0
-    )
+    targets = _scratch_synthetic_protected_path_targets()
+    adjustment: tuple[int, int, int, int, int, int, int] | None = None
+    try:
+        # R6 proved that the hosted runner's fixed /opt parent can be
+        # group/world writable while the first protected target is absent.
+        # Pin and tighten only that parent before creating the missing subtree.
+        first_opt_child = pathlib.Path("/opt/oldsparky")
+        try:
+            first_opt_child.lstat()
+            first_opt_child_missing = False
+        except FileNotFoundError:
+            first_opt_child_missing = True
+        if first_opt_child_missing and targets[0].parts[:2] == ("/", "opt"):
+            adjustment = _scratch_tighten_opt_parent_for_synthetic_path_fixture()
+        created = _scratch_create_missing_protected_path_directories(
+            targets, owner_uid=0, owner_gid=0
+        )
+        return created, adjustment
+    except BaseException as exc:
+        if adjustment is None:
+            pending = getattr(exc, "scratch_synthetic_opt_parent_adjustment", None)
+            if isinstance(pending, tuple):
+                adjustment = pending
+        if adjustment is not None:
+            setattr(exc, "scratch_synthetic_opt_parent_adjustment", adjustment)
+        raise
 
 
 def _scratch_stop_unit(unit_name: str) -> None:
@@ -8360,6 +8531,7 @@ def _run_isolated_restore_drill(
         phase_guard_monotonic_ns: int | None = None
         phase_drain_monotonic_ns: int | None = None
         synthetic_protected_path_dirs: tuple[tuple[str, int, int], ...] = ()
+        synthetic_opt_parent_adjustment: tuple[int, int, int, int, int, int, int] | None = None
         synthetic_protected_paths_cleaned = not synthetic_restore_diagnostic
         blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
         setup_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
@@ -8381,14 +8553,17 @@ def _run_isolated_restore_drill(
             raise
         try:
             # A pending TERM/INT is delivered only after the exact host
-            # mountpoint identity is ready for the normal cleanup path.
-            signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
+            # mountpoint and, for the synthetic lane, path-fixture lease are
+            # ready for the normal cleanup path.
+            if not synthetic_restore_diagnostic:
+                signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
             if synthetic_restore_diagnostic:
                 fault_site = "controller_synthetic_path_fixture"
                 try:
-                    synthetic_protected_path_dirs = (
-                        _scratch_prepare_synthetic_protected_paths()
-                    )
+                    (
+                        synthetic_protected_path_dirs,
+                        synthetic_opt_parent_adjustment,
+                    ) = _scratch_prepare_synthetic_protected_paths()
                 except BaseException as fixture_error:
                     created = getattr(
                         fixture_error,
@@ -8397,7 +8572,23 @@ def _run_isolated_restore_drill(
                     )
                     if isinstance(created, tuple):
                         synthetic_protected_path_dirs = created
+                    adjustment = getattr(
+                        fixture_error,
+                        "scratch_synthetic_opt_parent_adjustment",
+                        None,
+                    )
+                    if isinstance(adjustment, tuple):
+                        synthetic_opt_parent_adjustment = adjustment
+                    try:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
+                    except BaseException as mask_error:
+                        if hasattr(fixture_error, "add_note"):
+                            fixture_error.add_note(
+                                "Signal mask restoration also raised "
+                                f"{type(mask_error).__name__}."
+                            )
                     raise
+                signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
             fault_site = "controller_host_guard"
             _scratch_host_guard("parent_before_unit_launch")
             # Do not let a termination signal land after the client process
@@ -8847,6 +9038,13 @@ def _run_isolated_restore_drill(
                 )
                 if isinstance(created, tuple):
                     synthetic_protected_path_dirs = created
+                adjustment = getattr(
+                    operation_error,
+                    "scratch_synthetic_opt_parent_adjustment",
+                    None,
+                )
+                if isinstance(adjustment, tuple):
+                    synthetic_opt_parent_adjustment = adjustment
             # Record the first controller-side failure before any teardown can
             # raise or replace it. A separately validated worker frame, if
             # present, is more precise about the original child failure.
@@ -9151,6 +9349,23 @@ def _run_isolated_restore_drill(
                 except BaseException as cleanup_error:
                     protected_paths_cleaned = False
                     final_cleanup_errors.append(cleanup_error)
+                if synthetic_opt_parent_adjustment is not None:
+                    try:
+                        if not service_stopped or not protected_paths_cleaned:
+                            _scratch_finish_opt_parent_adjustment(
+                                synthetic_opt_parent_adjustment,
+                                restore=False,
+                            )
+                            raise RuntimeError(
+                                "Synthetic protected path fixture /opt cannot be restored before cleanup is confirmed."
+                            )
+                        _scratch_finish_opt_parent_adjustment(
+                            synthetic_opt_parent_adjustment,
+                            restore=True,
+                        )
+                    except BaseException as cleanup_error:
+                        protected_paths_cleaned = False
+                        final_cleanup_errors.append(cleanup_error)
             if selector is not None:
                 try:
                     selector.close()
