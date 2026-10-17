@@ -140,6 +140,14 @@ _SCRATCH_INACCESSIBLE_PATHS = (
     "/etc/postgresql",
     "/root",
 )
+_SCRATCH_SYNTHETIC_PATH_FIXTURE_PARENT_COUNTS = (4, 3, 2, 2, 1)
+_SCRATCH_SYNTHETIC_PATH_FIXTURE_PREDICATES = (
+    "not_directory",
+    "symlink",
+    "uid_mismatch",
+    "gid_mismatch",
+    "group_or_world_writable",
+)
 SCRATCH_SYNTHETIC_EXPECTED_ROWS = (
     (1, "alpha", "restore fixture alpha"),
     (2, "beta", "restore fixture beta"),
@@ -152,6 +160,7 @@ _SCRATCH_FIRST_FAULT_SITES = frozenset(
         "controller_entry",
         "controller_archive_identity",
         "controller_unit_setup",
+        "controller_synthetic_path_fixture",
         "controller_host_guard",
         "controller_launch",
         "controller_unit_snapshot",
@@ -208,11 +217,50 @@ _SCRATCH_FIRST_FAULT_KINDS = frozenset(
 )
 
 
+def valid_scratch_synthetic_path_fixture_rejection(value: Any) -> bool:
+    """Validate the bounded target/component/predicate projection."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "target_index", "parent_component_index", "predicates"
+    }:
+        return False
+    target_index = value.get("target_index")
+    parent_component_index = value.get("parent_component_index")
+    predicates = value.get("predicates")
+    if (
+        type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or type(target_index) is not int
+        or not 0 <= target_index < len(_SCRATCH_SYNTHETIC_PATH_FIXTURE_PARENT_COUNTS)
+        or type(parent_component_index) is not int
+        or not 0 <= parent_component_index
+        < _SCRATCH_SYNTHETIC_PATH_FIXTURE_PARENT_COUNTS[target_index]
+        or type(predicates) is not list
+        or not predicates
+        or len(predicates) > len(_SCRATCH_SYNTHETIC_PATH_FIXTURE_PREDICATES)
+        or any(
+            type(predicate) is not str
+            or predicate not in _SCRATCH_SYNTHETIC_PATH_FIXTURE_PREDICATES
+            for predicate in predicates
+        )
+        or len(set(predicates)) != len(predicates)
+        or tuple(predicates)
+        != tuple(
+            predicate
+            for predicate in _SCRATCH_SYNTHETIC_PATH_FIXTURE_PREDICATES
+            if predicate in predicates
+        )
+    ):
+        return False
+    return True
+
+
 def valid_scratch_first_fault(value: Any) -> bool:
     """Validate a closed first-fault projection without accepting raw details."""
-    if not isinstance(value, dict) or set(value) != {
-        "schema", "origin", "site", "exception_kind", "errno"
-    }:
+    base_fields = {"schema", "origin", "site", "exception_kind", "errno"}
+    if not isinstance(value, dict) or set(value) not in (
+        base_fields,
+        base_fields | {"synthetic_path_fixture_rejection"},
+    ):
         return False
     if (
         type(value.get("schema")) is not int
@@ -235,6 +283,15 @@ def valid_scratch_first_fault(value: Any) -> bool:
         else None
     )
     if value["origin"] != expected_origin:
+        return False
+    path_rejection = value.get("synthetic_path_fixture_rejection")
+    if "synthetic_path_fixture_rejection" in value and (
+        value["origin"] != "controller"
+        or value["site"] != "controller_synthetic_path_fixture"
+        or value["exception_kind"] != "runtime"
+        or value["errno"] is not None
+        or not valid_scratch_synthetic_path_fixture_rejection(path_rejection)
+    ):
         return False
     if value["exception_kind"] in {"permission", "os_error"}:
         return value["errno"] is None or type(value["errno"]) is int
@@ -299,7 +356,13 @@ def _scratch_exception_projection(error: BaseException) -> tuple[str, int | None
 
 
 def _scratch_first_fault(error: BaseException, *, origin: str, site: str) -> dict[str, Any] | None:
-    exception_kind, errno = _scratch_exception_projection(error)
+    path_rejection = getattr(error, "scratch_synthetic_path_fixture_rejection", None)
+    if path_rejection is not None:
+        if not valid_scratch_synthetic_path_fixture_rejection(path_rejection):
+            return None
+        exception_kind, errno = "runtime", None
+    else:
+        exception_kind, errno = _scratch_exception_projection(error)
     value = {
         "schema": 1,
         "origin": origin,
@@ -307,6 +370,8 @@ def _scratch_first_fault(error: BaseException, *, origin: str, site: str) -> dic
         "exception_kind": exception_kind,
         "errno": errno if exception_kind in {"permission", "os_error"} else None,
     }
+    if path_rejection is not None:
+        value["synthetic_path_fixture_rejection"] = path_rejection
     return value if valid_scratch_first_fault(value) else None
 
 
@@ -7947,7 +8012,7 @@ def _scratch_create_missing_protected_path_directories(
     """Create only absent fixed target directories and retain exact identities."""
     created: list[tuple[str, int, int]] = []
     try:
-        for target in targets:
+        for target_index, target in enumerate(targets):
             if not target.is_absolute() or ".." in target.parts:
                 raise RuntimeError("Synthetic protected path fixture target is invalid.")
             current = pathlib.Path("/")
@@ -7956,22 +8021,42 @@ def _scratch_create_missing_protected_path_directories(
                 try:
                     info = current.lstat()
                 except FileNotFoundError:
+                    info = None
+                if info is None:
                     try:
                         parent_info = current.parent.lstat()
                     except OSError as exc:
                         raise RuntimeError(
                             "Synthetic protected path fixture parent could not be verified."
                         ) from exc
-                    if (
-                        not stat.S_ISDIR(parent_info.st_mode)
-                        or stat.S_ISLNK(parent_info.st_mode)
-                        or parent_info.st_uid != owner_uid
-                        or parent_info.st_gid != owner_gid
-                        or stat.S_IMODE(parent_info.st_mode) & 0o022
-                    ):
-                        raise RuntimeError(
+                    rejected_predicates: list[str] = []
+                    if not stat.S_ISDIR(parent_info.st_mode):
+                        rejected_predicates.append("not_directory")
+                    if stat.S_ISLNK(parent_info.st_mode):
+                        rejected_predicates.append("symlink")
+                    if parent_info.st_uid != owner_uid:
+                        rejected_predicates.append("uid_mismatch")
+                    if parent_info.st_gid != owner_gid:
+                        rejected_predicates.append("gid_mismatch")
+                    if stat.S_IMODE(parent_info.st_mode) & 0o022:
+                        rejected_predicates.append("group_or_world_writable")
+                    if rejected_predicates:
+                        rejection = {
+                            "schema": 1,
+                            "target_index": target_index,
+                            "parent_component_index": len(current.parent.parts) - 1,
+                            "predicates": rejected_predicates,
+                        }
+                        failure = RuntimeError(
                             "Synthetic protected path fixture parent is not safely owned."
                         )
+                        if valid_scratch_synthetic_path_fixture_rejection(rejection):
+                            setattr(
+                                failure,
+                                "scratch_synthetic_path_fixture_rejection",
+                                rejection,
+                            )
+                        raise failure
                     try:
                         os.mkdir(current, 0o700)
                         # Keep an unpinned ledger entry until lstat confirms the
@@ -8299,6 +8384,7 @@ def _run_isolated_restore_drill(
             # mountpoint identity is ready for the normal cleanup path.
             signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
             if synthetic_restore_diagnostic:
+                fault_site = "controller_synthetic_path_fixture"
                 try:
                     synthetic_protected_path_dirs = (
                         _scratch_prepare_synthetic_protected_paths()

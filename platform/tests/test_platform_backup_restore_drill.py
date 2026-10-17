@@ -1451,6 +1451,174 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertTrue(unverified.is_dir())
             unverified.rmdir()
 
+        rejected_parent_cases = (
+            (
+                "regular_file",
+                stat.S_IFREG | 0o600,
+                owner_uid,
+                owner_gid,
+                ["not_directory"],
+            ),
+            (
+                "symlink",
+                stat.S_IFLNK | 0o700,
+                owner_uid,
+                owner_gid,
+                ["not_directory", "symlink"],
+            ),
+            (
+                "uid_mismatch",
+                stat.S_IFDIR | 0o700,
+                owner_uid + 1,
+                owner_gid,
+                ["uid_mismatch"],
+            ),
+            (
+                "gid_mismatch",
+                stat.S_IFDIR | 0o700,
+                owner_uid,
+                owner_gid + 1,
+                ["gid_mismatch"],
+            ),
+            (
+                "group_or_world_writable",
+                stat.S_IFDIR | 0o702,
+                owner_uid,
+                owner_gid,
+                ["group_or_world_writable"],
+            ),
+            (
+                "combined",
+                stat.S_IFDIR | 0o777,
+                owner_uid + 1,
+                owner_gid + 1,
+                ["uid_mismatch", "gid_mismatch", "group_or_world_writable"],
+            ),
+        )
+        for case_name, mode, parent_uid, parent_gid, predicates in rejected_parent_cases:
+            with self.subTest(parent_rejection=case_name):
+                with tempfile.TemporaryDirectory() as temporary_dir:
+                    root = pathlib.Path(temporary_dir)
+                    target = root / "missing"
+                    parent_component_index = len(root.parts) - 1
+                    parent_info = types.SimpleNamespace(
+                        st_mode=mode, st_uid=parent_uid, st_gid=parent_gid
+                    )
+                    original_lstat = pathlib.Path.lstat
+                    parent_lstat_calls = 0
+
+                    def fake_parent_lstat(path: pathlib.Path) -> os.stat_result:
+                        nonlocal parent_lstat_calls
+                        if path == target:
+                            raise FileNotFoundError(2, "expected missing child")
+                        if path == root:
+                            parent_lstat_calls += 1
+                            if parent_lstat_calls > 1:
+                                return parent_info  # type: ignore[return-value]
+                        return original_lstat(path)
+
+                    with mock.patch.object(
+                        pathlib.Path,
+                        "lstat",
+                        autospec=True,
+                        side_effect=fake_parent_lstat,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "parent is not safely owned"
+                        ) as raised:
+                            backup_drill._scratch_create_missing_protected_path_directories(
+                                (target,), owner_uid=owner_uid, owner_gid=owner_gid
+                            )
+                    self.assertTrue(
+                        getattr(
+                            raised.exception,
+                            "scratch_synthetic_path_fixture_cleanup_confirmed",
+                        )
+                    )
+                    self.assertEqual(
+                        getattr(
+                            raised.exception,
+                            "scratch_synthetic_path_fixture_created",
+                        ),
+                        (),
+                    )
+                    backup_drill._retain_first_scratch_fault(
+                        raised.exception,
+                        origin="controller",
+                        site="controller_synthetic_path_fixture",
+                    )
+                    first_fault = raised.exception.scratch_first_fault
+                    expected_rejection = {
+                        "schema": 1,
+                        "target_index": 0,
+                        "parent_component_index": parent_component_index,
+                        "predicates": predicates,
+                    }
+                    self.assertEqual(
+                        first_fault,
+                        {
+                            "schema": 1,
+                            "origin": "controller",
+                            "site": "controller_synthetic_path_fixture",
+                            "exception_kind": "runtime",
+                            "errno": None,
+                            "synthetic_path_fixture_rejection": expected_rejection,
+                        },
+                    )
+                    self.assertTrue(
+                        backup_drill.valid_scratch_first_fault(first_fault)
+                    )
+                    self.assertTrue(
+                        backup_drill.valid_scratch_synthetic_path_fixture_rejection(
+                            expected_rejection
+                        )
+                    )
+                    self.assertFalse(target.exists())
+                    if case_name == "combined":
+                        frame = backup_drill._scratch_first_fault_frame(first_fault)
+                        self.assertIsNotNone(frame)
+                        assert frame is not None
+                        worker_report = json.dumps(
+                            {
+                                "ok": False,
+                                "error": "fixed private failure marker",
+                                "scratch_first_fault": first_fault,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ).encode("utf-8") + b"\n"
+                        self.assertEqual(
+                            backup_drill._parse_bound_scratch_first_fault(
+                                worker_report,
+                                frame,
+                                stdout_truncated=False,
+                                stderr_truncated=False,
+                            ),
+                            first_fault,
+                        )
+
+        valid_rejection = {
+            "schema": 1,
+            "target_index": 0,
+            "parent_component_index": 3,
+            "predicates": ["uid_mismatch"],
+        }
+        for invalid_rejection in (
+            {**valid_rejection, "target_index": True},
+            {**valid_rejection, "target_index": len(backup_drill._SCRATCH_SYNTHETIC_PATH_FIXTURE_PARENT_COUNTS)},
+            {**valid_rejection, "parent_component_index": 4},
+            {**valid_rejection, "predicates": []},
+            {**valid_rejection, "predicates": ["unknown"]},
+            {**valid_rejection, "predicates": ["uid_mismatch", "uid_mismatch"]},
+            {**valid_rejection, "predicates": ["gid_mismatch", "uid_mismatch"]},
+            {**valid_rejection, "path": "/private/path"},
+        ):
+            self.assertFalse(
+                backup_drill.valid_scratch_synthetic_path_fixture_rejection(
+                    invalid_rejection
+                )
+            )
+
     def test_synthetic_protected_path_fixture_refuses_symlinks_and_identity_drift(self) -> None:
         owner_uid = os.geteuid()
         owner_gid = os.getegid()
@@ -1494,6 +1662,16 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             expected.discard("/var/run/postgresql")
             expected.add("/run/postgresql")
         self.assertEqual(targets, expected)
+        self.assertEqual(
+            tuple(map(str, backup_drill._scratch_synthetic_protected_path_targets())),
+            (
+                "/opt/oldsparky/platform/shared",
+                "/var/lib/postgresql",
+                "/run/postgresql",
+                "/etc/postgresql",
+                "/root",
+            ),
+        )
 
     def test_synthetic_pg16_restore_diagnostic_under_root(self) -> None:
         if (
