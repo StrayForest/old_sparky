@@ -159,11 +159,14 @@ _SYNTHETIC_RESTORE_STDERR_REASONS = frozenset(
         "invalid_command_argument",
         "unknown_unit_property",
         "systemd_bus_unavailable",
+        "synthetic_backend_exit_observer_failed",
     }
 )
 
 
 def _synthetic_restore_stderr_reason(line: str) -> str | None:
+    if line == "[FAIL] Synthetic restore backend-exit observer failed.":
+        return "synthetic_backend_exit_observer_failed"
     if re.fullmatch(
         r"ModuleNotFoundError: No module named ['\"]"
         r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*['\"]",
@@ -1070,16 +1073,24 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         query_args = backend_query.call_args_list[0].args[0]
         self.assertEqual(query_args[0], "/usr/lib/postgresql/16/bin/psql")
         self.assertEqual(query_args[query_args.index("--dbname") + 1], "postgres")
-        self.assertIn(f"--set=restore_database={restore_database}", query_args)
-        self.assertIn(":'restore_database'", query_args[-1])
+        self.assertNotIn(f"--set=restore_database={restore_database}", query_args)
+        self.assertEqual(
+            query_args[-1],
+            f"SELECT count(*) FROM pg_stat_activity WHERE datname = '{restore_database}';",
+        )
         self.assertEqual(backend_query.call_args_list[0].kwargs["timeout"], 1.0)
         poll_sleep.assert_called_once_with(backup_drill.SCRATCH_SYNTHETIC_WAL_POLL_SECONDS)
 
         with mock.patch.object(backup_drill.subprocess, "run") as backend_query:
-            with self.assertRaisesRegex(RuntimeError, "observer target is invalid"):
-                backup_drill._scratch_wait_for_restore_database_backends_to_exit(
-                    control_target, "production_database"
-                )
+            for invalid_database in (
+                "production_database",
+                f"{restore_database}'; SELECT pg_sleep(1); --",
+            ):
+                with self.subTest(invalid_database=invalid_database):
+                    with self.assertRaisesRegex(RuntimeError, "observer target is invalid"):
+                        backup_drill._scratch_wait_for_restore_database_backends_to_exit(
+                            control_target, invalid_database
+                        )
             backend_query.assert_not_called()
 
         with (
@@ -1135,6 +1146,16 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             noisy_startup_classification["suffix_bytes"],
             backup_drill.SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES,
         )
+        observer_failure = _classify_synthetic_restore_stderr(
+            b"[FAIL] Synthetic restore backend-exit observer failed.\n",
+            complete=True,
+        )
+        self.assertEqual(observer_failure["classification"], "known")
+        self.assertEqual(
+            observer_failure["reasons"],
+            ["synthetic_backend_exit_observer_failed"],
+        )
+        self.assertEqual(observer_failure["unknown_lines"], 0)
 
         report = {
             "kind": "synthetic_restore_diagnostic",

@@ -4580,14 +4580,17 @@ def _scratch_synthetic_expected_rows() -> list[list[Any]]:
     expected: list[list[Any]] = []
     seed = SCRATCH_SYNTHETIC_PAYLOAD_SEED
     for row_id in range(1, SCRATCH_SYNTHETIC_PAYLOAD_ROWS + 1):
-        digest = hashlib.md5()
+        digest = hashlib.md5(usedforsecurity=False)
         digest.update(f"{row_id:08d}".encode("ascii"))
         for block in range(1, SCRATCH_SYNTHETIC_PAYLOAD_BLOCKS + 1):
             block_digest = hashlib.md5(
-                f"{seed}:{row_id}:{block}".encode("ascii")
+                f"{seed}:{row_id}:{block}".encode("ascii"),
+                usedforsecurity=False,
             ).hexdigest()
             digest.update(block_digest.encode("ascii"))
-        tail = hashlib.md5(f"{seed}:tail:{row_id}".encode("ascii")).hexdigest()[:24]
+        tail = hashlib.md5(
+            f"{seed}:tail:{row_id}".encode("ascii"), usedforsecurity=False
+        ).hexdigest()[:24]
         digest.update(tail.encode("ascii"))
         expected.append([row_id, f"row-{row_id:08d}", digest.hexdigest()])
     return expected
@@ -7873,7 +7876,12 @@ def _scratch_wait_for_restore_database_backends_to_exit(
         raise RuntimeError("Synthetic restore backend observer target is invalid.")
 
     deadline = time.monotonic() + SCRATCH_SYNTHETIC_WAL_BACKEND_DRAIN_SECONDS
-    query = "SELECT count(*) FROM pg_stat_activity WHERE datname = :'restore_database';"
+    # The fullmatch above limits this generated name to a safe SQL literal.
+    # psql -c accepts server SQL and does not perform psql variable interpolation.
+    query = (
+        "SELECT count(*) FROM pg_stat_activity "
+        f"WHERE datname = '{restore_database}';"
+    )
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -7885,7 +7893,6 @@ def _scratch_wait_for_restore_database_backends_to_exit(
             "--tuples-only",
             "--no-align",
             "--set=ON_ERROR_STOP=1",
-            f"--set=restore_database={restore_database}",
             *connection_args(control_target),
             "--command",
             query,
