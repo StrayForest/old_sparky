@@ -353,6 +353,33 @@ class PlatformVerificationContractTests(unittest.TestCase):
             test_environment_requirement_issues([test_id], required_environment),
             [],
         )
+        synthetic_restore_id = (
+            "tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests."
+            "test_synthetic_pg16_restore_diagnostic_under_root"
+        )
+        hosted_runner_environment = {
+            "GITHUB_ACTIONS": "true",
+            "RUNNER_OS": "Linux",
+            "RUNNER_ENVIRONMENT": "github-hosted",
+        }
+        self.assertEqual(
+            registry_payload()["backend_test_catalog"]["test_environment_requirements"][
+                synthetic_restore_id
+            ],
+            hosted_runner_environment,
+        )
+        self.assertEqual(
+            test_environment_requirement_issues(
+                [synthetic_restore_id], hosted_runner_environment
+            ),
+            [],
+        )
+        self.assertEqual(
+            test_environment_requirement_issues(
+                [synthetic_restore_id], {"GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux"}
+            ),
+            [synthetic_restore_id + " requires RUNNER_ENVIRONMENT=github-hosted"],
+        )
 
         pid_namespace_id = sorted(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS)[0]
         self.assertEqual(

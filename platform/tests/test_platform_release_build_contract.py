@@ -5250,6 +5250,8 @@ fail 'private lock detail must not cross the public channel'
 
     def test_security_workflow_invokes_all_canonical_required_gates(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-security.yml").read_text()
+        privileged = workflow_job(workflow, "backend-privileged")
+        integration = workflow_job(workflow, "backend-integration")
 
         self.assertNotRegex(workflow, r"^\s{4}paths(?:-ignore)?:")
         self.assertIn("merge_group:", workflow)
@@ -5273,6 +5275,19 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn('github.event_name == \'workflow_dispatch\'', workflow)
         self.assertIn("runtime_sensitive", workflow)
         self.assertIn("platform_verify.py release-runtime", workflow)
+        self.assertIn("runs-on: ubuntu-24.04", privileged)
+        self.assertIn("runs-on: ubuntu-latest", integration)
+        self.assertIn("Check isolated synthetic PostgreSQL 16 prerequisites", privileged)
+        self.assertIn('pg_config_path="$(command -v pg_config)"', privileged)
+        self.assertIn('pg_config_version="$("$pg_config_path" --version)"', privileged)
+        for postgres_binary in (
+            "postgres", "initdb", "pg_ctl", "pg_dump", "pg_restore", "psql",
+            "createdb", "dropdb",
+        ):
+            self.assertIn(postgres_binary, privileged)
+        self.assertIn("pg_trgm.control", privileged)
+        self.assertIn('GITHUB_SHA="$GITHUB_SHA"', privileged)
+        self.assertIn("platform/ci-backend", privileged)
         self.assertIn("release-runtime-real:", workflow)
         self.assertIn("name: Conditional release runtime fixture", workflow)
         self.assertIn("name: Trusted dev immutable release runtime", workflow)

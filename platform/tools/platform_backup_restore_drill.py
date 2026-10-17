@@ -81,10 +81,13 @@ SCRATCH_TMPFS_STOP_BYTES = 64 * 1024**2
 SCRATCH_RUNTIME_SECONDS = 15 * 60
 SCRATCH_STARTUP_SECONDS = 30
 SCRATCH_RUNTIME_SAMPLE_SECONDS = 0.25
+SCRATCH_SYNTHETIC_ARCHIVE_MAX_BYTES = 1024 * 1024
+SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS = 0.01
 SCRATCH_EARLY_EXIT_DRAIN_SECONDS = 2.0
 SCRATCH_EARLY_EXIT_DRAIN_BYTES = 1024 * 1024
 SCRATCH_PG_PORT = 55432
 SCRATCH_WORKER_MODE = "--_scratch-restore-worker"
+SCRATCH_SYNTHETIC_RESTORE_DIAGNOSTIC_MODE = "--_scratch-synthetic-restore-diagnostic"
 SCRATCH_START_TOKEN = b"OLDSPARKY_SCRATCH_RESTORE_START_V1\n"
 SCRATCH_DONE_TOKEN = b"OLDSPARKY_SCRATCH_RESTORE_DONE_V1\n"
 SCRATCH_APP_ROLE = "platform_user"
@@ -116,6 +119,18 @@ SCRATCH_PRIVATE_RAW_BYTES = SCRATCH_PRIVATE_STDOUT_BYTES + SCRATCH_PRIVATE_STDER
 SCRATCH_PRIVATE_ENVELOPE_BYTES = 48 * 1024
 SCRATCH_AUTHORIZATION_PROBE_FRAME = (
     b'{"kind":"authorization_probe","schema":1,"status":"completed"}\n'
+)
+SCRATCH_SYNTHETIC_RESTORE_ARMS = (
+    ("baseline", "replica", 10, False),
+    ("minimal_no_senders", "minimal", 0, False),
+    ("minimal_no_senders_single_transaction", "minimal", 0, True),
+)
+SCRATCH_SYNTHETIC_FIXTURE_ID = "platform_backup_restore_synthetic_v1"
+SCRATCH_SYNTHETIC_ALEMBIC_REVISION = "synthetic_restore_revision_001"
+SCRATCH_SYNTHETIC_EXPECTED_ROWS = (
+    (1, "alpha", "restore fixture alpha"),
+    (2, "beta", "restore fixture beta"),
+    (3, "gamma", "restore fixture gamma"),
 )
 
 _SCRATCH_FIRST_FAULT_ORIGINS = frozenset({"controller", "worker"})
@@ -1718,6 +1733,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--_scratch-archive-sha256", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-timestamp-slug", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-authorization-probe", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        SCRATCH_SYNTHETIC_RESTORE_DIAGNOSTIC_MODE,
+        dest="_scratch_synthetic_restore_diagnostic",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     if args.private_scratch_diagnostics and not args.as_json:
         parser.error("--private-scratch-diagnostics requires --json")
@@ -3830,6 +3851,93 @@ def _rollback_published_backup_pair(
         raise RuntimeError("Could not roll back the exact newly published backup pair.")
 
 
+def _scratch_synthetic_restore_snapshot(
+    target: DatabaseTarget, *, psql_binary: str = "psql"
+) -> dict[str, Any]:
+    """Assert the fixed synthetic fixture after the production restore path."""
+    result = run_command(
+        [
+            psql_binary,
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            *connection_args(target),
+            "--command",
+            """
+            SELECT jsonb_build_object(
+                'tables', (
+                    SELECT COALESCE(jsonb_agg(table_name ORDER BY table_name), '[]'::jsonb)
+                    FROM information_schema.tables
+                    WHERE table_schema = 'platform' AND table_type = 'BASE TABLE'
+                ),
+                'columns', (
+                    SELECT COALESCE(
+                        jsonb_agg(
+                            jsonb_build_array(column_name, data_type, is_nullable)
+                            ORDER BY ordinal_position
+                        ),
+                        '[]'::jsonb
+                    )
+                    FROM information_schema.columns
+                    WHERE table_schema = 'platform'
+                      AND table_name = 'synthetic_restore_probe'
+                ),
+                'primary_key_columns', (
+                    SELECT COALESCE(jsonb_agg(attribute.attname ORDER BY key_column.ordinality), '[]'::jsonb)
+                    FROM pg_constraint AS constraint_row
+                    JOIN LATERAL unnest(constraint_row.conkey)
+                        WITH ORDINALITY AS key_column(attnum, ordinality) ON TRUE
+                    JOIN pg_attribute AS attribute
+                      ON attribute.attrelid = constraint_row.conrelid
+                     AND attribute.attnum = key_column.attnum
+                    WHERE constraint_row.conrelid = 'platform.synthetic_restore_probe'::regclass
+                      AND constraint_row.contype = 'p'
+                ),
+                'rows', (
+                    SELECT COALESCE(
+                        jsonb_agg(jsonb_build_array(id, label, search_text) ORDER BY id),
+                        '[]'::jsonb
+                    )
+                    FROM platform.synthetic_restore_probe
+                ),
+                'alembic_versions', (
+                    SELECT COALESCE(jsonb_agg(version_num ORDER BY version_num), '[]'::jsonb)
+                    FROM public.alembic_version
+                ),
+                'pg_trgm_installed', EXISTS (
+                    SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'
+                ),
+                'pg_trgm_functional',
+                    similarity('restore fixture alpha', 'restore fixture alpha') = 1.0
+            )::text;
+            """,
+        ],
+        target=target,
+        capture_output=True,
+    )
+    try:
+        actual = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("Synthetic restore returned an invalid logical snapshot.") from exc
+    expected = {
+        "tables": ["synthetic_restore_probe"],
+        "columns": [
+            ["id", "integer", "NO"],
+            ["label", "text", "NO"],
+            ["search_text", "text", "NO"],
+        ],
+        "primary_key_columns": ["id"],
+        "rows": [list(row) for row in SCRATCH_SYNTHETIC_EXPECTED_ROWS],
+        "alembic_versions": [SCRATCH_SYNTHETIC_ALEMBIC_REVISION],
+        "pg_trgm_installed": True,
+        "pg_trgm_functional": True,
+    }
+    if actual != expected:
+        raise RuntimeError("Synthetic PostgreSQL restore did not reproduce its exact fixture.")
+    canonical = json.dumps(actual, separators=(",", ":"), sort_keys=True).encode("ascii")
+    return {"logical_sha256": hashlib.sha256(canonical).hexdigest()}
+
+
 def perform_restore_drill(
     dump_path: pathlib.Path,
     *,
@@ -3839,10 +3947,20 @@ def perform_restore_drill(
     archive_stdin: BinaryIO | None = None,
     restore_as_postgres: bool = False,
     restore_no_tablespaces: bool = False,
+    restore_single_transaction: bool = False,
+    psql_binary: str = "psql",
+    pg_restore_binary: str = "pg_restore",
+    synthetic_validation_result: dict[str, Any] | None = None,
     resource_guard: Callable[[], None] | None = None,
     capture_private_output: bool = False,
     phase_observer: Callable[[str, str], None] | None = None,
 ) -> int:
+    if type(restore_single_transaction) is not bool:
+        raise ValueError("Restore transaction mode must be a boolean.")
+    if synthetic_validation_result is not None and (
+        type(synthetic_validation_result) is not dict or synthetic_validation_result
+    ):
+        raise ValueError("Synthetic restore validation result must be an empty dictionary.")
     drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
     use_local_admin = (
         admin_target is None
@@ -3882,7 +4000,7 @@ def perform_restore_drill(
         for extension in REQUIRED_PLATFORM_EXTENSIONS:
             run_command(
                 [
-                    "psql",
+                    psql_binary,
                     "--no-psqlrc",
                     *connection_args(restore_target),
                     "--command",
@@ -3894,7 +4012,7 @@ def perform_restore_drill(
         failure_stage = "schema_setup"
         run_command(
             [
-                "psql",
+                psql_binary,
                 "--no-psqlrc",
                 *connection_args(restore_target),
                 "--command",
@@ -3911,7 +4029,7 @@ def perform_restore_drill(
             if selector == ("--schema=public",):
                 failure_stage = "restore_public"
             restore_command = [
-                "pg_restore",
+                pg_restore_binary,
                 "--exit-on-error",
                 "--no-owner",
                 "--no-acl",
@@ -3920,6 +4038,8 @@ def perform_restore_drill(
             ]
             if restore_no_tablespaces:
                 restore_command.append("--no-tablespaces")
+            if restore_single_transaction:
+                restore_command.append("--single-transaction")
             if archive_stdin is None:
                 restore_command.append(str(dump_path))
             else:
@@ -3940,7 +4060,7 @@ def perform_restore_drill(
         failure_stage = "validate_table_count"
         table_count_result = run_command(
             [
-                "psql",
+                psql_binary,
                 "--no-psqlrc",
                 "--tuples-only",
                 "--no-align",
@@ -3957,7 +4077,7 @@ def perform_restore_drill(
         failure_stage = "validate_connectivity"
         connectivity_result = run_command(
             [
-                "psql",
+                psql_binary,
                 "--no-psqlrc",
                 "--tuples-only",
                 "--no-align",
@@ -3974,7 +4094,7 @@ def perform_restore_drill(
         def verify_alembic_revision() -> list[str]:
             revision_result = run_command(
                 [
-                    "psql",
+                    psql_binary,
                     "--no-psqlrc",
                     "--tuples-only",
                     "--no-align",
@@ -4002,7 +4122,7 @@ def perform_restore_drill(
         failure_stage = "validate_extensions"
         extension_count_result = run_command(
             [
-                "psql",
+                psql_binary,
                 "--no-psqlrc",
                 "--tuples-only",
                 "--no-align",
@@ -4015,6 +4135,12 @@ def perform_restore_drill(
         )
         if int(extension_count_result.stdout.strip()) != len(REQUIRED_PLATFORM_EXTENSIONS):
             raise RuntimeError("Restore drill is missing a required platform PostgreSQL extension.")
+        if synthetic_validation_result is not None:
+            synthetic_validation_result.update(
+                _scratch_synthetic_restore_snapshot(
+                    restore_target, psql_binary=psql_binary
+                )
+            )
     except BaseException as exc:
         failure = exc
         failure_traceback = exc.__traceback__
@@ -4041,6 +4167,7 @@ def perform_restore_drill(
                     app_target=app_target,
                     admin_target=admin_command_target,
                     use_local_admin=use_local_admin,
+                    psql_binary=psql_binary,
                 )
                 absence_result = run_command(
                     absence_command,
@@ -4100,6 +4227,7 @@ def _database_absence_command(
     app_target: DatabaseTarget,
     admin_target: DatabaseTarget | None,
     use_local_admin: bool,
+    psql_binary: str = "psql",
 ) -> tuple[list[str], DatabaseTarget | None]:
     if not re.fullmatch(r"platform_restore_drill_[a-z0-9_]{1,80}", database):
         raise ValueError("restore drill database identity is invalid")
@@ -4110,7 +4238,7 @@ def _database_absence_command(
             "-u",
             "postgres",
             "--",
-            "psql",
+            psql_binary,
             "--no-psqlrc",
             "--tuples-only",
             "--no-align",
@@ -4122,7 +4250,7 @@ def _database_absence_command(
         return command, None
     effective_admin = admin_target or app_target.with_database("postgres")
     command = [
-        "psql",
+        psql_binary,
         "--no-psqlrc",
         "--tuples-only",
         "--no-align",
@@ -5713,6 +5841,423 @@ def _scratch_read_worker_token(
                 pass
 
 
+def _scratch_cleanup_synthetic_cluster(
+    paths: tuple[pathlib.Path, ...], *, root_device: int
+) -> None:
+    pending: list[tuple[pathlib.Path, os.stat_result]] = []
+    for path in paths:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or info.st_dev != root_device:
+            raise RuntimeError("Synthetic restore cluster path escaped its private tmpfs.")
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                (path / "postmaster.pid").lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimeError("Synthetic restore cluster must be reaped before cleanup.")
+        pending.append((path, info))
+    for path, info in pending:
+        if stat.S_ISDIR(info.st_mode):
+            shutil.rmtree(path)
+        elif stat.S_ISREG(info.st_mode):
+            path.unlink()
+        else:
+            raise RuntimeError("Synthetic restore cluster contains an unsupported path type.")
+
+
+def _scratch_synthetic_restore_diagnostic_worker(
+    args: argparse.Namespace, root: pathlib.Path
+) -> dict[str, Any]:
+    """Build a real PGDMP fixture and measure three fixed restore arms in-unit."""
+    if any(
+        getattr(args, name, None) is not None
+        for name in (
+            "_scratch_archive", "_scratch_archive_dev", "_scratch_archive_ino",
+            "_scratch_archive_size", "_scratch_archive_sha256",
+        )
+    ):
+        raise RuntimeError("Synthetic restore diagnostic cannot receive an external archive.")
+    require_commands("pg_config", "runuser")
+    pg_config_path = shutil.which("pg_config")
+    if pg_config_path is None:
+        raise RuntimeError("Synthetic restore diagnostic is missing pg_config.")
+    pg_config = pathlib.Path(pg_config_path)
+    pg_config_version = run_command(
+        [str(pg_config), "--version"], capture_output=True
+    ).stdout
+    if re.search(r"\b16\.\d+\b", pg_config_version) is None:
+        raise RuntimeError("Synthetic restore diagnostic requires PostgreSQL 16 pg_config.")
+    bindir = pathlib.Path(
+        run_command([str(pg_config), "--bindir"], capture_output=True).stdout.strip()
+    )
+    sharedir = pathlib.Path(
+        run_command([str(pg_config), "--sharedir"], capture_output=True).stdout.strip()
+    )
+    postgres = bindir / "postgres"
+    initdb = bindir / "initdb"
+    pgctl = bindir / "pg_ctl"
+    pg_dump = bindir / "pg_dump"
+    pg_restore = bindir / "pg_restore"
+    psql = bindir / "psql"
+    createdb = bindir / "createdb"
+    dropdb = bindir / "dropdb"
+    for binary in (
+        postgres, initdb, pgctl, pg_dump, pg_restore, psql, createdb, dropdb
+    ):
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise RuntimeError("Synthetic restore diagnostic is missing a PostgreSQL 16 binary.")
+    version = run_command([str(postgres), "--version"], capture_output=True).stdout
+    version_match = re.search(r"\b16\.(\d+)\b", version)
+    if version_match is None:
+        raise RuntimeError("Synthetic restore diagnostic requires PostgreSQL 16 binaries.")
+    for binary in (initdb, pgctl, pg_dump, pg_restore, psql, createdb, dropdb):
+        binary_version = run_command([str(binary), "--version"], capture_output=True).stdout
+        if re.search(r"\b16\.\d+\b", binary_version) is None:
+            raise RuntimeError("Synthetic restore diagnostic requires PostgreSQL 16 binaries.")
+    postgres_version = f"16.{version_match.group(1)}"
+    if not (sharedir / "extension" / "pg_trgm.control").is_file():
+        raise RuntimeError("Synthetic restore diagnostic requires the pg_trgm extension files.")
+    # Resolve generic PostgreSQL helpers (createdb/dropdb) from this validated
+    # installation for this worker process only. Restore clients below also
+    # receive explicit paths so runuser cannot select a different pg_restore.
+    os.environ["PATH"] = os.pathsep.join(
+        part for part in (str(bindir), os.environ.get("PATH", "")) if part
+    )
+
+    postgres_user = pwd.getpwnam("postgres")
+    os.chown(root, postgres_user.pw_uid, postgres_user.pw_gid)
+    root_device = os.stat(root).st_dev
+    archive_path = root / "archive.dump"
+    archive: BinaryIO | None = None
+    peak_fd: int | None = None
+    archive_initial: tuple[int, int, int, int, int] | None = None
+    source_data = root / "source-data"
+    source_socket = root / "source-socket"
+    source_log = root / "source-postgres.log"
+    target_data = root / "data"
+    target_socket = root / "socket"
+    target_log = root / "postgres.log"
+
+    def as_postgres(command: list[str], *, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
+        return run_command(
+            ["runuser", "-u", "postgres", "--", *command],
+            capture_output=capture_output,
+        )
+
+    def prepare_cluster(data: pathlib.Path, socket_dir: pathlib.Path) -> None:
+        _scratch_prepare_postgres_directory(
+            data, uid=postgres_user.pw_uid, gid=postgres_user.pw_gid
+        )
+        _scratch_prepare_postgres_directory(
+            socket_dir, uid=postgres_user.pw_uid, gid=postgres_user.pw_gid
+        )
+        _scratch_resource_guard(root, guard_site="worker_synthetic_before_initdb")
+        as_postgres(_scratch_initdb_command(str(initdb), data), capture_output=True)
+
+    def start_cluster(
+        data: pathlib.Path,
+        socket_dir: pathlib.Path,
+        log: pathlib.Path,
+        options: list[str],
+    ) -> None:
+        _scratch_resource_guard(root, guard_site="worker_synthetic_before_postgres_start")
+        as_postgres(
+            [
+                str(pgctl), "--pgdata", str(data), "--log", str(log),
+                "--options", shlex.join(options), "--wait", "--timeout=30", "start",
+            ],
+            capture_output=True,
+        )
+        _scratch_resource_guard(root, guard_site="worker_synthetic_after_postgres_start")
+
+    def stop_cluster(data: pathlib.Path) -> None:
+        pid_file = data / "postmaster.pid"
+        if pid_file.exists():
+            as_postgres(
+                [str(pgctl), "--pgdata", str(data), "--mode=fast", "--wait", "--timeout=20", "stop"],
+                capture_output=True,
+            )
+        if pid_file.exists():
+            raise RuntimeError("Synthetic restore PostgreSQL process was not reaped.")
+
+    def remove_cluster(data: pathlib.Path, socket_dir: pathlib.Path, log: pathlib.Path) -> None:
+        _scratch_cleanup_synthetic_cluster(
+            (data, socket_dir, log), root_device=root_device
+        )
+
+    try:
+        # Fixture creation itself runs in this same private unit, after the
+        # controller has verified systemd, mount, cgroup, and host reserve.
+        prepare_cluster(source_data, source_socket)
+        source_admin = DatabaseTarget(
+            host=str(source_socket), port=SCRATCH_PG_PORT,
+            username="postgres", password=None, database="postgres",
+        )
+        source_started = False
+        try:
+            start_cluster(
+                source_data,
+                source_socket,
+                source_log,
+                _scratch_postgres_start_options(source_socket),
+            )
+            source_started = True
+            source_version_result = run_command(
+                [
+                    str(psql), "--no-psqlrc", "--tuples-only", "--no-align",
+                    *connection_args(source_admin), "--command",
+                    "SELECT current_setting('server_version');",
+                ],
+                target=source_admin,
+                capture_output=True,
+            )
+            source_version_match = re.match(
+                r"^16\.\d+\b", source_version_result.stdout.strip()
+            )
+            if source_version_match is None or source_version_match.group(0) != postgres_version:
+                raise RuntimeError("Synthetic source PostgreSQL server version differs from its PG16 binaries.")
+            run_command(
+                [str(psql), "--no-psqlrc", *connection_args(source_admin),
+                 "--command", "CREATE DATABASE scratch_restore_fixture;"],
+                target=source_admin,
+                capture_output=True,
+            )
+            fixture_target = source_admin.with_database("scratch_restore_fixture")
+            fixture_sql = """
+                CREATE EXTENSION pg_trgm WITH SCHEMA public;
+                CREATE SCHEMA platform;
+                CREATE TABLE platform.synthetic_restore_probe (
+                    id integer PRIMARY KEY,
+                    label text NOT NULL,
+                    search_text text NOT NULL
+                );
+                INSERT INTO platform.synthetic_restore_probe (id, label, search_text) VALUES
+                    (1, 'alpha', 'restore fixture alpha'),
+                    (2, 'beta', 'restore fixture beta'),
+                    (3, 'gamma', 'restore fixture gamma');
+                CREATE TABLE public.alembic_version (
+                    version_num varchar(32) NOT NULL PRIMARY KEY
+                );
+                INSERT INTO public.alembic_version (version_num)
+                    VALUES ('synthetic_restore_revision_001');
+            """
+            run_command(
+                [str(psql), "--no-psqlrc", "--set=ON_ERROR_STOP=1",
+                 *connection_args(fixture_target), "--command", fixture_sql],
+                target=fixture_target,
+                capture_output=True,
+            )
+            if archive_path.exists():
+                raise RuntimeError("Synthetic restore archive path already exists.")
+            as_postgres(
+                [
+                    str(pg_dump), "--format=custom", "--no-owner", "--no-acl",
+                    "--schema=platform", "--schema=public",
+                    *connection_args(fixture_target), "--file", str(archive_path),
+                ],
+                capture_output=True,
+            )
+            archive_info = archive_path.lstat()
+            if (
+                not stat.S_ISREG(archive_info.st_mode)
+                or archive_info.st_dev != root_device
+                or archive_info.st_uid != postgres_user.pw_uid
+                or archive_info.st_size <= 5
+                or archive_info.st_size > SCRATCH_SYNTHETIC_ARCHIVE_MAX_BYTES
+            ):
+                raise RuntimeError("Synthetic PostgreSQL custom archive is outside its fixed bound.")
+            os.chown(archive_path, 0, 0)
+            os.chmod(archive_path, 0o600)
+            archive_info = archive_path.lstat()
+            if archive_info.st_nlink != 1 or stat.S_IMODE(archive_info.st_mode) != 0o600:
+                raise RuntimeError("Synthetic PostgreSQL custom archive identity is unsafe.")
+            args._scratch_archive = str(archive_path)
+            args._scratch_archive_dev = archive_info.st_dev
+            args._scratch_archive_ino = archive_info.st_ino
+            args._scratch_archive_size = archive_info.st_size
+            args._scratch_archive_sha256 = sha256_file(archive_path)
+            archive = _open_verified_scratch_archive(args)
+            archive_initial = (
+                archive_info.st_dev,
+                archive_info.st_ino,
+                archive_info.st_size,
+                archive_info.st_mtime_ns,
+                archive_info.st_ctime_ns,
+            )
+        finally:
+            if source_started or (source_data / "postmaster.pid").exists():
+                stop_cluster(source_data)
+            remove_cluster(source_data, source_socket, source_log)
+
+        peak_fd = _scratch_open_memory_peak_fd(args)
+        arm_results: list[dict[str, Any]] = []
+        for arm_index, arm in enumerate(SCRATCH_SYNTHETIC_RESTORE_ARMS, start=1):
+            name, wal_level, max_wal_senders, single_transaction = arm
+            prepare_cluster(target_data, target_socket)
+            target_admin = DatabaseTarget(
+                host=str(target_socket), port=SCRATCH_PG_PORT,
+                username="postgres", password=None, database="postgres",
+            )
+            target_started = False
+            sampler: _ScratchTmpfsPeakSampler | None = None
+            metric_state: dict[str, int] = {}
+            validation: dict[str, Any] = {}
+            arm_slug = f"{args._scratch_timestamp_slug}_arm{arm_index}"
+            try:
+                start_cluster(
+                    target_data,
+                    target_socket,
+                    target_log,
+                    _scratch_postgres_start_options_for_diagnostic_arm(target_socket, arm),
+                )
+                target_started = True
+                _scratch_create_application_role(target_admin, psql_binary=str(psql))
+                setting_result = run_command(
+                    [
+                        str(psql), "--no-psqlrc", "--tuples-only", "--no-align",
+                        *connection_args(target_admin), "--command",
+                        "SELECT current_setting('server_version') || '|' || current_setting('wal_level') || '|' || current_setting('max_wal_senders');",
+                    ],
+                    target=target_admin,
+                    capture_output=True,
+                )
+                setting_fields = setting_result.stdout.strip().split("|", 2)
+                target_version_match = (
+                    re.match(r"^16\.\d+\b", setting_fields[0])
+                    if len(setting_fields) == 3
+                    else None
+                )
+                if (
+                    target_version_match is None
+                    or target_version_match.group(0) != postgres_version
+                    or setting_fields[1:] != [wal_level, str(max_wal_senders)]
+                ):
+                    raise RuntimeError("Synthetic restore PostgreSQL arm settings were not applied.")
+
+                def phase_observer(phase: str, event: str) -> None:
+                    nonlocal sampler
+                    if phase == "restore_platform" and event == "start":
+                        metric_state["wal_before"] = _scratch_pg_stat_wal_bytes(
+                            target_admin, psql_binary=str(psql)
+                        )
+                        _scratch_read_or_reset_memory_peak(peak_fd, reset=True)
+                        metric_state["started_ns"] = time.monotonic_ns()
+                        sampler = _ScratchTmpfsPeakSampler(root)
+                        sampler.start()
+                    elif phase == "restore_public" and event == "end":
+                        metric_state["ended_ns"] = time.monotonic_ns()
+                        if sampler is None:
+                            raise RuntimeError("Synthetic restore tmpfs sampler did not start.")
+                        metric_state["tmpfs_peak"] = sampler.stop()
+                        sampler = None
+                        metric_state["memory_peak"] = _scratch_read_or_reset_memory_peak(peak_fd)
+                        metric_state["wal_after"] = _scratch_pg_stat_wal_bytes(
+                            target_admin, psql_binary=str(psql)
+                        )
+
+                def resource_guard() -> None:
+                    _scratch_resource_guard(root, guard_site="worker_synthetic_restore_resource_guard")
+
+                table_count = perform_restore_drill(
+                    archive_path,
+                    app_target=DatabaseTarget(
+                        host=str(target_socket), port=SCRATCH_PG_PORT,
+                        username=SCRATCH_APP_ROLE, password=None, database="postgres",
+                    ),
+                    admin_target=target_admin,
+                    timestamp_slug=arm_slug,
+                    archive_stdin=archive,
+                    restore_as_postgres=True,
+                    restore_no_tablespaces=True,
+                    restore_single_transaction=single_transaction,
+                    psql_binary=str(psql),
+                    pg_restore_binary=str(pg_restore),
+                    synthetic_validation_result=validation,
+                    resource_guard=resource_guard,
+                    phase_observer=phase_observer,
+                )
+                if (
+                    len(validation) != 1
+                    or not isinstance(validation.get("logical_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", validation["logical_sha256"]) is None
+                    or not {"wal_before", "wal_after", "started_ns", "ended_ns",
+                            "tmpfs_peak", "memory_peak"}.issubset(metric_state)
+                ):
+                    raise RuntimeError("Synthetic restore arm did not produce complete validation metrics.")
+                wal_bytes = metric_state["wal_after"] - metric_state["wal_before"]
+                elapsed_ms = max(
+                    1,
+                    (metric_state["ended_ns"] - metric_state["started_ns"]) // 1_000_000,
+                )
+                if wal_bytes < 0 or elapsed_ms > SCRATCH_RUNTIME_SECONDS * 1000:
+                    raise RuntimeError("Synthetic restore arm metrics are outside their fixed bound.")
+                arm_results.append(
+                    {
+                        "name": name,
+                        "wal_level": wal_level,
+                        "max_wal_senders": max_wal_senders,
+                        "single_transaction": single_transaction,
+                        "restored_table_count": table_count,
+                        "logical_sha256": validation["logical_sha256"],
+                        "memory_peak_bytes": metric_state["memory_peak"],
+                        "tmpfs_peak_sampled_bytes": metric_state["tmpfs_peak"],
+                        "tmpfs_sample_period_ms": int(SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS * 1000),
+                        "wal_bytes": wal_bytes,
+                        "elapsed_ms": elapsed_ms,
+                    }
+                )
+            finally:
+                if sampler is not None:
+                    sampler.stop()
+                if target_started or (target_data / "postmaster.pid").exists():
+                    stop_cluster(target_data)
+                remove_cluster(target_data, target_socket, target_log)
+
+        if archive is None or archive_initial is None:
+            raise RuntimeError("Synthetic restore archive was not retained for all arms.")
+        final_archive_info = os.fstat(archive.fileno())
+        current_archive_info = archive_path.lstat()
+        final_identity = (
+            final_archive_info.st_dev,
+            final_archive_info.st_ino,
+            final_archive_info.st_size,
+            final_archive_info.st_mtime_ns,
+            final_archive_info.st_ctime_ns,
+        )
+        if final_identity != archive_initial or (
+            current_archive_info.st_dev,
+            current_archive_info.st_ino,
+        ) != archive_initial[:2]:
+            raise RuntimeError("Synthetic restore archive changed during its diagnostic arms.")
+        report = {
+            "kind": "synthetic_restore_diagnostic",
+            "schema": 1,
+            "status": "completed",
+            "postgres_version": postgres_version,
+            "source_fixture": SCRATCH_SYNTHETIC_FIXTURE_ID,
+            "archive_format": "pg_dump_custom",
+            "archive_size_bytes": archive_initial[2],
+            "archive_sha256": args._scratch_archive_sha256,
+            "arms": arm_results,
+        }
+        if not valid_scratch_synthetic_restore_diagnostic(report):
+            raise RuntimeError("Synthetic restore diagnostic did not complete all fixed arms.")
+        return report
+    finally:
+        if archive is not None:
+            archive.close()
+        if peak_fd is not None:
+            os.close(peak_fd)
+        _scratch_cleanup_synthetic_cluster(
+            (source_data, source_socket, source_log, target_data, target_socket, target_log, archive_path),
+            root_device=root_device,
+        )
+
+
 def _scratch_worker_main(args: argparse.Namespace) -> int:
     worker_deadline = time.monotonic() + SCRATCH_RUNTIME_SECONDS
     startup_deadline = min(
@@ -5753,11 +6298,44 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         )
     else:
         _raise_scratch_host_memory_reserve(
-            "worker_after_start_before_archive_open",
+            "worker_after_start_before_synthetic_diagnostic"
+            if getattr(args, "_scratch_synthetic_restore_diagnostic", False)
+            else "worker_after_start_before_archive_open",
             message="Scratch restore admission memory reserve is unavailable.",
         )
     if os.geteuid() != 0:
         raise RuntimeError("Scratch restore supervisor is not root.")
+    if getattr(args, "_scratch_synthetic_restore_diagnostic", False):
+        if getattr(args, "_scratch_authorization_probe", False) or any(
+            getattr(args, name, None) is not None
+            for name in (
+                "_scratch_archive", "_scratch_archive_dev", "_scratch_archive_ino",
+                "_scratch_archive_size", "_scratch_archive_sha256",
+            )
+        ):
+            raise RuntimeError("Synthetic restore diagnostic must not receive archive inputs.")
+        args._scratch_fault_site = "worker_synthetic_restore_diagnostic"
+        report = _scratch_synthetic_restore_diagnostic_worker(args, root)
+        result_stream = getattr(sys.stdout, "buffer", None)
+        if result_stream is None:
+            raise RuntimeError("Synthetic restore diagnostic result channel is unavailable.")
+        result_stream.write(
+            (json.dumps(report, separators=(",", ":"), sort_keys=True) + "\n").encode("ascii")
+        )
+        result_stream.flush()
+        try:
+            args._scratch_fault_site = "worker_done_token"
+            completion = _scratch_read_worker_token(
+                sys.stdin,
+                SCRATCH_DONE_TOKEN,
+                require_eof=True,
+                deadline=worker_deadline,
+            )
+        except (OSError, AttributeError) as exc:
+            raise RuntimeError("Synthetic restore diagnostic completion was not acknowledged.") from exc
+        if completion != SCRATCH_DONE_TOKEN:
+            raise RuntimeError("Synthetic restore diagnostic completion was not acknowledged.")
+        return 0
     if getattr(args, "_scratch_authorization_probe", False):
         if any(
             getattr(args, name, None) is not None
@@ -6013,10 +6591,12 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     return 0
 
 
-def _scratch_create_application_role(admin_target: DatabaseTarget) -> None:
+def _scratch_create_application_role(
+    admin_target: DatabaseTarget, *, psql_binary: str = "psql"
+) -> None:
     run_command(
         [
-            "psql",
+            psql_binary,
             "--no-psqlrc",
             *connection_args(admin_target),
             "--command",
@@ -6079,6 +6659,142 @@ def _scratch_postgres_start_options(socket_dir: pathlib.Path) -> list[str]:
     ]
 
 
+def _scratch_postgres_start_options_for_diagnostic_arm(
+    socket_dir: pathlib.Path, arm: tuple[str, str, int, bool]
+) -> list[str]:
+    """Apply only the fixed diagnostic WAL variants to a disposable cluster."""
+    if arm not in SCRATCH_SYNTHETIC_RESTORE_ARMS:
+        raise ValueError("Synthetic restore diagnostic arm is not recognized.")
+    options = _scratch_postgres_start_options(socket_dir)
+    name, wal_level, max_wal_senders, _single_transaction = arm
+    if name != "baseline":
+        if (wal_level, max_wal_senders) != ("minimal", 0):
+            raise ValueError("Synthetic restore diagnostic WAL settings are invalid.")
+        options.extend(("-c", "wal_level=minimal", "-c", "max_wal_senders=0"))
+    elif (wal_level, max_wal_senders) != ("replica", 10):
+        raise ValueError("Synthetic baseline WAL settings are invalid.")
+    return options
+
+
+def _scratch_open_memory_peak_fd(args: argparse.Namespace) -> int:
+    """Open the verified unit's cgroup-v2 peak counter for per-arm sampling."""
+    root_name = pathlib.Path(args._scratch_root).name
+    match = re.fullmatch(r"oldsparky-backup-restore-([0-9a-f]{24})", root_name)
+    if match is None:
+        raise RuntimeError("Synthetic restore diagnostic unit identity is invalid.")
+    expected_group = f"/system.slice/oldsparky-backup-restore-{match.group(1)}.service"
+    control_group = None
+    for row in pathlib.Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines():
+        fields = row.split(":", 2)
+        if len(fields) == 3 and fields[0] == "0":
+            control_group = fields[2]
+            break
+    if control_group != expected_group:
+        raise RuntimeError("Synthetic restore diagnostic is outside its verified unit cgroup.")
+    cgroup_root = pathlib.Path("/sys/fs/cgroup").resolve(strict=True)
+    cgroup_directory = (cgroup_root / control_group.lstrip("/")).resolve(strict=True)
+    cgroup_directory.relative_to(cgroup_root)
+    descriptor = os.open(
+        cgroup_directory / "memory.peak",
+        os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RuntimeError("Synthetic restore cgroup peak counter is not a regular interface file.")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _scratch_read_or_reset_memory_peak(descriptor: int, *, reset: bool = False) -> int:
+    if reset:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        written = os.write(descriptor, b"reset\n")
+        if written != 6:
+            raise RuntimeError("Synthetic restore cgroup peak counter could not be reset.")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    raw = os.read(descriptor, 64)
+    value = raw.decode("ascii").strip()
+    if not value.isdecimal():
+        raise RuntimeError("Synthetic restore cgroup peak counter is invalid.")
+    peak = int(value)
+    if not 0 < peak <= SCRATCH_MEMORY_MAX_BYTES:
+        raise RuntimeError("Synthetic restore cgroup peak exceeded the fixed memory bound.")
+    return peak
+
+
+def _scratch_tmpfs_used_bytes(root: pathlib.Path) -> int:
+    statvfs = os.statvfs(root)
+    total = statvfs.f_blocks * statvfs.f_frsize
+    free = statvfs.f_bavail * statvfs.f_frsize
+    used = total - free
+    if total != SCRATCH_TMPFS_BYTES or not 0 <= used <= total:
+        raise RuntimeError("Synthetic restore tmpfs measurement is outside its fixed bound.")
+    return used
+
+
+class _ScratchTmpfsPeakSampler:
+    """Capture a bounded sampled tmpfs high-water mark during one restore."""
+
+    def __init__(self, root: pathlib.Path) -> None:
+        self.root = root
+        self.stop_event = threading.Event()
+        self.peak_bytes = 0
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name="scratch-tmpfs-sampler",
+            daemon=True,
+        )
+
+    def _sample(self) -> None:
+        self.peak_bytes = max(self.peak_bytes, _scratch_tmpfs_used_bytes(self.root))
+
+    def _run(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                self._sample()
+                self.stop_event.wait(SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS)
+        except BaseException as exc:
+            self.error = exc
+            self.stop_event.set()
+
+    def start(self) -> None:
+        self._sample()
+        self.thread.start()
+
+    def stop(self) -> int:
+        self.stop_event.set()
+        self.thread.join(timeout=2.0)
+        if self.thread.is_alive():
+            raise RuntimeError("Synthetic restore tmpfs sampler could not be reaped.")
+        if self.error is not None:
+            raise RuntimeError("Synthetic restore tmpfs sampler failed.") from self.error
+        self._sample()
+        return self.peak_bytes
+
+
+def _scratch_pg_stat_wal_bytes(
+    target: DatabaseTarget, *, psql_binary: str = "psql"
+) -> int:
+    result = run_command(
+        [
+            psql_binary, "--no-psqlrc", "--tuples-only", "--no-align",
+            *connection_args(target), "--command", "SELECT wal_bytes FROM pg_stat_wal;",
+        ],
+        target=target,
+        capture_output=True,
+    )
+    raw = result.stdout.strip()
+    if not raw.isdecimal():
+        raise RuntimeError("Synthetic restore WAL counter is invalid.")
+    value = int(raw)
+    if value < 0 or value > SCRATCH_TMPFS_BYTES:
+        raise RuntimeError("Synthetic restore WAL counter exceeded the fixed fixture bound.")
+    return value
+
+
 def _scratch_unit_command(
     *,
     mountpoint: pathlib.Path,
@@ -6089,6 +6805,7 @@ def _scratch_unit_command(
     unit_name: str,
     private_scratch_diagnostics: bool = False,
     authorization_probe: bool = False,
+    synthetic_restore_diagnostic: bool = False,
 ) -> list[str]:
     source_script = pathlib.Path(__file__).resolve(strict=True)
     source_policy = source_script.with_name("platform_disk_policy.py").resolve(strict=True)
@@ -6149,10 +6866,16 @@ def _scratch_unit_command(
         "--_scratch-timestamp-slug",
         timestamp_slug,
     ]
+    if authorization_probe and synthetic_restore_diagnostic:
+        raise ValueError("Scratch authorization probe and synthetic diagnostic are mutually exclusive.")
     if authorization_probe:
         if archive_path is not None or archive_stat is not None or archive_sha256 is not None:
             raise ValueError("Authorization probe cannot bind archive inputs.")
         command.append("--_scratch-authorization-probe")
+    elif synthetic_restore_diagnostic:
+        if archive_path is not None or archive_stat is not None or archive_sha256 is not None:
+            raise ValueError("Synthetic restore diagnostic cannot bind archive inputs.")
+        command.append(SCRATCH_SYNTHETIC_RESTORE_DIAGNOSTIC_MODE)
     else:
         if archive_path is None or archive_stat is None or archive_sha256 is None:
             raise ValueError("Scratch restore requires a complete archive identity.")
@@ -6485,6 +7208,86 @@ def _scratch_worker_candidate(stdout: bytes) -> dict[str, Any] | None:
     return decoded
 
 
+def valid_scratch_synthetic_restore_diagnostic(value: Any) -> bool:
+    """Validate the diagnostic-only result; it is never a backup receipt."""
+    if not isinstance(value, dict) or set(value) != {
+        "kind", "schema", "status", "postgres_version", "source_fixture",
+        "archive_format", "archive_size_bytes", "archive_sha256", "arms",
+    }:
+        return False
+    archive_sha256 = value.get("archive_sha256")
+    arms = value.get("arms")
+    if (
+        value.get("kind") != "synthetic_restore_diagnostic"
+        or type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or value.get("status") != "completed"
+        or type(value.get("postgres_version")) is not str
+        or re.fullmatch(r"16\.\d+", value["postgres_version"]) is None
+        or value.get("source_fixture") != SCRATCH_SYNTHETIC_FIXTURE_ID
+        or value.get("archive_format") != "pg_dump_custom"
+        or type(value.get("archive_size_bytes")) is not int
+        or not 5 < value["archive_size_bytes"] <= SCRATCH_SYNTHETIC_ARCHIVE_MAX_BYTES
+        or type(archive_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", archive_sha256) is None
+        or not isinstance(arms, list)
+        or len(arms) != len(SCRATCH_SYNTHETIC_RESTORE_ARMS)
+    ):
+        return False
+    expected_names = [arm[0] for arm in SCRATCH_SYNTHETIC_RESTORE_ARMS]
+    arm_keys = {
+        "name", "wal_level", "max_wal_senders", "single_transaction",
+        "restored_table_count", "logical_sha256", "memory_peak_bytes",
+        "tmpfs_peak_sampled_bytes", "tmpfs_sample_period_ms", "wal_bytes",
+        "elapsed_ms",
+    }
+    for index, arm in enumerate(arms):
+        expected = SCRATCH_SYNTHETIC_RESTORE_ARMS[index]
+        if (
+            not isinstance(arm, dict)
+            or set(arm) != arm_keys
+            or arm.get("name") != expected_names[index]
+            or arm.get("wal_level") != expected[1]
+            or type(arm.get("max_wal_senders")) is not int
+            or arm["max_wal_senders"] != expected[2]
+            or type(arm.get("single_transaction")) is not bool
+            or arm["single_transaction"] is not expected[3]
+            or type(arm.get("restored_table_count")) is not int
+            or arm["restored_table_count"] <= 0
+            or type(arm.get("logical_sha256")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", arm["logical_sha256"]) is None
+            or type(arm.get("memory_peak_bytes")) is not int
+            or not 0 < arm["memory_peak_bytes"] <= SCRATCH_MEMORY_MAX_BYTES
+            or type(arm.get("tmpfs_peak_sampled_bytes")) is not int
+            or not 0 <= arm["tmpfs_peak_sampled_bytes"] <= SCRATCH_TMPFS_BYTES
+            or type(arm.get("tmpfs_sample_period_ms")) is not int
+            or arm["tmpfs_sample_period_ms"] != int(SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS * 1000)
+            or type(arm.get("wal_bytes")) is not int
+            or not 0 <= arm["wal_bytes"] <= SCRATCH_TMPFS_BYTES
+            or type(arm.get("elapsed_ms")) is not int
+            or not 0 < arm["elapsed_ms"] <= SCRATCH_RUNTIME_SECONDS * 1000
+        ):
+            return False
+    logical_digests = {arm["logical_sha256"] for arm in arms}
+    return len(logical_digests) == 1
+
+
+def _scratch_synthetic_worker_candidate(stdout: bytes) -> dict[str, Any] | None:
+    """Accept only one closed diagnostic frame with all three fixed arms."""
+    if not stdout or len(stdout) > 4096 or not stdout.endswith(b"\n"):
+        return None
+    payload = stdout[:-1]
+    if not payload or b"\n" in payload or b"\r" in payload:
+        raise RuntimeError("Scratch synthetic diagnostic result framing is invalid.")
+    try:
+        decoded = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Scratch synthetic diagnostic returned invalid JSON.") from exc
+    if not valid_scratch_synthetic_restore_diagnostic(decoded):
+        raise RuntimeError("Scratch synthetic diagnostic result failed validation.")
+    return decoded
+
+
 def _scratch_authorization_probe_candidate(stdout: bytes) -> dict[str, Any] | None:
     """Accept only the probe-only result frame, never a restore receipt."""
     if stdout != SCRATCH_AUTHORIZATION_PROBE_FRAME:
@@ -6509,7 +7312,10 @@ def _scratch_expected_properties(
     mountpoint: pathlib.Path,
     python_binary: pathlib.Path,
     authorization_probe: bool = False,
+    synthetic_restore_diagnostic: bool = False,
 ) -> str:
+    if authorization_probe and synthetic_restore_diagnostic:
+        raise ValueError("Scratch authorization probe and synthetic diagnostic are mutually exclusive.")
     properties = snapshot.get("properties")
     if not isinstance(properties, dict):
         raise RuntimeError("Scratch restore service properties are malformed.")
@@ -6577,13 +7383,15 @@ def _scratch_expected_properties(
         str(mountpoint / "platform_backup_restore_drill.py"),
         str(mountpoint / "platform_disk_policy.py"),
     ]
-    if not authorization_probe:
+    if not authorization_probe and not synthetic_restore_diagnostic:
         required_binds.insert(0, str(mountpoint / "archive.dump"))
     for required in required_binds:
         if required not in bind_paths:
             raise RuntimeError("Scratch restore service is missing a required read-only input bind.")
     if authorization_probe and str(mountpoint / "archive.dump") in bind_paths:
         raise RuntimeError("Scratch authorization probe has an unexpected archive bind.")
+    if synthetic_restore_diagnostic and str(mountpoint / "archive.dump") in bind_paths:
+        raise RuntimeError("Synthetic restore diagnostic has an unexpected archive bind.")
     return control_group
 
 
@@ -6626,19 +7434,28 @@ def _run_isolated_restore_drill(
     timestamp_slug: str,
     private_scratch_diagnostics: bool = False,
     authorization_probe: bool = False,
-) -> int:
-    """Run a restore drill or the distinct no-archive authorization protocol."""
+    synthetic_restore_diagnostic: bool = False,
+) -> int | dict[str, Any]:
+    """Run an existing-archive drill or one of the fixed no-input protocols."""
     fault_site = "controller_entry"
     try:
         if os.geteuid() != 0:
             raise RuntimeError("Isolated backup verification requires the root maintenance owner.")
         if re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", timestamp_slug) is None:
             raise ValueError("Scratch restore timestamp identity is invalid.")
+        if authorization_probe and synthetic_restore_diagnostic:
+            raise ValueError("Scratch authorization probe and synthetic diagnostic are mutually exclusive.")
+        if synthetic_restore_diagnostic and (dump_path is not None or private_scratch_diagnostics):
+            raise ValueError("Synthetic restore diagnostic must not receive an archive or private archive diagnostics.")
         fault_site = "controller_entry"
         if authorization_probe:
             if dump_path is not None:
-                raise ValueError("Authorization probe must not receive an archive path.")
+                raise ValueError("No-archive scratch protocol must not receive an archive path.")
             require_commands("systemd-run", "systemctl")
+        elif synthetic_restore_diagnostic:
+            if dump_path is not None:
+                raise ValueError("No-archive scratch protocol must not receive an archive path.")
+            require_commands("systemd-run", "systemctl", "pg_config", "runuser")
         else:
             if dump_path is None:
                 raise ValueError("Scratch restore requires an archive path.")
@@ -6646,6 +7463,8 @@ def _run_isolated_restore_drill(
         fault_site = "controller_host_guard"
         if authorization_probe:
             _scratch_host_guard("parent_before_authorization_probe")
+        elif synthetic_restore_diagnostic:
+            _scratch_host_guard("parent_before_synthetic_restore_diagnostic")
         else:
             _scratch_host_guard("parent_before_archive_open")
     except BaseException as exc:
@@ -6657,12 +7476,12 @@ def _run_isolated_restore_drill(
     archive_descriptor: int | None = None
     archive_before: os.stat_result | None = None
     archive_sha256: str | None = None
-    if not authorization_probe:
+    if not authorization_probe and not synthetic_restore_diagnostic:
         assert dump_path is not None
         fault_site = "controller_archive_identity"
         archive_path = dump_path.absolute()
     try:
-        if not authorization_probe:
+        if not authorization_probe and not synthetic_restore_diagnostic:
             assert archive_path is not None
             archive_descriptor = os.open(
                 archive_path,
@@ -6716,6 +7535,7 @@ def _run_isolated_restore_drill(
             unit_name=unit_name,
             private_scratch_diagnostics=private_scratch_diagnostics,
             authorization_probe=authorization_probe,
+            synthetic_restore_diagnostic=synthetic_restore_diagnostic,
         )
         environment = {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -6932,6 +7752,7 @@ def _run_isolated_restore_drill(
                                 getattr(sys, "_base_executable", sys.executable)
                             ).resolve(strict=True),
                             authorization_probe=authorization_probe,
+                            synthetic_restore_diagnostic=synthetic_restore_diagnostic,
                         )
                         _scratch_control_group_snapshot(verified_control_group)
                         invocation_id = properties.get("InvocationID", "")
@@ -6962,6 +7783,7 @@ def _run_isolated_restore_drill(
                                     getattr(sys, "_base_executable", sys.executable)
                                 ).resolve(strict=True),
                                 authorization_probe=authorization_probe,
+                                synthetic_restore_diagnostic=synthetic_restore_diagnostic,
                             )
                             _scratch_control_group_snapshot(second_control_group)
                             if (
@@ -7048,6 +7870,8 @@ def _run_isolated_restore_drill(
                     candidate = (
                         _scratch_authorization_probe_candidate(bytes(stdout_buffer))
                         if authorization_probe
+                        else _scratch_synthetic_worker_candidate(bytes(stdout_buffer))
+                        if synthetic_restore_diagnostic
                         else _scratch_worker_candidate(bytes(stdout_buffer))
                     )
                     if candidate is not None:
@@ -7073,6 +7897,7 @@ def _run_isolated_restore_drill(
                                 getattr(sys, "_base_executable", sys.executable)
                             ).resolve(strict=True),
                             authorization_probe=authorization_probe,
+                            synthetic_restore_diagnostic=synthetic_restore_diagnostic,
                         )
                         _scratch_control_group_snapshot(final_control_group)
                         if (
@@ -7166,6 +7991,12 @@ def _run_isolated_restore_drill(
                     early_exit_snapshot = _scratch_service_snapshot(unit_name)
                     early_exit_phase = "unit_exited_after_confinement"
                     raise RuntimeError("Scratch authorization probe result failed validation.")
+            elif synthetic_restore_diagnostic:
+                decoded = _scratch_synthetic_worker_candidate(bytes(stdout_buffer))
+                if decoded is None:
+                    early_exit_snapshot = _scratch_service_snapshot(unit_name)
+                    early_exit_phase = "unit_exited_after_confinement"
+                    raise RuntimeError("Scratch synthetic restore diagnostic result failed validation.")
             else:
                 try:
                     decoded = json.loads(stdout_buffer.decode("ascii"))
@@ -7476,6 +8307,12 @@ def _run_isolated_restore_drill(
             fault_site = "controller_host_guard"
             _scratch_host_guard("parent_after_worker_cleanup")
             return 0
+        if synthetic_restore_diagnostic:
+            if not valid_scratch_synthetic_restore_diagnostic(worker_result):
+                raise RuntimeError("Scratch synthetic restore diagnostic returned an invalid result.")
+            fault_site = "controller_host_guard"
+            _scratch_host_guard("parent_after_worker_cleanup")
+            return worker_result
         assert archive_descriptor is not None and archive_path is not None and archive_before is not None
         archive_after = os.fstat(archive_descriptor)
         current_path = archive_path.lstat()
@@ -7498,6 +8335,19 @@ def _run_isolated_restore_drill(
     finally:
         if archive_descriptor is not None:
             os.close(archive_descriptor)
+
+
+def run_synthetic_restore_diagnostic() -> dict[str, Any]:
+    """Run the fixed three-arm synthetic diagnostic through the verified unit."""
+    timestamp_slug = utc_now().strftime("%Y%m%dT%H%M%SZ")
+    result = _run_isolated_restore_drill(
+        None,
+        timestamp_slug=timestamp_slug,
+        synthetic_restore_diagnostic=True,
+    )
+    if not valid_scratch_synthetic_restore_diagnostic(result):
+        raise RuntimeError("Synthetic restore diagnostic did not return a complete report.")
+    return result
 
 
 def _validate_custom_archive_header(path: pathlib.Path) -> None:

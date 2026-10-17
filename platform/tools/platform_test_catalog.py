@@ -45,6 +45,11 @@ TEST_ENVIRONMENT_REQUIREMENTS: Mapping[str, Mapping[str, str]] = {
         "RUNNER_OS": "Linux",
         "RUNNER_ENVIRONMENT": "github-hosted",
     },
+    "tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_synthetic_pg16_restore_diagnostic_under_root": {
+        "GITHUB_ACTIONS": "true",
+        "RUNNER_OS": "Linux",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+    },
 }
 
 # These cases execute the real PID-namespace supervisor and require the
@@ -582,6 +587,11 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
         "test_isolated_restore_signal_cleanup_under_root",
     ): "backend-privileged",
     (
+        "test_platform_backup_restore_drill",
+        "PlatformBackupRestoreDrillTests",
+        "test_synthetic_pg16_restore_diagnostic_under_root",
+    ): "backend-privileged",
+    (
         "test_platform_host_tools_bundle",
         "HostToolsBundleTests",
         "test_active_release_baseline_reader_returns_stable_closed_tuple",
@@ -594,10 +604,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 170,
     "module_digest": "514ecaf735c3c338cc9d1759bdeadea72fbafdc819d17a6fe2d031dce6f684f6",
-    "test_count": 1996,
-    "test_id_digest": "e2247c8a20c26f65d409fd22eedabc1664957c125cb3e5edfc2bfe0f364f80b7",
-    "backend_test_count": 1922,
-    "backend_test_id_digest": "a385ef06b02c7e283663b2d11937483725b8e07a845172b875d88206471022a2",
+    "test_count": 1998,
+    "test_id_digest": "7fd81f368f3b31ff82aa19942c18d2e5e98c2995109464ceb7768c46b51b7297",
+    "backend_test_count": 1924,
+    "backend_test_id_digest": "5d425ac40024b261336fbf0f08c8bf0899cc310ea2dfdf9ae66a22466835b27b",
     "verification_test_count": 74,
     "verification_test_id_digest": "757f12e70c708e7b69affcdd79cfdb963a06bac46e4c2b022b3b6db7c101c783",
     "verification_classifier_test_count": 38,
@@ -612,7 +622,7 @@ CONTOUR_RATIONALE: Mapping[str, str] = {
     "backend-unit": "pure unit/domain/backend behavior without external operator resources",
     "backend-tool-contract": "hermetic repository tools, backup restore diagnostics, source-bound artifact proofs and read-only release-capture diagnostics without root-owned host state",
     "backend-integration": "PostgreSQL/Redis workflows and concurrency behavior",
-    "backend-privileged": "root/service-identity, release/install/systemd, artifact ownership and privileged wrappers",
+    "backend-privileged": "root/service-identity, release/install/systemd, artifact ownership, privileged wrappers and verified ephemeral scratch PostgreSQL diagnostics",
     "performance-contract": "deterministic load, observer and acceptance contracts",
     VERIFICATION_CONTOUR: "registry, workflow and profile ownership self-tests",
 }
@@ -626,8 +636,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 52,
         "module_digest": "88caec1d7501a955a7d663309dcffb8ed6b0c178445690524f3597b9a892f2c4",
-        "test_count": 512,
-        "test_id_digest": "5994e5135c64455928b5656355a477d4f209a693848a4921fc670104c16f9cac",
+        "test_count": 513,
+        "test_id_digest": "6a6e0ece90dcc562e405edd218a218a15e361c3276669951f181647f1c532112",
     },
     "backend-integration": {
         "module_count": 41,
@@ -638,8 +648,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 26,
         "module_digest": "210efce670a082b8360377da86457b71db79310b02abffc0d3849445b073748a",
-        "test_count": 634,
-        "test_id_digest": "3ad5be085b5113878386ccba5e774fbc236725b7c078f925d175eb12706884b0",
+        "test_count": 635,
+        "test_id_digest": "d9bba537d10011067952606fb2937ffb7b80c249f30290eb7cbfa635f4d998b7",
     },
     "performance-contract": {
         "module_count": 11,

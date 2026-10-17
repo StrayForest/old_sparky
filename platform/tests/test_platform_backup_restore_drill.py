@@ -12,9 +12,11 @@ import inspect
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,68 @@ assert SPEC is not None and SPEC.loader is not None
 backup_drill = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = backup_drill
 SPEC.loader.exec_module(backup_drill)
+
+
+def _write_synthetic_restore_diagnostic_artifact(
+    report: dict[str, Any], *, source_sha: str
+) -> pathlib.Path:
+    if (
+        not backup_drill.valid_scratch_synthetic_restore_diagnostic(report)
+        or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+    ):
+        raise RuntimeError("Synthetic restore CI artifact context failed validation.")
+    artifact = {
+        "kind": "synthetic_restore_diagnostic_artifact",
+        "schema": 1,
+        "source_sha": source_sha,
+        "diagnostic": report,
+    }
+    artifact_root = REPO_ROOT / "platform" / "ci-backend"
+    artifact_directory = artifact_root / "backend-privileged"
+    for directory in (artifact_root, artifact_directory):
+        created = False
+        try:
+            directory.mkdir(mode=0o755)
+        except FileExistsError:
+            pass
+        else:
+            created = True
+        if created:
+            directory.chmod(0o755)
+        info = directory.lstat()
+        if (
+            not directory.is_dir()
+            or directory.is_symlink()
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o755
+        ):
+            raise RuntimeError("Synthetic restore CI artifact directory failed validation.")
+    artifact_path = artifact_directory / "synthetic-restore-diagnostic.json"
+    descriptor = os.open(
+        artifact_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        0o644,
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o644
+        ):
+            raise RuntimeError("Synthetic restore CI artifact file failed validation.")
+        payload = json.dumps(artifact, separators=(",", ":"), sort_keys=True).encode("ascii") + b"\n"
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return artifact_path
 
 
 class StagedWorkerInput:
@@ -649,6 +713,127 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             },
         )
         self.assertNotIn("huge_pages", start_settings)
+
+    def test_synthetic_restore_diagnostic_arms_are_fixed_and_report_requires_all_three(self) -> None:
+        socket_dir = pathlib.Path("/run/oldsparky-backup-restore-deadbeef/socket")
+        production_options = backup_drill._scratch_postgres_start_options(socket_dir)
+        arms = backup_drill.SCRATCH_SYNTHETIC_RESTORE_ARMS
+        self.assertEqual(
+            [arm[0] for arm in arms],
+            ["baseline", "minimal_no_senders", "minimal_no_senders_single_transaction"],
+        )
+        self.assertEqual(
+            backup_drill._scratch_postgres_start_options_for_diagnostic_arm(socket_dir, arms[0]),
+            production_options,
+        )
+        minimal_options = backup_drill._scratch_postgres_start_options_for_diagnostic_arm(
+            socket_dir, arms[1]
+        )
+        self.assertEqual(minimal_options[-4:], ["-c", "wal_level=minimal", "-c", "max_wal_senders=0"])
+        self.assertEqual(
+            backup_drill._scratch_postgres_start_options_for_diagnostic_arm(socket_dir, arms[2]),
+            minimal_options,
+        )
+
+        report = {
+            "kind": "synthetic_restore_diagnostic",
+            "schema": 1,
+            "status": "completed",
+            "postgres_version": "16.15",
+            "source_fixture": backup_drill.SCRATCH_SYNTHETIC_FIXTURE_ID,
+            "archive_format": "pg_dump_custom",
+            "archive_size_bytes": 4096,
+            "archive_sha256": "a" * 64,
+            "arms": [
+                {
+                    "name": name,
+                    "wal_level": wal_level,
+                    "max_wal_senders": max_wal_senders,
+                    "single_transaction": single_transaction,
+                    "restored_table_count": 1,
+                    "logical_sha256": "b" * 64,
+                    "memory_peak_bytes": 128 * 1024**2,
+                    "tmpfs_peak_sampled_bytes": 16 * 1024**2,
+                    "tmpfs_sample_period_ms": 10,
+                    "wal_bytes": 4096,
+                    "elapsed_ms": 25,
+                }
+                for name, wal_level, max_wal_senders, single_transaction in arms
+            ],
+        }
+        self.assertTrue(backup_drill.valid_scratch_synthetic_restore_diagnostic(report))
+        missing_arm = json.loads(json.dumps(report))
+        missing_arm["arms"].pop()
+        self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(missing_arm))
+        changed_arm = json.loads(json.dumps(report))
+        changed_arm["arms"][2]["single_transaction"] = False
+        self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(changed_arm))
+        bad_version = json.loads(json.dumps(report))
+        bad_version["postgres_version"] = "17.1"
+        self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(bad_version))
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            cluster = pathlib.Path(temporary_dir) / "data"
+            cluster.mkdir()
+            pid_file = cluster / "postmaster.pid"
+            pid_file.write_text("synthetic live-cluster marker\n", encoding="ascii")
+            with self.assertRaisesRegex(RuntimeError, "must be reaped"):
+                backup_drill._scratch_cleanup_synthetic_cluster(
+                    (cluster,), root_device=cluster.stat().st_dev
+                )
+            self.assertTrue(pid_file.is_file())
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            temporary_root = pathlib.Path(temporary_dir)
+            (temporary_root / "platform").mkdir()
+            with mock.patch.object(sys.modules[__name__], "REPO_ROOT", temporary_root):
+                artifact_path = _write_synthetic_restore_diagnostic_artifact(
+                    report, source_sha="c" * 40
+                )
+            self.assertEqual(
+                json.loads(artifact_path.read_text(encoding="ascii")),
+                {
+                    "kind": "synthetic_restore_diagnostic_artifact",
+                    "schema": 1,
+                    "source_sha": "c" * 40,
+                    "diagnostic": report,
+                },
+            )
+
+    def test_synthetic_pg16_restore_diagnostic_under_root(self) -> None:
+        if (
+            os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+        ):
+            self.skipTest("real PostgreSQL restore diagnostics run only in the ephemeral GitHub-hosted gate")
+        self.assertEqual(os.geteuid(), 0)
+        report = backup_drill.run_synthetic_restore_diagnostic()
+        self.assertTrue(backup_drill.valid_scratch_synthetic_restore_diagnostic(report))
+        self.assertEqual(
+            [arm["name"] for arm in report["arms"]],
+            ["baseline", "minimal_no_senders", "minimal_no_senders_single_transaction"],
+        )
+        self.assertEqual(len({arm["logical_sha256"] for arm in report["arms"]}), 1)
+        for arm in report["arms"]:
+            with self.subTest(arm=arm["name"]):
+                self.assertGreater(arm["memory_peak_bytes"], 0)
+                self.assertGreater(arm["tmpfs_peak_sampled_bytes"], 0)
+                self.assertGreaterEqual(arm["wal_bytes"], 0)
+                self.assertGreater(arm["elapsed_ms"], 0)
+        source_sha = os.environ.get("GITHUB_SHA", "")
+        self.assertRegex(source_sha, r"^[0-9a-f]{40}$")
+        artifact_path = _write_synthetic_restore_diagnostic_artifact(
+            report, source_sha=source_sha
+        )
+        self.assertEqual(
+            json.loads(artifact_path.read_text(encoding="ascii")),
+            {
+                "kind": "synthetic_restore_diagnostic_artifact",
+                "schema": 1,
+                "source_sha": source_sha,
+                "diagnostic": report,
+            },
+        )
 
     def test_scratch_process_start_time_parses_binary_proc_stat_safely(self) -> None:
         actual = self._original_proc_start_time(str(os.getpid()))
@@ -4067,6 +4252,16 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
         archive = io.BytesIO(b"PGDMPsynthetic archive")
         resource_guard = mock.Mock()
+        self.assertEqual(
+            inspect.signature(backup_drill.perform_restore_drill)
+            .parameters["psql_binary"].default,
+            "psql",
+        )
+        self.assertEqual(
+            inspect.signature(backup_drill.perform_restore_drill)
+            .parameters["pg_restore_binary"].default,
+            "pg_restore",
+        )
         with tempfile.TemporaryDirectory() as temporary_dir, mock.patch.object(
             backup_drill, "run_command", side_effect=responses
         ) as run_command, mock.patch.object(
@@ -4082,6 +4277,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 archive_stdin=archive,
                 restore_as_postgres=True,
                 restore_no_tablespaces=True,
+                psql_binary="/validated/pg16/bin/psql",
+                pg_restore_binary="/validated/pg16/bin/pg_restore",
                 resource_guard=resource_guard,
             )
 
@@ -4091,6 +4288,10 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertIn("platform_user", run_command.call_args_list[0].args[0])
         for index in (1, 2, 3, 4, 5, 6):
             self.assertEqual(run_command.call_args_list[index].kwargs["target"].username, "platform_user")
+            self.assertEqual(
+                run_command.call_args_list[index].args[0][0],
+                "/validated/pg16/bin/psql",
+            )
         self.assertEqual(run_command.call_args_list[7].kwargs["target"], admin_target)
         self.assertIn("postgres", run_command.call_args_list[7].args[0])
         self.assertTrue(run_command.call_args_list[1].kwargs["capture_output"])
@@ -4100,18 +4301,25 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         for index, schema in enumerate(("--schema=platform", "--schema=public")):
             command = run_restore_command.call_args_list[index].args[0]
             self.assertEqual(command[:4], ["runuser", "-u", "postgres", "--"])
+            self.assertEqual(command[4], "/validated/pg16/bin/pg_restore")
             self.assertEqual(run_restore_command.call_args_list[index].kwargs["target"].username, "platform_user")
             self.assertIn(["--username", "platform_user"], [command[i : i + 2] for i in range(len(command) - 1)])
             self.assertIn(schema, command)
             self.assertIn("--no-tablespaces", command)
+            self.assertNotIn("--single-transaction", command)
             self.assertNotIn(str(pathlib.Path(temporary_dir) / "backup.dump"), command)
             self.assertIs(run_restore_command.call_args_list[index].kwargs["stdin_handle"], archive)
             self.assertIs(run_restore_command.call_args_list[index].kwargs["resource_guard"], resource_guard)
         self.assertEqual(archive.tell(), 0)
 
         with mock.patch.object(backup_drill, "run_command") as role_command:
-            backup_drill._scratch_create_application_role(admin_target)
+            backup_drill._scratch_create_application_role(
+                admin_target, psql_binary="/validated/pg16/bin/psql"
+            )
         self.assertEqual(role_command.call_args.kwargs["target"], admin_target)
+        self.assertEqual(
+            role_command.call_args.args[0][0], "/validated/pg16/bin/psql"
+        )
         self.assertEqual(
             role_command.call_args.args[0][-1],
             "CREATE ROLE platform_user LOGIN;",

@@ -2,24 +2,24 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-16
+- Last reviewed: 2026-10-17
+
+## Ephemeral synthetic restore diagnostic
+
+The privileged Security contour runs a fixed synthetic PG16 custom archive through three serial restores inside the verified scratch unit. The [test-suite governance](test-suite-governance.md) owns its fixture, equivalence checks, runner preflight and sanitized metrics artifact. This small diagnostic does not change production restore settings or prove full-restore capacity.
 
 ## Local verified backup
 
-`platform_backup_restore_drill.py` is the only DB-backup owner. It dumps
-`platformdb.platform` plus `public.alembic_version`, writes a private checksum
-manifest, and verifies the dump by restoring it into a disposable PostgreSQL 16
-cluster. The cluster runs in a private 512 MiB tmpfs inside a transient
-systemd unit capped at 640 MiB memory with swap disabled. It has no network
-access, cannot see production PostgreSQL data/socket paths or shared
+`platform_backup_restore_drill.py` is the only DB-backup owner. It dumps `platformdb.platform` plus `public.alembic_version`, writes a private checksum
+manifest, and verifies the dump by restoring it into a disposable PostgreSQL 16 cluster. The cluster runs in a private 512 MiB tmpfs inside a transient
+systemd unit capped at 640 MiB memory with swap disabled. It has no network access, cannot see production PostgreSQL data/socket paths or shared
 credentials, and runs `pg_restore` as the `postgres` OS user. The root-owned
 archive is opened and hash-pinned, then exposed read-only; `pg_restore` reads
 that seekable file descriptor from standard input and restores tablespaces
 inside the private cluster. SQL restore and validation use a passwordless
 `platform_user` role created only in that disposable cluster; its separate
 `postgres` admin connection creates and drops the temporary database.
-Production PostgreSQL is never used as the restore target. The disposable
-cluster is stopped and its unit and mount are confirmed gone before a verified
+Production PostgreSQL is never used as the restore target. The disposable cluster is stopped and its unit and mount are confirmed gone before a verified
 backup pair is published. Ordinary rotating maintenance retains 14 verified
 copies; backup-only preserve-existing mode keeps every complete pair; see [named backup retention](backup-retention-protection.md) for opt-in rotation.
 

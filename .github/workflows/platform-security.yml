@@ -684,7 +684,7 @@ jobs:
     name: Backend privileged ephemeral contour
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
     if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       redis:
@@ -744,12 +744,40 @@ jobs:
           sudo usermod -a -G oldsparky-media oldsparky-api
           sudo usermod -a -G oldsparky-media oldsparky-worker
           getent group oldsparky-media
+      - name: Check isolated synthetic PostgreSQL 16 prerequisites
+        run: |
+          set -euo pipefail
+          pg_config_path="$(command -v pg_config)"
+          test -x "$pg_config_path"
+          pg_config_version="$("$pg_config_path" --version)"
+          if [[ "$pg_config_version" != *"PostgreSQL 16."* ]]; then
+            printf 'pg_config must be PostgreSQL 16, got: %s\n' "$pg_config_version" >&2
+            exit 1
+          fi
+          bindir="$("$pg_config_path" --bindir)"
+          sharedir="$("$pg_config_path" --sharedir)"
+          test -d "$bindir"
+          test -d "$sharedir/extension"
+          getent passwd postgres >/dev/null
+          test -x "$(command -v runuser)"
+          test -x "$(command -v systemd-run)"
+          test -x "$(command -v systemctl)"
+          for binary in postgres initdb pg_ctl pg_dump pg_restore psql createdb dropdb; do
+            test -x "$bindir/$binary"
+            version="$("$bindir/$binary" --version)"
+            if [[ "$version" != *" 16."* ]]; then
+              printf '%s\n' "$binary must be PostgreSQL 16, got: $version" >&2
+              exit 1
+            fi
+          done
+          test -f "$sharedir/extension/pg_trgm.control"
+          printf 'Verified PostgreSQL 16 binaries in %s and pg_trgm under %s\n' "$bindir" "$sharedir"
       - name: Run serial privileged catalog contour exactly once as root
         run: >-
           sudo -n env -i
           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
           HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
-          GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS"
+          GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
           PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
           PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
@@ -761,7 +789,7 @@ jobs:
           .venv_platform/bin/python tools/platform_verify.py backend-privileged
           --manifest ci-backend/backend-privileged/manifest.json
           --summary ci-backend/backend-privileged/summary.json --quiet"
-      - name: Upload backend privileged manifests
+      - name: Upload backend privileged manifests and synthetic restore diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
