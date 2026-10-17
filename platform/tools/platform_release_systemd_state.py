@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
@@ -55,6 +56,23 @@ CLOUDFLARE_TIMER_PROPERTIES: Final = (
     "Id", "FragmentPath", "DropInPaths", "NeedDaemonReload", "ActiveState", "SubState",
     "Unit", "UnitFileState", "LastTriggerUSec", "NextElapseUSecRealtime",
 )
+HEALTH_MONITOR_UNIT: Final = "deadlock-health-monitor.service"
+HEALTH_MONITOR_TIMER: Final = "deadlock-health-monitor.timer"
+HEALTH_MONITOR_FRAGMENT: Final = "/etc/systemd/system/deadlock-health-monitor.service"
+HEALTH_MONITOR_PROPERTIES: Final = (
+    "Id", "FragmentPath", "DropInPaths", "NeedDaemonReload", "LoadState",
+    "UnitFileState", "Type", "ActiveState", "SubState", "Result", "ExecMainCode",
+    "ExecMainStatus", "MainPID", "ControlPID", "InvocationID",
+    "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic", "ExecStart",
+)
+HEALTH_MONITOR_TIMER_PROPERTIES: Final = (
+    "Id", "FragmentPath", "DropInPaths", "NeedDaemonReload", "Unit",
+    "ActiveState", "SubState", "UnitFileState",
+    "LastTriggerUSecMonotonic", "RandomizedDelayUSec", "AccuracyUSec",
+    "Persistent", "TimersMonotonic",
+)
+HEALTH_MONITOR_WAIT_SECONDS: Final = 450
+HEALTH_MONITOR_POLL_SECONDS: Final = 3
 SLUG_PATTERN: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 OPERATION_ID_PATTERN: Final = re.compile(r"^[0-9a-f]{32}$")
 ACTIVE_STATES: Final = frozenset(("active", "inactive"))
@@ -1058,9 +1076,14 @@ def _parse_show_fields(output: str, expected: tuple[str, ...]) -> dict[str, str]
     fields: dict[str, str] = {}
     for line in output.splitlines():
         key, separator, value = line.partition("=")
-        if not separator or key not in expected or key in fields or "\x00" in value:
+        if not separator or key not in expected or "\x00" in value:
             raise StateError("systemd properties are malformed")
-        fields[key] = value
+        if key == "TimersMonotonic" and key in fields:
+            fields[key] += "\n" + value
+        elif key in fields:
+            raise StateError("systemd properties are malformed")
+        else:
+            fields[key] = value
     if set(fields) != set(expected):
         raise StateError("systemd properties are incomplete")
     return fields
@@ -1094,6 +1117,206 @@ def _fixed_jobs() -> list[tuple[str, str, str, str]]:
             raise StateError("systemd jobs are malformed")
         jobs.append((fields[0], fields[1], fields[2], fields[3]))
     return jobs
+
+
+def _systemd_timespan_usec(value: str) -> int:
+    factors = {
+        "us": Decimal(1), "ms": Decimal(1000),
+        "s": Decimal(1_000_000), "min": Decimal(60_000_000),
+        "h": Decimal(3_600_000_000), "d": Decimal(86_400_000_000),
+        "w": Decimal(604_800_000_000), "month": Decimal(2_629_800_000_000),
+        "y": Decimal(31_557_600_000_000),
+    }
+    token = re.compile(r"([0-9]+(?:\.[0-9]+)?)(month|y|min|ms|us|w|d|h|s)")
+    position = 0
+    total = Decimal(0)
+    count = 0
+    previous_factor: Decimal | None = None
+    try:
+        while position < len(value):
+            while position < len(value) and value[position] == " ":
+                position += 1
+            match = token.match(value, position)
+            if match is None:
+                raise StateError("systemd monotonic timestamp is malformed")
+            factor = factors[match.group(2)]
+            amount = Decimal(match.group(1))
+            if (
+                amount < 0
+                or (previous_factor is not None and factor >= previous_factor)
+                or (
+                    "." in match.group(1)
+                    and (
+                        match.group(2) != "s"
+                        or len(match.group(1).partition(".")[2]) > 6
+                        or value[match.end():].strip()
+                    )
+                )
+            ):
+                raise StateError("systemd monotonic timestamp is malformed")
+            total += amount * factor
+            previous_factor = factor
+            position = match.end()
+            count += 1
+    except InvalidOperation as exc:
+        raise StateError("systemd monotonic timestamp is malformed") from exc
+    if count == 0 or not total.is_finite() or total < 0:
+        raise StateError("systemd monotonic timestamp is malformed")
+    return int(total)
+
+
+def _health_timer_schedule_is_fixed(value: str) -> bool:
+    entry = re.compile(
+        r"\{\s*(OnBootUSec|OnUnitActiveUSec)=([0-9]+(?:\.[0-9]+)?(?:month|y|min|ms|us|w|d|h|s))"
+        r"\s*;\s*next_elapse=([^{}\n]{1,128})\s*\}"
+    )
+    schedules: dict[str, str] = {}
+    remainder = value
+    for match in entry.finditer(value):
+        key, interval, next_elapse = match.groups()
+        if key in schedules or not next_elapse.strip():
+            return False
+        schedules[key] = interval
+        remainder = remainder.replace(match.group(0), "", 1)
+    return (
+        not remainder.strip()
+        and schedules == {"OnBootUSec": "5min", "OnUnitActiveUSec": "5min"}
+    )
+
+
+def _health_monitor_identity() -> tuple[dict[str, str], dict[str, str]]:
+    service = _fixed_show(HEALTH_MONITOR_UNIT, HEALTH_MONITOR_PROPERTIES)
+    timer = _fixed_show(HEALTH_MONITOR_TIMER, HEALTH_MONITOR_TIMER_PROPERTIES)
+    expected_argv = (
+        "/opt/oldsparky/platform/shared/venv/bin/python",
+        "/opt/oldsparky/platform/current/tools/platform_health_monitor.py",
+        "--disk-min-free-gib", "5", "--disk-max-used-percent", "85",
+    )
+    exec_value = service["ExecStart"]
+    if not exec_value.startswith("{ ") or not exec_value.endswith(" }"):
+        raise StateError("health-monitor ExecStart is malformed")
+    fields: dict[str, str] = {}
+    for item in exec_value[2:-2].split(" ; "):
+        key, separator, field_value = item.partition("=")
+        if not separator or key not in {"path", "argv[]", "ignore_errors", "start_time", "stop_time", "pid", "code", "status"} or key in fields:
+            raise StateError("health-monitor ExecStart is malformed")
+        fields[key] = field_value
+    try:
+        actual_argv = tuple(shlex.split(fields["argv[]"], posix=True))
+    except (KeyError, ValueError) as exc:
+        raise StateError("health-monitor ExecStart is malformed") from exc
+    if (
+        service["Id"] != HEALTH_MONITOR_UNIT
+        or service["FragmentPath"] != HEALTH_MONITOR_FRAGMENT
+        or service["DropInPaths"] != ""
+        or service["NeedDaemonReload"] != "no"
+        or service["LoadState"] != "loaded"
+        or service["UnitFileState"] != "static"
+        or service["Type"] != "oneshot"
+        or set(fields) != {"path", "argv[]", "ignore_errors", "start_time", "stop_time", "pid", "code", "status"}
+        or fields["path"] != expected_argv[0]
+        or actual_argv != expected_argv
+        or fields["ignore_errors"] != "no"
+        or timer["Id"] != HEALTH_MONITOR_TIMER
+        or timer["FragmentPath"] != "/etc/systemd/system/deadlock-health-monitor.timer"
+        or timer["DropInPaths"] != ""
+        or timer["NeedDaemonReload"] != "no"
+        or timer["Unit"] != HEALTH_MONITOR_UNIT
+        or timer["UnitFileState"] != "enabled"
+        or not _health_timer_schedule_is_fixed(timer["TimersMonotonic"])
+        or timer["RandomizedDelayUSec"] != "30s"
+        or timer["AccuracyUSec"] != "15s"
+        or timer["Persistent"] != "yes"
+    ):
+        raise StateError("health-monitor unit identity is unsupported")
+    return service, timer
+
+
+def _health_monitor_baseline() -> dict[str, object]:
+    if _fixed_jobs():
+        raise StateError("systemd jobs prevent protected recovery")
+    service, timer = _health_monitor_identity()
+    if (
+        service["ActiveState"] not in {"failed", "inactive"}
+        or service["InvocationID"] == ""
+        or not service["ExecMainStartTimestampMonotonic"].isdigit()
+        or not service["ExecMainExitTimestampMonotonic"].isdigit()
+        or timer["ActiveState"] != "active"
+        or timer["SubState"] != "waiting"
+        or (
+            service["ActiveState"] == "inactive"
+            and (
+                service["Result"] != "success"
+                or service["ExecMainCode"] != "1"
+                or service["ExecMainStatus"] != "0"
+                or service["MainPID"] != "0"
+                or service["ControlPID"] != "0"
+            )
+        )
+    ):
+        raise StateError("health-monitor baseline is unsupported")
+    # Every unrelated owned unit must be in the ordinary supported state set.
+    for unit in OWNED_UNITS:
+        if unit == HEALTH_MONITOR_UNIT:
+            continue
+        _read_active(unit)
+        _read_enabled(unit)
+    return {
+        "schema": 1,
+        "invocation_id": service["InvocationID"],
+        "last_trigger_usec_monotonic": _systemd_timespan_usec(
+            timer["LastTriggerUSecMonotonic"]
+        ),
+    }
+
+
+def _wait_health_monitor_success(baseline_json: str, *, timeout: int) -> None:
+    try:
+        baseline = json.loads(baseline_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise StateError("health-monitor baseline is malformed") from exc
+    if (
+        not isinstance(baseline, dict)
+        or set(baseline) != {"schema", "invocation_id", "last_trigger_usec_monotonic"}
+        or baseline.get("schema") != 1
+        or not isinstance(baseline.get("invocation_id"), str)
+        or not baseline["invocation_id"]
+        or type(baseline.get("last_trigger_usec_monotonic")) is not int
+        or baseline["last_trigger_usec_monotonic"] < 0
+        or not 1 <= timeout <= 600
+    ):
+        raise StateError("health-monitor baseline is malformed")
+    restored_at = int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1_000_000)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if _fixed_jobs():
+                raise StateError("systemd jobs prevent health-monitor proof")
+            service, timer = _health_monitor_identity()
+            start = int(service["ExecMainStartTimestampMonotonic"])
+            finish = int(service["ExecMainExitTimestampMonotonic"])
+            trigger = _systemd_timespan_usec(timer["LastTriggerUSecMonotonic"])
+            if (
+                service["InvocationID"] != baseline["invocation_id"]
+                and start > restored_at
+                and finish >= start
+                and trigger > max(restored_at, baseline["last_trigger_usec_monotonic"])
+                and service["Result"] == "success"
+                and service["ExecMainCode"] == "1"
+                and service["ExecMainStatus"] == "0"
+                and service["MainPID"] == "0"
+                and service["ControlPID"] == "0"
+                and service["ActiveState"] == "inactive"
+                and timer["ActiveState"] == "active"
+                and timer["SubState"] == "waiting"
+            ):
+                return
+        except (StateError, ValueError):
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise StateError("fresh health-monitor success was not observed")
+        time.sleep(min(HEALTH_MONITOR_POLL_SECONDS, remaining))
 
 
 def _systemd_timestamp(value: str) -> datetime:
@@ -1796,6 +2019,12 @@ def _parser() -> argparse.ArgumentParser:
     cloudflare_reset.add_argument("--app-dir", required=True, type=Path)
     cloudflare_reset.add_argument("--attempt-nonce", required=True)
     cloudflare_reset.add_argument("--expected-event-id", required=True)
+    health_baseline = commands.add_parser("health-monitor-baseline")
+    health_baseline.add_argument("--systemctl", default=SYSTEMCTL)
+    health_wait = commands.add_parser("wait-health-monitor-success")
+    health_wait.add_argument("--systemctl", default=SYSTEMCTL)
+    health_wait.add_argument("--baseline", required=True)
+    health_wait.add_argument("--timeout", type=int, default=HEALTH_MONITOR_WAIT_SECONDS)
     return parser
 
 
@@ -1905,6 +2134,10 @@ def main() -> int:
                 print("RELEASE_CLOUDFLARE_PENDING_RESET schema=1 status=skip")
             else:
                 raise StateError("Cloudflare reset outcome is invalid")
+        elif args.command == "health-monitor-baseline":
+            print(json.dumps(_health_monitor_baseline(), sort_keys=True, separators=(",", ":")))
+        elif args.command == "wait-health-monitor-success":
+            _wait_health_monitor_success(args.baseline, timeout=args.timeout)
         else:
             raise StateError("unknown systemd state command")
         return 0

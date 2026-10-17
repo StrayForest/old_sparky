@@ -71,6 +71,184 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         finally:
             self.temp_dir.cleanup()
 
+    def test_protected_activation_core_restore_is_idempotent_and_timer_free(self) -> None:
+        state = self.shared / STATE_NAME
+        candidate = self.releases / "candidate"
+        current = self.releases / "current"
+        previous = self.releases / "previous"
+        shared = self.shared
+        identities = {
+            current: {
+                "slug": current.name, "dev": 1, "ino": 2,
+                "source_sha": transaction.PROTECTED_ACTIVATION_CURRENT_SHA,
+            },
+            previous: {
+                "slug": previous.name, "dev": 1, "ino": 3,
+                "source_sha": transaction.PROTECTED_ACTIVATION_PREVIOUS_SHA,
+            },
+            candidate: {
+                "slug": candidate.name, "dev": 1, "ino": 4,
+                "source_sha": transaction.PROTECTED_ACTIVATION_CANDIDATE_SHA,
+            },
+        }
+        record: dict[str, object] = {
+            "operation": "install",
+            "phase": "filesystem-restored-services-pending",
+            "candidate_release": candidate,
+            "current_before_path": current,
+            "previous_before_path": previous,
+            "shared": shared,
+            "current_before_identity": identities[current],
+            "previous_before_identity": identities[previous],
+            "candidate_identity": identities[candidate],
+            "systemd_state_before": None,
+            "timer_active_before": True,
+            "timer_enabled_before": "enabled",
+            "service_state_before": {
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+            },
+            "service_enabled_before": {
+                "deadlock-api": "enabled",
+                "deadlock-worker": "enabled",
+                "deadlock-web": "enabled",
+            },
+        }
+        with (
+            mock.patch.object(transaction, "_load_record", return_value=record),
+            mock.patch.object(
+                transaction, "_quarantine_release_identity",
+                side_effect=lambda path: identities[path],
+            ),
+            mock.patch.object(transaction, "_lexists", return_value=False),
+            mock.patch.object(transaction, "validate_service_snapshot"),
+            mock.patch.object(transaction, "_verify_original_pointers"),
+            mock.patch.object(transaction, "_restore_venv"),
+            mock.patch.object(transaction, "_systemctl_path", return_value="/usr/bin/systemctl"),
+            mock.patch.object(
+                transaction, "_read_systemctl_enabled", return_value="enabled"
+            ),
+            mock.patch.object(
+                transaction, "_read_systemctl_state",
+                side_effect=lambda _systemctl, unit: {
+                    "deadlock-api": "active",
+                    "deadlock-worker": "inactive",
+                    "deadlock-web": "active",
+                }[unit],
+            ),
+            mock.patch.object(transaction, "_run_systemctl") as run_systemctl,
+        ):
+            transaction.restore_protected_activation_core_services(
+                state, systemctl="/usr/bin/systemctl"
+            )
+            run_systemctl.assert_not_called()
+
+            identities[candidate] = {**identities[candidate], "source_sha": "0" * 40}
+            with self.assertRaises(transaction.TransactionError):
+                transaction.restore_protected_activation_core_services(
+                    state, systemctl="/usr/bin/systemctl"
+                )
+
+    def test_health_monitor_wait_requires_fresh_success_after_restore(self) -> None:
+        timer_properties = systemd_state._parse_show_fields(
+            "TimersMonotonic={ OnUnitActiveUSec=5min ; next_elapse=2month 23min 5.751439s }\n"
+            "TimersMonotonic={ OnBootUSec=5min ; next_elapse=5min }",
+            ("TimersMonotonic",),
+        )
+        self.assertTrue(
+            systemd_state._health_timer_schedule_is_fixed(
+                timer_properties["TimersMonotonic"]
+            )
+        )
+        self.assertFalse(
+            systemd_state._health_timer_schedule_is_fixed(
+                "{ OnCalendar=hourly ; next_elapse=5min }"
+            )
+        )
+        self.assertEqual(
+            systemd_state._systemd_timespan_usec("2month 18min 5.743733s"),
+            5_259_600_000_000 + 1_080_000_000 + 5_743_733,
+        )
+        self.assertEqual(
+            systemd_state._systemd_timespan_usec("1y 1s"),
+            31_557_600_000_000 + 1_000_000,
+        )
+        self.assertEqual(
+            systemd_state._systemd_timespan_usec(
+                "1y 1month 1w 1d 1h 1min 1s 1ms 1us"
+            ),
+            31_557_600_000_000 + 2_629_800_000_000 + 604_800_000_000
+            + 86_400_000_000 + 3_600_000_000 + 60_000_000 + 1_000_000
+            + 1_000 + 1,
+        )
+        with self.assertRaises(systemd_state.StateError):
+            systemd_state._systemd_timespan_usec("1year")
+        with self.assertRaises(systemd_state.StateError):
+            systemd_state._systemd_timespan_usec("1s 1min")
+        with self.assertRaises(systemd_state.StateError):
+            systemd_state._systemd_timespan_usec("1.0000001s")
+        wrapper = RECOVERY_WRAPPER.read_text(encoding="utf-8")
+        route_start = wrapper.index('if [[ "$pending_operation" == install')
+        proof_at = wrapper.index("verify = namespace.get(\"verify_active_release_artifact\")", route_start)
+        core_restore_at = wrapper.index(
+            "restore-protected-activation-core-services", route_start
+        )
+        wait_at = wrapper.index("wait-health-monitor-success", route_start)
+        capture_at = wrapper.index('capture-transaction \\', route_start)
+        self.assertLess(proof_at, core_restore_at)
+        self.assertLess(core_restore_at, wait_at)
+        self.assertLess(wait_at, capture_at)
+        self.assertNotIn("restore-services \\", wrapper[route_start:capture_at])
+
+        baseline = {
+            "schema": 1,
+            "invocation_id": "a" * 32,
+            "last_trigger_usec_monotonic": 100,
+        }
+        service = {
+            "InvocationID": "b" * 32,
+            "ExecMainStartTimestampMonotonic": "10000001",
+            "ExecMainExitTimestampMonotonic": "10000002",
+            "Result": "success",
+            "ExecMainCode": "1",
+            "ExecMainStatus": "0",
+            "MainPID": "0",
+            "ControlPID": "0",
+            "ActiveState": "inactive",
+        }
+        timer = {
+            "LastTriggerUSecMonotonic": "10.000003s",
+            "ActiveState": "active",
+            "SubState": "waiting",
+        }
+        with (
+            mock.patch.object(systemd_state, "_fixed_jobs", return_value=[]),
+            mock.patch.object(
+                systemd_state, "_health_monitor_identity", return_value=(service, timer)
+            ),
+            mock.patch.object(systemd_state.time, "clock_gettime", return_value=10.0),
+            mock.patch.object(systemd_state.time, "monotonic", side_effect=[0.0, 0.0]),
+        ):
+            systemd_state._wait_health_monitor_success(
+                json.dumps(baseline), timeout=450
+            )
+
+        stale = {**service, "InvocationID": baseline["invocation_id"]}
+        with (
+            mock.patch.object(systemd_state, "_fixed_jobs", return_value=[]),
+            mock.patch.object(
+                systemd_state, "_health_monitor_identity", return_value=(stale, timer)
+            ),
+            mock.patch.object(systemd_state.time, "clock_gettime", return_value=10.0),
+            mock.patch.object(systemd_state.time, "monotonic", side_effect=[0.0, 451.0]),
+            mock.patch.object(systemd_state.time, "sleep"),
+            self.assertRaises(systemd_state.StateError),
+        ):
+            systemd_state._wait_health_monitor_success(
+                json.dumps(baseline), timeout=450
+            )
+
     def test_cache_purge_runtime_uses_transaction_bound_pre_activation_source(self) -> None:
         current = self.add_release("purge-source-current")
         older = self.add_release("purge-target-older")

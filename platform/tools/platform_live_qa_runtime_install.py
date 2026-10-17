@@ -91,6 +91,7 @@ CHROMIUM_SANDBOX_SHA256 = (
 )
 RUNTIME_MANIFEST_RELATIVE = PurePosixPath("runtime-manifest.json")
 LEGACY_RUNTIME_REPORTER_SOURCE_SHA = "6343099bb7686671bdef49d0c4ecd10f21ef19d2"
+LEGACY_MACHINE_LOCK_SOURCE_SHA = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
 # One-time repair target for the attested 19603 live-QA engine artifact.  This
 # command intentionally cannot be used to publish an arbitrary provider SHA.
 PROVIDER_RECOVERY_SOURCE_SHA = "19603dfff122386726313c86b0350812ebbe8cca"
@@ -1227,6 +1228,10 @@ def _runtime_provider_payload(
         app_dir=app_dir,
         allow_legacy_release_validator_omission=True,
         allow_legacy_runtime_reporter_omission=True,
+        allow_legacy_machine_lock_omission=(
+            source_sha == LEGACY_MACHINE_LOCK_SOURCE_SHA
+            and source_sha in _protected_shas(app_dir)
+        ),
     )
     provider_file = active_root / "runtime-provider.json"
     if os.path.lexists(provider_file):
@@ -1444,6 +1449,7 @@ def _validate_payload(
     validate_provider: bool = True,
     allow_legacy_release_validator_omission: bool = False,
     allow_legacy_runtime_reporter_omission: bool = False,
+    allow_legacy_machine_lock_omission: bool = False,
 ) -> None:
     source_sha = str(payload["source_sha"])
     root = Path(str(payload["payload"]))
@@ -1493,6 +1499,13 @@ def _validate_payload(
     }
     if legacy_validator_omission:
         required_files.remove(release_validator_relative)
+    legacy_machine_lock_omission = (
+        allow_legacy_machine_lock_omission
+        and source_sha == LEGACY_MACHINE_LOCK_SOURCE_SHA
+        and source_sha in _protected_shas(app_dir)
+    )
+    if legacy_machine_lock_omission:
+        required_files.remove("platform/tools/platform_live_qa_machine_lock.py")
     if not required_files.issubset(manifest_files):
         raise InstallerError("trusted live-QA manifest is missing a required entrypoint")
     provider_path = root / "runtime-provider.json"

@@ -320,6 +320,10 @@ QUIESCE_STATE="$APP_DIR/shared/.release-quiesce.json"
 SYSTEMD_STATE="$APP_DIR/shared/.release-systemd-state.json"
 TRANSACTION_TOOL="$TOOLS_DIR/platform_release_transaction.py"
 SYSTEMD_STATE_TOOL="$TOOLS_DIR/platform_release_systemd_state.py"
+SOURCE_BOUND_LIVEQA_DIR="/tmp/oldsparky-source-bound-liveqa-proof"
+SOURCE_BOUND_LIVEQA_TAR="$SOURCE_BOUND_LIVEQA_DIR/gha-38185744516-1-9ceaf09ab7ba.tar.gz"
+SOURCE_BOUND_LIVEQA_CHECKSUM="$SOURCE_BOUND_LIVEQA_TAR.sha256"
+SOURCE_BOUND_LIVEQA_RECEIPT="$SOURCE_BOUND_LIVEQA_DIR/attestation-receipt.json"
 RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"
 CLOUDFLARE_PENDING_RESET_ATTEMPTED=0
 CLOUDFLARE_PENDING_RESET_EVIDENCE_PATH=""
@@ -1102,6 +1106,97 @@ fi
   public_status failed topology >&2
   exit 1
 }
+
+if [[ "$pending_operation" == install \
+  && ( "$transaction_phase" == activation-pending \
+    || "$transaction_phase" == filesystem-restored-services-pending ) ]]; then
+  if [[ "$transaction_phase" == activation-pending \
+    && ( -e "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE" ) ]]; then
+    public_status failed topology >&2
+    exit 1
+  fi
+  if [[ "$transaction_phase" == filesystem-restored-services-pending \
+    && ( -e "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE" ) ]]; then
+    # The strict receipt may already have been captured before interruption;
+    # resume through the ordinary receipt-bound path below.
+    :
+  else
+  [[ "$SOURCE_BOUND_LIVEQA_REUSE" -eq 1 ]] \
+    || { public_status failed liveqa_runtime >&2; exit 1; }
+  [[ ! -e "$SYSTEMD_STATE" && ! -L "$SYSTEMD_STATE" ]] \
+    || { public_status failed topology >&2; exit 1; }
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-recovery-pointers \
+    --state "$STATE" >/dev/null 2>/dev/null \
+    || { public_status failed topology >&2; exit 1; }
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-protected-activation-recovery \
+    --state "$STATE" --phase "$transaction_phase" \
+    >/dev/null 2>/dev/null \
+    || { public_status failed topology >&2; exit 1; }
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-service-snapshot \
+    --state "$STATE" --require present >/dev/null 2>/dev/null \
+    || { public_status failed service_state >&2; exit 1; }
+  proof_metadata="$(stat -c '%F:%u:%g:%h:%a' \
+    "$TOOLS_DIR/platform_release_active_artifact_proof.py" 2>/dev/null || true)"
+  [[ "$proof_metadata" == "regular file:0:0:1:444" ]] \
+    || { public_status failed liveqa_runtime >&2; exit 1; }
+  proof_directory_metadata="$(stat -c '%F:%u:%g:%h:%a' \
+    "$SOURCE_BOUND_LIVEQA_DIR" 2>/dev/null || true)"
+  [[ "$proof_directory_metadata" == "directory:0:0:2:700" ]] \
+    || { public_status failed liveqa_runtime >&2; exit 1; }
+  health_baseline="$(/usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" \
+    health-monitor-baseline --systemctl "$SYSTEMCTL_BIN" 2>/dev/null)" \
+    || { public_status failed systemd_state >&2; exit 1; }
+  if [[ "$transaction_phase" == activation-pending ]]; then
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+      --retain --service-pending --state "$STATE" \
+      >/dev/null 2>/dev/null \
+      || { public_status failed transaction >&2; exit 1; }
+  fi
+  # Reuse the identical source-bound verifier and result binding used by the
+  # runtime restore path. Pointer rewind is complete, but no core service has
+  # started yet; proof refusal leaves the transaction retained.
+  if ! "$APP_DIR/shared/venv/bin/python" -I -B - \
+    "$TOOLS_DIR/platform_release_active_artifact_proof.py" \
+    "$APP_DIR" "$SOURCE_BOUND_LIVEQA_TAR" "$SOURCE_BOUND_LIVEQA_CHECKSUM" \
+    "$SOURCE_BOUND_LIVEQA_RECEIPT" <<'PY'
+import re
+import runpy
+import sys
+from pathlib import Path
+
+module_path, app_dir, artifact_tar, checksum_path, receipt_path = sys.argv[1:]
+namespace = runpy.run_path(module_path)
+verify = namespace.get("verify_active_release_artifact")
+if not callable(verify):
+    raise SystemExit(1)
+try:
+    result = verify(
+        Path(app_dir), Path(artifact_tar), Path(checksum_path), Path(receipt_path),
+        deadline_seconds=600,
+    )
+except namespace.get("ActiveArtifactProofError", RuntimeError):
+    raise SystemExit(1)
+if (not isinstance(result, dict) or result.get("schema") != 1
+        or result.get("status") != "passed"
+        or result.get("proof") != "active_signed_artifact_reuse"
+        or result.get("source_sha") != "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"):
+    raise SystemExit(1)
+PY
+  then
+    public_status failed liveqa_runtime >&2
+    exit 1
+  fi
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" \
+    restore-protected-activation-core-services --state "$STATE" \
+    --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
+    || { public_status failed service_state >&2; exit 1; }
+  /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" wait-health-monitor-success \
+    --systemctl "$SYSTEMCTL_BIN" --baseline "$health_baseline" --timeout 450 \
+    >/dev/null 2>/dev/null \
+    || { public_status failed systemd_state >&2; exit 1; }
+  transaction_phase=filesystem-restored-services-pending
+  fi
+fi
 
 complete_service_snapshot() {
   /usr/bin/python3 -I - "$STATE" <<'PY'

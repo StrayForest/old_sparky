@@ -1513,6 +1513,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 self.assertFalse((trusted / "active-manifest.json").exists())
 
     def test_prior_provider_reuse_accepts_m6_payload_without_new_validator(self) -> None:
+        self._assert_protected_legacy_machine_lock_compatibility()
         source_sha = "9" * 40
         engine_manifest = {
             "engine_tree_sha256": "d" * 64,
@@ -1650,6 +1651,151 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         app_dir,
                         expected_manifest=engine_manifest,
                     )
+
+    def _assert_protected_legacy_machine_lock_compatibility(self) -> None:
+        source_sha = runtime.LEGACY_MACHINE_LOCK_SOURCE_SHA
+        expected_manifest = {
+            "version": 2,
+            "engine_tree_sha256": "d" * 64,
+            "node_version": "26.3.1",
+            "package_lock_sha256": "e" * 64,
+            "engine_files": {},
+        }
+        provider = {
+            "version": 1,
+            "source_sha": source_sha,
+            "provider_sha": source_sha,
+            **{
+                key: expected_manifest[key]
+                for key in (
+                    "engine_tree_sha256",
+                    "node_version",
+                    "package_lock_sha256",
+                    "engine_files",
+                )
+            },
+        }
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.canonical_runtime_tree(Path(temporary), source_sha) as (
+                app_dir,
+                release,
+                trusted,
+                payload_root,
+            ):
+                with mock.patch.object(
+                    runtime,
+                    "_validate_runtime_source",
+                    return_value={"version": 1},
+                ):
+                    active_manifest = runtime.install(app_dir, release)
+                payload = payload_root / source_sha
+                lock_relative = "platform/tools/platform_live_qa_machine_lock.py"
+                lock_path = payload / lock_relative
+                self.assertTrue(lock_path.is_file())
+
+                os.chmod(payload, 0o700)
+                os.chmod(payload / "platform/tools", 0o700)
+                lock_path.unlink()
+                provider_path = payload / "runtime-provider.json"
+                provider_path.write_text(
+                    json.dumps(provider, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                os.chown(provider_path, 0, 0)
+                os.chmod(provider_path, 0o444)
+                for directory in sorted(
+                    (entry for entry in payload.rglob("*") if entry.is_dir()),
+                    key=lambda entry: len(entry.parts),
+                    reverse=True,
+                ):
+                    os.chown(directory, 0, 0)
+                    os.chmod(directory, 0o555)
+                os.chown(payload, 0, 0)
+                os.chmod(payload, 0o555)
+
+                def refresh_manifest() -> dict[str, object]:
+                    tree_sha, file_map = runtime._tree_digest(payload)
+                    updated = {
+                        **active_manifest,
+                        "payload_tree_sha256": tree_sha,
+                        "files": file_map,
+                    }
+                    runtime._write_manifest(trusted / "active-manifest.json", updated)
+                    return updated
+
+                old_manifest = refresh_manifest()
+                old_tree = runtime._tree_digest(payload)
+                with mock.patch.object(
+                    runtime, "_validate_runtime_source", return_value=expected_manifest
+                ), mock.patch.object(runtime, "_validate_engine_root"):
+                    with self.assertRaises(runtime.InstallerError):
+                        runtime.verify(app_dir, source_sha)
+                    reused = runtime._runtime_provider_payload(
+                        app_dir,
+                        expected_manifest=expected_manifest,
+                    )
+                self.assertEqual(reused, provider)
+                self.assertEqual(runtime._tree_digest(payload), old_tree)
+
+                # Every other required entrypoint remains mandatory.
+                other_relative = "platform/tools/platform_live_qa_guard.py"
+                other_path = payload / other_relative
+                other_bytes = other_path.read_bytes()
+                os.chmod(payload, 0o700)
+                os.chmod(payload / "platform/tools", 0o700)
+                other_path.unlink()
+                os.chmod(payload / "platform/tools", 0o555)
+                os.chmod(payload, 0o555)
+                refresh_manifest()
+                with mock.patch.object(
+                    runtime, "_validate_runtime_source", return_value=expected_manifest
+                ), mock.patch.object(runtime, "_validate_engine_root"):
+                    with self.assertRaises(runtime.InstallerError):
+                        runtime._runtime_provider_payload(
+                            app_dir,
+                            expected_manifest=expected_manifest,
+                        )
+
+                os.chmod(payload, 0o700)
+                os.chmod(payload / "platform/tools", 0o700)
+                other_path.write_bytes(other_bytes)
+                os.chown(other_path, 0, 0)
+                os.chmod(other_path, 0o444)
+                os.chmod(payload / "platform/tools", 0o555)
+                os.chmod(payload, 0o555)
+                old_manifest = refresh_manifest()
+
+                with (
+                    mock.patch.object(runtime, "_protected_shas", return_value=set()),
+                    mock.patch.object(
+                        runtime, "_validate_runtime_source", return_value=expected_manifest
+                    ),
+                    mock.patch.object(runtime, "_validate_engine_root"),
+                ):
+                    with self.assertRaises(runtime.InstallerError):
+                        runtime._runtime_provider_payload(
+                            app_dir,
+                            expected_manifest=expected_manifest,
+                        )
+
+                wrong_source_manifest = {
+                    **old_manifest,
+                    "source_sha": "8" * 40,
+                    "payload": str(payload_root / ("8" * 40)),
+                }
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_payload(wrong_source_manifest, app_dir=app_dir)
+
+                # Reconciliation cannot reuse the malformed old generation as
+                # its final payload: the default validator remains strict.
+                with (
+                    mock.patch.object(
+                        runtime, "_validate_runtime_source", return_value=expected_manifest
+                    ),
+                    mock.patch.object(runtime, "_validate_engine_root"),
+                ):
+                    with self.assertRaises(runtime.InstallerError):
+                        runtime._validate_payload(old_manifest, app_dir=app_dir)
 
     def test_m8_source_only_provider_may_omit_only_the_new_reporter(self) -> None:
         source_sha = runtime.LEGACY_RUNTIME_REPORTER_SOURCE_SHA

@@ -54,6 +54,9 @@ RENAME_EXCHANGE = 2
 AT_FDCWD = -100
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 OPERATION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+PROTECTED_ACTIVATION_CANDIDATE_SHA = "79faf7fe9104da7afa67036d3894e19e41c582ad"
+PROTECTED_ACTIVATION_CURRENT_SHA = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+PROTECTED_ACTIVATION_PREVIOUS_SHA = "f1154c7dba4f57bf52f7d7544e97d924c732be94"
 SERVICE_UNITS = ("deadlock-api", "deadlock-worker", "deadlock-web")
 LEGACY_READINESS_TIMEOUT_SECONDS = 30.0
 LEGACY_READINESS_ATTEMPT_TIMEOUT_SECONDS = 3.0
@@ -3421,6 +3424,73 @@ def purge_legacy_profile_access_cache(state: Path) -> None:
         _write_record(state, _record_for_write(latest), creating=False)
 
 
+def _validate_protected_activation_recovery(
+    state: Path, record: dict[str, object], *, phase: str
+) -> None:
+    """Accept only the bound 79/9ce/f115 install recovery topology."""
+    candidate = cast(Path, record["candidate_release"])
+    current = cast(Path, record["current_before_path"])
+    previous = cast(Path, record["previous_before_path"])
+    shared = cast(Path, record["shared"])
+    current_identity = _quarantine_release_identity(current)
+    previous_identity = _quarantine_release_identity(previous)
+    candidate_identity = _quarantine_release_identity(candidate)
+    if (
+        record["operation"] != "install"
+        or record["phase"] != phase
+        or record["current_before_identity"] is None
+        or record["previous_before_identity"] is None
+        or record["candidate_identity"] is None
+        or record["systemd_state_before"] is not None
+        or _lexists(shared / SYSTEMD_STATE_NAME)
+        or current_identity is None
+        or current_identity["source_sha"] != PROTECTED_ACTIVATION_CURRENT_SHA
+        or current_identity != record["current_before_identity"]
+        or previous_identity is None
+        or previous_identity["source_sha"] != PROTECTED_ACTIVATION_PREVIOUS_SHA
+        or previous_identity != record["previous_before_identity"]
+        or candidate_identity is None
+        or candidate_identity["source_sha"] != PROTECTED_ACTIVATION_CANDIDATE_SHA
+        or candidate_identity != record["candidate_identity"]
+        or record["timer_active_before"] is not True
+        or record["timer_enabled_before"] != "enabled"
+    ):
+        raise TransactionError("protected activation recovery topology is not exact")
+    validate_service_snapshot(state, require="present")
+
+
+def restore_protected_activation_core_services(state: Path, *, systemctl: str) -> None:
+    """Restore only API/worker/web from the bound protected snapshot."""
+    systemctl = _systemctl_path(systemctl)
+    record = _load_record(state)
+    _validate_protected_activation_recovery(
+        state, record, phase="filesystem-restored-services-pending"
+    )
+    _verify_original_pointers(record)
+    _restore_venv(record)
+    service_state = cast(dict[str, str], record["service_state_before"])
+    service_enabled = cast(dict[str, str], record["service_enabled_before"])
+    for unit in SERVICE_UNITS:
+        expected_enabled = service_enabled[unit]
+        current_enabled = _read_systemctl_enabled(systemctl, unit)
+        if current_enabled != expected_enabled:
+            _run_systemctl(
+                systemctl,
+                "enable" if expected_enabled == "enabled" else "disable",
+                unit,
+            )
+        if _read_systemctl_enabled(systemctl, unit) != expected_enabled:
+            raise TransactionError("pre-migration service enabled state was not restored")
+        expected = service_state[unit]
+        current = _read_systemctl_state(systemctl, unit)
+        if current not in {"active", "inactive"}:
+            raise TransactionError("pre-migration service state is unsupported")
+        if current != expected:
+            _run_systemctl(systemctl, "start" if expected == "active" else "stop", unit)
+        if _read_systemctl_state(systemctl, unit) != expected:
+            raise TransactionError("pre-migration service state was not restored")
+
+
 def restore_services(state: Path, *, systemctl: str) -> None:
     """Restore a current-only install's exact pre-quiesce service snapshot."""
 
@@ -3718,10 +3788,13 @@ def recover(
         not retain
         or record["operation"] != "install"
         or record["current_before_path"] is None
-        or record["previous_before_path"] is not None
     ):
         raise TransactionError(
-            "service-pending recovery requires a retained current-only install"
+            "service-pending recovery requires a retained install"
+        )
+    if service_pending and record["previous_before_path"] is not None:
+        _validate_protected_activation_recovery(
+            state, record, phase="activation-pending"
         )
     if service_pending:
         validate_service_snapshot(state, require="present")
@@ -3990,6 +4063,19 @@ def _build_parser() -> argparse.ArgumentParser:
     restore_services_parser = commands.add_parser("restore-services")
     restore_services_parser.add_argument("--state", required=True, type=Path)
     restore_services_parser.add_argument("--systemctl", required=True)
+    protected_core_parser = commands.add_parser(
+        "restore-protected-activation-core-services"
+    )
+    protected_core_parser.add_argument("--state", required=True, type=Path)
+    protected_core_parser.add_argument("--systemctl", required=True)
+    protected_validate_parser = commands.add_parser(
+        "validate-protected-activation-recovery"
+    )
+    protected_validate_parser.add_argument("--state", required=True, type=Path)
+    protected_validate_parser.add_argument(
+        "--phase", required=True,
+        choices=("activation-pending", "filesystem-restored-services-pending"),
+    )
     purge_legacy_profile_cache_parser = commands.add_parser(
         "purge-legacy-profile-access-cache"
     )
@@ -4174,6 +4260,15 @@ def main() -> int:
             validate_service_snapshot(args.state, require=args.require)
         elif args.command == "restore-services":
             restore_services(args.state, systemctl=args.systemctl)
+        elif args.command == "restore-protected-activation-core-services":
+            restore_protected_activation_core_services(
+                args.state, systemctl=args.systemctl
+            )
+        elif args.command == "validate-protected-activation-recovery":
+            record = _load_record(args.state)
+            _validate_protected_activation_recovery(
+                args.state, record, phase=args.phase
+            )
         elif args.command == "purge-legacy-profile-access-cache":
             purge_legacy_profile_access_cache(args.state)
         elif args.command == "validate-legacy-liveqa-recovery":
