@@ -424,7 +424,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             )
 
             with (
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify._validated_privileged_environment") as env,
                 patch("tools.platform_verify._run") as run,
             ):
@@ -475,6 +475,9 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 )
 
             with (
+                patch.dict(os.environ, {}, clear=True),
+                patch("tools.platform_test_runner.os.getuid", return_value=0),
+                patch("tools.platform_test_runner.os.getgid", return_value=0),
                 patch("tools.platform_test_runner._require_test_environment") as env,
                 patch("tools.platform_test_runner.verification_resource_lock") as lock,
             ):
@@ -1762,7 +1765,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, inherited, clear=True),
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run", side_effect=capture_run),
@@ -1805,7 +1808,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             observed.clear()
             with (
                 patch.dict(os.environ, inherited, clear=True),
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run", side_effect=capture_run),
@@ -1841,7 +1844,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             observed.clear()
             with (
                 patch.dict(os.environ, inherited, clear=True),
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run", side_effect=capture_run),
@@ -1874,7 +1877,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             with (
                 redirect_stderr(timeout_stderr),
                 patch.dict(os.environ, inherited, clear=True),
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run", side_effect=capture_run),
@@ -1908,7 +1911,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             with (
                 redirect_stderr(unavailable_stderr),
                 patch.dict(os.environ, inherited, clear=True),
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run", side_effect=capture_run),
@@ -1933,7 +1936,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             )
             with (
                 patch.dict(os.environ, inherited, clear=True),
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run", side_effect=capture_run),
@@ -1976,7 +1979,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             with (
                 redirect_stderr(io.StringIO()),
                 patch.dict(os.environ, inherited, clear=True),
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run", side_effect=capture_run),
@@ -2004,7 +2007,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             pinned_python.chmod(0o600)
             with (
                 patch.dict(os.environ, inherited, clear=True),
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run") as child_run,
@@ -2016,7 +2019,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, inherited, clear=True),
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
                 patch("tools.platform_verify._tool", side_effect=fake_tool),
                 patch("tools.platform_verify._run") as child_run,
@@ -2068,7 +2071,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             )
             with (
                 patch.dict(os.environ, inherited, clear=True),
-                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._require_backend_privileged_root"),
                 patch("tools.platform_verify._run") as child_run,
             ):
                 with self.assertRaises(VerificationError):

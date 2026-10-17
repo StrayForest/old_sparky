@@ -727,6 +727,146 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         code = platform_verify_venv_reuse._compile_source(b"annotation: object\n", "proof.py")
         self.assertEqual(code.co_flags & __future__.annotations.compiler_flag, 0)
 
+    def test_venv_reuse_runtime_guard_rejects_unbound_interpreters_and_layouts(self) -> None:
+        from types import SimpleNamespace
+
+        self.assertEqual(os.geteuid(), 0, "runtime owner cases require the privileged contour")
+
+        def fixture(root: Path) -> tuple[Path, Path, object, object]:
+            base_python = root / "python3.12"
+            base_python.write_bytes(b"synthetic pinned interpreter fixture\n")
+            base_python.chmod(0o755)
+            venv = root / "venv"
+            directories = (
+                venv,
+                venv / "bin",
+                venv / "lib",
+                venv / "lib" / "python3.12",
+                venv / "lib" / "python3.12" / "site-packages",
+            )
+            for directory in directories:
+                directory.mkdir(exist_ok=True)
+                directory.chmod(0o755)
+            for alias in ("python", "python3", "python3.12"):
+                (venv / "bin" / alias).symlink_to(base_python)
+            (venv / "pyvenv.cfg").write_text(
+                f"home = {root}\ninclude-system-site-packages = false\nversion = 3.12.3\n",
+                encoding="ascii",
+            )
+            (venv / "pyvenv.cfg").chmod(0o644)
+            runtime_sys = SimpleNamespace(
+                executable=str(base_python),
+                version_info=(3, 12, 3),
+                implementation=SimpleNamespace(cache_tag="cpython-312"),
+            )
+            runtime_sysconfig = SimpleNamespace(
+                get_config_var=lambda name: (
+                    "cpython-312-x86_64-linux-gnu" if name == "SOABI" else None
+                ),
+                get_platform=lambda: "linux-x86_64",
+            )
+            return base_python, venv, runtime_sys, runtime_sysconfig
+
+        def check_case(case: str, expected_reason: str | None) -> None:
+            with tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                root = Path(temporary)
+                base_python, venv, runtime_sys, runtime_sysconfig = fixture(root)
+                expected_python = base_python
+                pinned_digest = hashlib.sha256(base_python.read_bytes()).hexdigest()
+
+                if case == "wrong_hash":
+                    pinned_digest = "0" * 64
+                elif case == "wrong_executable_path":
+                    alternate = root / "alternate-python"
+                    alternate.write_bytes(base_python.read_bytes())
+                    alternate.chmod(0o755)
+                    runtime_sys.executable = str(alternate)
+                elif case == "symlink_executable":
+                    expected_python = root / "python-link"
+                    expected_python.symlink_to(base_python)
+                    runtime_sys.executable = str(expected_python)
+                elif case == "executable_mode":
+                    base_python.chmod(0o644)
+                elif case == "executable_owner":
+                    os.chown(base_python, 65534, 0)
+                elif case == "venv_owner":
+                    os.chown(venv, 65534, 0)
+                elif case == "venv_mode":
+                    venv.chmod(0o700)
+                elif case.startswith("alias:"):
+                    alias = venv / "bin" / case.split(":", 1)[1]
+                    alias.unlink()
+                    alternate = root / "alternate-python"
+                    alternate.write_bytes(base_python.read_bytes())
+                    alternate.chmod(0o755)
+                    alias.symlink_to(alternate)
+                elif case == "python_version":
+                    runtime_sys.version_info = (3, 11, 9)
+                elif case == "python_cache_tag":
+                    runtime_sys.implementation.cache_tag = "cpython-311"
+                elif case == "soabi":
+                    runtime_sysconfig.get_config_var = lambda _name: "cpython-311-x86_64-linux-gnu"
+                elif case == "platform":
+                    runtime_sysconfig.get_platform = lambda: "linux-aarch64"
+                elif case == "pyvenv_home":
+                    (venv / "pyvenv.cfg").write_text(
+                        "home = /other\ninclude-system-site-packages = false\nversion = 3.12.3\n",
+                        encoding="ascii",
+                    )
+                elif case == "pyvenv_site_packages":
+                    (venv / "pyvenv.cfg").write_text(
+                        f"home = {root}\ninclude-system-site-packages = true\nversion = 3.12.3\n",
+                        encoding="ascii",
+                    )
+                elif case == "pyvenv_version":
+                    (venv / "pyvenv.cfg").write_text(
+                        f"home = {root}\ninclude-system-site-packages = false\nversion = 3.12.4\n",
+                        encoding="ascii",
+                    )
+                elif case != "supported":
+                    raise AssertionError(f"unknown runtime fixture: {case}")
+
+                with (
+                    mock.patch.object(
+                        platform_verify_venv_reuse, "PINNED_PYTHON_SHA256", pinned_digest
+                    ),
+                    mock.patch.object(platform_verify_venv_reuse, "sys", runtime_sys),
+                    mock.patch.object(
+                        platform_verify_venv_reuse, "sysconfig", runtime_sysconfig
+                    ),
+                ):
+                    if expected_reason is None:
+                        platform_verify_venv_reuse._runtime(venv, expected_python)
+                    else:
+                        with self.assertRaisesRegex(
+                            platform_verify_venv_reuse.ReuseRefused,
+                            expected_reason,
+                        ):
+                            platform_verify_venv_reuse._runtime(venv, expected_python)
+
+        check_case("supported", None)
+        for case, expected_reason in (
+            ("wrong_hash", "base_python"),
+            ("wrong_executable_path", "base_python"),
+            ("symlink_executable", "base_python"),
+            ("executable_mode", "base_python"),
+            ("executable_owner", "base_python"),
+            ("venv_owner", "venv_directory"),
+            ("venv_mode", "venv_directory"),
+            ("alias:python", "venv_python"),
+            ("alias:python3", "venv_python"),
+            ("alias:python3.12", "venv_python"),
+            ("python_version", "runtime_abi"),
+            ("python_cache_tag", "runtime_abi"),
+            ("soabi", "runtime_abi"),
+            ("platform", "runtime_abi"),
+            ("pyvenv_home", "venv_config"),
+            ("pyvenv_site_packages", "venv_config"),
+            ("pyvenv_version", "venv_config"),
+        ):
+            with self.subTest(runtime_case=case):
+                check_case(case, expected_reason)
+
     def test_required_reuse_policy_runs_real_proof_cli_and_persists_its_receipt(self) -> None:
         def prepare_case(name: str, *, corrupt_origin: bool) -> tuple[Path, Path, Path, Path]:
             current = self.add_installed_release(f"strict-current-{name}")
@@ -858,12 +998,24 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             "spec = importlib.util.spec_from_file_location('reuse_cli_real', real)\n"
             "module = importlib.util.module_from_spec(spec)\n"
             "spec.loader.exec_module(module)\n"
+            "# The production interpreter binding has its own closed guard tests; this CLI wiring fixture must not depend on the host Python image.\n"
+            "module._runtime = lambda venv, expected_python: None\n"
             "module._venv_integrity = lambda venv, wheelhouse, slug: "
             "module._activation_scripts_digest(module._expected_activation_scripts(venv, slug))\n"
             "trace = os.environ.get('PLATFORM_TEST_VENV_REUSE_CLI_TRACE')\n"
             "if trace:\n"
             "    with open(trace, 'a', encoding='ascii') as stream:\n"
             "        stream.write('main\\n')\n"
+            "OriginalReuseRefused = module.ReuseRefused\n"
+            "runtime_refusals = {'base_python', 'venv_directory', 'venv_python', 'runtime_abi', 'venv_config'}\n"
+            "class TracedReuseRefused(OriginalReuseRefused):\n"
+            "    def __init__(self, reason):\n"
+            "        if trace:\n"
+            "            label = 'runtime_refusal:' + reason if reason in runtime_refusals else 'proof_refusal'\n"
+            "            with open(trace, 'a', encoding='ascii') as stream:\n"
+            "                stream.write(label + '\\n')\n"
+            "        super().__init__(reason)\n"
+            "module.ReuseRefused = TracedReuseRefused\n"
             "output = io.StringIO()\n"
             "with contextlib.redirect_stdout(output):\n"
             "    status = module.main()\n"
@@ -877,6 +1029,18 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             encoding="ascii",
         )
         verifier_path.chmod(0o755)
+
+        installer_source = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        reader_start = installer_source.index("read_install_space() {")
+        reader_end = installer_source.index("\n}\n", reader_start) + 3
+        installer_copy = self.tools_dir / "platform_release_rollback_venv_reuse_test.sh"
+        installer_copy.write_text(
+            installer_source[:reader_start]
+            + "read_install_space() { printf '%s %s\\n' 8589934592 42949672960; }\n"
+            + installer_source[reader_end:],
+            encoding="utf-8",
+        )
+        installer_copy.chmod(0o755)
 
         for case, corrupt_origin, tamper_proof in (
             ("accepted", False, False),
@@ -900,7 +1064,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 test_env["PLATFORM_TEST_VENV_REUSE_TAMPER_PROOF"] = "1"
             with mock.patch.dict(os.environ, test_env):
                 result = self.run_script(
-                    INSTALL_SCRIPT,
+                    installer_copy,
                     "--stage-only",
                     str(artifact),
                     str(self.app_dir),
@@ -909,7 +1073,10 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             candidate_after = self.releases_dir / f"strict-reuse-{case}-{BUILT_AT}"
             if corrupt_origin or tamper_proof:
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(trace.read_text(encoding="ascii"), "main\n")
+                self.assertEqual(
+                    trace.read_text(encoding="ascii"),
+                    "main\nproof_refusal\n" if corrupt_origin else "main\n",
+                )
                 self.assertIn("class=venv_policy stage=venv_policy_proof", result.stderr)
                 self.assertEqual((self.app_dir / "current").resolve(), current)
                 self.assertEqual((self.app_dir / "previous").resolve().name, f"strict-previous-{case}")

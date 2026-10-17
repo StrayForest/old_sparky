@@ -135,6 +135,7 @@ WORKER_SCRIPT = textwrap.dedent(
             Path(config['started_file']).write_text('started', encoding='ascii')
     if mode == 'external-term':
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        Path(config['started_file']).write_text('started', encoding='ascii')
         time.sleep(60)
     time.sleep(60)
     """
@@ -1648,9 +1649,18 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 textwrap.dedent(
                     f"""
                     import sys
+                    import signal
                     sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
                     from pathlib import Path
                     from tools.platform_load_runtime import run_supervised
+                    handler_ready = Path({str(root / 'handler-ready')!r})
+                    original_signal = signal.signal
+                    def observe_signal(signum, handler):
+                        previous = original_signal(signum, handler)
+                        if signum == signal.SIGTERM and callable(handler):
+                            handler_ready.write_text('ready\\n')
+                        return previous
+                    signal.signal = observe_signal
                     result = run_supervised(
                         worker_command=(sys.executable, {str(script)!r}),
                         report_path=Path({str(root / 'final.json')!r}),
@@ -1666,6 +1676,7 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                                 'external_run_id': '1',
                             }},
                             'mode': 'external-term',
+                            'started_file': {str(root / 'worker-started')!r},
                         }},
                         term_grace_seconds=0.05,
                         poll_seconds=0.01,
@@ -1675,13 +1686,30 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 )
             )
             process = subprocess.Popen([sys.executable, str(supervisor)], stdout=subprocess.PIPE)
-            time.sleep(0.25)
+            ready_path = root / 'handler-ready'
+            worker_started_path = root / 'worker-started'
+            ready_deadline = time.monotonic() + 5
+            ready = False
+            while time.monotonic() < ready_deadline:
+                try:
+                    handler_ready = ready_path.read_text() == 'ready\n'
+                    worker_started = worker_started_path.read_text() == 'started'
+                    if handler_ready and worker_started:
+                        ready = True
+                        break
+                except FileNotFoundError:
+                    pass
+                if process.poll() is not None:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(ready, 'supervisor handler and worker readiness timed out')
             process.send_signal(signal.SIGTERM)
             stdout, _ = process.communicate(timeout=3)
             self.assertEqual(process.returncode, 0)
             self.assertEqual(stdout.decode().strip(), 'external_signal')
             payload = json.loads((root / 'final.json').read_text())
             self.assertTrue(payload['inflight_unknown'])
+            self.assertIs(payload['runtime_supervisor']['descendants_reaped'], True)
 
 
 if __name__ == '__main__':

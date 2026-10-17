@@ -403,6 +403,13 @@ def _preflight_backend_test_environment(
         raise VerificationError("LOCAL GATE BLOCKED: " + " | ".join(issues))
 
 
+def _require_backend_privileged_root() -> None:
+    """Require the real root identity before dispatching privileged tests."""
+
+    if os.geteuid() != 0:
+        raise VerificationError("backend-privileged requires the root test user")
+
+
 @dataclass(frozen=True, slots=True)
 class Gate:
     """Metadata and ownership for one stable verification contour."""
@@ -1158,8 +1165,7 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
 
     if gate_id in BACKEND_CONTOURS:
         if gate_id == "backend-privileged":
-            if os.geteuid() != 0:
-                raise VerificationError("backend-privileged requires the root test user")
+            _require_backend_privileged_root()
             _preflight_backend_test_environment(gate_id, arguments)
             wrapper_command = _backend_contour_command(gate_id, arguments)
             runner_arguments = wrapper_command[3:]
@@ -1234,8 +1240,7 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
     if gate_id == "release-runtime":
         if arguments:
             raise VerificationError("release-runtime does not accept extra arguments.")
-        if os.geteuid() != 0:
-            raise VerificationError("backend-privileged requires the root test user")
+        _require_backend_privileged_root()
         child_env, resource_settings = _validated_privileged_environment()
 
         def timeout_cleanup() -> None:
