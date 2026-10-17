@@ -210,11 +210,13 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     patch.object(platform_live_user_qa_dispatch, "_validate_source_binding_schema"), \
                     patch.object(platform_live_user_qa_dispatch, "_require_release_lock_supervisor", side_effect=RuntimeError("no lock")) as lock_check, \
                     patch.object(platform_live_user_qa_dispatch, "_validate_source_binding_under_lock") as tuple_check, \
+                    patch.object(platform_live_user_qa_dispatch.os, "execve") as execve, \
                     patch.dict(os.environ, {"PLATFORM_RELEASE_LOCK_SUPERVISED": "1"}, clear=True), \
                     redirect_stdout(output):
                     self.assertEqual(platform_live_user_qa_dispatch.main(arguments), 1)
                 lock_check.assert_called_once_with()
                 tuple_check.assert_not_called()
+                execve.assert_not_called()
                 if arguments[0] == "run-launch":
                     self.assertEqual(
                         output.getvalue(),
@@ -222,7 +224,12 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         f"stage=dispatch check=release_lock child_exit=1 source_sha={sha}\n",
                     )
                 else:
-                    self.assertEqual(output.getvalue(), "")
+                    self.assertEqual(
+                        output.getvalue(),
+                        "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "
+                        "stage=dispatch check=release_lock stdout_bytes=0 "
+                        "stderr_bytes=0 truncated=false child_exit=1\n",
+                    )
 
     def test_live_launch_pre_supervisor_failures_emit_only_closed_stage(self) -> None:
         sha = "a" * 40
