@@ -1168,6 +1168,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             failure.scratch_unit_journal_diagnostic = {
                 "schema": 1,
                 "status": "complete",
+                "sync_status": "synced",
                 "bytes_read": 120,
                 "complete": True,
                 "records": 1,
@@ -2134,6 +2135,99 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertEqual(journal_diagnostic["errno"], "EACCES")
         self.assertEqual(journal_diagnostic["target"], "scratch_tmpfs")
 
+        prefixed_unit_record = json.dumps(
+            {
+                "_SYSTEMD_UNIT": unit_name,
+                "MESSAGE": (
+                    f"{unit_name}: Failed at step NAMESPACE spawning "
+                    f"{mountpoint / 'platform_backup_restore_drill.py'}: Operation not permitted"
+                ),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        prefixed_unit = backup_drill._scratch_parse_unit_journal(
+            prefixed_unit_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertEqual(prefixed_unit["reason"], "namespace_setup")
+        self.assertEqual(prefixed_unit["target"], "source_script")
+        self.assertNotIn(str(mountpoint), json.dumps(prefixed_unit))
+
+        other_unit_name = "oldsparky-backup-restore-" + ("b" * 24) + ".service"
+        wrong_prefix_record = json.dumps(
+            {
+                "_SYSTEMD_UNIT": unit_name,
+                "MESSAGE": (
+                    f"{other_unit_name}: Failed at step NAMESPACE spawning "
+                    f"{mountpoint / 'platform_backup_restore_drill.py'}: Operation not permitted"
+                ),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        wrong_prefix = backup_drill._scratch_parse_unit_journal(
+            wrong_prefix_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertEqual(wrong_prefix["reason"], "unknown")
+
+        terminal_namespace_exit = {
+            "load_state": "loaded",
+            "active_state": "failed",
+            "sub_state": "failed",
+            "result": "exit-code",
+            "exec_main_status": 226,
+            "exec_main_code": "exited",
+            "start_token_sent": False,
+            "completion_token_sent": False,
+        }
+        exit_summary_record = json.dumps(
+            {
+                "_SYSTEMD_UNIT": unit_name,
+                "MESSAGE": (
+                    f"{unit_name}: Main process exited, code=exited, "
+                    "status=226/NAMESPACE"
+                ),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        exit_summary = backup_drill._scratch_parse_unit_journal(
+            exit_summary_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+            terminal_snapshot=terminal_namespace_exit,
+        )
+        self.assertEqual(exit_summary["reason"], "namespace_setup")
+        self.assertEqual(exit_summary["namespace_kind"], "unknown")
+        self.assertEqual(exit_summary["errno"], "unknown")
+        self.assertEqual(exit_summary["target"], "unknown")
+        exit_summary_without_terminal = backup_drill._scratch_parse_unit_journal(
+            exit_summary_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+        )
+        self.assertEqual(exit_summary_without_terminal["reason"], "unknown")
+        unsynced = backup_drill._scratch_parse_unit_journal(
+            journal_record,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            complete=True,
+            status="complete",
+            sync_status="timeout",
+        )
+        self.assertEqual(unsynced["status"], "complete")
+        self.assertEqual(unsynced["sync_status"], "timeout")
+        self.assertEqual(unsynced["reason"], "unknown")
+
         prefixed_target_record = json.dumps(
             {
                 "_SYSTEMD_UNIT": unit_name,
@@ -2258,6 +2352,23 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ),
             ("bounded", False),
         )
+        with mock.patch.object(
+            backup_drill.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(["journalctl", "--sync"], 0, b"", b""),
+        ) as journal_sync:
+            self.assertEqual(backup_drill._scratch_journal_sync_status(), "synced")
+        self.assertEqual(journal_sync.call_args.args[0], ["journalctl", "--sync"])
+        self.assertEqual(
+            journal_sync.call_args.kwargs["timeout"],
+            backup_drill.SCRATCH_SYNTHETIC_JOURNAL_TIMEOUT_SECONDS,
+        )
+        with mock.patch.object(
+            backup_drill.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["journalctl", "--sync"], 2),
+        ):
+            self.assertEqual(backup_drill._scratch_journal_sync_status(), "timeout")
         malformed = backup_drill._scratch_parse_unit_journal(
             b"not-json\n",
             unit_name=unit_name,

@@ -1364,6 +1364,7 @@ _SCRATCH_UNIT_RESULTS = {
 }
 _SCRATCH_UNIT_EXEC_MAIN_CODES = {"exited", "killed", "dumped", "unknown", "none"}
 _SCRATCH_JOURNAL_STATUSES = {"complete", "bounded", "unavailable", "malformed"}
+_SCRATCH_JOURNAL_SYNC_STATUSES = {"synced", "timeout", "unavailable"}
 _SCRATCH_JOURNAL_REASONS = {
     "namespace_setup", "exec_failure", "unit_start_failure", "none", "unknown"
 }
@@ -1533,7 +1534,7 @@ def _scratch_terminal_snapshot(
 
 def valid_scratch_unit_journal_diagnostic(value: Any) -> bool:
     keys = {
-        "schema", "status", "bytes_read", "complete", "records", "reason",
+        "schema", "status", "sync_status", "bytes_read", "complete", "records", "reason",
         "namespace_kind", "errno", "target",
     }
     return (
@@ -1543,6 +1544,8 @@ def valid_scratch_unit_journal_diagnostic(value: Any) -> bool:
         and value["schema"] == 1
         and type(value.get("status")) is str
         and value["status"] in _SCRATCH_JOURNAL_STATUSES
+        and type(value.get("sync_status")) is str
+        and value["sync_status"] in _SCRATCH_JOURNAL_SYNC_STATUSES
         and type(value.get("bytes_read")) is int
         and 0 <= value["bytes_read"] <= SCRATCH_SYNTHETIC_JOURNAL_MAX_BYTES
         and type(value.get("complete")) is bool
@@ -1569,11 +1572,17 @@ def valid_scratch_unit_journal_diagnostic(value: Any) -> bool:
 
 
 def _scratch_empty_journal_diagnostic(
-    status: str, *, bytes_read: int = 0, complete: bool = False, records: int = 0
+    status: str,
+    *,
+    sync_status: str = "unavailable",
+    bytes_read: int = 0,
+    complete: bool = False,
+    records: int = 0,
 ) -> dict[str, Any]:
     diagnostic = {
         "schema": 1,
         "status": status,
+        "sync_status": sync_status,
         "bytes_read": bytes_read,
         "complete": complete,
         "records": records,
@@ -1585,6 +1594,7 @@ def _scratch_empty_journal_diagnostic(
     return diagnostic if valid_scratch_unit_journal_diagnostic(diagnostic) else {
         "schema": 1,
         "status": "unavailable",
+        "sync_status": "unavailable",
         "bytes_read": 0,
         "complete": False,
         "records": 0,
@@ -1632,8 +1642,15 @@ def _scratch_journal_target(message: str, mountpoint: pathlib.Path) -> str:
 
 
 def _scratch_journal_message_projection(
-    message: str, *, mountpoint: pathlib.Path
+    message: str,
+    *,
+    unit_name: str,
+    mountpoint: pathlib.Path,
+    terminal_snapshot: dict[str, Any] | None,
 ) -> tuple[str, str, str, str] | None:
+    unit_prefix = f"{unit_name}: "
+    if message.startswith(unit_prefix):
+        message = message[len(unit_prefix):]
     lowered = message.casefold()
     namespace_start = re.match(
         r"^failed to set up (mount|user|network|ipc|uts|cgroup|time) namespacing"
@@ -1654,6 +1671,17 @@ def _scratch_journal_message_projection(
     elif re.match(r"^failed at step exec(?:\s|$)", lowered):
         namespace_kind = "none"
         reason = "exec_failure"
+    elif (
+        re.fullmatch(
+            r"main process exited, code=exited, status=226/namespace",
+            lowered,
+        )
+        and isinstance(terminal_snapshot, dict)
+        and terminal_snapshot.get("exec_main_code") == "exited"
+        and terminal_snapshot.get("exec_main_status") == 226
+    ):
+        namespace_kind = "unknown"
+        reason = "namespace_setup"
     elif re.match(r"^failed (?:to start|with result)\b", lowered):
         namespace_kind = "none"
         reason = "unit_start_failure"
@@ -1701,18 +1729,22 @@ def _scratch_parse_unit_journal(
     mountpoint: pathlib.Path,
     complete: bool,
     status: str,
+    sync_status: str = "synced",
+    terminal_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if (
         _SCRATCH_GENERATED_UNIT_RE.fullmatch(unit_name) is None
         or type(raw) is not bytes
         or len(raw) > SCRATCH_SYNTHETIC_JOURNAL_MAX_BYTES
         or status not in _SCRATCH_JOURNAL_STATUSES
+        or sync_status not in _SCRATCH_JOURNAL_SYNC_STATUSES
         or type(complete) is not bool
     ):
         return _scratch_empty_journal_diagnostic("malformed", bytes_read=0)
     if status != "complete" or not complete:
         return _scratch_empty_journal_diagnostic(
             "bounded" if status == "bounded" else "unavailable",
+            sync_status=sync_status,
             bytes_read=len(raw),
         )
 
@@ -1741,18 +1773,36 @@ def _scratch_parse_unit_journal(
             if exact_records > SCRATCH_SYNTHETIC_JOURNAL_MAX_LINES:
                 raise ValueError("journal record count")
             projection = _scratch_journal_message_projection(
-                message, mountpoint=mountpoint
+                message,
+                unit_name=unit_name,
+                mountpoint=mountpoint,
+                terminal_snapshot=terminal_snapshot,
             )
             if projection is not None:
                 projections.add(projection)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return _scratch_empty_journal_diagnostic(
-            "malformed", bytes_read=len(raw), records=min(exact_records, SCRATCH_SYNTHETIC_JOURNAL_MAX_LINES)
+            "malformed",
+            sync_status=sync_status,
+            bytes_read=len(raw),
+            records=min(exact_records, SCRATCH_SYNTHETIC_JOURNAL_MAX_LINES),
         )
 
+    if sync_status != "synced":
+        return _scratch_empty_journal_diagnostic(
+            "complete",
+            sync_status=sync_status,
+            bytes_read=len(raw),
+            complete=True,
+            records=exact_records,
+        )
     if not projections:
         return _scratch_empty_journal_diagnostic(
-            "complete", bytes_read=len(raw), complete=True, records=exact_records
+            "complete",
+            sync_status=sync_status,
+            bytes_read=len(raw),
+            complete=True,
+            records=exact_records,
         )
     specific_projections = {
         item for item in projections if item[0] != "unit_start_failure"
@@ -1766,6 +1816,7 @@ def _scratch_parse_unit_journal(
     diagnostic = {
         "schema": 1,
         "status": "complete",
+        "sync_status": sync_status,
         "bytes_read": len(raw),
         "complete": True,
         "records": exact_records,
@@ -1775,16 +1826,51 @@ def _scratch_parse_unit_journal(
         "target": target,
     }
     return diagnostic if valid_scratch_unit_journal_diagnostic(diagnostic) else (
-        _scratch_empty_journal_diagnostic("malformed", bytes_read=len(raw), records=exact_records)
+        _scratch_empty_journal_diagnostic(
+            "malformed",
+            sync_status=sync_status,
+            bytes_read=len(raw),
+            records=exact_records,
+        )
     )
 
 
+def _scratch_journal_sync_status() -> str:
+    try:
+        completed = subprocess.run(
+            ["journalctl", "--sync"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "SYSTEMD_COLORS": "0",
+                "SYSTEMD_PAGER": "cat",
+            },
+            cwd="/",
+            close_fds=True,
+            timeout=SCRATCH_SYNTHETIC_JOURNAL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except (OSError, subprocess.SubprocessError):
+        return "unavailable"
+    return "synced" if completed.returncode == 0 else "unavailable"
+
+
 def _scratch_unit_journal_diagnostic(
-    unit_name: str, *, mountpoint: pathlib.Path
+    unit_name: str,
+    *,
+    mountpoint: pathlib.Path,
+    terminal_snapshot: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Capture only bounded, exact-unit journal facts; never retain raw messages."""
     if _SCRATCH_GENERATED_UNIT_RE.fullmatch(unit_name) is None:
         return _scratch_empty_journal_diagnostic("malformed")
+    sync_status = _scratch_journal_sync_status()
     command = [
         "journalctl", "--no-pager", "--quiet", "--output=json",
         f"--lines={SCRATCH_SYNTHETIC_JOURNAL_QUERY_LINES}", f"--unit={unit_name}",
@@ -1879,6 +1965,8 @@ def _scratch_unit_journal_diagnostic(
         mountpoint=mountpoint,
         complete=complete,
         status=status,
+        sync_status=sync_status,
+        terminal_snapshot=terminal_snapshot,
     )
 
 
@@ -8534,7 +8622,9 @@ def _run_isolated_restore_drill(
                     pass
                 try:
                     journal_diagnostic = _scratch_unit_journal_diagnostic(
-                        unit_name, mountpoint=mountpoint
+                        unit_name,
+                        mountpoint=mountpoint,
+                        terminal_snapshot=terminal_snapshot,
                     )
                     if valid_scratch_unit_journal_diagnostic(journal_diagnostic):
                         setattr(
