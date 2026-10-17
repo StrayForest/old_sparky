@@ -38,20 +38,23 @@ sys.modules[SPEC.name] = backup_drill
 SPEC.loader.exec_module(backup_drill)
 
 
-def _write_synthetic_restore_diagnostic_artifact(
-    report: dict[str, Any], *, source_sha: str
-) -> pathlib.Path:
-    if (
-        not backup_drill.valid_scratch_synthetic_restore_diagnostic(report)
-        or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
-    ):
-        raise RuntimeError("Synthetic restore CI artifact context failed validation.")
-    artifact = {
-        "kind": "synthetic_restore_diagnostic_artifact",
-        "schema": 1,
-        "source_sha": source_sha,
-        "diagnostic": report,
+_SYNTHETIC_RESTORE_CI_ARTIFACT_NAMES = frozenset(
+    {
+        "synthetic-restore-diagnostic.json",
+        "synthetic-restore-diagnostic-failure.json",
     }
+)
+_SYNTHETIC_RESTORE_TEST_ID = (
+    "tests.test_platform_backup_restore_drill."
+    "PlatformBackupRestoreDrillTests.test_synthetic_pg16_restore_diagnostic_under_root"
+)
+
+
+def _write_synthetic_restore_ci_artifact(
+    name: str, artifact: dict[str, Any]
+) -> pathlib.Path:
+    if name not in _SYNTHETIC_RESTORE_CI_ARTIFACT_NAMES:
+        raise RuntimeError("Synthetic restore CI artifact name failed validation.")
     artifact_root = REPO_ROOT / "platform" / "ci-backend"
     artifact_directory = artifact_root / "backend-privileged"
     for directory in (artifact_root, artifact_directory):
@@ -72,32 +75,314 @@ def _write_synthetic_restore_diagnostic_artifact(
             or stat.S_IMODE(info.st_mode) != 0o755
         ):
             raise RuntimeError("Synthetic restore CI artifact directory failed validation.")
-    artifact_path = artifact_directory / "synthetic-restore-diagnostic.json"
+    artifact_path = artifact_directory / name
+    temporary_path = artifact_directory / f".{name}.tmp"
     descriptor = os.open(
-        artifact_path,
+        temporary_path,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0),
         0o644,
     )
+    temporary_created = True
     try:
         info = os.fstat(descriptor)
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.geteuid()
             or info.st_nlink != 1
-            or stat.S_IMODE(info.st_mode) != 0o644
         ):
             raise RuntimeError("Synthetic restore CI artifact file failed validation.")
-        payload = json.dumps(artifact, separators=(",", ":"), sort_keys=True).encode("ascii") + b"\n"
+        os.fchmod(descriptor, 0o644)
+        payload = (
+            json.dumps(artifact, separators=(",", ":"), sort_keys=True).encode("ascii")
+            + b"\n"
+        )
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             descriptor = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        # Publish only a complete report without replacing an earlier artifact.
+        os.link(temporary_path, artifact_path, follow_symlinks=False)
+        temporary_path.unlink()
+        temporary_created = False
+        published = artifact_path.lstat()
+        if (
+            not stat.S_ISREG(published.st_mode)
+            or published.st_uid != os.geteuid()
+            or published.st_nlink != 1
+            or stat.S_IMODE(published.st_mode) != 0o644
+        ):
+            raise RuntimeError("Synthetic restore artifact publication failed validation.")
+        directory_fd = os.open(
+            artifact_directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if temporary_created:
+            temporary_path.unlink(missing_ok=True)
     return artifact_path
+
+
+def _write_synthetic_restore_diagnostic_artifact(
+    report: dict[str, Any], *, source_sha: str
+) -> pathlib.Path:
+    if (
+        not backup_drill.valid_scratch_synthetic_restore_diagnostic(report)
+        or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+    ):
+        raise RuntimeError("Synthetic restore CI artifact context failed validation.")
+    artifact = {
+        "kind": "synthetic_restore_diagnostic_artifact",
+        "schema": 1,
+        "source_sha": source_sha,
+        "diagnostic": report,
+    }
+    return _write_synthetic_restore_ci_artifact(
+        "synthetic-restore-diagnostic.json", artifact
+    )
+
+
+_SYNTHETIC_RESTORE_STDERR_REASONS = frozenset(
+    {
+        "missing_module",
+        "missing_executable",
+        "missing_shared_library",
+        "permission_denied",
+        "namespace_setup_failure",
+        "invalid_command_argument",
+        "unknown_unit_property",
+        "systemd_bus_unavailable",
+    }
+)
+
+
+def _synthetic_restore_stderr_reason(line: str) -> str | None:
+    if re.fullmatch(
+        r"ModuleNotFoundError: No module named ['\"]"
+        r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*['\"]",
+        line,
+    ):
+        return "missing_module"
+    if re.fullmatch(
+        r"PermissionError: \[Errno [0-9]{1,3}\] Permission denied"
+        r"(?:: (?:'[^'\r\n]*'|\"[^\"\r\n]*\"))?",
+        line,
+    ) or re.fullmatch(
+        r"Failed at step EXEC spawning [^:\r\n]{1,512}: Permission denied",
+        line,
+    ):
+        return "permission_denied"
+    if re.fullmatch(
+        r"FileNotFoundError: \[Errno [0-9]{1,3}\] No such file or directory"
+        r"(?:: (?:'[^'\r\n]*'|\"[^\"\r\n]*\"))?",
+        line,
+    ) or re.fullmatch(
+        r"Failed at step EXEC spawning [^:\r\n]{1,512}: No such file or directory",
+        line,
+    ):
+        return "missing_executable"
+    if re.fullmatch(
+        r"[^:\r\n]{1,256}: error while loading shared libraries: "
+        r"[A-Za-z0-9_.+-]+\.so(?:\.[0-9]+)*: cannot open shared object file: "
+        r"No such file or directory",
+        line,
+    ) or re.fullmatch(
+        r"ImportError: [A-Za-z0-9_.+-]+\.so(?:\.[0-9]+)*: cannot open shared object file: "
+        r"No such file or directory",
+        line,
+    ):
+        return "missing_shared_library"
+    if re.fullmatch(
+        r"(?:systemd-run: )?Failed to set up (?:mount|user|network|IPC|UTS|cgroup|time) "
+        r"namespacing: (?:Permission denied|Operation not permitted|Invalid argument)",
+        line,
+    ) or re.fullmatch(
+        r"Failed at step NAMESPACE spawning [^:\r\n]{1,512}: "
+        r"(?:Permission denied|Operation not permitted|Invalid argument)",
+        line,
+    ):
+        return "namespace_setup_failure"
+    if re.fullmatch(
+        r"(?:systemd-run|postgres|initdb|pg_ctl|pg_restore|psql): "
+        r"(?:error: )?(?:unrecognized|unknown|invalid) (?:option|argument)(?: .*)?",
+        line,
+    ) or re.fullmatch(
+        r"[^:\r\n]{1,256}: error: unrecognized arguments: .+",
+        line,
+    ):
+        return "invalid_command_argument"
+    if re.fullmatch(
+        r"(?:systemd-run: )?Unknown assignment: [A-Za-z_][A-Za-z0-9_.]*=.*",
+        line,
+    ):
+        return "unknown_unit_property"
+    if re.fullmatch(
+        r"(?:systemd-run: )?Failed to connect to bus: .+", line
+    ) or re.fullmatch(
+        r"System has not been booted with systemd as init system .*Can't operate\.",
+        line,
+    ):
+        return "systemd_bus_unavailable"
+    return None
+
+
+def _classify_synthetic_restore_stderr(
+    stderr_suffix: bytes | None, *, complete: bool | None
+) -> dict[str, Any]:
+    if stderr_suffix is None:
+        if complete is not None:
+            raise RuntimeError("Synthetic restore stderr suffix metadata is inconsistent.")
+        return {
+            "schema": 1,
+            "classification": "unavailable",
+            "reasons": [],
+            "unknown_lines": 0,
+            "suffix_bytes": None,
+            "suffix_sha256": None,
+            "suffix_complete": None,
+        }
+    if type(stderr_suffix) is not bytes or len(stderr_suffix) > backup_drill.SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES:
+        raise RuntimeError("Synthetic restore stderr suffix exceeded its fixed evidence bound.")
+    if type(complete) is not bool:
+        raise RuntimeError("Synthetic restore stderr suffix completeness failed validation.")
+
+    # Classify the final bounded suffix only. Text is never included in the report.
+    reasons: list[str] = []
+    unknown_lines = 0 if complete else 1
+    for line in stderr_suffix.decode("utf-8", errors="replace").splitlines():
+        if not line:
+            continue
+        if len(line) > 1024 or any(ord(char) < 32 or ord(char) > 126 for char in line):
+            unknown_lines += 1
+            continue
+        reason = _synthetic_restore_stderr_reason(line)
+        if reason is None:
+            unknown_lines += 1
+        elif reason not in reasons:
+            reasons.append(reason)
+    if reasons and unknown_lines:
+        classification = "mixed"
+    elif reasons:
+        classification = "known"
+    else:
+        classification = "unknown"
+    if not set(reasons) <= _SYNTHETIC_RESTORE_STDERR_REASONS:
+        raise RuntimeError("Synthetic restore stderr reason failed closed validation.")
+    return {
+        "schema": 1,
+        "classification": classification,
+        "reasons": reasons,
+        "unknown_lines": unknown_lines,
+        "suffix_bytes": len(stderr_suffix),
+        "suffix_sha256": hashlib.sha256(stderr_suffix).hexdigest(),
+        "suffix_complete": complete,
+    }
+
+
+def _write_synthetic_restore_failure_artifact(
+    failure: Exception, *, source_sha: str
+) -> pathlib.Path:
+    if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
+        raise RuntimeError("Synthetic restore failure artifact source failed validation.")
+    unit_diagnostic = getattr(failure, "scratch_unit_diagnostic", None)
+    if unit_diagnostic is not None and not backup_drill.valid_scratch_unit_diagnostic(
+        unit_diagnostic
+    ):
+        raise RuntimeError("Synthetic restore failure unit summary failed validation.")
+    first_fault = getattr(failure, "scratch_first_fault", None)
+    if first_fault is not None and not backup_drill.valid_scratch_first_fault(first_fault):
+        raise RuntimeError("Synthetic restore failure site failed validation.")
+    cleanup_status = getattr(failure, "scratch_cleanup_status", "unknown")
+    if not backup_drill.valid_scratch_cleanup_status(cleanup_status):
+        raise RuntimeError("Synthetic restore cleanup status failed validation.")
+
+    private_output = getattr(failure, "scratch_unit_private_output", None)
+    if private_output is None:
+        if unit_diagnostic is not None:
+            raise RuntimeError("Synthetic restore output was missing its closed unit summary.")
+        stderr_suffix = None
+        stderr_suffix_complete = None
+    elif (
+        not isinstance(private_output, tuple)
+        or len(private_output) != 2
+        or any(type(part) is not bytes for part in private_output)
+        or len(private_output[0]) > backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES
+        or len(private_output[1]) > backup_drill.SCRATCH_PRIVATE_STDERR_BYTES
+    ):
+        raise RuntimeError("Synthetic restore failure output exceeded its closed bounds.")
+    else:
+        # Stdout and stderr text are never exported; only fixed reason enums and
+        # the bounded stderr byte count/hash are retained.
+        if unit_diagnostic is not None and (
+            len(private_output[0]) != unit_diagnostic["stdout_bytes"]
+            or len(private_output[1]) != unit_diagnostic["stderr_bytes"]
+            or hashlib.sha256(private_output[0]).hexdigest()
+            != unit_diagnostic["stdout_sha256"]
+            or hashlib.sha256(private_output[1]).hexdigest()
+            != unit_diagnostic["stderr_sha256"]
+        ):
+            raise RuntimeError("Synthetic restore failure output did not match its closed summary.")
+
+    if private_output is not None:
+        stderr_suffix = getattr(failure, "scratch_synthetic_stderr_tail", None)
+        stderr_suffix_complete = getattr(
+            failure, "scratch_synthetic_stderr_tail_complete", None
+        )
+        if stderr_suffix is not None and (
+            type(stderr_suffix) is not bytes
+            or len(stderr_suffix) > backup_drill.SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES
+            or type(stderr_suffix_complete) is not bool
+        ):
+            raise RuntimeError("Synthetic restore stderr suffix failed validation.")
+        if (
+            stderr_suffix is not None
+            and unit_diagnostic is not None
+            and not unit_diagnostic["stderr_truncated"]
+            and stderr_suffix != private_output[1][
+                -backup_drill.SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES :
+            ]
+        ):
+            raise RuntimeError("Synthetic restore stderr suffix did not match its closed summary.")
+    else:
+        stderr_suffix = None
+        stderr_suffix_complete = None
+
+    artifact = {
+        "kind": "synthetic_restore_diagnostic_failure_artifact",
+        "schema": 1,
+        "source_sha": source_sha,
+        "test_id": _SYNTHETIC_RESTORE_TEST_ID,
+        "failure_stage": "run_synthetic_restore_diagnostic",
+        "scratch_first_fault": first_fault,
+        "scratch_unit_diagnostic": unit_diagnostic,
+        "scratch_cleanup_status": cleanup_status,
+        "stderr_diagnostic": _classify_synthetic_restore_stderr(
+            stderr_suffix, complete=stderr_suffix_complete
+        ),
+    }
+    return _write_synthetic_restore_ci_artifact(
+        "synthetic-restore-diagnostic-failure.json", artifact
+    )
+
+
+def _run_synthetic_restore_diagnostic_for_ci(*, source_sha: str) -> dict[str, Any]:
+    try:
+        return backup_drill.run_synthetic_restore_diagnostic()
+    except Exception as failure:
+        try:
+            _write_synthetic_restore_failure_artifact(failure, source_sha=source_sha)
+        except Exception:
+            # The original diagnostic exception remains the test failure if
+            # secondary evidence cannot be retained; never serialize raw details.
+            pass
+        raise
 
 
 class StagedWorkerInput:
@@ -734,6 +1019,27 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill._scratch_postgres_start_options_for_diagnostic_arm(socket_dir, arms[2]),
             minimal_options,
         )
+        noisy_startup = b"x" * 8192 + b"\nModuleNotFoundError: No module named 'asyncpg'\n"
+        stderr_tail = bytearray()
+        for offset in range(0, len(noisy_startup), 1024):
+            backup_drill._scratch_append_bounded_tail(
+                stderr_tail,
+                noisy_startup[offset : offset + 1024],
+                backup_drill.SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES,
+            )
+        self.assertEqual(
+            bytes(stderr_tail),
+            noisy_startup[-backup_drill.SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES :],
+        )
+        noisy_startup_classification = _classify_synthetic_restore_stderr(
+            bytes(stderr_tail), complete=True
+        )
+        self.assertEqual(noisy_startup_classification["classification"], "mixed")
+        self.assertIn("missing_module", noisy_startup_classification["reasons"])
+        self.assertEqual(
+            noisy_startup_classification["suffix_bytes"],
+            backup_drill.SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES,
+        )
 
         report = {
             "kind": "synthetic_restore_diagnostic",
@@ -799,6 +1105,236 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "diagnostic": report,
                 },
             )
+            self.assertEqual(stat.S_IMODE(artifact_path.stat().st_mode), 0o644)
+            self.assertFalse(
+                (artifact_path.parent / ".synthetic-restore-diagnostic.json.tmp").exists()
+            )
+
+            synthetic_stdout = b"private stdout must not be exported"
+            synthetic_stderr = b"".join(
+                (
+                    b"ModuleNotFoundError: No module named 'asyncpg'\n",
+                    b"File '/root/private/secret.cfg', line 7\n",
+                    b"PermissionError: [Errno 13] Permission denied: '",
+                    b"/run/oldsparky-backup-restore-0123456789abcdef01234567/worker.py'\n",
+                    b"FileNotFoundError: [Errno 2] No such file or directory: '",
+                    b"/opt/runner/private/python'\n",
+                    b"/opt/runner/private/python: error while loading shared libraries: ",
+                    b"libpq.so.5: cannot open shared object file: No such file or directory\n",
+                    b"pg_ctl: error: invalid option '--private-argument=value'\n",
+                    b"systemd-run: Failed to connect to bus: No such file or directory\n",
+                    b"Failed at step NAMESPACE spawning /private/path: Operation not permitted\n",
+                    b"systemd-run: Unknown assignment: PrivateValue=secret-data\n",
+                    b"platform_backup_restore_drill.py: error: unrecognized arguments: private-value\n",
+                    b"password=must-not-export\n",
+                    b"runner id abcdef0123456789abcdef0123456789\n",
+                    b"warning /root/private path-with-spaces\n",
+                )
+            )
+            unit_diagnostic = {
+                "schema": 1,
+                "phase": "unit_exited_before_confinement",
+                "active_state": "failed",
+                "sub_state": "failed",
+                "result": "exit-code",
+                "exec_main_status": 127,
+                "launcher_exit_status": 1,
+                "stdout_bytes": len(synthetic_stdout),
+                "stdout_sha256": hashlib.sha256(synthetic_stdout).hexdigest(),
+                "stdout_truncated": False,
+                "stderr_bytes": len(synthetic_stderr),
+                "stderr_sha256": hashlib.sha256(synthetic_stderr).hexdigest(),
+                "stderr_truncated": False,
+                "verification_error": "none",
+                "verification_errno": None,
+            }
+            failure = RuntimeError("private exception text must not be exported")
+            failure.scratch_first_fault = {
+                "schema": 1,
+                "origin": "controller",
+                "site": "controller_unit_snapshot",
+                "exception_kind": "runtime",
+                "errno": None,
+            }
+            failure.scratch_unit_diagnostic = unit_diagnostic
+            failure.scratch_cleanup_status = "confirmed"
+            failure.scratch_unit_private_output = (synthetic_stdout, synthetic_stderr)
+            failure.scratch_synthetic_stderr_tail = synthetic_stderr[
+                -backup_drill.SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES :
+            ]
+            failure.scratch_synthetic_stderr_tail_complete = True
+            with (
+                mock.patch.object(sys.modules[__name__], "REPO_ROOT", temporary_root),
+                mock.patch.object(
+                    backup_drill,
+                    "run_synthetic_restore_diagnostic",
+                    side_effect=failure,
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    _run_synthetic_restore_diagnostic_for_ci(source_sha="e" * 40)
+            self.assertIs(raised.exception, failure)
+            failure_artifact_path = (
+                temporary_root
+                / "platform"
+                / "ci-backend"
+                / "backend-privileged"
+                / "synthetic-restore-diagnostic-failure.json"
+            )
+            failure_artifact = json.loads(
+                failure_artifact_path.read_text(encoding="ascii")
+            )
+            self.assertEqual(
+                set(failure_artifact),
+                {
+                    "kind",
+                    "schema",
+                    "source_sha",
+                    "test_id",
+                    "failure_stage",
+                    "scratch_first_fault",
+                    "scratch_unit_diagnostic",
+                    "scratch_cleanup_status",
+                    "stderr_diagnostic",
+                },
+            )
+            self.assertEqual(
+                failure_artifact["kind"],
+                "synthetic_restore_diagnostic_failure_artifact",
+            )
+            self.assertEqual(failure_artifact["source_sha"], "e" * 40)
+            self.assertEqual(failure_artifact["test_id"], _SYNTHETIC_RESTORE_TEST_ID)
+            self.assertEqual(failure_artifact["failure_stage"], "run_synthetic_restore_diagnostic")
+            self.assertEqual(
+                failure_artifact["scratch_unit_diagnostic"], unit_diagnostic
+            )
+            self.assertEqual(
+                failure_artifact["scratch_first_fault"], failure.scratch_first_fault
+            )
+            self.assertEqual(failure_artifact["scratch_cleanup_status"], "confirmed")
+            stderr_diagnostic = failure_artifact["stderr_diagnostic"]
+            self.assertEqual(
+                set(stderr_diagnostic),
+                {
+                    "schema",
+                    "classification",
+                    "reasons",
+                    "unknown_lines",
+                    "suffix_bytes",
+                    "suffix_sha256",
+                    "suffix_complete",
+                },
+            )
+            self.assertEqual(stderr_diagnostic["schema"], 1)
+            self.assertEqual(stderr_diagnostic["classification"], "mixed")
+            self.assertEqual(
+                stderr_diagnostic["reasons"],
+                [
+                    "missing_module",
+                    "permission_denied",
+                    "missing_executable",
+                    "missing_shared_library",
+                    "invalid_command_argument",
+                    "systemd_bus_unavailable",
+                    "namespace_setup_failure",
+                    "unknown_unit_property",
+                ],
+            )
+            self.assertGreater(stderr_diagnostic["unknown_lines"], 0)
+            self.assertEqual(
+                stderr_diagnostic["suffix_bytes"],
+                len(failure.scratch_synthetic_stderr_tail),
+            )
+            self.assertEqual(
+                stderr_diagnostic["suffix_sha256"],
+                hashlib.sha256(failure.scratch_synthetic_stderr_tail).hexdigest(),
+            )
+            self.assertTrue(stderr_diagnostic["suffix_complete"])
+            for private_value in (
+                "/root/",
+                "secret.cfg",
+                "0123456789abcdef",
+                "must-not-export",
+                "private stdout",
+                "private exception text",
+                "path-with-spaces",
+                "/opt/runner/private/python",
+                "libpq.so.5",
+                "private-argument",
+                "secret-data",
+                "private-value",
+                "private-user@example.invalid",
+            ):
+                self.assertNotIn(private_value, json.dumps(failure_artifact))
+            self.assertFalse(failure_artifact_path.stat().st_mode & 0o022)
+            self.assertEqual(stat.S_IMODE(failure_artifact_path.stat().st_mode), 0o644)
+            self.assertFalse(
+                (
+                    failure_artifact_path.parent
+                    / ".synthetic-restore-diagnostic-failure.json.tmp"
+                ).exists()
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "unit summary"):
+            malformed_failure = RuntimeError("private")
+            malformed_failure.scratch_unit_diagnostic = {"schema": 1}
+            _write_synthetic_restore_failure_artifact(
+                malformed_failure, source_sha="e" * 40
+            )
+        with self.assertRaisesRegex(RuntimeError, "closed bounds"):
+            oversized_failure = RuntimeError("private")
+            oversized_failure.scratch_unit_private_output = (
+                b"x" * (backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES + 1),
+                b"",
+            )
+            _write_synthetic_restore_failure_artifact(
+                oversized_failure, source_sha="e" * 40
+            )
+        with self.assertRaisesRegex(RuntimeError, "evidence bound"):
+            _classify_synthetic_restore_stderr(
+                b"x" * (backup_drill.SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES + 1),
+                complete=True,
+            )
+        ambiguous_stderr = (
+            b"path /root/private with ambiguous spaces\n"
+            b"password=private\n"
+            b"database row contains private-user@example.invalid\n"
+        )
+        ambiguous_diagnostic = _classify_synthetic_restore_stderr(
+            ambiguous_stderr, complete=True
+        )
+        self.assertEqual(ambiguous_diagnostic["classification"], "unknown")
+        self.assertEqual(ambiguous_diagnostic["reasons"], [])
+        self.assertEqual(ambiguous_diagnostic["suffix_bytes"], len(ambiguous_stderr))
+        incomplete_diagnostic = _classify_synthetic_restore_stderr(
+            b"PermissionError: [Errno 13] Permission denied: '/private/path'\n",
+            complete=False,
+        )
+        self.assertEqual(incomplete_diagnostic["classification"], "mixed")
+        self.assertEqual(incomplete_diagnostic["unknown_lines"], 1)
+        self.assertFalse(incomplete_diagnostic["suffix_complete"])
+        unavailable_diagnostic = _classify_synthetic_restore_stderr(
+            None, complete=None
+        )
+        self.assertEqual(unavailable_diagnostic["classification"], "unavailable")
+        with self.assertRaisesRegex(RuntimeError, "metadata is inconsistent"):
+            _classify_synthetic_restore_stderr(None, complete=True)
+        reporter_error = RuntimeError("original synthetic failure")
+        with (
+            mock.patch.object(
+                backup_drill,
+                "run_synthetic_restore_diagnostic",
+                side_effect=reporter_error,
+            ),
+            mock.patch.object(
+                sys.modules[__name__],
+                "_write_synthetic_restore_failure_artifact",
+                side_effect=OSError("artifact write failed"),
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                _run_synthetic_restore_diagnostic_for_ci(source_sha="e" * 40)
+        self.assertIs(raised.exception, reporter_error)
 
     def test_synthetic_pg16_restore_diagnostic_under_root(self) -> None:
         if (
@@ -807,7 +1343,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         ):
             self.skipTest("real PostgreSQL restore diagnostics run only in the ephemeral GitHub-hosted gate")
         self.assertEqual(os.geteuid(), 0)
-        report = backup_drill.run_synthetic_restore_diagnostic()
+        source_sha = os.environ.get("GITHUB_SHA", "")
+        self.assertRegex(source_sha, r"^[0-9a-f]{40}$")
+        report = _run_synthetic_restore_diagnostic_for_ci(source_sha=source_sha)
         self.assertTrue(backup_drill.valid_scratch_synthetic_restore_diagnostic(report))
         self.assertEqual(
             [arm["name"] for arm in report["arms"]],
@@ -820,8 +1358,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 self.assertGreater(arm["tmpfs_peak_sampled_bytes"], 0)
                 self.assertGreaterEqual(arm["wal_bytes"], 0)
                 self.assertGreater(arm["elapsed_ms"], 0)
-        source_sha = os.environ.get("GITHUB_SHA", "")
-        self.assertRegex(source_sha, r"^[0-9a-f]{40}$")
         artifact_path = _write_synthetic_restore_diagnostic_artifact(
             report, source_sha=source_sha
         )
@@ -1553,11 +2089,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         required_bytes = backup_drill.SCRATCH_MEMORY_ADMISSION_BYTES
         guard_sites = (
             "parent_before_authorization_probe",
+            "parent_before_synthetic_restore_diagnostic",
             "parent_before_archive_open",
             "parent_before_unit_launch",
             "parent_active_poll",
             "parent_after_worker_cleanup",
             "worker_after_start_before_authorization_probe",
+            "worker_after_start_before_synthetic_diagnostic",
             "worker_after_start_before_archive_open",
             "worker_after_initdb_before_postgres_start",
             "worker_after_postgres_start",
@@ -1808,6 +2346,14 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         def call_site_constants(function: Any, function_name: str) -> list[str]:
             tree = ast.parse(inspect.getsource(function))
             result: list[str] = []
+
+            def constant_strings(node: ast.expr) -> list[str]:
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    return [node.value]
+                if isinstance(node, ast.IfExp):
+                    return constant_strings(node.body) + constant_strings(node.orelse)
+                return []
+
             for node in sorted(
                 ast.walk(tree), key=lambda candidate: getattr(candidate, "lineno", 0)
             ):
@@ -1818,15 +2364,14 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 )
                 if called_name != function_name:
                     continue
-                if node.args and isinstance(node.args[0], ast.Constant):
-                    result.append(node.args[0].value)
-                else:
-                    result.extend(
-                        keyword.value.value
-                        for keyword in node.keywords
-                        if keyword.arg == "guard_site"
-                        and isinstance(keyword.value, ast.Constant)
-                    )
+                if node.args:
+                    result.extend(constant_strings(node.args[0]))
+                result.extend(
+                    value
+                    for keyword in node.keywords
+                    if keyword.arg == "guard_site"
+                    for value in constant_strings(keyword.value)
+                )
             return result
 
         self.assertEqual(
@@ -1835,11 +2380,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ),
             [
                 "parent_before_authorization_probe",
+                "parent_before_synthetic_restore_diagnostic",
                 "parent_before_archive_open",
                 "parent_before_unit_launch",
                 "parent_active_poll",
-                # Probe and full-restore success use separate return paths,
-                # each with the same final parent reserve check.
+                # Probe, synthetic diagnostic, and full restore each have a
+                # separate success return with the same final parent reserve check.
+                "parent_after_worker_cleanup",
                 "parent_after_worker_cleanup",
                 "parent_after_worker_cleanup",
             ],
@@ -1851,6 +2398,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ),
             [
                 "worker_after_start_before_authorization_probe",
+                "worker_after_start_before_synthetic_diagnostic",
                 "worker_after_start_before_archive_open",
             ],
         )

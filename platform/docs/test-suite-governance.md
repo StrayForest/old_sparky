@@ -426,6 +426,10 @@ cd platform
 ```
 
 Use the repository's `.venv_platform` interpreter for Python gates; a system `python3` may lack the required dependencies and is not a canonical owner run.
+Before publishing release-tooling changes, run the full canonical focused owner
+slice, not only selected methods. If `.venv_platform` is unavailable, a
+documented system-Python supplement may cover dependency-safe owner cases, but
+the canonical gate remains `LOCAL GATE BLOCKED` until its external pass.
 
 `LOCAL GATE BLOCKED` means a required safe dependency such as test PostgreSQL,
 isolated Redis or Chromium is unavailable. A smaller substitute must not be

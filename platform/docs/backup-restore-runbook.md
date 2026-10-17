@@ -6,7 +6,7 @@
 
 ## Ephemeral synthetic restore diagnostic
 
-The privileged Security contour runs a fixed synthetic PG16 custom archive through three serial restores inside the verified scratch unit. The [test-suite governance](test-suite-governance.md) owns its fixture, equivalence checks, runner preflight and sanitized metrics artifact. This small diagnostic does not change production restore settings or prove full-restore capacity.
+The privileged Security contour runs a fixed synthetic PG16 custom archive through three serial restores inside the verified scratch unit. The [test-suite governance](test-suite-governance.md) owns its fixture, equivalence checks, runner preflight and sanitized success metrics artifact. This diagnostic does not change production restore settings or prove full-restore capacity. On failure, sibling `synthetic-restore-diagnostic-failure.json` retains fixed reason enums, unit status and bounded stderr byte/hash metadata; `unknown` is not a cause and the failure artifact contains no successful three-arm metrics.
 
 ## Local verified backup
 

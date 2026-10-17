@@ -115,6 +115,7 @@ SCRATCH_PHASES = (
 )
 SCRATCH_PRIVATE_STDOUT_BYTES = 2 * 1024
 SCRATCH_PRIVATE_STDERR_BYTES = 32 * 1024
+SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES = 4 * 1024
 SCRATCH_PRIVATE_RAW_BYTES = SCRATCH_PRIVATE_STDOUT_BYTES + SCRATCH_PRIVATE_STDERR_BYTES
 SCRATCH_PRIVATE_ENVELOPE_BYTES = 48 * 1024
 SCRATCH_AUTHORIZATION_PROBE_FRAME = (
@@ -554,11 +555,13 @@ _SCRATCH_HOST_GUARD_SITES = frozenset(
     {
         "parent_before_archive_open",
         "parent_before_authorization_probe",
+        "parent_before_synthetic_restore_diagnostic",
         "parent_before_unit_launch",
         "parent_active_poll",
         "parent_after_worker_cleanup",
         "worker_after_start_before_archive_open",
         "worker_after_start_before_authorization_probe",
+        "worker_after_start_before_synthetic_diagnostic",
         "worker_after_initdb_before_postgres_start",
         "worker_after_postgres_start",
         "worker_pg_restore_resource_guard",
@@ -6906,6 +6909,8 @@ def _scratch_drain_early_exit_output(
     stderr_buffer: bytearray,
     stdout_observed: int,
     stderr_observed: int,
+    *,
+    stderr_tail_buffer: bytearray | None = None,
 ) -> tuple[dict[str, bool], int, int]:
     """Drain stopped-launcher pipes to EOF, bounded by time and bytes.
 
@@ -6967,6 +6972,10 @@ def _scratch_drain_early_exit_output(
                 stdout_observed += len(data)
             else:
                 stderr_observed += len(data)
+                if stderr_tail_buffer is not None:
+                    _scratch_append_bounded_tail(
+                        stderr_tail_buffer, data, SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES
+                    )
             if len(prefix) < cap:
                 prefix.extend(data[: cap - len(prefix)])
             if drained[name] > SCRATCH_EARLY_EXIT_DRAIN_BYTES:
@@ -6980,10 +6989,24 @@ def _scratch_drain_early_exit_output(
     return complete, stdout_observed, stderr_observed
 
 
+def _scratch_append_bounded_tail(buffer: bytearray, data: bytes, cap: int) -> None:
+    if type(buffer) is not bytearray or type(data) is not bytes or type(cap) is not int or cap <= 0:
+        raise ValueError("Scratch diagnostic tail buffer is invalid.")
+    if len(data) >= cap:
+        buffer[:] = data[-cap:]
+        return
+    overflow = len(buffer) + len(data) - cap
+    if overflow > 0:
+        del buffer[:overflow]
+    buffer.extend(data)
+
+
 def _scratch_drain_phase_prefix_now(
     process: subprocess.Popen[bytes],
     stderr_buffer: bytearray,
     stderr_observed: int,
+    *,
+    stderr_tail_buffer: bytearray | None = None,
 ) -> tuple[int, bool]:
     """Take one immediate, nonblocking, bounded stderr prefix before stopping."""
     stream = process.stderr
@@ -7007,6 +7030,10 @@ def _scratch_drain_phase_prefix_now(
             break
         drained += len(block)
         stderr_observed += len(block)
+        if stderr_tail_buffer is not None:
+            _scratch_append_bounded_tail(
+                stderr_tail_buffer, block, SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES
+            )
         if len(stderr_buffer) < SCRATCH_PRIVATE_STDERR_BYTES:
             stderr_buffer.extend(block[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
         if drained > SCRATCH_PRIVATE_STDERR_BYTES:
@@ -7547,6 +7574,9 @@ def _run_isolated_restore_drill(
         process: subprocess.Popen[bytes] | None = None
         stdout_buffer = bytearray()
         stderr_buffer = bytearray()
+        stderr_tail_buffer = (
+            bytearray() if synthetic_restore_diagnostic else None
+        )
         stdout_observed = 0
         stderr_size = 0
         early_exit_snapshot: dict[str, Any] | None = None
@@ -7658,7 +7688,10 @@ def _run_isolated_restore_drill(
                         try:
                             if process is not None:
                                 stderr_size, _phase_prefix_eof = _scratch_drain_phase_prefix_now(
-                                    process, stderr_buffer, stderr_size
+                                    process,
+                                    stderr_buffer,
+                                    stderr_size,
+                                    stderr_tail_buffer=stderr_tail_buffer,
                                 )
                                 phase_prefix = bytes(stderr_buffer)
                                 phase_prefix_observed = stderr_size
@@ -7861,6 +7894,12 @@ def _run_isolated_restore_drill(
                             raise RuntimeError("Scratch restore worker output exceeded its closed bound.")
                     else:
                         stderr_size += len(data)
+                        if stderr_tail_buffer is not None:
+                            _scratch_append_bounded_tail(
+                                stderr_tail_buffer,
+                                data,
+                                SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES,
+                            )
                         if len(stderr_buffer) < SCRATCH_PRIVATE_STDERR_BYTES:
                             stderr_buffer.extend(data[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
                         if stderr_size > 65536:
@@ -7957,6 +7996,12 @@ def _run_isolated_restore_drill(
                                 raise RuntimeError("Scratch restore worker output exceeded its closed bound.")
                         else:
                             stderr_size += len(data)
+                            if stderr_tail_buffer is not None:
+                                _scratch_append_bounded_tail(
+                                    stderr_tail_buffer,
+                                    data,
+                                    SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES,
+                                )
                             if len(stderr_buffer) < SCRATCH_PRIVATE_STDERR_BYTES:
                                 stderr_buffer.extend(data[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
                         if stderr_size > 65536:
@@ -8086,8 +8131,20 @@ def _run_isolated_restore_drill(
                             stderr_buffer,
                             stdout_observed,
                             stderr_size,
+                            stderr_tail_buffer=stderr_tail_buffer,
                         )
                     )
+                    if synthetic_restore_diagnostic:
+                        setattr(
+                            operation_error,
+                            "scratch_synthetic_stderr_tail",
+                            bytes(stderr_tail_buffer or b""),
+                        )
+                        setattr(
+                            operation_error,
+                            "scratch_synthetic_stderr_tail_complete",
+                            drain_complete["stderr"],
+                        )
                     stdout_prefix = bytes(stdout_buffer[:SCRATCH_PRIVATE_STDOUT_BYTES])
                     stderr_prefix = bytes(stderr_buffer[:SCRATCH_PRIVATE_STDERR_BYTES])
                     if private_scratch_diagnostics:
