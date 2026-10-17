@@ -868,6 +868,37 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 check_case(case, expected_reason)
 
     def test_required_reuse_policy_runs_real_proof_cli_and_persists_its_receipt(self) -> None:
+        proof_python = self.root / "venv-reuse-proof-python"
+        proof_python.write_text(
+            # Model only the exact proof/installer pip vectors; this does not
+            # validate a real pip environment.
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "if [ \"$#\" -eq 5 ] && [ \"$1\" = '-B' ] && [ \"$2\" = '-I' ] "
+            "&& [ \"$3\" = '-m' ] && [ \"$4\" = 'pip' ] && [ \"$5\" = 'check' ]; then\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [ \"$#\" -eq 6 ] && [ \"$1\" = '-B' ] && [ \"$2\" = '-I' ] "
+            "&& [ \"$3\" = '-m' ] && [ \"$4\" = 'pip' ] "
+            "&& [ \"$5\" = 'freeze' ] && [ \"$6\" = '--all' ]; then\n"
+            "  printf '%s\\n' 'pip==26.1.2'\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [ \"$#\" -eq 5 ] && [ \"$1\" = '-I' ] && [ \"$2\" = '-B' ] "
+            "&& [ \"$3\" = '-m' ] && [ \"$4\" = 'pip' ] && [ \"$5\" = 'check' ]; then\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [ \"$#\" -eq 6 ] && [ \"$1\" = '-I' ] && [ \"$2\" = '-B' ] "
+            "&& [ \"$3\" = '-m' ] && [ \"$4\" = 'pip' ] "
+            "&& [ \"$5\" = 'freeze' ] && [ \"$6\" = '--all' ]; then\n"
+            "  printf '%s\\n' 'pip==26.1.2'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 64\n",
+            encoding="ascii",
+        )
+        proof_python.chmod(0o755)
+
         def prepare_case(name: str, *, corrupt_origin: bool) -> tuple[Path, Path, Path, Path]:
             current = self.add_installed_release(f"strict-current-{name}")
             previous = self.add_installed_release(f"strict-previous-{name}")
@@ -935,8 +966,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             venv.chmod(0o755)
             (venv / "bin").chmod(0o755)
             site_packages.chmod(0o755)
-            base_python = Path("/usr/bin/python3.12")
-            self.assertTrue(base_python.is_file())
+            base_python = proof_python
             for name_alias in ("python", "python3", "python3.12"):
                 (venv / "bin" / name_alias).symlink_to(base_python)
             (venv / "pyvenv.cfg").write_text(
@@ -944,21 +974,6 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 encoding="ascii",
             )
             (venv / "pyvenv.cfg").chmod(0o644)
-            pip_package = site_packages / "pip"
-            pip_package.mkdir(mode=0o755)
-            (pip_package / "__init__.py").write_text("__version__ = '26.1.2'\n")
-            (pip_package / "__main__.py").write_text(
-                "import sys\n"
-                "args = sys.argv[1:]\n"
-                "if args == ['check']:\n    raise SystemExit(0)\n"
-                "if args == ['freeze', '--all']:\n"
-                "    print('pip==26.1.2')\n    raise SystemExit(0)\n"
-                "raise SystemExit(64)\n",
-                encoding="ascii",
-            )
-            (pip_package / "__init__.py").chmod(0o644)
-            (pip_package / "__main__.py").chmod(0o644)
-
             if corrupt_origin:
                 previous_file = current / ".rollback" / "previous-release"
                 previous_file.write_text(
@@ -994,6 +1009,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             "import os\n"
             "from pathlib import Path\n"
             "import sys\n"
+            "import subprocess\n"
             "real = Path(__file__).with_name('platform_verify_venv_reuse_real.py')\n"
             "spec = importlib.util.spec_from_file_location('reuse_cli_real', real)\n"
             "module = importlib.util.module_from_spec(spec)\n"
@@ -1006,16 +1022,54 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             "if trace:\n"
             "    with open(trace, 'a', encoding='ascii') as stream:\n"
             "        stream.write('main\\n')\n"
-            "OriginalReuseRefused = module.ReuseRefused\n"
-            "runtime_refusals = {'base_python', 'venv_directory', 'venv_python', 'runtime_abi', 'venv_config'}\n"
-            "class TracedReuseRefused(OriginalReuseRefused):\n"
-            "    def __init__(self, reason):\n"
+            "original_prove = module.prove\n"
+            "closed_refusals = {\n"
+            "    'current_pointer': 'pointer_binding', 'previous_pointer': 'pointer_binding',\n"
+            "    'candidate': 'pointer_binding',\n"
+            "    'transaction_identity': 'transaction_binding',\n"
+            "    'transaction_missing': 'transaction_binding',\n"
+            "    'transaction_state': 'transaction_binding',\n"
+            "    'release_identity': 'release_binding',\n"
+            "    'dependency_inputs': 'dependency_binding',\n"
+            "    'origin_receipt_binding': 'origin_proof',\n"
+            "    'origin_receipt_changed': 'origin_proof',\n"
+            "    'origin_receipt_metadata': 'origin_proof',\n"
+            "    'origin_receipt_schema': 'origin_proof',\n"
+            "    'origin_chain_cycle': 'origin_proof',\n"
+            "    'origin_chain_limit': 'origin_proof',\n"
+            "    'pip_state': 'pip_check', 'freeze': 'pip_freeze',\n"
+            "    'venv_directory': 'venv_metadata',\n"
+            "}\n"
+            "def traced_prove(*args, **kwargs):\n"
+            "    try:\n"
+            "        result = original_prove(*args, **kwargs)\n"
+            "    except module.ReuseRefused as exc:\n"
+            "        reason = str(exc)\n"
+            "        label = 'proof_refusal:' + closed_refusals.get(reason, 'other')\n"
             "        if trace:\n"
-            "            label = 'runtime_refusal:' + reason if reason in runtime_refusals else 'proof_refusal'\n"
             "            with open(trace, 'a', encoding='ascii') as stream:\n"
             "                stream.write(label + '\\n')\n"
-            "        super().__init__(reason)\n"
-            "module.ReuseRefused = TracedReuseRefused\n"
+            "        raise\n"
+            "    except OSError:\n"
+            "        if trace:\n"
+            "            with open(trace, 'a', encoding='ascii') as stream:\n"
+            "                stream.write('proof_os_error\\n')\n"
+            "        raise\n"
+            "    except ValueError:\n"
+            "        if trace:\n"
+            "            with open(trace, 'a', encoding='ascii') as stream:\n"
+            "                stream.write('proof_value_error\\n')\n"
+            "        raise\n"
+            "    except subprocess.SubprocessError:\n"
+            "        if trace:\n"
+            "            with open(trace, 'a', encoding='ascii') as stream:\n"
+            "                stream.write('proof_subprocess_error\\n')\n"
+            "        raise\n"
+            "    if trace:\n"
+            "        with open(trace, 'a', encoding='ascii') as stream:\n"
+            "            stream.write('proof_pass\\n')\n"
+            "    return result\n"
+            "module.prove = traced_prove\n"
             "output = io.StringIO()\n"
             "with contextlib.redirect_stdout(output):\n"
             "    status = module.main()\n"
@@ -1024,6 +1078,9 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             "    proof = json.loads(proof_output)\n"
             "    proof['venv_ino'] += 1\n"
             "    proof_output = json.dumps(proof, sort_keys=True, separators=(',', ':')) + '\\n'\n"
+            "    if trace:\n"
+            "        with open(trace, 'a', encoding='ascii') as stream:\n"
+            "            stream.write('proof_output_tampered\\n')\n"
             "sys.stdout.write(proof_output)\n"
             "raise SystemExit(status)\n",
             encoding="ascii",
@@ -1072,22 +1129,25 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 )
             candidate_after = self.releases_dir / f"strict-reuse-{case}-{BUILT_AT}"
             if corrupt_origin or tamper_proof:
+                safe_trace = trace.read_text(encoding="ascii")
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(
-                    trace.read_text(encoding="ascii"),
-                    "main\nproof_refusal\n" if corrupt_origin else "main\n",
-                )
+                self.assertEqual(safe_trace, "main\nproof_refusal:transaction_binding\n" if corrupt_origin else "main\nproof_pass\nproof_output_tampered\n")
                 self.assertIn("class=venv_policy stage=venv_policy_proof", result.stderr)
                 self.assertEqual((self.app_dir / "current").resolve(), current)
                 self.assertEqual((self.app_dir / "previous").resolve().name, f"strict-previous-{case}")
                 self.assertEqual((venv.stat().st_dev, venv.stat().st_ino), (before_venv.st_dev, before_venv.st_ino))
                 self.assertFalse((candidate_after / ".rollback" / "venv-origin.json").exists())
             else:
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                safe_trace = trace.read_text(encoding="ascii")
+                self.assertEqual(safe_trace, "main\nproof_pass\n")
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    result.stdout + result.stderr + f"\nclosed proof trace: {safe_trace}",
+                )
                 self.assertEqual((self.app_dir / "current").resolve(), current)
                 self.assertEqual((self.app_dir / "previous").resolve().name, f"strict-previous-{case}")
                 self.assertEqual((venv.stat().st_dev, venv.stat().st_ino), (before_venv.st_dev, before_venv.st_ino))
-                self.assertEqual(trace.read_text(encoding="ascii"), "main\n")
                 receipt_path = candidate_after / ".rollback" / "venv-origin.json"
                 receipt = json.loads(receipt_path.read_text(encoding="ascii"))
                 self.assertEqual(receipt["release_slug"], candidate_after.name)
