@@ -8692,7 +8692,6 @@ def _run_isolated_restore_drill(
         phase_drain_monotonic_ns: int | None = None
         synthetic_protected_path_dirs: tuple[tuple[str, int, int], ...] = ()
         synthetic_opt_parent_adjustment: tuple[int, int, int, int, int, int, int] | None = None
-        synthetic_protected_paths_cleaned = not synthetic_restore_diagnostic
         blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
         setup_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
         try:
