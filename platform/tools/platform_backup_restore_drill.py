@@ -81,7 +81,7 @@ SCRATCH_TMPFS_STOP_BYTES = 64 * 1024**2
 SCRATCH_RUNTIME_SECONDS = 15 * 60
 SCRATCH_STARTUP_SECONDS = 30
 SCRATCH_RUNTIME_SAMPLE_SECONDS = 0.25
-SCRATCH_SYNTHETIC_ARCHIVE_MAX_BYTES = 1024 * 1024
+SCRATCH_SYNTHETIC_ARCHIVE_MAX_BYTES = 48 * 1024**2
 SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS = 0.01
 SCRATCH_SYNTHETIC_JOURNAL_MAX_BYTES = 16 * 1024
 SCRATCH_SYNTHETIC_JOURNAL_MAX_LINES = 32
@@ -120,6 +120,7 @@ SCRATCH_PHASES = (
 SCRATCH_PRIVATE_STDOUT_BYTES = 2 * 1024
 SCRATCH_PRIVATE_STDERR_BYTES = 32 * 1024
 SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES = 4 * 1024
+SCRATCH_SYNTHETIC_RESULT_MAX_BYTES = 8 * 1024
 SCRATCH_PRIVATE_RAW_BYTES = SCRATCH_PRIVATE_STDOUT_BYTES + SCRATCH_PRIVATE_STDERR_BYTES
 SCRATCH_PRIVATE_ENVELOPE_BYTES = 48 * 1024
 SCRATCH_AUTHORIZATION_PROBE_FRAME = (
@@ -130,8 +131,25 @@ SCRATCH_SYNTHETIC_RESTORE_ARMS = (
     ("minimal_no_senders", "minimal", 0, False),
     ("minimal_no_senders_single_transaction", "minimal", 0, True),
 )
-SCRATCH_SYNTHETIC_FIXTURE_ID = "platform_backup_restore_synthetic_v1"
+SCRATCH_SYNTHETIC_RESTORE_PHASES = ("restore_platform", "restore_public")
+SCRATCH_SYNTHETIC_PAYLOAD_ROWS = 4096
+SCRATCH_SYNTHETIC_PAYLOAD_BYTES_PER_ROW = 8192
+SCRATCH_SYNTHETIC_PAYLOAD_BLOCKS = 255
+SCRATCH_SYNTHETIC_PAYLOAD_SEED = "oldsparky-backup-restore-synthetic-v2"
+SCRATCH_SYNTHETIC_PAYLOAD_BYTES = (
+    SCRATCH_SYNTHETIC_PAYLOAD_ROWS * SCRATCH_SYNTHETIC_PAYLOAD_BYTES_PER_ROW
+)
+SCRATCH_SYNTHETIC_FIXTURE_ID = "platform_backup_restore_synthetic_bulk_v2"
 SCRATCH_SYNTHETIC_ALEMBIC_REVISION = "synthetic_restore_revision_001"
+SCRATCH_SYNTHETIC_TRGM_INDEX = "synthetic_restore_probe_search_trgm_idx"
+SCRATCH_SYNTHETIC_MEMORY_SCOPE = "unit_cgroup_peak_since_phase_start_reset"
+SCRATCH_SYNTHETIC_WAL_SCOPE = "cluster_pg_stat_wal_delta_after_restore_db_backend_drain"
+SCRATCH_SYNTHETIC_ELAPSED_SCOPE = "monotonic_ns_around_pg_restore_command"
+SCRATCH_SYNTHETIC_PHASE_ELAPSED_SCOPE = "monotonic_ns_precheck_through_postcheck"
+SCRATCH_SYNTHETIC_TMPFS_SCOPE = "sampled_high_water_during_pg_restore_command"
+SCRATCH_SYNTHETIC_WAL_BACKEND_DRAIN_SECONDS = 5.0
+SCRATCH_SYNTHETIC_WAL_QUERY_TIMEOUT_SECONDS = 1.0
+SCRATCH_SYNTHETIC_WAL_POLL_SECONDS = 0.05
 _SCRATCH_INACCESSIBLE_PATHS = (
     "/opt/oldsparky/platform/shared",
     "/var/lib/postgresql",
@@ -160,12 +178,6 @@ _SCRATCH_IDENTITY_COMPARISON_PROPERTIES = (
     "exec_main_pid",
     "invocation_id",
 )
-SCRATCH_SYNTHETIC_EXPECTED_ROWS = (
-    (1, "alpha", "restore fixture alpha"),
-    (2, "beta", "restore fixture beta"),
-    (3, "gamma", "restore fixture gamma"),
-)
-
 _SCRATCH_FIRST_FAULT_ORIGINS = frozenset({"controller", "worker"})
 _SCRATCH_FIRST_FAULT_SITES = frozenset(
     {
@@ -4563,10 +4575,106 @@ def _rollback_published_backup_pair(
         raise RuntimeError("Could not roll back the exact newly published backup pair.")
 
 
-def _scratch_synthetic_restore_snapshot(
-    target: DatabaseTarget, *, psql_binary: str = "psql"
+def _scratch_synthetic_expected_rows() -> list[list[Any]]:
+    """Build fixed row digests without retaining the bulk payload in memory."""
+    expected: list[list[Any]] = []
+    seed = SCRATCH_SYNTHETIC_PAYLOAD_SEED
+    for row_id in range(1, SCRATCH_SYNTHETIC_PAYLOAD_ROWS + 1):
+        digest = hashlib.md5()
+        digest.update(f"{row_id:08d}".encode("ascii"))
+        for block in range(1, SCRATCH_SYNTHETIC_PAYLOAD_BLOCKS + 1):
+            block_digest = hashlib.md5(
+                f"{seed}:{row_id}:{block}".encode("ascii")
+            ).hexdigest()
+            digest.update(block_digest.encode("ascii"))
+        tail = hashlib.md5(f"{seed}:tail:{row_id}".encode("ascii")).hexdigest()[:24]
+        digest.update(tail.encode("ascii"))
+        expected.append([row_id, f"row-{row_id:08d}", digest.hexdigest()])
+    return expected
+
+
+def _scratch_synthetic_restore_payload_state(
+    target: DatabaseTarget,
+    *,
+    expected_rows: list[list[Any]],
+    psql_binary: str = "psql",
 ) -> dict[str, Any]:
-    """Assert the fixed synthetic fixture after the production restore path."""
+    """Check exact synthetic bulk bytes and row digests at one phase boundary."""
+    presence = run_command(
+        [
+            psql_binary,
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            *connection_args(target),
+            "--command",
+            "SELECT to_regclass('platform.synthetic_restore_probe') IS NOT NULL;",
+        ],
+        target=target,
+        capture_output=True,
+    )
+    if presence.stdout.strip() == "f":
+        return {"table_present": False}
+    if presence.stdout.strip() != "t":
+        raise RuntimeError("Synthetic restore payload presence check was invalid.")
+    result = run_command(
+        [
+            psql_binary,
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            *connection_args(target),
+            "--command",
+            """
+            SELECT jsonb_build_object(
+                'table_present', true,
+                'rows', (
+                    SELECT COALESCE(
+                        jsonb_agg(jsonb_build_array(id, label, md5(search_text)) ORDER BY id),
+                        '[]'::jsonb
+                    ) FROM platform.synthetic_restore_probe
+                ),
+                'row_count', count(*),
+                'payload_bytes', COALESCE(sum(octet_length(search_text)), 0),
+                'min_payload_bytes', min(octet_length(search_text)),
+                'max_payload_bytes', max(octet_length(search_text)),
+                'unique_prefix_count', count(DISTINCT left(search_text, 8)),
+                'prefixes_match_ids', COALESCE(
+                    bool_and(left(search_text, 8) = lpad(id::text, 8, '0')), false
+                )
+            )::text
+            FROM platform.synthetic_restore_probe;
+            """,
+        ],
+        target=target,
+        capture_output=True,
+    )
+    try:
+        actual = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("Synthetic restore payload snapshot was invalid.") from exc
+    expected = {
+        "table_present": True,
+        "rows": expected_rows,
+        "row_count": SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+        "payload_bytes": SCRATCH_SYNTHETIC_PAYLOAD_BYTES,
+        "min_payload_bytes": SCRATCH_SYNTHETIC_PAYLOAD_BYTES_PER_ROW,
+        "max_payload_bytes": SCRATCH_SYNTHETIC_PAYLOAD_BYTES_PER_ROW,
+        "unique_prefix_count": SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+        "prefixes_match_ids": True,
+    }
+    if actual != expected:
+        raise RuntimeError("Synthetic restore phase changed the exact bulk fixture payload.")
+    return actual
+
+
+def _scratch_synthetic_restore_snapshot(
+    target: DatabaseTarget,
+    *,
+    expected_rows: list[list[Any]] | None = None,
+    psql_binary: str = "psql",
+) -> dict[str, Any]:
+    """Assert the fixed bulk fixture, index path, and Alembic marker."""
     result = run_command(
         [
             psql_binary,
@@ -4607,10 +4715,38 @@ def _scratch_synthetic_restore_snapshot(
                 ),
                 'rows', (
                     SELECT COALESCE(
-                        jsonb_agg(jsonb_build_array(id, label, search_text) ORDER BY id),
+                        jsonb_agg(jsonb_build_array(id, label, md5(search_text)) ORDER BY id),
                         '[]'::jsonb
                     )
                     FROM platform.synthetic_restore_probe
+                ),
+                'row_count', (
+                    SELECT count(*) FROM platform.synthetic_restore_probe
+                ),
+                'payload_bytes', (
+                    SELECT COALESCE(sum(octet_length(search_text)), 0)
+                    FROM platform.synthetic_restore_probe
+                ),
+                'min_payload_bytes', (
+                    SELECT min(octet_length(search_text))
+                    FROM platform.synthetic_restore_probe
+                ),
+                'max_payload_bytes', (
+                    SELECT max(octet_length(search_text))
+                    FROM platform.synthetic_restore_probe
+                ),
+                'unique_prefix_count', (
+                    SELECT count(DISTINCT left(search_text, 8))
+                    FROM platform.synthetic_restore_probe
+                ),
+                'prefixes_match_ids', (
+                    SELECT COALESCE(bool_and(left(search_text, 8) = lpad(id::text, 8, '0')), false)
+                    FROM platform.synthetic_restore_probe
+                ),
+                'like_match_ids', (
+                    SELECT COALESCE(jsonb_agg(id ORDER BY id), '[]'::jsonb)
+                    FROM platform.synthetic_restore_probe
+                    WHERE search_text LIKE '00000001%'
                 ),
                 'alembic_versions', (
                     SELECT COALESCE(jsonb_agg(version_num ORDER BY version_num), '[]'::jsonb)
@@ -4620,7 +4756,26 @@ def _scratch_synthetic_restore_snapshot(
                     SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'
                 ),
                 'pg_trgm_functional',
-                    similarity('restore fixture alpha', 'restore fixture alpha') = 1.0
+                    similarity('restore fixture alpha', 'restore fixture alpha') = 1.0,
+                'gin_trgm_index_valid', EXISTS (
+                    SELECT 1
+                    FROM pg_index AS index_row
+                    JOIN pg_class AS index_class ON index_class.oid = index_row.indexrelid
+                    JOIN pg_am AS access_method ON access_method.oid = index_class.relam
+                    JOIN pg_opclass AS operator_class
+                      ON operator_class.oid = index_row.indclass[0]
+                    WHERE index_row.indrelid = 'platform.synthetic_restore_probe'::regclass
+                      AND index_class.relname = 'synthetic_restore_probe_search_trgm_idx'
+                      AND index_class.relnamespace = 'platform'::regnamespace
+                      AND index_row.indisvalid
+                      AND index_row.indisready
+                      AND index_row.indnatts = 1
+                      AND index_row.indnkeyatts = 1
+                      AND access_method.amname = 'gin'
+                      AND operator_class.opcname = 'gin_trgm_ops'
+                      AND operator_class.opcnamespace = 'public'::regnamespace
+                      AND pg_get_indexdef(index_row.indexrelid, 1, true) = 'search_text'
+                )
             )::text;
             """,
         ],
@@ -4631,6 +4786,47 @@ def _scratch_synthetic_restore_snapshot(
         actual = json.loads(result.stdout.strip())
     except (json.JSONDecodeError, TypeError) as exc:
         raise RuntimeError("Synthetic restore returned an invalid logical snapshot.") from exc
+    actual_plan_result = run_command(
+        [
+            psql_binary,
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            *connection_args(target),
+            "--command",
+            "SET enable_seqscan = off; EXPLAIN (FORMAT JSON) "
+            "SELECT id FROM platform.synthetic_restore_probe "
+            "WHERE search_text LIKE '00000001%';",
+        ],
+        target=target,
+        capture_output=True,
+    )
+    try:
+        plan_rows = json.loads(actual_plan_result.stdout.strip())
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("Synthetic restore returned an invalid index plan.") from exc
+
+    def has_expected_index_scan(node: Any) -> bool:
+        if not isinstance(node, dict):
+            return False
+        if (
+            node.get("Node Type") == "Bitmap Index Scan"
+            and node.get("Index Name") == SCRATCH_SYNTHETIC_TRGM_INDEX
+        ):
+            return True
+        return any(
+            has_expected_index_scan(child)
+            for child in node.get("Plans", [])
+            if isinstance(child, dict)
+        )
+
+    if (
+        not isinstance(plan_rows, list)
+        or len(plan_rows) != 1
+        or not isinstance(plan_rows[0], dict)
+        or not has_expected_index_scan(plan_rows[0].get("Plan"))
+    ):
+        raise RuntimeError("Synthetic pg_trgm lookup did not use its fixed GIN index.")
     expected = {
         "tables": ["synthetic_restore_probe"],
         "columns": [
@@ -4639,10 +4835,18 @@ def _scratch_synthetic_restore_snapshot(
             ["search_text", "text", "NO"],
         ],
         "primary_key_columns": ["id"],
-        "rows": [list(row) for row in SCRATCH_SYNTHETIC_EXPECTED_ROWS],
+        "rows": expected_rows if expected_rows is not None else _scratch_synthetic_expected_rows(),
+        "row_count": SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+        "payload_bytes": SCRATCH_SYNTHETIC_PAYLOAD_BYTES,
+        "min_payload_bytes": SCRATCH_SYNTHETIC_PAYLOAD_BYTES_PER_ROW,
+        "max_payload_bytes": SCRATCH_SYNTHETIC_PAYLOAD_BYTES_PER_ROW,
+        "unique_prefix_count": SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+        "prefixes_match_ids": True,
+        "like_match_ids": [1],
         "alembic_versions": [SCRATCH_SYNTHETIC_ALEMBIC_REVISION],
         "pg_trgm_installed": True,
         "pg_trgm_functional": True,
+        "gin_trgm_index_valid": True,
     }
     if actual != expected:
         raise RuntimeError("Synthetic PostgreSQL restore did not reproduce its exact fixture.")
@@ -4663,6 +4867,8 @@ def perform_restore_drill(
     psql_binary: str = "psql",
     pg_restore_binary: str = "pg_restore",
     synthetic_validation_result: dict[str, Any] | None = None,
+    synthetic_expected_rows: list[list[Any]] | None = None,
+    synthetic_phase_validator: Callable[[str, str], None] | None = None,
     resource_guard: Callable[[], None] | None = None,
     capture_private_output: bool = False,
     phase_observer: Callable[[str, str], None] | None = None,
@@ -4673,6 +4879,16 @@ def perform_restore_drill(
         type(synthetic_validation_result) is not dict or synthetic_validation_result
     ):
         raise ValueError("Synthetic restore validation result must be an empty dictionary.")
+    if synthetic_validation_result is None and (
+        synthetic_expected_rows is not None or synthetic_phase_validator is not None
+    ):
+        raise ValueError("Synthetic restore phase checks require synthetic validation mode.")
+    if synthetic_validation_result is not None and (
+        not isinstance(synthetic_expected_rows, list)
+        or len(synthetic_expected_rows) != SCRATCH_SYNTHETIC_PAYLOAD_ROWS
+        or not callable(synthetic_phase_validator)
+    ):
+        raise ValueError("Synthetic restore phase checks are incomplete.")
     drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
     use_local_admin = (
         admin_target is None
@@ -4738,8 +4954,14 @@ def perform_restore_drill(
             ("--schema=platform",),
             ("--schema=public",),
         ):
-            if selector == ("--schema=public",):
-                failure_stage = "restore_public"
+            phase_name = (
+                "restore_platform"
+                if selector == ("--schema=platform",)
+                else "restore_public"
+            )
+            failure_stage = phase_name
+            if synthetic_phase_validator is not None:
+                synthetic_phase_validator(phase_name, "before")
             restore_command = [
                 pg_restore_binary,
                 "--exit-on-error",
@@ -4769,6 +4991,8 @@ def perform_restore_drill(
                     capture_private_output=capture_private_output,
                 ),
             )
+            if synthetic_phase_validator is not None:
+                synthetic_phase_validator(phase_name, "after")
         failure_stage = "validate_table_count"
         table_count_result = run_command(
             [
@@ -4850,7 +5074,9 @@ def perform_restore_drill(
         if synthetic_validation_result is not None:
             synthetic_validation_result.update(
                 _scratch_synthetic_restore_snapshot(
-                    restore_target, psql_binary=psql_binary
+                    restore_target,
+                    expected_rows=synthetic_expected_rows,
+                    psql_binary=psql_binary,
                 )
             )
     except BaseException as exc:
@@ -6647,6 +6873,7 @@ def _scratch_synthetic_restore_diagnostic_worker(
     archive: BinaryIO | None = None
     peak_fd: int | None = None
     archive_initial: tuple[int, int, int, int, int] | None = None
+    expected_rows = _scratch_synthetic_expected_rows()
     source_data = root / "source-data"
     source_socket = root / "source-socket"
     source_log = root / "source-postgres.log"
@@ -6739,7 +6966,7 @@ def _scratch_synthetic_restore_diagnostic_worker(
                 capture_output=True,
             )
             fixture_target = source_admin.with_database("scratch_restore_fixture")
-            fixture_sql = """
+            fixture_sql = f"""
                 CREATE EXTENSION pg_trgm WITH SCHEMA public;
                 CREATE SCHEMA platform;
                 CREATE TABLE platform.synthetic_restore_probe (
@@ -6747,10 +6974,22 @@ def _scratch_synthetic_restore_diagnostic_worker(
                     label text NOT NULL,
                     search_text text NOT NULL
                 );
-                INSERT INTO platform.synthetic_restore_probe (id, label, search_text) VALUES
-                    (1, 'alpha', 'restore fixture alpha'),
-                    (2, 'beta', 'restore fixture beta'),
-                    (3, 'gamma', 'restore fixture gamma');
+                INSERT INTO platform.synthetic_restore_probe (id, label, search_text)
+                SELECT
+                    row_id,
+                    'row-' || lpad(row_id::text, 8, '0'),
+                    lpad(row_id::text, 8, '0')
+                    || string_agg(
+                        md5('{SCRATCH_SYNTHETIC_PAYLOAD_SEED}:' || row_id::text || ':' || block_id::text),
+                        '' ORDER BY block_id
+                    )
+                    || left(md5('{SCRATCH_SYNTHETIC_PAYLOAD_SEED}:tail:' || row_id::text), 24)
+                FROM generate_series(1, {SCRATCH_SYNTHETIC_PAYLOAD_ROWS}) AS rows(row_id)
+                CROSS JOIN generate_series(1, {SCRATCH_SYNTHETIC_PAYLOAD_BLOCKS}) AS blocks(block_id)
+                GROUP BY row_id
+                ORDER BY row_id;
+                CREATE INDEX {SCRATCH_SYNTHETIC_TRGM_INDEX}
+                    ON platform.synthetic_restore_probe USING gin (search_text gin_trgm_ops);
                 CREATE TABLE public.alembic_version (
                     version_num varchar(32) NOT NULL PRIMARY KEY
                 );
@@ -6762,6 +7001,11 @@ def _scratch_synthetic_restore_diagnostic_worker(
                  *connection_args(fixture_target), "--command", fixture_sql],
                 target=fixture_target,
                 capture_output=True,
+            )
+            _scratch_synthetic_restore_payload_state(
+                fixture_target,
+                expected_rows=expected_rows,
+                psql_binary=str(psql),
             )
             if archive_path.exists():
                 raise RuntimeError("Synthetic restore archive path already exists.")
@@ -6816,9 +7060,19 @@ def _scratch_synthetic_restore_diagnostic_worker(
             )
             target_started = False
             sampler: _ScratchTmpfsPeakSampler | None = None
-            metric_state: dict[str, int] = {}
+            metric_state: dict[str, dict[str, int]] = {}
             validation: dict[str, Any] = {}
             arm_slug = f"{args._scratch_timestamp_slug}_arm{arm_index}"
+            arm_restore_database = (
+                f"platform_restore_drill_{arm_slug.lower()}_{os.getpid()}"
+            )
+            arm_restore_target = DatabaseTarget(
+                host=str(target_socket),
+                port=SCRATCH_PG_PORT,
+                username=SCRATCH_APP_ROLE,
+                password=None,
+                database=arm_restore_database,
+            )
             try:
                 start_cluster(
                     target_data,
@@ -6852,34 +7106,84 @@ def _scratch_synthetic_restore_diagnostic_worker(
 
                 def phase_observer(phase: str, event: str) -> None:
                     nonlocal sampler
-                    if phase == "restore_platform" and event == "start":
-                        metric_state["wal_before"] = _scratch_pg_stat_wal_bytes(
+                    if phase not in SCRATCH_SYNTHETIC_RESTORE_PHASES:
+                        raise RuntimeError("Synthetic restore reported an unknown phase.")
+                    if event == "start":
+                        state = metric_state.get(phase)
+                        if (
+                            state is None
+                            or set(state) != {"phase_started_ns"}
+                            or sampler is not None
+                        ):
+                            raise RuntimeError("Synthetic restore phase metrics started more than once.")
+                        state["wal_before_bytes"] = _scratch_pg_stat_wal_bytes(
                             target_admin, psql_binary=str(psql)
                         )
-                        _scratch_read_or_reset_memory_peak(peak_fd, reset=True)
-                        metric_state["started_ns"] = time.monotonic_ns()
+                        state["memory_start_bytes"] = _scratch_read_or_reset_memory_peak(
+                            peak_fd, reset=True
+                        )
                         sampler = _ScratchTmpfsPeakSampler(root)
                         sampler.start()
-                    elif phase == "restore_public" and event == "end":
-                        metric_state["ended_ns"] = time.monotonic_ns()
-                        if sampler is None:
-                            raise RuntimeError("Synthetic restore tmpfs sampler did not start.")
-                        metric_state["tmpfs_peak"] = sampler.stop()
+                        state["restore_command_started_ns"] = time.monotonic_ns()
+                    elif event == "end":
+                        state = metric_state.get(phase)
+                        if (
+                            state is None
+                            or "restore_command_started_ns" not in state
+                            or "restore_command_ended_ns" in state
+                            or sampler is None
+                        ):
+                            raise RuntimeError("Synthetic restore phase metrics ended out of order.")
+                        state["restore_command_ended_ns"] = time.monotonic_ns()
+                        state["tmpfs_peak_sampled_bytes"] = sampler.stop()
                         sampler = None
-                        metric_state["memory_peak"] = _scratch_read_or_reset_memory_peak(peak_fd)
-                        metric_state["wal_after"] = _scratch_pg_stat_wal_bytes(
+                        state["memory_peak_bytes"] = _scratch_read_or_reset_memory_peak(peak_fd)
+                        _scratch_wait_for_restore_database_backends_to_exit(
+                            target_admin,
+                            arm_restore_target.database,
+                            psql_binary=str(psql),
+                        )
+                        state["wal_after_bytes"] = _scratch_pg_stat_wal_bytes(
                             target_admin, psql_binary=str(psql)
                         )
+                    else:
+                        raise RuntimeError("Synthetic restore reported an unknown phase event.")
+
+                def validate_restore_phase(phase: str, boundary: str) -> None:
+                    if phase not in SCRATCH_SYNTHETIC_RESTORE_PHASES or boundary not in ("before", "after"):
+                        raise RuntimeError("Synthetic restore payload check reported an unknown boundary.")
+                    if boundary == "before":
+                        if phase in metric_state or sampler is not None:
+                            raise RuntimeError("Synthetic restore phase validation began out of order.")
+                        metric_state[phase] = {"phase_started_ns": time.monotonic_ns()}
+                    state = _scratch_synthetic_restore_payload_state(
+                        arm_restore_target,
+                        expected_rows=expected_rows,
+                        psql_binary=str(psql),
+                    )
+                    if phase == "restore_platform" and boundary == "before":
+                        if state != {"table_present": False}:
+                            raise RuntimeError(
+                                "Synthetic restore platform target was not empty before restore."
+                            )
+                    elif state.get("table_present") is not True:
+                        raise RuntimeError("Synthetic restore phase did not retain the bulk table.")
+                    if boundary == "after":
+                        phase_state = metric_state.get(phase)
+                        if (
+                            phase_state is None
+                            or "restore_command_ended_ns" not in phase_state
+                            or "phase_ended_ns" in phase_state
+                        ):
+                            raise RuntimeError("Synthetic restore phase validation ended out of order.")
+                        phase_state["phase_ended_ns"] = time.monotonic_ns()
 
                 def resource_guard() -> None:
                     _scratch_resource_guard(root, guard_site="worker_synthetic_restore_resource_guard")
 
                 table_count = perform_restore_drill(
                     archive_path,
-                    app_target=DatabaseTarget(
-                        host=str(target_socket), port=SCRATCH_PG_PORT,
-                        username=SCRATCH_APP_ROLE, password=None, database="postgres",
-                    ),
+                    app_target=arm_restore_target,
                     admin_target=target_admin,
                     timestamp_slug=arm_slug,
                     archive_stdin=archive,
@@ -6889,6 +7193,8 @@ def _scratch_synthetic_restore_diagnostic_worker(
                     psql_binary=str(psql),
                     pg_restore_binary=str(pg_restore),
                     synthetic_validation_result=validation,
+                    synthetic_expected_rows=expected_rows,
+                    synthetic_phase_validator=validate_restore_phase,
                     resource_guard=resource_guard,
                     phase_observer=phase_observer,
                 )
@@ -6896,17 +7202,59 @@ def _scratch_synthetic_restore_diagnostic_worker(
                     len(validation) != 1
                     or not isinstance(validation.get("logical_sha256"), str)
                     or re.fullmatch(r"[0-9a-f]{64}", validation["logical_sha256"]) is None
-                    or not {"wal_before", "wal_after", "started_ns", "ended_ns",
-                            "tmpfs_peak", "memory_peak"}.issubset(metric_state)
+                    or list(metric_state) != list(SCRATCH_SYNTHETIC_RESTORE_PHASES)
+                    or any(
+                        not {
+                            "wal_before_bytes", "wal_after_bytes", "phase_started_ns",
+                            "phase_ended_ns", "restore_command_started_ns",
+                            "restore_command_ended_ns", "tmpfs_peak_sampled_bytes",
+                            "memory_start_bytes", "memory_peak_bytes",
+                        }.issubset(metric_state[phase])
+                        for phase in SCRATCH_SYNTHETIC_RESTORE_PHASES
+                    )
                 ):
                     raise RuntimeError("Synthetic restore arm did not produce complete validation metrics.")
-                wal_bytes = metric_state["wal_after"] - metric_state["wal_before"]
-                elapsed_ms = max(
-                    1,
-                    (metric_state["ended_ns"] - metric_state["started_ns"]) // 1_000_000,
-                )
-                if wal_bytes < 0 or elapsed_ms > SCRATCH_RUNTIME_SECONDS * 1000:
-                    raise RuntimeError("Synthetic restore arm metrics are outside their fixed bound.")
+                phase_results: list[dict[str, Any]] = []
+                for phase in SCRATCH_SYNTHETIC_RESTORE_PHASES:
+                    state = metric_state[phase]
+                    wal_delta_bytes = state["wal_after_bytes"] - state["wal_before_bytes"]
+                    command_elapsed_ns = (
+                        state["restore_command_ended_ns"]
+                        - state["restore_command_started_ns"]
+                    )
+                    phase_elapsed_ns = state["phase_ended_ns"] - state["phase_started_ns"]
+                    command_elapsed_us = (command_elapsed_ns + 999) // 1000
+                    phase_elapsed_us = (phase_elapsed_ns + 999) // 1000
+                    if (
+                        wal_delta_bytes < 0
+                        or command_elapsed_ns <= 0
+                        or phase_elapsed_ns < command_elapsed_ns
+                        or command_elapsed_us > SCRATCH_RUNTIME_SECONDS * 1_000_000
+                        or phase_elapsed_us > SCRATCH_RUNTIME_SECONDS * 1_000_000
+                        or state["memory_peak_bytes"] < state["memory_start_bytes"]
+                    ):
+                        raise RuntimeError("Synthetic restore phase metrics are outside their fixed bound.")
+                    phase_results.append(
+                        {
+                            "phase": phase,
+                            "wal_before_bytes": state["wal_before_bytes"],
+                            "wal_after_bytes": state["wal_after_bytes"],
+                            "wal_delta_bytes": wal_delta_bytes,
+                            "restore_command_elapsed_us": command_elapsed_us,
+                            "phase_elapsed_us": phase_elapsed_us,
+                            "memory_start_bytes": state["memory_start_bytes"],
+                            "memory_peak_bytes": state["memory_peak_bytes"],
+                            "tmpfs_peak_sampled_bytes": state["tmpfs_peak_sampled_bytes"],
+                            "tmpfs_sample_period_ms": int(
+                                SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS * 1000
+                            ),
+                            "memory_scope": SCRATCH_SYNTHETIC_MEMORY_SCOPE,
+                            "wal_scope": SCRATCH_SYNTHETIC_WAL_SCOPE,
+                            "elapsed_scope": SCRATCH_SYNTHETIC_ELAPSED_SCOPE,
+                            "phase_elapsed_scope": SCRATCH_SYNTHETIC_PHASE_ELAPSED_SCOPE,
+                            "tmpfs_scope": SCRATCH_SYNTHETIC_TMPFS_SCOPE,
+                        }
+                    )
                 arm_results.append(
                     {
                         "name": name,
@@ -6914,12 +7262,10 @@ def _scratch_synthetic_restore_diagnostic_worker(
                         "max_wal_senders": max_wal_senders,
                         "single_transaction": single_transaction,
                         "restored_table_count": table_count,
+                        "fixture_row_count": SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+                        "fixture_payload_bytes": SCRATCH_SYNTHETIC_PAYLOAD_BYTES,
                         "logical_sha256": validation["logical_sha256"],
-                        "memory_peak_bytes": metric_state["memory_peak"],
-                        "tmpfs_peak_sampled_bytes": metric_state["tmpfs_peak"],
-                        "tmpfs_sample_period_ms": int(SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS * 1000),
-                        "wal_bytes": wal_bytes,
-                        "elapsed_ms": elapsed_ms,
+                        "phases": phase_results,
                     }
                 )
             finally:
@@ -6947,10 +7293,12 @@ def _scratch_synthetic_restore_diagnostic_worker(
             raise RuntimeError("Synthetic restore archive changed during its diagnostic arms.")
         report = {
             "kind": "synthetic_restore_diagnostic",
-            "schema": 1,
+            "schema": 2,
             "status": "completed",
             "postgres_version": postgres_version,
             "source_fixture": SCRATCH_SYNTHETIC_FIXTURE_ID,
+            "fixture_row_count": SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+            "fixture_payload_bytes": SCRATCH_SYNTHETIC_PAYLOAD_BYTES,
             "archive_format": "pg_dump_custom",
             "archive_size_bytes": archive_initial[2],
             "archive_sha256": args._scratch_archive_sha256,
@@ -7507,6 +7855,65 @@ def _scratch_pg_stat_wal_bytes(
     return value
 
 
+def _scratch_wait_for_restore_database_backends_to_exit(
+    control_target: DatabaseTarget,
+    restore_database: str,
+    *,
+    psql_binary: str = "psql",
+) -> None:
+    """Wait until the exact restore DB has flushed and removed its backends."""
+    if (
+        control_target.database == restore_database
+        or re.fullmatch(
+            r"platform_restore_drill_\d{8}t\d{6}z_arm[1-3]_\d+",
+            restore_database,
+        )
+        is None
+    ):
+        raise RuntimeError("Synthetic restore backend observer target is invalid.")
+
+    deadline = time.monotonic() + SCRATCH_SYNTHETIC_WAL_BACKEND_DRAIN_SECONDS
+    query = "SELECT count(*) FROM pg_stat_activity WHERE datname = :'restore_database';"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Synthetic restore database backends did not exit before the WAL read.")
+        command = [
+            psql_binary,
+            "--no-psqlrc",
+            "--quiet",
+            "--tuples-only",
+            "--no-align",
+            "--set=ON_ERROR_STOP=1",
+            f"--set=restore_database={restore_database}",
+            *connection_args(control_target),
+            "--command",
+            query,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                check=True,
+                text=True,
+                capture_output=True,
+                env=command_env(control_target),
+                timeout=min(SCRATCH_SYNTHETIC_WAL_QUERY_TIMEOUT_SECONDS, remaining),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("Synthetic restore backend-exit observer failed.") from exc
+        raw = result.stdout.strip()
+        if not raw.isdecimal():
+            raise RuntimeError("Synthetic restore backend-exit observer returned an invalid count.")
+        backend_count = int(raw)
+        if backend_count == 0:
+            return
+        if backend_count > 13:
+            raise RuntimeError("Synthetic restore backend-exit observer exceeded its fixed bound.")
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(SCRATCH_SYNTHETIC_WAL_POLL_SECONDS, remaining))
+
+
 def _scratch_unit_command(
     *,
     mountpoint: pathlib.Path,
@@ -7950,7 +8357,8 @@ def valid_scratch_synthetic_restore_diagnostic(value: Any) -> bool:
     """Validate the diagnostic-only result; it is never a backup receipt."""
     if not isinstance(value, dict) or set(value) != {
         "kind", "schema", "status", "postgres_version", "source_fixture",
-        "archive_format", "archive_size_bytes", "archive_sha256", "arms",
+        "fixture_row_count", "fixture_payload_bytes", "archive_format",
+        "archive_size_bytes", "archive_sha256", "arms",
     }:
         return False
     archive_sha256 = value.get("archive_sha256")
@@ -7958,11 +8366,15 @@ def valid_scratch_synthetic_restore_diagnostic(value: Any) -> bool:
     if (
         value.get("kind") != "synthetic_restore_diagnostic"
         or type(value.get("schema")) is not int
-        or value["schema"] != 1
+        or value["schema"] != 2
         or value.get("status") != "completed"
         or type(value.get("postgres_version")) is not str
         or re.fullmatch(r"16\.\d+", value["postgres_version"]) is None
         or value.get("source_fixture") != SCRATCH_SYNTHETIC_FIXTURE_ID
+        or type(value.get("fixture_row_count")) is not int
+        or value["fixture_row_count"] != SCRATCH_SYNTHETIC_PAYLOAD_ROWS
+        or type(value.get("fixture_payload_bytes")) is not int
+        or value["fixture_payload_bytes"] != SCRATCH_SYNTHETIC_PAYLOAD_BYTES
         or value.get("archive_format") != "pg_dump_custom"
         or type(value.get("archive_size_bytes")) is not int
         or not 5 < value["archive_size_bytes"] <= SCRATCH_SYNTHETIC_ARCHIVE_MAX_BYTES
@@ -7975,9 +8387,8 @@ def valid_scratch_synthetic_restore_diagnostic(value: Any) -> bool:
     expected_names = [arm[0] for arm in SCRATCH_SYNTHETIC_RESTORE_ARMS]
     arm_keys = {
         "name", "wal_level", "max_wal_senders", "single_transaction",
-        "restored_table_count", "logical_sha256", "memory_peak_bytes",
-        "tmpfs_peak_sampled_bytes", "tmpfs_sample_period_ms", "wal_bytes",
-        "elapsed_ms",
+        "restored_table_count", "fixture_row_count", "fixture_payload_bytes",
+        "logical_sha256", "phases",
     }
     for index, arm in enumerate(arms):
         expected = SCRATCH_SYNTHETIC_RESTORE_ARMS[index]
@@ -7992,27 +8403,67 @@ def valid_scratch_synthetic_restore_diagnostic(value: Any) -> bool:
             or arm["single_transaction"] is not expected[3]
             or type(arm.get("restored_table_count")) is not int
             or arm["restored_table_count"] <= 0
+            or type(arm.get("fixture_row_count")) is not int
+            or arm["fixture_row_count"] != SCRATCH_SYNTHETIC_PAYLOAD_ROWS
+            or type(arm.get("fixture_payload_bytes")) is not int
+            or arm["fixture_payload_bytes"] != SCRATCH_SYNTHETIC_PAYLOAD_BYTES
             or type(arm.get("logical_sha256")) is not str
             or re.fullmatch(r"[0-9a-f]{64}", arm["logical_sha256"]) is None
-            or type(arm.get("memory_peak_bytes")) is not int
-            or not 0 < arm["memory_peak_bytes"] <= SCRATCH_MEMORY_MAX_BYTES
-            or type(arm.get("tmpfs_peak_sampled_bytes")) is not int
-            or not 0 <= arm["tmpfs_peak_sampled_bytes"] <= SCRATCH_TMPFS_BYTES
-            or type(arm.get("tmpfs_sample_period_ms")) is not int
-            or arm["tmpfs_sample_period_ms"] != int(SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS * 1000)
-            or type(arm.get("wal_bytes")) is not int
-            or not 0 <= arm["wal_bytes"] <= SCRATCH_TMPFS_BYTES
-            or type(arm.get("elapsed_ms")) is not int
-            or not 0 < arm["elapsed_ms"] <= SCRATCH_RUNTIME_SECONDS * 1000
+            or not isinstance(arm.get("phases"), list)
+            or len(arm["phases"]) != len(SCRATCH_SYNTHETIC_RESTORE_PHASES)
         ):
             return False
+        for phase_index, phase in enumerate(arm["phases"]):
+            phase_keys = {
+                "phase", "wal_before_bytes", "wal_after_bytes", "wal_delta_bytes",
+                "restore_command_elapsed_us", "phase_elapsed_us",
+                "memory_start_bytes", "memory_peak_bytes",
+                "tmpfs_peak_sampled_bytes", "tmpfs_sample_period_ms", "memory_scope",
+                "wal_scope", "elapsed_scope", "phase_elapsed_scope", "tmpfs_scope",
+            }
+            if not isinstance(phase, dict) or set(phase) != phase_keys:
+                return False
+            integer_fields = (
+                "wal_before_bytes", "wal_after_bytes", "wal_delta_bytes",
+                "restore_command_elapsed_us", "phase_elapsed_us",
+                "memory_start_bytes", "memory_peak_bytes", "tmpfs_peak_sampled_bytes",
+                "tmpfs_sample_period_ms",
+            )
+            if (
+                phase.get("phase") != SCRATCH_SYNTHETIC_RESTORE_PHASES[phase_index]
+                or any(type(phase.get(field)) is not int for field in integer_fields)
+                or not 0 <= phase["wal_before_bytes"] <= 2**63 - 1
+                or not 0 <= phase["wal_after_bytes"] <= 2**63 - 1
+                or phase["wal_delta_bytes"]
+                != phase["wal_after_bytes"] - phase["wal_before_bytes"]
+                or not 0 <= phase["wal_delta_bytes"] <= SCRATCH_TMPFS_BYTES
+                or not 0 < phase["restore_command_elapsed_us"]
+                <= SCRATCH_RUNTIME_SECONDS * 1_000_000
+                or not phase["restore_command_elapsed_us"] <= phase["phase_elapsed_us"]
+                <= SCRATCH_RUNTIME_SECONDS * 1_000_000
+                or not 0 < phase["memory_start_bytes"] <= SCRATCH_MEMORY_MAX_BYTES
+                or not phase["memory_start_bytes"] <= phase["memory_peak_bytes"] <= SCRATCH_MEMORY_MAX_BYTES
+                or not 0 <= phase["tmpfs_peak_sampled_bytes"] <= SCRATCH_TMPFS_BYTES
+                or phase["tmpfs_sample_period_ms"]
+                != int(SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS * 1000)
+                or phase.get("memory_scope") != SCRATCH_SYNTHETIC_MEMORY_SCOPE
+                or phase.get("wal_scope") != SCRATCH_SYNTHETIC_WAL_SCOPE
+                or phase.get("elapsed_scope") != SCRATCH_SYNTHETIC_ELAPSED_SCOPE
+                or phase.get("phase_elapsed_scope") != SCRATCH_SYNTHETIC_PHASE_ELAPSED_SCOPE
+                or phase.get("tmpfs_scope") != SCRATCH_SYNTHETIC_TMPFS_SCOPE
+            ):
+                return False
     logical_digests = {arm["logical_sha256"] for arm in arms}
     return len(logical_digests) == 1
 
 
 def _scratch_synthetic_worker_candidate(stdout: bytes) -> dict[str, Any] | None:
     """Accept only one closed diagnostic frame with all three fixed arms."""
-    if not stdout or len(stdout) > 4096 or not stdout.endswith(b"\n"):
+    if (
+        not stdout
+        or len(stdout) > SCRATCH_SYNTHETIC_RESULT_MAX_BYTES
+        or not stdout.endswith(b"\n")
+    ):
         return None
     payload = stdout[:-1]
     if not payload or b"\n" in payload or b"\r" in payload:
@@ -8661,6 +9112,11 @@ def _run_isolated_restore_drill(
         }
         process: subprocess.Popen[bytes] | None = None
         stdout_buffer = bytearray()
+        stdout_limit = (
+            SCRATCH_SYNTHETIC_RESULT_MAX_BYTES
+            if synthetic_restore_diagnostic
+            else 4096
+        )
         stderr_buffer = bytearray()
         stderr_tail_buffer = (
             bytearray() if synthetic_restore_diagnostic else None
@@ -9016,7 +9472,7 @@ def _run_isolated_restore_drill(
                     elif key.data == "stdout":
                         stdout_observed += len(data)
                         stdout_buffer.extend(data)
-                        if len(stdout_buffer) > 4096:
+                        if len(stdout_buffer) > stdout_limit:
                             raise RuntimeError("Scratch restore worker output exceeded its closed bound.")
                     else:
                         stderr_size += len(data)
@@ -9118,7 +9574,7 @@ def _run_isolated_restore_drill(
                         if stream is process.stdout:
                             stdout_observed += len(data)
                             stdout_buffer.extend(data)
-                            if len(stdout_buffer) > 4096:
+                            if len(stdout_buffer) > stdout_limit:
                                 raise RuntimeError("Scratch restore worker output exceeded its closed bound.")
                         else:
                             stderr_size += len(data)

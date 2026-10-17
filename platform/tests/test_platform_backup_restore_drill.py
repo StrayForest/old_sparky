@@ -1027,6 +1027,93 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill._scratch_postgres_start_options_for_diagnostic_arm(socket_dir, arms[2]),
             minimal_options,
         )
+        self.assertEqual(backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_ROWS, 4096)
+        self.assertEqual(backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_BYTES_PER_ROW, 8192)
+        self.assertEqual(backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_BYTES, 33_554_432)
+        self.assertLessEqual(backup_drill.SCRATCH_SYNTHETIC_ARCHIVE_MAX_BYTES, 48 * 1024**2)
+        expected_rows = backup_drill._scratch_synthetic_expected_rows()
+        self.assertEqual(len(expected_rows), backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_ROWS)
+        self.assertEqual(expected_rows[0][0:2], [1, "row-00000001"])
+        self.assertEqual(expected_rows[-1][0:2], [4096, "row-00004096"])
+        self.assertEqual(
+            len({row[2] for row in expected_rows}),
+            backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+        )
+        self.assertEqual(
+            backup_drill.SCRATCH_SYNTHETIC_RESTORE_PHASES,
+            ("restore_platform", "restore_public"),
+        )
+        control_target = backup_drill.DatabaseTarget(
+            host="/run/oldsparky-backup-restore-deadbeef/socket",
+            port=backup_drill.SCRATCH_PG_PORT,
+            username="postgres",
+            password=None,
+            database="postgres",
+        )
+        restore_database = "platform_restore_drill_20261018t230000z_arm1_12345"
+        completed_counts = [
+            subprocess.CompletedProcess([], 0, stdout="1\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="0\n", stderr=""),
+        ]
+        with (
+            mock.patch.object(
+                backup_drill.subprocess, "run", side_effect=completed_counts
+            ) as backend_query,
+            mock.patch.object(backup_drill.time, "sleep") as poll_sleep,
+        ):
+            backup_drill._scratch_wait_for_restore_database_backends_to_exit(
+                control_target,
+                restore_database,
+                psql_binary="/usr/lib/postgresql/16/bin/psql",
+            )
+        self.assertEqual(backend_query.call_count, 2)
+        query_args = backend_query.call_args_list[0].args[0]
+        self.assertEqual(query_args[0], "/usr/lib/postgresql/16/bin/psql")
+        self.assertEqual(query_args[query_args.index("--dbname") + 1], "postgres")
+        self.assertIn(f"--set=restore_database={restore_database}", query_args)
+        self.assertIn(":'restore_database'", query_args[-1])
+        self.assertEqual(backend_query.call_args_list[0].kwargs["timeout"], 1.0)
+        poll_sleep.assert_called_once_with(backup_drill.SCRATCH_SYNTHETIC_WAL_POLL_SECONDS)
+
+        with mock.patch.object(backup_drill.subprocess, "run") as backend_query:
+            with self.assertRaisesRegex(RuntimeError, "observer target is invalid"):
+                backup_drill._scratch_wait_for_restore_database_backends_to_exit(
+                    control_target, "production_database"
+                )
+            backend_query.assert_not_called()
+
+        with (
+            mock.patch.object(
+                backup_drill,
+                "SCRATCH_SYNTHETIC_WAL_BACKEND_DRAIN_SECONDS",
+                0.01,
+            ),
+            mock.patch.object(
+                backup_drill.time, "monotonic", side_effect=[0.0, 0.0, 0.02, 0.03]
+            ),
+            mock.patch.object(backup_drill.time, "sleep"),
+            mock.patch.object(
+                backup_drill.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout="1\n", stderr=""),
+            ) as backend_query,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not exit"):
+                backup_drill._scratch_wait_for_restore_database_backends_to_exit(
+                    control_target, restore_database
+                )
+        backend_query.assert_called_once()
+
+        with mock.patch.object(
+            backup_drill.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout="unknown\n", stderr=""),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid count"):
+                backup_drill._scratch_wait_for_restore_database_backends_to_exit(
+                    control_target, restore_database
+                )
+
         noisy_startup = b"x" * 8192 + b"\nModuleNotFoundError: No module named 'asyncpg'\n"
         stderr_tail = bytearray()
         for offset in range(0, len(noisy_startup), 1024):
@@ -1051,10 +1138,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
         report = {
             "kind": "synthetic_restore_diagnostic",
-            "schema": 1,
+            "schema": 2,
             "status": "completed",
             "postgres_version": "16.15",
             "source_fixture": backup_drill.SCRATCH_SYNTHETIC_FIXTURE_ID,
+            "fixture_row_count": backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+            "fixture_payload_bytes": backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_BYTES,
             "archive_format": "pg_dump_custom",
             "archive_size_bytes": 4096,
             "archive_sha256": "a" * 64,
@@ -1065,26 +1154,85 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "max_wal_senders": max_wal_senders,
                     "single_transaction": single_transaction,
                     "restored_table_count": 1,
+                    "fixture_row_count": backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+                    "fixture_payload_bytes": backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_BYTES,
                     "logical_sha256": "b" * 64,
-                    "memory_peak_bytes": 128 * 1024**2,
-                    "tmpfs_peak_sampled_bytes": 16 * 1024**2,
-                    "tmpfs_sample_period_ms": 10,
-                    "wal_bytes": 4096,
-                    "elapsed_ms": 25,
+                    "phases": [
+                        {
+                            "phase": phase,
+                            "wal_before_bytes": 1000 + phase_index * 1000,
+                            "wal_after_bytes": 2000 + phase_index * 1000,
+                            "wal_delta_bytes": 1000,
+                            "restore_command_elapsed_us": 25_000,
+                            "phase_elapsed_us": 35_000,
+                            "memory_start_bytes": 64 * 1024**2,
+                            "memory_peak_bytes": 128 * 1024**2,
+                            "tmpfs_peak_sampled_bytes": 16 * 1024**2,
+                            "tmpfs_sample_period_ms": 10,
+                            "memory_scope": backup_drill.SCRATCH_SYNTHETIC_MEMORY_SCOPE,
+                            "wal_scope": backup_drill.SCRATCH_SYNTHETIC_WAL_SCOPE,
+                            "elapsed_scope": backup_drill.SCRATCH_SYNTHETIC_ELAPSED_SCOPE,
+                            "phase_elapsed_scope": backup_drill.SCRATCH_SYNTHETIC_PHASE_ELAPSED_SCOPE,
+                            "tmpfs_scope": backup_drill.SCRATCH_SYNTHETIC_TMPFS_SCOPE,
+                        }
+                        for phase_index, phase in enumerate(
+                            backup_drill.SCRATCH_SYNTHETIC_RESTORE_PHASES
+                        )
+                    ],
                 }
                 for name, wal_level, max_wal_senders, single_transaction in arms
             ],
         }
         self.assertTrue(backup_drill.valid_scratch_synthetic_restore_diagnostic(report))
+        result_frame = (
+            json.dumps(report, separators=(",", ":"), sort_keys=True) + "\n"
+        ).encode("ascii")
+        self.assertLessEqual(len(result_frame), backup_drill.SCRATCH_SYNTHETIC_RESULT_MAX_BYTES)
+        self.assertEqual(backup_drill._scratch_synthetic_worker_candidate(result_frame), report)
         missing_arm = json.loads(json.dumps(report))
         missing_arm["arms"].pop()
         self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(missing_arm))
         changed_arm = json.loads(json.dumps(report))
         changed_arm["arms"][2]["single_transaction"] = False
         self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(changed_arm))
+        changed_phase = json.loads(json.dumps(report))
+        changed_phase["arms"][0]["phases"][1]["wal_delta_bytes"] += 1
+        self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(changed_phase))
+        missing_phase = json.loads(json.dumps(report))
+        missing_phase["arms"][1]["phases"].pop()
+        self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(missing_phase))
+        swapped_arms = json.loads(json.dumps(report))
+        swapped_arms["arms"][0], swapped_arms["arms"][1] = (
+            swapped_arms["arms"][1], swapped_arms["arms"][0]
+        )
+        self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(swapped_arms))
+        swapped_phases = json.loads(json.dumps(report))
+        swapped_phases["arms"][0]["phases"].reverse()
+        self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(swapped_phases))
+        changed_logical_hash = json.loads(json.dumps(report))
+        changed_logical_hash["arms"][2]["logical_sha256"] = "c" * 64
+        self.assertFalse(
+            backup_drill.valid_scratch_synthetic_restore_diagnostic(changed_logical_hash)
+        )
+        wrong_metric_scope = json.loads(json.dumps(report))
+        wrong_metric_scope["arms"][0]["phases"][0]["memory_scope"] = "whole_arm"
+        self.assertFalse(
+            backup_drill.valid_scratch_synthetic_restore_diagnostic(wrong_metric_scope)
+        )
+        wrong_fixture_size = json.loads(json.dumps(report))
+        wrong_fixture_size["fixture_payload_bytes"] -= 1
+        self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(wrong_fixture_size))
         bad_version = json.loads(json.dumps(report))
         bad_version["postgres_version"] = "17.1"
         self.assertFalse(backup_drill.valid_scratch_synthetic_restore_diagnostic(bad_version))
+        with (
+            mock.patch.object(backup_drill.os, "lseek", return_value=0),
+            mock.patch.object(backup_drill.os, "write", return_value=5),
+            mock.patch.object(backup_drill.os, "read") as read_peak,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "could not be reset"):
+                backup_drill._scratch_read_or_reset_memory_peak(10, reset=True)
+        read_peak.assert_not_called()
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             cluster = pathlib.Path(temporary_dir) / "data"
@@ -1856,12 +2004,22 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ["baseline", "minimal_no_senders", "minimal_no_senders_single_transaction"],
         )
         self.assertEqual(len({arm["logical_sha256"] for arm in report["arms"]}), 1)
+        self.assertEqual(report["fixture_row_count"], backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_ROWS)
+        self.assertEqual(report["fixture_payload_bytes"], 33_554_432)
         for arm in report["arms"]:
             with self.subTest(arm=arm["name"]):
-                self.assertGreater(arm["memory_peak_bytes"], 0)
-                self.assertGreater(arm["tmpfs_peak_sampled_bytes"], 0)
-                self.assertGreaterEqual(arm["wal_bytes"], 0)
-                self.assertGreater(arm["elapsed_ms"], 0)
+                self.assertEqual(
+                    [phase["phase"] for phase in arm["phases"]],
+                    ["restore_platform", "restore_public"],
+                )
+                for phase in arm["phases"]:
+                    self.assertGreater(phase["memory_peak_bytes"], 0)
+                    self.assertGreater(phase["tmpfs_peak_sampled_bytes"], 0)
+                    self.assertGreaterEqual(phase["wal_delta_bytes"], 0)
+                    self.assertGreater(phase["restore_command_elapsed_us"], 0)
+                    self.assertGreaterEqual(
+                        phase["phase_elapsed_us"], phase["restore_command_elapsed_us"]
+                    )
         artifact_path = _write_synthetic_restore_diagnostic_artifact(
             report, source_sha=source_sha
         )
