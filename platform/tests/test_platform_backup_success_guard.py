@@ -1062,6 +1062,42 @@ class BackupSuccessGuardTests(unittest.TestCase):
             backup_guard.wait_for_backup_success(api, _binding())
         self.assertNotIn("download_artifact", api.calls)
 
+        # A short nonempty API page is not an end-of-list marker: a second
+        # exact candidate on the next page must remain visible to the guard.
+        source_api = FakeBackupProofApi()
+        hidden_duplicate = dict(source_api.runs[0], id=BACKUP_RUN_ID + 1)
+        run_rows = [source_api.runs[0], hidden_duplicate]
+        list_api = backup_guard.GitHubBackupProofApi(
+            "StrayForest/old_sparky", "https://api.github.com", "gh-token-sentinel"
+        )
+        listed_pages: list[str] = []
+
+        def list_short_pages(path: str, *, max_bytes: int = 1_048_576) -> dict[str, Any]:
+            listed_pages.append(path)
+            page = int(path.rsplit("page=", 1)[1])
+            start = page - 1
+            return {"total_count": 2, "workflow_runs": run_rows[start : start + 1]}
+
+        list_api._json = list_short_pages
+
+        class PagedRunProofApi:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(source_api, name)
+
+            def backup_runs(
+                self, workflow_id: int, branch: str, event: str, head_sha: str
+            ) -> list[dict[str, Any]]:
+                return list_api.backup_runs(workflow_id, branch, event, head_sha)
+
+        with self.assertRaisesRegex(
+            backup_guard.BackupProofError,
+            "multiple exact source-bound backup runs are ambiguous",
+        ):
+            backup_guard.wait_for_backup_success(PagedRunProofApi(), _binding())
+        self.assertEqual(len(listed_pages), 2)
+        self.assertTrue(listed_pages[-1].endswith("page=2"))
+        self.assertNotIn("download_artifact", source_api.calls)
+
     def test_backup_must_start_before_security_run_completes(self) -> None:
         api = FakeBackupProofApi()
         api.runs[0].update(
@@ -1201,6 +1237,111 @@ class BackupSuccessGuardTests(unittest.TestCase):
             f"/actions/runs/{BACKUP_RUN_ID}/attempts/{BACKUP_ATTEMPT}/jobs?per_page=100&page=1",
             max_bytes=2_097_152,
         )
+
+        run_api = backup_guard.GitHubBackupProofApi(
+            "StrayForest/old_sparky", "https://api.github.com", "gh-token-sentinel"
+        )
+        backup_runs = [
+            {"id": 20_000 + index, "display_title": f"run {index}"}
+            for index in range(205)
+        ]
+        run_paths: list[str] = []
+
+        def paged_runs(path: str, *, max_bytes: int = 1_048_576) -> dict[str, Any]:
+            run_paths.append(path)
+            page = int(path.rsplit("page=", 1)[1])
+            page_rows = {
+                1: backup_runs[:42],
+                2: backup_runs[42:142],
+                3: backup_runs[142:],
+            }[page]
+            return {
+                "total_count": len(backup_runs),
+                "workflow_runs": page_rows,
+            }
+
+        with mock.patch.object(run_api, "_json", side_effect=paged_runs):
+            self.assertEqual(
+                run_api.backup_runs(901, "dev", "workflow_dispatch", SOURCE_SHA),
+                backup_runs,
+            )
+        self.assertEqual(
+            run_paths,
+            [
+                f"/actions/workflows/901/runs?branch=dev&event=workflow_dispatch&head_sha={SOURCE_SHA}&per_page=100&page=1",
+                f"/actions/workflows/901/runs?branch=dev&event=workflow_dispatch&head_sha={SOURCE_SHA}&per_page=100&page=2",
+                f"/actions/workflows/901/runs?branch=dev&event=workflow_dispatch&head_sha={SOURCE_SHA}&per_page=100&page=3",
+            ],
+        )
+
+        with mock.patch.object(
+            run_api,
+            "_json",
+            return_value={"total_count": 0, "workflow_runs": []},
+        ):
+            self.assertEqual(
+                run_api.backup_runs(901, "dev", "workflow_dispatch", SOURCE_SHA), []
+            )
+
+        run_pagination_failures = (
+            # A short first page must continue; an empty next page is premature.
+            (
+                {"total_count": 101, "workflow_runs": backup_runs[:99]},
+                {"total_count": 101, "workflow_runs": []},
+            ),
+            # A short final page must not be treated as an end-of-list marker.
+            (
+                {"total_count": 101, "workflow_runs": backup_runs[:100]},
+                {"total_count": 101, "workflow_runs": []},
+            ),
+            # A final page larger than the remaining count must not be accepted.
+            (
+                {"total_count": 101, "workflow_runs": backup_runs[:100]},
+                {"total_count": 101, "workflow_runs": backup_runs[100:102]},
+            ),
+            (
+                {"total_count": 101, "workflow_runs": backup_runs[:100]},
+                {"total_count": 102, "workflow_runs": backup_runs[100:101]},
+            ),
+            (
+                {"total_count": 101, "workflow_runs": backup_runs[:100]},
+                {"total_count": 101, "workflow_runs": [backup_runs[0]]},
+            ),
+        )
+        for scenario, pages in enumerate(run_pagination_failures):
+            with self.subTest(run_pagination_scenario=scenario):
+                with mock.patch.object(run_api, "_json", side_effect=pages), self.assertRaises(
+                    backup_guard.BackupProofError
+                ):
+                    run_api.backup_runs(901, "dev", "workflow_dispatch", SOURCE_SHA)
+
+        malformed_run_responses = (
+            {"total_count": True, "workflow_runs": []},
+            {"total_count": 1, "workflow_runs": ["not a run object"]},
+            {"total_count": 1, "workflow_runs": [{"id": True}]},
+        )
+        for response in malformed_run_responses:
+            with self.subTest(malformed_run_response=response):
+                with mock.patch.object(run_api, "_json", return_value=response), self.assertRaises(
+                    backup_guard.BackupProofError
+                ):
+                    run_api.backup_runs(901, "dev", "workflow_dispatch", SOURCE_SHA)
+
+        with mock.patch.object(
+            run_api,
+            "_json",
+            return_value={"total_count": 10_001, "workflow_runs": []},
+        ), self.assertRaises(backup_guard.BackupProofError):
+            run_api.backup_runs(901, "dev", "workflow_dispatch", SOURCE_SHA)
+
+        bounded_rows = [{"id": 30_000 + index} for index in range(100)]
+        bounded_pages = [
+            {"total_count": 101, "workflow_runs": [row]} for row in bounded_rows
+        ]
+        with mock.patch.object(run_api, "_json", side_effect=bounded_pages), self.assertRaisesRegex(
+            backup_guard.BackupProofError, "pagination exceeded its bound"
+        ):
+            run_api.backup_runs(901, "dev", "workflow_dispatch", SOURCE_SHA)
 
         pagination_failures = (
             lambda rows: ({"total_count": 101, "jobs": rows[:99]}, {"total_count": 101, "jobs": rows[99:]}),

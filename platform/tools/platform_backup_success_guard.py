@@ -759,14 +759,20 @@ class GitHubBackupProofApi:
                 total = payload["total_count"]
             elif total != payload["total_count"]:
                 raise BackupProofError("backup workflow pagination changed during proof")
-            rows.extend(payload["workflow_runs"])
-            if len(rows) >= total:
-                break
-            if len(payload["workflow_runs"]) < 100:
+            remaining = total - len(rows)
+            if remaining < 0:
+                raise BackupProofError("backup workflow pagination exceeds its reported total")
+            page_rows = payload["workflow_runs"]
+            if len(page_rows) > remaining:
+                raise BackupProofError("backup workflow pagination exceeds its reported total")
+            if remaining > 0 and not page_rows:
+                raise BackupProofError("backup workflow pagination is incomplete")
+            rows.extend(page_rows)
+            if len(rows) == total:
                 break
         else:
             raise BackupProofError("backup workflow pagination exceeded its bound")
-        if total is None or len(rows) > 10_000:
+        if total is None or len(rows) != total:
             raise BackupProofError("backup workflow pagination is incomplete")
         ids = [row.get("id") for row in rows if isinstance(row, dict)]
         if len(ids) != len(rows) or any(type(item) is not int or item <= 0 for item in ids) or len(ids) != len(set(ids)):

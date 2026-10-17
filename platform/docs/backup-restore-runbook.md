@@ -431,7 +431,7 @@ and does not dispatch a manual-deployment path.
 The source-bound candidate title is the exact `run-name` emitted by
 `platform-production-backup.yml`, including the operation label, Security run
 ID and attempt, and source SHA. A title mismatch is treated as a missing exact
-candidate; the guard does not infer identity from a similar title.
+candidate; the guard does not infer identity from a similar title. Run discovery completes every page, continues after short nonempty pages, and requires unique run IDs to match stable `total_count`; premature empty, overfull, changed-total, malformed/duplicate IDs or page-bound exhaustion fail closed. A complete zero-count response remains an ordinary poll sample under the existing deadline.
 
 When the source-bound scratch restore service exits before its confinement can
 be verified, the explicit private-diagnostics path records only a closed unit
