@@ -31,10 +31,13 @@ from tools.platform_load import (
 from tools.platform_load_runtime import PID_NAMESPACE_ISOLATION, WORKER_REPORT_SCHEMA
 from tools.platform_load_acceptance import (
     _capacity_ramp_evidence,
+    _phase_retry_totals_reconciliation,
+    _retry_reconciliation,
     derive_expected_phase_plan,
     evaluate_acceptance,
     observer_evidence_required,
     phase_plan_completeness,
+    timing_completeness,
 )
 
 
@@ -2748,6 +2751,178 @@ class LoadAcceptanceTests(unittest.TestCase):
             result["phase_budget_evidence"]["read"]["checks"][
                 "raw_requests_cover_logical_actions"
             ]
+        )
+
+        # Schedule delay and late start are emitted once per logical action,
+        # while service/queue/observed latency and lifecycle counts cover each
+        # raw attempt. Check the producer's zero-retry shape, then reconcile
+        # multiple retries at both aggregate and phase boundaries.
+        logical = canonical_logical(5)
+        logical.update({"total_retries": 3, "retry_amplification_percent": 60})
+        # The aggregate includes two non-retried state reads in addition to
+        # three primary actions and their three retries. Derive applicability
+        # from each summary's own request/retry counters rather than
+        # subtracting a phase retry total from the aggregate more than once.
+        raw_http = canonical_raw(8)
+        raw_http.update(
+            {
+                "retry_attempts": 3,
+                "total_retries": 3,
+                "retry_amplification_percent": 60,
+            }
+        )
+        for metric_name in ("schedule_delay", "late_start"):
+            raw_http["timing"][metric_name] = canonical_metric(5)  # type: ignore[index]
+
+        phase_logical = canonical_logical(2)
+        phase_logical.update(
+            {"total_retries": 2, "retry_amplification_percent": 100}
+        )
+        phase_raw = canonical_raw(4)
+        phase_raw.update(
+            {
+                "retry_attempts": 2,
+                "total_retries": 2,
+                "retry_amplification_percent": 100,
+            }
+        )
+        for metric_name in ("schedule_delay", "late_start"):
+            phase_raw["timing"][metric_name] = canonical_metric(2)  # type: ignore[index]
+        second_phase_logical = canonical_logical(1)
+        second_phase_logical.update(
+            {"total_retries": 1, "retry_amplification_percent": 100}
+        )
+        second_phase_raw = canonical_raw(2)
+        second_phase_raw.update(
+            {
+                "retry_attempts": 1,
+                "total_retries": 1,
+                "retry_amplification_percent": 100,
+            }
+        )
+        for metric_name in ("schedule_delay", "late_start"):
+            second_phase_raw["timing"][metric_name] = canonical_metric(1)  # type: ignore[index]
+        state_raw = canonical_raw(2)
+        phases = {
+            "write_a": {"logical": phase_logical, "raw_http": phase_raw},
+            "write_b": {
+                "logical": second_phase_logical,
+                "raw_http": second_phase_raw,
+            },
+            "state": state_raw,
+        }
+
+        zero_retry = canonical_raw(6)
+        self.assertTrue(
+            timing_completeness(
+                logical_summary=canonical_logical(6),
+                raw_http_summary=zero_retry,
+                require_metrics=True,
+            )["complete"]
+        )
+        retry_timing_evidence = timing_completeness(
+            logical_summary=logical,
+            raw_http_summary=raw_http,
+            phase_summaries=phases,
+            require_metrics=True,
+        )
+        self.assertTrue(retry_timing_evidence["complete"], retry_timing_evidence)
+        self.assertTrue(
+            _retry_reconciliation(logical, raw_http, canonical=True)["complete"]
+        )
+        self.assertTrue(
+            _phase_retry_totals_reconciliation(
+                phases,
+                logical,
+                raw_http,
+                canonical=True,
+            )["complete"]
+        )
+
+        read_alias = deepcopy(raw_http)
+        read_plan = phase_plan_completeness(
+            phase_summaries={
+                "read": {
+                    "logical": read_alias,
+                    "raw_http": deepcopy(raw_http),
+                }
+            },
+            expected_phase_plan=[{"name": "read", "logical_actions": 8}],
+            canonical=True,
+            expected_logical_scope="full_population",
+            allowed_phase_names={"read"},
+        )
+        self.assertTrue(read_plan["checks"]["phase_read"], read_plan)
+        read_alias["timing"]["schedule_delay"] = canonical_metric(4)  # type: ignore[index]
+        malformed_read_plan = phase_plan_completeness(
+            phase_summaries={
+                "read": {
+                    "logical": read_alias,
+                    "raw_http": deepcopy(raw_http),
+                }
+            },
+            expected_phase_plan=[{"name": "read", "logical_actions": 8}],
+            canonical=True,
+            expected_logical_scope="full_population",
+            allowed_phase_names={"read"},
+        )
+        self.assertFalse(malformed_read_plan["checks"]["phase_read"])
+
+        missing_phase_sample = deepcopy(phases)
+        missing_phase_sample["write_a"]["raw_http"]["timing"]["late_start"] = canonical_metric(1)  # type: ignore[index]
+        self.assertFalse(
+            timing_completeness(
+                logical_summary=logical,
+                raw_http_summary=raw_http,
+                phase_summaries=missing_phase_sample,
+                require_metrics=True,
+            )["complete"]
+        )
+
+        missing_first_attempt_sample = deepcopy(raw_http)
+        missing_first_attempt_sample["timing"]["schedule_delay"] = canonical_metric(2)  # type: ignore[index]
+        self.assertFalse(
+            timing_completeness(
+                logical_summary=logical,
+                raw_http_summary=missing_first_attempt_sample,
+                require_metrics=True,
+            )["complete"]
+        )
+
+        invalid_raw_counts = deepcopy(raw_http)
+        for retry_count in (-1, 7, True):
+            with self.subTest(invalid_retry_attempts=retry_count):
+                invalid_raw_counts = deepcopy(raw_http)
+                invalid_raw_counts["retry_attempts"] = retry_count
+                self.assertFalse(
+                    timing_completeness(
+                        logical_summary=logical,
+                        raw_http_summary=invalid_raw_counts,
+                        require_metrics=True,
+                    )["complete"]
+                )
+                self.assertFalse(
+                    _retry_reconciliation(logical, invalid_raw_counts, canonical=True)[
+                        "complete"
+                    ]
+                )
+
+        inconsistent_retries = deepcopy(raw_http)
+        inconsistent_retries["retry_attempts"] = 2
+        self.assertFalse(
+            _retry_reconciliation(logical, inconsistent_retries, canonical=True)[
+                "complete"
+            ]
+        )
+
+        missing_service_sample = deepcopy(raw_http)
+        missing_service_sample["timing"]["service_latency"].pop("count")  # type: ignore[index,union-attr]
+        self.assertFalse(
+            timing_completeness(
+                logical_summary=logical,
+                raw_http_summary=missing_service_sample,
+                require_metrics=True,
+            )["complete"]
         )
 
     def test_canonical_closed_world_matrix_rejects_remaining_false_green_shapes(self) -> None:

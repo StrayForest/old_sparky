@@ -7,7 +7,7 @@ no database, remote origin, credentials, or live workflow is used.
 
 from __future__ import annotations
 
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stdout
 from copy import deepcopy
 import hashlib
 import base64
@@ -31,7 +31,12 @@ from unittest.mock import patch
 
 import yaml
 
-from tools import platform_load, platform_load_runtime, platform_load_worker
+from tools import (
+    platform_external_load,
+    platform_load,
+    platform_load_runtime,
+    platform_load_worker,
+)
 from tools.platform_external_load import RequestResult, VirtualUser
 from tools.platform_load_runtime import PID_NAMESPACE_ISOLATION, WORKER_REPORT_SCHEMA
 from tools.platform_load_acceptance import _acceptance_budget_evidence
@@ -493,6 +498,23 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             timeout_diagnostics_run_id=RUN_ID,
         )
         self._assert_timeout_diagnostic_receipt(report)
+        retry_terminal_report = self._exercise_closed_failure_builder(
+            "ready-vote-slo-v2",
+            "http_error",
+            500,
+            "server_error",
+            retry_before_terminal_failure=True,
+        )
+        raw_http = retry_terminal_report["raw_http"]
+        self.assertEqual(raw_http["retry_attempts"], 1)
+        self.assertEqual(
+            raw_http["timing"]["schedule_delay"]["count"],
+            raw_http["requests"] - raw_http["retry_attempts"],
+        )
+        self.assertEqual(
+            raw_http["timing"]["late_start"]["count"],
+            raw_http["requests"] - raw_http["retry_attempts"],
+        )
 
     def test_explicit_child_boundary_disables_non_ready_raw_alias(self) -> None:
         self._exercise_closed_failure_builder(
@@ -513,6 +535,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
         add_explicit_child: bool = False,
         preserve_profile: bool = False,
         timeout_diagnostics_run_id: str | None = None,
+        retry_before_terminal_failure: bool = False,
     ) -> dict[str, object]:
         profile = deepcopy(platform_load.get_profile(profile_id))
         exact_transport_pair = profile_id == READY_VOTE_TRANSPORT_PAIR_PROFILE_ID
@@ -623,10 +646,10 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             pair_ready_counts[users[0].tournament_slug] -= 1
 
         class FakeResponse:
-            status = 200
             headers = {"etag": '"fixture-etag"', "cf-ray": "fixture-ray"}
 
-            def __init__(self, body: bytes) -> None:
+            def __init__(self, body: bytes, *, status: int = 200) -> None:
+                self.status = status
                 self._body = body
                 self._offset = 0
 
@@ -681,6 +704,11 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 if inject_failure:
                     failing_attempts += 1
             if inject_failure:
+                if retry_before_terminal_failure and failing_attempts == 1:
+                    return FakeResponse(
+                        b'{"code":"READY_VOTE_OVERLOADED","retryable":true}',
+                        status=503,
+                    )
                 if failure_kind == "transport":
                     raise URLError("synthetic bounded transport failure")
                 raise HTTPError(
@@ -1032,16 +1060,33 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 self.assertTrue(
                     platform_load._is_closed_pending_origin_candidate(profile, result)
                 )
+            if retry_before_terminal_failure:
+                malformed_retry_report = deepcopy(report)
+                malformed_retry_report["raw_http"]["timing"]["schedule_delay"][
+                    "count"
+                ] -= 1
+                self.assertFalse(
+                    platform_load._closed_terminal_status_failure(
+                        profile, malformed_retry_report
+                    )
+                )
         self.assertFalse(report["acceptance"]["contract_ok"])
         self.assertFalse(report["acceptance"]["passed"])
         observed_failures = report["raw_http"]["status_counts"].get(
             str(expected_status), 0
         )
         self.assertGreaterEqual(observed_failures, 1)
-        self.assertEqual(
-            report["raw_http"]["error_kinds"].get(expected_error),
-            observed_failures,
-        )
+        if retry_before_terminal_failure:
+            self.assertEqual(report["raw_http"]["retry_attempts"], 1)
+            self.assertGreaterEqual(
+                report["raw_http"]["error_kinds"].get(expected_error, 0),
+                observed_failures,
+            )
+        else:
+            self.assertEqual(
+                report["raw_http"]["error_kinds"].get(expected_error),
+                observed_failures,
+            )
         return report
 
     def _assert_timeout_diagnostic_receipt(
@@ -1229,6 +1274,16 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
         for profile_id in ("read-mix-human-v2", "ready-vote-capacity-ramp-v2"):
             with self.subTest(profile=profile_id):
                 self._exercise_deferred_pipeline(profile_id)
+        self._exercise_deferred_pipeline(
+            "ready-vote-slo-v2",
+            retry_failure=True,
+        )
+        self._exercise_deferred_pipeline(
+            "ready-vote-slo-v2",
+            retry_failure=True,
+            candidate_mutation="missing_retry_schedule_sample",
+            expected_candidate_exit=1,
+        )
 
     def test_cli_completed_transport_failure_reaches_origin_bound_red_gate(self) -> None:
         self._exercise_deferred_pipeline(
@@ -1274,6 +1329,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
         profile_id: str,
         *,
         transport_failure: bool = False,
+        retry_failure: bool = False,
         candidate_mutation: str | None = None,
         expected_candidate_exit: int = 3,
         source_binding: dict[str, object] | None = None,
@@ -1281,7 +1337,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
         profile = _hermetic_profile(profile_id)
         profile, manifest, users = _small_profile(profile)
         target_users = len(users)
-        if transport_failure:
+        if transport_failure or retry_failure:
             # Preserve one real successful mutation before the typed transport
             # failure so the producer still performs its final state read.
             target_users = max(2, len(users))
@@ -1354,6 +1410,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
 
         transport_failures = 0
         post_requests = 0
+        retry_injected = False
 
         class FakeResponse:
             status = 200
@@ -1362,7 +1419,8 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 "cf-ray": "fixture-ray",
             }
 
-            def __init__(self, body: bytes) -> None:
+            def __init__(self, body: bytes, *, status: int = 200) -> None:
+                self.status = status
                 self._body = body
                 self._offset = 0
 
@@ -1385,19 +1443,27 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             timeout: float,
             context: ssl.SSLContext,
         ) -> FakeResponse:
-            nonlocal post_requests, transport_failures
+            nonlocal post_requests, transport_failures, retry_injected
             del timeout, context
             method = request_object.get_method()
             path = request_object.full_url
+            if retry_failure and method == "POST" and not retry_injected:
+                retry_injected = True
+                return FakeResponse(
+                    b'{"code":"READY_VOTE_OVERLOADED","retryable":true}',
+                    status=503,
+                )
             if method == "POST":
                 post_requests += 1
-                if post_requests == 2:
+                if transport_failure and post_requests == 2:
                     transport_failures += 1
                     raise URLError("synthetic bounded transport failure")
             body = (
                 b'{"changed":true}'
                 if method == "POST"
-                else b'{"active_round":{"ready_count":1}}'
+                else json.dumps(
+                    {"active_round": {"ready_count": len(users) if retry_failure else 1}}
+                ).encode("ascii")
                 if path.endswith("/deadlock/ready-check")
                 else b"{}"
             )
@@ -1588,9 +1654,39 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             }
             request_transport = (
                 patch("tools.platform_external_load.urlopen", side_effect=urlopen)
-                if transport_failure
+                if transport_failure or retry_failure
                 else patch("tools.platform_external_load._request", side_effect=request)
             )
+            timing_summary_patch = nullcontext()
+            if candidate_mutation == "missing_retry_schedule_sample":
+                original_timing_summary = platform_external_load._TimingAccumulator.summary
+                timing_sample_removed = False
+
+                def timing_summary_missing_first_attempt_sample(
+                    accumulator: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> dict[str, object]:
+                    nonlocal timing_sample_removed
+                    summary = original_timing_summary(
+                        accumulator,
+                        *args,
+                        **kwargs,
+                    )
+                    if (
+                        not timing_sample_removed
+                        and kwargs.get("unit") == "requests"
+                        and summary["schedule_delay"]["count"] > 0
+                    ):
+                        summary["schedule_delay"]["count"] -= 1
+                        timing_sample_removed = True
+                    return summary
+
+                timing_summary_patch = patch(
+                    "tools.platform_external_load._TimingAccumulator.summary",
+                    autospec=True,
+                    side_effect=timing_summary_missing_first_attempt_sample,
+                )
             with (
                 patch("tools.platform_load.get_profile", return_value=profile),
                 patch("tools.platform_load_runtime.require_pid_namespace_capability", return_value=None),
@@ -1598,6 +1694,8 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 patch("tools.platform_external_load.load_manifest", return_value=(manifest, users)),
                 patch("tools.platform_external_load._trace", return_value={"status": "200", "ip": "192.0.2.10", "colo": "TEST"}),
                 request_transport,
+                timing_summary_patch,
+                patch("tools.platform_external_load.random.uniform", side_effect=lambda low, _high: low),
                 patch("socket.socket.connect", side_effect=AssertionError("network access is forbidden in this test")),
                 patch.dict(os.environ, os_env, clear=False),
             ):
@@ -1655,6 +1753,13 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 self.assertEqual(
                     candidate["raw_http"]["error_kinds"], {"transport": 1}
                 )
+            if retry_failure and candidate_mutation is None:
+                raw_timing = candidate["raw_http"]["timing"]
+                self.assertEqual(candidate["raw_http"]["retry_attempts"], 1)
+                self.assertEqual(raw_timing["completed_count"], 3)
+                self.assertEqual(raw_timing["schedule_delay"]["count"], 2)
+                self.assertEqual(raw_timing["late_start"]["count"], 2)
+                self.assertEqual(raw_timing["service_latency"]["count"], 3)
 
             # Execute the exact candidate-state Bash branch from the workflow.
             status_branch = load_step[load_step.index("client_exit_status=\"$load_status\""):load_step.index("if [[ \"$TIMEOUT_DIAGNOSTICS\" == true ]]; then", load_step.index("client_exit_status=\"$load_status\""))]

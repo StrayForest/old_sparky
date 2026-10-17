@@ -2427,13 +2427,22 @@ def _closed_timing_evidence_tree(value: Any) -> bool:
     """Reject partial, malformed or inconsistent timing evidence anywhere."""
 
     try:
-        from tools.platform_load_acceptance import timing_summary_is_complete
+        from tools.platform_load_acceptance import (
+            _timing_metric_populations,
+            timing_summary_is_complete,
+        )
     except ModuleNotFoundError:  # Direct execution from platform/tools.
-        from platform_load_acceptance import timing_summary_is_complete  # type: ignore[no-redef]
+        from platform_load_acceptance import (  # type: ignore[no-redef]
+            _timing_metric_populations,
+            timing_summary_is_complete,
+        )
 
     seen: set[int] = set()
 
-    def visit(node: Any) -> bool:
+    def visit(
+        node: Any,
+        metric_populations: Mapping[str, int | None] | None = None,
+    ) -> bool:
         if isinstance(node, (list, tuple)):
             return all(visit(child) for child in node)
         if not isinstance(node, Mapping) or id(node) in seen:
@@ -2444,11 +2453,22 @@ def _closed_timing_evidence_tree(value: Any) -> bool:
         if "inflight_unknown" in node and node.get("inflight_unknown") is not False:
             return False
         if "timing_schema" in node and "partial" in node:
-            if not timing_summary_is_complete(node, require_metrics=True):
+            if not timing_summary_is_complete(
+                node,
+                require_metrics=True,
+                metric_populations=metric_populations,
+            ):
                 return False
+
+        def child_population(key: Any) -> Mapping[str, int | None] | None:
+            if key == "timing" and "requests" in node:
+                populations = _timing_metric_populations(node)
+                return populations or None
+            return None
+
         return all(
-            visit(child)
-            for child in node.values()
+            visit(child, child_population(key))
+            for key, child in node.items()
             if isinstance(child, (Mapping, list, tuple))
         )
 
@@ -2578,12 +2598,14 @@ def _closed_terminal_status_failure(
     try:
         from tools.platform_load_acceptance import (
             _outcome_consistency,
+            _timing_metric_populations,
             normalize_evidence,
             timing_summary_is_complete,
         )
     except ModuleNotFoundError:  # Direct execution from platform/tools.
         from platform_load_acceptance import (  # type: ignore[no-redef]
             _outcome_consistency,
+            _timing_metric_populations,
             normalize_evidence,
             timing_summary_is_complete,
         )
@@ -2597,7 +2619,15 @@ def _closed_terminal_status_failure(
             not isinstance(timing, Mapping)
             or "timing_schema" not in timing
             or "partial" not in timing
-            or not timing_summary_is_complete(timing, require_metrics=True)
+            or not timing_summary_is_complete(
+                timing,
+                require_metrics=True,
+                metric_populations=(
+                    _timing_metric_populations(summary)
+                    if "requests" in summary
+                    else None
+                ),
+            )
         ):
             return False
         if "requests" in summary and "status_counts" not in summary:

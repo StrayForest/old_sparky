@@ -874,10 +874,37 @@ def _nonnegative_int(
     return value
 
 
+def _timing_metric_populations(summary: Any) -> dict[str, int | None]:
+    """Return producer-applicable metric counts for one raw HTTP population.
+
+    Schedule delay and late start belong to the action's submitted first
+    attempt. Inline retries retain per-attempt lifecycle, queue and latency
+    evidence, but the producer intentionally does not attribute the action's
+    schedule to those retries. Their expected count is therefore the raw
+    request count minus the retry count. Invalid or absent counters produce an
+    invalid expectation so canonical metric validation fails closed.
+    """
+
+    if not isinstance(summary, Mapping) or "requests" not in summary:
+        return {}
+    requests = _nonnegative_int(summary.get("requests"))
+    retries = _nonnegative_int(summary.get("retry_attempts"))
+    applicable = (
+        requests - retries
+        if requests is not None and retries is not None and retries <= requests
+        else None
+    )
+    return {
+        "schedule_delay": applicable,
+        "late_start": applicable,
+    }
+
+
 def _timing_metric_checks(
     timing: Any,
     *,
     require_user_observed: bool = False,
+    metric_populations: Mapping[str, int | None] | None = None,
 ) -> dict[str, bool]:
     """Validate nested latency metric populations and percentile domains."""
 
@@ -894,6 +921,12 @@ def _timing_metric_checks(
             timing.get("user_observed_latency"), Mapping
         )
     for metric_name in _TIMING_METRICS:
+        metric_population = (
+            metric_populations.get(metric_name, population)
+            if isinstance(metric_populations, Mapping)
+            else population
+        )
+        metric_population = _nonnegative_int(metric_population)
         metric = timing.get(metric_name)
         if metric is None:
             checks[f"{metric_name}_present"] = False
@@ -903,22 +936,24 @@ def _timing_metric_checks(
             continue
         metric_count = _nonnegative_int(metric.get("count"))
         checks[f"{metric_name}_count"] = (
-            metric_count is not None and metric_count == population
+            metric_population is not None and metric_count == metric_population
         )
         values: list[float] = []
         for percentile in _PERCENTILES:
             value = _number(metric, f"{percentile}_ms")
-            if population == 0:
+            if metric_population == 0:
                 checks[f"{metric_name}_{percentile}_empty"] = (
                     f"{percentile}_ms" in metric and metric.get(f"{percentile}_ms") is None
                 )
             else:
                 checks[f"{metric_name}_{percentile}_finite"] = (
-                    f"{percentile}_ms" in metric and value is not None
+                    metric_population is not None
+                    and f"{percentile}_ms" in metric
+                    and value is not None
                 )
                 if value is not None:
                     values.append(value)
-        if population > 0:
+        if metric_population is not None and metric_population > 0:
             checks[f"{metric_name}_percentiles_ordered"] = (
                 len(values) == len(_PERCENTILES)
                 and all(left <= right for left, right in zip(values, values[1:]))
@@ -927,7 +962,7 @@ def _timing_metric_checks(
             if field in metric:
                 checks[f"{metric_name}_{field}_finite"] = (
                     metric.get(field) is None
-                    if population == 0
+                    if metric_population == 0
                     else _number(metric, field) is not None
                 )
     return checks
@@ -937,10 +972,12 @@ def _timing_evidence_is_complete(
     timing: Any,
     *,
     require_metrics: bool = False,
+    metric_populations: Mapping[str, int | None] | None = None,
 ) -> bool:
     checks = _timing_metric_checks(
         timing,
         require_user_observed=require_metrics,
+        metric_populations=metric_populations,
     ) if require_metrics else {}
     return timing_summary_is_complete(timing) and all(checks.values())
 
@@ -949,6 +986,7 @@ def timing_summary_is_complete(
     timing: Any,
     *,
     require_metrics: bool = False,
+    metric_populations: Mapping[str, int | None] | None = None,
 ) -> bool:
     """Validate the canonical timing population, fail closed.
 
@@ -982,7 +1020,11 @@ def timing_summary_is_complete(
         return False
     if require_metrics:
         return all(
-            _timing_metric_checks(timing, require_user_observed=True).values()
+            _timing_metric_checks(
+                timing,
+                require_user_observed=True,
+                metric_populations=metric_populations,
+            ).values()
         )
     return True
 
@@ -991,6 +1033,7 @@ def _timing_summary_details(
     timing: Any,
     *,
     require_metrics: bool = False,
+    metric_populations: Mapping[str, int | None] | None = None,
 ) -> dict[str, Any]:
     """Return compact diagnostics for a failed timing completeness check."""
 
@@ -1002,7 +1045,11 @@ def _timing_summary_details(
         }
     details: dict[str, Any] = {
         "present": True,
-        "complete": timing_summary_is_complete(timing, require_metrics=require_metrics),
+        "complete": timing_summary_is_complete(
+            timing,
+            require_metrics=require_metrics,
+            metric_populations=metric_populations,
+        ),
         "partial": timing.get("partial"),
         "dropped_work": timing.get("dropped_work"),
         "missing_schedule_context": timing.get("missing_schedule_context"),
@@ -1346,6 +1393,9 @@ def normalize_evidence(
     checks["timing_complete"] = _timing_evidence_is_complete(
         timing,
         require_metrics=canonical,
+        metric_populations=(
+            _timing_metric_populations(summary) if kind == "raw_http" else None
+        ),
     )
     goodput = _derived_goodput(
         summary,
@@ -1569,13 +1619,24 @@ def _retry_reconciliation(
     }
 
 
-def _timing_nodes(value: Any, *, path: str = "summary") -> list[tuple[str, Any]]:
-    """Collect timing summaries without treating timing fields as summaries."""
+def _timing_nodes(
+    value: Any,
+    *,
+    path: str = "summary",
+) -> list[tuple[str, Any, Mapping[str, int | None] | None]]:
+    """Collect timing summaries and their parent raw-population context."""
 
-    nodes: list[tuple[str, Any]] = []
+    nodes: list[tuple[str, Any, Mapping[str, int | None] | None]] = []
     if isinstance(value, dict):
         if "timing" in value:
-            nodes.append((f"{path}.timing", value.get("timing")))
+            populations = _timing_metric_populations(value)
+            nodes.append(
+                (
+                    f"{path}.timing",
+                    value.get("timing"),
+                    populations or None,
+                )
+            )
         for key, item in value.items():
             if key == "timing":
                 continue
@@ -1595,18 +1656,21 @@ def timing_completeness(
 ) -> dict[str, Any]:
     """Validate all timing summaries used by one current acceptance report."""
 
-    nodes: list[tuple[str, Any]] = []
+    nodes: list[tuple[str, Any, Mapping[str, int | None] | None]] = []
 
     def add_summary(path: str, summary: Any) -> None:
         """Require a timing object whenever a non-empty summary is present."""
 
         if not isinstance(summary, dict) or not summary:
-            nodes.append((f"{path}.timing", None))
+            nodes.append((f"{path}.timing", None, None))
             return
         if "timing" not in summary:
-            nodes.append((f"{path}.timing", None))
+            nodes.append((f"{path}.timing", None, None))
             return
-        nodes.append((f"{path}.timing", summary.get("timing")))
+        populations = _timing_metric_populations(summary)
+        nodes.append(
+            (f"{path}.timing", summary.get("timing"), populations or None)
+        )
 
     def add_phase_summaries(phases: Any) -> None:
         if not isinstance(phases, dict) or not phases:
@@ -1614,7 +1678,7 @@ def timing_completeness(
         for phase_name, phase in phases.items():
             phase_path = f"phases.{phase_name}"
             if not isinstance(phase, dict):
-                nodes.append((f"{phase_path}.timing", None))
+                nodes.append((f"{phase_path}.timing", None, None))
                 continue
             # A read-mix concurrency ramp is a phase container: each named
             # stage carries its own full-population timing summary.  Requiring
@@ -1648,8 +1712,12 @@ def timing_completeness(
     # Preserve diagnostics for any additional nested timing objects supplied
     # by a report while avoiding duplicate primary/phase nodes.
     nested_nodes = _timing_nodes(phase_summaries, path="phases")
-    known = {path for path, _timing in nodes}
-    nodes.extend((path, timing) for path, timing in nested_nodes if path not in known)
+    known = {path for path, _timing, _populations in nodes}
+    nodes.extend(
+        (path, timing, populations)
+        for path, timing, populations in nested_nodes
+        if path not in known
+    )
 
     # A current canonical report must carry timing evidence at its primary
     # boundary.  Capacity reports may use an empty top-level summary and put
@@ -1674,10 +1742,18 @@ def timing_completeness(
     failed = [
         {
             "path": path,
-            **_timing_summary_details(timing, require_metrics=require_metrics),
+            **_timing_summary_details(
+                timing,
+                require_metrics=require_metrics,
+                metric_populations=populations,
+            ),
         }
-        for path, timing in nodes
-        if not timing_summary_is_complete(timing, require_metrics=require_metrics)
+        for path, timing, populations in nodes
+        if not timing_summary_is_complete(
+            timing,
+            require_metrics=require_metrics,
+            metric_populations=populations,
+        )
     ]
     return {
         "complete": not failed,
@@ -2185,7 +2261,15 @@ def phase_plan_completeness(
                     and _nonnegative_int(timing.get("expected_count")) == expected_actions
                     and _nonnegative_int(timing.get("submitted_count")) == expected_actions
                     and _nonnegative_int(timing.get("completed_count")) == expected_actions
-                    and timing_summary_is_complete(timing, require_metrics=canonical)
+                    and timing_summary_is_complete(
+                        timing,
+                        require_metrics=canonical,
+                        metric_populations=(
+                            _timing_metric_populations(logical)
+                            if expected_logical_scope == "full_population"
+                            else None
+                        ),
+                    )
                 )
                 if phase_metadata_required:
                     phase_population = phase_population and (
@@ -2291,6 +2375,7 @@ def phase_plan_completeness(
                 and timing_summary_is_complete(
                     raw_http.get("timing"),
                     require_metrics=canonical,
+                    metric_populations=_timing_metric_populations(raw_http),
                 )
             )
             raw_requests = (

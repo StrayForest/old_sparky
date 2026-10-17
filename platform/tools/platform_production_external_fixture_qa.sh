@@ -297,6 +297,7 @@ server_observability_log="$run_root/server-observability.json"
 external_vote_root="$run_root/external-vote"
 install -d -o root -g root -m 0700 "$external_vote_root"
 external_vote_report="$external_vote_root/external-vote.json"
+external_vote_timing="$external_vote_root/fixture-timing.json"
 external_vote_manifest="$external_vote_root/manifest.json"
 external_vote_summary="$external_vote_root/matrix-summary.json"
 external_vote_complete="$export_dir/complete"
@@ -624,61 +625,13 @@ find "$run_root" -xdev -type f -links 1 \
   -exec chown root:root -- {} + \
   -exec chmod 0600 -- {} +
 
-"$SYSTEM_PYTHON" -I -B - "$summary_path" "$export_dir/matrix-summary.json" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-source_path, destination = sys.argv[1:]
-try:
-    payload = json.loads(Path(source_path).read_text(encoding="utf-8"))
-except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-    payload = {}
-if not isinstance(payload, dict):
-    payload = {}
-rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
-safe_rows = []
-for row in rows[:20]:
-    if not isinstance(row, dict):
-        continue
-    result = row.get("result") if isinstance(row.get("result"), dict) else {}
-    synthetic_users = row.get("synthetic_users")
-    if (
-        isinstance(synthetic_users, bool)
-        or not isinstance(synthetic_users, int)
-        or synthetic_users < 0
-        or synthetic_users > 1_000_000_000
-    ):
-        synthetic_users = 0
-    safe_rows.append(
-        {
-            "synthetic_users": synthetic_users,
-            "result": {
-                "passed": result.get("passed") is True,
-            },
-        }
-    )
-def safe_count(key):
-    value = payload.get(key)
-    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000_000 else 0
-mode = payload.get("mode")
-if not isinstance(mode, str) or mode not in {"scale", "read-mix", "write-burst"}:
-    mode = "other"
-safe = {
-    "schema": 1,
-    "mode": mode,
-    "control_account_preserved": payload.get("control_account_preserved") is True,
-    "planned_tournaments": safe_count("planned_tournaments"),
-    "completed_tournaments": safe_count("completed_tournaments"),
-    "planned_users": safe_count("planned_users"),
-    "completed_users": safe_count("completed_users"),
-    "passed": payload.get("passed") is True,
-    "rows": safe_rows,
-}
-Path(destination).write_text(json.dumps(safe, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-PY
-chown "$export_uid:$export_gid" "$export_dir/matrix-summary.json"
-chmod 0600 "$export_dir/matrix-summary.json"
+safe_matrix_summary="$run_root/fixture-export-matrix-summary.json"
+env PLATFORM_RUNTIME_SERVICE=qa "$QA_PYTHON" -B \
+  "$TOOLS_DIR/platform_prepare_external_vote_fixture.py" \
+  --project-fixture-timing "$external_vote_timing" \
+  "$summary_path" "$safe_matrix_summary" "$qa_status"
+install -o "$export_uid" -g "$export_gid" -m 0600 \
+  "$safe_matrix_summary" "$export_dir/matrix-summary.json"
 install -o "$export_uid" -g "$export_gid" -m 0600 \
   "$log_path" "$export_dir/canonical.log"
 if [[ -s "$server_observability_log" ]]; then
