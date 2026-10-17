@@ -1265,6 +1265,36 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(special_outputs["route_recovery_bootstrap_only"], "true")
         self.assertEqual(special_outputs["route_candidate_packaging_only"], "false")
 
+        host_tools_adr = "platform/docs/adr/production-host-tools-provisioning.md"
+        adr_push = classify(
+            [host_tools_adr],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(adr_push["class"], "full")
+        self.assertEqual(adr_push["expected_gates"], list(FULL_GATE_IDS))
+        self.assertEqual(adr_push["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertFalse(adr_push["fallback"])
+        self.assertFalse(adr_push["runtime_sensitive"])
+        self.assertFalse(adr_push["deployable"])
+        adr_outputs = self._run_auto_deploy_manifest_contract(adr_push)
+        self.assertEqual(adr_outputs["route_class"], "full")
+        self.assertEqual(adr_outputs["route_deployable"], "false")
+        self.assertEqual(adr_outputs["route_recovery_bootstrap_only"], "true")
+        self.assertEqual(adr_outputs["route_candidate_packaging_only"], "false")
+
+        adr_pr = classify(
+            [host_tools_adr],
+            event="pull_request",
+            target_sha=self.TARGET_SHA,
+            branch="feature",
+        )
+        self.assertEqual(adr_pr["class"], "full")
+        self.assertEqual(adr_pr["expected_gates"], list(FULL_GATE_IDS))
+        self.assertFalse(adr_pr["fallback"])
+        self.assertFalse(adr_pr["deployable"])
+
         overlap_route = classify(
             [".github/workflows/platform-production-autodeploy.yml"],
             event="push",
@@ -1303,6 +1333,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             target_sha=self.TARGET_SHA,
             branch="dev",
         )
+        self.assertEqual(docs_only["class"], "docs-only")
+        self.assertEqual(docs_only["expected_gates"], list(DOCS_ONLY_GATE_IDS))
+        self.assertFalse(docs_only["deployable"])
         docs_outputs = self._run_auto_deploy_manifest_contract(docs_only)
         self.assertEqual(docs_outputs["route_recovery_bootstrap_only"], "false")
         self.assertEqual(docs_outputs["route_candidate_packaging_only"], "false")
@@ -1657,6 +1690,22 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 target_sha=self.TARGET_SHA,
                 require_recovery_bootstrap=True,
             )
+
+            host_tools_adr = "platform/docs/adr/production-host-tools-provisioning.md"
+            adr_route = classify(
+                [host_tools_adr],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            adr_archive = self._write_production_classifier_archive(root, adr_route)
+            accepted_adr = validate_production_classifier_manifest(
+                adr_archive,
+                target_sha=self.TARGET_SHA,
+                require_recovery_bootstrap=True,
+            )
+            self.assertEqual(accepted_adr["reason"], RECOVERY_BOOTSTRAP_REASON)
+            self.assertFalse(accepted_adr["deployable"])
 
             recovery_caller = "platform/tests/test_platform_recovery_workflow_caller.py"
             caller_route = classify(

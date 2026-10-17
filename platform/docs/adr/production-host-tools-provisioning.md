@@ -12,10 +12,10 @@ generation.  The immutable path is:
 The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
-is the only source for `HOST_TOOLS_SHA`. This change follows the A/B pin
-lifecycle: source commit A updates the runtime-profile output boundary and its
-regression, and pin commit B selects A as generation S11 with its exact
-closure. S11 source A is `138128c99025069143f5c234f6cb58545ed8ab1c` and is
+is the only source for `HOST_TOOLS_SHA` and selects
+`bdc5adfe1d2be5e08fbf169040bd735910092aa0`. This differs from installed host
+generation **C1** and application source **G** (`TARGET_SHA`); pin selection is not installation evidence.
+S11 source A is `138128c99025069143f5c234f6cb58545ed8ab1c` and is
 installed with provisioning receipt SHA-256
 `2f182be1aaf90ee56ed83f7c755e4f38ec860d6f7f20e2ae003084c1a0a7c3f7`. Its
 exact-target preflight run `37276328155` passed; independent checkpoint

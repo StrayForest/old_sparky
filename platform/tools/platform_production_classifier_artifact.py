@@ -140,6 +140,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tests/test_platform_host_tools_bundle.py",
         "platform/tests/test_platform_workflow_provenance.py",
         "platform/tests/test_platform_recovery_workflow_caller.py",
+        "platform/docs/adr/production-host-tools-provisioning.md",
         "platform/tests/test_platform_cloudflare_ips.py",
         "platform/python_packages/platform_infra/db.py",
         "platform/tests/test_platform_install_nginx.py",

@@ -215,6 +215,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tests/test_platform_workflow_provenance.py",
         "platform/tests/test_platform_recovery_workflow_caller.py",
         "platform/tests/test_platform_cloudflare_ips.py",
+        "platform/docs/adr/production-host-tools-provisioning.md",
         "platform/python_packages/platform_infra/db.py",
         "platform/tests/test_platform_install_nginx.py",
         "platform/contracts/host_tools_pin.json",
@@ -425,6 +426,13 @@ def _is_storage_operations_only(files: Sequence[str]) -> bool:
 def _route_for_files(files: Sequence[str]) -> tuple[str, tuple[str, ...], str, bool]:
     """Return class, gates, reason and whether the path set is a fallback."""
 
+    if _is_recovery_bootstrap_only(files):
+        return (
+            "full",
+            FULL_GATE_IDS,
+            RECOVERY_BOOTSTRAP_REASON,
+            False,
+        )
     if all(path.startswith(DOCS_PREFIX) for path in files):
         return (
             "docs-only",
