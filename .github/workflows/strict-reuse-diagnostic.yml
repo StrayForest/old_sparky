@@ -1,0 +1,187 @@
+name: Focused strict reuse diagnostic (temporary)
+
+on:
+  push:
+    branches:
+      - codex/strict-reuse-diag-20261017
+
+permissions:
+  contents: read
+
+concurrency:
+  group: strict-reuse-focused-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  strict-reuse-diagnostic:
+    name: One focused strict-reuse proof diagnostic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      PLATFORM_ENVIRONMENT: test
+      PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+      PLATFORM_DB_SCHEMA: platform
+      PLATFORM_SECRET_KEY: example-ci-focused-diagnostic-secret-no-production-credentials
+      PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
+      PLATFORM_CELERY_BROKER_URL: redis://127.0.0.1:6379/13
+      PLATFORM_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/14
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+      - name: Install canonical hash-locked Python CI environment
+        run: platform/tools/platform_install_ci_python.sh
+      - name: Provision fixed root-owned global verification lock
+        run: |
+          set -euo pipefail
+          sudo -n "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python" \
+            "$GITHUB_WORKSPACE/platform/tools/platform_verification_lock.py" --provision
+      - name: Check root Pillow runuser setpriv and media-group prerequisites
+        run: |
+          set -euo pipefail
+          test "$(sudo -n id -u)" -eq 0
+          platform/.venv_platform/bin/python -c 'import PIL; print("Pillow available")'
+          test -x /usr/bin/runuser || test -x /usr/sbin/runuser
+          test -x /usr/bin/test
+          test -x /usr/bin/setpriv
+          for identity in oldsparky-web oldsparky-api oldsparky-worker; do
+            if ! getent group "$identity" >/dev/null; then
+              sudo groupadd --system "$identity"
+            fi
+            if ! id "$identity" >/dev/null 2>&1; then
+              sudo useradd --system --home-dir /nonexistent --no-create-home \
+                --gid "$identity" --shell /usr/sbin/nologin "$identity"
+            fi
+            sudo id "$identity"
+          done
+          if ! getent group oldsparky-media >/dev/null; then
+            sudo groupadd --system oldsparky-media
+          fi
+          sudo usermod -a -G oldsparky-media oldsparky-api
+          sudo usermod -a -G oldsparky-media oldsparky-worker
+          getent group oldsparky-media
+      - name: Run only the strict reuse proof fixture and emit bounded diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          raw_log="$(mktemp "$RUNNER_TEMP/strict-reuse-diag.XXXXXX")"
+          summary="platform/ci-backend/strict-reuse-diagnostic/summary.json"
+          manifest="platform/ci-backend/strict-reuse-diagnostic/manifest.json"
+          mkdir -p "$(dirname "$summary")"
+          chmod 700 "$(dirname "$summary")"
+          set +e
+          sudo -n env -i \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1 \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform \
+            PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test \
+            PLATFORM_SECRET_KEY=example-ci-focused-diagnostic-secret-no-production-credentials \
+            PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15 \
+            PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13 \
+            PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14 \
+            /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' && \
+            tools/platform_run_tests.sh --contour backend-privileged --focused \
+            tests.test_platform_release_venv_rollback.PlatformReleaseVenvRollbackTests.test_required_reuse_policy_runs_real_proof_cli_and_persists_its_receipt \
+            --manifest ci-backend/strict-reuse-diagnostic/manifest.json \
+            --summary ci-backend/strict-reuse-diagnostic/summary.json --quiet" \
+            >"$raw_log" 2>&1
+          runner_status=$?
+          set -e
+          chmod 600 "$raw_log"
+          sudo -n /usr/bin/python3 - "$raw_log" "$summary" "$manifest" "$runner_status" <<'PYCODE'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          raw_path, summary_path, manifest_path, runner_status = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4])
+          safe_reasons = frozenset("""
+              activation_content activation_context activation_template base_python
+              bin_extra_cache bin_extra_directory bin_extra_link bin_file_set bin_metadata
+              candidate current_pointer data_script_set dependency_inputs directory_metadata
+              freeze generated_metadata metadata missing origin_chain_cycle origin_chain_limit
+              origin_receipt_binding origin_receipt_changed origin_receipt_metadata
+              origin_receipt_schema pip_state previous_pointer pyc_content pyc_header
+              pyc_metadata pyc_parse pyc_source record_content record_duplicate_target
+              record_format record_hash_format record_incomplete record_metadata
+              record_missing record_missing_file record_path record_path_spelling record_script
+              record_script_path release_identity runtime_abi script_generator script_set
+              site_packages site_packages_metadata transaction_identity transaction_missing
+              transaction_state unrecorded_file unrecorded_metadata venv_config venv_directory
+              venv_python wheel_hash wheel_metadata wheel_record wheel_record_duplicate
+              wheel_record_path wheel_record_scheme wheel_set
+          """.split())
+          expected = "tests.test_platform_release_venv_rollback.PlatformReleaseVenvRollbackTests.test_required_reuse_policy_runs_real_proof_cli_and_persists_its_receipt"
+          summary_status = None
+          try:
+              if raw_path.stat().st_size > 2 * 1024 * 1024:
+                  raise ValueError("bounded capture exceeded")
+              raw = raw_path.read_text(encoding="utf-8", errors="replace")
+              summary = json.loads(summary_path.read_text(encoding="utf-8"))
+              valid = (
+                  summary.get("schema") == 1
+                  and summary.get("contour") == "backend-privileged"
+                  and summary.get("expected_ids") == [expected]
+                  and summary.get("executed_ids") == [expected]
+                  and summary.get("tests_selected") == 1
+                  and summary.get("tests_run") == 1
+                  and summary.get("status") in {"passed", "failed", "timeout"}
+                  and type(summary.get("failures")) is int
+                  and type(summary.get("errors")) is int
+                  and summary.get("unexpected_skips") == []
+              )
+              if not valid:
+                  print("diagnostic_summary=unavailable")
+              else:
+                  summary_status = summary["status"]
+                  print("diagnostic_summary=" + json.dumps({
+                      "status": summary_status,
+                      "selected": 1,
+                      "run": 1,
+                      "failures": summary["failures"],
+                      "errors": summary["errors"],
+                      "unexpected_skips": [],
+                      "exit_status": runner_status,
+                  }, sort_keys=True, separators=(",", ":")))
+              matches = re.findall(
+                  r"VENV_REUSE_TEST_DIAG case=(accepted|refused|proof-binding) "
+                  r"reason=([a-z][a-z0-9_]{0,63}|unknown) line=([0-9]{1,5})",
+                  raw,
+              )
+              accepted = [(reason, int(line)) for case, reason, line in matches if case == "accepted"]
+              if len(accepted) == 1:
+                  reason, line = accepted[0]
+                  helper_lines = len(Path("platform/tools/platform_verify_venv_reuse.py").read_text().splitlines())
+                  if (reason not in safe_reasons and reason != "unknown") or line > helper_lines:
+                      reason, line = "unknown", 0
+                  print(f"accepted_proof_refusal={reason} helper_line={line}")
+              else:
+                  print("accepted_proof_refusal=unavailable")
+          except Exception:
+              print("diagnostic_summary=unavailable")
+              print("accepted_proof_refusal=unavailable")
+          finally:
+              raw_path.unlink(missing_ok=True)
+              summary_path.unlink(missing_ok=True)
+              manifest_path.unlink(missing_ok=True)
+          if runner_status != 0 or summary_status != "passed":
+              raise SystemExit(runner_status or 1)
+          PYCODE
