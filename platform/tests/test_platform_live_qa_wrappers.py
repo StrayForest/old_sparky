@@ -2491,6 +2491,67 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         arbitrary[23] = "/bin/sh"
         self.assertFalse(platform_live_qa_guard._is_fixed_live_browser_command(arbitrary))
 
+        browser_command = list(command)
+        browser_command[-1] = f"{runtime}/web/tests/smoke/live-user-journey.spec.ts"
+        browser_command.append("--project=live-desktop")
+        self.assertTrue(
+            platform_live_qa_guard._is_fixed_live_user_browser_command(browser_command)
+        )
+        with self.assertRaises(platform_live_qa_guard.GuardError):
+            platform_live_qa_guard._capture_qa_child(
+                browser_command, timeout_seconds=1500.0
+            )
+        with self.assertRaises(platform_live_qa_guard.GuardError):
+            platform_live_qa_guard._capture_qa_child(
+                arbitrary,
+                timeout_seconds=1500.0,
+                live_user_browser=True,
+            )
+
+        marker = (
+            "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none stdout_bytes=1 "
+            "stderr_bytes=0 truncated=false child_exit=0\n"
+        )
+        output = StringIO()
+        with (
+            patch.object(platform_live_qa_guard.os, "geteuid", return_value=0),
+            patch.object(
+                platform_live_qa_guard,
+                "_capture_qa_child",
+                return_value=(0, marker),
+            ) as capture,
+            redirect_stdout(output),
+        ):
+            result = platform_live_qa_guard.main(
+                ["capture-qa-browser-child", "--", *browser_command]
+            )
+        self.assertEqual(result, 0)
+        capture.assert_called_once_with(
+            browser_command,
+            timeout_seconds=1500.0,
+            live_user_browser=True,
+        )
+        self.assertEqual(output.getvalue(), marker)
+
+        with (
+            patch.object(platform_live_qa_guard.os, "geteuid", return_value=0),
+            patch.object(
+                platform_live_qa_guard,
+                "_capture_qa_child",
+                return_value=(0, marker),
+            ) as capture,
+            redirect_stdout(StringIO()),
+        ):
+            result = platform_live_qa_guard.main(
+                ["capture-qa-browser-child", "--", *command]
+            )
+        self.assertEqual(result, 0)
+        capture.assert_called_once_with(
+            command,
+            timeout_seconds=300.0,
+            live_user_browser=False,
+        )
+
     def test_deploy_marker_capture_keeps_bounded_timeout_cleanup(self) -> None:
         expected = ("deploy", "gha-123456-2-aaaaaaaaaaaa", "a" * 40)
         child_code = (
@@ -3318,6 +3379,36 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(skipped_status, 0)
         self.assertIn(all_skipped, skipped_output)
         self.assertNotIn(b"LIVE_USER_QA_SUCCESS", skipped_output)
+
+        timed_processes: list[subprocess.Popen[bytes]] = []
+        timeout_capture = Capture()
+
+        def sleeping_child(_command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            process = real_popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                **kwargs,
+            )
+            timed_processes.append(process)
+            return process
+
+        with (
+            patch.object(dispatch, "_trusted_helper", return_value=True),
+            patch.object(dispatch, "LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS", 0.05),
+            patch.object(dispatch.subprocess, "Popen", side_effect=sleeping_child),
+            patch.object(dispatch.sys, "stdout", timeout_capture),
+            patch.object(
+                dispatch,
+                "_terminate_process_group",
+                wraps=dispatch._terminate_process_group,
+            ) as terminate_group,
+        ):
+            timed_status = dispatch._run_live_user_qa_sudo(
+                [source_sha], expected_sha=source_sha, expected_app_sha=app_sha
+            )
+        self.assertEqual(timed_status, 124)
+        terminate_group.assert_called_once()
+        self.assertEqual(len(timed_processes), 1)
+        self.assertIsNotNone(timed_processes[0].poll())
 
     def test_live_user_dispatch_reports_only_fixed_early_preflight_boundary(self) -> None:
         dispatch = platform_live_user_qa_dispatch

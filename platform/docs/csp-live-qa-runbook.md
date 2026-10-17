@@ -229,9 +229,9 @@ gh workflow run platform-live-user-qa.yml \
   -f confirmation=RUN-LIVE-USER-QA
 ```
 
-Dispatch only after the exact deployed `dev` SHA is confirmed. The workflow
-creates no fixture until the release lock, active-SHA check, host-installed
-supervisor/helper, bundle and browser preflight checks pass.
+Dispatch only after confirming the exact deployed `dev` SHA; no fixture is created until release lock, active SHA, host supervisor/helper, bundle and browser preflight checks pass.
+The fixed desktop journey uses a 1,500-second child cap for its 600-second Playwright test plus separate 600-second teardown (300 seconds planning reserve); systemd stays capped at 30 minutes.
+The remote operation cap is 2,400 seconds (900 seconds planning reserve) inside the 45-minute job (final 300 seconds shared with bounded handoff/report steps; pre-helper checks consume part); external setup/network time is not guaranteed, other action limits are unchanged, and timeout/cleanup uncertainty fails closed.
 The workflow accepts a bounded dispatcher diagnostic only when its fixed schema and child exit code agree. Early-failure `stage` and `check` values are closed enums; the sanitizer publishes no exception text, paths, environment values or stderr. Failures before the trusted Python dispatcher starts—including SSH or sudo setup—remain unclassified. SSH exit 255 is also unclassified because it can represent either a remote child status or an SSH error. Diagnostics do not change failure status or fixture cleanup, and cannot establish the cause of historical runs.
 The launch workflow validates `base_url`, `provision` and the optional marker
 with the canonical bounded-ASCII workflow-input parser before it creates any

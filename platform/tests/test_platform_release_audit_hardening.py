@@ -564,13 +564,16 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             "DEPLOY_OPERATION_TIMEOUT_SECONDS = 1950.0",
             "CLEANUP_OPERATION_TIMEOUT_SECONDS = 300.0",
             "ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS = 120.0",
-            "LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 300.0",
+            "LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 2400.0",
             "LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS = 300.0",
             "start_new_session=True",
             "os.killpg",
             "timeout_seconds=ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS",
         ):
             self.assertIn(value, dispatcher)
+        live_qa_guard = self.read_tool("platform_live_qa_guard.py")
+        self.assertIn("LIVE_QA_CHILD_CAPTURE_TIMEOUT_SECONDS = 300.0", live_qa_guard)
+        self.assertIn("LIVE_USER_BROWSER_TIMEOUT_SECONDS = 1500.0", live_qa_guard)
         health = self.read_tool("platform_health_monitor.py")
         self.assertIn("HEALTH_OPERATION_BUDGET_SECONDS", health)
         self.assertIn(

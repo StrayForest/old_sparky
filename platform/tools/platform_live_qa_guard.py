@@ -49,6 +49,8 @@ BUILD_NODE_ROOT = Path("/var/lib/oldsparky-build")
 RUN_GATE_ROOT = Path("/run/oldsparky-liveqa")
 LIVE_QA_SYSTEMD_UNIT = "oldsparky-liveqa-browser.service"
 LIVE_QA_RUNTIME_PROBE_TIMEOUT_SECONDS = 45.0
+LIVE_QA_CHILD_CAPTURE_TIMEOUT_SECONDS = 300.0
+LIVE_USER_BROWSER_TIMEOUT_SECONDS = 1500.0
 LIVE_QA_CHILD_CAPTURE_BYTES = 64 * 1024
 LIVE_QA_CHILD_MARKER_RE = re.compile(
     r"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(none|playwright_cli_usage|"
@@ -5246,15 +5248,23 @@ def _stop_timed_out_qa_browser_unit() -> bool:
 
 
 def _capture_qa_child(
-    command: list[str], *, timeout_seconds: float
+    command: list[str], *, timeout_seconds: float, live_user_browser: bool = False
 ) -> tuple[int, str]:
     """Drain both QA streams while retaining only bounded classifier prefixes."""
 
+    timeout_limit = (
+        LIVE_USER_BROWSER_TIMEOUT_SECONDS
+        if live_user_browser
+        else LIVE_QA_CHILD_CAPTURE_TIMEOUT_SECONDS
+    )
     if (
         not command
         or len(command) > 64
         or any(not arg or len(arg) > 4096 or "\x00" in arg for arg in command)
-        or not 0 < timeout_seconds <= 300
+        or type(live_user_browser) is not bool
+        or (live_user_browser and not _is_fixed_live_user_browser_command(command))
+        or type(timeout_seconds) not in (int, float)
+        or not 0 < timeout_seconds <= timeout_limit
     ):
         raise GuardError("QA child command shape is invalid")
     process = subprocess.Popen(  # nosec B603
@@ -5435,6 +5445,17 @@ def _is_fixed_live_browser_command(command: list[str]) -> bool:
     return True
 
 
+def _is_fixed_live_user_browser_command(command: list[str]) -> bool:
+    return (
+        _is_fixed_live_browser_command(command)
+        and any(
+            item.endswith("/web/tests/smoke/live-user-journey.spec.ts")
+            for item in command
+        )
+        and command[-1] == "--project=live-desktop"
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Guard production live QA execution.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -5528,7 +5549,16 @@ def main(argv: Iterable[str] | None = None) -> int:
                 command = command[1:]
             if not _is_fixed_live_browser_command(command):
                 raise GuardError("QA browser child command is not the fixed systemd scope")
-            child_exit, marker = _capture_qa_child(command, timeout_seconds=300.0)
+            live_user_browser = _is_fixed_live_user_browser_command(command)
+            child_exit, marker = _capture_qa_child(
+                command,
+                timeout_seconds=(
+                    LIVE_USER_BROWSER_TIMEOUT_SECONDS
+                    if live_user_browser
+                    else LIVE_QA_CHILD_CAPTURE_TIMEOUT_SECONDS
+                ),
+                live_user_browser=live_user_browser,
+            )
             if child_exit == 124 and not _stop_timed_out_qa_browser_unit():
                 matched = LIVE_QA_CHILD_MARKER_RE.fullmatch(marker)
                 if matched is not None:
