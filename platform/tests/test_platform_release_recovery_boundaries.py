@@ -213,6 +213,140 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             all(isinstance(call.args[0], Path) for call in identity_reader.call_args_list)
         )
 
+    def test_protected_activation_recovery_requires_durable_migration_authorization(self) -> None:
+        migration_fixture = self.root / "static-migration-fixture"
+        versions = migration_fixture / "alembic" / "versions"
+        versions.mkdir(parents=True)
+        marker = self.root / "migration-module-executed"
+        (versions / "0054_literal.py").write_text(
+            "revision = '20261010_0054'\n"
+            "down_revision = None\n"
+            "depends_on = None\n"
+            "branch_labels = None\n"
+            "import pathlib\n"
+            f"pathlib.Path({str(marker)!r}).write_text('executed')\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            transaction._protected_static_revision_graph(migration_fixture),
+            {"20261010_0054": ()},
+        )
+        self.assertFalse(marker.exists())
+        (versions / "0054_literal.py").write_text(
+            "revision = get_revision()\n"
+            "down_revision = None\n"
+            "depends_on = None\n"
+            "branch_labels = None\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(transaction.TransactionError):
+            transaction._protected_static_revision_graph(migration_fixture)
+
+        current = self.add_release("protected-auth-current")
+        previous = self.add_release("protected-auth-previous")
+
+        def set_source_sha(release: Path, source_sha: str) -> None:
+            metadata = release / "RELEASE.json"
+            metadata.chmod(0o644)
+            metadata.write_text(
+                json.dumps({"source_git_commit": source_sha}) + "\n",
+                encoding="ascii",
+            )
+            metadata.chmod(0o444)
+
+        set_source_sha(current, transaction.PROTECTED_ACTIVATION_CURRENT_SHA)
+        set_source_sha(previous, transaction.PROTECTED_ACTIVATION_PREVIOUS_SHA)
+        candidate = self.create_wrapper_transaction(
+            current,
+            previous,
+            "protected-auth",
+            complete_snapshot=True,
+            service_states={
+                "deadlock-api": "active",
+                "deadlock-worker": "active",
+                "deadlock-web": "active",
+            },
+            timer_active=True,
+        )
+        set_source_sha(candidate, transaction.PROTECTED_ACTIVATION_CANDIDATE_SHA)
+        for expected, phase in (
+            ("staged", "migration-pending"),
+            ("migration-pending", "migration-applied"),
+            ("migration-applied", "activation-pending"),
+        ):
+            self.run_transaction("phase", "--expected", expected, "--phase", phase)
+        (self.app_dir / "current").symlink_to(candidate)
+        (self.app_dir / "previous").symlink_to(current)
+        state = self.shared / STATE_NAME
+        before_state = state.read_bytes()
+        before_pointers = (
+            os.readlink(self.app_dir / "current"),
+            os.readlink(self.app_dir / "previous"),
+        )
+        command = [
+            "recover",
+            "--retain",
+            "--service-pending",
+            "--state",
+            str(state),
+        ]
+
+        # The real CLI/main path must refuse an uncertain migration before the
+        # first pointer mutation, while preserving the serialized record.
+        with mock.patch.object(sys, "argv", [str(TRANSACTION_TOOL), *command]):
+            refused = transaction.main()
+        self.assertEqual(refused, 2)
+        self.assertEqual(state.read_bytes(), before_state)
+        self.assertEqual(
+            (os.readlink(self.app_dir / "current"), os.readlink(self.app_dir / "previous")),
+            before_pointers,
+        )
+
+        self.run_transaction(
+            "authorize-recovery", "--confirm", "MIGRATION_NOT_REVERSED"
+        )
+        self.assertEqual(self.state_phase(), "recovery-authorized")
+        authorized_state = state.read_bytes()
+
+        # A source identity mismatch remains a refusal even after the durable
+        # operator decision; it cannot reach the pointer mutation barrier.
+        set_source_sha(candidate, "0" * 40)
+        with mock.patch.object(sys, "argv", [str(TRANSACTION_TOOL), *command]):
+            wrong_tuple = transaction.main()
+        self.assertEqual(wrong_tuple, 2)
+        self.assertEqual(state.read_bytes(), authorized_state)
+        self.assertEqual(
+            (os.readlink(self.app_dir / "current"), os.readlink(self.app_dir / "previous")),
+            before_pointers,
+        )
+        set_source_sha(candidate, transaction.PROTECTED_ACTIVATION_CANDIDATE_SHA)
+
+        # Block the first actual pointer write and verify the genuine CLI
+        # reaches it only for the exact authorized serialized transaction.
+        with (
+            mock.patch.object(sys, "argv", [str(TRANSACTION_TOOL), *command]),
+            mock.patch.object(
+                transaction,
+                "_restore_pointers",
+                side_effect=transaction.TransactionError("first-write barrier"),
+            ) as first_write,
+        ):
+            barrier_result = transaction.main()
+        self.assertEqual(barrier_result, 2)
+        first_write.assert_called_once()
+        self.assertEqual(self.state_phase(), "recovery-authorized")
+        self.assertEqual(
+            (os.readlink(self.app_dir / "current"), os.readlink(self.app_dir / "previous")),
+            before_pointers,
+        )
+
+        # Retry from the same durable phase performs the protected rewind and
+        # retains the transaction at the service-pending boundary.
+        self.run_transaction(*command)
+        self.assertEqual(self.state_phase(), "filesystem-restored-services-pending")
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+
     def test_health_monitor_wait_requires_fresh_success_after_restore(self) -> None:
         timer_properties = systemd_state._parse_show_fields(
             "TimersMonotonic={ OnUnitActiveUSec=5min ; next_elapse=2month 23min 5.751439s }\n"
@@ -253,12 +387,22 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             systemd_state._systemd_timespan_usec("1.0000001s")
         wrapper = RECOVERY_WRAPPER.read_text(encoding="utf-8")
         route_start = wrapper.index('if [[ "$pending_operation" == install')
+        self.assertIn('namespace["_protected_static_revision_graph"]', wrapper[route_start:])
+        self.assertNotIn("walk_revisions", wrapper[route_start:])
+        migration_head_at = wrapper.index("async def read_current()", route_start)
+        archive_attestation_at = wrapper.index('proof["_validate_receipt"]', route_start)
+        authorization_at = wrapper.index('authorize-recovery \\', route_start)
+        rewind_at = wrapper.index('recover \\\n      --retain --service-pending', authorization_at)
         proof_at = wrapper.index("verify = namespace.get(\"verify_active_release_artifact\")", route_start)
         core_restore_at = wrapper.index(
             "restore-protected-activation-core-services", route_start
         )
         wait_at = wrapper.index("wait-health-monitor-success", route_start)
         capture_at = wrapper.index('capture-transaction \\', route_start)
+        self.assertLess(migration_head_at, authorization_at)
+        self.assertLess(archive_attestation_at, authorization_at)
+        self.assertLess(authorization_at, rewind_at)
+        self.assertLess(rewind_at, proof_at)
         self.assertLess(proof_at, core_restore_at)
         self.assertLess(core_restore_at, wait_at)
         self.assertLess(wait_at, capture_at)

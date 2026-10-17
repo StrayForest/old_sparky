@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import ctypes
 import errno
@@ -67,6 +68,122 @@ SYSTEMD_OPERATION_TIMEOUT_SECONDS = 120.0
 WEB_CACHE_RELATIVE_PATH = Path(
     "apps/platform_web/.next/standalone/.next/cache"
 )
+
+
+def _protected_static_revision_graph(release_root: Path) -> dict[str, tuple[str, ...]]:
+    """Read only literal Alembic metadata for the pinned protected recovery.
+
+    Migration files belong to a release tree whose full payload proof may not
+    have run yet. Parse metadata as data; never import or execute those files.
+    """
+    root = Path(release_root)
+    versions = root / "alembic" / "versions"
+    for directory in (root, root / "alembic", versions):
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise TransactionError("protected migration directory is unsafe")
+
+    result: dict[str, tuple[str, ...]] = {}
+    with os.scandir(versions) as iterator:
+        entries = list(iterator)
+    for entry in entries:
+        if entry.is_symlink():
+            raise TransactionError("protected migration entry is a symlink")
+        if entry.is_dir(follow_symlinks=False):
+            if entry.name == "__pycache__":
+                continue
+            raise TransactionError("protected migration subdirectory is unsafe")
+        if entry.name == "__init__.py":
+            continue
+        if not entry.name.endswith(".py"):
+            raise TransactionError("protected migration entry is unexpected")
+        info = entry.stat(follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode):
+            raise TransactionError("protected migration file is unsafe")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(entry.path, flags)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or (before.st_dev, before.st_ino) != (
+                info.st_dev,
+                info.st_ino,
+            ):
+                raise TransactionError("protected migration file changed")
+            chunks: list[bytes] = []
+            total_bytes = 0
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total_bytes += len(chunk)
+                if total_bytes > 2 * 1024 * 1024:
+                    raise TransactionError("protected migration file is too large")
+            after = os.fstat(fd)
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise TransactionError("protected migration file changed while reading")
+        finally:
+            os.close(fd)
+        try:
+            tree = ast.parse(b"".join(chunks).decode("utf-8"), filename=entry.name)
+        except (UnicodeDecodeError, SyntaxError) as exc:
+            raise TransactionError("protected migration metadata is malformed") from exc
+
+        metadata: dict[str, object] = {}
+        for node in tree.body:
+            names: list[str] = []
+            value: ast.expr | None = None
+            if isinstance(node, ast.Assign):
+                names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+                value = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names = [node.target.id]
+                value = node.value
+            for name in ("revision", "down_revision", "depends_on", "branch_labels"):
+                if name not in names:
+                    continue
+                if name in metadata or value is None:
+                    raise TransactionError("protected migration metadata is ambiguous")
+                try:
+                    metadata[name] = ast.literal_eval(value)
+                except (ValueError, TypeError, SyntaxError) as exc:
+                    raise TransactionError("protected migration metadata is not literal") from exc
+
+        revision = metadata.get("revision")
+        if set(metadata) != {"revision", "down_revision", "depends_on", "branch_labels"}:
+            raise TransactionError("protected migration metadata is incomplete")
+        if not isinstance(revision, str) or not revision or revision in result:
+            raise TransactionError("protected migration revision is invalid")
+        parents: list[str] = []
+        for name in ("down_revision", "depends_on"):
+            value = metadata.get(name)
+            if value is None:
+                continue
+            values = (value,) if isinstance(value, str) else value
+            if not isinstance(values, (tuple, list)) or not all(
+                isinstance(parent, str) and parent for parent in values
+            ):
+                raise TransactionError("protected migration parent metadata is invalid")
+            parents.extend(values)
+        labels = metadata.get("branch_labels")
+        if labels is not None and not (
+            isinstance(labels, str)
+            or isinstance(labels, (tuple, list))
+            and all(isinstance(label, str) for label in labels)
+        ):
+            raise TransactionError("protected migration branch metadata is invalid")
+        result[revision] = tuple(dict.fromkeys(parents))
+
+    if not result or any(
+        parent not in result for parents in result.values() for parent in parents
+    ):
+        raise TransactionError("protected migration graph is incomplete")
+    return result
 PHASES = {
     "prepared",
     "venv-transitioned",
@@ -3428,6 +3545,12 @@ def _validate_protected_activation_recovery(
     state: Path, record: dict[str, object], *, phase: str
 ) -> None:
     """Accept only the bound 79/9ce/f115 install recovery topology."""
+    if phase not in {
+        "activation-pending",
+        "recovery-authorized",
+        "filesystem-restored-services-pending",
+    }:
+        raise TransactionError("protected activation recovery phase is unsupported")
     candidate = cast(Path, record["candidate_path"])
     current = cast(Path, record["current_before_path"])
     previous = cast(Path, record["previous_before_path"])
@@ -3796,8 +3919,13 @@ def recover(
             "service-pending recovery requires a retained install"
         )
     if service_pending and record["previous_before_path"] is not None:
+        protected_phase = cast(str, record["phase"])
+        if protected_phase not in {"activation-pending", "recovery-authorized"}:
+            raise TransactionError(
+                "protected service-pending recovery phase is not authorized"
+            )
         _validate_protected_activation_recovery(
-            state, record, phase="activation-pending"
+            state, record, phase=protected_phase
         )
     if service_pending:
         validate_service_snapshot(state, require="present")

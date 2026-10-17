@@ -1109,8 +1109,10 @@ fi
 
 if [[ "$pending_operation" == install \
   && ( "$transaction_phase" == activation-pending \
+    || "$transaction_phase" == recovery-authorized \
     || "$transaction_phase" == filesystem-restored-services-pending ) ]]; then
-  if [[ "$transaction_phase" == activation-pending \
+  if [[ ( "$transaction_phase" == activation-pending \
+      || "$transaction_phase" == recovery-authorized ) \
     && ( -e "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE" ) ]]; then
     public_status failed topology >&2
     exit 1
@@ -1143,10 +1145,157 @@ if [[ "$pending_operation" == install \
     "$SOURCE_BOUND_LIVEQA_DIR" 2>/dev/null || true)"
   [[ "$proof_directory_metadata" == "directory:0:0:2:700" ]] \
     || { public_status failed liveqa_runtime >&2; exit 1; }
+
+  # This incident retains the database at 0054. Before recording the explicit
+  # migration decision, bind the read-only live revision to the identical
+  # pinned 9ce/79 migration graph and validate the staged signed 9ce archive
+  # attestation. The full active-payload proof remains after pointer rewind and
+  # before any core service is started.
+  candidate_release="$(readlink -f -- "$APP_DIR/current" 2>/dev/null || true)"
+  [[ -L "$APP_DIR/current" && -n "$candidate_release" \
+    && "$(dirname -- "$candidate_release")" == "$APP_DIR/releases" ]] \
+    || { public_status failed topology >&2; exit 1; }
+  if ! "$APP_DIR/shared/venv/bin/python" -I -B - \
+    "$TRANSACTION_TOOL" "$candidate_release" "$original_current" <<'PY'
+import asyncio
+import os
+import runpy
+import sys
+from pathlib import Path
+from sqlalchemy.engine import make_url
+import asyncpg
+
+transaction_path, candidate_root, original_root = sys.argv[1:]
+namespace = runpy.run_path(transaction_path)
+candidate_graph = namespace["_protected_static_revision_graph"](Path(candidate_root))
+original_graph = namespace["_protected_static_revision_graph"](Path(original_root))
+if candidate_graph != original_graph:
+    raise SystemExit(1)
+children = {
+    parent
+    for parents in candidate_graph.values()
+    for parent in parents
+}
+heads = sorted(set(candidate_graph) - children)
+if heads != ["20261010_0054"]:
+    raise SystemExit(1)
+raw_url = os.environ.get("PLATFORM_DATABASE_URL", "")
+if not raw_url:
+    raise SystemExit(1)
+url = make_url(raw_url)
+if url.drivername not in {"postgresql+asyncpg", "postgresql"} or url.database != "platformdb":
+    raise SystemExit(1)
+dsn = url.set(drivername="postgresql").render_as_string(hide_password=False)
+
+async def read_current():
+    connection = await asyncpg.connect(
+        dsn=dsn,
+        timeout=10,
+        server_settings={
+            "application_name": "oldsparky-release-migration-guard",
+            "statement_timeout": "10000",
+            "lock_timeout": "10000",
+            "default_transaction_read_only": "on",
+        },
+    )
+    try:
+        async with connection.transaction(readonly=True):
+            identity = await connection.fetchrow(
+                "SELECT current_database() AS database_name, "
+                "current_schema() AS schema_name, "
+                "to_regclass('alembic_version')::oid AS resolved_oid"
+            )
+            if identity is None or identity["database_name"] != "platformdb" or identity["schema_name"] not in {"platform", "public"}:
+                raise RuntimeError("database identity is unsupported")
+            registries = await connection.fetch(
+                "SELECT c.oid, n.nspname AS schema_name, c.relkind::text AS relkind "
+                "FROM pg_catalog.pg_class AS c "
+                "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+                "WHERE c.relname = 'alembic_version' ORDER BY n.nspname"
+            )
+            if len(registries) != 1:
+                raise RuntimeError("database revision registry is ambiguous")
+            registry = registries[0]
+            if registry["relkind"] != "r" or registry["schema_name"] not in {"platform", "public"} or identity["resolved_oid"] != registry["oid"]:
+                raise RuntimeError("database revision registry is unsupported")
+            rows = await connection.fetch(
+                'SELECT version_num FROM "' + registry["schema_name"] + '".alembic_version ORDER BY version_num LIMIT 2'
+            )
+            return tuple(row["version_num"] for row in rows)
+    finally:
+        await connection.close()
+
+current = asyncio.run(read_current())
+if current != tuple(heads):
+    raise SystemExit(1)
+PY
+  then
+    public_status failed migration >&2
+    exit 1
+  fi
+  if ! "$APP_DIR/shared/venv/bin/python" -I -B - \
+    "$TOOLS_DIR/platform_release_active_artifact_proof.py" \
+    "$SOURCE_BOUND_LIVEQA_TAR" "$SOURCE_BOUND_LIVEQA_CHECKSUM" \
+    "$SOURCE_BOUND_LIVEQA_RECEIPT" <<'PY'
+import os
+import runpy
+import sys
+import time
+from pathlib import Path
+
+module_path, archive_path, checksum_path, receipt_path = sys.argv[1:]
+proof = runpy.run_path(module_path)
+archive_path = Path(archive_path)
+checksum_path = Path(checksum_path)
+receipt_path = Path(receipt_path)
+receipt, receipt_identity = proof["_validate_receipt"](receipt_path)
+deadline = time.monotonic() + 600
+archive_fd, archive_before = proof["_safe_file"](
+    archive_path, maximum=proof["MAX_ARCHIVE_BYTES"]
+)
+try:
+    archive_digest = proof["_hash_fd"](archive_fd, deadline=deadline)
+    archive_after = os.fstat(archive_fd)
+finally:
+    os.close(archive_fd)
+checksum_fd, checksum_before = proof["_safe_file"](
+    checksum_path, maximum=proof["MAX_CHECKSUM_BYTES"]
+)
+try:
+    checksum = os.read(checksum_fd, proof["MAX_CHECKSUM_BYTES"] + 1)
+    checksum_after = os.fstat(checksum_fd)
+finally:
+    os.close(checksum_fd)
+expected_digest = proof["RELEASE_TAR_SHA256"]
+expected_checksum = f"{expected_digest}  {archive_path.name}\n".encode("ascii")
+if (
+    archive_digest != expected_digest
+    or archive_digest != receipt.get("tar_sha256")
+    or checksum != expected_checksum
+    or proof["_fingerprint"](archive_after) != proof["_fingerprint"](archive_before)
+    or proof["_fingerprint"](checksum_after) != proof["_fingerprint"](checksum_before)
+    or proof["_fingerprint"](archive_path.lstat()) != proof["_fingerprint"](archive_before)
+    or proof["_fingerprint"](checksum_path.lstat()) != proof["_fingerprint"](checksum_before)
+    or proof["_fingerprint"](receipt_path.lstat()) != receipt_identity
+):
+    raise SystemExit(1)
+PY
+  then
+    public_status failed liveqa_runtime >&2
+    exit 1
+  fi
+
   health_baseline="$(/usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" \
     health-monitor-baseline --systemctl "$SYSTEMCTL_BIN" 2>/dev/null)" \
     || { public_status failed systemd_state >&2; exit 1; }
   if [[ "$transaction_phase" == activation-pending ]]; then
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" authorize-recovery \
+      --state "$STATE" --confirm MIGRATION_NOT_REVERSED \
+      >/dev/null 2>/dev/null \
+      || { public_status failed transaction >&2; exit 1; }
+    transaction_phase=recovery-authorized
+  fi
+  if [[ "$transaction_phase" == recovery-authorized ]]; then
     /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
       --retain --service-pending --state "$STATE" \
       >/dev/null 2>/dev/null \
