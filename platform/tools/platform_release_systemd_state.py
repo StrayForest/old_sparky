@@ -11,22 +11,50 @@ boundary.
 from __future__ import annotations
 
 import argparse
+import base64
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import selectors
+import shlex
 import stat
 import subprocess
 import sys
+import time
 from typing import Final, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 SCHEMA_VERSION: Final = 1
 SYSTEMCTL: Final = "/usr/bin/systemctl"
 SYSTEMCTL_PATH = SYSTEMCTL
+JOURNALCTL_PATH: Final = "/usr/bin/journalctl"
 RECEIPT_MAX_BYTES: Final = 64 * 1024
+PRIVATE_EVIDENCE_MAX_BYTES: Final = 16 * 1024
+PRIVATE_JOURNAL_MAX_BYTES: Final = 64 * 1024
+PENDING_GUARD_MIN_NEXT_TIMER_SECONDS: Final = 900
+PENDING_GUARD_CURRENT_SOURCE_SHA: Final = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
+PENDING_GUARD_PREVIOUS_SOURCE_SHA: Final = "f1154c7dba4f57bf52f7d7544e97d924c732be94"
+CLOUDFLARE_UNIT: Final = "deadlock-cloudflare-ips.service"
+CLOUDFLARE_TIMER: Final = "deadlock-cloudflare-ips.timer"
+CLOUDFLARE_FRAGMENT: Final = "/etc/systemd/system/deadlock-cloudflare-ips.service"
+CLOUDFLARE_EXEC_START_FIELDS: Final = (
+    "path", "argv[]", "ignore_errors", "start_time", "stop_time", "pid", "code", "status",
+)
+CLOUDFLARE_SERVICE_PROPERTIES: Final = (
+    "Id", "FragmentPath", "DropInPaths", "NeedDaemonReload", "Type", "RemainAfterExit",
+    "KillMode", "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus",
+    "MainPID", "ControlPID", "ControlGroup", "TasksCurrent", "UnitFileState", "InvocationID",
+    "ExecMainStartTimestamp", "ExecStart",
+)
+CLOUDFLARE_TIMER_PROPERTIES: Final = (
+    "Id", "FragmentPath", "DropInPaths", "NeedDaemonReload", "ActiveState", "SubState",
+    "Unit", "UnitFileState", "LastTriggerUSec", "NextElapseUSecRealtime",
+)
 SLUG_PATTERN: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 OPERATION_ID_PATTERN: Final = re.compile(r"^[0-9a-f]{32}$")
 ACTIVE_STATES: Final = frozenset(("active", "inactive"))
@@ -964,6 +992,759 @@ def clear(
         os.close(descriptor)
 
 
+def _bounded_command(argv: list[str], *, maximum: int, timeout: int = 30) -> tuple[int, str]:
+    """Run one fixed evidence command without buffering unbounded output."""
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    output = bytearray()
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C", "TZ": "Europe/Helsinki"},
+        )
+        assert process.stdout is not None
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        selector.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            events = selector.select(remaining) if remaining > 0 else []
+            if not events:
+                raise StateError("bounded systemd evidence command timed out")
+            for key, _ in events:
+                try:
+                    chunk = os.read(key.fd, 8192)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                if len(output) + len(chunk) > maximum:
+                    raise StateError("bounded systemd evidence command exceeded limit")
+                output.extend(chunk)
+        try:
+            returncode = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as exc:
+            raise StateError("bounded systemd evidence command timed out") from exc
+        try:
+            decoded = output.decode("ascii", errors="strict")
+        except UnicodeError as exc:
+            raise StateError("bounded systemd evidence output is malformed") from exc
+        return returncode, decoded
+    except OSError as exc:
+        raise StateError("bounded systemd evidence command failed") from exc
+    finally:
+        selector.close()
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+
+
+def _parse_show_fields(output: str, expected: tuple[str, ...]) -> dict[str, str]:
+    if not isinstance(output, str) or len(output.encode("ascii", errors="strict")) > 32 * 1024:
+        raise StateError("systemd properties are malformed")
+    fields: dict[str, str] = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key not in expected or key in fields or "\x00" in value:
+            raise StateError("systemd properties are malformed")
+        fields[key] = value
+    if set(fields) != set(expected):
+        raise StateError("systemd properties are incomplete")
+    return fields
+
+
+def _fixed_show(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
+    status, output = _bounded_command(
+        [SYSTEMCTL_PATH, "show", unit, "--no-pager", "--property=" + ",".join(properties)],
+        maximum=32 * 1024,
+    )
+    if status != 0:
+        raise StateError("fixed systemd unit properties are unavailable")
+    return _parse_show_fields(output, properties)
+
+
+def _fixed_jobs() -> list[tuple[str, str, str, str]]:
+    status, output = _bounded_command(
+        [SYSTEMCTL_PATH, "list-jobs", "--no-pager", "--all"], maximum=32 * 1024,
+    )
+    if status != 0:
+        raise StateError("systemd jobs are unavailable")
+    lines = output.splitlines()
+    if lines == ["No jobs running."]:
+        return []
+    if len(lines) < 2 or lines[0].split() != ["JOB", "UNIT", "TYPE", "STATE"]:
+        raise StateError("systemd jobs are malformed")
+    jobs: list[tuple[str, str, str, str]] = []
+    for line in lines[1:]:
+        fields = line.split()
+        if len(fields) != 4 or not fields[0].isdigit():
+            raise StateError("systemd jobs are malformed")
+        jobs.append((fields[0], fields[1], fields[2], fields[3]))
+    return jobs
+
+
+def _systemd_timestamp(value: str) -> datetime:
+    match = re.fullmatch(
+        r"[A-Z][a-z]{2} ([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}:[0-9]{2}:[0-9]{2}) ([A-Z]{3,5})",
+        value,
+    )
+    if match is None:
+        raise StateError("systemd timestamp is malformed")
+    try:
+        zone = ZoneInfo("Europe/Helsinki")
+    except ZoneInfoNotFoundError as exc:
+        raise StateError("systemd timestamp zone is unavailable") from exc
+    try:
+        naive = datetime.strptime(match.group(1) + " " + match.group(2), "%Y-%m-%d %H:%M:%S")
+    except ValueError as exc:
+        raise StateError("systemd timestamp is malformed") from exc
+    parsed = naive.replace(tzinfo=zone)
+    if parsed.tzname() != match.group(3) or parsed.strftime("%a") != value[:3]:
+        raise StateError("systemd timestamp zone mismatch")
+    return parsed.astimezone(timezone.utc)
+
+
+def _cloudflare_source_sha(release: Path) -> str:
+    raw = _read_cloudflare_source_file(release / "RELEASE.json", maximum=256 * 1024, label="release identity metadata")
+    try:
+        value = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise StateError("release identity metadata is malformed") from exc
+    source_sha = value.get("source_git_commit") if isinstance(value, dict) else None
+    if not isinstance(source_sha, str) or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
+        raise StateError("release source identity is invalid")
+    return source_sha
+
+
+def _cloudflare_exec_start(value: str) -> tuple[str, ...]:
+    if not value.startswith("{ ") or not value.endswith(" }"):
+        raise StateError("Cloudflare unit ExecStart is malformed")
+    fields: dict[str, str] = {}
+    for item in value[2:-2].split(" ; "):
+        key, separator, field_value = item.partition("=")
+        if not separator or key not in CLOUDFLARE_EXEC_START_FIELDS or key in fields:
+            raise StateError("Cloudflare unit ExecStart is malformed")
+        fields[key] = field_value
+    if tuple(fields) != CLOUDFLARE_EXEC_START_FIELDS or fields["ignore_errors"] != "no":
+        raise StateError("Cloudflare unit ExecStart is malformed")
+    if (
+        fields["start_time"] != "[n/a]"
+        or fields["stop_time"] != "[n/a]"
+        or fields["pid"] != "0"
+        or fields["code"] != "(null)"
+        or fields["status"] != "0/0"
+    ):
+        raise StateError("Cloudflare unit ExecStart metadata changed")
+    try:
+        argv = tuple(shlex.split(fields["argv[]"], posix=True))
+    except ValueError as exc:
+        raise StateError("Cloudflare unit ExecStart is malformed") from exc
+    expected = (
+        "/bin/bash", "/opt/oldsparky/platform/current/tools/platform_release_lock_exec.sh",
+        "--app-dir", "/opt/oldsparky/platform", "--",
+        "/opt/oldsparky/platform/shared/venv/bin/python",
+        "/opt/oldsparky/platform/current/tools/platform_update_cloudflare_ips.py",
+        "--apply", "--reload",
+    )
+    if fields["path"] != expected[0] or argv != expected:
+        raise StateError("Cloudflare unit command identity changed")
+    return argv
+
+
+def _source_cloudflare_exec_start(release: Path) -> tuple[tuple[str, ...], str]:
+    path = release / "deploy/systemd/deadlock-cloudflare-ips.service"
+    raw = _read_cloudflare_source_file(path, maximum=64 * 1024, label="Cloudflare source unit")
+    try:
+        lines = raw.decode("ascii", errors="strict").splitlines()
+    except UnicodeError as exc:
+        raise StateError("Cloudflare source unit is malformed") from exc
+    service = False
+    exec_values: list[str] = []
+    for line in lines:
+        if line.startswith("[") and line.endswith("]"):
+            service = line == "[Service]"
+        elif service and line.startswith("ExecStart="):
+            exec_values.append(line.partition("=")[2])
+    if len(exec_values) != 1:
+        raise StateError("Cloudflare source unit command is ambiguous")
+    try:
+        argv = tuple(shlex.split(exec_values[0], posix=True))
+    except ValueError as exc:
+        raise StateError("Cloudflare source unit command is malformed") from exc
+    expected = (
+        "/bin/bash", "/opt/oldsparky/platform/current/tools/platform_release_lock_exec.sh",
+        "--app-dir", "/opt/oldsparky/platform", "--",
+        "/opt/oldsparky/platform/shared/venv/bin/python",
+        "/opt/oldsparky/platform/current/tools/platform_update_cloudflare_ips.py",
+        "--apply", "--reload",
+    )
+    if argv != expected:
+        raise StateError("Cloudflare source unit command identity changed")
+    return argv, hashlib.sha256(raw).hexdigest()
+
+
+def _read_cloudflare_source_file(path: Path, *, maximum: int, label: str) -> bytes:
+    descriptor = -1
+    try:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or before.st_nlink != 1
+            or before.st_size > maximum
+            or stat.S_IMODE(before.st_mode) & 0o022
+        ):
+            raise StateError(f"{label} is unsafe")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_uid != before.st_uid
+            or opened.st_gid != before.st_gid
+            or opened.st_nlink != 1
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_size != before.st_size
+            or stat.S_IMODE(opened.st_mode) & 0o022
+        ):
+            raise StateError(f"{label} changed while opening")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, min(8192, maximum + 1 - total)):
+            total += len(chunk)
+            if total > maximum:
+                raise StateError(f"{label} exceeds its size limit")
+            chunks.append(chunk)
+        final = os.fstat(descriptor)
+        after = path.lstat()
+        if (
+            total != opened.st_size
+            or final.st_dev != opened.st_dev
+            or final.st_ino != opened.st_ino
+            or final.st_size != opened.st_size
+            or final.st_mtime_ns != opened.st_mtime_ns
+            or final.st_ctime_ns != opened.st_ctime_ns
+            or after.st_dev != opened.st_dev
+            or after.st_ino != opened.st_ino
+        ):
+            raise StateError(f"{label} changed while reading")
+        return b"".join(chunks)
+    except OSError as exc:
+        raise StateError(f"{label} is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _invocation_guard_record(invocation_id: str) -> tuple[datetime, bytes] | None:
+    if re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None or set(invocation_id) == {"0"}:
+        return None
+    try:
+        status, output = _bounded_command(
+            [
+                JOURNALCTL_PATH, "--no-pager", "--quiet", "--output=json", "--lines=50",
+                "--unit=" + CLOUDFLARE_UNIT, "_SYSTEMD_INVOCATION_ID=" + invocation_id,
+            ],
+            maximum=PRIVATE_JOURNAL_MAX_BYTES,
+            timeout=15,
+        )
+    except StateError:
+        return None
+    if status != 0 or not output.endswith("\n"):
+        return None
+    matches: list[tuple[datetime, bytes]] = []
+    for line in output.splitlines():
+        if len(line) > 8192:
+            return None
+        try:
+            entry = json.loads(line, object_pairs_hook=_strict_object)
+        except (json.JSONDecodeError, StateError):
+            return None
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("_SYSTEMD_INVOCATION_ID") != invocation_id:
+            return None
+        message = entry.get("MESSAGE")
+        expected = re.fullmatch(
+            r"RELEASE_GUARD schema=1 status=failed class=pending_operation release_slug=unavailable source_sha=unavailable",
+            message if isinstance(message, str) else "",
+        )
+        if expected is not None:
+            timestamp = entry.get("__REALTIME_TIMESTAMP")
+            if not isinstance(timestamp, str) or re.fullmatch(r"[0-9]{1,20}", timestamp) is None:
+                return None
+            parsed = datetime.fromtimestamp(int(timestamp) / 1_000_000, timezone.utc)
+            matches.append((parsed, hashlib.sha256(line.encode("ascii")).digest()))
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _fixed_pair_jobs_empty() -> bool:
+    jobs = _fixed_jobs()
+    return not any(job[1] in {CLOUDFLARE_UNIT, CLOUDFLARE_TIMER} for job in jobs)
+
+
+def _private_evidence_directory(shared: Path) -> Path:
+    _identity(shared, label="shared directory")
+    directory = shared / ".release-cloudflare-pending-reset-evidence"
+    created = False
+    try:
+        os.mkdir(directory, 0o700)
+        created = True
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise StateError("Cloudflare reset evidence directory is unavailable") from exc
+    try:
+        metadata = directory.lstat()
+    except OSError as exc:
+        raise StateError("Cloudflare reset evidence directory is unavailable") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink < 2
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or directory.resolve(strict=True) != directory
+    ):
+        raise StateError("Cloudflare reset evidence directory is unsafe")
+    if created:
+        shared_fd = os.open(
+            shared,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(shared_fd)
+        finally:
+            os.close(shared_fd)
+    return directory
+
+
+def _write_cloudflare_evidence(shared: Path, key: str, record: dict[str, object]) -> Path:
+    directory = _private_evidence_directory(shared)
+    path = directory / f"{key}.json"
+    raw = (json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n").encode("ascii")
+    if len(raw) > PRIVATE_EVIDENCE_MAX_BYTES:
+        raise StateError("Cloudflare reset evidence is too large")
+    directory_fd = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    descriptor = -1
+    try:
+        directory_metadata = os.fstat(directory_fd)
+        path_metadata = directory.lstat()
+        if (
+            directory_metadata.st_dev != path_metadata.st_dev
+            or directory_metadata.st_ino != path_metadata.st_ino
+            or directory_metadata.st_uid != 0
+            or directory_metadata.st_gid != 0
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        ):
+            raise StateError("Cloudflare reset evidence directory changed")
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1:
+            raise StateError("Cloudflare reset evidence metadata is unsafe")
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(descriptor)
+        os.fsync(directory_fd)
+    except OSError as exc:
+        raise StateError("Cloudflare reset evidence already exists or cannot be created") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+    return path
+
+
+def _revalidate_cloudflare_binding(
+    *,
+    path: Path,
+    transaction: Path,
+    app_dir: Path,
+    helper_release: Path,
+    transaction_bytes: bytes,
+    receipt_bytes: bytes,
+    current: Path,
+    previous: Path,
+    invocation_id: str,
+    expected_unit: dict[str, str],
+    expected_timer: dict[str, str],
+    expected_journal: tuple[datetime, bytes],
+) -> None:
+    """Recheck all durable bindings immediately before the one reset action."""
+    if transaction.read_bytes() != transaction_bytes or path.read_bytes() != receipt_bytes:
+        raise StateError("Cloudflare recovery receipt changed before reset")
+    record = _read_receipt(path)
+    _validate_context(record, app_dir)
+    _validate_transaction_binding(record, transaction, app_dir, helper_release)
+    tx = json.loads(transaction_bytes.decode("ascii"), object_pairs_hook=_strict_object)
+    if (
+        tx.get("operation") != "install"
+        or tx.get("phase") != "recovery-restored"
+        or Path(cast(str, tx.get("current_before"))) != current
+        or Path(cast(str, tx.get("previous_before"))) != previous
+        or (app_dir / "current").resolve(strict=True) != current
+        or (app_dir / "previous").resolve(strict=True) != previous
+        or _cloudflare_source_sha(current) != PENDING_GUARD_CURRENT_SOURCE_SHA
+        or _cloudflare_source_sha(previous) != PENDING_GUARD_PREVIOUS_SOURCE_SHA
+    ):
+        raise StateError("Cloudflare recovery binding changed before reset")
+    unit = _fixed_show(CLOUDFLARE_UNIT, CLOUDFLARE_SERVICE_PROPERTIES)
+    if unit != expected_unit or unit["InvocationID"] != invocation_id:
+        raise StateError("Cloudflare invocation changed before reset")
+    journal = _invocation_guard_record(invocation_id)
+    if journal != expected_journal:
+        raise StateError("Cloudflare guard evidence changed before reset")
+    timer = _fixed_show(CLOUDFLARE_TIMER, CLOUDFLARE_TIMER_PROPERTIES)
+    timer_status, timer_enabled = _run_systemctl("is-enabled", CLOUDFLARE_TIMER)
+    next_elapse = _systemd_timestamp(timer["NextElapseUSecRealtime"])
+    if (
+        timer != expected_timer
+        or timer_status != 0
+        or timer_enabled != "enabled"
+        or not _fixed_pair_jobs_empty()
+        or (next_elapse - datetime.now(timezone.utc)).total_seconds()
+        <= PENDING_GUARD_MIN_NEXT_TIMER_SECONDS
+    ):
+        raise StateError("Cloudflare timer binding changed before reset")
+
+
+def _revalidate_cloudflare_timer_before_stop(expected_timer: dict[str, str]) -> None:
+    timer = _fixed_show(CLOUDFLARE_TIMER, CLOUDFLARE_TIMER_PROPERTIES)
+    timer_status, timer_enabled = _run_systemctl("is-enabled", CLOUDFLARE_TIMER)
+    next_elapse = _systemd_timestamp(timer["NextElapseUSecRealtime"])
+    if (
+        timer != expected_timer
+        or timer_status != 0
+        or timer_enabled != "enabled"
+        or not _fixed_pair_jobs_empty()
+        or (next_elapse - datetime.now(timezone.utc)).total_seconds()
+        <= PENDING_GUARD_MIN_NEXT_TIMER_SECONDS
+    ):
+        raise StateError("Cloudflare timer horizon changed before stop")
+
+
+def reset_cloudflare_pending_guard(
+    path: Path,
+    *,
+    transaction: Path,
+    app_dir: Path,
+    helper_release: Path,
+    attempt_nonce: str,
+    apply_reset: bool = True,
+) -> dict[str, object] | None:
+    """Clear only the stale failed result proven to be the pending-operation guard."""
+    if os.geteuid() != 0:
+        raise StateError("Cloudflare pending-guard reset requires root")
+    if re.fullmatch(r"[0-9a-f]{64}", attempt_nonce) is None:
+        raise StateError("Cloudflare reset attempt nonce is invalid")
+    record = _read_receipt(path)
+    _validate_context(record, app_dir)
+    _validate_transaction_binding(record, transaction, app_dir, helper_release)
+    raw_transaction = transaction.read_bytes()
+    raw_receipt = path.read_bytes()
+    tx = json.loads(raw_transaction.decode("ascii"), object_pairs_hook=_strict_object)
+    if (
+        tx.get("operation") != "install"
+        or tx.get("phase") != "recovery-restored"
+        or record.get("operation") != "rollback"
+    ):
+        raise StateError("Cloudflare pending-guard transaction phase is unsupported")
+    current = Path(cast(str, tx["current_before"]))
+    previous = Path(cast(str, tx["previous_before"]))
+    if (
+        current.resolve(strict=True) != current
+        or previous.resolve(strict=True) != previous
+        or (app_dir / "current").resolve(strict=True) != current
+        or (app_dir / "previous").resolve(strict=True) != previous
+        or _cloudflare_source_sha(current) != PENDING_GUARD_CURRENT_SOURCE_SHA
+        or _cloudflare_source_sha(previous) != PENDING_GUARD_PREVIOUS_SOURCE_SHA
+    ):
+        raise StateError("Cloudflare pending-guard release pair changed")
+    units = _receipt_units(record)
+    unit_receipt = next((item for item in units if item["name"] == CLOUDFLARE_UNIT), None)
+    timer_receipt = next((item for item in units if item["name"] == CLOUDFLARE_TIMER), None)
+    if unit_receipt != {"name": CLOUDFLARE_UNIT, "active": "inactive", "enabled": "static"} or timer_receipt != {
+        "name": CLOUDFLARE_TIMER, "active": "active", "enabled": "enabled",
+    }:
+        raise StateError("Cloudflare receipt state is not the fixed recovery target")
+
+    try:
+        unit = _fixed_show(CLOUDFLARE_UNIT, CLOUDFLARE_SERVICE_PROPERTIES)
+    except StateError:
+        # This optional incident-specific cleanup must never block the
+        # canonical receipt restore when the observation itself is unavailable.
+        return {"outcome": "skip"}
+    try:
+        loaded_argv = _cloudflare_exec_start(unit["ExecStart"])
+        source_argv, source_unit_sha = _source_cloudflare_exec_start(current)
+    except StateError:
+        return {"outcome": "skip"}
+    if (
+        unit["Id"] != CLOUDFLARE_UNIT
+        or unit["FragmentPath"] != CLOUDFLARE_FRAGMENT
+        or unit["DropInPaths"] != ""
+        or unit["NeedDaemonReload"] != "no"
+        or unit["Type"] != "oneshot"
+        or unit["RemainAfterExit"] != "no"
+        or unit["KillMode"] != "control-group"
+        or unit["UnitFileState"] != "static"
+        or unit["MainPID"] != "0"
+        or unit["ControlPID"] != "0"
+        or unit["ControlGroup"] != ""
+        or unit["TasksCurrent"] != "[not set]"
+        or loaded_argv != source_argv
+    ):
+        return {"outcome": "skip"}
+    try:
+        unit_active_status, unit_active = _run_systemctl("is-active", CLOUDFLARE_UNIT)
+        unit_enabled_status, unit_enabled = _run_systemctl("is-enabled", CLOUDFLARE_UNIT)
+    except StateError:
+        return {"outcome": "skip"}
+    if unit_enabled_status != 0 or unit_enabled != "static":
+        return {"outcome": "skip"}
+    if (
+        unit["ActiveState"] != "failed"
+        or unit["SubState"] != "failed"
+        or unit["Result"] != "exit-code"
+        or unit["ExecMainCode"] != "1"
+        or unit["ExecMainStatus"] != "75"
+        or unit_active != "failed"
+        or unit_active_status != 3
+    ):
+        return {"outcome": "skip"}
+    if (
+        unit["SubState"] != "failed"
+        or unit["Result"] != "exit-code"
+        or unit["ExecMainCode"] != "1"
+        or unit["ExecMainStatus"] != "75"
+        or unit["MainPID"] != "0"
+        or unit["ControlPID"] != "0"
+    ):
+        raise StateError("Cloudflare oneshot failure state is not the fixed target")
+    invocation_id = unit["InvocationID"]
+    journal = _invocation_guard_record(invocation_id)
+    if journal is None:
+        return {"outcome": "skip"}
+    journal_time, journal_digest = journal
+    try:
+        start_time = _systemd_timestamp(unit["ExecMainStartTimestamp"])
+    except StateError:
+        return {"outcome": "skip"}
+    if abs((journal_time - start_time).total_seconds()) > 120:
+        return {"outcome": "skip"}
+
+    timer = _fixed_show(CLOUDFLARE_TIMER, CLOUDFLARE_TIMER_PROPERTIES)
+    timer_enabled_status, timer_enabled = _run_systemctl("is-enabled", CLOUDFLARE_TIMER)
+    if (
+        timer["Id"] != CLOUDFLARE_TIMER
+        or timer["FragmentPath"] != "/etc/systemd/system/deadlock-cloudflare-ips.timer"
+        or timer["DropInPaths"] != ""
+        or timer["NeedDaemonReload"] != "no"
+        or timer["ActiveState"] != "active"
+        or timer["SubState"] != "waiting"
+        or timer["Unit"] != CLOUDFLARE_UNIT
+        or timer["UnitFileState"] != "enabled"
+        or timer_enabled_status != 0
+        or timer_enabled != "enabled"
+        or not _fixed_pair_jobs_empty()
+    ):
+        raise StateError("Cloudflare timer is not safely pending")
+
+    last_trigger = _systemd_timestamp(timer["LastTriggerUSec"])
+    next_elapse = _systemd_timestamp(timer["NextElapseUSecRealtime"])
+    now = datetime.now(timezone.utc)
+    if (
+        abs((last_trigger - start_time).total_seconds()) > 120
+        or abs((last_trigger - journal_time).total_seconds()) > 120
+        or (next_elapse - now).total_seconds() <= PENDING_GUARD_MIN_NEXT_TIMER_SECONDS
+        or next_elapse <= last_trigger
+    ):
+        raise StateError("Cloudflare timer horizon does not protect the recovery window")
+
+    operation_id = cast(str, tx["operation_id"])
+    transaction_sha = hashlib.sha256(raw_transaction).hexdigest()
+    receipt_sha = hashlib.sha256(raw_receipt).hexdigest()
+    key = hashlib.sha256(
+        f"{operation_id}:{transaction_sha}:{receipt_sha}:{invocation_id}".encode("ascii")
+    ).hexdigest()
+    source_sha = _cloudflare_source_sha(current)
+    evidence: dict[str, object] = {
+        "schema": 1,
+        "kind": "cloudflare_pending_guard_reset_evidence",
+        "observed_at_utc": now.isoformat().replace("+00:00", "Z"),
+        "source_sha": source_sha,
+        "previous_source_sha": _cloudflare_source_sha(previous),
+        "executing_helper_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "target_helper_manifest": _helper_digests(current),
+        "current_before": str(current),
+        "previous_before": str(previous),
+        "current_before_identity": tx["current_before_identity"],
+        "previous_before_identity": tx["previous_before_identity"],
+        "operation": tx["operation"],
+        "operation_id": operation_id,
+        "phase": tx["phase"],
+        "transaction_sha256": transaction_sha,
+        "systemd_receipt_sha256": receipt_sha,
+        "attempt_nonce": attempt_nonce,
+        "service": {
+            "fragment_path": unit["FragmentPath"],
+            "exec_start": list(loaded_argv),
+            "source_unit_sha256": source_unit_sha,
+            "invocation_id": invocation_id,
+            "active_state": unit["ActiveState"],
+            "sub_state": unit["SubState"],
+            "result": unit["Result"],
+            "exec_main_code": 1,
+            "exec_main_status": 75,
+            "main_pid": 0,
+            "control_pid": 0,
+            "control_group": "",
+            "tasks_current": "[not set]",
+            "exec_main_start_timestamp": unit["ExecMainStartTimestamp"],
+        },
+        "guard_journal": {
+            "timestamp_utc": journal_time.isoformat().replace("+00:00", "Z"),
+            "record_sha256": journal_digest.hex(),
+        },
+        "timer": {
+            "active_state": timer["ActiveState"],
+            "sub_state": timer["SubState"],
+            "unit": timer["Unit"],
+            "unit_file_state": timer["UnitFileState"],
+            "last_trigger": timer["LastTriggerUSec"],
+            "next_elapse": timer["NextElapseUSecRealtime"],
+            "jobs_for_pair": 0,
+        },
+        "planned_action": "reset-failed deadlock-cloudflare-ips.service",
+    }
+    _revalidate_cloudflare_binding(
+        path=path,
+        transaction=transaction,
+        app_dir=app_dir,
+        helper_release=helper_release,
+        transaction_bytes=raw_transaction,
+        receipt_bytes=raw_receipt,
+        current=current,
+        previous=previous,
+        invocation_id=invocation_id,
+        expected_unit=unit,
+        expected_timer=timer,
+        expected_journal=(journal_time, journal_digest),
+    )
+    if not apply_reset:
+        evidence["outcome"] = "preflight"
+        return evidence
+
+    timer_stop_attempted = False
+    try:
+        _revalidate_cloudflare_timer_before_stop(timer)
+        # Bind the attempt durably only after all ordinary guards pass.  The
+        # next operation is the one fixed timer stop, so the EXIT trap can
+        # compensate only an attempt that crossed this point.
+        evidence_path = _write_cloudflare_evidence(app_dir / "shared", key, evidence)
+        timer_stop_attempted = True
+        status, _ = _run_systemctl("stop", CLOUDFLARE_TIMER)
+        if status != 0:
+            raise StateError("Cloudflare timer stop failed")
+        stopped_timer = _fixed_show(CLOUDFLARE_TIMER, CLOUDFLARE_TIMER_PROPERTIES)
+        active_status, active_value = _run_systemctl("is-active", CLOUDFLARE_TIMER)
+        if (
+            active_status != 3
+            or active_value != "inactive"
+            or stopped_timer["ActiveState"] != "inactive"
+            or stopped_timer["Unit"] != CLOUDFLARE_UNIT
+            or stopped_timer["UnitFileState"] != "enabled"
+            or not _fixed_pair_jobs_empty()
+        ):
+            raise StateError("Cloudflare timer did not quiesce safely")
+        if transaction.read_bytes() != raw_transaction or path.read_bytes() != raw_receipt:
+            raise StateError("Cloudflare recovery receipt changed before reset")
+        bound_record = _read_receipt(path)
+        _validate_context(bound_record, app_dir)
+        _validate_transaction_binding(bound_record, transaction, app_dir, helper_release)
+        if (
+            (app_dir / "current").resolve(strict=True) != current
+            or (app_dir / "previous").resolve(strict=True) != previous
+            or _cloudflare_source_sha(current) != PENDING_GUARD_CURRENT_SOURCE_SHA
+            or _cloudflare_source_sha(previous) != PENDING_GUARD_PREVIOUS_SOURCE_SHA
+            or _invocation_guard_record(invocation_id) != (journal_time, journal_digest)
+        ):
+            raise StateError("Cloudflare recovery binding changed before reset")
+        current_unit = _fixed_show(CLOUDFLARE_UNIT, CLOUDFLARE_SERVICE_PROPERTIES)
+        if (
+            current_unit != unit
+            or current_unit["InvocationID"] != invocation_id
+            or _source_cloudflare_exec_start(current)[0] != source_argv
+            or _cloudflare_source_sha(current) != PENDING_GUARD_CURRENT_SOURCE_SHA
+            or not _fixed_pair_jobs_empty()
+        ):
+            raise StateError("Cloudflare invocation changed before reset")
+        status, _ = _run_systemctl("reset-failed", CLOUDFLARE_UNIT)
+        if status != 0:
+            raise StateError("Cloudflare pending-guard reset failed")
+        reset_unit = _fixed_show(CLOUDFLARE_UNIT, CLOUDFLARE_SERVICE_PROPERTIES)
+        active_status, active_value = _run_systemctl("is-active", CLOUDFLARE_UNIT)
+        enabled_status, enabled_value = _run_systemctl("is-enabled", CLOUDFLARE_UNIT)
+        if (
+            active_status != 3
+            or active_value != "inactive"
+            or enabled_status != 0
+            or enabled_value != "static"
+            or reset_unit["ActiveState"] != "inactive"
+            or reset_unit["SubState"] != "dead"
+            or reset_unit["UnitFileState"] != "static"
+            or reset_unit["MainPID"] != "0"
+            or reset_unit["ControlPID"] != "0"
+            or reset_unit["ControlGroup"] != ""
+            or reset_unit["TasksCurrent"] != "[not set]"
+            or not _fixed_pair_jobs_empty()
+        ):
+            raise StateError("Cloudflare reset did not verify inactive/static")
+    except BaseException as exc:
+        if timer_stop_attempted:
+            active_status, active_value = _run_systemctl("is-active", CLOUDFLARE_TIMER)
+            if active_status != 0 or active_value != "active":
+                restore_status, _ = _run_systemctl("start", CLOUDFLARE_TIMER)
+                verify_status, verify_value = _run_systemctl("is-active", CLOUDFLARE_TIMER)
+                enabled_status, enabled_value = _run_systemctl("is-enabled", CLOUDFLARE_TIMER)
+                if restore_status != 0 or verify_status != 0 or verify_value != "active" or enabled_status != 0 or enabled_value != "enabled":
+                    raise StateError("Cloudflare timer restoration failed after reset refusal") from exc
+        raise
+    if not evidence_path.is_file():
+        raise StateError("Cloudflare reset evidence disappeared")
+    return {"outcome": "performed", "evidence_id": key}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -988,7 +1769,43 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--transaction", type=Path)
         command.add_argument("--helper-release", type=Path)
         command.add_argument("--app-dir", required=True, type=Path)
+    cloudflare_reset = commands.add_parser("reset-cloudflare-pending-guard")
+    cloudflare_reset.add_argument("--systemctl", default=SYSTEMCTL)
+    cloudflare_reset.add_argument("--state", required=True, type=Path)
+    cloudflare_reset.add_argument("--transaction", required=True, type=Path)
+    cloudflare_reset.add_argument("--helper-release", required=True, type=Path)
+    cloudflare_reset.add_argument("--app-dir", required=True, type=Path)
+    cloudflare_reset.add_argument("--attempt-nonce", required=True)
     return parser
+
+
+def _emit_cloudflare_reset_private_marker() -> None:
+    if (
+        os.environ.get("PLATFORM_RUNTIME_PRIVATE_CAPTURE") != "1"
+        or os.environ.get("PLATFORM_RUNTIME_PRIVATE_ROUTE") != "recover_pending"
+    ):
+        return
+    output = b"fixed cloudflare pending-guard reset refused\n"
+    print(
+        "RUNTIME_PRIVATE_CONTEXT "
+        + json.dumps(
+            {
+                "schema": 1,
+                "route": "recover_pending",
+                "component": "systemd_state_restore",
+                "guard_id": None,
+                "returncode": 2,
+                "stream": "combined",
+                "output_b64": base64.b64encode(output).decode("ascii"),
+                "total_bytes": len(output),
+                "truncated": False,
+                "retained": "tail",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        file=sys.stderr,
+    )
 
 
 def main() -> int:
@@ -1049,12 +1866,32 @@ def main() -> int:
                 transaction=args.transaction,
                 helper_release=args.helper_release,
             )
+        elif args.command == "reset-cloudflare-pending-guard":
+            result = reset_cloudflare_pending_guard(
+                args.state,
+                transaction=args.transaction,
+                app_dir=args.app_dir,
+                helper_release=args.helper_release,
+                attempt_nonce=args.attempt_nonce,
+            )
+            outcome = result.get("outcome") if isinstance(result, dict) else None
+            evidence_id = result.get("evidence_id") if isinstance(result, dict) else None
+            if outcome == "performed":
+                if not isinstance(evidence_id, str) or re.fullmatch(r"[0-9a-f]{64}", evidence_id) is None:
+                    raise StateError("Cloudflare reset evidence identity is invalid")
+                print(f"RELEASE_CLOUDFLARE_PENDING_RESET schema=1 status=performed evidence_id={evidence_id}")
+            elif outcome == "skip":
+                print("RELEASE_CLOUDFLARE_PENDING_RESET schema=1 status=skip")
+            else:
+                raise StateError("Cloudflare reset outcome is invalid")
         else:
             raise StateError("unknown systemd state command")
         return 0
     except (StateError, OSError, ValueError):
         # Keep paths and systemctl output out of public logs.  Callers only
         # need a stable non-zero result and retain the receipt for recovery.
+        if args.command == "reset-cloudflare-pending-guard":
+            _emit_cloudflare_reset_private_marker()
         print("RELEASE_SYSTEMD_STATE schema=1 status=failed", file=sys.stderr)
         return 2
 

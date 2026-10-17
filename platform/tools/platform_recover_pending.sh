@@ -321,6 +321,141 @@ SYSTEMD_STATE="$APP_DIR/shared/.release-systemd-state.json"
 TRANSACTION_TOOL="$TOOLS_DIR/platform_release_transaction.py"
 SYSTEMD_STATE_TOOL="$TOOLS_DIR/platform_release_systemd_state.py"
 RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"
+CLOUDFLARE_PENDING_RESET_ATTEMPTED=0
+CLOUDFLARE_PENDING_RESET_EVIDENCE_PATH=""
+CLOUDFLARE_PENDING_RESET_ATTEMPT_NONCE=""
+CLOUDFLARE_PENDING_RESET_EVIDENCE_ID=""
+CLOUDFLARE_PENDING_RESET_TX_SHA256=""
+CLOUDFLARE_PENDING_RESET_RECEIPT_SHA256=""
+CLOUDFLARE_PENDING_RESET_INVOCATION_ID=""
+platform_release_recovery_exit() {
+  local original_status="$?" active_status=0 active_value="" enabled_status=0 enabled_value=""
+  local evidence_bound=0 evidence_exists=0
+  trap - EXIT
+  if [[ "$CLOUDFLARE_PENDING_RESET_ATTEMPTED" == "1" ]]; then
+    if [[ -n "$CLOUDFLARE_PENDING_RESET_EVIDENCE_PATH" \
+      && -n "$CLOUDFLARE_PENDING_RESET_ATTEMPT_NONCE" \
+      && -n "$CLOUDFLARE_PENDING_RESET_EVIDENCE_ID" ]]; then
+      if [[ -e "$CLOUDFLARE_PENDING_RESET_EVIDENCE_PATH" || -L "$CLOUDFLARE_PENDING_RESET_EVIDENCE_PATH" ]]; then
+        evidence_exists=1
+        if /usr/bin/python3 -I - \
+          "$CLOUDFLARE_PENDING_RESET_EVIDENCE_PATH" \
+          "$CLOUDFLARE_PENDING_RESET_EVIDENCE_ID" \
+          "$CLOUDFLARE_PENDING_RESET_ATTEMPT_NONCE" \
+          "$operation_id" \
+          "$CLOUDFLARE_PENDING_RESET_TX_SHA256" \
+          "$CLOUDFLARE_PENDING_RESET_RECEIPT_SHA256" \
+          "$CLOUDFLARE_PENDING_RESET_INVOCATION_ID" \
+          "$source_sha" \
+          "$previous_source_sha" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+evidence_id, nonce, operation_id, transaction_sha, receipt_sha, invocation_id, source_sha, previous_sha = sys.argv[2:]
+
+def _unique(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+
+try:
+    parent = path.parent.lstat()
+    before = path.lstat()
+    if (
+        not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid != 0 or parent.st_gid != 0 or stat.S_IMODE(parent.st_mode) != 0o700
+        or not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != 0 or before.st_gid != 0 or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 16 * 1024
+        or path.name != evidence_id + ".json"
+    ):
+        raise ValueError
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_gid, opened.st_mode, opened.st_nlink, opened.st_size) != (
+            before.st_dev, before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_nlink, before.st_size
+        ):
+            raise ValueError
+        chunks = []
+        total = 0
+        while total <= 16 * 1024:
+            chunk = os.read(fd, min(4096, 16 * 1024 + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        if total != before.st_size or total > 16 * 1024 or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+            raise ValueError
+    finally:
+        os.close(fd)
+    value = json.loads(b"".join(chunks).decode("ascii"), object_pairs_hook=_unique)
+    service = value["service"]
+    expected_id = hashlib.sha256(f"{operation_id}:{transaction_sha}:{receipt_sha}:{invocation_id}".encode("ascii")).hexdigest()
+    if (
+        expected_id != evidence_id or value.get("schema") != 1
+        or value.get("kind") != "cloudflare_pending_guard_reset_evidence"
+        or value.get("operation_id") != operation_id or value.get("attempt_nonce") != nonce
+        or value.get("transaction_sha256") != transaction_sha
+        or value.get("systemd_receipt_sha256") != receipt_sha
+        or value.get("source_sha") != source_sha or value.get("previous_source_sha") != previous_sha
+        or not isinstance(service, dict) or service.get("invocation_id") != invocation_id
+    ):
+        raise ValueError
+except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+        then
+          evidence_bound=1
+        fi
+      fi
+    fi
+    if [[ "$evidence_bound" == "1" ]]; then
+      if active_value="$(run_systemctl is-active deadlock-cloudflare-ips.timer 2>/dev/null)"; then
+        active_status=0
+      else
+        active_status="$?"
+      fi
+      if enabled_value="$(run_systemctl is-enabled deadlock-cloudflare-ips.timer 2>/dev/null)"; then
+        enabled_status=0
+      else
+        enabled_status="$?"
+      fi
+      if [[ "$active_status:$active_value" == "3:inactive" \
+        && "$enabled_status:$enabled_value" == "0:enabled" ]]; then
+        run_systemctl start deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null || true
+        active_value=""
+        if active_value="$(run_systemctl is-active deadlock-cloudflare-ips.timer 2>/dev/null)"; then
+          active_status=0
+        else
+          active_status="$?"
+        fi
+      fi
+      if [[ "$active_status:$active_value:$enabled_status:$enabled_value" != "0:active:0:enabled" ]]; then
+        printf 'RECOVERY_TIMER_RESTORE schema=1 status=failed\n' >&2
+        [[ "$original_status" -ne 0 ]] || original_status=1
+      fi
+    elif [[ "$evidence_exists" == "1" ]]; then
+      # A file at the expected event path with different identity/content is
+      # not authority to start a timer.
+      printf 'RECOVERY_TIMER_RESTORE schema=1 status=failed\n' >&2
+      [[ "$original_status" -ne 0 ]] || original_status=1
+    fi
+  fi
+  platform_release_lock_close
+  exit "$original_status"
+}
+trap platform_release_recovery_exit EXIT
 if [[ -e "$STATE" || -L "$STATE" ]]; then
   test -f "$STATE" && test ! -L "$STATE" \
     && test "$(stat -c '%u:%h:%a' "$STATE" 2>/dev/null)" = "0:1:600" \
@@ -1056,6 +1191,139 @@ if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value):
 PY
 } 2>/dev/null)"
 [[ -n "$source_sha" ]] && PUBLIC_SOURCE_SHA="$source_sha"
+
+# A single install-recovery compatibility repair is permitted only when the
+# already validated operation/companion pair proves the fixed 9ce -> f115
+# target and the rollback receipt expects Cloudflare inactive/static while its
+# timer remains active/enabled. All live state, journal, source-unit and
+# timer-horizon checks remain in the immutable systemd helper.
+if [[ "$transaction_phase" == recovery-restored \
+  && "$pending_operation" == install \
+  && "$current_release" == "$original_current" \
+  && "$source_sha" == 9ceaf09ab7ba4bf5c5e636865106910eaa034c8d ]]; then
+  previous_source_sha="$(/usr/bin/python3 -I - "$original_previous/RELEASE.json" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+try:
+    value = json.loads(Path(sys.argv[1]).read_text(encoding="ascii")).get("source_git_commit", "")
+except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+    value = ""
+if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value):
+    print(value)
+PY
+  2>/dev/null)"
+  receipt_target="$({
+    /usr/bin/python3 -I - "$SYSTEMD_STATE" <<'PY'
+import json
+import sys
+from pathlib import Path
+try:
+    record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+units = record.get("units")
+if not isinstance(units, list) or record.get("operation") != "rollback":
+    raise SystemExit(1)
+by_name = {item.get("name"): item for item in units if isinstance(item, dict)}
+if len(by_name) != len(units):
+    raise SystemExit(1)
+if (
+    by_name.get("deadlock-cloudflare-ips.service") == {
+        "name": "deadlock-cloudflare-ips.service", "active": "inactive", "enabled": "static"
+    }
+    and by_name.get("deadlock-cloudflare-ips.timer") == {
+        "name": "deadlock-cloudflare-ips.timer", "active": "active", "enabled": "enabled"
+    }
+):
+    print("fixed-target")
+PY
+  } 2>/dev/null)"
+  if [[ "$previous_source_sha" == f1154c7dba4f57bf52f7d7544e97d924c732be94 \
+    && "$receipt_target" == fixed-target ]]; then
+    CLOUDFLARE_PENDING_RESET_READY=0
+    if CLOUDFLARE_PENDING_RESET_ATTEMPT_NONCE="$(/usr/bin/python3 -I -c 'import secrets; print(secrets.token_hex(32))')" \
+      && [[ "$CLOUDFLARE_PENDING_RESET_ATTEMPT_NONCE" =~ ^[0-9a-f]{64}$ ]]; then
+      CLOUDFLARE_PENDING_RESET_INVOCATION_ID="$(run_systemctl show --property=InvocationID --value deadlock-cloudflare-ips.service 2>/dev/null || true)"
+    fi
+    if [[ "$CLOUDFLARE_PENDING_RESET_INVOCATION_ID" =~ ^[0-9a-f]{32}$ ]]; then
+      if binding_values="$(/usr/bin/python3 -I - "$STATE" "$SYSTEMD_STATE" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+def read_bound(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 1024 * 1024:
+            raise SystemExit(1)
+        data = bytearray()
+        while len(data) <= 1024 * 1024:
+            chunk = os.read(fd, min(65536, 1024 * 1024 + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(fd)
+        if len(data) != before.st_size or len(data) > 1024 * 1024 or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise SystemExit(1)
+        return bytes(data)
+    finally:
+        os.close(fd)
+
+transaction, receipt = (read_bound(path) for path in sys.argv[1:])
+print(hashlib.sha256(transaction).hexdigest(), hashlib.sha256(receipt).hexdigest())
+PY
+        )"; then
+        read -r CLOUDFLARE_PENDING_RESET_TX_SHA256 CLOUDFLARE_PENDING_RESET_RECEIPT_SHA256 <<<"$binding_values"
+        if [[ "$CLOUDFLARE_PENDING_RESET_TX_SHA256" =~ ^[0-9a-f]{64}$ \
+          && "$CLOUDFLARE_PENDING_RESET_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+          CLOUDFLARE_PENDING_RESET_EVIDENCE_ID="$(/usr/bin/python3 -I -c 'import hashlib,sys; print(hashlib.sha256(":".join(sys.argv[1:]).encode("ascii")).hexdigest())' \
+            "$operation_id" "$CLOUDFLARE_PENDING_RESET_TX_SHA256" \
+            "$CLOUDFLARE_PENDING_RESET_RECEIPT_SHA256" "$CLOUDFLARE_PENDING_RESET_INVOCATION_ID")"
+          if [[ "$CLOUDFLARE_PENDING_RESET_EVIDENCE_ID" =~ ^[0-9a-f]{64}$ ]]; then
+            CLOUDFLARE_PENDING_RESET_EVIDENCE_PATH="$APP_DIR/shared/.release-cloudflare-pending-reset-evidence/$CLOUDFLARE_PENDING_RESET_EVIDENCE_ID.json"
+            CLOUDFLARE_PENDING_RESET_READY=1
+          fi
+        fi
+      fi
+    fi
+    if [[ "$CLOUDFLARE_PENDING_RESET_READY" == "1" ]]; then
+      # Evidence is created only at the helper's final pre-stop boundary. The
+      # EXIT trap accepts it only when its nonce and immutable bindings match.
+      CLOUDFLARE_PENDING_RESET_ATTEMPTED=1
+      helper_result=""
+      if helper_result="$(/usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" reset-cloudflare-pending-guard \
+        --state "$SYSTEMD_STATE" --transaction "$STATE" \
+        --helper-release "$current_release" --app-dir "$APP_DIR" \
+        --systemctl "$SYSTEMCTL_BIN" \
+        --attempt-nonce "$CLOUDFLARE_PENDING_RESET_ATTEMPT_NONCE")"; then
+        helper_status=0
+      else
+        helper_status="$?"
+      fi
+      if [[ "$helper_status" -ne 0 ]]; then
+        public_status failed systemd_state >&2
+        exit 1
+      fi
+      case "$helper_result" in
+        'RELEASE_CLOUDFLARE_PENDING_RESET schema=1 status=skip')
+          CLOUDFLARE_PENDING_RESET_ATTEMPTED=0
+          ;;
+        "RELEASE_CLOUDFLARE_PENDING_RESET schema=1 status=performed evidence_id=$CLOUDFLARE_PENDING_RESET_EVIDENCE_ID")
+          [[ "$CLOUDFLARE_PENDING_RESET_ATTEMPTED" == "1" ]] \
+            || { public_status failed systemd_state >&2; exit 1; }
+          ;;
+        *)
+          public_status failed systemd_state >&2
+          exit 1
+          ;;
+      esac
+    fi
+  fi
+fi
 
 # Release-specific installers are data-plane inputs. The immutable systemd
 # helper has already verified their recorded digest manifest before this call.

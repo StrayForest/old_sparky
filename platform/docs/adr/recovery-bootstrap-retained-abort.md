@@ -422,3 +422,23 @@ security checks, install and health path. Only a real successful deployment of
 **T** publishes a green deployment status; **R** remains failed. Never rerun
 the failed child, manually run an installer, weaken a fallback check or use
 this exception for a normal deployment.
+
+## Fixed Cloudflare pending-guard latch recovery
+
+The immutable `recover_pending` path may clear one exact failed
+`deadlock-cloudflare-ips.service` oneshot only when the bound install
+transaction and companion rollback receipt identify the reviewed 9ce/f115
+release pair, the receipt expects that service inactive/static and its timer
+active/enabled, and the current invocation journal proves the fixed
+`pending_operation` guard exited 75. The unit source identity, zero PIDs,
+empty service cgroup, empty pair jobs, timer identity and a fresh timer horizon
+beyond the bounded recovery window are checked under the canonical lock. A
+per-event root-owned file is created with `O_EXCL` after those checks and before
+the timer stop; a random attempt nonce in that file prevents stale evidence
+from authorizing EXIT compensation. The helper stops only the fixed timer,
+performs at most one fixed `reset-failed` for the service, and never starts the
+service. The ordinary systemd receipt restoration re-arms the timer and
+verifies the recorded unit states. Any incomplete or changed evidence fails
+closed while retaining the recovery receipts. This exception does not weaken
+the maintenance reset guard and does not identify the original cause of the
+pending release operation.

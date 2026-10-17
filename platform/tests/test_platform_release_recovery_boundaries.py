@@ -14,12 +14,15 @@ import tempfile
 import time
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import cast
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from tests import platform_test_lock_support as lock_support
 from tools import platform_recovery_bootstrap as recovery
 from tools import platform_release_transaction as transaction
+from tools import platform_release_systemd_state as systemd_state
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -2045,6 +2048,605 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                     f"rc={exit_code} must retain the transaction for an immutable retry",
                 )
                 self.assertTrue(candidate.exists())
+
+        fixture = type(self)(self._testMethodName)
+        fixture.setUp()
+        try:
+            fixture._assert_cloudflare_pending_guard_preflight_replay()
+        finally:
+            fixture.tearDown()
+
+    def _run_cloudflare_recovery_exit_trap(
+        self,
+        *,
+        systemctl: Path,
+        evidence_path: Path,
+        evidence_id: str,
+        attempt_nonce: str,
+        operation_id: str,
+        transaction_sha: str,
+        receipt_sha: str,
+        invocation_id: str,
+    ) -> subprocess.CompletedProcess[str]:
+        wrapper_source = RECOVERY_WRAPPER.read_text(encoding="utf-8")
+        start = wrapper_source.index("platform_release_recovery_exit() {")
+        end = wrapper_source.index("\ntrap platform_release_recovery_exit EXIT", start)
+        exit_function = wrapper_source[start:end]
+        harness = "\n".join(
+            (
+                f"SYSTEMCTL_BIN={shlex.quote(str(systemctl))}",
+                "CLOUDFLARE_PENDING_RESET_ATTEMPTED=1",
+                f"CLOUDFLARE_PENDING_RESET_EVIDENCE_PATH={shlex.quote(str(evidence_path))}",
+                f"CLOUDFLARE_PENDING_RESET_ATTEMPT_NONCE={shlex.quote(attempt_nonce)}",
+                f"CLOUDFLARE_PENDING_RESET_EVIDENCE_ID={shlex.quote(evidence_id)}",
+                f"CLOUDFLARE_PENDING_RESET_TX_SHA256={shlex.quote(transaction_sha)}",
+                f"CLOUDFLARE_PENDING_RESET_RECEIPT_SHA256={shlex.quote(receipt_sha)}",
+                f"CLOUDFLARE_PENDING_RESET_INVOCATION_ID={shlex.quote(invocation_id)}",
+                f"operation_id={shlex.quote(operation_id)}",
+                f"source_sha={shlex.quote(systemd_state.PENDING_GUARD_CURRENT_SOURCE_SHA)}",
+                f"previous_source_sha={shlex.quote(systemd_state.PENDING_GUARD_PREVIOUS_SOURCE_SHA)}",
+                'run_systemctl() { "$SYSTEMCTL_BIN" "$@"; }',
+                "platform_release_lock_close() { :; }",
+                exit_function,
+                "trap platform_release_recovery_exit EXIT",
+                "exit 0",
+            )
+        )
+        return subprocess.run(
+            ["/bin/bash", "-c", harness],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+
+    def _assert_cloudflare_pending_guard_preflight_replay(self) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("Cloudflare pending-guard preflight requires root-owned receipt fixtures")
+
+        current = self.add_release("cloudflare-fixed-current")
+        previous = self.add_release("cloudflare-fixed-previous")
+        for release, source_sha in (
+            (current, systemd_state.PENDING_GUARD_CURRENT_SOURCE_SHA),
+            (previous, systemd_state.PENDING_GUARD_PREVIOUS_SOURCE_SHA),
+        ):
+            (release / "RELEASE.json").write_text(
+                json.dumps({"source_git_commit": source_sha}) + "\n", encoding="ascii"
+            )
+            (release / "RELEASE.json").chmod(0o444)
+        for relative in systemd_state.HELPER_RELATIVE_PATHS:
+            source = REPO_ROOT / "platform" / relative
+            for release in (current, previous):
+                target = release / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target, follow_symlinks=False)
+                target.chmod(0o755)
+        unit_source = REPO_ROOT / "platform/deploy/systemd/deadlock-cloudflare-ips.service"
+        for release in (current, previous):
+            target = release / "deploy/systemd/deadlock-cloudflare-ips.service"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(unit_source, target, follow_symlinks=False)
+            target.chmod(0o644)
+
+        self.switch_pointer("current", current)
+        self.switch_pointer("previous", previous)
+        (self.shared / "venv").mkdir(mode=0o755)
+        self.create_wrapper_transaction(
+            current, previous, "cloudflare-pending-guard", complete_snapshot=True, timer_active=True
+        )
+        self.run_transaction("recover", "--retain")
+        self.assertEqual(self.state_phase(), "recovery-restored")
+
+        invocation = "179af136423f48e190994de6fba470af"
+        start = datetime.now(ZoneInfo("Europe/Helsinki")).replace(microsecond=0) - timedelta(seconds=2)
+        next_elapse = start + timedelta(hours=2)
+        exec_start = (
+            "{ path=/bin/bash ; argv[]=/bin/bash "
+            "/opt/oldsparky/platform/current/tools/platform_release_lock_exec.sh "
+            "--app-dir /opt/oldsparky/platform -- "
+            "/opt/oldsparky/platform/shared/venv/bin/python "
+            "/opt/oldsparky/platform/current/tools/platform_update_cloudflare_ips.py "
+            "--apply --reload ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; "
+            "pid=0 ; code=(null) ; status=0/0 }"
+        )
+        service = {
+            "Id": systemd_state.CLOUDFLARE_UNIT,
+            "FragmentPath": systemd_state.CLOUDFLARE_FRAGMENT,
+            "DropInPaths": "",
+            "NeedDaemonReload": "no",
+            "Type": "oneshot",
+            "RemainAfterExit": "no",
+            "KillMode": "control-group",
+            "ActiveState": "failed",
+            "SubState": "failed",
+            "Result": "exit-code",
+            "ExecMainCode": "1",
+            "ExecMainStatus": "75",
+            "MainPID": "0",
+            "ControlPID": "0",
+            "ControlGroup": "",
+            "TasksCurrent": "[not set]",
+            "UnitFileState": "static",
+            "InvocationID": invocation,
+            "ExecMainStartTimestamp": start.strftime("%a %Y-%m-%d %H:%M:%S %Z"),
+            "ExecMainExitTimestamp": start.strftime("%a %Y-%m-%d %H:%M:%S %Z"),
+            "ExecStart": exec_start,
+        }
+        timer = {
+            "Id": systemd_state.CLOUDFLARE_TIMER,
+            "FragmentPath": "/etc/systemd/system/deadlock-cloudflare-ips.timer",
+            "DropInPaths": "",
+            "NeedDaemonReload": "no",
+            "ActiveState": "active",
+            "SubState": "waiting",
+            "Unit": systemd_state.CLOUDFLARE_UNIT,
+            "UnitFileState": "enabled",
+            "LastTriggerUSec": start.strftime("%a %Y-%m-%d %H:%M:%S %Z"),
+            "NextElapseUSecRealtime": next_elapse.strftime("%a %Y-%m-%d %H:%M:%S %Z"),
+        }
+        states = {
+            unit: ("active" if unit == systemd_state.CLOUDFLARE_TIMER else "inactive")
+            for unit in systemd_state.OWNED_UNITS
+        }
+        states[systemd_state.CLOUDFLARE_UNIT] = "inactive"
+        static_units = {
+            unit for unit in systemd_state.OWNED_UNITS
+            if unit.endswith(".service") and unit not in {
+                "deadlock-api.service", "deadlock-worker.service", "deadlock-web.service"
+            }
+        }
+        enabled = {
+            unit: ("static" if unit in static_units else "disabled" if unit == "deadlock-offsite-backup.timer" else "enabled")
+            for unit in systemd_state.OWNED_UNITS
+        }
+        config_path = self.root / "cloudflare-systemd-config.json"
+        command_log = self.root / "cloudflare-systemd-commands.jsonl"
+        config = {
+            "states": states,
+            "enabled": enabled,
+            "properties": {systemd_state.CLOUDFLARE_UNIT: service, systemd_state.CLOUDFLARE_TIMER: timer},
+            "jobs": [],
+        }
+        config_path.write_text(json.dumps(config), encoding="ascii")
+        systemctl = self.root / "cloudflare-systemctl"
+        systemctl.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json,sys\n"
+            f"config_path={str(config_path)!r}; log_path={str(command_log)!r}\n"
+            "args=sys.argv[1:]\n"
+            "with open(log_path,'a',encoding='ascii') as f: f.write(json.dumps(args)+'\\n')\n"
+            "cfg=json.load(open(config_path,encoding='ascii')); cmd=args[0] if args else ''\n"
+            "if cmd=='show':\n"
+            " unit=args[1]; props=next(x.partition('=')[2] for x in args if x.startswith('--property=')); values=cfg['properties'][unit]\n"
+            " if unit=='deadlock-cloudflare-ips.service' and cfg.get('fail_service_show_after') is not None:\n"
+            "  count=cfg.get('service_show_count',0)+1; cfg['service_show_count']=count; json.dump(cfg,open(config_path,'w',encoding='ascii'))\n"
+            "  if count>=cfg['fail_service_show_after']: raise SystemExit(1)\n"
+            " for key in props.split(','): print(f'{key}={values[key]}')\n"
+            "elif cmd=='list-jobs':\n"
+            " if not cfg['jobs']: print('No jobs running.')\n"
+            " else:\n  print('JOB UNIT TYPE STATE')\n  [print(' '.join(row)) for row in cfg['jobs']]\n"
+            "elif cmd=='is-active':\n"
+            " state=cfg['states'][args[1]]; print(state); raise SystemExit(0 if state=='active' else 3)\n"
+            "elif cmd=='is-enabled':\n"
+            " state=cfg['enabled'][args[1]]; print(state); raise SystemExit(1 if state=='disabled' else 0)\n"
+            "elif cmd in ('stop','start','reset-failed'):\n"
+            " unit=args[1]\n"
+            " if cmd=='stop': cfg['states'][unit]='inactive'; cfg['properties'][unit]['ActiveState']='inactive'; cfg['properties'][unit]['SubState']='dead'\n"
+            " if cmd=='start': cfg['states'][unit]='active'; cfg['properties'][unit]['ActiveState']='active'; cfg['properties'][unit]['SubState']='waiting'\n"
+            " if cmd=='reset-failed' and cfg.get('fail_reset'): raise SystemExit(1)\n"
+            " if cmd=='reset-failed':\n  cfg['states'][unit]='inactive'; p=cfg['properties'][unit]; p['ActiveState']='inactive'; p['SubState']='dead'; p['Result']='success'; p['ExecMainCode']='0'; p['ExecMainStatus']='0'\n"
+            " json.dump(cfg,open(config_path,'w',encoding='ascii')); raise SystemExit(0)\n"
+            "else: raise SystemExit(2)\n",
+            encoding="ascii",
+        )
+        systemctl.chmod(0o755)
+        timestamp_usec = str(int(start.astimezone(timezone.utc).timestamp() * 1_000_000))
+        journal = self.root / "cloudflare-journalctl"
+        journal.write_text(
+            "#!/usr/bin/env python3\nimport json\nprint(json.dumps({"
+            "'MESSAGE':'RELEASE_GUARD schema=1 status=failed class=pending_operation release_slug=unavailable source_sha=unavailable',"
+            f"'_SYSTEMD_INVOCATION_ID':{invocation!r},'__REALTIME_TIMESTAMP':{timestamp_usec!r}"
+            "},separators=(',',':')))\n",
+            encoding="ascii",
+        )
+        journal.chmod(0o755)
+        original_journal = journal.read_text(encoding="ascii")
+
+        receipt = self.shared / ".release-systemd-state.json"
+        capture = self.run_script(
+            SYSTEMD_STATE_TOOL, "capture-transaction", "--state", str(receipt),
+            "--transaction", str(self.shared / STATE_NAME), "--app-dir", str(self.app_dir),
+            "--helper-release", str(current), "--require-helper-manifest", "--systemctl", str(systemctl),
+            check=False,
+        )
+        self.assertEqual(capture.returncode, 0, capture.stderr)
+        config = json.loads(config_path.read_text(encoding="ascii"))
+        config["properties"][systemd_state.CLOUDFLARE_UNIT] = {
+            **service,
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+            "ExecMainCode": "0",
+            "ExecMainStatus": "0",
+        }
+        config["states"][systemd_state.CLOUDFLARE_UNIT] = "inactive"
+        config_path.write_text(json.dumps(config), encoding="ascii")
+        cli_skip = self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "reset-cloudflare-pending-guard",
+            "--state", str(receipt), "--transaction", str(self.shared / STATE_NAME),
+            "--helper-release", str(current), "--app-dir", str(self.app_dir),
+            "--systemctl", str(systemctl), "--attempt-nonce", "a" * 64,
+            check=False,
+        )
+        self.assertEqual(cli_skip.returncode, 0, cli_skip.stderr)
+        self.assertEqual(
+            cli_skip.stdout.strip(),
+            "RELEASE_CLOUDFLARE_PENDING_RESET schema=1 status=skip",
+        )
+        config["properties"][systemd_state.CLOUDFLARE_UNIT] = service
+        config["states"][systemd_state.CLOUDFLARE_UNIT] = "failed"
+        config_path.write_text(json.dumps(config), encoding="ascii")
+
+        original_systemctl_path = systemd_state.SYSTEMCTL_PATH
+        original_journal_path = systemd_state.JOURNALCTL_PATH
+        attempt_nonce = "a" * 64
+        try:
+            systemd_state.SYSTEMCTL_PATH = str(systemctl)
+            systemd_state.JOURNALCTL_PATH = str(journal)
+            evidence_dir = self.shared / ".release-cloudflare-pending-reset-evidence"
+            # A receipt-matching ordinary inactive/static unit is not an
+            # incident. It must skip before consulting journal/timer guards.
+            config["properties"][systemd_state.CLOUDFLARE_UNIT] = {
+                **service,
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainCode": "0",
+                "ExecMainStatus": "0",
+            }
+            config["states"][systemd_state.CLOUDFLARE_UNIT] = "inactive"
+            config["properties"][systemd_state.CLOUDFLARE_TIMER]["NextElapseUSecRealtime"] = "n/a"
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            journal.unlink()
+            ordinary = systemd_state.reset_cloudflare_pending_guard(
+                receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                helper_release=current, attempt_nonce=attempt_nonce,
+            )
+            self.assertEqual(ordinary, {"outcome": "skip"})
+            self.assertFalse(evidence_dir.exists())
+            commands = [json.loads(line) for line in command_log.read_text().splitlines()]
+            self.assertFalse(any(command and command[0] in {"stop", "start", "reset-failed"} for command in commands))
+
+            config["properties"][systemd_state.CLOUDFLARE_UNIT] = service
+            config["states"][systemd_state.CLOUDFLARE_UNIT] = "failed"
+            config["properties"][systemd_state.CLOUDFLARE_TIMER]["NextElapseUSecRealtime"] = timer[
+                "NextElapseUSecRealtime"
+            ]
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            journal.write_text(original_journal, encoding="ascii")
+            journal.chmod(0o755)
+            plan = systemd_state.reset_cloudflare_pending_guard(
+                receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                helper_release=current, attempt_nonce=attempt_nonce, apply_reset=False,
+            )
+            journal_status, journal_output = systemd_state._bounded_command(
+                [
+                    str(journal), "--no-pager", "--quiet", "--output=json", "--lines=50",
+                    "--unit=" + systemd_state.CLOUDFLARE_UNIT,
+                    "_SYSTEMD_INVOCATION_ID=" + invocation,
+                ],
+                maximum=systemd_state.PRIVATE_JOURNAL_MAX_BYTES,
+                timeout=15,
+            )
+            self.assertEqual((journal_status, journal_output.endswith("\n")), (0, True), repr(journal_output))
+            self.assertIsNotNone(
+                systemd_state._invocation_guard_record(invocation),
+                f"synthetic invocation journal was not accepted: {journal.read_text(encoding='ascii')!r}",
+            )
+            self.assertIn(
+                "service", plan,
+                f"unexpected incident skip: {plan!r}; tail commands="
+                f"{command_log.read_text(encoding='ascii').splitlines()[-20:]!r}",
+            )
+            self.assertEqual(plan["service"]["exec_main_status"], 75)
+            self.assertEqual(plan["timer"]["unit"], systemd_state.CLOUDFLARE_UNIT)
+            self.assertFalse(evidence_dir.exists())
+            commands = [json.loads(line) for line in command_log.read_text().splitlines()]
+            self.assertFalse(any(command and command[0] in {"stop", "start", "reset-failed"} for command in commands))
+
+            for change, expected_outcome in (
+                ({"properties": {systemd_state.CLOUDFLARE_UNIT: {"FragmentPath": "/tmp/foreign.service"}}}, "skip"),
+                ({"states": {systemd_state.CLOUDFLARE_UNIT: "active"}, "properties": {systemd_state.CLOUDFLARE_UNIT: {**service, "ActiveState": "active", "SubState": "running"}}}, "skip"),
+                ({"properties": {systemd_state.CLOUDFLARE_UNIT: {**service, "ExecMainStatus": "1"}}}, "skip"),
+                ({"properties": {systemd_state.CLOUDFLARE_UNIT: {**service, "ExecStart": exec_start.replace("--reload", "--changed")}}}, "skip"),
+            ):
+                config.update(change)
+                config_path.write_text(json.dumps(config), encoding="ascii")
+                outcome = systemd_state.reset_cloudflare_pending_guard(
+                    receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                    helper_release=current, attempt_nonce=attempt_nonce, apply_reset=False,
+                )
+                self.assertEqual(outcome["outcome"], expected_outcome)
+                config = json.loads(config_path.read_text(encoding="ascii"))
+                config["properties"][systemd_state.CLOUDFLARE_UNIT] = service
+                config["states"][systemd_state.CLOUDFLARE_UNIT] = "failed"
+                config["properties"][systemd_state.CLOUDFLARE_TIMER] = timer
+                config["states"][systemd_state.CLOUDFLARE_TIMER] = "active"
+                config["jobs"] = []
+                config_path.write_text(json.dumps(config), encoding="ascii")
+            journal.write_text(original_journal.replace("pending_operation", "other_failure"), encoding="ascii")
+            outcome = systemd_state.reset_cloudflare_pending_guard(
+                receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                helper_release=current, attempt_nonce=attempt_nonce, apply_reset=False,
+            )
+            self.assertEqual(outcome["outcome"], "skip")
+            journal.write_text(original_journal, encoding="ascii")
+
+            config["jobs"] = [["7", systemd_state.CLOUDFLARE_TIMER, "stop", "running"]]
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            with self.assertRaises(systemd_state.StateError):
+                systemd_state.reset_cloudflare_pending_guard(
+                    receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                    helper_release=current, attempt_nonce=attempt_nonce, apply_reset=False,
+                )
+            config["jobs"] = []
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            commands = [json.loads(line) for line in command_log.read_text().splitlines()]
+            self.assertFalse(any(command and command[0] in {"stop", "start", "reset-failed"} for command in commands))
+
+            config["service_show_count"] = 0
+            config["fail_service_show_after"] = 2
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            with self.assertRaises(systemd_state.StateError):
+                systemd_state.reset_cloudflare_pending_guard(
+                    receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                    helper_release=current, attempt_nonce=attempt_nonce,
+                )
+            after_revalidation_failure = [json.loads(line) for line in command_log.read_text().splitlines()]
+            self.assertFalse(
+                any(
+                    command and command[0] in {"stop", "start", "reset-failed"}
+                    for command in after_revalidation_failure
+                )
+            )
+            self.assertFalse(evidence_dir.exists())
+            config = json.loads(config_path.read_text(encoding="ascii"))
+            config.pop("fail_service_show_after", None)
+            config.pop("service_show_count", None)
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            timer_status, timer_output = systemd_state._bounded_command(
+                [
+                    str(systemctl), "show", systemd_state.CLOUDFLARE_TIMER, "--no-pager",
+                    "--property=" + ",".join(systemd_state.CLOUDFLARE_TIMER_PROPERTIES),
+                ],
+                maximum=32 * 1024,
+            )
+            self.assertEqual(
+                timer_status, 0,
+                f"fixed timer fixture failed: {timer_output!r}; "
+                f"config={config_path.read_text(encoding='ascii')!r}",
+            )
+
+            result = systemd_state.reset_cloudflare_pending_guard(
+                receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                helper_release=current, attempt_nonce=attempt_nonce,
+            )
+            self.assertEqual(result["outcome"], "performed")
+            self.assertRegex(str(result["evidence_id"]), r"^[0-9a-f]{64}$")
+            commands = [json.loads(line) for line in command_log.read_text().splitlines()]
+            actions = [tuple(command[:2]) for command in commands if command and command[0] in {"stop", "start", "reset-failed"}]
+            self.assertEqual(actions, [("stop", systemd_state.CLOUDFLARE_TIMER), ("reset-failed", systemd_state.CLOUDFLARE_UNIT)])
+            self.assertTrue(receipt.is_file())
+            self.assertTrue((self.shared / STATE_NAME).is_file())
+            records = list(evidence_dir.glob("*.json"))
+            self.assertEqual(len(records), 1)
+            self.assertEqual(stat.S_IMODE(records[0].stat().st_mode), 0o600)
+            evidence = json.loads(records[0].read_text(encoding="ascii"))
+            transaction_bytes = (self.shared / STATE_NAME).read_bytes()
+            receipt_bytes = receipt.read_bytes()
+            transaction_record = json.loads(transaction_bytes)
+            expected_evidence_id = hashlib.sha256(
+                ":".join(
+                    (
+                        transaction_record["operation_id"],
+                        hashlib.sha256(transaction_bytes).hexdigest(),
+                        hashlib.sha256(receipt_bytes).hexdigest(),
+                        invocation,
+                    )
+                ).encode("ascii")
+            ).hexdigest()
+            self.assertEqual(result["evidence_id"], expected_evidence_id)
+            self.assertEqual(records[0].name, expected_evidence_id + ".json")
+            self.assertEqual(evidence["attempt_nonce"], attempt_nonce)
+            self.assertEqual(evidence["transaction_sha256"], hashlib.sha256(transaction_bytes).hexdigest())
+            self.assertEqual(evidence["systemd_receipt_sha256"], hashlib.sha256(receipt_bytes).hexdigest())
+            self.assertEqual(evidence["service"]["invocation_id"], invocation)
+            config = json.loads(config_path.read_text(encoding="ascii"))
+            config["properties"][systemd_state.CLOUDFLARE_UNIT] = service
+            config["states"][systemd_state.CLOUDFLARE_UNIT] = "failed"
+            config["properties"][systemd_state.CLOUDFLARE_TIMER] = timer
+            config["states"][systemd_state.CLOUDFLARE_TIMER] = "active"
+            config["jobs"] = []
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            before_collision = [
+                tuple(command[:2]) for command in
+                (json.loads(line) for line in command_log.read_text().splitlines())
+                if command and command[0] in {"stop", "start", "reset-failed"}
+            ]
+            with self.assertRaises(systemd_state.StateError):
+                systemd_state.reset_cloudflare_pending_guard(
+                    receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                    helper_release=current, attempt_nonce="e" * 64,
+                )
+            after_collision = [
+                tuple(command[:2]) for command in
+                (json.loads(line) for line in command_log.read_text().splitlines())
+                if command and command[0] in {"stop", "start", "reset-failed"}
+            ]
+            self.assertEqual(after_collision, before_collision)
+
+            active_timer_trap = self._run_cloudflare_recovery_exit_trap(
+                systemctl=systemctl, evidence_path=records[0], evidence_id=expected_evidence_id,
+                attempt_nonce=attempt_nonce, operation_id=transaction_record["operation_id"],
+                transaction_sha=evidence["transaction_sha256"], receipt_sha=evidence["systemd_receipt_sha256"],
+                invocation_id=invocation,
+            )
+            self.assertEqual(active_timer_trap.returncode, 0, active_timer_trap.stderr)
+            after_active_timer_trap = [
+                tuple(command[:2]) for command in
+                (json.loads(line) for line in command_log.read_text().splitlines())
+                if command and command[0] in {"stop", "start", "reset-failed"}
+            ]
+            self.assertEqual(after_active_timer_trap, before_collision)
+
+            timer_property = config["properties"][systemd_state.CLOUDFLARE_TIMER]
+            config["states"][systemd_state.CLOUDFLARE_TIMER] = "inactive"
+            timer_property.update({"ActiveState": "inactive", "SubState": "dead"})
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            before_trap_actions = [
+                tuple(command[:2]) for command in
+                (json.loads(line) for line in command_log.read_text().splitlines())
+                if command and command[0] in {"stop", "start", "reset-failed"}
+            ]
+            missing_path = evidence_dir / ("f" * 64 + ".json")
+            no_evidence = self._run_cloudflare_recovery_exit_trap(
+                systemctl=systemctl, evidence_path=missing_path, evidence_id="f" * 64,
+                attempt_nonce=attempt_nonce, operation_id=transaction_record["operation_id"],
+                transaction_sha=evidence["transaction_sha256"], receipt_sha=evidence["systemd_receipt_sha256"],
+                invocation_id=invocation,
+            )
+            self.assertEqual(no_evidence.returncode, 0, no_evidence.stderr)
+            current_actions = [
+                tuple(command[:2]) for command in
+                (json.loads(line) for line in command_log.read_text().splitlines())
+                if command and command[0] in {"stop", "start", "reset-failed"}
+            ]
+            self.assertEqual(current_actions, before_trap_actions)
+
+            valid_evidence = self._run_cloudflare_recovery_exit_trap(
+                systemctl=systemctl, evidence_path=records[0], evidence_id=expected_evidence_id,
+                attempt_nonce=attempt_nonce, operation_id=transaction_record["operation_id"],
+                transaction_sha=evidence["transaction_sha256"], receipt_sha=evidence["systemd_receipt_sha256"],
+                invocation_id=invocation,
+            )
+            self.assertEqual(valid_evidence.returncode, 0, valid_evidence.stderr)
+            current_actions = [
+                tuple(command[:2]) for command in
+                (json.loads(line) for line in command_log.read_text().splitlines())
+                if command and command[0] in {"stop", "start", "reset-failed"}
+            ]
+            self.assertEqual(
+                current_actions[len(before_trap_actions):],
+                [("start", systemd_state.CLOUDFLARE_TIMER)],
+            )
+            timer_active_checks = [
+                command for command in
+                (json.loads(line) for line in command_log.read_text().splitlines())
+                if command[:2] == ["is-active", systemd_state.CLOUDFLARE_TIMER]
+            ]
+            self.assertGreaterEqual(len(timer_active_checks), 2)
+
+            config = json.loads(config_path.read_text(encoding="ascii"))
+            config["states"][systemd_state.CLOUDFLARE_TIMER] = "inactive"
+            config["properties"][systemd_state.CLOUDFLARE_TIMER].update(
+                {"ActiveState": "inactive", "SubState": "dead"}
+            )
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            before_stale_trap = current_actions.copy()
+            stale_nonce = self._run_cloudflare_recovery_exit_trap(
+                systemctl=systemctl, evidence_path=records[0], evidence_id=expected_evidence_id,
+                attempt_nonce="d" * 64, operation_id=transaction_record["operation_id"],
+                transaction_sha=evidence["transaction_sha256"], receipt_sha=evidence["systemd_receipt_sha256"],
+                invocation_id=invocation,
+            )
+            self.assertEqual(stale_nonce.returncode, 1)
+            current_actions = [
+                tuple(command[:2]) for command in
+                (json.loads(line) for line in command_log.read_text().splitlines())
+                if command and command[0] in {"stop", "start", "reset-failed"}
+            ]
+            self.assertEqual(current_actions, before_stale_trap)
+            actions_before_retry = current_actions.copy()
+            config = json.loads(config_path.read_text(encoding="ascii"))
+            config["states"][systemd_state.CLOUDFLARE_TIMER] = "inactive"
+            config["properties"][systemd_state.CLOUDFLARE_TIMER].update(
+                {"ActiveState": "inactive", "SubState": "dead", "NextElapseUSecRealtime": "n/a"}
+            )
+            config["jobs"] = [["8", systemd_state.CLOUDFLARE_TIMER, "start", "running"]]
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            journal.write_text(original_journal.replace("pending_operation", "unrelated"), encoding="ascii")
+            retry = systemd_state.reset_cloudflare_pending_guard(
+                receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                helper_release=current, attempt_nonce="b" * 64,
+            )
+            self.assertEqual(retry, {"outcome": "skip"})
+            commands = [json.loads(line) for line in command_log.read_text().splitlines()]
+            self.assertEqual(
+                [tuple(command[:2]) for command in commands if command and command[0] in {"stop", "start", "reset-failed"}],
+                actions_before_retry,
+            )
+
+            # A failed reset restores only the fixed timer; it never starts
+            # the Cloudflare service and retains both recovery records.
+            second_invocation = "279af136423f48e190994de6fba470af"
+            second_start = datetime.now(ZoneInfo("Europe/Helsinki")).replace(microsecond=0) - timedelta(seconds=2)
+            second_next = second_start + timedelta(hours=2)
+            second_start_text = second_start.strftime("%a %Y-%m-%d %H:%M:%S %Z")
+            second_next_text = second_next.strftime("%a %Y-%m-%d %H:%M:%S %Z")
+            config = json.loads(config_path.read_text(encoding="ascii"))
+            config["states"][systemd_state.CLOUDFLARE_UNIT] = "failed"
+            config["states"][systemd_state.CLOUDFLARE_TIMER] = "active"
+            config["properties"][systemd_state.CLOUDFLARE_UNIT] = {
+                **service,
+                "InvocationID": second_invocation,
+                "ExecMainStartTimestamp": second_start_text,
+                "ExecMainExitTimestamp": second_start_text,
+            }
+            config["properties"][systemd_state.CLOUDFLARE_TIMER] = {
+                **timer,
+                "ActiveState": "active",
+                "SubState": "waiting",
+                "LastTriggerUSec": second_start_text,
+                "NextElapseUSecRealtime": second_next_text,
+            }
+            config["jobs"] = []
+            config["fail_reset"] = True
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            second_usec = str(int(second_start.astimezone(timezone.utc).timestamp() * 1_000_000))
+            journal.write_text(
+                original_journal.replace(invocation, second_invocation).replace(timestamp_usec, second_usec),
+                encoding="ascii",
+            )
+            before_failed_reset = [
+                tuple(command[:2]) for command in
+                (json.loads(line) for line in command_log.read_text().splitlines())
+                if command and command[0] in {"stop", "start", "reset-failed"}
+            ]
+            with self.assertRaises(systemd_state.StateError):
+                systemd_state.reset_cloudflare_pending_guard(
+                    receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                    helper_release=current, attempt_nonce="c" * 64,
+                )
+            after_failed_reset = [
+                tuple(command[:2]) for command in
+                (json.loads(line) for line in command_log.read_text().splitlines())
+                if command and command[0] in {"stop", "start", "reset-failed"}
+            ]
+            self.assertEqual(
+                after_failed_reset[len(before_failed_reset):],
+                [
+                    ("stop", systemd_state.CLOUDFLARE_TIMER),
+                    ("reset-failed", systemd_state.CLOUDFLARE_UNIT),
+                    ("start", systemd_state.CLOUDFLARE_TIMER),
+                ],
+            )
+            self.assertFalse(any(action == ("start", systemd_state.CLOUDFLARE_UNIT) for action in after_failed_reset))
+            self.assertTrue(receipt.is_file())
+            self.assertTrue((self.shared / STATE_NAME).is_file())
+        finally:
+            systemd_state.SYSTEMCTL_PATH = original_systemctl_path
+            systemd_state.JOURNALCTL_PATH = original_journal_path
 
     def test_immutable_recovery_wrapper_rejects_tampered_generation_before_transaction(
         self,
