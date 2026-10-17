@@ -1161,7 +1161,7 @@ if [[ "$pending_operation" == install \
     || { public_status failed migration >&2; exit 1; }
   safe_env_parser_metadata="$(stat -c '%F:%u:%h:%a' \
     "$safe_env_parser" 2>/dev/null || true)"
-  [[ "$safe_env_parser_metadata" == "regular file:0:1:644" ]] \
+  [[ "$safe_env_parser_metadata" == "regular file:0:1:755" ]] \
     || { public_status failed migration >&2; exit 1; }
   safe_env_parser_sha256="$(/usr/bin/sha256sum -- "$safe_env_parser" 2>/dev/null | cut -d ' ' -f 1)"
   [[ "$safe_env_parser_sha256" == 819ccc9e489c3fb8b14b3cb61eae500c111c5edb663161504b6ca6e02868399d ]] \

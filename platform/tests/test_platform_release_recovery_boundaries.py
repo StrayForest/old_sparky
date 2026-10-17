@@ -213,6 +213,57 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             all(isinstance(call.args[0], Path) for call in identity_reader.call_args_list)
         )
 
+    def _assert_preauth_parser_shell_metadata_gate(self, wrapper_source: str) -> None:
+        gate_start = wrapper_source.index(
+            '  safe_env_parser="$original_current/tools/platform_safe_env_exec.py"'
+        )
+        gate_end = wrapper_source.index(
+            '\n  if ! "$APP_DIR/shared/venv/bin/python"', gate_start
+        )
+        gate = wrapper_source[gate_start:gate_end]
+        canonical_parser = REPO_ROOT / "platform/tools/platform_safe_env_exec.py"
+        parser_bytes = canonical_parser.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(parser_bytes).hexdigest(),
+            "819ccc9e489c3fb8b14b3cb61eae500c111c5edb663161504b6ca6e02868399d",
+        )
+
+        def run_gate(name: str, *, mode: int, symlink: bool = False, mutate: bool = False):
+            release = self.root / f"parser-gate-{name}"
+            tools = release / "tools"
+            tools.mkdir(parents=True)
+            parser = tools / "platform_safe_env_exec.py"
+            payload = parser_bytes + (b"\n# changed\n" if mutate else b"")
+            if symlink:
+                target = tools / "trusted-parser-target.py"
+                target.write_bytes(payload)
+                target.chmod(0o755)
+                parser.symlink_to(target.name)
+            else:
+                parser.write_bytes(payload)
+                parser.chmod(mode)
+            script = (
+                "set -Eeuo pipefail\n"
+                "public_status() { return 0; }\n"
+                f"original_current={shlex.quote(str(release))}\n"
+                f"{gate}\n"
+                "printf 'PARSER_GATE_PASSED\\n'\n"
+            )
+            return subprocess.run(
+                ["/usr/bin/bash", "-Eeuo", "pipefail", "-c", script],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        canonical = run_gate("canonical", mode=0o755)
+        self.assertEqual(canonical.returncode, 0, canonical.stderr)
+        self.assertEqual(canonical.stdout, "PARSER_GATE_PASSED\n")
+        self.assertNotIn("PLATFORM_DATABASE_URL", canonical.stdout + canonical.stderr)
+        self.assertEqual(run_gate("group-writable", mode=0o775).returncode, 1)
+        self.assertEqual(run_gate("symlink", mode=0o755, symlink=True).returncode, 1)
+        self.assertEqual(run_gate("bad-digest", mode=0o755, mutate=True).returncode, 1)
+
     def test_protected_activation_recovery_requires_durable_migration_authorization(self) -> None:
         migration_fixture = self.root / "static-migration-fixture"
         versions = migration_fixture / "alembic" / "versions"
@@ -260,6 +311,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             )
             preauth_releases.append(release_root)
         wrapper_source = RECOVERY_WRAPPER.read_text(encoding="utf-8")
+        self._assert_preauth_parser_shell_metadata_gate(wrapper_source)
         preauth_start = wrapper_source.index('"$safe_env_parser" "$api_env_file" <<\'PY\'')
         preauth_body_start = wrapper_source.index("\n", preauth_start) + 1
         preauth_body_end = wrapper_source.index("\nPY\n  then", preauth_body_start)
