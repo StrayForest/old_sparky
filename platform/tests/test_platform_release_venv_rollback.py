@@ -1134,7 +1134,9 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 venv, activation_name
             ).items():
                 activation_path.write_bytes(content)
-                activation_path.chmod(mode)
+                # The reused activation scripts are root-owned readable data;
+                # do not inherit version-dependent template permission bits.
+                activation_path.chmod(0o644)
             before_venv = venv.stat()
             trace = self.root / f"reuse-cli-{case}.trace"
             diagnostic = self.root / f"reuse-cli-{case}.diagnostic"
@@ -2048,7 +2050,10 @@ else:
     def reset_app_tree(self) -> None:
         shutil.rmtree(self.app_dir)
         self.releases_dir.mkdir(parents=True)
+        self.app_dir.chmod(0o755)
+        self.releases_dir.chmod(0o755)
         self.shared_dir.mkdir()
+        self.shared_dir.chmod(0o755)
         (self.shared_dir / ".env.platform").write_text("PLATFORM_TESTING=1\n")
         (self.shared_dir / ".env.platform").chmod(0o600)
 
@@ -2438,8 +2443,10 @@ else:
     def add_installed_release(self, name: str) -> Path:
         release = self.releases_dir / name
         release.mkdir()
+        release.chmod(0o755)
         tools = release / "tools"
         tools.mkdir()
+        tools.chmod(0o755)
         for tool_name in RELEASE_HELPER_NAMES:
             tool = tools / tool_name
             tool.write_text("#!/usr/bin/env sh\nexit 0\n")
@@ -2480,12 +2487,14 @@ else:
             )
             policy.chmod(0o644)
         (release / "requirements-platform.txt").write_text("pip==26.1.2\n")
+        (release / "requirements-platform.txt").chmod(0o644)
         lock = release / "requirements-platform.lock.txt"
         freeze = release / "requirements-platform.freeze.txt"
         freeze.write_text("pip==26.1.2\n")
         freeze.chmod(0o444)
         wheelhouse = release / "wheelhouse"
         wheelhouse.mkdir()
+        wheelhouse.chmod(0o755)
         for relative in platform_validate_release_artifact.REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS:
             helper = release / relative
             helper.parent.mkdir(parents=True, exist_ok=True)
@@ -2500,11 +2509,13 @@ else:
         runtime_installer.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n")
         runtime_installer.chmod(0o755)
         pip_wheel = self.add_fake_pip_wheel(wheelhouse, result=pip_result)
+        pip_wheel.chmod(0o644)
         lock.write_text(
             "pip==26.1.2 --hash=sha256:"
             f"{hashlib.sha256(pip_wheel.read_bytes()).hexdigest()}\n"
         )
         lock.chmod(0o644)
+        self.normalize_artifact_fixture_modes(release)
         platform_validate_wheelhouse.create_manifest(
             wheelhouse,
             release / "requirements-platform.txt",
@@ -2543,9 +2554,35 @@ else:
 
         with tarfile.open(artifact, "w:gz") as archive:
             archive.add(release, arcname=slug, filter=archive_filter)
+        artifact.chmod(0o644)
         digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        Path(f"{artifact}.sha256").write_text(f"{digest}  {artifact.name}\n")
+        checksum = Path(f"{artifact}.sha256")
+        checksum.write_text(f"{digest}  {artifact.name}\n")
+        checksum.chmod(0o644)
         return artifact
+
+    def normalize_artifact_fixture_modes(self, release: Path) -> None:
+        """Make generated artifact inputs independent of the process umask."""
+
+        runtime = release / platform_validate_release_artifact.LIVE_QA_RUNTIME_ROOT
+        wheelhouse = release / "wheelhouse"
+        freeze = release / "requirements-platform.freeze.txt"
+        for path in (release, *release.rglob("*")):
+            if path == runtime or runtime in path.parents:
+                # add_liveqa_runtime assigns its closed read-only modes itself.
+                continue
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                continue
+            if path == wheelhouse:
+                path.chmod(0o755)
+            elif path == freeze:
+                path.chmod(0o444)
+            elif stat.S_ISDIR(metadata.st_mode):
+                path.chmod(0o755)
+            elif stat.S_ISREG(metadata.st_mode):
+                mode = stat.S_IMODE(metadata.st_mode)
+                path.chmod(0o755 if mode & 0o111 else 0o644)
 
     def add_liveqa_runtime(self, release: Path) -> None:
         """Build the smallest immutable runtime accepted by the artifact validator."""
