@@ -352,6 +352,7 @@ RELEASE_MARKER_RE = re.compile(
     rb"cleanup|liveqa_runtime_recovery|recovery|venv_policy|venv|rollback_metadata|"
     rb"wheelhouse|liveqa_runtime|unknown)"
     rb" candidate_stage=(?P<candidate_stage>artifact_validation|wheelhouse_validation|"
+    rb"venv_policy_parse|venv_policy_preconditions|venv_policy_proof|venv_policy_space|"
     rb"disk_guard|environment_prepare|venv_setup|transaction_stage|runtime_prepare|unknown)"
     rb" candidate_exit_status=(?P<candidate_exit_status>0|[1-9][0-9]{0,2}))?)? "
     rb"release_slug=(?P<release_slug>[A-Za-z0-9][A-Za-z0-9._-]{0,179}) "

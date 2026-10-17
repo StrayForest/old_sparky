@@ -293,10 +293,15 @@ PY
 }
 
 enforce_required_venv_reuse() {
+  INSTALL_DIAGNOSTIC_STAGE="venv_policy_parse"
   if ! read_venv_install_policy; then
     return 1
   fi
-  [[ "$VENV_INSTALL_POLICY" == "require_proven_reuse" ]] || return 0
+  INSTALL_DIAGNOSTIC_STAGE="venv_policy_preconditions"
+  if [[ "$VENV_INSTALL_POLICY" != "require_proven_reuse" ]]; then
+    INSTALL_DIAGNOSTIC_STAGE="artifact_validation"
+    return 0
+  fi
   # A caller-supplied skip flag is never accepted for an artifact whose own
   # closed policy requires the strict verifier below.
   (( SKIP_PYTHON_DEPS == 0 )) || return 1
@@ -304,6 +309,7 @@ enforce_required_venv_reuse() {
     && -f "$TOOLS_DIR/platform_verify_venv_reuse.py" \
     && ! -L "$TOOLS_DIR/platform_verify_venv_reuse.py" ]] || return 1
   local proof
+  INSTALL_DIAGNOSTIC_STAGE="venv_policy_proof"
   if ! proof="$(/usr/bin/python3 -I -S -B "$TOOLS_DIR/platform_verify_venv_reuse.py" \
     --app "$APP_DIR" \
     --current "$PREVIOUS_TARGET" \
@@ -318,10 +324,12 @@ enforce_required_venv_reuse() {
   [[ -n "$proof" && ${#proof} -le 4096 ]] || return 1
   VENV_REUSE_PROOF="$proof"
   local space available total
+  INSTALL_DIAGNOSTIC_STAGE="venv_policy_space"
   space="$(read_install_space)" || return 1
   read -r available total <<<"$space"
   install_space_floor_ok "$available" "$total" || return 1
   SKIP_PYTHON_DEPS=1
+  INSTALL_DIAGNOSTIC_STAGE="artifact_validation"
 }
 
 persist_venv_origin_receipt() {
@@ -727,7 +735,7 @@ cleanup_failed_install() {
 emit_install_failure_diagnostic() {
   local exit_status="$1"
   [[ "$exit_status" =~ ^(1[0-9]{2}|2[0-4][0-9]|25[0-5]|[1-9][0-9]?)$ ]] || return 0
-  [[ "$INSTALL_DIAGNOSTIC_STAGE" =~ ^(artifact_validation|wheelhouse_validation|disk_guard|environment_prepare|venv_setup|transaction_stage|runtime_prepare|unknown)$ ]] || return 0
+  [[ "$INSTALL_DIAGNOSTIC_STAGE" =~ ^(artifact_validation|wheelhouse_validation|venv_policy_parse|venv_policy_preconditions|venv_policy_proof|venv_policy_space|disk_guard|environment_prepare|venv_setup|transaction_stage|runtime_prepare|unknown)$ ]] || return 0
   [[ "$INSTALL_DIAGNOSTIC_CLASS" =~ ^(argument|privilege|artifact|checksum|environment|layout|production_guard|pending_operation|duplicate|pointer|cleanup|liveqa_runtime_recovery|recovery|venv_policy|venv|rollback_metadata|wheelhouse|liveqa_runtime|unknown)$ ]] || return 0
   [[ "$PUBLIC_RELEASE_SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] || return 0
   printf 'RELEASE_INSTALL_DIAG schema=1 status=failed class=%s stage=%s exit_status=%s release_slug=%s\n' \
@@ -1285,6 +1293,7 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
       "$VENV_ROLLBACK_TRANSITION_FILE" \
       "$VENV_ROLLBACK_FREEZE_FILE"
     if [[ -n "$VENV_REUSE_PROOF" ]]; then
+      INSTALL_DIAGNOSTIC_STAGE="venv_policy_proof"
       if ! persist_venv_origin_receipt "$VENV_REUSE_PROOF"; then
         public_status failed venv_policy
         exit 1

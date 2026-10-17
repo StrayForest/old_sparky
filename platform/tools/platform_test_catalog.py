@@ -16,8 +16,10 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
-from typing import Iterable, Mapping
+import sys
+from typing import Callable, Iterable, Mapping
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +34,100 @@ BACKEND_CONTOURS: tuple[str, ...] = (
 )
 BACKEND_AGGREGATE = "backend"
 VERIFICATION_CONTOUR = "verification-contract"
+
+# A small number of privileged contracts deliberately mutate real host-owned
+# resources and are executable only on the designated GitHub-hosted runner.
+# Keep this policy attached to exact catalog IDs so local dispatchers can fail
+# before starting the rest of a long contour without changing CI membership.
+TEST_ENVIRONMENT_REQUIREMENTS: Mapping[str, Mapping[str, str]] = {
+    "tests.test_platform_release_audit_hardening.ReleaseHardeningContractTests.test_storage_maintenance_expected_service_exit_reaches_report_binding": {
+        "GITHUB_ACTIONS": "true",
+        "RUNNER_OS": "Linux",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+    },
+}
+
+# These cases execute the real PID-namespace supervisor and require the
+# non-root Linux identity provided by the hosted Security runner. A root local
+# executor cannot safely impersonate that boundary; both canonical entry
+# points block before resource setup or test execution for these exact IDs.
+TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS: frozenset[str] = frozenset(
+    {
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_timeout_checkpoint_survives_missing_report_only_after_namespace_reap",
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_success_report_publishes_only_after_child_exit",
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_completed_failed_measurement_is_preserved",
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_malformed_child_report_becomes_closed_failure",
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_measurement_deadline_kills_hung_dns_connect_header_body_and_future",
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_whole_runner_deadline_is_reachable_independently",
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_sigterm_ignoring_descendant_is_killed_with_the_pid_namespace",
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_double_fork_and_setsid_cannot_escape_namespace",
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_forced_kill_preserves_timeout_when_child_report_is_missing",
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_pdeathsig_reclaims_namespace_when_supervisor_is_sigkilled",
+        "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_external_term_is_reaped_and_reported",
+    }
+)
+
+
+def test_environment_requirement_issues(
+    test_ids: Iterable[str],
+    environment: Mapping[str, str],
+) -> list[str]:
+    """Return missing fixed environment markers for the selected test IDs."""
+
+    issues: list[str] = []
+    for test_id in sorted(set(test_ids)):
+        requirements = TEST_ENVIRONMENT_REQUIREMENTS.get(test_id)
+        if requirements is None:
+            continue
+        missing = [
+            f"{name}={expected}"
+            for name, expected in sorted(requirements.items())
+            if environment.get(name) != expected
+        ]
+        if missing:
+            issues.append(f"{test_id} requires " + ", ".join(missing))
+    return issues
+
+
+def test_execution_requirement_issues(
+    test_ids: Iterable[str],
+    *,
+    uid: int | None = None,
+    gid: int | None = None,
+    system: str | None = None,
+    namespace_probe: Callable[[], str] | None = None,
+) -> list[str]:
+    """Return fixed refusals for tests needing a non-root PID namespace."""
+
+    selected = sorted(set(test_ids) & TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS)
+    if not selected:
+        return []
+    current_uid = os.getuid() if uid is None else uid
+    current_gid = os.getgid() if gid is None else gid
+    current_system = sys.platform if system is None else system
+    capable = False
+    if current_system.startswith("linux") and current_uid != 0 and current_gid != 0:
+        try:
+            if namespace_probe is None:
+                try:
+                    from tools.platform_load_runtime import require_pid_namespace_capability
+                except ModuleNotFoundError:  # Direct execution from platform/tools.
+                    from platform_load_runtime import require_pid_namespace_capability
+
+                probe = require_pid_namespace_capability
+            else:
+                probe = namespace_probe
+            probe()
+            capable = True
+        except Exception:
+            # Never expose probe details through the catalog's public contract.
+            capable = False
+    if capable:
+        return []
+    return [
+        f"{test_id} requires a non-root Linux runner with PID namespace capability"
+        for test_id in selected
+    ]
 
 # CI uses one inexpensive DB-free job for the first, second and fifth contours,
 # while the two serial contours remain isolated jobs. Keep this metadata next
@@ -498,12 +594,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 170,
     "module_digest": "514ecaf735c3c338cc9d1759bdeadea72fbafdc819d17a6fe2d031dce6f684f6",
-    "test_count": 1984,
-    "test_id_digest": "061b8715ff935478c730e00e119024dfcd1e637fb3b6c9a0740c33c8c5303027",
-    "backend_test_count": 1912,
-    "backend_test_id_digest": "b9ecd78f45037c86adcafe476e7f87b026aac70c27ad0833ed5f7708f2eb6747",
-    "verification_test_count": 72,
-    "verification_test_id_digest": "3c52523e15a19be1b10831e2a505af8e7a711e7b9d667246e1198598c947a7c0",
+    "test_count": 1988,
+    "test_id_digest": "309884ba39ee83781b35cc585f35d9c0b19264e20228dc9f4690decf63b4e894",
+    "backend_test_count": 1914,
+    "backend_test_id_digest": "02a6cb371d6c1970250d21c40dbe5c9fb0c2f1bcf5a3e38d504e7c41715cdeba",
+    "verification_test_count": 74,
+    "verification_test_id_digest": "757f12e70c708e7b69affcdd79cfdb963a06bac46e4c2b022b3b6db7c101c783",
     "verification_classifier_test_count": 38,
     "verification_classifier_test_id_digest": "3071e068f59bbb5fa0d26d6b9128bf5469d7def96bd163238df356a89ae08c34",
 }
@@ -542,8 +638,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 26,
         "module_digest": "210efce670a082b8360377da86457b71db79310b02abffc0d3849445b073748a",
-        "test_count": 625,
-        "test_id_digest": "55ca1f272cc7aa63d3265a4d7d5f28e81277b98bebee9f340788fc2452a57a91",
+        "test_count": 627,
+        "test_id_digest": "44ec480493ecffcd80af16df161812b9136b748f8eca04b53c89fb8d7b26c98c",
     },
     "performance-contract": {
         "module_count": 11,
@@ -554,8 +650,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     VERIFICATION_CONTOUR: {
         "module_count": 3,
         "module_digest": "bc3b5eb1bc4e61842407a5e9edd6ab07f4bb21581ac2663b4754f6dcdaf5c02c",
-        "test_count": 72,
-        "test_id_digest": "3c52523e15a19be1b10831e2a505af8e7a711e7b9d667246e1198598c947a7c0",
+        "test_count": 74,
+        "test_id_digest": "757f12e70c708e7b69affcdd79cfdb963a06bac46e4c2b022b3b6db7c101c783",
     },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])
@@ -950,6 +1046,18 @@ def registry_payload() -> dict[str, object]:
             for contour in BACKEND_CONTOURS
         ],
         "external_owners": dict(EXTERNAL_MODULE_OWNERS),
+        "test_environment_requirements": {
+            test_id: dict(sorted(requirements.items()))
+            for test_id, requirements in sorted(TEST_ENVIRONMENT_REQUIREMENTS.items())
+        },
+        "test_execution_requirements": {
+            test_id: {
+                "non_root": True,
+                "linux": True,
+                "pid_namespace_capability": True,
+            }
+            for test_id in sorted(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS)
+        },
         "external_contours": [
             {
                 "id": VERIFICATION_CONTOUR,

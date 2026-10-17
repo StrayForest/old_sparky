@@ -24,6 +24,7 @@ from pathlib import Path
 import signal
 import shutil
 import sys
+import tempfile
 import time
 import unittest
 from typing import Callable, Iterable, Iterator, Mapping, Sequence
@@ -93,6 +94,10 @@ INTEGRATION_REQUIRED_ROLE_SLUGS = frozenset(
         "admin",
         "superadmin",
     }
+)
+_INTEGRATION_SETUP_HINT = (
+    "run the migration gate, then `alembic upgrade head` against the disposable "
+    "platformdb_test database before this contour"
 )
 
 
@@ -267,19 +272,20 @@ def _integration_preflight_error(
         return (
             "backend-integration requires exactly one migrated Alembic head "
             f"({expected_heads[0] if len(expected_heads) == 1 else 'the source head'}); "
-            "run the migration gate before this contour"
+            + _INTEGRATION_SETUP_HINT
         )
     if version_rows is not None and tuple(version_rows) != tuple(migration_heads):
         return (
             "backend-integration requires exactly one Alembic version-table row "
-            "matching the current head; run the migration gate before this contour"
+            "matching the current head; " + _INTEGRATION_SETUP_HINT
         )
     missing_roles = sorted(INTEGRATION_REQUIRED_ROLE_SLUGS - set(role_slugs))
     if missing_roles:
         return (
             "backend-integration is missing required seed roles: "
             + ", ".join(missing_roles)
-            + "; run the migration gate before this contour"
+            + "; "
+            + _INTEGRATION_SETUP_HINT
         )
     return None
 
@@ -352,7 +358,9 @@ def _require_integration_resources_ready() -> None:
     except Exception as exc:
         raise SystemExit(
             "LOCAL GATE BLOCKED: backend-integration PostgreSQL preflight is unavailable; "
-            "run the migration gate before this contour."
+            "ensure disposable PostgreSQL is available, then "
+            + _INTEGRATION_SETUP_HINT
+            + "."
         ) from exc
 
     error = _integration_preflight_error(
@@ -612,6 +620,11 @@ class TimingResult(unittest.TextTestResult):
         self._subtest_outcomes: dict[str, set[str]] = {}
         self.between_case_cleanup: Callable[[], None] | None = None
         self.between_case_cleanup_failures = 0
+        self.progress_path: Path | None = None
+        self.progress_contour: str | None = None
+        self.progress_expected_ids: tuple[str, ...] = ()
+        self._active_test_id: str | None = None
+        self._progress_write_failed = False
 
     @staticmethod
     def _test_id(test: unittest.case.TestCase) -> str:
@@ -619,7 +632,9 @@ class TimingResult(unittest.TextTestResult):
 
     def startTest(self, test: unittest.case.TestCase) -> None:
         self._started_at = time.perf_counter()
-        self._subtest_outcomes[self._test_id(test)] = set()
+        self._active_test_id = self._test_id(test)
+        self._subtest_outcomes[self._active_test_id] = set()
+        self._write_progress_checkpoint()
         super().startTest(test)
 
     def addSubTest(
@@ -650,6 +665,10 @@ class TimingResult(unittest.TextTestResult):
         if self.between_case_cleanup is not None:
             try:
                 self.between_case_cleanup()
+            except ContourTimeout:
+                # Keep this ID active in the last checkpoint until its
+                # between-case cleanup has completed.
+                raise
             except Exception:
                 # Keep diagnostics closed: no Redis key, URL or exception text
                 # is emitted. Stop before another case can inherit this state;
@@ -662,6 +681,8 @@ class TimingResult(unittest.TextTestResult):
                     flush=True,
                 )
         super().stopTest(test)
+        self._active_test_id = None
+        self._write_progress_checkpoint()
 
     def addSuccess(self, test: unittest.case.TestCase) -> None:
         self._record(test, "passed")
@@ -713,6 +734,59 @@ class TimingResult(unittest.TextTestResult):
         )
         self._started_at = None
 
+    def _write_progress_checkpoint(self) -> None:
+        path = self.progress_path
+        if path is None or self._progress_write_failed:
+            return
+        active_test_id = self._active_test_id
+        outcome_rank = {
+            "passed": 0,
+            "expected-failure": 1,
+            "skipped": 1,
+            "unexpected-success": 2,
+            "failed": 3,
+            "error": 4,
+        }
+        projected: dict[str, TestTiming] = {}
+        for item in self.timings:
+            if item.test_id == active_test_id:
+                continue
+            previous = projected.pop(item.test_id, None)
+            if previous is None:
+                projected[item.test_id] = TestTiming(
+                    test_id=item.test_id,
+                    duration_ms=item.duration_ms,
+                    outcome=item.outcome,
+                )
+                continue
+            projected[item.test_id] = TestTiming(
+                test_id=item.test_id,
+                duration_ms=max(previous.duration_ms, item.duration_ms),
+                outcome=max(
+                    (previous.outcome, item.outcome),
+                    key=outcome_rank.__getitem__,
+                ),
+            )
+        completed = [
+            asdict(timing) for timing in projected.values()
+        ]
+        payload = {
+            "schema": 1,
+            "contour": self.progress_contour,
+            "status": "diagnostic_only",
+            "execution_complete": False,
+            "selected_count": len(self.progress_expected_ids),
+            "expected_ids": list(self.progress_expected_ids),
+            "completed_timings": completed,
+            "active_test_id": active_test_id,
+        }
+        try:
+            _write_progress_json(path, payload)
+        except (OSError, ValueError):
+            # Progress never changes test outcomes or the verifier's timeout
+            # result. The last complete atomic checkpoint remains available.
+            self._progress_write_failed = True
+
 
 class TimingRunner(unittest.TextTestRunner):
     resultclass = TimingResult
@@ -721,10 +795,17 @@ class TimingRunner(unittest.TextTestRunner):
         super().__init__(*args, **kwargs)
         self.last_result: TimingResult | None = None
         self.between_case_cleanup: Callable[[], None] | None = None
+        self.progress_path: Path | None = None
+        self.progress_contour: str | None = None
+        self.progress_expected_ids: tuple[str, ...] = ()
 
     def _makeResult(self) -> TimingResult:
         result = super()._makeResult()
         result.between_case_cleanup = self.between_case_cleanup
+        result.progress_path = self.progress_path
+        result.progress_contour = self.progress_contour
+        result.progress_expected_ids = self.progress_expected_ids
+        result._write_progress_checkpoint()
         self.last_result = result
         return result
 
@@ -864,11 +945,61 @@ def _requires_root_before_resources(args: argparse.Namespace) -> bool:
     return not (args.contour == BACKEND_AGGREGATE and args.component_dir is not None)
 
 
+def _preflight_execution_environment(cases: Sequence[TestCase]) -> None:
+    """Stop before resource setup when a selected test needs a hosted runner."""
+
+    try:
+        from tools.platform_test_catalog import (
+            test_environment_requirement_issues,
+            test_execution_requirement_issues,
+        )
+    except ModuleNotFoundError:  # Direct execution from platform/tools.
+        from platform_test_catalog import (
+            test_environment_requirement_issues,
+            test_execution_requirement_issues,
+        )
+
+    test_ids = (case.test_id for case in cases)
+    selected_ids = tuple(test_ids)
+    issues = test_environment_requirement_issues(selected_ids, os.environ)
+    issues.extend(test_execution_requirement_issues(selected_ids))
+    if issues:
+        raise SystemExit("LOCAL GATE BLOCKED: " + " | ".join(issues))
+
+
 def _write_json(path: Path | None, payload: dict[str, object]) -> None:
     if path is None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_progress_json(path: Path, payload: dict[str, object]) -> None:
+    """Atomically replace a private, diagnostic-only runner checkpoint."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(
+                payload,
+                stream,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            stream.write("\n")
+            stream.flush()
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def _manifest(cases: Sequence[TestCase], contour: str) -> dict[str, object]:
@@ -1092,10 +1223,12 @@ def verify_backend_components(component_dir: Path) -> dict[str, object]:
         if not isinstance(skip_reasons, dict) or set(skip_reasons) != set(skipped):
             raise ValueError(f"backend component skip reasons are inconsistent: {contour}")
         if any(
-            not isinstance(reason, str) or not reason
-            for reason in skip_reasons.values()
+            not isinstance(reason, str)
+            or not reason
+            or INTENTIONAL_SKIP_IDS.get(test_id) != reason
+            for test_id, reason in skip_reasons.items()
         ):
-            raise ValueError(f"backend component skip reasons are malformed: {contour}")
+            raise ValueError(f"backend component contains an unapproved skip: {contour}")
 
         timings = summary.get("timings")
         if not isinstance(timings, list) or len(timings) != len(expected_ids):
@@ -1225,6 +1358,11 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--summary", type=Path)
     parser.add_argument(
+        "--progress",
+        type=Path,
+        help="private diagnostic checkpoint path supplied by the canonical verifier",
+    )
+    parser.add_argument(
         "--component-dir",
         type=Path,
         help="verify backend component manifests without executing tests",
@@ -1234,6 +1372,12 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.focused and args.selectors:
         parser.error("use either --focused selectors or positional selectors, not both")
+    if args.progress is not None and (
+        args.contour != "backend-privileged"
+        or args.component_dir is not None
+        or args.list_ids
+    ):
+        parser.error("--progress is valid only for executing the backend-privileged contour")
     return args
 
 
@@ -1315,6 +1459,12 @@ def _run_contour(args: argparse.Namespace) -> int:
             )
             suite = _load_suite(_flatten_ids(cases))
             runner = TimingRunner(verbosity=0 if args.quiet else 2)
+            if args.contour == "backend-privileged" and args.progress is not None:
+                runner.progress_path = args.progress
+                runner.progress_contour = args.contour
+                runner.progress_expected_ids = tuple(
+                    sorted(case.test_id for case in cases)
+                )
             if args.contour in {BACKEND_AGGREGATE, "backend-integration"}:
                 runner.between_case_cleanup = _clear_integration_auth_rate_limit_keys
             result = runner.run(suite)
@@ -1425,6 +1575,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     # or any cleanup path can touch shared resources.
     if _requires_root_before_resources(args):
         _require_root_identity(args.contour)
+    if args.component_dir is None and not args.list_ids:
+        selected_cases = _select_cases(
+            args.contour,
+            tuple(args.focused or args.selectors),
+        )
+        _preflight_execution_environment(selected_cases)
     _require_test_environment(args.contour)
     # Aggregate execution and both resource-bearing sub-contours must share
     # one host-level boundary.  DB-free contours intentionally stay outside

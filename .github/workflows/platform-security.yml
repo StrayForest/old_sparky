@@ -519,10 +519,48 @@ jobs:
           PY
             )"
 
+  host-tools-pin-preflight:
+    name: Exact-source host-tools pin preflight
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (contains(fromJSON('["full","docs-only","out-of-scope"]'), needs.classifier.outputs.class) || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve and verify canonical host-tools pin against full target history
+        shell: bash
+        env:
+          TARGET_SHA: ${{ github.sha }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"
+          target_sha_re='^[0-9a-f]{40}$'
+          [[ "$TARGET_SHA" =~ $target_sha_re ]]
+          pin_output="$RUNNER_TEMP/platform-host-tools-pin"
+          trap 'rm -f -- "$pin_output"' EXIT
+          /usr/bin/python3 platform/tools/platform_host_tools_pin.py resolve \
+            --source-root "$GITHUB_WORKSPACE" \
+            --target-sha "$TARGET_SHA" \
+            --expected-repository "$EXPECTED_REPOSITORY" > "$pin_output"
+          test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
+          test "$(wc -l < "$pin_output" | tr -d ' ')" = 1
+          IFS= read -r host_tools_sha < "$pin_output"
+          [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
+          rm -f -- "$pin_output"
+          test ! -e "$pin_output" && test ! -L "$pin_output"
+
   backend-static:
     name: Backend DB-free contours
-    needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -571,8 +609,8 @@ jobs:
 
   backend-integration:
     name: Backend PostgreSQL and Redis integration
-    needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -644,8 +682,8 @@ jobs:
 
   backend-privileged:
     name: Backend privileged ephemeral contour
-    needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -706,53 +744,6 @@ jobs:
           sudo usermod -a -G oldsparky-media oldsparky-api
           sudo usermod -a -G oldsparky-media oldsparky-worker
           getent group oldsparky-media
-      - name: Run focused scratch restore diagnostic without gate credit
-        id: scratch_restore_diagnostic
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          umask 077
-          diagnostic="$RUNNER_TEMP/platform-backup-scratch-diagnostic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
-          if ! {
-            printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' \
-              "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
-          } > "$diagnostic"; then
-            echo "Unable to create the private scratch diagnostic log." >&2
-            exit 1
-          fi
-          if sudo -n env -i \
-            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1 \
-            GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS" \
-            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
-            PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform \
-            PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test \
-            PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials \
-            PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15 \
-            PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13 \
-            PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14 \
-            /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' && \
-            .venv_platform/bin/python tools/platform_verify.py backend-privileged \
-            --focused tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_isolated_restore_signal_cleanup_under_root" \
-            >> "$diagnostic" 2>&1; then
-            result=0
-          else
-            result=$?
-          fi
-          printf 'focused_exit=%s\n' "$result" >> "$diagnostic"
-          chmod 600 "$diagnostic"
-          printf 'Focused scratch diagnostic exit=%s (no gate credit).\n' "$result"
-          exit "$result"
-      - name: Upload focused scratch restore diagnostic
-        id: scratch_diagnostic_upload
-        if: ${{ always() }}
-        continue-on-error: true
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}.log
-          if-no-files-found: error
-          retention-days: 14
       - name: Run serial privileged catalog contour exactly once as root
         run: >-
           sudo -n env -i
@@ -778,18 +769,6 @@ jobs:
           path: platform/ci-backend
           if-no-files-found: error
           retention-days: 14
-      - name: Require focused scratch restore diagnostic success
-        if: ${{ always() }}
-        env:
-          SCRATCH_DIAGNOSTIC_OUTCOME: ${{ steps.scratch_restore_diagnostic.outcome }}
-          SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME: ${{ steps.scratch_diagnostic_upload.outcome }}
-        run: |
-          set -euo pipefail
-          if [[ "$SCRATCH_DIAGNOSTIC_OUTCOME" != "success" || "$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success" ]]; then
-            echo "Focused scratch restore diagnostic or artifact upload failed; full contour still ran, but this job cannot pass." >&2
-            exit 1
-          fi
-
   backend:
     name: Backend aggregate
     needs: [classifier, baseline-runtime-guard, backend-static, backend-integration, backend-privileged]
@@ -839,8 +818,8 @@ jobs:
 
   python-quality:
     name: Python quality
-    needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -861,8 +840,8 @@ jobs:
 
   security:
     name: Security gates
-    needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -882,8 +861,8 @@ jobs:
           .venv_platform/bin/python tools/platform_verify.py security
 
   web-quality:
-    needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -903,8 +882,8 @@ jobs:
 
   docs:
     name: Documentation consistency
-    needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || needs.classifier.outputs.class == 'docs-only' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || needs.classifier.outputs.class == 'docs-only' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -916,8 +895,8 @@ jobs:
 
   migration:
     name: Migration scenarios
-    needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     services:
@@ -963,8 +942,8 @@ jobs:
 
   web-hermetic:
     name: Web hermetic
-    needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -998,8 +977,8 @@ jobs:
 
   verification-contract:
     name: Verification contract
-    needs: [classifier, baseline-runtime-guard]
-    if: ${{ always() && needs.classifier.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
+    if: ${{ always() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -1012,29 +991,6 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Resolve and verify canonical host-tools pin against full target history
-        shell: bash
-        env:
-          TARGET_SHA: ${{ github.sha }}
-          EXPECTED_REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          umask 077
-          test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"
-          target_sha_re='^[0-9a-f]{40}$'
-          [[ "$TARGET_SHA" =~ $target_sha_re ]]
-          pin_output="$RUNNER_TEMP/platform-host-tools-pin"
-          trap 'rm -f -- "$pin_output"' EXIT
-          /usr/bin/python3 platform/tools/platform_host_tools_pin.py resolve \
-            --source-root "$GITHUB_WORKSPACE" \
-            --target-sha "$TARGET_SHA" \
-            --expected-repository "$EXPECTED_REPOSITORY" > "$pin_output"
-          test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
-          test "$(wc -l < "$pin_output" | tr -d ' ')" = 1
-          IFS= read -r host_tools_sha < "$pin_output"
-          [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
-          rm -f -- "$pin_output"
-          test ! -e "$pin_output" && test ! -L "$pin_output"
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
@@ -1197,10 +1153,11 @@ jobs:
 
   release-runtime:
     name: Conditional release runtime fixture
-    needs: [classifier, baseline-runtime-guard]
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
     if: >-
       !cancelled() &&
       needs.classifier.result == 'success' &&
+      needs.host-tools-pin-preflight.result == 'success' &&
       (
         needs.classifier.outputs.runtime_sensitive == 'true' ||
         needs.classifier.outputs.fallback == 'true' ||
@@ -1267,9 +1224,10 @@ jobs:
 
   release-runtime-real:
     name: Trusted dev immutable release runtime
-    needs: [classifier, baseline-runtime-guard]
+    needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
     if: >-
       !cancelled() &&
+      needs.host-tools-pin-preflight.result == 'success' &&
       (
         (
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
@@ -1972,7 +1930,7 @@ jobs:
     if: ${{ always() }}
     permissions:
       statuses: write
-    needs: [classifier, baseline-runtime-guard, status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract, release-runtime, release-runtime-real]
+    needs: [classifier, baseline-runtime-guard, status-start, host-tools-pin-preflight, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract, release-runtime, release-runtime-real]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1984,6 +1942,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PROOF_MODE: ${{ inputs.proof_mode || 'standard' }}
           BASELINE_GUARD_RESULT: ${{ needs.baseline-runtime-guard.result }}
+          HOST_TOOLS_PIN_PREFLIGHT_RESULT: ${{ needs.host-tools-pin-preflight.result }}
           TARGET_SHA_INPUT: ${{ inputs.target_sha }}
           SOURCE_SECURITY_RUN_ID: ${{ inputs.source_security_run_id }}
           SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.source_security_run_attempt }}
@@ -2047,6 +2006,8 @@ jobs:
           baseline_mode = event_name == "workflow_dispatch" and proof_mode == "baseline-runtime"
           raw_runtime_sensitive = os.environ.get("ROUTE_RUNTIME_SENSITIVE", "")
           route_errors = []
+          if os.environ.get("HOST_TOOLS_PIN_PREFLIGHT_RESULT") != "success":
+              route_errors.append("exact-source host-tools pin preflight did not succeed")
           if event_name == "workflow_dispatch" and proof_mode not in {"standard", "baseline-runtime"}:
               route_errors.append("workflow-dispatch proof mode is missing or invalid")
           if baseline_mode and os.environ.get("BASELINE_GUARD_RESULT") != "success":

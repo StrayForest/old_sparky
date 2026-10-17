@@ -1216,12 +1216,15 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn('rm -f -- "$stage/bundle.zip" || true', release_recover)
         self.assertNotIn("$runtime/current/tools", release_recover)
         failed_deploy_binding = (
+            '"$api/actions/workflows/platform-production-deploy.yml"',
             '"$api/actions/runs/$FAILED_DEPLOY_RUN_ID/attempts/$FAILED_DEPLOY_RUN_ATTEMPT"',
             '"$api/actions/runs/$FAILED_DEPLOY_RUN_ID/attempts/$FAILED_DEPLOY_RUN_ATTEMPT/jobs?per_page=100&page=1"',
+            'deploy_workflow.get("name") != "Platform production deploy"',
+            'deploy_workflow.get("path") != ".github/workflows/platform-production-deploy.yml"',
+            'failed.get("workflow_id") != deploy_workflow_id',
             'failed.get("id") != failed_id',
             'failed.get("run_attempt") != failed_attempt',
-            'failed.get("name") != "Platform production deploy"',
-            'failed.get("path") != ".github/workflows/platform-production-deploy.yml"',
+            'failed.get("path") != deploy_workflow["path"]',
             'failed.get("head_branch") != "dev"',
             'failed_source = failed.get("head_sha")',
             'not isinstance(failed_source, str)',
@@ -1241,6 +1244,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         for predicate in failed_deploy_binding:
             with self.subTest(failed_deploy_predicate=predicate):
                 self.assertIn(predicate, release_recover)
+        self.assertNotIn('failed.get("name") != "Platform production deploy"', release_recover)
         self.assertNotIn('failed.get("head_sha") != source', release_recover)
         self.assertNotIn('failed_deploy_source_sha" == "$source_sha"', release_recover)
         self.assertNotIn("candidate_slug:", release_recover.split("jobs:", 1)[0])

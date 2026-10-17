@@ -727,6 +727,211 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         code = platform_verify_venv_reuse._compile_source(b"annotation: object\n", "proof.py")
         self.assertEqual(code.co_flags & __future__.annotations.compiler_flag, 0)
 
+    def test_required_reuse_policy_runs_real_proof_cli_and_persists_its_receipt(self) -> None:
+        def prepare_case(name: str, *, corrupt_origin: bool) -> tuple[Path, Path, Path, Path]:
+            current = self.add_installed_release(f"strict-current-{name}")
+            previous = self.add_installed_release(f"strict-previous-{name}")
+            origin = self.add_installed_release(f"strict-origin-{name}")
+            (self.app_dir / "current").symlink_to(current)
+            (self.app_dir / "previous").symlink_to(previous)
+
+            artifact = self.build_artifact(
+                f"strict-reuse-{name}", pip_result="unused", require_proven_reuse=True
+            )
+            slug = f"strict-reuse-{name}-{BUILT_AT}"
+            candidate = self.releases_dir / slug
+            artifact_source = self.root / "artifact-src" / slug
+            for relative in (
+                "requirements-platform.txt",
+                "requirements-platform.lock.txt",
+                "requirements-platform.freeze.txt",
+            ):
+                shutil.copy2(artifact_source / relative, current / relative)
+            shutil.copytree(artifact_source / "wheelhouse", current / "wheelhouse")
+
+            def add_identity_and_rollback(
+                release: Path, transition: str, prior: Path | None
+            ) -> None:
+                metadata = {
+                    "release_slug": release.name,
+                    "source_git_commit": "a" * 40,
+                }
+                manifest = release / "RELEASE.json"
+                manifest.write_text(json.dumps(metadata) + "\n", encoding="ascii")
+                manifest.chmod(0o444)
+                if not (release / "requirements-platform.freeze.txt").exists():
+                    (release / "requirements-platform.freeze.txt").write_text(
+                        "pip==26.1.2\n", encoding="ascii"
+                    )
+                    (release / "requirements-platform.freeze.txt").chmod(0o444)
+                rollback = release / ".rollback"
+                rollback.mkdir(mode=0o700)
+                marker = rollback / "venv-transition"
+                marker.write_text(f"{transition}\n", encoding="ascii")
+                marker.chmod(0o600)
+                if transition == "snapshot":
+                    (rollback / "shared-venv-before-install").mkdir(mode=0o700)
+                if prior is not None:
+                    previous_file = rollback / "previous-release"
+                    previous_file.write_text(f"{prior}\n", encoding="ascii")
+                    previous_file.chmod(0o600)
+                    if transition == "unchanged":
+                        freeze = release / "requirements-platform.freeze.txt"
+                        receipt = rollback / "shared-freeze.sha256"
+                        receipt.write_text(
+                            hashlib.sha256(freeze.read_bytes()).hexdigest() + "\n",
+                            encoding="ascii",
+                        )
+                        receipt.chmod(0o600)
+
+            add_identity_and_rollback(current, "unchanged", previous)
+            add_identity_and_rollback(previous, "unchanged", origin)
+            add_identity_and_rollback(origin, "snapshot", None)
+
+            venv = self.shared_dir / "venv"
+            site_packages = venv / "lib" / "python3.12" / "site-packages"
+            site_packages.mkdir(parents=True, mode=0o755)
+            (venv / "bin").mkdir(mode=0o755)
+            venv.chmod(0o755)
+            (venv / "bin").chmod(0o755)
+            site_packages.chmod(0o755)
+            base_python = Path("/usr/bin/python3.12")
+            self.assertTrue(base_python.is_file())
+            for name_alias in ("python", "python3", "python3.12"):
+                (venv / "bin" / name_alias).symlink_to(base_python)
+            (venv / "pyvenv.cfg").write_text(
+                "home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.12.3\n",
+                encoding="ascii",
+            )
+            (venv / "pyvenv.cfg").chmod(0o644)
+            pip_package = site_packages / "pip"
+            pip_package.mkdir(mode=0o755)
+            (pip_package / "__init__.py").write_text("__version__ = '26.1.2'\n")
+            (pip_package / "__main__.py").write_text(
+                "import sys\n"
+                "args = sys.argv[1:]\n"
+                "if args == ['check']:\n    raise SystemExit(0)\n"
+                "if args == ['freeze', '--all']:\n"
+                "    print('pip==26.1.2')\n    raise SystemExit(0)\n"
+                "raise SystemExit(64)\n",
+                encoding="ascii",
+            )
+            (pip_package / "__init__.py").chmod(0o644)
+            (pip_package / "__main__.py").chmod(0o644)
+
+            if corrupt_origin:
+                previous_file = current / ".rollback" / "previous-release"
+                previous_file.write_text(
+                    f"{self.releases_dir / 'missing-origin'}\n", encoding="ascii"
+                )
+                previous_file.chmod(0o600)
+
+            state = self.shared_dir / TRANSACTION_STATE_NAME
+            platform_release_transaction.prepare_quiesce(
+                state,
+                app_dir=self.app_dir,
+                candidate_release=candidate,
+                service_states=[
+                    "deadlock-api=active", "deadlock-worker=active", "deadlock-web=active"
+                ],
+                timer_active_before="inactive",
+                service_enabled=[
+                    "deadlock-api=enabled", "deadlock-worker=enabled", "deadlock-web=enabled"
+                ],
+                timer_enabled_before="enabled",
+                candidate_may_exist=False,
+            )
+            return artifact, current, candidate, venv
+
+        verifier_path = self.tools_dir / "platform_verify_venv_reuse.py"
+        real_verifier = self.tools_dir / "platform_verify_venv_reuse_real.py"
+        shutil.copy2(verifier_path, real_verifier)
+        verifier_path.write_text(
+            "import contextlib\n"
+            "import io\n"
+            "import importlib.util\n"
+            "import json\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            "real = Path(__file__).with_name('platform_verify_venv_reuse_real.py')\n"
+            "spec = importlib.util.spec_from_file_location('reuse_cli_real', real)\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "module._venv_integrity = lambda venv, wheelhouse, slug: "
+            "module._activation_scripts_digest(module._expected_activation_scripts(venv, slug))\n"
+            "trace = os.environ.get('PLATFORM_TEST_VENV_REUSE_CLI_TRACE')\n"
+            "if trace:\n"
+            "    with open(trace, 'a', encoding='ascii') as stream:\n"
+            "        stream.write('main\\n')\n"
+            "output = io.StringIO()\n"
+            "with contextlib.redirect_stdout(output):\n"
+            "    status = module.main()\n"
+            "proof_output = output.getvalue()\n"
+            "if os.environ.get('PLATFORM_TEST_VENV_REUSE_TAMPER_PROOF') == '1' and status == 0:\n"
+            "    proof = json.loads(proof_output)\n"
+            "    proof['venv_ino'] += 1\n"
+            "    proof_output = json.dumps(proof, sort_keys=True, separators=(',', ':')) + '\\n'\n"
+            "sys.stdout.write(proof_output)\n"
+            "raise SystemExit(status)\n",
+            encoding="ascii",
+        )
+        verifier_path.chmod(0o755)
+
+        for case, corrupt_origin, tamper_proof in (
+            ("accepted", False, False),
+            ("refused", True, False),
+            ("proof-binding", False, True),
+        ):
+            self.reset_app_tree()
+            artifact, current, candidate, venv = prepare_case(
+                case, corrupt_origin=corrupt_origin
+            )
+            activation_name = f".venv-install-strict-origin-{case}.ABC123"
+            for activation_path, (content, mode) in platform_verify_venv_reuse._render_activation_scripts(
+                venv, activation_name
+            ).items():
+                activation_path.write_bytes(content)
+                activation_path.chmod(mode)
+            before_venv = venv.stat()
+            trace = self.root / f"reuse-cli-{case}.trace"
+            test_env = {"PLATFORM_TEST_VENV_REUSE_CLI_TRACE": str(trace)}
+            if tamper_proof:
+                test_env["PLATFORM_TEST_VENV_REUSE_TAMPER_PROOF"] = "1"
+            with mock.patch.dict(os.environ, test_env):
+                result = self.run_script(
+                    INSTALL_SCRIPT,
+                    "--stage-only",
+                    str(artifact),
+                    str(self.app_dir),
+                    check=False,
+                )
+            candidate_after = self.releases_dir / f"strict-reuse-{case}-{BUILT_AT}"
+            if corrupt_origin or tamper_proof:
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(trace.read_text(encoding="ascii"), "main\n")
+                self.assertIn("class=venv_policy stage=venv_policy_proof", result.stderr)
+                self.assertEqual((self.app_dir / "current").resolve(), current)
+                self.assertEqual((self.app_dir / "previous").resolve().name, f"strict-previous-{case}")
+                self.assertEqual((venv.stat().st_dev, venv.stat().st_ino), (before_venv.st_dev, before_venv.st_ino))
+                self.assertFalse((candidate_after / ".rollback" / "venv-origin.json").exists())
+            else:
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((self.app_dir / "current").resolve(), current)
+                self.assertEqual((self.app_dir / "previous").resolve().name, f"strict-previous-{case}")
+                self.assertEqual((venv.stat().st_dev, venv.stat().st_ino), (before_venv.st_dev, before_venv.st_ino))
+                self.assertEqual(trace.read_text(encoding="ascii"), "main\n")
+                receipt_path = candidate_after / ".rollback" / "venv-origin.json"
+                receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+                self.assertEqual(receipt["release_slug"], candidate_after.name)
+                self.assertEqual(receipt["origin_release_slug"], f"strict-origin-{case}")
+                self.assertEqual(receipt["venv_dev"], before_venv.st_dev)
+                self.assertEqual(receipt["venv_ino"], before_venv.st_ino)
+                self.assertEqual(
+                    json.loads((self.shared_dir / TRANSACTION_STATE_NAME).read_text())["phase"],
+                    "staged",
+                )
+
     def test_venv_reuse_rejects_source_tamper_even_with_rewritten_record(self) -> None:
         venv = self.root / "proof-venv"
         site = venv / "lib" / "python3.12" / "site-packages"
@@ -1961,7 +2166,13 @@ else:
             tool.chmod(0o755)
         return release
 
-    def build_artifact(self, release_ref: str, *, pip_result: str) -> Path:
+    def build_artifact(
+        self,
+        release_ref: str,
+        *,
+        pip_result: str,
+        require_proven_reuse: bool = False,
+    ) -> Path:
         slug = f"{release_ref}-{BUILT_AT}"
         release = self.root / "artifact-src" / slug
         static_dir = (
@@ -1979,6 +2190,15 @@ else:
         ).write_text("console.log('ok');\n")
         (release / "apps" / "platform_web" / "package-lock.json").write_text("{}\n")
         (release / ".env.platform.example").write_text("PLATFORM_TESTING=1\n")
+        if require_proven_reuse:
+            deploy = release / "deploy"
+            deploy.mkdir()
+            policy = deploy / "python-venv-policy.json"
+            policy.write_text(
+                '{"schema":1,"transition":"require_proven_reuse"}\n',
+                encoding="ascii",
+            )
+            policy.chmod(0o644)
         (release / "requirements-platform.txt").write_text("pip==26.1.2\n")
         lock = release / "requirements-platform.lock.txt"
         freeze = release / "requirements-platform.freeze.txt"

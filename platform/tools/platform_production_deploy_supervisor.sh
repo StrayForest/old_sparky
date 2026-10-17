@@ -1105,7 +1105,8 @@ finally:
         b"recovery|venv_policy|venv|rollback_metadata|wheelhouse|liveqa_runtime|unknown"
     )
     install_stages = (
-        b"artifact_validation|wheelhouse_validation|disk_guard|environment_prepare|"
+        b"artifact_validation|wheelhouse_validation|venv_policy_parse|"
+        b"venv_policy_preconditions|venv_policy_proof|venv_policy_space|disk_guard|environment_prepare|"
         b"venv_setup|transaction_stage|runtime_prepare|unknown"
     )
     install_diag_pattern = re.compile(
@@ -1218,7 +1219,7 @@ print(
 PY
   2>/dev/null
 )"; then
-if [[ "$candidate_result" =~ ^candidate_status=(none|0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])\ capture_state=(complete|truncated|write_failed|read_failed|inherited_pipe_open|descendant_processes_open|metadata_failed|cleanup_failed|cleanup_unreaped|spawn_failed|setup_failed|timeout|interrupted)\ install_diag_state=(classified|unknown)\ install_diag_reason=(matched|missing|malformed|duplicate|truncated|capture_incomplete|status_mismatch)\ install_class=(argument|privilege|artifact|checksum|environment|layout|production_guard|pending_operation|duplicate|pointer|cleanup|liveqa_runtime_recovery|recovery|venv_policy|venv|rollback_metadata|wheelhouse|liveqa_runtime|unknown)\ install_stage=(artifact_validation|wheelhouse_validation|disk_guard|environment_prepare|venv_setup|transaction_stage|runtime_prepare|unknown)\ install_exit=(none|[1-9][0-9]{0,2})$ ]]; then
+if [[ "$candidate_result" =~ ^candidate_status=(none|0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])\ capture_state=(complete|truncated|write_failed|read_failed|inherited_pipe_open|descendant_processes_open|metadata_failed|cleanup_failed|cleanup_unreaped|spawn_failed|setup_failed|timeout|interrupted)\ install_diag_state=(classified|unknown)\ install_diag_reason=(matched|missing|malformed|duplicate|truncated|capture_incomplete|status_mismatch)\ install_class=(argument|privilege|artifact|checksum|environment|layout|production_guard|pending_operation|duplicate|pointer|cleanup|liveqa_runtime_recovery|recovery|venv_policy|venv|rollback_metadata|wheelhouse|liveqa_runtime|unknown)\ install_stage=(artifact_validation|wheelhouse_validation|venv_policy_parse|venv_policy_preconditions|venv_policy_proof|venv_policy_space|disk_guard|environment_prepare|venv_setup|transaction_stage|runtime_prepare|unknown)\ install_exit=(none|[1-9][0-9]{0,2})$ ]]; then
   candidate_status="${BASH_REMATCH[1]}"
   candidate_capture_state="${BASH_REMATCH[2]}"
   install_diag_state="${BASH_REMATCH[3]}"

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -26,6 +27,7 @@ PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_ROOT = PLATFORM_ROOT / "tools"
 WEB_ROOT = PLATFORM_ROOT / "apps" / "platform_web"
 _PROCESS_GROUP_TERM_GRACE_SECONDS = 1.0
+_BACKEND_PROGRESS_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _create_private_migration_diagnostic() -> tuple[Path, Path]:
@@ -72,6 +74,288 @@ def _create_private_migration_diagnostic() -> tuple[Path, Path]:
             os.close(descriptor)
 
 
+def _create_backend_progress_path(
+    arguments: Sequence[str],
+) -> tuple[Path, Path | None]:
+    """Create one private runner checkpoint path, adjacent to summaries when supplied."""
+
+    summary_path: Path | None = None
+    normalized = tuple(arguments[1:]) if arguments[:1] == ("--",) else tuple(arguments)
+    for index, argument in enumerate(normalized):
+        if argument == "--summary" and index + 1 < len(normalized):
+            summary_path = Path(normalized[index + 1])
+        elif argument.startswith("--summary="):
+            summary_path = Path(argument.partition("=")[2])
+
+    private_directory: Path | None = None
+    path: Path | None = None
+    descriptor = -1
+    try:
+        if summary_path is None:
+            private_directory = Path(
+                tempfile.mkdtemp(prefix="platform-backend-progress-", dir="/tmp")
+            )
+            path = private_directory / "progress.json"
+            directory_stat = os.lstat(private_directory)
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_stat.st_mode) != 0o700
+            ):
+                raise OSError("private backend progress directory failed validation")
+            descriptor = os.open(
+                path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+        else:
+            if not summary_path.is_absolute():
+                summary_path = PLATFORM_ROOT / summary_path
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(
+                prefix="backend-privileged-progress-",
+                suffix=".json",
+                dir=summary_path.parent,
+            )
+            path = Path(name)
+        file_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != os.geteuid()
+            or file_stat.st_nlink != 1
+            or stat.S_IMODE(file_stat.st_mode) != 0o600
+        ):
+            raise OSError("backend progress file failed validation")
+        return path, private_directory
+    except BaseException:
+        try:
+            if path is not None:
+                path.unlink(missing_ok=True)
+            if private_directory is not None:
+                private_directory.rmdir()
+        except OSError:
+            pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_backend_progress(path: Path) -> dict[str, object] | None:
+    """Read a bounded diagnostic checkpoint without following or trusting paths."""
+
+    descriptor = -1
+    try:
+        before = os.lstat(path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size > _BACKEND_PROGRESS_MAX_BYTES
+        ):
+            return None
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = _BACKEND_PROGRESS_MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > _BACKEND_PROGRESS_MAX_BYTES:
+            return None
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    expected_keys = {
+        "schema",
+        "contour",
+        "status",
+        "execution_complete",
+        "selected_count",
+        "expected_ids",
+        "completed_timings",
+        "active_test_id",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        return None
+    if (
+        isinstance(payload.get("schema"), bool)
+        or payload.get("schema") != 1
+        or payload.get("contour") != "backend-privileged"
+        or payload.get("status") != "diagnostic_only"
+        or payload.get("execution_complete") is not False
+    ):
+        return None
+
+    catalog = _backend_catalog_module()
+    registered_ids = {
+        case.test_id for case in catalog.cases_for_contour("backend-privileged")
+    }
+    expected_ids = payload.get("expected_ids")
+    selected_count = payload.get("selected_count")
+    completed = payload.get("completed_timings")
+    active_id = payload.get("active_test_id")
+    if (
+        not isinstance(expected_ids, list)
+        or not expected_ids
+        or any(not isinstance(test_id, str) for test_id in expected_ids)
+        or expected_ids != sorted(set(expected_ids))
+        or not set(expected_ids).issubset(registered_ids)
+        or isinstance(selected_count, bool)
+        or not isinstance(selected_count, int)
+        or selected_count != len(expected_ids)
+        or not isinstance(completed, list)
+        or len(completed) > selected_count
+        or (active_id is not None and not isinstance(active_id, str))
+        or (active_id is not None and active_id not in expected_ids)
+    ):
+        return None
+
+    completed_ids: list[str] = []
+    for timing in completed:
+        if not isinstance(timing, dict) or set(timing) != {
+            "test_id",
+            "duration_ms",
+            "outcome",
+        }:
+            return None
+        test_id = timing.get("test_id")
+        duration = timing.get("duration_ms")
+        outcome = timing.get("outcome")
+        if (
+            not isinstance(test_id, str)
+            or test_id not in expected_ids
+            or isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or duration < 0
+            or duration
+            > catalog.CONTOUR_TIMEOUT_SECONDS["backend-privileged"] * 2000
+            or not math.isfinite(float(duration))
+            or not isinstance(outcome, str)
+            or outcome not in {
+                "passed",
+                "failed",
+                "error",
+                "skipped",
+                "expected-failure",
+                "unexpected-success",
+            }
+        ):
+            return None
+        completed_ids.append(test_id)
+    if (
+        len(set(completed_ids)) != len(completed_ids)
+        or (active_id is not None and active_id in completed_ids)
+    ):
+        return None
+    payload["last_completed_test_id"] = completed_ids[-1] if completed_ids else None
+    return payload
+
+
+def _emit_backend_progress_timeout(path: Path) -> bool:
+    progress = _read_backend_progress(path)
+    if progress is None:
+        print(
+            "[GATE TIMEOUT DETAIL] backend-privileged progress=unavailable",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    print(
+        "[GATE TIMEOUT DETAIL] backend-privileged "
+        f"selected={progress['selected_count']} "
+        f"completed={len(progress['completed_timings'])} "
+        f"active_test_id={progress['active_test_id'] or 'none'} "
+        f"last_completed_test_id={progress['last_completed_test_id'] or 'none'}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return True
+
+
+def _remove_backend_progress_path(path: Path) -> bool:
+    """Remove only our private regular progress file after it is no longer needed."""
+
+    try:
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.geteuid()
+            or current.st_nlink != 1
+            or stat.S_IMODE(current.st_mode) != 0o600
+        ):
+            return False
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _remove_backend_progress_temps(path: Path) -> bool:
+    """Remove only atomic-write temps uniquely associated with this progress path."""
+
+    prefix = f".{path.name}."
+    directory_fd = -1
+    try:
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                if not entry.name.startswith(prefix) or not entry.name.endswith(".tmp"):
+                    continue
+                try:
+                    current = entry.stat(follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(current.st_mode)
+                        or current.st_uid != os.geteuid()
+                        or current.st_nlink != 1
+                        or stat.S_IMODE(current.st_mode) != 0o600
+                    ):
+                        return False
+                    os.unlink(entry.name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return False
+    except OSError:
+        return False
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+    return True
+
+
 class _VerifierTermination(BaseException):
     """A TERM delivered while the verifier owns a running gate process group."""
 
@@ -87,6 +371,36 @@ def _backend_catalog_module():
 
         return platform_test_catalog
     return platform_test_catalog
+
+
+def _preflight_backend_test_environment(
+    contour: str,
+    arguments: Sequence[str],
+) -> None:
+    """Apply exact catalog-owned host requirements before dispatching tests."""
+
+    catalog = _backend_catalog_module()
+    normalized = tuple(arguments[1:]) if arguments[:1] == ("--",) else tuple(arguments)
+    if normalized[:1] == ("--list",):
+        return
+    selectors = normalized[1:] if normalized[:1] == ("--focused",) else ()
+    cases = catalog.cases_for_contour(contour)
+    if selectors:
+        selected_ids = {
+            case.test_id
+            for case in cases
+            if any(
+                case.test_id == selector
+                or case.test_id.startswith(selector + ".")
+                for selector in selectors
+            )
+        }
+    else:
+        selected_ids = {case.test_id for case in cases}
+    issues = catalog.test_environment_requirement_issues(selected_ids, os.environ)
+    issues.extend(catalog.test_execution_requirement_issues(selected_ids))
+    if issues:
+        raise VerificationError("LOCAL GATE BLOCKED: " + " | ".join(issues))
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +624,147 @@ def registry_payload() -> dict[str, object]:
         "gates": [gate.as_json() for gate in GATES],
         "ci_gate_ids": list(CI_GATE_IDS),
         "backend_test_catalog": backend_registry_payload(),
+        "impact_planning": {
+            "command": "python3 tools/platform_verify.py impact --changed-path <repo-relative-path>",
+            "skip_authority": False,
+            "unknown_path_behavior": "require full canonical CI; never return an empty plan",
+        },
+    }
+
+
+_IMPACT_SOURCE_ROUTES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("platform/tools/platform_live_qa_", ("backend-privileged", "backend-tool-contract")),
+    ("platform/tools/platform_live_user_qa_", ("backend-privileged", "backend-tool-contract")),
+    ("platform/tools/platform_maintenance_qa_", ("backend-privileged", "backend-tool-contract")),
+    ("platform/tools/platform_production_qa.py", ("backend-privileged", "backend-tool-contract")),
+    ("platform/tools/platform_release_", ("backend-privileged", "backend-tool-contract")),
+    ("platform/tools/platform_backup_", ("backend-privileged", "backend-tool-contract")),
+    ("platform/tools/platform_external_load_", ("backend-tool-contract", "performance-contract")),
+    ("platform/tools/platform_verify", ("verification-contract", "backend-tool-contract")),
+    ("platform/tools/platform_test_catalog.py", ("verification-contract", "backend-tool-contract")),
+    ("platform/tools/platform_test_runner.py", ("verification-contract", "backend-tool-contract", "backend-privileged")),
+    ("platform/tools/platform_ci_classifier.py", ("verification-contract", "backend-tool-contract")),
+    (".github/workflows/platform-security.yml", ("verification-contract", "backend-tool-contract", "backend-privileged")),
+    (".github/workflows/platform-live-launch.yml", ("backend-privileged", "backend-tool-contract")),
+    (".github/workflows/platform-live-user-qa.yml", ("backend-privileged", "backend-tool-contract")),
+    (".github/workflows/platform-production-external-load.yml", ("backend-tool-contract", "performance-contract")),
+)
+
+
+def impact_plan(changed_paths: Sequence[str]) -> dict[str, object]:
+    """Route changed paths to complete owner contours; this never authorizes skips."""
+
+    catalog = _backend_catalog_module()
+    normalized: list[str] = []
+    for raw_path in changed_paths:
+        path = raw_path.strip()
+        if (
+            not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+        ):
+            return {
+                "schema": 1,
+                "status": "broad_ci_required",
+                "changed_paths": list(changed_paths),
+                "required_gates": list(CI_GATE_IDS),
+                "owner_contours": list(catalog.BACKEND_CONTOURS),
+                "owner_modules": [],
+                "skip_authority": False,
+                "reason": "malformed path; run the full canonical CI route",
+            }
+        normalized.append(path)
+    if not normalized:
+        raise VerificationError("impact requires at least one --changed-path")
+
+    selected_contours: set[str] = set()
+    selected_gates: set[str] = set()
+    selected_modules: set[str] = set()
+    unmapped: list[str] = []
+    cases = catalog.discover_test_cases()
+    module_to_contours: dict[str, set[str]] = {}
+    for case in cases:
+        module_to_contours.setdefault(case.module, set()).add(case.contour)
+    for path in normalized:
+        if path.startswith("platform/docs/"):
+            selected_gates.add("docs")
+            selected_contours.add("verification-contract")
+            selected_modules.add("test_platform_verification_contract")
+            continue
+        if path.startswith("platform/tests/") and path.endswith(".py"):
+            module = Path(path).stem
+            contours = module_to_contours.get(module)
+            external_owner = catalog.EXTERNAL_MODULE_OWNERS.get(module)
+            if contours:
+                selected_contours.update(contours)
+                selected_modules.add(module)
+            elif external_owner:
+                selected_contours.add(external_owner)
+                selected_modules.add(module)
+            else:
+                unmapped.append(path)
+            continue
+        route = next(
+            (contours for prefix, contours in _IMPACT_SOURCE_ROUTES if path.startswith(prefix)),
+            None,
+        )
+        if route is None:
+            unmapped.append(path)
+            continue
+        selected_contours.update(route)
+        if "live_qa" in path or "live_user_qa" in path:
+            selected_modules.update(
+                module for module in module_to_contours
+                if module.startswith(("test_platform_live_qa_", "test_platform_cleanup_live_user_qa", "test_platform_recover_live_user_qa"))
+            )
+            selected_modules.update({"test_platform_maintenance_qa_evidence", "test_platform_noop_source_binding", "test_platform_remote_workflow_guards"})
+        if path.endswith("platform-security.yml"):
+            selected_modules.update({
+                "test_platform_ci_classifier",
+                "test_platform_verification_contract",
+            })
+        if path.startswith((
+            "platform/tools/platform_verify",
+            "platform/tools/platform_test_runner.py",
+            "platform/tools/platform_test_catalog.py",
+        )):
+            selected_modules.add("test_platform_verification_contract")
+        if path.endswith("platform_ci_classifier.py"):
+            selected_modules.add("test_platform_ci_classifier")
+        if path.endswith("platform-production-external-load.yml"):
+            selected_modules.update({"test_platform_external_load_workflow_contract", "test_platform_maintenance_qa_evidence"})
+
+    if unmapped:
+        return {
+            "schema": 1,
+            "status": "broad_ci_required",
+            "changed_paths": normalized,
+            "unmapped_paths": sorted(unmapped),
+            "required_gates": list(CI_GATE_IDS),
+            "owner_contours": list(catalog.BACKEND_CONTOURS),
+            "owner_modules": [],
+            "skip_authority": False,
+            "reason": "unknown or unmapped path; run the full canonical CI route",
+        }
+
+    required_gates = sorted(selected_gates | {
+        "backend" if contour in catalog.BACKEND_CONTOURS else contour
+        for contour in selected_contours
+    })
+    contour_modules = {
+        case.module for case in cases if case.contour in selected_contours
+    }
+    contour_modules.update(selected_modules)
+    return {
+        "schema": 1,
+        "status": "routed",
+        "changed_paths": normalized,
+        "required_gates": required_gates,
+        "owner_contours": sorted(selected_contours),
+        "owner_modules": sorted(contour_modules),
+        "skip_authority": False,
+        "reason": "planning aid only; exact-SHA CI remains required",
     }
 
 
@@ -490,6 +945,7 @@ def _run(
     cwd: Path = PLATFORM_ROOT,
     timeout_seconds: float | None = None,
     timeout_cleanup: Callable[[], None] | None = None,
+    timeout_diagnostic: Callable[[], None] | None = None,
 ) -> int:
     print(f"[GATE START] {label}", flush=True)
     previous_term_handler = signal.getsignal(signal.SIGTERM)
@@ -536,20 +992,31 @@ def _run(
                     f"[GATE TIMEOUT CLEANUP INCOMPLETE] {label}",
                     file=sys.stderr,
                 )
-            elif timeout_cleanup is not None:
-                try:
-                    timeout_cleanup()
-                except Exception as exc:
-                    print(
-                        f"[GATE TIMEOUT RESOURCE CLEANUP FAIL] {label} "
-                        f"class={type(exc).__name__}",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(
-                        f"[GATE TIMEOUT RESOURCE CLEANUP] {label} status=passed",
-                        flush=True,
-                    )
+            else:
+                if timeout_diagnostic is not None:
+                    try:
+                        timeout_diagnostic()
+                    except Exception as exc:
+                        print(
+                            f"[GATE TIMEOUT DIAGNOSTIC FAIL] {label} "
+                            f"class={type(exc).__name__}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                if timeout_cleanup is not None:
+                    try:
+                        timeout_cleanup()
+                    except Exception as exc:
+                        print(
+                            f"[GATE TIMEOUT RESOURCE CLEANUP FAIL] {label} "
+                            f"class={type(exc).__name__}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"[GATE TIMEOUT RESOURCE CLEANUP] {label} status=passed",
+                            flush=True,
+                        )
             timeout_label = (
                 f"{timeout_seconds:g}s" if timeout_seconds is not None else "the configured timeout"
             )
@@ -693,27 +1160,72 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
         if gate_id == "backend-privileged":
             if os.geteuid() != 0:
                 raise VerificationError("backend-privileged requires the root test user")
+            _preflight_backend_test_environment(gate_id, arguments)
             wrapper_command = _backend_contour_command(gate_id, arguments)
             runner_arguments = wrapper_command[3:]
             child_env, resource_settings = _validated_privileged_environment()
+            progress_path, private_progress_directory = _create_backend_progress_path(
+                runner_arguments
+            )
             command = [
                 _privileged_runner_python(child_env),
                 _tool("platform_test_runner.py"),
                 "--contour",
                 gate_id,
                 *runner_arguments,
+                "--progress",
+                str(progress_path),
             ]
 
             def timeout_cleanup() -> None:
                 _cleanup_timed_out_backend_privileged_resources(resource_settings)
 
-            return _run(
-                gate_id,
-                command,
-                env=child_env,
-                timeout_seconds=_backend_catalog_module().CONTOUR_TIMEOUT_SECONDS[gate_id],
-                timeout_cleanup=timeout_cleanup,
-            )
+            diagnostic_ran = False
+            diagnostic_read = False
+
+            def timeout_diagnostic() -> None:
+                nonlocal diagnostic_ran, diagnostic_read
+                diagnostic_ran = True
+                diagnostic_read = _emit_backend_progress_timeout(progress_path)
+
+            result: int | None = None
+            try:
+                result = _run(
+                    gate_id,
+                    command,
+                    env=child_env,
+                    timeout_seconds=_backend_catalog_module().CONTOUR_TIMEOUT_SECONDS[gate_id],
+                    timeout_cleanup=timeout_cleanup,
+                    timeout_diagnostic=timeout_diagnostic,
+                )
+                return result
+            finally:
+                # A valid explicit-summary checkpoint is uploaded with the
+                # component artifact only after the outer timeout stopped its
+                # owned process group. Private /tmp checkpoints never persist.
+                remove_progress = (
+                    private_progress_directory is not None
+                    and (result != 124 or diagnostic_ran)
+                ) or (
+                    private_progress_directory is None
+                    and (result != 124 or (diagnostic_ran and not diagnostic_read))
+                )
+                process_group_stopped = result != 124 or diagnostic_ran
+                temporary_files_removed = (
+                    process_group_stopped
+                    and _remove_backend_progress_temps(progress_path)
+                )
+                if (
+                    remove_progress
+                    and temporary_files_removed
+                    and _remove_backend_progress_path(progress_path)
+                ):
+                    if private_progress_directory is not None:
+                        try:
+                            private_progress_directory.rmdir()
+                        except OSError:
+                            pass
+        _preflight_backend_test_environment(gate_id, arguments)
         return _run(
             gate_id,
             _backend_contour_command(gate_id, arguments),
@@ -1037,7 +1549,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "gate",
-        choices=("list", "ci", *GATES_BY_ID, *BACKEND_CONTOURS),
+        choices=("list", "ci", "impact", *GATES_BY_ID, *BACKEND_CONTOURS),
     )
     parser.add_argument("gate_arguments", nargs=argparse.REMAINDER)
     return parser.parse_args(argv)
@@ -1065,6 +1577,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.gate_arguments:
             raise VerificationError("ci accepts no extra arguments.")
         return dispatch_ci()
+    if args.gate == "impact":
+        paths: list[str] = []
+        arguments = list(args.gate_arguments)
+        index = 0
+        while index < len(arguments):
+            if arguments[index] != "--changed-path" or index + 1 >= len(arguments):
+                raise VerificationError("impact accepts repeated --changed-path PATH arguments only.")
+            paths.append(arguments[index + 1])
+            index += 2
+        print(json.dumps(impact_plan(paths), indent=2, ensure_ascii=False))
+        return 0
     return dispatch(args.gate, args.gate_arguments)
 
 

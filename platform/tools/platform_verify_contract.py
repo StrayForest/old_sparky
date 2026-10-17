@@ -442,196 +442,6 @@ def _workflow_step_blocks(job_block: str) -> tuple[str, ...]:
     )
 
 
-def _validated_scratch_diagnostic_filtered_workflow(
-    workflow_text: str,
-) -> tuple[str, list[str]]:
-    """Exclude only the validated diagnostic and upload steps from gate checks."""
-
-    issues: list[str] = []
-    job_block = _workflow_job_block(workflow_text, "backend-privileged")
-    if not job_block:
-        return workflow_text, ["backend-privileged is missing for scratch diagnostic"]
-
-    steps = _workflow_step_blocks(job_block)
-
-    def named_steps(name: str) -> list[tuple[int, str]]:
-        return [
-            (index, step)
-            for index, step in enumerate(steps)
-            if re.match(rf"^      - name: {re.escape(name)}[ \t]*(?:\r?\n|$)", step)
-        ]
-
-    diagnostic_name = "Run focused scratch restore diagnostic without gate credit"
-    upload_name = "Upload focused scratch restore diagnostic"
-    contour_name = "Run serial privileged catalog contour exactly once as root"
-    finalizer_name = "Require focused scratch restore diagnostic success"
-    diagnostic_matches = named_steps(diagnostic_name)
-    upload_matches = named_steps(upload_name)
-    contour_matches = named_steps(contour_name)
-    finalizer_matches = named_steps(finalizer_name)
-    for name, matches in (
-        (diagnostic_name, diagnostic_matches),
-        (upload_name, upload_matches),
-        (contour_name, contour_matches),
-        (finalizer_name, finalizer_matches),
-    ):
-        if len(matches) != 1:
-            issues.append(f"backend-privileged must contain exactly one {name} step")
-    if issues:
-        return workflow_text, issues
-
-    diagnostic_index, diagnostic_step = diagnostic_matches[0]
-    upload_index, upload_step = upload_matches[0]
-    contour_index, _ = contour_matches[0]
-    finalizer_index, finalizer_step = finalizer_matches[0]
-    if not diagnostic_index < upload_index < contour_index < finalizer_index:
-        issues.append("focused scratch diagnostic, upload, full contour and finalizer are out of order")
-
-    test_case = next(
-        (
-            case
-            for case in discover_test_cases()
-            if case.module == "test_platform_backup_restore_drill"
-            and case.method_name == "test_isolated_restore_signal_cleanup_under_root"
-        ),
-        None,
-    )
-    if test_case is None or test_case.contour != "backend-privileged":
-        issues.append("focused scratch diagnostic test is not owned by backend-privileged")
-    if test_case is not None:
-        expected_diagnostic_run = (
-            "set -euo pipefail\n"
-            "umask 077\n"
-            'diagnostic="$RUNNER_TEMP/platform-backup-scratch-diagnostic-'
-            '${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"\n'
-            "if ! {\n"
-            "  printf 'source_sha=%s\\nrun_id=%s\\nrun_attempt=%s\\n' \\\n"
-            '    "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"\n'
-            '} > "$diagnostic"; then\n'
-            '  echo "Unable to create the private scratch diagnostic log." >&2\n'
-            "  exit 1\n"
-            "fi\n"
-            "if sudo -n env -i \\\n"
-            "  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\\n"
-            "  HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1 \\\n"
-            '  GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS" \\\n'
-            '  RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \\\n'
-            "  PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform \\\n"
-            "  PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@"
-            "127.0.0.1:5432/platformdb_test \\\n"
-            "  PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials \\\n"
-            "  PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15 \\\n"
-            "  PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13 \\\n"
-            "  PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14 \\\n"
-            '  /bin/bash -c "cd \'$GITHUB_WORKSPACE/platform\' && \\\n'
-            "  .venv_platform/bin/python tools/platform_verify.py backend-privileged \\\n"
-            f'  --focused {test_case.test_id}" \\\n'
-            '  >> "$diagnostic" 2>&1; then\n'
-            "  result=0\n"
-            "else\n"
-            "  result=$?\n"
-            "fi\n"
-            "printf 'focused_exit=%s\\n' \"$result\" >> \"$diagnostic\"\n"
-            'chmod 600 "$diagnostic"\n'
-            'printf \'Focused scratch diagnostic exit=%s (no gate credit).\\n\' "$result"\n'
-            'exit "$result"\n'
-        )
-        try:
-            parsed_workflow = yaml.safe_load(workflow_text)
-        except yaml.YAMLError:
-            parsed_workflow = None
-        parsed_jobs = parsed_workflow.get("jobs") if isinstance(parsed_workflow, dict) else None
-        parsed_privileged = parsed_jobs.get("backend-privileged") if isinstance(parsed_jobs, dict) else None
-        parsed_steps = parsed_privileged.get("steps") if isinstance(parsed_privileged, dict) else None
-        parsed_diagnostic_steps = [
-            step
-            for step in parsed_steps or []
-            if isinstance(step, dict) and step.get("name") == diagnostic_name
-        ]
-        if (
-            len(parsed_diagnostic_steps) != 1
-            or parsed_diagnostic_steps[0].get("run") != expected_diagnostic_run
-        ):
-            issues.append(
-                "focused scratch diagnostic must match the exact closed script/env and "
-                "exact catalog-owned verifier selector"
-            )
-    if diagnostic_step.count("tools/platform_verify.py") != 1:
-        issues.append("focused scratch diagnostic must invoke the canonical verifier exactly once")
-    if "platform_run_tests.sh" in diagnostic_step:
-        issues.append("focused scratch diagnostic must not call the test runner directly")
-    if re.search(r"--(?:manifest|summary)\b", diagnostic_step):
-        issues.append("focused scratch diagnostic must not emit a gate manifest or summary")
-    if not re.search(r"(?m)^\s+id: scratch_restore_diagnostic$", diagnostic_step):
-        issues.append("focused scratch diagnostic must have its unique outcome id")
-    if len(re.findall(r"(?m)^\s+id: scratch_restore_diagnostic$", job_block)) != 1:
-        issues.append("backend-privileged must define the scratch diagnostic outcome id exactly once")
-    if not re.search(r"(?m)^\s+id: scratch_diagnostic_upload$", upload_step):
-        issues.append("focused scratch diagnostic upload must have its unique outcome id")
-    if len(re.findall(r"(?m)^\s+id: scratch_diagnostic_upload$", job_block)) != 1:
-        issues.append("backend-privileged must define the diagnostic upload outcome id exactly once")
-    if len(re.findall(r"(?m)^\s+continue-on-error:", diagnostic_step)) != 1 or not re.search(
-        r"(?m)^\s+continue-on-error: true$", diagnostic_step
-    ):
-        issues.append("focused scratch diagnostic must continue only to run the full contour")
-    for required in (
-        "umask 077",
-        'source_sha=%s\\nrun_id=%s\\nrun_attempt=%s',
-        '"$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
-        'diagnostic="$RUNNER_TEMP/platform-backup-scratch-diagnostic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"',
-        'chmod 600 "$diagnostic"',
-        '>> "$diagnostic" 2>&1',
-    ):
-        if required not in diagnostic_step:
-            issues.append(f"focused scratch diagnostic is missing private/source-bound capture: {required}")
-
-    if not re.search(r"(?m)^\s+if: \$\{\{ always\(\) \}\}$", upload_step):
-        issues.append("focused scratch diagnostic upload must run always")
-    if len(re.findall(r"(?m)^\s+continue-on-error:", upload_step)) != 1 or not re.search(
-        r"(?m)^\s+continue-on-error: true$", upload_step
-    ):
-        issues.append("focused scratch diagnostic upload must not prevent the full contour")
-    if "actions/upload-artifact@" not in upload_step:
-        issues.append("focused scratch diagnostic must use the pinned artifact uploader")
-    if "platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}" not in upload_step:
-        issues.append("focused scratch diagnostic artifact name must bind the workflow attempt")
-    if "${{ runner.temp }}/platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}.log" not in upload_step:
-        issues.append("focused scratch diagnostic upload path must bind the private attempt log")
-    if "if-no-files-found: error" not in upload_step:
-        issues.append("focused scratch diagnostic upload must fail when its log is absent")
-    if "retention-days: 14" not in upload_step:
-        issues.append("focused scratch diagnostic artifact retention must remain bounded")
-    if not re.search(r"(?m)^\s+if: \$\{\{ always\(\) \}\}$", finalizer_step):
-        issues.append("focused scratch diagnostic finalizer must run always")
-    expected_finalizer_env = (
-        "SCRATCH_DIAGNOSTIC_OUTCOME: ${{ steps.scratch_restore_diagnostic.outcome }}",
-        "SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME: ${{ steps.scratch_diagnostic_upload.outcome }}",
-    )
-    for value in expected_finalizer_env:
-        if value not in finalizer_step:
-            issues.append(f"focused scratch diagnostic finalizer must bind {value.split(':', 1)[0]}")
-    normalized_finalizer = re.sub(r"\s+", " ", finalizer_step)
-    expected_failure_branch = (
-        'if [[ "$SCRATCH_DIAGNOSTIC_OUTCOME" != "success" || '
-        '"$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success" ]]; then '
-        'echo "Focused scratch restore diagnostic or artifact upload failed; full contour still ran, but this job cannot pass." >&2 '
-        "exit 1 fi"
-    )
-    if expected_failure_branch not in normalized_finalizer or finalizer_step.count("exit 1") != 1:
-        issues.append("focused scratch diagnostic finalizer must fail inside the exact unsuccessful-outcome branch")
-    for outcome in (
-        "steps.scratch_restore_diagnostic.outcome",
-        "steps.scratch_diagnostic_upload.outcome",
-    ):
-        if outcome not in finalizer_step:
-            issues.append(f"focused scratch diagnostic finalizer must check {outcome}")
-    if issues:
-        return workflow_text, issues
-    filtered_workflow = workflow_text.replace(diagnostic_step, "", 1)
-    filtered_workflow = filtered_workflow.replace(upload_step, "", 1)
-    return filtered_workflow, []
-
-
 def host_tools_candidate_artifact_zip_curl_blocks(workflow_text: str) -> tuple[str, ...]:
     """Find every artifact ZIP download curl command in the candidate workflow.
 
@@ -1688,10 +1498,7 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
     """Check the backend DAG without executing any CI jobs."""
 
     issues: list[str] = []
-    execution_text, diagnostic_issues = _validated_scratch_diagnostic_filtered_workflow(
-        security_text
-    )
-    issues.extend(diagnostic_issues)
+    execution_text = security_text
     expected_jobs = {
         "backend-static": ("backend-unit", "backend-tool-contract", "performance-contract"),
         "backend-integration": ("backend-integration",),
@@ -1802,75 +1609,82 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
 
 
 def host_tools_pin_verification_issues(security_text: str) -> list[str]:
-    """Require real host-tools pin verification on a full-history CI job.
-
-    The ordinary backend contours intentionally keep their shallow checkout
-    for fast DB-free feedback.  The repository's historical installed pin
-    needs ancestry proof, so the non-secret verification-contract job owns one
-    explicit full-history resolve against the exact workflow SHA.
-    """
+    """Require an early exact-source pin check and explicit downstream gates."""
 
     issues: list[str] = []
-    block = _workflow_job_block(security_text, "verification-contract")
+    block = _workflow_job_block(security_text, "host-tools-pin-preflight")
     if not block:
-        return ["platform-security.yml is missing verification-contract host-tools pin owner"]
-
+        return ["platform-security.yml is missing host-tools-pin-preflight"]
     checkout_steps = tuple(
-        step
-        for step in _workflow_step_blocks(block)
-        if "actions/checkout@" in step
+        step for step in _workflow_step_blocks(block) if "actions/checkout@" in step
     )
     if len(checkout_steps) != 1:
-        issues.append(
-            "verification-contract must have exactly one checkout for real host-tools pin verification"
-        )
+        issues.append("host-tools-pin-preflight must have exactly one checkout")
     else:
-        checkout = checkout_steps[0]
         for marker, description in (
-            ("ref: ${{ github.sha }}", "the exact workflow SHA"),
+            ("ref: ${{ github.sha }}", "exact workflow SHA"),
             ("fetch-depth: 0", "full target history"),
             ("persist-credentials: false", "disabled checkout credentials"),
         ):
-            if marker not in checkout:
-                issues.append(
-                    f"verification-contract checkout must include {description}"
-                )
-
+            if marker not in checkout_steps[0]:
+                issues.append(f"host-tools-pin-preflight checkout must include {description}")
     resolver_steps = tuple(
-        step
-        for step in _workflow_step_blocks(block)
+        step for step in _workflow_step_blocks(block)
         if "platform_host_tools_pin.py resolve" in step
     )
     if len(resolver_steps) != 1:
-        issues.append(
-            "verification-contract must run the canonical host-tools pin resolver exactly once"
-        )
-        return issues
-
-    resolver = resolver_steps[0]
-    for marker, description in (
-        (
-            "name: Resolve and verify canonical host-tools pin against full target history",
-            "an explicit full-history host-tools pin step",
-        ),
-        (
-            "/usr/bin/python3 platform/tools/platform_host_tools_pin.py resolve",
-            "the canonical resolver entrypoint",
-        ),
-        ('--source-root "$GITHUB_WORKSPACE"', "the checked-out target source"),
-        ('--target-sha "$TARGET_SHA"', "TARGET_SHA"),
-        ('--expected-repository "$EXPECTED_REPOSITORY"', "the expected repository"),
-        ('test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"', "the repository allow-list"),
-        ("target_sha_re='^[0-9a-f]{40}$'", "the full lowercase target SHA check"),
-        ('test "$(stat -c \'%F:%h:%a\' -- "$pin_output")" = "regular file:1:600"', "the bounded resolver output file check"),
-        ('test "$(wc -l < "$pin_output" | tr -d \' \')" = 1', "the single-line resolver output check"),
-        ('[[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]', "the lowercase host-tools SHA check"),
-        ('trap \'rm -f -- "$pin_output"\' EXIT', "resolver output cleanup"),
-    ):
-        if marker not in resolver:
-            issues.append(f"verification-contract pin step must include {description}")
+        issues.append("host-tools-pin-preflight must run the canonical resolver exactly once")
+    else:
+        resolver = resolver_steps[0]
+        for marker, description in (
+            ("name: Resolve and verify canonical host-tools pin against full target history", "named resolver step"),
+            ("/usr/bin/python3 platform/tools/platform_host_tools_pin.py resolve", "canonical resolver entrypoint"),
+            ('--source-root "$GITHUB_WORKSPACE"', "checked-out target source"),
+            ('--target-sha "$TARGET_SHA"', "TARGET_SHA"),
+            ('--expected-repository "$EXPECTED_REPOSITORY"', "expected repository"),
+            ('test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"', "repository allow-list"),
+            ("target_sha_re='^[0-9a-f]{40}$'", "full lowercase target SHA check"),
+            ("test \"$(stat -c '%F:%h:%a' -- \"$pin_output\")\" = \"regular file:1:600\"", "private output metadata check"),
+            ("test \"$(wc -l < \"$pin_output\" | tr -d ' ')\" = 1", "single-line output check"),
+            ('[[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]', "host-tools SHA check"),
+            ("trap 'rm -f -- \"$pin_output\"' EXIT", "resolver output cleanup"),
+        ):
+            if marker not in resolver:
+                issues.append(f"host-tools-pin-preflight is missing {description}")
     if "secrets." in block or "environment:" in block:
-        issues.append("verification-contract host-tools pin proof must remain non-secret")
+        issues.append("host-tools-pin-preflight must not receive credentials or an environment")
+    if "permissions:\n      contents: read" not in block or "id-token:" in block or "attestations:" in block:
+        issues.append("host-tools-pin-preflight must have only contents: read permission")
+    condition = re.search(r"(?m)^    if: (.+)$", block)
+    if condition is None or any(
+        marker not in condition.group(1)
+        for marker in (
+            "!cancelled()",
+            "needs.classifier.result == 'success'",
+            "needs.baseline-runtime-guard.result == 'success'",
+            "docs-only",
+            "out-of-scope",
+            "full",
+        )
+    ):
+        issues.append("host-tools-pin-preflight must preserve classified route and baseline guards")
+    for job_id in (
+        "verification-contract", "backend-static", "backend-integration",
+        "backend-privileged", "python-quality", "security", "web-quality",
+        "web-hermetic", "docs", "migration", "release-runtime", "release-runtime-real",
+    ):
+        job = _workflow_job_block(security_text, job_id)
+        if not job:
+            continue
+        if "host-tools-pin-preflight" not in _workflow_job_needs(job):
+            issues.append(f"{job_id} must depend on host-tools-pin-preflight")
+        if "needs.host-tools-pin-preflight.result == 'success'" not in job:
+            issues.append(f"{job_id} must explicitly require successful host-tools-pin-preflight")
+    final = _workflow_job_block(security_text, "status-final")
+    if "host-tools-pin-preflight" not in _workflow_job_needs(final):
+        issues.append("status-final must account for host-tools-pin-preflight")
+    if "needs.host-tools-pin-preflight.result" not in final:
+        issues.append("status-final must publish the host-tools-pin-preflight result")
     return issues
 
 
@@ -1892,6 +1706,8 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
     fixture_needs = _workflow_job_needs(fixture)
     if "classifier" not in fixture_needs:
         issues.append("release-runtime fixture must depend on classifier")
+    if "host-tools-pin-preflight" not in fixture_needs or "needs.host-tools-pin-preflight.result == 'success'" not in fixture:
+        issues.append("release-runtime fixture must require host-tools-pin-preflight")
     if "baseline-runtime-guard" in fixture_needs and (
         "inputs.proof_mode == 'baseline-runtime'" not in fixture
         or "needs.baseline-runtime-guard.result == 'success'" not in fixture
@@ -1930,6 +1746,8 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
     real_needs = _workflow_job_needs(real)
     if "classifier" not in real_needs:
         issues.append("release-runtime-real must depend on classifier")
+    if "host-tools-pin-preflight" not in real_needs or "needs.host-tools-pin-preflight.result == 'success'" not in real:
+        issues.append("release-runtime-real must require host-tools-pin-preflight")
     if "timeout-minutes: 45" not in real:
         issues.append("release-runtime-real must retain a 45-minute job timeout")
     if "permissions:\n      contents: read" not in real:
@@ -2252,8 +2070,7 @@ def collect_issues() -> list[str]:
         issues.append("platform-security.yml must publish a machine-readable summary")
     issues.extend(_checkout_credential_issues("platform-security.yml", security_text))
     issues.extend(_ci_dependency_issues(security_text))
-    gate_contract_text, _ = _validated_scratch_diagnostic_filtered_workflow(security_text)
-    invocations = extract_gate_invocations(gate_contract_text)
+    invocations = extract_gate_invocations(security_text)
     missing = sorted(set(CI_GATE_IDS) - set(invocations))
     if missing:
         issues.append(f"CI does not invoke required canonical gates: {', '.join(missing)}")
@@ -2283,11 +2100,7 @@ def collect_issues() -> list[str]:
     unknown = sorted(
         gate_id
     for path, text in _workflow_texts()
-        for gate_id in extract_gate_invocations(
-            _validated_scratch_diagnostic_filtered_workflow(text)[0]
-            if path == SECURITY_WORKFLOW
-            else text
-        )
+        for gate_id in extract_gate_invocations(text)
         if gate_id not in GATES_BY_ID
         and gate_id not in (*BACKEND_CONTOURS, BACKEND_AGGREGATE, VERIFICATION_CONTOUR)
         and gate_id != "ci"

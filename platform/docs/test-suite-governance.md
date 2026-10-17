@@ -2,13 +2,21 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-16
+- Last reviewed: 2026-10-17
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
 requirements and CI membership. Use `list --json` when tooling needs the
 machine-readable registry. This document explains the architecture and
 placement rules; it does not repeat tool arguments.
+
+For a local change-impact plan, run from `platform/`:
+
+```sh
+python3 tools/platform_verify.py impact --changed-path platform/tools/platform_verify.py
+```
+
+The planner maps changed sources to complete owners; unknown or malformed paths select the full canonical gate set. It is a test-selection aid only: it cannot skip owner gates or replace exact-SHA CI. Changes to test modules select their complete owner contour.
 
 ## Verification layers
 
@@ -47,60 +55,42 @@ override for `@next/eslint-plugin-next`; remove that override after upstream
 releases a patched `braces` dependency. Run `tools/platform_verify.py
 web-quality` from `platform/`; the helper requires Node 26.3.1.
 
-The first eight gates are deterministic and always part of the normal CI
-aggregate. The conditional `release-runtime` gate is deterministic as well,
-but is intentionally excluded from `platform_verify.py ci`: the classifier
-enables it for an exact runtime-sensitive path change, a fail-closed fallback,
-an exact baseline-runtime proof, or every deployable full push to `dev`. This
-ensures that a later test-only push cannot deploy atop undelivered runtime
-changes without producing exact-target runtime proof. In the local `ci` aggregate, migration cleanup drops the disposable schema, so a validated test URL/schema and migration lock guard an Alembic-head re-upgrade before backend preflight; unsafe targets stop the aggregate, and standalone migration behavior is unchanged.
-On pull requests and `merge_group`, `release-runtime` is fixture-only: it
-builds staged runtime from pinned ZIP fixtures under `python -I`, then checks
-file-map/mode parity, ordered paths, archive validation and install behavior.
-Compact-v2 fixtures verify the source-suite/provider digests, provider
-retention, validator agreement and fixed read-only unit aliases; collision,
-identity-bound cleanup and UID paths are covered without a live browser. The
-gate has no production
-network, credentials or deployment authority. A separate `release-runtime-real`
-job runs for classifier-sensitive or fallback pushes to canonical `dev`, every
-deployable full push to `dev`, same-repository PRs targeting `dev` when that
-route requires the real builder, or `workflow_dispatch` whose ref is exactly
-`dev`. The PR route binds the
-tested merge SHA, ordered base/head parents and exact same-repository refs
-before building. It starts on a fresh runner, checks out the exact tested SHA,
-creates the production-style clean root venv and invokes the full
-`platform_build_release.sh` builder. It validates the archive checksum and
-`RELEASE.json` provenance read-only, emits only bounded status/digest data,
-and removes its identified temporary output/cache in an exit trap. The
-same-repository PR route also uploads one short-lived JSON size projection
-bound to the tested source, run and archive; the release archive, logs and
-build tree are never uploaded. The job receives no production secrets or SSH
-material and does not deploy; `status-final` independently requires the
-fixture job and real job on routes where each is required. Non-`dev` manual
-runs and ordinary/docs routes keep the real job skipped as selected by the
-classifier; there is no schedule trigger.
-The canonical builder keeps its ordinary build output in a private root-owned
-`0600` raw log and emits only allowlisted `RELEASE_BUILD_PHASE` markers to a
-separate root-owned `0600` marker stream. The real job reads only that bounded
-marker stream through `platform_release_build_diagnostics.py`'s explicit
-`--marker-log` interface before
-identity-checked cleanup and prints only the normalized phase, reason, cleanup
-state and builder/parser return codes. Missing, malformed, oversized, mutable
-or untrusted marker streams fail closed; the raw builder log is never parsed,
-printed or uploaded, and both files are removed with the identified temporary
-root after successful cleanup. Cleanup-identity failures remain fail-closed
-for operator investigation. The workflow contract verifies the exact
-identity-checked cleanup path; deletion-failure simulation is intentionally
-not mocked because it would replace the root-owned filesystem boundary with a
-test double. The builder's cleanup trap preserves the original
-failure status and emits a failed `complete` marker, so diagnostic success
-cannot turn a failed build into a green gate. A parser rejection is reported
-only with the bounded reason enum `oversized`, `metadata`, `control`,
-`encoding`, `marker`, `sequence` or `missing`.
-`platform_verify.py ci` can execute only the always-on deterministic gates and
-never connects to production, creates production fixtures, opens a production
-browser or starts a load generator. The latter four remain discoverable
-governance groups but are workflow-only.
+The first eight gates are deterministic and always part of the normal CI aggregate. The conditional `release-runtime` gate is
+deterministic as well, but is intentionally excluded from `platform_verify.py ci`: the classifier enables it for an exact
+runtime-sensitive path change, a fail-closed fallback, an exact baseline-runtime proof, or every deployable full push to `dev`.
+This ensures that a later test-only push cannot deploy atop undelivered runtime changes without producing exact-target runtime
+proof. In the local `ci` aggregate, migration cleanup drops the disposable schema, so a validated test URL/schema and migration
+lock guard an Alembic-head re-upgrade before backend preflight; unsafe targets stop the aggregate, and standalone migration
+behavior is unchanged. On pull requests and `merge_group`, `release-runtime` is fixture-only: it builds staged runtime from pinned
+ZIP fixtures under `python -I`, then checks file-map/mode parity, ordered paths, archive validation and install behavior.
+Compact-v2 fixtures verify the source-suite/provider digests, provider retention, validator agreement and fixed read-only unit
+aliases; collision, identity-bound cleanup and UID paths are covered without a live browser. The gate has no production network,
+credentials or deployment authority. A separate `release-runtime-real` job runs for classifier-sensitive or fallback pushes to
+canonical `dev`, every deployable full push to `dev`, same-repository PRs targeting `dev` when that route requires the real
+builder, or `workflow_dispatch` whose ref is exactly `dev`. The PR route binds the tested merge SHA, ordered base/head parents and
+exact same-repository refs before building. It starts on a fresh runner, checks out the exact tested SHA, creates the
+production-style clean root venv and invokes the full `platform_build_release.sh` builder. It validates the archive checksum and
+`RELEASE.json` provenance read-only, emits only bounded status/digest data, and removes its identified temporary output/cache in
+an exit trap. The same-repository PR route also uploads one short-lived JSON size projection bound to the tested source, run and
+archive; the release archive, logs and build tree are never uploaded. The job receives no production secrets or SSH material and
+does not deploy; `status-final` independently requires the fixture job and real job on routes where each is required. Non-`dev`
+manual runs and ordinary/docs routes keep the real job skipped as selected by the classifier; there is no schedule trigger. The
+canonical builder keeps its ordinary build output in a private root-owned `0600` raw log and emits only allowlisted
+`RELEASE_BUILD_PHASE` markers to a separate root-owned `0600` marker stream. The real job reads only that bounded marker stream
+through `platform_release_build_diagnostics.py`'s explicit `--marker-log` interface before identity-checked cleanup and prints
+only the normalized phase, reason, cleanup state and builder/parser return codes. Missing, malformed, oversized, mutable or
+untrusted marker streams fail closed; the raw builder log is never parsed, printed or uploaded, and both files are removed with
+the identified temporary root after successful cleanup. Cleanup-identity failures remain fail-closed for operator investigation.
+The workflow contract verifies the exact identity-checked cleanup path; deletion-failure simulation is intentionally not mocked
+because it would replace the root-owned filesystem boundary with a test double. The builder's cleanup trap preserves the original
+failure status and emits a failed `complete` marker, so diagnostic success cannot turn a failed build into a green gate. A parser
+rejection is reported only with the bounded reason enum `oversized`, `metadata`, `control`, `encoding`, `marker`, `sequence` or
+`missing`. `platform_verify.py ci` can execute only the always-on deterministic gates and never connects to production, creates
+production fixtures, opens a production browser or starts a load generator. The latter four remain discoverable governance groups
+but are workflow-only.
+
+
+The security workflow runs credential-free `host-tools-pin-preflight` before applicable test jobs. It resolves the exact-SHA pin against full history; downstream jobs require its success, and status finalization fails closed on a skipped prerequisite. The resolver result is not an input to the backup-verifier artifact.
 
 ## Backend catalog and contours
 
@@ -122,47 +112,49 @@ these five catalog contours:
 
 
 `test_platform_external_load` (performance-contract) covers bounded HTTP body failures, phase accounting, client CPU sampler lifecycle, cgroup-capacity reason parsing and mount-root mapping, and inline retry queue attribution; missing or ambiguous visible quota evidence remains UNKNOWN. `test_platform_evidence_privacy` (backend-tool-contract) owns whole-series run-window, production observer-row mapping, observer-timeline and identity-stripping projections. `test_platform_live_qa_runtime_install` (backend-privileged) exercises the copied dispatcher against its installed release validator, including missing/tampered refusal. The existing `test_platform_live_qa_guard` lock cases own the shared machine-lock boundary, while `test_platform_storage_maintenance` checks backup-only lazy imports and maintenance-to-guard lock identity.
+
+The root-only isolated-restore signal test runs once in the required `backend-privileged` contour. The aggregate summary must include its successful timing; missing or skipped execution fails. This current-run evidence does not replace the separately source- and parent-bound `baseline-runtime` proof, and does not authorize reuse across runs.
 The SSR admission-shed parser remains in `test_platform_ssr_observability` (performance-contract), public projection privacy in `test_platform_evidence_privacy` (backend-tool-contract), and the bounded web scheduler in the existing `frontend-audit-regressions.spec.ts` smoke owner. The inline retry queue regression adds one ID to the existing performance-contract module; it adds no module or gate-ownership entry.
 
-Every aggregate and backend sub-contour is guarded before test discovery by
-one pure, fail-closed resource validator. It requires the exact values
-`PLATFORM_ENVIRONMENT=test`, `PLATFORM_DB_SCHEMA=platform`, database
-`platformdb_test`, a literal IP loopback database host, and a literal IP
-loopback Redis host with path `/15`. Missing values, DNS names, host lists,
-malformed URLs, userinfo ambiguity, query strings and fragments are rejected;
-the validator performs no connection, DNS lookup or client operation. The
-shell wrapper and runner both invoke this same validator, including the
-aggregate-only artifact-verification path, so a skipped wrapper check cannot
-open a production target. A production environment or `platformdb` target is
-a `LOCAL GATE BLOCKED` refusal, not a test run.
-The aggregate and `backend-integration` runner additionally perform a
-read-only resource preflight: PostgreSQL must expose exactly the current
-Alembic head and the complete initial role seed, and Redis DB 15 must answer a
-ping. A missing migration or seed is a `LOCAL GATE BLOCKED` refusal with an
-instruction to run the migration gate, so an already-cleaned disposable
-database cannot produce a misleading cascade of HTTP 503 test failures.
-`backend-privileged` requires root and disposable Redis DB 15, but not PostgreSQL. The verifier resolves
-the safe dotenv once and passes the validated mapping to the child and timeout cleanup. CI provisions
-Redis 7 for both lanes; teardown flushes only DB 15. On timeout, the parent reaps its direct child
-before reacquiring the privileged lock; cleanup errors do not replace timeout 124.
-`backend-integration` and `backend-privileged` are serial because they share database, Redis or host-identity resources; the aggregate preserves that boundary. Release/install and systemd modules
-remain privileged even with temporary-directory fixtures because production paths enforce root
-ownership, fixed release paths or systemd state. Tests mock subprocess contracts instead of requiring
-a real mount namespace or `CAP_SYS_ADMIN` on the CI runner.
-`test_profile_access_cache_purge_is_fixed_bounded_and_verified` is
-`backend-integration`; it verifies fixed rollback/restore namespaces, bounded scans and fail-closed handling. `test_restore_profile_access_cache_purge_requires_stopped_services_and_skips_retention` is `backend-privileged`; it verifies restore purge requires stopped API/worker and skips backup/retention.
-`test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher`
-is a root-only `backend-privileged` and `release-runtime` fixture exercising
-the production runner, marker, dispatcher and isolated fake candidates for
-bounded capture, status, no-follow setup, cleanup and descendant termination.
-Successful captures are removed after reap and durable metadata; failed ones
-stay root-only for scoped owner cleanup, and raw output never enters logs.
-`test_cloudflare_failed_oneshot_is_quiescent_only_with_empty_cgroup_contract`
-is a root-only `backend-privileged`/`release-runtime` fixture accepting only
-failed process-free oneshots with empty `ControlGroup`; all else fails closed.
-Privileged release-lock tests hold a serial test guard and use unique
-root-owned files directly beneath `/run/lock`; cleanup removes only the exact
-test-prefixed regular file and never the production canonical lock.
+Every aggregate and backend sub-contour is guarded before test discovery by one pure, fail-closed resource validator. It requires
+the exact values `PLATFORM_ENVIRONMENT=test`, `PLATFORM_DB_SCHEMA=platform`, database `platformdb_test`, a literal IP loopback
+database host, and a literal IP loopback Redis host with path `/15`. Missing values, DNS names, host lists, malformed URLs,
+userinfo ambiguity, query strings and fragments are rejected; the validator performs no connection, DNS lookup or client
+operation. The shell wrapper and runner both invoke this same validator, including the aggregate-only artifact-verification path,
+so a skipped wrapper check cannot open a production target. A production environment or `platformdb` target is a `LOCAL GATE
+BLOCKED` refusal, not a test run. The aggregate and `backend-integration` runner additionally perform a read-only resource
+preflight: PostgreSQL must expose exactly the current Alembic head and the complete initial role seed, and Redis DB 15 must answer
+a ping. A missing migration or seed is a `LOCAL GATE BLOCKED` refusal with an instruction to run the migration gate, so an
+already-cleaned disposable database cannot produce a misleading cascade of HTTP 503 test failures. The migration scenario
+cleans the disposable schema when it exits; direct local sequencing must then apply `.venv_platform/bin/python -m alembic
+upgrade head` to `platformdb_test` before `backend-integration`, matching the CI job's separate schema-upgrade step.
+`backend-privileged` requires
+root and disposable Redis DB 15, but not PostgreSQL. The verifier resolves the safe dotenv once and passes the validated mapping
+to the child and timeout cleanup. CI provisions Redis 7 for both lanes; teardown flushes only DB 15. On timeout, the parent reaps
+its direct child before reacquiring the privileged lock; cleanup errors do not replace timeout 124. `backend-integration` and
+`backend-privileged` are serial because they share database, Redis or host-identity resources; the aggregate preserves that
+boundary. Release/install and systemd modules remain privileged even with temporary-directory fixtures because production paths
+enforce root ownership, fixed release paths or systemd state. Tests mock subprocess contracts instead of requiring a real mount
+namespace or `CAP_SYS_ADMIN` on the CI runner. `test_profile_access_cache_purge_is_fixed_bounded_and_verified` is
+`backend-integration`; it verifies fixed rollback/restore namespaces, bounded scans and fail-closed handling.
+`test_restore_profile_access_cache_purge_requires_stopped_services_and_skips_retention` is `backend-privileged`; it verifies
+restore purge requires stopped API/worker and skips backup/retention.
+
+The 11 catalogued `test_platform_load_runtime` cases that create real PID
+namespaces require a non-root Linux process with PID-namespace capability.
+The canonical verifier and direct runner check this exact ID set before test
+execution; a local miss is `LOCAL GATE BLOCKED`, not an exclusion or skip. The
+negative test for explicit namespace-probe refusal remains runnable on root.
+The complete `performance-contract` contour still runs on the hosted Security
+runner.
+`test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` is a root-only `backend-privileged` and
+`release-runtime` fixture exercising the production runner, marker, dispatcher and isolated fake candidates for bounded capture,
+status, no-follow setup, cleanup and descendant termination. Successful captures are removed after reap and durable metadata;
+failed ones stay root-only for scoped owner cleanup, and raw output never enters logs.
+`test_cloudflare_failed_oneshot_is_quiescent_only_with_empty_cgroup_contract` is a root-only
+`backend-privileged`/`release-runtime` fixture accepting only failed process-free oneshots with empty `ControlGroup`; all else
+fails closed. Privileged release-lock tests hold a serial test guard and use unique root-owned files directly beneath `/run/lock`;
+cleanup removes only the exact test-prefixed regular file and never the production canonical lock.
 
 Local/canonical invocations that use the host test services hold one global
 cross-UID lock at the fixed
@@ -268,18 +260,18 @@ resolver against the repository and target SHA. The fast DB-free backend
 contour stays shallow and proves the static contract plus the synthetic A/B
 pin-bump lifecycle; it does not silently skip historical ancestry proof.
 
-Operation-bound legacy LiveQA and maintenance-failure evidence fixtures in `test_platform_recovery_bootstrap` stay in `backend-privileged`; they cover receipt/pointer/venv identity, service/timer snapshot, bounded readiness retries, immutable evidence binding, fixed reset-failed diagnostics and receipt-last cleanup. The recovery workflow contract also executes the capture staging shell with fake SSH/SCP and a real OpenSSL CMS round trip, including certificate pin rejection, ciphertext tampering, wrong-key failure and plaintext exclusion; it adds no test ID or host operation.
+Operation-bound legacy LiveQA and maintenance-failure evidence fixtures in `test_platform_recovery_bootstrap` stay in `backend-privileged`; they cover receipt/pointer/venv identity, service/timer snapshot, bounded readiness retries, immutable evidence binding, fixed reset-failed diagnostics and receipt-last cleanup. The recovery workflow contract also executes the capture staging shell with fake SSH/SCP and a real OpenSSL CMS round trip, including certificate pin rejection, ciphertext tampering, wrong-key failure and plaintext exclusion. Its recovery-binding regression resolves the workflow by exact path and workflow ID while retaining failed-run, source, repository, ref and attempt checks; it does not accept a display-name prefix or add a host operation.
 `test_platform_release_recovery_boundaries` covers clamped reconcile timeout, retained receipts, retry after partial publish, and refusal to resume rollback without durable cache-purge proof. Its transaction-bound purge test uses the current release/pre-rollback venv for rollback and the candidate release/venv for install-abort. The protected activation recovery cases bind the exact prior provider and durable migration authorization, restore only the recorded core services while the health timer remains quiesced, and require a fresh successful health-monitor invocation before ordinary receipt-bound restoration. Their write-barrier fixtures verify refusal before authorization and stop before the first pointer mutation in the authorized path. `test_platform_live_qa_runtime_install` covers fixed retention-failure diagnostics, provider reuse without relaxing generation checks, M8 rollback reconciliation, and the bounded provider-only recovery boundary. Recovery tests verify the complete v1 runtime validator, source-manifest binding, all three logical pointer roles with deduplicated owner manifests, refusal to overwrite invalid targets, safe failure diagnostics, and private-stage cleanup on reference drift or publication failure. These are `backend-privileged` because they exercise release state and privileged payload ownership.
 `test_platform_live_qa_wrappers` also owns the source-bound fixed-stage status contract for public launch failures before the browser supervisor starts; its failure tests remain in `backend-privileged` and invoke no browser or database work.
 The same wrapper owns the optional closed browser-count line, bound to source/app/marker hashes and logical-case/attempt partitions before terminal launch status. Its one-case, no-retry live-user journey succeeds only with one executed/passed case and attempt and no skips or failures. Workflow `test_count` counts executed logical outcomes; total and skipped remain separate. Missing/invalid counts stay unavailable and sanitization never invents QA results. QA-only child-capture tests cover concurrent pipe draining, bounded output, closed diagnostics, timeout cleanup, secret privacy, and fixed systemd/Playwright commands; generic release subprocesses remain outside this adapter.
 `test_liveqa_reconcile_stderr_is_available_only_to_private_candidate_capture` checks private reconcile stderr. Its companion `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` verifies private capture and closed stdout/public markers; the executable catalog snapshot tracks both IDs.
 Privileged release tests prove promoted dependencies stay readable, relocation removes only wheel/RECORD-bound generated caches, cleanup is receipt/readiness/cgroup-bound, and runtime summaries stay out of deployment markers.
-Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity; tampering is refused. The origin proof follows a bounded, cycle-checked unchanged-release chain until the installer writes its root-private candidate-bound receipt. Owner tests cover two unchanged hops, pruning intermediate releases, receipt tampering and chain gaps; proof misses fail before fresh-venv allocation when required. These root-owned cases remain in `backend-privileged`; bootstrap extraction and release-size projection tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
+Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity; tampering is refused. The origin proof follows a bounded, cycle-checked unchanged-release chain until the installer writes its root-private candidate-bound receipt. Owner tests cover two unchanged hops, pruning intermediate releases, receipt tampering and chain gaps; proof misses fail before fresh-venv allocation when required. The required-reuse policy integration test invokes the real proof CLI and verifies that the installer persists its validated receipt. These root-owned cases remain in `backend-privileged`; bootstrap extraction and release-size projection tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
 `test_platform_cpu_profile` also owns the fixed-schema diagnostic-plan, process CPU-window, and bounded CPU-profile contracts in `performance-contract`; they cover exact service/process/phase binding, one-use request selection, released-runtime identity, and fixed-category summaries without exporting raw frames.
 `TmpfsAllocationAuditTests` in `test_platform_performance_contract` owns the metadata-only tmpfs diagnostic contracts in `performance-contract`. Synthetic private trees cover no-follow symlinks, regular-file hardlink deduplication, two-pass identity drift, entry caps, bounded `MemAvailable`/`Shmem` parsing, private outputs, the final execution-receipt rule and a complete synthetic `main` run. These tests do not scan the host `/dev/shm`, read service/process state, or permit cleanup.
 `test_platform_load_runtime` and `test_platform_external_load` own source-bound timeout checkpoints in `performance-contract`; diagnostic counters include completed HTTP attempts only and never grant acceptance. `PerformanceProfileContractTests.test_observer_progress_receipt_is_private_bound_monotonic_and_non_authoritative` verifies its private source/run/profile-bound monotonic receipt remains non-authoritative.
 `test_platform_profile_read_models` owns the profile cache-generation CAS service regressions in `backend-integration`; the real trigger/Redis ordering test in `test_platform_tournament_concurrency_integration` verifies join generation advancement and rejection of a stale leave delta.
-The canonical AST snapshot is 1,984 tests (1,912 backend, including 625 privileged) across 170 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 304, tool-contract 511, integration 260, privileged 625, and performance-contract 212. The source-bound backup proof module contributes 23 hermetic tool-contract cases, including the named-pair removal proof and tamper checks. Its helper-bundle workflow contract remains in the existing release-build contract module, whose full ownership is backend-privileged; it therefore runs in the isolated privileged contour and is not a new tool-contract case. The three maintenance-failure evidence/reset helper cases in `test_platform_recovery_bootstrap` are also backend-privileged and use synthetic receipt, unit and journal fixtures. The machine-readable catalog in `platform_test_catalog.py` is authoritative for the exact test IDs and digests. The Ready Vote transport-pair profile is a separate diagnostic contract; it adds no production workflow input beyond the fixed profile choice and does not count toward the 11-profile load matrix.
+The canonical AST snapshot is 1,988 tests (1,914 backend, including 627 privileged) across 170 modules, with every ID assigned exactly once. The 74 verification-contract tests are separately owned; the five backend contours are unit 304, tool-contract 511, integration 260, privileged 627, and performance-contract 212. The source-bound backup proof module contributes 23 hermetic tool-contract cases, including the named-pair removal proof and tamper checks. Its helper-bundle workflow contract remains in the existing release-build contract module, whose full ownership is backend-privileged; it therefore runs in the isolated privileged contour and is not a new tool-contract case. The maintenance-failure evidence/reset helper cases in `test_platform_recovery_bootstrap` are also backend-privileged and use synthetic receipt, unit and journal fixtures. The machine-readable catalog in `platform_test_catalog.py` is authoritative for the exact test IDs and digests. The Ready Vote transport-pair profile is a separate diagnostic contract; it adds no production workflow input beyond the fixed profile choice and does not count toward the 11-profile load matrix.
 `test_platform_release_capture_probe` belongs to `backend-tool-contract`. Its workflow-contract case keeps the existing diagnostics mode as the default and verifies isolation of the explicit read-only capture probe; helper cases use temporary release metadata, symlink fixtures and mocked unit-state reads to cover closed check results without touching host state. The actual pinned snapshot path also checks finite state/return-code observations for the failing owned-unit query without exposing command output or issuing another query. The default-off `--diagnostic-systemd-state` route separately validates the exact pending target and canonical systemd receipt, emits bounded private expected/observed unit facts, and does not run payload, nginx, health, restore or recovery actions; collection, validation, current-state comparison and historical-cause status are distinct. `test_platform_release_active_artifact_proof` also belongs to `backend-tool-contract`; it executes a read-only proof with a tiny synthetic archive, archive-derived payload comparison, generated bytecode validation, closed receipt/current-pointer refusals, traversal-error handling and no-write assertions. The existing `test_platform_recovery_bootstrap` owner verifies default-off reconcile, proof-success skip and proof-refusal stop behavior. Release retention tests own locked candidate-set rechecks and belong to `backend-privileged`.
 
 `test_platform_backup_restore_drill` owns newest-pair restore, preserve-existing inventory, and named-pair proof behavior in `backend-tool-contract`; it verifies complete dump/sidecar pairing and content hashes, preserves every prior file identity, validates ordered pre-delete removal evidence, and rejects changed, incomplete or path-escaping pairs. The post-publication member-change regression additionally proves that the final inventory check rejects a changed old member and rolls back only the newly owned pair. Its schema-1/schema-2 private lifecycle diagnostic validator, closed host-memory guard-site frame, binary `/proc/<pid>/stat` start-time parser, closed first-fault projection, and optional private phase-boundary projection are also covered here, including a real self-process read, malformed byte fixtures, and preservation of the original controller failure when secondary diagnostic collection fails. Phase events are ordered boundary history with separate worker/controller clocks; tests keep malformed or partial observations secondary to the original guard. Its root-only isolated-restore signal, two-phase worker-authorization barrier, resource-guard lifecycle and scratch-directory mode-before-ownership capability regression tests are assigned to `backend-privileged`, where they exercise the real root-owned `/run` scratch boundary without skipping the coverage. `test_platform_storage_maintenance` owns lock-held build-cache eviction/fallback-compaction integration and the canonical lock-aware backup workflow contract in `backend-privileged`, including schema-1 compatibility, closed schema-2 scratch-unit and host-memory diagnostic projections, the optional private phase-attribution handoff, dual-channel validation of the private host-guard receipt, rejection of malformed summaries, the full-maintenance preserve-all and protected-proof CLI/wiring contracts, and the exclusive no-archive authorization-probe CLI contract. Its backup workflow regression also executes the extracted remote normalizer call with runner-only uppercase flag variables absent, proving the validated lowercase positional values reach the real normalizer under Bash `nounset`. `test_platform_backup_probe_workflow_contract` owns source-bound authorization-probe workflow validation in `backend-tool-contract`; it checks exact Security/source/helper gating, the no-database/no-backup path, closed success/failure envelopes, durable private receipt binding/no-overwrite/no-upload, and first-fault/phase-attribution privacy. `test_platform_maintenance_qa_evidence` owns source-bound live-QA artifact validation in `backend-tool-contract`; its positive reports are emitted by the checked-in live-launch and live-user sanitizers with synthetic inputs, while fake API metadata and ZIP archives cover exact workflow/run/attempt binding, expiry, digest, malformed archive, closed report behavior and binding of the private protected-retention proof to the manifest and new archive. `test_platform_release_build_contract` covers pinned cache integrity/regeneration. New aggregate scratch-allocation schema/privacy, bounded metadata-walk, mount-identity, parent-root-view, and first-fault-precedence regressions also belong to `test_platform_backup_restore_drill` under `backend-tool-contract`; they use synthetic proc/mount records and disposable temporary trees and never read production paths or change a resource guard. Named-backup cases remain in these existing owners; the catalog remains authoritative and all tests use synthetic paths only.
@@ -422,11 +414,21 @@ cd platform
 .venv_platform/bin/python tools/platform_verify.py list
 .venv_platform/bin/python tools/platform_verify.py backend --focused tests.test_platform_domain
 .venv_platform/bin/python tools/platform_verify.py python-quality
+.venv_platform/bin/python tools/platform_verify.py verification-contract
 ```
+
+Use the repository's `.venv_platform` interpreter for Python gates; a system `python3` may lack the required dependencies and is not a canonical owner run.
 
 `LOCAL GATE BLOCKED` means a required safe dependency such as test PostgreSQL,
 isolated Redis or Chromium is unavailable. A smaller substitute must not be
 reported as a complete-gate pass.
+
+The privileged storage-maintenance host-contract test is catalogued with its
+GitHub-hosted Linux environment markers. The canonical verifier and runner
+check those markers before launching the contour or preparing shared test
+resources; a local run reports `LOCAL GATE BLOCKED` while the exact full
+contour remains required on the hosted Security runner. Do not spoof runner
+markers or skip the test's own host-safety assertions.
 
 ### Python CI dependency contract
 
@@ -533,49 +535,32 @@ reviewed guard before exposing an SSH secret; host-side revalidation fails
 closed when the installed helper is absent or returns an error. The canonical
 load-profile registry remains the owner of profile IDs and dispatchability.
 
-The canonical load-profile registry is `platform/performance/`.
-Profiles record fixture shape, logical actions, HTTP attempts, concurrency,
-spread/ramp, retry semantics, expected statuses, correctness, latency budgets,
-resource evidence and cleanup. The external HTTP generator runs on the
-GitHub-hosted runner. The production host performs only bounded fixture,
-observer and exact-cleanup work; it never generates the measured client load.
-Production SSH secrets are scoped only to trusted fixture, finalization and
-cleanup steps: checkout persists no credentials, and each checked-out client
-or evaluator runs with an explicit allowlist while private keys, SSH auth
-sockets and control paths are absent from the runner. The external-load workflow contract executes cleanup-evidence handoff from finalizer copy through origin artifact and evaluator sanitization; missing transcripts fail projection and final acceptance.
-The same contract applies to every production workflow: SSH secret expressions
-are step-local only, and checkout, artifact upload/download and checked-out
-client steps must not inherit them. Read-only web-runtime diagnostics upload
-only fixed-schema aggregate summaries; producer/helper failures fail closed and
-successful empty input is the only permitted empty result.
-Candidate checkout/build/load jobs and environment-approved SSH jobs are
-separate fresh jobs. A secret-bearing job never checks out the candidate or
-executes a candidate-produced program; it consumes only a fixed-path,
-closed-schema handoff or immutable release archive after inline validation of
-the exact target SHA, artifact digest and provenance. Long-running origin
-supervisors detach at the trusted remote dispatcher boundary, so a local
-background child cannot cross into a later candidate job or retain runner
-credentials.
-The production deploy DAG keeps its dispatch validator always scheduled,
-builds and publishes the candidate artifact only in the separate
-non-secret build-release job, and requires both validator and build success
-before the production job can consume that exact artifact. The
-environment-approved production job has no checkout or candidate build
-executable; verification-contract owns this DAG assertion.
-The standardized production SSH workflows that materialize credentials use a
-literal, per-workflow `$RUNNER_TEMP/...-ssh` directory; setup and cleanup
-reject a directory symlink. An `always()` cleanup removes only the named key,
-`known_hosts`, config and control-socket paths, verifies each path and the
-directory are absent, clears `SSH_DIR` through `GITHUB_ENV`, and gates any
-later artifact action on cleanup success. Cleanup is never
-`continue-on-error`, so a cleanup failure keeps the job failed without
-replacing the primary operation result.
-Their host-key setup uses the same bounded two-attempt contract: each fresh
-mode-600 scan file is limited by `timeout --foreground 4s` around
-`ssh-keyscan -T 3`, with a visible 0.5-second backoff and exact pinned
-Ed25519/fingerprint validation. The SSH contract test discovers every workflow
-site dynamically and exercises first-attempt recovery, persistent failure,
-wrong/multiple/malformed output, attempt bounds and candidate cleanup.
+The canonical load-profile registry is `platform/performance/`. Profiles record fixture shape, logical actions, HTTP attempts,
+concurrency, spread/ramp, retry semantics, expected statuses, correctness, latency budgets, resource evidence and cleanup. The
+external HTTP generator runs on the GitHub-hosted runner. The production host performs only bounded fixture, observer and
+exact-cleanup work; it never generates the measured client load. Production SSH secrets are scoped only to trusted fixture,
+finalization and cleanup steps: checkout persists no credentials, and each checked-out client or evaluator runs with an explicit
+allowlist while private keys, SSH auth sockets and control paths are absent from the runner. The external-load workflow contract
+executes cleanup-evidence handoff from finalizer copy through origin artifact and evaluator sanitization; missing transcripts fail
+projection and final acceptance. The same contract applies to every production workflow: SSH secret expressions are step-local
+only, and checkout, artifact upload/download and checked-out client steps must not inherit them. Read-only web-runtime diagnostics
+upload only fixed-schema aggregate summaries; producer/helper failures fail closed and successful empty input is the only
+permitted empty result. Candidate checkout/build/load jobs and environment-approved SSH jobs are separate fresh jobs. A
+secret-bearing job never checks out the candidate or executes a candidate-produced program; it consumes only a fixed-path,
+closed-schema handoff or immutable release archive after inline validation of the exact target SHA, artifact digest and
+provenance. Long-running origin supervisors detach at the trusted remote dispatcher boundary, so a local background child cannot
+cross into a later candidate job or retain runner credentials. The production deploy DAG keeps its dispatch validator always
+scheduled, builds and publishes the candidate artifact only in the separate non-secret build-release job, and requires both
+validator and build success before the production job can consume that exact artifact. The environment-approved production job has
+no checkout or candidate build executable; verification-contract owns this DAG assertion. The standardized production SSH
+workflows that materialize credentials use a literal, per-workflow `$RUNNER_TEMP/...-ssh` directory; setup and cleanup reject a
+directory symlink. An `always()` cleanup removes only the named key, `known_hosts`, config and control-socket paths, verifies each
+path and the directory are absent, clears `SSH_DIR` through `GITHUB_ENV`, and gates any later artifact action on cleanup success.
+Cleanup is never `continue-on-error`, so a cleanup failure keeps the job failed without replacing the primary operation result.
+Their host-key setup uses the same bounded two-attempt contract: each fresh mode-600 scan file is limited by `timeout --foreground
+4s` around `ssh-keyscan -T 3`, with a visible 0.5-second backoff and exact pinned Ed25519/fingerprint validation. The SSH contract
+test discovers every workflow site dynamically and exercises first-attempt recovery, persistent failure, wrong/multiple/malformed
+output, attempt bounds and candidate cleanup.
 
 Every retained result identifies its source SHA, profile ID/version/digest,
 runner, fixture shape, offered logical actions, HTTP attempts and acceptance

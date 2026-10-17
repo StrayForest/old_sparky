@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ast
 from contextlib import redirect_stdout
 import fcntl
 import hashlib
@@ -2894,6 +2895,144 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn("$runtime/current/tools", recover)
         self.assertNotIn("platform_release_rollback.sh", recover)
 
+    def test_failed_deploy_recovery_binding_uses_stable_workflow_identity(self) -> None:
+        import yaml
+
+        recovery_path = REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
+        recovery_source = recovery_path.read_text(encoding="utf-8")
+        workflow = yaml.safe_load(recovery_source)
+        job = workflow["jobs"]["recover"]
+        step = next(
+            item for item in job["steps"]
+            if item.get("name") == "Validate exact security and recovery provenance before SSH"
+        )
+        match = re.search(
+            r'''/usr/bin/python3 -I -B - "\$metadata" "\$GITHUB_OUTPUT" <<'PY'\n(?P<script>.*?)\n[ \t]*PY(?:\n|$)''',
+            step["run"],
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match, "provenance step must keep its bounded Python validator")
+        validator = textwrap.dedent(match.group("script"))
+        tree = ast.parse(validator)
+        failed_branch = next(
+            node for node in tree.body
+            if isinstance(node, ast.If)
+            and "RECOVERY_ACTION" in ast.get_source_segment(validator, node.test)
+            and "quarantine_populated_quiesce" in ast.get_source_segment(validator, node.test)
+        )
+        initial_binding = next(
+            node for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "failed_deploy_values"
+                    for target in node.targets)
+        )
+        executable = compile(
+            ast.Module(body=[initial_binding, failed_branch], type_ignores=[]),
+            "<recovery failed-deploy binding>",
+            "exec",
+        )
+        workflow_metadata = {
+            "id": 410,
+            "name": "Platform production deploy",
+            "path": ".github/workflows/platform-production-deploy.yml",
+            "state": "active",
+        }
+        failed_run = {
+            "id": 5001,
+            "run_attempt": 2,
+            "workflow_id": 410,
+            "name": (
+                "Platform production deploy mode=baseline-reconcile target="
+                + "a" * 40 + " source=5000.1 auto=4999.1"
+            ),
+            "path": ".github/workflows/platform-production-deploy.yml",
+            "head_branch": "dev",
+            "head_sha": "a" * 40,
+            "event": "workflow_dispatch",
+            "status": "completed",
+            "conclusion": "failure",
+            "repository": {"full_name": "StrayForest/old_sparky"},
+        }
+        jobs_payload = {
+            "total_count": 1,
+            "jobs": [{
+                "id": 6001,
+                "name": "Deploy production",
+                "run_id": 5001,
+                "run_attempt": 2,
+                "head_sha": "a" * 40,
+                "status": "completed",
+                "conclusion": "failure",
+            }],
+        }
+
+        def run_guard(*, workflow_row=None, run_row=None, jobs_row=None):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "failed-deploy-workflow.json").write_text(
+                    json.dumps(workflow_row or workflow_metadata), encoding="utf-8"
+                )
+                (root / "failed-deploy-run.json").write_text(
+                    json.dumps(run_row or failed_run), encoding="utf-8"
+                )
+                (root / "failed-deploy-jobs.json").write_text(
+                    json.dumps(jobs_row or jobs_payload), encoding="utf-8"
+                )
+                namespace = {
+                    "json": json,
+                    "os": os,
+                    "re": re,
+                    "root": root,
+                    "repo": "StrayForest/old_sparky",
+                }
+                with patch.dict(os.environ, {
+                    "RECOVERY_ACTION": "quarantine_populated_quiesce",
+                    "FAILED_DEPLOY_RUN_ID": "5001",
+                    "FAILED_DEPLOY_RUN_ATTEMPT": "2",
+                }, clear=False):
+                    exec(executable, namespace)
+                return namespace["failed_deploy_values"]
+
+        self.assertEqual(run_guard(), (5001, 2, "a" * 40))
+        mutations = (
+            ("workflow metadata id", "workflow", {"id": 411}),
+            ("workflow metadata path", "workflow", {"path": ".github/workflows/other.yml"}),
+            ("run workflow id", "run", {"workflow_id": 411}),
+            ("run workflow path", "run", {"path": ".github/workflows/other.yml"}),
+            ("repository", "run", {"repository": {"full_name": "attacker/fork"}}),
+            ("branch", "run", {"head_branch": "topic"}),
+            ("run source versus job source", "run", {"head_sha": "b" * 40}),
+            ("attempt", "run", {"run_attempt": 3}),
+            ("job identity", "jobs", {"jobs": [{**jobs_payload["jobs"][0], "name": "Other job"}]}),
+        )
+        for label, target, changes in mutations:
+            with self.subTest(label=label):
+                workflow_row = dict(workflow_metadata)
+                run_row = dict(failed_run)
+                jobs_row = {"total_count": 1, "jobs": [dict(jobs_payload["jobs"][0])]}
+                if target == "workflow":
+                    workflow_row.update(changes)
+                elif target == "run":
+                    run_row.update(changes)
+                else:
+                    jobs_row.update(changes)
+                with self.assertRaises(SystemExit):
+                    run_guard(
+                        workflow_row=workflow_row,
+                        run_row=run_row,
+                        jobs_row=jobs_row,
+                    )
+
+        self.assertIn(
+            '"$api/actions/workflows/platform-production-deploy.yml"',
+            step["run"],
+        )
+        self.assertIn(
+            'failed.get("workflow_id") != deploy_workflow_id',
+            validator,
+        )
+        self.assertNotIn('failed.get("name") != "Platform production deploy"', validator)
+
     def test_supervisor_provenance_consumer_matches_canonical_ci_schema(self) -> None:
         """Execute the supervisor consumer against the CI-produced provenance.
 
@@ -4130,7 +4269,7 @@ fail 'private lock detail must not cross the public channel'
             )
             accepted_diag = (
                 "RELEASE_INSTALL_DIAG schema=1 status=failed "
-                "class=production_guard stage=disk_guard exit_status=23 "
+                "class=venv_policy stage=venv_policy_proof exit_status=23 "
                 "release_slug={slug}\n"
             )
             cleanup_marker = (
@@ -4155,7 +4294,7 @@ fail 'private lock detail must not cross the public channel'
                 diagnostic.stdout,
                 "candidate_status=23 capture_state=complete "
                 "install_diag_state=classified install_diag_reason=matched "
-                "install_class=production_guard install_stage=disk_guard install_exit=23\n",
+                "install_class=venv_policy install_stage=venv_policy_proof install_exit=23\n",
             )
             private_stderr = (diagnostic_dir / "candidate.stderr").read_text(
                 encoding="ascii"
@@ -4185,12 +4324,21 @@ fail 'private lock detail must not cross the public channel'
                 "RELEASE_DEPLOY schema=1 status=failed class=deployment "
                 "phase=candidate reason=activation_failed "
                 "candidate_diag_state=classified candidate_diag_reason=matched "
-                "candidate_class=production_guard candidate_stage=disk_guard "
+                "candidate_class=venv_policy candidate_stage=venv_policy_proof "
                 f"candidate_exit_status=23 release_slug={diagnostic_slug} "
                 f"source_sha={target_sha}\n",
             )
             self.assertNotIn("RELEASE_INSTALL_DIAG", public.stdout)
             self.assertNotIn("pending_operation", public.stdout)
+            dispatched = io.StringIO()
+            with redirect_stdout(dispatched):
+                status = platform_workflow_remote_dispatch._run_bounded_child(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", diagnostic_harness],
+                    timeout_seconds=5,
+                    expected_release_marker=("deploy", diagnostic_slug, target_sha),
+                )
+            self.assertEqual(status, 23, dispatched.getvalue())
+            self.assertEqual(dispatched.getvalue(), public.stdout)
 
             diagnostic_cases = (
                 (
@@ -7344,6 +7492,9 @@ cleanup
         function_start = install.index('VENV_INSTALL_POLICY="legacy"')
         function_end = install.index("\nLOCK_HELPER=", function_start)
         production_functions = install[function_start:function_end]
+        diagnostic_start = install.index("emit_install_failure_diagnostic() {")
+        diagnostic_end = install.index("\ntrap cleanup_failed_install EXIT", diagnostic_start)
+        production_diagnostic = install[diagnostic_start:diagnostic_end]
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -7441,6 +7592,8 @@ cleanup
             # guard threshold cases below use deterministic capacity tuples.
             guard_harness = (
                 production_functions
+                + "\n"
+                + production_diagnostic
                 + "\nPREVIOUS_TARGET=/previous\n"
                 + "ORIGINAL_PREVIOUS_TARGET=/older\n"
                 + "TRANSACTION_STATE=/state\n"
@@ -7456,6 +7609,9 @@ cleanup
                 + "  printf '\\n'\n"
                 + "else\n"
                 + "  printf 'rejected:%s\\n' \"$SKIP_PYTHON_DEPS\"\n"
+                + "  INSTALL_DIAGNOSTIC_CLASS=venv_policy\n"
+                + f"  PUBLIC_RELEASE_SLUG={RELEASE_SLUG!r}\n"
+                + "  emit_install_failure_diagnostic 1\n"
                 + "fi\n"
             )
 
@@ -7529,24 +7685,28 @@ cleanup
             empty_proof, marker, sentinel = run_guard(valid_policy, verifier_output="")
             self.assertEqual(empty_proof.returncode, 0, empty_proof.stderr)
             self.assertEqual(empty_proof.stdout.strip(), "rejected:0")
+            self.assertIn("stage=venv_policy_proof", empty_proof.stderr)
             self.assertTrue(marker.is_file())
             self.assertFalse(sentinel.exists())
 
             missed, marker, sentinel = run_guard(valid_policy, verifier_rc=1)
             self.assertEqual(missed.returncode, 0, missed.stderr)
             self.assertEqual(missed.stdout.strip(), "rejected:0")
+            self.assertIn("stage=venv_policy_proof", missed.stderr)
             self.assertTrue(marker.is_file())
             self.assertFalse(sentinel.exists())
 
             bypass, marker, sentinel = run_guard(valid_policy, skip=1)
             self.assertEqual(bypass.returncode, 0, bypass.stderr)
             self.assertEqual(bypass.stdout.strip(), "rejected:1")
+            self.assertIn("stage=venv_policy_preconditions", bypass.stderr)
             self.assertFalse(marker.exists())
             self.assertFalse(sentinel.exists())
 
             malformed, marker, sentinel = run_guard('{"schema":true,"transition":"require_proven_reuse"}\n')
             self.assertEqual(malformed.returncode, 0, malformed.stderr)
             self.assertEqual(malformed.stdout.strip(), "rejected:0")
+            self.assertIn("stage=venv_policy_parse", malformed.stderr)
             self.assertFalse(marker.exists())
             self.assertFalse(sentinel.exists())
 
@@ -7584,6 +7744,7 @@ cleanup
             )
             self.assertEqual(low_space.returncode, 0, low_space.stderr)
             self.assertEqual(low_space.stdout.strip(), "rejected:0")
+            self.assertIn("stage=venv_policy_space", low_space.stderr)
             self.assertTrue(marker.is_file())
             self.assertFalse(sentinel.exists())
 

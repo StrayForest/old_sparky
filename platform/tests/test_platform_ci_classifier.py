@@ -949,6 +949,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 "EVENT_NAME": "workflow_dispatch",
                 "PROOF_MODE": "baseline-runtime",
                 "BASELINE_GUARD_RESULT": "success",
+                "HOST_TOOLS_PIN_PREFLIGHT_RESULT": "success",
                 "TARGET_SHA_INPUT": self.TARGET_SHA,
                 "PROOF_RUN_ID": "12345",
                 "PROOF_RUN_ATTEMPT": "1",
@@ -1019,6 +1020,22 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     self.assertEqual(failed.returncode, 0, failed.stderr)
                     self.assertEqual(failed.stdout.strip(), "false")
 
+            failed_preflight_environment = dict(environment)
+            failed_preflight_environment["HOST_TOOLS_PIN_PREFLIGHT_RESULT"] = "failure"
+            failed_preflight_environment["SUMMARY_PATH"] = str(
+                Path(directory) / "failed-host-tools-preflight.json"
+            )
+            failed_preflight = subprocess.run(
+                ["/usr/bin/python3"],
+                input=status_script,
+                text=True,
+                capture_output=True,
+                env=failed_preflight_environment,
+                check=False,
+            )
+            self.assertEqual(failed_preflight.returncode, 0, failed_preflight.stderr)
+            self.assertEqual(failed_preflight.stdout.strip(), "false")
+
             invalid_environment = dict(environment)
             invalid_environment["PROOF_MODE"] = "unrecognized"
             invalid_environment["SUMMARY_PATH"] = str(Path(directory) / "invalid.json")
@@ -1064,6 +1081,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "EVENT_NAME": "workflow_dispatch",
                     "PROOF_MODE": "baseline-runtime",
                     "BASELINE_GUARD_RESULT": "success",
+                    "HOST_TOOLS_PIN_PREFLIGHT_RESULT": "success",
                     "TARGET_SHA_INPUT": self.TARGET_SHA,
                     "PROOF_RUN_ID": "12345",
                     "PROOF_RUN_ATTEMPT": "1",
@@ -1975,6 +1993,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "CLASSIFIER_RESULT": "success",
             "PROOF_MODE": "standard",
             "BASELINE_GUARD_RESULT": "skipped",
+            "HOST_TOOLS_PIN_PREFLIGHT_RESULT": "success",
             "EVENT_NAME": "pull_request",
             "ROUTE_EVENT": "pull_request",
             "ROUTE_CLASS": "docs-only",
@@ -2035,6 +2054,28 @@ class PlatformCiClassifierTests(unittest.TestCase):
                         summary["requires_release_runtime"],
                         raw_runtime == "true" or raw_fallback == "true",
                     )
+
+            for preflight_result in (None, "failure", "skipped"):
+                with self.subTest(host_tools_pin_preflight=preflight_result):
+                    environment = os.environ.copy()
+                    environment.update(base_environment)
+                    if preflight_result is None:
+                        environment.pop("HOST_TOOLS_PIN_PREFLIGHT_RESULT", None)
+                    else:
+                        environment["HOST_TOOLS_PIN_PREFLIGHT_RESULT"] = preflight_result
+                    environment["SUMMARY_PATH"] = str(
+                        Path(directory) / f"preflight-{preflight_result or 'missing'}.json"
+                    )
+                    completed = subprocess.run(
+                        ["/usr/bin/python3"],
+                        input=status_script,
+                        text=True,
+                        capture_output=True,
+                        env=environment,
+                        check=False,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(completed.stdout.strip(), "false")
 
             trusted_base = {
                 **base_environment,

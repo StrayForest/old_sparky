@@ -28,11 +28,16 @@ from tools.platform_test_catalog import (
     CONTOUR_METADATA,
     CONTOUR_TIMEOUT_SECONDS,
     EXPECTED_SNAPSHOT,
+    INTENTIONAL_SKIP_IDS,
+    TEST_ENVIRONMENT_REQUIREMENTS,
+    TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS,
     TestCase as CatalogTestCase,
     VERIFICATION_CONTOUR,
     cases_for_contour,
     discover_test_cases,
     test_id_digest,
+    test_environment_requirement_issues,
+    test_execution_requirement_issues,
 )
 from tools.platform_load import (
     LoadProfileError,
@@ -61,15 +66,19 @@ from tools.platform_verify import (
     _cleanup_timed_out_backend_privileged_resources,
     _create_private_migration_diagnostic,
     _privileged_runner_python,
+    _preflight_backend_test_environment,
     _run,
     _validated_privileged_environment,
     _verification_contract_commands,
     dispatch,
+    impact_plan,
     dispatch_ci,
     registry_payload,
 )
 from tools.platform_test_runner import (
+    ContourTimeout,
     TimingRunner,
+    TestTiming,
     TestResourceConfigurationError,
     _clear_integration_auth_rate_limit_keys,
     _summary,
@@ -77,7 +86,9 @@ from tools.platform_test_runner import (
     _require_integration_resources_ready,
     _require_redis_db15_ready,
     _teardown_privileged_redis_resource,
+    _write_progress_json,
     main as test_runner_main,
+    _preflight_execution_environment,
     validate_test_resource_configuration,
     verify_backend_components,
 )
@@ -95,7 +106,6 @@ from tools.platform_verify_contract import (
     SECURITY_WORKFLOW,
     _production_secret_scope_issues,
     _backend_workflow_issues,
-    _validated_scratch_diagnostic_filtered_workflow,
     action_pin_issues,
     collect_issues,
     _ci_dependency_issues,
@@ -317,6 +327,167 @@ def _lock_holder(command: list[str], *, cwd: Path, env: dict[str, str] | None = 
 
 
 class PlatformVerificationContractTests(unittest.TestCase):
+    def test_hosted_test_environment_blocks_before_privileged_resources(self) -> None:
+        test_id = next(iter(TEST_ENVIRONMENT_REQUIREMENTS))
+        required_environment = dict(TEST_ENVIRONMENT_REQUIREMENTS[test_id])
+        self.assertEqual(
+            registry_payload()["backend_test_catalog"]["test_environment_requirements"][test_id],
+            required_environment,
+        )
+        execution_requirements = registry_payload()["backend_test_catalog"][
+            "test_execution_requirements"
+        ]
+        self.assertEqual(
+            set(execution_requirements),
+            set(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS),
+        )
+        registered_ids = {case.test_id for case in discover_test_cases()}
+        self.assertEqual(len(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS), 11)
+        self.assertLessEqual(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS, registered_ids)
+        negative_probe_id = (
+            "tests.test_platform_load_runtime.LoadRuntimeBudgetTests."
+            "test_namespace_probe_is_explicit_and_has_no_unsafe_fallback"
+        )
+        self.assertNotIn(negative_probe_id, execution_requirements)
+        self.assertEqual(
+            test_environment_requirement_issues([test_id], required_environment),
+            [],
+        )
+
+        pid_namespace_id = sorted(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS)[0]
+        self.assertEqual(
+            test_execution_requirement_issues(
+                [pid_namespace_id],
+                uid=1000,
+                gid=1000,
+                system="linux",
+                namespace_probe=lambda: "/usr/bin/unshare",
+            ),
+            [],
+        )
+        self.assertEqual(
+            test_execution_requirement_issues(
+                [pid_namespace_id],
+                uid=1000,
+                gid=1000,
+                system="linux",
+                namespace_probe=lambda: (_ for _ in ()).throw(RuntimeError("unavailable")),
+            ),
+            [
+                f"{pid_namespace_id} requires a non-root Linux runner with PID namespace capability"
+            ],
+        )
+        root_probe_calls: list[bool] = []
+        self.assertEqual(
+            test_execution_requirement_issues(
+                [pid_namespace_id],
+                uid=0,
+                gid=0,
+                system="linux",
+                namespace_probe=lambda: root_probe_calls.append(True) or "/usr/bin/unshare",
+            ),
+            [
+                f"{pid_namespace_id} requires a non-root Linux runner with PID namespace capability"
+            ],
+        )
+        self.assertEqual(root_probe_calls, [])
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(VerificationError, "LOCAL GATE BLOCKED"):
+                _preflight_backend_test_environment("backend-privileged", ())
+            _preflight_backend_test_environment(
+                "backend-privileged",
+                ("--focused", "tests.synthetic.Unrelated.test_case"),
+            )
+            _preflight_execution_environment(
+                (
+                    CatalogTestCase(
+                        test_id="tests.synthetic.Unrelated.test_case",
+                        module="test_synthetic_unrelated",
+                        class_name="Unrelated",
+                        method_name="test_case",
+                        line=1,
+                        is_async=False,
+                        contour="backend-privileged",
+                    ),
+                )
+            )
+            self.assertEqual(
+                test_environment_requirement_issues(
+                    [test_id],
+                    {"GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux"},
+                ),
+                [
+                    test_id
+                    + " requires RUNNER_ENVIRONMENT=github-hosted"
+                ],
+            )
+
+            with (
+                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify._validated_privileged_environment") as env,
+                patch("tools.platform_verify._run") as run,
+            ):
+                with self.assertRaisesRegex(VerificationError, "LOCAL GATE BLOCKED"):
+                    dispatch("backend-privileged")
+                env.assert_not_called()
+                run.assert_not_called()
+
+            with (
+                patch("tools.platform_test_runner._require_root_identity") as root,
+                patch("tools.platform_test_runner._require_test_environment") as env,
+                patch("tools.platform_test_runner.verification_resource_lock") as lock,
+            ):
+                with self.assertRaisesRegex(SystemExit, "LOCAL GATE BLOCKED"):
+                    test_runner_main(["--contour", "backend-privileged"])
+                root.assert_called_once_with("backend-privileged")
+                env.assert_not_called()
+                lock.assert_not_called()
+
+            root_owned_id = sorted(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS)[0]
+            root_owned_case = CatalogTestCase(
+                test_id=root_owned_id,
+                module="test_platform_load_runtime",
+                class_name="LoadRuntimeBudgetTests",
+                method_name=root_owned_id.rsplit(".", 1)[1],
+                line=1,
+                is_async=False,
+                contour="performance-contract",
+            )
+            unrelated_performance_case = CatalogTestCase(
+                test_id="tests.test_platform_external_load.ExternalLoadTests.test_unrelated",
+                module="test_platform_external_load",
+                class_name="ExternalLoadTests",
+                method_name="test_unrelated",
+                line=1,
+                is_async=False,
+                contour="performance-contract",
+            )
+            with patch("tools.platform_verify.os.getuid", return_value=0), patch(
+                "tools.platform_verify.os.getgid", return_value=0
+            ), patch("tools.platform_verify._run") as run:
+                with self.assertRaisesRegex(VerificationError, "LOCAL GATE BLOCKED"):
+                    dispatch("performance-contract", ("--focused", root_owned_id))
+                run.assert_not_called()
+                _preflight_backend_test_environment(
+                    "performance-contract",
+                    ("--focused", unrelated_performance_case.test_id),
+                )
+
+            with (
+                patch("tools.platform_test_runner._require_test_environment") as env,
+                patch("tools.platform_test_runner.verification_resource_lock") as lock,
+            ):
+                with self.assertRaisesRegex(SystemExit, "LOCAL GATE BLOCKED"):
+                    test_runner_main(
+                        ["--contour", "performance-contract", "--focused", root_owned_id]
+                    )
+                env.assert_not_called()
+                lock.assert_not_called()
+                with self.assertRaisesRegex(SystemExit, "LOCAL GATE BLOCKED"):
+                    _preflight_execution_environment((root_owned_case,))
+                _preflight_execution_environment((unrelated_performance_case,))
+
     def test_failed_subtests_record_one_parent_execution_without_hiding_failures(self) -> None:
         class FailingSubtests(unittest.TestCase):
             def test_two_subtests(self) -> None:
@@ -382,6 +553,68 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 self.assertEqual(len(timings), 1)
                 self.assertEqual(timings[0]["test_id"], parent_id)
                 self.assertEqual(timings[0]["outcome"], outcome)
+
+        with tempfile.TemporaryDirectory(prefix="platform-runner-progress-") as temp_dir:
+            progress_path = Path(temp_dir) / "progress.json"
+            observed_checkpoint: dict[str, object] = {}
+
+            class ProgressCases(unittest.TestCase):
+                def test_a_completed(self) -> None:
+                    pass
+
+                def test_b_active(self) -> None:
+                    checkpoint = json.loads(progress_path.read_text(encoding="utf-8"))
+                    observed_checkpoint.update(checkpoint)
+                    raise ContourTimeout("backend-privileged", 1200)
+
+            progress_cases = tuple(
+                sorted(
+                    (ProgressCases("test_a_completed"), ProgressCases("test_b_active")),
+                    key=lambda case: case.id(),
+                )
+            )
+            progress_runner = TimingRunner(stream=io.StringIO(), verbosity=0)
+            progress_runner.progress_path = progress_path
+            progress_runner.progress_contour = "backend-privileged"
+            progress_runner.progress_expected_ids = tuple(case.id() for case in progress_cases)
+            progress_result = progress_runner.run(unittest.TestSuite(progress_cases))
+
+            self.assertEqual(observed_checkpoint["status"], "diagnostic_only")
+            self.assertIs(observed_checkpoint["execution_complete"], False)
+            self.assertEqual(observed_checkpoint["active_test_id"], progress_cases[1].id())
+            self.assertEqual(
+                [entry["test_id"] for entry in observed_checkpoint["completed_timings"]],
+                [progress_cases[0].id()],
+            )
+            self.assertTrue(progress_result.timed_out)
+            self.assertFalse(progress_result.wasSuccessful())
+            final_checkpoint = json.loads(progress_path.read_text(encoding="utf-8"))
+            self.assertIsNone(final_checkpoint["active_test_id"])
+            self.assertEqual(
+                [entry["test_id"] for entry in final_checkpoint["completed_timings"]],
+                [case.id() for case in progress_cases],
+            )
+            self.assertEqual(stat.S_IMODE(progress_path.stat().st_mode), 0o600)
+
+            duplicate_id = progress_cases[0].id()
+            progress_result.timings.extend(
+                (
+                    TestTiming(duplicate_id, 5.0, "passed"),
+                    TestTiming(duplicate_id, 19.0, "error"),
+                )
+            )
+            progress_result._write_progress_checkpoint()
+            projected = json.loads(progress_path.read_text(encoding="utf-8"))
+            projected_timings = projected["completed_timings"]
+            self.assertEqual(
+                [entry["test_id"] for entry in projected_timings],
+                [progress_cases[1].id(), duplicate_id],
+            )
+            collapsed = next(
+                entry for entry in projected_timings if entry["test_id"] == duplicate_id
+            )
+            self.assertEqual(collapsed["duration_ms"], 19.0)
+            self.assertEqual(collapsed["outcome"], "error")
 
     @staticmethod
     def _test_settings(**overrides: object) -> SimpleNamespace:
@@ -932,6 +1165,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 stdout = io.StringIO()
                 stderr = io.StringIO()
                 cleanup_observations: list[bool] = []
+                timeout_lifecycle: list[str] = []
 
                 real_popen = subprocess.Popen
 
@@ -982,6 +1216,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 self.assertTrue(parent_code)
 
                 def verify_timeout_cleanup_order() -> None:
+                    timeout_lifecycle.append("resource_cleanup")
                     self.assertTrue(parent_pid_path.is_file())
                     owned_process_pid = int(parent_pid_path.read_text(encoding="ascii"))
                     identity = child_identity(owned_process_pid)
@@ -991,6 +1226,17 @@ class PlatformVerificationContractTests(unittest.TestCase):
                         or marker.encode() not in identity[1]
                     )
                     cleanup_observations.append(sentinel.poll() is None)
+
+                def verify_timeout_diagnostic_after_reap() -> None:
+                    self.assertTrue(parent_pid_path.is_file())
+                    owned_process_pid = int(parent_pid_path.read_text(encoding="ascii"))
+                    identity = child_identity(owned_process_pid)
+                    self.assertTrue(
+                        identity is None or identity[0] == "Z",
+                        "timeout diagnostic ran before the owned process group was reaped",
+                    )
+                    self.assertIsNone(sentinel.poll(), "diagnostic touched an unrelated process")
+                    timeout_lifecycle.append("diagnostic")
 
                 with (
                     patch("tools.platform_verify.subprocess.Popen", side_effect=wait_for_synthetic_group_ready),
@@ -1008,6 +1254,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                         },
                         timeout_seconds=0.2,
                         timeout_cleanup=verify_timeout_cleanup_order,
+                        timeout_diagnostic=verify_timeout_diagnostic_after_reap,
                     )
                 self.assertEqual(status, 124)
                 self.assertIn("[GATE START] timeout process group contract", stdout.getvalue())
@@ -1020,6 +1267,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                     "[GATE TIMEOUT] timeout process group contract exceeded 0.2s\n",
                 )
                 self.assertEqual(cleanup_observations, [True, True])
+                self.assertEqual(timeout_lifecycle, ["diagnostic", "resource_cleanup"])
                 self.assertTrue(progress_report.is_file())
                 self.assertEqual(
                     stat.S_IMODE(progress_report.stat().st_mode),
@@ -1306,230 +1554,29 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertIn("- 6379:6379", privileged_job.group("body"))
         self.assertIn('--health-cmd="redis-cli ping"', privileged_job.group("body"))
         privileged_body = privileged_job.group("body")
-        diagnostic_start = privileged_body.index(
-            "Run focused scratch restore diagnostic without gate credit"
+        self.assertNotIn("Run focused scratch restore diagnostic", privileged_body)
+        self.assertNotIn("platform-backup-scratch-diagnostic", privileged_body)
+        self.assertNotIn("Require focused scratch restore diagnostic", privileged_body)
+        workflow_data = yaml.safe_load(workflow)
+        full_step = next(
+            step for step in workflow_data["jobs"]["backend-privileged"]["steps"]
+            if step.get("name") == "Run serial privileged catalog contour exactly once as root"
         )
-        diagnostic_upload = privileged_body.index("Upload focused scratch restore diagnostic")
-        full_contour = privileged_body.index("Run serial privileged catalog contour exactly once as root")
-        diagnostic_finalizer = privileged_body.index(
-            "Require focused scratch restore diagnostic success"
-        )
-        diagnostic_script = privileged_body[diagnostic_start:diagnostic_upload]
-        upload_start = diagnostic_upload
-        upload_end = full_contour
-        finalizer_start = diagnostic_finalizer
-        self.assertLess(diagnostic_start, diagnostic_upload)
-        self.assertLess(diagnostic_upload, full_contour)
-        self.assertLess(full_contour, diagnostic_finalizer)
-        self.assertRegex(
-            privileged_body[diagnostic_start:diagnostic_upload],
-            r"(?m)^\s+continue-on-error: true$",
-        )
-        diagnostic_test = next(
-            case
-            for case in discover_test_cases()
+        self.assertIn("platform_verify.py backend-privileged", full_step["run"])
+        self.assertIn("--manifest ci-backend/backend-privileged/manifest.json", full_step["run"])
+        self.assertIn("--summary ci-backend/backend-privileged/summary.json", full_step["run"])
+        self.assertIn("Upload backend privileged manifests", privileged_body)
+        self.assertNotIn("continue-on-error", full_step)
+        restore_test = next(
+            case for case in discover_test_cases()
             if case.module == "test_platform_backup_restore_drill"
             and case.method_name == "test_isolated_restore_signal_cleanup_under_root"
         )
-        self.assertEqual(diagnostic_test.contour, "backend-privileged")
-        self.assertIn(f"--focused {diagnostic_test.test_id}", privileged_body)
-        normalized_diagnostic_script = re.sub(
-            r"\s+",
-            " ",
-            re.sub(r"\\\s*\n\s*", " ", diagnostic_script),
-        )
-        self.assertIn(
-            f"tools/platform_verify.py backend-privileged --focused {diagnostic_test.test_id}",
-            normalized_diagnostic_script,
-        )
-        self.assertNotIn("platform_run_tests.sh", diagnostic_script)
-        self.assertIn("focused_exit=%s", privileged_body)
-        self.assertIn("(no gate credit)", privileged_body)
-        self.assertIn("platform-backup-scratch-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}", privileged_body)
-        self.assertIn("steps.scratch_restore_diagnostic.outcome", privileged_body)
-        self.assertIn("steps.scratch_diagnostic_upload.outcome", privileged_body)
-        self.assertIn("this job cannot pass", privileged_body)
-        upload_contract = privileged_body[upload_start:upload_end]
-        finalizer_contract = privileged_body[finalizer_start:]
-        self.assertIn("source_sha=%s\\nrun_id=%s\\nrun_attempt=%s", diagnostic_script)
-        self.assertIn('"$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"', diagnostic_script)
-        self.assertIn("umask 077", diagnostic_script)
-        self.assertIn("chmod 600", diagnostic_script)
-        self.assertIn("if: ${{ always() }}", upload_contract)
-        self.assertIn("continue-on-error: true", upload_contract)
-        self.assertIn("retention-days: 14", upload_contract)
-        self.assertIn("if: ${{ always() }}", finalizer_contract)
-        self.assertIn("SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME", finalizer_contract)
-        self.assertIn('"$SCRATCH_DIAGNOSTIC_OUTCOME" != "success"', finalizer_contract)
-        self.assertIn('"$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success"', finalizer_contract)
-
-        filtered_workflow, diagnostic_issues = _validated_scratch_diagnostic_filtered_workflow(
-            workflow
-        )
-        self.assertEqual(diagnostic_issues, [])
-        self.assertEqual(
-            extract_gate_invocations(filtered_workflow).count("backend-privileged"),
-            1,
-        )
-        diagnostic_step = workflow[
-            workflow.index("      - name: Run focused scratch restore diagnostic without gate credit") :
-            workflow.index("      - name: Upload focused scratch restore diagnostic")
-        ]
-        missing_diagnostic = workflow.replace(diagnostic_step, "", 1)
-        _, missing_issues = _validated_scratch_diagnostic_filtered_workflow(
-            missing_diagnostic
-        )
-        self.assertTrue(any("exactly one Run focused scratch restore diagnostic" in issue for issue in missing_issues))
-        duplicate_diagnostic = workflow.replace(
-            diagnostic_step, diagnostic_step + diagnostic_step, 1
-        )
-        _, duplicate_issues = _validated_scratch_diagnostic_filtered_workflow(
-            duplicate_diagnostic
-        )
-        self.assertTrue(any("exactly one Run focused scratch restore diagnostic" in issue for issue in duplicate_issues))
-        duplicate_diagnostic_retry = workflow.replace(
-            "        continue-on-error: true\n        run: |\n          set -euo pipefail\n          umask 077",
-            "        continue-on-error: true\n        continue-on-error: true\n        run: |\n          set -euo pipefail\n          umask 077",
-            1,
-        )
-        _, duplicate_retry_issues = _validated_scratch_diagnostic_filtered_workflow(
-            duplicate_diagnostic_retry
-        )
-        self.assertTrue(any("diagnostic must continue only" in issue for issue in duplicate_retry_issues))
-        malformed_selector = workflow.replace(
-            f"--focused {diagnostic_test.test_id}",
-            "--focused tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_missing_case",
-            1,
-        )
-        unfiltered_malformed, malformed_issues = _validated_scratch_diagnostic_filtered_workflow(
-            malformed_selector
-        )
-        self.assertEqual(unfiltered_malformed, malformed_selector)
-        self.assertTrue(any("exact catalog-owned verifier selector" in issue for issue in malformed_issues))
-        malformed_extra_arg = workflow.replace(
-            f"--focused {diagnostic_test.test_id}\"",
-            f"--focused {diagnostic_test.test_id} --quiet\"",
-            1,
-        )
-        unfiltered_extra_arg, extra_arg_issues = _validated_scratch_diagnostic_filtered_workflow(
-            malformed_extra_arg
-        )
-        self.assertEqual(unfiltered_extra_arg, malformed_extra_arg)
-        self.assertTrue(any("exact catalog-owned verifier selector" in issue for issue in extra_arg_issues))
-        login_shell_diagnostic = workflow.replace(
-            "/bin/bash -c \"cd '$GITHUB_WORKSPACE/platform'",
-            "/bin/bash -lc \"cd '$GITHUB_WORKSPACE/platform'",
-            1,
-        )
-        unfiltered_login_shell, login_shell_issues = _validated_scratch_diagnostic_filtered_workflow(
-            login_shell_diagnostic
-        )
-        self.assertEqual(unfiltered_login_shell, login_shell_diagnostic)
-        self.assertTrue(any("exact closed script/env" in issue for issue in login_shell_issues))
-        prepended_sudo = workflow.replace(
-            "          if sudo -n env -i \\\n",
-            "          sudo -E true\n          if sudo -n env -i \\\n",
-            1,
-        )
-        unfiltered_prepended_sudo, prepended_sudo_issues = (
-            _validated_scratch_diagnostic_filtered_workflow(prepended_sudo)
-        )
-        self.assertEqual(unfiltered_prepended_sudo, prepended_sudo)
-        self.assertTrue(any("exact closed script" in issue for issue in prepended_sudo_issues))
-        nested_sudo = workflow.replace(
-            "          if sudo -n env -i \\\n",
-            '          if /bin/bash -c "sudo -E true"; then :; fi\n'
-            "          if sudo -n env -i \\\n",
-            1,
-        )
-        unfiltered_nested_sudo, nested_sudo_issues = (
-            _validated_scratch_diagnostic_filtered_workflow(nested_sudo)
-        )
-        self.assertEqual(unfiltered_nested_sudo, nested_sudo)
-        self.assertTrue(any("exact closed script" in issue for issue in nested_sudo_issues))
-        inherited_environment = workflow.replace(
-            "sudo -n env -i \\\n",
-            "sudo -E env -i \\\n",
-            1,
-        )
-        unfiltered_inherited_environment, inherited_environment_issues = (
-            _validated_scratch_diagnostic_filtered_workflow(inherited_environment)
-        )
-        self.assertEqual(unfiltered_inherited_environment, inherited_environment)
-        self.assertTrue(
-            any("exact closed script/env" in issue for issue in inherited_environment_issues)
-        )
-        malformed_source_binding = workflow.replace(
-            '"$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
-            '"$GITHUB_SHA" "$GITHUB_RUN_ID" "0"',
-            1,
-        )
-        _, source_binding_issues = _validated_scratch_diagnostic_filtered_workflow(
-            malformed_source_binding
-        )
-        self.assertTrue(any("private/source-bound capture" in issue for issue in source_binding_issues))
-        malformed_finalizer = workflow.replace(
-            '"$SCRATCH_DIAGNOSTIC_OUTCOME" != "success" || '
-            '"$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success"',
-            '"$SCRATCH_DIAGNOSTIC_OUTCOME" != "success" && '
-            '"$SCRATCH_DIAGNOSTIC_UPLOAD_OUTCOME" != "success"',
-            1,
-        )
-        unfiltered_finalizer, finalizer_condition_issues = _validated_scratch_diagnostic_filtered_workflow(
-            malformed_finalizer
-        )
-        self.assertEqual(unfiltered_finalizer, malformed_finalizer)
-        self.assertTrue(any("inside the exact unsuccessful-outcome branch" in issue for issue in finalizer_condition_issues))
-        finalizer_start = workflow.index(
-            "      - name: Require focused scratch restore diagnostic success"
-        )
-        finalizer_end = workflow.index("\n  backend:", finalizer_start)
-        workflow_before_finalizer = workflow[:finalizer_start]
-        finalizer_step_block = workflow[finalizer_start:finalizer_end]
-        workflow_after_finalizer = workflow[finalizer_end:]
-        self.assertEqual(finalizer_step_block.count('            exit 1\n          fi'), 1)
-        malformed_finalizer_exit = workflow_before_finalizer + finalizer_step_block.replace(
-            '            exit 1\n          fi',
-            '          fi\n          exit 1',
-            1,
-        ) + workflow_after_finalizer
-        self.assertNotEqual(malformed_finalizer_exit, workflow)
-        unfiltered_finalizer_exit, finalizer_exit_issues = _validated_scratch_diagnostic_filtered_workflow(
-            malformed_finalizer_exit
-        )
-        self.assertEqual(unfiltered_finalizer_exit, malformed_finalizer_exit)
-        self.assertTrue(any("inside the exact unsuccessful-outcome branch" in issue for issue in finalizer_exit_issues))
-        missing_upload = workflow.replace(
-            workflow[
-                workflow.index("      - name: Upload focused scratch restore diagnostic") :
-                workflow.index("      - name: Run serial privileged catalog contour exactly once as root")
-            ],
-            "",
-            1,
-        )
-        _, upload_issues = _validated_scratch_diagnostic_filtered_workflow(missing_upload)
-        self.assertTrue(any("exactly one Upload focused scratch restore diagnostic" in issue for issue in upload_issues))
-        upload_step = workflow[
-            workflow.index("      - name: Upload focused scratch restore diagnostic") :
-            workflow.index("      - name: Run serial privileged catalog contour exactly once as root")
-        ]
-        duplicate_upload = workflow.replace(upload_step, upload_step + upload_step, 1)
-        _, duplicate_upload_issues = _validated_scratch_diagnostic_filtered_workflow(
-            duplicate_upload
-        )
-        self.assertTrue(any("exactly one Upload focused scratch restore diagnostic" in issue for issue in duplicate_upload_issues))
-        missing_finalizer = workflow.replace(
-            workflow[
-                workflow.index("      - name: Require focused scratch restore diagnostic success") :
-                workflow.index("\n  backend:", workflow.index("      - name: Require focused scratch restore diagnostic success"))
-            ],
-            "",
-            1,
-        )
-        _, finalizer_issues = _validated_scratch_diagnostic_filtered_workflow(
-            missing_finalizer
-        )
-        self.assertTrue(any("exactly one Require focused scratch restore diagnostic success" in issue for issue in finalizer_issues))
+        self.assertEqual(restore_test.contour, "backend-privileged")
+        self.assertNotIn(restore_test.test_id, INTENTIONAL_SKIP_IDS)
+        self.assertIn("backend-privileged", workflow)
+        self.assertIn("Verify every backend component result and catalog union", workflow)
+        self.assertIn("--component-dir", workflow)
         duplicate_full_gate = workflow.replace(
             "          .venv_platform/bin/python tools/platform_verify.py backend-privileged\n",
             "          .venv_platform/bin/python tools/platform_verify.py backend-privileged\n"
@@ -1640,6 +1687,9 @@ class PlatformVerificationContractTests(unittest.TestCase):
                     "postgresql+asyncpg://u:p@remote.invalid:5432/platformdb_test"
                 ),
                 "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/0",
+                "GITHUB_ACTIONS": "true",
+                "RUNNER_OS": "Linux",
+                "RUNNER_ENVIRONMENT": "github-hosted",
             }
             checkout_root = Path(temp_dir) / "checkout"
             pinned_python = checkout_root / ".venv_platform/bin/python"
@@ -1651,6 +1701,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 return str(checkout_root / "tools" / name)
 
             observed: dict[str, object] = {}
+            progress_capture = {"mode": "none"}
 
             def capture_run(label: str, command: object, **kwargs: object) -> int:
                 observed["label"] = label
@@ -1658,6 +1709,54 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 observed["kwargs"] = kwargs
                 callback = kwargs.get("timeout_cleanup")
                 self.assertTrue(callable(callback))
+                diagnostic = kwargs.get("timeout_diagnostic")
+                mode = progress_capture["mode"]
+                if mode != "none":
+                    self.assertIsInstance(command, list)
+                    assert isinstance(command, list)
+                    self.assertIn("--progress", command)
+                    progress_path = Path(command[command.index("--progress") + 1])
+                    if "--summary" in command:
+                        orphan_temp = progress_path.parent / f".{progress_path.name}.orphan.tmp"
+                        orphan_temp.write_text("partial", encoding="ascii")
+                        orphan_temp.chmod(0o600)
+                        unrelated_sibling = progress_path.parent / "keep-unrelated.txt"
+                        unrelated_sibling.write_text("keep", encoding="ascii")
+                        unrelated_sibling.chmod(0o600)
+                        observed["orphan_temp"] = orphan_temp
+                        observed["unrelated_sibling"] = unrelated_sibling
+                    cases = sorted(
+                        cases_for_contour("backend-privileged"),
+                        key=lambda case: case.test_id,
+                    )
+                    expected_ids = [case.test_id for case in cases]
+                    active_test_id = expected_ids[1]
+                    if mode == "invalid":
+                        active_test_id = expected_ids[0]
+                    _write_progress_json(
+                        progress_path,
+                        {
+                            "schema": 1,
+                            "contour": "backend-privileged",
+                            "status": "diagnostic_only",
+                            "execution_complete": False,
+                            "selected_count": len(expected_ids),
+                            "expected_ids": expected_ids,
+                            "completed_timings": [
+                                {
+                                    "test_id": expected_ids[0],
+                                    "duration_ms": 12.5,
+                                    "outcome": "passed",
+                                }
+                            ],
+                            "active_test_id": active_test_id,
+                        },
+                    )
+                    observed["progress_path"] = progress_path
+                    self.assertTrue(callable(diagnostic))
+                    diagnostic()
+                    callback()
+                    return 124
                 callback()
                 return 0
 
@@ -1717,7 +1816,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 self.assertEqual(dispatch("backend-privileged"), 0)
             command = observed["command"]
             self.assertEqual(
-                command,
+                command[:4],
                 [
                     str(pinned_python),
                     fake_tool("platform_test_runner.py"),
@@ -1725,6 +1824,8 @@ class PlatformVerificationContractTests(unittest.TestCase):
                     "backend-privileged",
                 ],
             )
+            self.assertEqual(command[4], "--progress")
+            self.assertEqual(len(command), 6)
             backend_kwargs = observed["kwargs"]
             assert isinstance(backend_kwargs, dict)
             self.assertEqual(backend_kwargs["env"]["PLATFORM_DATABASE_URL"], safe_environment["PLATFORM_DATABASE_URL"])
@@ -1758,13 +1859,148 @@ class PlatformVerificationContractTests(unittest.TestCase):
             command = observed["command"]
             self.assertEqual(command[0], str(pinned_python))
             self.assertEqual(
-                command[-2:],
+                command[4:6],
                 ["--focused", "tests.synthetic.Owner.test_case"],
             )
+            self.assertEqual(command[6], "--progress")
+            self.assertEqual(len(command), 8)
             backend_kwargs = observed["kwargs"]
             assert isinstance(backend_kwargs, dict)
             self.assertEqual(backend_kwargs["timeout_seconds"], CONTOUR_TIMEOUT_SECONDS["backend-privileged"])
             cleanup.assert_called_once()
+
+            progress_capture["mode"] = "valid"
+            timeout_stderr = io.StringIO()
+            with (
+                redirect_stderr(timeout_stderr),
+                patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+                patch("tools.platform_verify._tool", side_effect=fake_tool),
+                patch("tools.platform_verify._run", side_effect=capture_run),
+                patch(
+                    "tools.platform_verify._cleanup_timed_out_backend_privileged_resources"
+                ) as cleanup,
+            ):
+                self.assertEqual(dispatch("backend-privileged"), 124)
+            progress_command = observed["command"]
+            assert isinstance(progress_command, list)
+            progress_path = Path(
+                progress_command[progress_command.index("--progress") + 1]
+            )
+            progress_cases = sorted(
+                cases_for_contour("backend-privileged"),
+                key=lambda case: case.test_id,
+            )
+            self.assertIn(
+                f"selected={len(progress_cases)} completed=1 "
+                f"active_test_id={progress_cases[1].test_id} "
+                f"last_completed_test_id={progress_cases[0].test_id}",
+                timeout_stderr.getvalue(),
+            )
+            self.assertNotIn("duration_ms", timeout_stderr.getvalue())
+            self.assertFalse(progress_path.exists())
+            self.assertFalse(progress_path.parent.exists())
+            cleanup.assert_called_once()
+
+            progress_capture["mode"] = "invalid"
+            unavailable_stderr = io.StringIO()
+            with (
+                redirect_stderr(unavailable_stderr),
+                patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+                patch("tools.platform_verify._tool", side_effect=fake_tool),
+                patch("tools.platform_verify._run", side_effect=capture_run),
+                patch(
+                    "tools.platform_verify._cleanup_timed_out_backend_privileged_resources"
+                ),
+            ):
+                self.assertEqual(dispatch("backend-privileged"), 124)
+            invalid_progress_path = observed["progress_path"]
+            self.assertIsInstance(invalid_progress_path, Path)
+            assert isinstance(invalid_progress_path, Path)
+            self.assertIn(
+                "backend-privileged progress=unavailable",
+                unavailable_stderr.getvalue(),
+            )
+            self.assertFalse(invalid_progress_path.exists())
+            self.assertFalse(invalid_progress_path.parent.exists())
+
+            progress_capture["mode"] = "valid"
+            explicit_summary = (
+                checkout_root / "ci-backend" / "backend-privileged" / "summary.json"
+            )
+            with (
+                patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+                patch("tools.platform_verify._tool", side_effect=fake_tool),
+                patch("tools.platform_verify._run", side_effect=capture_run),
+                patch(
+                    "tools.platform_verify._cleanup_timed_out_backend_privileged_resources"
+                ),
+            ):
+                self.assertEqual(
+                    dispatch(
+                        "backend-privileged",
+                        ["--summary", str(explicit_summary)],
+                    ),
+                    124,
+                )
+            explicit_progress_path = observed["progress_path"]
+            self.assertIsInstance(explicit_progress_path, Path)
+            assert isinstance(explicit_progress_path, Path)
+            self.assertTrue(explicit_progress_path.is_file())
+            self.assertEqual(
+                stat.S_IMODE(explicit_progress_path.stat().st_mode),
+                0o600,
+            )
+            self.assertEqual(
+                json.loads(explicit_progress_path.read_text(encoding="utf-8"))["status"],
+                "diagnostic_only",
+            )
+            orphan_temp = observed["orphan_temp"]
+            unrelated_sibling = observed["unrelated_sibling"]
+            self.assertIsInstance(orphan_temp, Path)
+            self.assertIsInstance(unrelated_sibling, Path)
+            assert isinstance(orphan_temp, Path)
+            assert isinstance(unrelated_sibling, Path)
+            self.assertFalse(orphan_temp.exists())
+            self.assertTrue(unrelated_sibling.is_file())
+
+            progress_capture["mode"] = "invalid"
+            invalid_summary = (
+                checkout_root / "ci-backend" / "backend-privileged" / "invalid-summary.json"
+            )
+            with (
+                redirect_stderr(io.StringIO()),
+                patch.dict(os.environ, inherited, clear=True),
+                patch("tools.platform_verify.os.geteuid", return_value=0),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+                patch("tools.platform_verify._tool", side_effect=fake_tool),
+                patch("tools.platform_verify._run", side_effect=capture_run),
+                patch(
+                    "tools.platform_verify._cleanup_timed_out_backend_privileged_resources"
+                ),
+            ):
+                self.assertEqual(
+                    dispatch(
+                        "backend-privileged",
+                        ["--summary", str(invalid_summary)],
+                    ),
+                    124,
+                )
+            invalid_explicit_path = observed["progress_path"]
+            invalid_orphan_temp = observed["orphan_temp"]
+            self.assertIsInstance(invalid_explicit_path, Path)
+            self.assertIsInstance(invalid_orphan_temp, Path)
+            assert isinstance(invalid_explicit_path, Path)
+            assert isinstance(invalid_orphan_temp, Path)
+            self.assertFalse(invalid_explicit_path.exists())
+            self.assertFalse(invalid_orphan_temp.exists())
+            self.assertTrue(unrelated_sibling.is_file())
+
             pinned_python.chmod(0o600)
             with (
                 patch.dict(os.environ, inherited, clear=True),
@@ -2467,7 +2703,6 @@ except lock.VerificationLockError as exc:
         workflow_data = yaml.safe_load(workflow)
         privileged_job = workflow_data["jobs"]["backend-privileged"]
         for step_name in (
-            "Run focused scratch restore diagnostic without gate credit",
             "Run serial privileged catalog contour exactly once as root",
         ):
             step = next(
@@ -2519,6 +2754,75 @@ except lock.VerificationLockError as exc:
         self.assertFalse(GATES_BY_ID["external-load"].deterministic)
         self.assertFalse(GATES_BY_ID["external-load"].local_safe)
         self.assertEqual(registry_payload()["ci_gate_ids"], list(CI_GATE_IDS))
+        self.assertFalse(registry_payload()["impact_planning"]["skip_authority"])
+
+    def test_impact_planner_routes_liveqa_producers_consumers_and_unknown_paths_broadly(self) -> None:
+        live_qa = impact_plan(["platform/tools/platform_live_qa_runtime_install.py"])
+        self.assertEqual(live_qa["status"], "routed")
+        self.assertEqual(
+            set(live_qa["owner_contours"]),
+            {"backend-privileged", "backend-tool-contract"},
+        )
+        self.assertTrue(
+            {
+                "test_platform_live_qa_runtime_install",
+                "test_platform_live_qa_wrappers",
+                "test_platform_live_qa_mailbox_helper",
+                "test_platform_maintenance_qa_evidence",
+                "test_platform_remote_workflow_guards",
+            }.issubset(set(live_qa["owner_modules"]))
+        )
+        self.assertFalse(live_qa["skip_authority"])
+
+        report_consumer = impact_plan(["platform/tools/platform_live_user_qa_report.py"])
+        self.assertIn("backend-tool-contract", report_consumer["owner_contours"])
+        self.assertIn("test_platform_maintenance_qa_evidence", report_consumer["owner_modules"])
+        schema_producer = impact_plan(["platform/tools/platform_maintenance_qa_evidence.py"])
+        self.assertIn("test_platform_maintenance_qa_evidence", schema_producer["owner_modules"])
+        self.assertIn("test_platform_live_qa_wrappers", schema_producer["owner_modules"])
+        workflow_consumer = impact_plan([".github/workflows/platform-live-user-qa.yml"])
+        self.assertIn("backend-privileged", workflow_consumer["owner_contours"])
+        self.assertIn("test_platform_maintenance_qa_evidence", workflow_consumer["owner_modules"])
+
+        for source_path in (
+            "platform/tools/platform_test_runner.py",
+            "platform/tools/platform_verify.py",
+            "platform/tools/platform_verify_contract.py",
+            "platform/tools/platform_test_catalog.py",
+        ):
+            with self.subTest(source_path=source_path):
+                owner_plan = impact_plan([source_path])
+                self.assertIn("verification-contract", owner_plan["owner_contours"])
+                self.assertIn(
+                    "test_platform_verification_contract",
+                    owner_plan["owner_modules"],
+                )
+        classifier_plan = impact_plan(["platform/tools/platform_ci_classifier.py"])
+        self.assertIn("test_platform_ci_classifier", classifier_plan["owner_modules"])
+        security_plan = impact_plan([".github/workflows/platform-security.yml"])
+        self.assertTrue(
+            {
+                "test_platform_ci_classifier",
+                "test_platform_verification_contract",
+            }.issubset(set(security_plan["owner_modules"]))
+        )
+        docs_plan = impact_plan(["platform/docs/test-suite-governance.md"])
+        self.assertIn("docs", docs_plan["required_gates"])
+        self.assertIn("test_platform_verification_contract", docs_plan["owner_modules"])
+
+        test_owner = impact_plan(["platform/tests/test_platform_live_qa_wrappers.py"])
+        self.assertEqual(test_owner["owner_contours"], ["backend-privileged"])
+        self.assertIn("backend", test_owner["required_gates"])
+        self.assertIn("test_platform_live_qa_wrappers", test_owner["owner_modules"])
+
+        unknown = impact_plan(["platform/tools/new_unmapped_consumer.py"])
+        self.assertEqual(unknown["status"], "broad_ci_required")
+        self.assertEqual(unknown["required_gates"], list(CI_GATE_IDS))
+        self.assertFalse(unknown["skip_authority"])
+        self.assertIn("full canonical CI", unknown["reason"])
+        malformed = impact_plan(["platform/../secrets.env"])
+        self.assertEqual(malformed["status"], "broad_ci_required")
+        self.assertEqual(malformed["required_gates"], list(CI_GATE_IDS))
 
         verification_cases = cases_for_contour(
             VERIFICATION_CONTOUR,
@@ -2642,6 +2946,9 @@ except lock.VerificationLockError as exc:
         self.assertIsNotNone(missing_seed)
         self.assertIn("missing required seed roles", str(missing_seed))
         self.assertIn("authenticated_user", str(missing_seed))
+        self.assertIn("run the migration gate", str(missing_seed))
+        self.assertIn("`alembic upgrade head`", str(missing_seed))
+        self.assertIn("disposable platformdb_test", str(missing_seed))
         self.assertEqual(
             [call.args[1] for call in run.call_args_list],
             list(_verification_contract_commands()),
@@ -2793,7 +3100,7 @@ except lock.VerificationLockError as exc:
         )
         self.assertTrue(
             any(
-                "canonical host-tools pin resolver exactly once" in issue
+                "host-tools-pin-preflight must run the canonical resolver exactly once" in issue
                 for issue in host_tools_pin_verification_issues(missing_pin_resolver)
             )
         )
@@ -2812,6 +3119,17 @@ except lock.VerificationLockError as exc:
             any(
                 "full target history" in issue
                 for issue in host_tools_pin_verification_issues(missing_pin_history)
+            )
+        )
+        missing_early_dependency = workflow_text.replace(
+            "needs.host-tools-pin-preflight.result == 'success' &&",
+            "",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "backend-static must explicitly require successful host-tools-pin-preflight" in issue
+                for issue in host_tools_pin_verification_issues(missing_early_dependency)
             )
         )
         self.assertEqual(release_runtime_workflow_issues(workflow_text), [])
@@ -3129,6 +3447,40 @@ except lock.VerificationLockError as exc:
             expected_ids = aggregate["expected_ids"]
             self.assertEqual(aggregate["executed_ids"], expected_ids)
             self.assertEqual(len(aggregate["timings"]), expected_backend_count)
+            restore_id = next(
+                case.test_id for case in discover_test_cases()
+                if case.module == "test_platform_backup_restore_drill"
+                and case.method_name == "test_isolated_restore_signal_cleanup_under_root"
+            )
+            restore_timing = next(item for item in aggregate["timings"] if item["test_id"] == restore_id)
+            self.assertEqual(restore_timing["outcome"], "passed")
+            self.assertNotIn(restore_id, aggregate["skipped"])
+
+        mailbox_skip_id = (
+            "tests.test_platform_live_qa_mailbox_helper.MailboxHelperTests."
+            "test_live_shared_env_metadata_matches_reviewed_contour_when_present"
+        )
+        mailbox_skip_reason = "production shared env path is absent"
+        self.assertEqual(
+            INTENTIONAL_SKIP_IDS,
+            {mailbox_skip_id: mailbox_skip_reason},
+        )
+        mailbox_case = next(case for case in discover_test_cases() if case.test_id == mailbox_skip_id)
+        self.assertEqual(mailbox_case.contour, "backend-privileged")
+        with tempfile.TemporaryDirectory() as directory:
+            component_dir = Path(directory)
+            _write_backend_component_fixture(component_dir)
+            summary_path = component_dir / "backend-privileged" / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["skipped"] = [mailbox_skip_id]
+            summary["skipped_count"] = 1
+            summary["skip_reasons"] = {mailbox_skip_id: mailbox_skip_reason}
+            timing = next(item for item in summary["timings"] if item["test_id"] == mailbox_skip_id)
+            timing["outcome"] = "skipped"
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            aggregate = verify_backend_components(component_dir)
+            self.assertEqual(aggregate["status"], "passed")
+            self.assertEqual(aggregate["skipped"], [mailbox_skip_id])
 
         mutations = (
             "duplicate executed ID",
@@ -3138,6 +3490,7 @@ except lock.VerificationLockError as exc:
             "empty timings",
             "invalid timing duration",
             "tests_run mismatch",
+            "unapproved isolated restore skip",
             "out-of-order manifest IDs",
             "duplicate manifest artifact",
         )
@@ -3166,6 +3519,26 @@ except lock.VerificationLockError as exc:
                     summary["timings"][0]["duration_ms"] = -1
                 elif mutation == "tests_run mismatch":
                     summary["tests_run"] -= 1
+                elif mutation == "unapproved isolated restore skip":
+                    restore_id = next(
+                        case.test_id for case in discover_test_cases()
+                        if case.module == "test_platform_backup_restore_drill"
+                        and case.method_name == "test_isolated_restore_signal_cleanup_under_root"
+                    )
+                    summary_path = (
+                        component_dir / "backend-privileged" / "summary.json"
+                    )
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    self.assertIn(restore_id, summary["expected_ids"])
+                    self.assertIn(restore_id, summary["executed_ids"])
+                    summary["skipped"] = [restore_id]
+                    summary["skipped_count"] = 1
+                    summary["skip_reasons"] = {
+                        restore_id: "isolated restore unexpectedly skipped"
+                    }
+                    timing = next(item for item in summary["timings"] if item["test_id"] == restore_id)
+                    timing["outcome"] = "skipped"
+                    summary_path.write_text(json.dumps(summary), encoding="utf-8")
                 elif mutation == "out-of-order manifest IDs":
                     manifest_path = component_dir / "backend-unit" / "manifest.json"
                     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

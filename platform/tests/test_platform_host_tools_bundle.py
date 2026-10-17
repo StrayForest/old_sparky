@@ -1017,19 +1017,27 @@ class HostToolsBundleTests(unittest.TestCase):
         security = (REPO_ROOT / ".github/workflows/platform-security.yml").read_text(
             encoding="utf-8"
         )
+        pin_preflight = security.split("  host-tools-pin-preflight:", 1)[1].split(
+            "  backend-static:", 1
+        )[0]
         verification = security.split("  verification-contract:", 1)[1].split(
             "  release-runtime:", 1
         )[0]
-        self.assertIn("fetch-depth: 0", verification)
-        self.assertIn("ref: ${{ github.sha }}", verification)
+        self.assertIn("needs: [classifier, baseline-runtime-guard]", pin_preflight)
+        self.assertIn("fetch-depth: 0", pin_preflight)
+        self.assertIn("ref: ${{ github.sha }}", pin_preflight)
         self.assertIn(
             "name: Resolve and verify canonical host-tools pin against full target history",
+            pin_preflight,
+        )
+        self.assertIn("platform/tools/platform_host_tools_pin.py resolve", pin_preflight)
+        self.assertIn('--target-sha "$TARGET_SHA"', pin_preflight)
+        self.assertIn('--expected-repository "$EXPECTED_REPOSITORY"', pin_preflight)
+        self.assertIn("test ! -e \"$pin_output\"", pin_preflight)
+        self.assertIn(
+            "needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]",
             verification,
         )
-        self.assertIn("platform/tools/platform_host_tools_pin.py resolve", verification)
-        self.assertIn('--target-sha "$TARGET_SHA"', verification)
-        self.assertIn('--expected-repository "$EXPECTED_REPOSITORY"', verification)
-        self.assertIn("test ! -e \"$pin_output\"", verification)
 
     def test_host_attestation_policy_accepts_flat_verified_certificate_claims(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(

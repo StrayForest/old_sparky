@@ -182,6 +182,7 @@ jobs:
           )"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$RECOVERY_RUN_ID/attempts/$RECOVERY_RUN_ATTEMPT" --output "$metadata/recovery-run.json"
           if [[ "$RECOVERY_ACTION" == "quarantine_populated_quiesce" ]]; then
+            curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/workflows/platform-production-deploy.yml" --output "$metadata/failed-deploy-workflow.json"
             curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$FAILED_DEPLOY_RUN_ID/attempts/$FAILED_DEPLOY_RUN_ATTEMPT" --output "$metadata/failed-deploy-run.json"
             curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$FAILED_DEPLOY_RUN_ID/attempts/$FAILED_DEPLOY_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/failed-deploy-jobs.json"
           fi
@@ -256,15 +257,20 @@ jobs:
           if os.environ["RECOVERY_ACTION"] == "quarantine_populated_quiesce":
               failed_id = int(os.environ["FAILED_DEPLOY_RUN_ID"])
               failed_attempt = int(os.environ["FAILED_DEPLOY_RUN_ATTEMPT"])
+              deploy_workflow = json.loads((root / "failed-deploy-workflow.json").read_text(encoding="utf-8"))
               failed = json.loads((root / "failed-deploy-run.json").read_text(encoding="utf-8"))
               failed_jobs_payload = json.loads((root / "failed-deploy-jobs.json").read_text(encoding="utf-8"))
               failed_jobs = failed_jobs_payload.get("jobs") if isinstance(failed_jobs_payload, dict) else None
               failed_source = failed.get("head_sha")
+              deploy_workflow_id = deploy_workflow.get("id") if isinstance(deploy_workflow, dict) else None
               if (
                   failed.get("id") != failed_id
                   or failed.get("run_attempt") != failed_attempt
-                  or failed.get("name") != "Platform production deploy"
-                  or failed.get("path") != ".github/workflows/platform-production-deploy.yml"
+                  or type(deploy_workflow_id) is not int or deploy_workflow_id <= 0
+                  or deploy_workflow.get("name") != "Platform production deploy"
+                  or deploy_workflow.get("path") != ".github/workflows/platform-production-deploy.yml"
+                  or failed.get("workflow_id") != deploy_workflow_id
+                  or failed.get("path") != deploy_workflow["path"]
                   or failed.get("head_branch") != "dev"
                   or not isinstance(failed_source, str)
                   or re.fullmatch(r"[0-9a-f]{40}", failed_source) is None
