@@ -2277,6 +2277,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "--state", str(receipt), "--transaction", str(self.shared / STATE_NAME),
             "--helper-release", str(current), "--app-dir", str(self.app_dir),
             "--systemctl", str(systemctl), "--attempt-nonce", "a" * 64,
+            "--expected-event-id", "a" * 64,
             check=False,
         )
         self.assertEqual(cli_skip.returncode, 0, cli_skip.stderr)
@@ -2291,6 +2292,22 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         original_systemctl_path = systemd_state.SYSTEMCTL_PATH
         original_journal_path = systemd_state.JOURNALCTL_PATH
         attempt_nonce = "a" * 64
+
+        def event_id_for(invocation_id: str = invocation) -> str:
+            raw_transaction = (self.shared / STATE_NAME).read_bytes()
+            raw_receipt = receipt.read_bytes()
+            transaction_record = json.loads(raw_transaction)
+            return hashlib.sha256(
+                ":".join(
+                    (
+                        transaction_record["operation_id"],
+                        hashlib.sha256(raw_transaction).hexdigest(),
+                        hashlib.sha256(raw_receipt).hexdigest(),
+                        invocation_id,
+                    )
+                ).encode("ascii")
+            ).hexdigest()
+
         try:
             systemd_state.SYSTEMCTL_PATH = str(systemctl)
             systemd_state.JOURNALCTL_PATH = str(journal)
@@ -2312,6 +2329,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             ordinary = systemd_state.reset_cloudflare_pending_guard(
                 receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
                 helper_release=current, attempt_nonce=attempt_nonce,
+                expected_event_id=event_id_for(),
             )
             self.assertEqual(ordinary, {"outcome": "skip"})
             self.assertFalse(evidence_dir.exists())
@@ -2328,7 +2346,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             journal.chmod(0o755)
             plan = systemd_state.reset_cloudflare_pending_guard(
                 receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
-                helper_release=current, attempt_nonce=attempt_nonce, apply_reset=False,
+                helper_release=current, attempt_nonce=attempt_nonce,
+                expected_event_id=event_id_for(), apply_reset=False,
             )
             journal_status, journal_output = systemd_state._bounded_command(
                 [
@@ -2365,7 +2384,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 config_path.write_text(json.dumps(config), encoding="ascii")
                 outcome = systemd_state.reset_cloudflare_pending_guard(
                     receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
-                    helper_release=current, attempt_nonce=attempt_nonce, apply_reset=False,
+                    helper_release=current, attempt_nonce=attempt_nonce,
+                    expected_event_id=event_id_for(), apply_reset=False,
                 )
                 self.assertEqual(outcome["outcome"], expected_outcome)
                 config = json.loads(config_path.read_text(encoding="ascii"))
@@ -2378,7 +2398,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             journal.write_text(original_journal.replace("pending_operation", "other_failure"), encoding="ascii")
             outcome = systemd_state.reset_cloudflare_pending_guard(
                 receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
-                helper_release=current, attempt_nonce=attempt_nonce, apply_reset=False,
+                helper_release=current, attempt_nonce=attempt_nonce,
+                expected_event_id=event_id_for(), apply_reset=False,
             )
             self.assertEqual(outcome["outcome"], "skip")
             journal.write_text(original_journal, encoding="ascii")
@@ -2388,7 +2409,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             with self.assertRaises(systemd_state.StateError):
                 systemd_state.reset_cloudflare_pending_guard(
                     receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
-                    helper_release=current, attempt_nonce=attempt_nonce, apply_reset=False,
+                    helper_release=current, attempt_nonce=attempt_nonce,
+                    expected_event_id=event_id_for(), apply_reset=False,
                 )
             config["jobs"] = []
             config_path.write_text(json.dumps(config), encoding="ascii")
@@ -2402,6 +2424,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 systemd_state.reset_cloudflare_pending_guard(
                     receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
                     helper_release=current, attempt_nonce=attempt_nonce,
+                    expected_event_id=event_id_for(),
                 )
             after_revalidation_failure = [json.loads(line) for line in command_log.read_text().splitlines()]
             self.assertFalse(
@@ -2428,9 +2451,41 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 f"config={config_path.read_text(encoding='ascii')!r}",
             )
 
+            # A fresh, otherwise valid invocation must not be acted on when
+            # the wrapper supplied the prior event identity.
+            stale_event_id = event_id_for()
+            second_invocation = "279af136423f48e190994de6fba470af"
+            config["properties"][systemd_state.CLOUDFLARE_UNIT] = {
+                **service, "InvocationID": second_invocation,
+            }
+            config["states"][systemd_state.CLOUDFLARE_UNIT] = "failed"
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            journal.write_text(original_journal.replace(invocation, second_invocation), encoding="ascii")
+            journal.chmod(0o755)
+            commands_before_drift = [json.loads(line) for line in command_log.read_text().splitlines()]
+            drift = systemd_state.reset_cloudflare_pending_guard(
+                receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
+                helper_release=current, attempt_nonce=attempt_nonce,
+                expected_event_id=stale_event_id,
+            )
+            self.assertEqual(drift, {"outcome": "skip"})
+            self.assertFalse(evidence_dir.exists())
+            commands_after_drift = [json.loads(line) for line in command_log.read_text().splitlines()]
+            mutation_commands = {"stop", "start", "reset-failed"}
+            self.assertEqual(
+                [entry for entry in commands_after_drift if entry and entry[0] in mutation_commands],
+                [entry for entry in commands_before_drift if entry and entry[0] in mutation_commands],
+            )
+
+            config["properties"][systemd_state.CLOUDFLARE_UNIT] = service
+            config_path.write_text(json.dumps(config), encoding="ascii")
+            journal.write_text(original_journal, encoding="ascii")
+            journal.chmod(0o755)
+
             result = systemd_state.reset_cloudflare_pending_guard(
                 receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
                 helper_release=current, attempt_nonce=attempt_nonce,
+                expected_event_id=event_id_for(),
             )
             self.assertEqual(result["outcome"], "performed")
             self.assertRegex(str(result["evidence_id"]), r"^[0-9a-f]{64}$")
@@ -2478,6 +2533,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 systemd_state.reset_cloudflare_pending_guard(
                     receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
                     helper_release=current, attempt_nonce="e" * 64,
+                    expected_event_id=event_id_for(),
                 )
             after_collision = [
                 tuple(command[:2]) for command in
@@ -2579,6 +2635,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             retry = systemd_state.reset_cloudflare_pending_guard(
                 receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
                 helper_release=current, attempt_nonce="b" * 64,
+                expected_event_id=event_id_for(),
             )
             self.assertEqual(retry, {"outcome": "skip"})
             commands = [json.loads(line) for line in command_log.read_text().splitlines()]
@@ -2627,6 +2684,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 systemd_state.reset_cloudflare_pending_guard(
                     receipt, transaction=self.shared / STATE_NAME, app_dir=self.app_dir,
                     helper_release=current, attempt_nonce="c" * 64,
+                    expected_event_id=event_id_for(second_invocation),
                 )
             after_failed_reset = [
                 tuple(command[:2]) for command in

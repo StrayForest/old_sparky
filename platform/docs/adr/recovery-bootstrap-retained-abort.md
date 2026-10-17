@@ -434,7 +434,9 @@ active/enabled, and the current invocation journal proves the fixed
 empty service cgroup, empty pair jobs, timer identity and a fresh timer horizon
 beyond the bounded recovery window are checked under the canonical lock. A
 per-event root-owned file is created with `O_EXCL` after those checks and before
-the timer stop; a random attempt nonce in that file prevents stale evidence
+the timer stop; the helper must match its independently derived event ID to
+the wrapper's precomputed transaction/receipt/invocation binding before any
+write or action. A random attempt nonce in that file prevents stale evidence
 from authorizing EXIT compensation. The helper stops only the fixed timer,
 performs at most one fixed `reset-failed` for the service, and never starts the
 service. The ordinary systemd receipt restoration re-arms the timer and

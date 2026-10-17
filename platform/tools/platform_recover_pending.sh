@@ -1299,7 +1299,8 @@ PY
         --state "$SYSTEMD_STATE" --transaction "$STATE" \
         --helper-release "$current_release" --app-dir "$APP_DIR" \
         --systemctl "$SYSTEMCTL_BIN" \
-        --attempt-nonce "$CLOUDFLARE_PENDING_RESET_ATTEMPT_NONCE")"; then
+        --attempt-nonce "$CLOUDFLARE_PENDING_RESET_ATTEMPT_NONCE" \
+        --expected-event-id "$CLOUDFLARE_PENDING_RESET_EVIDENCE_ID")"; then
         helper_status=0
       else
         helper_status="$?"

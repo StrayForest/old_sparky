@@ -1460,6 +1460,7 @@ def reset_cloudflare_pending_guard(
     app_dir: Path,
     helper_release: Path,
     attempt_nonce: str,
+    expected_event_id: str,
     apply_reset: bool = True,
 ) -> dict[str, object] | None:
     """Clear only the stale failed result proven to be the pending-operation guard."""
@@ -1467,6 +1468,8 @@ def reset_cloudflare_pending_guard(
         raise StateError("Cloudflare pending-guard reset requires root")
     if re.fullmatch(r"[0-9a-f]{64}", attempt_nonce) is None:
         raise StateError("Cloudflare reset attempt nonce is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_event_id) is None:
+        raise StateError("Cloudflare reset expected event identity is invalid")
     record = _read_receipt(path)
     _validate_context(record, app_dir)
     _validate_transaction_binding(record, transaction, app_dir, helper_release)
@@ -1597,6 +1600,12 @@ def reset_cloudflare_pending_guard(
     key = hashlib.sha256(
         f"{operation_id}:{transaction_sha}:{receipt_sha}:{invocation_id}".encode("ascii")
     ).hexdigest()
+    # The wrapper snapshots this event key before invoking us.  If the
+    # invocation or bound files changed between that snapshot and this fresh
+    # preflight, leave the incident to canonical recovery without authorizing
+    # an action or a compensation record for a different event.
+    if key != expected_event_id:
+        return {"outcome": "skip"}
     source_sha = _cloudflare_source_sha(current)
     evidence: dict[str, object] = {
         "schema": 1,
@@ -1776,6 +1785,7 @@ def _parser() -> argparse.ArgumentParser:
     cloudflare_reset.add_argument("--helper-release", required=True, type=Path)
     cloudflare_reset.add_argument("--app-dir", required=True, type=Path)
     cloudflare_reset.add_argument("--attempt-nonce", required=True)
+    cloudflare_reset.add_argument("--expected-event-id", required=True)
     return parser
 
 
@@ -1873,6 +1883,7 @@ def main() -> int:
                 app_dir=args.app_dir,
                 helper_release=args.helper_release,
                 attempt_nonce=args.attempt_nonce,
+                expected_event_id=args.expected_event_id,
             )
             outcome = result.get("outcome") if isinstance(result, dict) else None
             evidence_id = result.get("evidence_id") if isinstance(result, dict) else None
