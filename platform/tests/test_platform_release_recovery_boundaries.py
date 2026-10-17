@@ -242,6 +242,127 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         with self.assertRaises(transaction.TransactionError):
             transaction._protected_static_revision_graph(migration_fixture)
 
+        import types
+
+        preauth_roots = self.root / "preauth-release-roots"
+        preauth_roots.mkdir()
+        preauth_releases = []
+        for name in ("candidate", "original"):
+            release_root = preauth_roots / name
+            versions = release_root / "alembic" / "versions"
+            versions.mkdir(parents=True)
+            (versions / "0054_literal.py").write_text(
+                "revision = '20261010_0054'\n"
+                "down_revision = None\n"
+                "depends_on = None\n"
+                "branch_labels = None\n",
+                encoding="utf-8",
+            )
+            preauth_releases.append(release_root)
+        wrapper_source = RECOVERY_WRAPPER.read_text(encoding="utf-8")
+        preauth_start = wrapper_source.index('"$safe_env_parser" "$api_env_file" <<\'PY\'')
+        preauth_body_start = wrapper_source.index("\n", preauth_start) + 1
+        preauth_body_end = wrapper_source.index("\nPY\n  then", preauth_body_start)
+        preauth_body = wrapper_source[preauth_body_start:preauth_body_end]
+
+        class FakeConnection:
+            readonly = False
+
+            class Transaction:
+                def __init__(self, outer):
+                    self.outer = outer
+
+                async def __aenter__(self):
+                    self.outer.readonly = True
+
+                async def __aexit__(self, *_args):
+                    return None
+
+            def __init__(self):
+                pass
+
+            def transaction(self, *, readonly: bool):
+                if not readonly:
+                    raise AssertionError("preauth DB transaction must be readonly")
+                return self.Transaction(self)
+
+            async def fetchrow(self, _query):
+                return {
+                    "database_name": "platformdb",
+                    "schema_name": "platform",
+                    "resolved_oid": 123,
+                }
+
+            async def fetch(self, query):
+                if "pg_catalog.pg_class" in query:
+                    return [{"oid": 123, "schema_name": "platform", "relkind": "r"}]
+                return [{"version_num": "20261010_0054"}]
+
+            async def close(self):
+                return None
+
+        fake_connection = FakeConnection()
+        fake_asyncpg = types.ModuleType("asyncpg")
+        fake_sqlalchemy = types.ModuleType("sqlalchemy")
+        fake_sqlalchemy_engine = types.ModuleType("sqlalchemy.engine")
+
+        class FakeURL:
+            def __init__(self, url: str):
+                self.drivername = url.split("://", 1)[0]
+                self.database = url.rsplit("/", 1)[-1]
+
+            def set(self, *, drivername: str):
+                self.drivername = drivername
+                return self
+
+            def render_as_string(self, *, hide_password: bool):
+                return "postgresql://fixture:fixture@127.0.0.1/platformdb"
+
+        fake_sqlalchemy_engine.make_url = FakeURL
+        fake_sqlalchemy.engine = fake_sqlalchemy_engine
+
+        async def fake_connect(*, dsn, timeout, server_settings):
+            self.assertTrue(dsn.startswith("postgresql://"))
+            self.assertEqual(timeout, 10)
+            self.assertEqual(server_settings["default_transaction_read_only"], "on")
+            return fake_connection
+
+        fake_asyncpg.connect = fake_connect
+        with tempfile.TemporaryDirectory(prefix="trusted-api-env-", dir="/root") as fixture_dir:
+            env_path = Path(fixture_dir) / "api.env"
+            env_path.write_text(
+                "PLATFORM_DATABASE_URL=postgresql+asyncpg://fixture:fixture@127.0.0.1/platformdb\n",
+                encoding="utf-8",
+            )
+            env_path.chmod(0o640)
+            os.chown(env_path, 0, 985)
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "preauth",
+                        str(TRANSACTION_TOOL),
+                        str(preauth_releases[0]),
+                        str(preauth_releases[1]),
+                        str(REPO_ROOT / "platform/tools/platform_safe_env_exec.py"),
+                        str(env_path),
+                    ],
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "asyncpg": fake_asyncpg,
+                        "sqlalchemy": fake_sqlalchemy,
+                        "sqlalchemy.engine": fake_sqlalchemy_engine,
+                    },
+                ),
+                mock.patch.dict(os.environ),
+            ):
+                os.environ.pop("PLATFORM_DATABASE_URL", None)
+                exec(compile(preauth_body, "recovery-preauth-heredoc", "exec"), {"__name__": "__main__"})
+            self.assertTrue(fake_connection.readonly)
+
         current = self.add_release("protected-auth-current")
         previous = self.add_release("protected-auth-previous")
 
@@ -389,6 +510,14 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         route_start = wrapper.index('if [[ "$pending_operation" == install')
         self.assertIn('namespace["_protected_static_revision_graph"]', wrapper[route_start:])
         self.assertNotIn("walk_revisions", wrapper[route_start:])
+        self.assertIn('api_env_file="/opt/oldsparky/platform/shared/env/api.env"', wrapper[route_start:])
+        self.assertIn('regular file:0:1:644', wrapper[route_start:])
+        self.assertIn(
+            "819ccc9e489c3fb8b14b3cb61eae500c111c5edb663161504b6ca6e02868399d",
+            wrapper[route_start:],
+        )
+        self.assertIn('env_before.st_gid != 985', wrapper[route_start:])
+        self.assertNotIn('os.environ.get("PLATFORM_DATABASE_URL"', wrapper[route_start:])
         migration_head_at = wrapper.index("async def read_current()", route_start)
         archive_attestation_at = wrapper.index('proof["_validate_receipt"]', route_start)
         authorization_at = wrapper.index('authorize-recovery \\', route_start)

@@ -1155,17 +1155,30 @@ if [[ "$pending_operation" == install \
   [[ -L "$APP_DIR/current" && -n "$candidate_release" \
     && "$(dirname -- "$candidate_release")" == "$APP_DIR/releases" ]] \
     || { public_status failed topology >&2; exit 1; }
+  api_env_file="/opt/oldsparky/platform/shared/env/api.env"
+  safe_env_parser="$original_current/tools/platform_safe_env_exec.py"
+  test -f "$safe_env_parser" && test ! -L "$safe_env_parser" \
+    || { public_status failed migration >&2; exit 1; }
+  safe_env_parser_metadata="$(stat -c '%F:%u:%h:%a' \
+    "$safe_env_parser" 2>/dev/null || true)"
+  [[ "$safe_env_parser_metadata" == "regular file:0:1:644" ]] \
+    || { public_status failed migration >&2; exit 1; }
+  safe_env_parser_sha256="$(/usr/bin/sha256sum -- "$safe_env_parser" 2>/dev/null | cut -d ' ' -f 1)"
+  [[ "$safe_env_parser_sha256" == 819ccc9e489c3fb8b14b3cb61eae500c111c5edb663161504b6ca6e02868399d ]] \
+    || { public_status failed migration >&2; exit 1; }
   if ! "$APP_DIR/shared/venv/bin/python" -I -B - \
-    "$TRANSACTION_TOOL" "$candidate_release" "$original_current" <<'PY'
+    "$TRANSACTION_TOOL" "$candidate_release" "$original_current" \
+    "$safe_env_parser" "$api_env_file" <<'PY'
 import asyncio
 import os
 import runpy
 import sys
 from pathlib import Path
+import stat
 from sqlalchemy.engine import make_url
 import asyncpg
 
-transaction_path, candidate_root, original_root = sys.argv[1:]
+transaction_path, candidate_root, original_root, safe_env_parser_path, database_env_path = sys.argv[1:]
 namespace = runpy.run_path(transaction_path)
 candidate_graph = namespace["_protected_static_revision_graph"](Path(candidate_root))
 original_graph = namespace["_protected_static_revision_graph"](Path(original_root))
@@ -1179,7 +1192,92 @@ children = {
 heads = sorted(set(candidate_graph) - children)
 if heads != ["20261010_0054"]:
     raise SystemExit(1)
-raw_url = os.environ.get("PLATFORM_DATABASE_URL", "")
+env_path = Path(database_env_path)
+env_parser = runpy.run_path(safe_env_parser_path)
+if not env_path.is_absolute() or any(part in {"", ".", ".."} for part in env_path.parts[1:]):
+    raise SystemExit(1)
+root_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+directory_fd = root_fd
+opened_directories = []
+try:
+    directory_metadata = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or directory_metadata.st_uid != 0
+        or stat.S_IMODE(directory_metadata.st_mode) & 0o022
+    ):
+        raise SystemExit(1)
+    for component in env_path.parts[1:-1]:
+        next_fd = os.open(
+            component,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        opened_directories.append(next_fd)
+        directory_metadata = os.fstat(next_fd)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_uid != 0
+            or stat.S_IMODE(directory_metadata.st_mode) & 0o022
+        ):
+            raise SystemExit(1)
+        directory_fd = next_fd
+    env_fd = os.open(
+        env_path.name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    try:
+        env_before = os.fstat(env_fd)
+        if (
+            not stat.S_ISREG(env_before.st_mode)
+            or env_before.st_uid != 0
+            or env_before.st_gid != 985
+            or stat.S_IMODE(env_before.st_mode) != 0o640
+            or env_before.st_nlink != 1
+            or env_before.st_size > env_parser["MAX_ENV_BYTES"]
+        ):
+            raise SystemExit(1)
+        env_chunks = []
+        env_remaining = env_parser["MAX_ENV_BYTES"] + 1
+        while env_remaining:
+            chunk = os.read(env_fd, min(64 * 1024, env_remaining))
+            if not chunk:
+                break
+            env_chunks.append(chunk)
+            env_remaining -= len(chunk)
+        env_bytes = b"".join(env_chunks)
+        env_after = os.fstat(env_fd)
+        if len(env_bytes) > env_parser["MAX_ENV_BYTES"] or (
+            env_before.st_dev,
+            env_before.st_ino,
+            env_before.st_uid,
+            env_before.st_gid,
+            stat.S_IMODE(env_before.st_mode),
+            env_before.st_nlink,
+            env_before.st_size,
+            env_before.st_mtime_ns,
+            env_before.st_ctime_ns,
+        ) != (
+            env_after.st_dev,
+            env_after.st_ino,
+            env_after.st_uid,
+            env_after.st_gid,
+            stat.S_IMODE(env_after.st_mode),
+            env_after.st_nlink,
+            env_after.st_size,
+            env_after.st_mtime_ns,
+            env_after.st_ctime_ns,
+        ):
+            raise SystemExit(1)
+    finally:
+        os.close(env_fd)
+finally:
+    for opened_fd in reversed(opened_directories):
+        os.close(opened_fd)
+    os.close(root_fd)
+database_values = env_parser["parse_dotenv"](env_bytes)
+raw_url = database_values.get("PLATFORM_DATABASE_URL", "")
 if not raw_url:
     raise SystemExit(1)
 url = make_url(raw_url)
