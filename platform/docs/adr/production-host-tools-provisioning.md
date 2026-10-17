@@ -140,7 +140,7 @@ selects C and updates exactly the dispatcher and shared-environment config
 digests in the 14-member closure. The selected 24x8 profile keeps the existing
 32-slot admitted-plus-waiting envelope and temporarily enables only the
 bounded numeric heap sampler. Exact-C CI, signed provisioning and installed
-self-test are still required; this source pin does not prove activation.
+self-test are still required; this source pin does not prove activation. The fixed-enum early Live User QA failure-boundary diagnostics use source **C** `a45d5e9cd42b7a738cea76ee8e3dc411d79b36c3` and pin-only **P** `e8557e430958019941f6482975cdbde4223e28a8`; only `platform_workflow_remote_dispatch.py` changes within the 15-member host-tools closure, and exact-P full CI, signed preflight, out-of-band provisioning and installed-generation self-test remain required.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable

@@ -153,7 +153,7 @@ USER_REPORT_KEYS = frozenset(
         "retained_line_count", "truncated", "coverage_status", "test_count",
         "logical_total", "logical_skip_count", "logical_expected_fail_count",
         "failed_test_count", "browser_counts", "error_class_counts",
-        "child_diagnostic",
+        "child_diagnostic", "failure_origin",
     }
 )
 USER_BROWSER_COUNT_KEYS = frozenset(
@@ -669,6 +669,7 @@ def validate_live_user_qa_report(report: dict[str, Any], expected_sha: str) -> N
         or report.get("schema") != 1
         or report.get("source_git_sha") != expected_sha
         or report.get("status") != "passed"
+        or report.get("failure_origin") is not None
         or report.get("success") is not True
         or report.get("process_exit_code") != 0
         or type(report.get("process_exit_code")) is not int

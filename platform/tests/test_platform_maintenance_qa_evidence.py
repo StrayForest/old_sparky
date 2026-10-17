@@ -136,6 +136,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
         evidence.validate_live_launch_report(launch, target_sha)
         user = _canonical_workflow_report("platform-live-user-qa.yml", target_sha)
         evidence.validate_live_user_qa_report(user, target_sha)
+        self.assertIsNone(user["failure_origin"])
 
         invalid = (
             ("launch-skip-count", {**launch, "logical_counts": {**launch["logical_counts"], "logical_skip": 5}}, "launch"),
@@ -143,6 +144,8 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             ("launch-failure", {**launch, "success": False}, "launch"),
             ("user-bool-counter", {**user, "logical_total": True}, "user"),
             ("user-child-diagnostic-missing", {**user, "child_diagnostic": None}, "user"),
+            ("user-failure-origin", {**user, "failure_origin": "dispatcher"}, "user"),
+            ("user-failure-origin-missing", {key: value for key, value in user.items() if key != "failure_origin"}, "user"),
             ("user-skipped", {**user, "browser_counts": {**user["browser_counts"], "logical_skip": 1}}, "user"),
             ("user-binding", {**user, "source_binding_sha256": ""}, "user"),
         )
