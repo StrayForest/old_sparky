@@ -132,6 +132,14 @@ SCRATCH_SYNTHETIC_RESTORE_ARMS = (
 )
 SCRATCH_SYNTHETIC_FIXTURE_ID = "platform_backup_restore_synthetic_v1"
 SCRATCH_SYNTHETIC_ALEMBIC_REVISION = "synthetic_restore_revision_001"
+_SCRATCH_INACCESSIBLE_PATHS = (
+    "/opt/oldsparky/platform/shared",
+    "/var/lib/postgresql",
+    "/var/run/postgresql",
+    "/run/postgresql",
+    "/etc/postgresql",
+    "/root",
+)
 SCRATCH_SYNTHETIC_EXPECTED_ROWS = (
     (1, "alpha", "restore fixture alpha"),
     (2, "beta", "restore fixture beta"),
@@ -318,9 +326,12 @@ def _scratch_cleanup_failure(
     service_stopped: bool | None = None,
     mount_absent: bool | None = None,
     mountpoint_removed: bool | None = None,
+    protected_paths_cleaned: bool | None = None,
 ) -> BaseException | None:
     """Keep cleanup status separate and never replace an existing first fault."""
     observed_cleanup = (service_stopped, mount_absent, mountpoint_removed)
+    if protected_paths_cleaned is not None:
+        observed_cleanup += (protected_paths_cleaned,)
     if all(type(value) is bool for value in observed_cleanup):
         cleanup_status = (
             "confirmed"
@@ -7315,12 +7326,10 @@ def _scratch_unit_command(
         "--property=ProtectHome=tmpfs",
         "--property=NoNewPrivileges=yes",
         "--property=CapabilityBoundingSet=CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE",
-        "--property=InaccessiblePaths=/opt/oldsparky/platform/shared",
-        "--property=InaccessiblePaths=/var/lib/postgresql",
-        "--property=InaccessiblePaths=/var/run/postgresql",
-        "--property=InaccessiblePaths=/run/postgresql",
-        "--property=InaccessiblePaths=/etc/postgresql",
-        "--property=InaccessiblePaths=/root",
+        *(
+            f"--property=InaccessiblePaths={path}"
+            for path in _SCRATCH_INACCESSIBLE_PATHS
+        ),
         "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "--setenv=LANG=C.UTF-8",
         "--setenv=LC_ALL=C.UTF-8",
@@ -7874,14 +7883,7 @@ def _scratch_expected_properties(
     if str(mountpoint) not in tmpfs:
         raise RuntimeError("Scratch restore tmpfs request is not present in the active unit.")
     inaccessible = properties.get("InaccessiblePaths", "")
-    for required in (
-        "/opt/oldsparky/platform/shared",
-        "/var/lib/postgresql",
-        "/var/run/postgresql",
-        "/run/postgresql",
-        "/etc/postgresql",
-        "/root",
-    ):
+    for required in _SCRATCH_INACCESSIBLE_PATHS:
         if required not in inaccessible:
             raise RuntimeError("Scratch restore service can see an out-of-scope credential or cluster path.")
     bind_paths = properties.get("BindReadOnlyPaths", "")
@@ -7918,6 +7920,155 @@ def _scratch_mountpoint_is_mounted(path: pathlib.Path) -> bool:
         if separator and len(fields) >= 5 and fields[4].replace("\\040", " ") == target:
             return True
     return False
+
+
+def _scratch_synthetic_protected_path_targets() -> tuple[pathlib.Path, ...]:
+    targets: list[pathlib.Path] = []
+    var_run = pathlib.Path("/var/run")
+    try:
+        if not var_run.is_symlink() or var_run.resolve(strict=True) != pathlib.Path("/run"):
+            raise RuntimeError("Synthetic protected path fixture found an unsupported /var/run alias.")
+    except OSError as exc:
+        raise RuntimeError("Synthetic protected path fixture could not verify /var/run.") from exc
+    for value in _SCRATCH_INACCESSIBLE_PATHS:
+        target = pathlib.Path(value)
+        if value == "/var/run/postgresql" and var_run.is_symlink():
+            target = pathlib.Path("/run/postgresql")
+        if not target.is_absolute() or ".." in target.parts:
+            raise RuntimeError("Synthetic protected path fixture contains an invalid fixed target.")
+        if target not in targets:
+            targets.append(target)
+    return tuple(targets)
+
+
+def _scratch_create_missing_protected_path_directories(
+    targets: tuple[pathlib.Path, ...], *, owner_uid: int, owner_gid: int
+) -> tuple[tuple[str, int, int], ...]:
+    """Create only absent fixed target directories and retain exact identities."""
+    created: list[tuple[str, int, int]] = []
+    try:
+        for target in targets:
+            if not target.is_absolute() or ".." in target.parts:
+                raise RuntimeError("Synthetic protected path fixture target is invalid.")
+            current = pathlib.Path("/")
+            for part in target.parts[1:]:
+                current = current / part
+                try:
+                    info = current.lstat()
+                except FileNotFoundError:
+                    try:
+                        parent_info = current.parent.lstat()
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "Synthetic protected path fixture parent could not be verified."
+                        ) from exc
+                    if (
+                        not stat.S_ISDIR(parent_info.st_mode)
+                        or stat.S_ISLNK(parent_info.st_mode)
+                        or parent_info.st_uid != owner_uid
+                        or parent_info.st_gid != owner_gid
+                        or stat.S_IMODE(parent_info.st_mode) & 0o022
+                    ):
+                        raise RuntimeError(
+                            "Synthetic protected path fixture parent is not safely owned."
+                        )
+                    try:
+                        os.mkdir(current, 0o700)
+                        # Keep an unpinned ledger entry until lstat confirms the
+                        # inode. If that read fails, cleanup must not claim success
+                        # or remove a path whose identity is ambiguous.
+                        created.append((str(current), -1, -1))
+                        try:
+                            info = current.lstat()
+                        except OSError as exc:
+                            raise RuntimeError(
+                                "Synthetic protected path fixture directory could not be created."
+                            ) from exc
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "Synthetic protected path fixture directory could not be created."
+                        ) from exc
+                    created[-1] = (str(current), info.st_dev, info.st_ino)
+                    if (
+                        not stat.S_ISDIR(info.st_mode)
+                        or stat.S_ISLNK(info.st_mode)
+                        or info.st_uid != owner_uid
+                        or info.st_gid != owner_gid
+                        or stat.S_IMODE(info.st_mode) != 0o700
+                    ):
+                        raise RuntimeError(
+                            "Synthetic protected path fixture directory identity is unsafe."
+                        )
+                if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    raise RuntimeError(
+                        "Synthetic protected path fixture target is not a real directory."
+                    )
+    except BaseException as exc:
+        cleanup_confirmed = True
+        try:
+            _scratch_remove_created_protected_path_directories(
+                tuple(created), owner_uid=owner_uid, owner_gid=owner_gid
+            )
+        except BaseException:
+            cleanup_confirmed = False
+        setattr(exc, "scratch_synthetic_path_fixture_created", tuple(created))
+        setattr(exc, "scratch_synthetic_path_fixture_cleanup_confirmed", cleanup_confirmed)
+        raise
+    return tuple(created)
+
+
+def _scratch_remove_created_protected_path_directories(
+    created: tuple[tuple[str, int, int], ...], *, owner_uid: int, owner_gid: int
+) -> None:
+    """Remove only empty fixture directories whose pinned identities still match."""
+    cleanup_failed = False
+    for path_text, device, inode in reversed(created):
+        path = pathlib.Path(path_text)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            cleanup_failed = True
+            continue
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or (info.st_dev, info.st_ino) != (device, inode)
+            or info.st_uid != owner_uid
+            or info.st_gid != owner_gid
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            cleanup_failed = True
+            continue
+        try:
+            if any(path.iterdir()):
+                cleanup_failed = True
+                continue
+            path.rmdir()
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                continue
+            cleanup_failed = True
+        except OSError:
+            cleanup_failed = True
+    if cleanup_failed:
+        raise RuntimeError("Synthetic protected path fixture cleanup could not be confirmed.")
+
+
+def _scratch_prepare_synthetic_protected_paths() -> tuple[tuple[str, int, int], ...]:
+    """Prepare the fixed namespace targets only on the ephemeral hosted runner."""
+    if (
+        os.geteuid() != 0
+        or os.environ.get("GITHUB_ACTIONS") != "true"
+        or os.environ.get("RUNNER_OS") != "Linux"
+        or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+    ):
+        raise RuntimeError("Synthetic protected path fixture requires the root GitHub-hosted Linux runner.")
+    return _scratch_create_missing_protected_path_directories(
+        _scratch_synthetic_protected_path_targets(), owner_uid=0, owner_gid=0
+    )
 
 
 def _scratch_stop_unit(unit_name: str) -> None:
@@ -8123,6 +8274,8 @@ def _run_isolated_restore_drill(
         phase_prefix_observed: int | None = None
         phase_guard_monotonic_ns: int | None = None
         phase_drain_monotonic_ns: int | None = None
+        synthetic_protected_path_dirs: tuple[tuple[str, int, int], ...] = ()
+        synthetic_protected_paths_cleaned = not synthetic_restore_diagnostic
         blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
         setup_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
         try:
@@ -8145,6 +8298,20 @@ def _run_isolated_restore_drill(
             # A pending TERM/INT is delivered only after the exact host
             # mountpoint identity is ready for the normal cleanup path.
             signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
+            if synthetic_restore_diagnostic:
+                try:
+                    synthetic_protected_path_dirs = (
+                        _scratch_prepare_synthetic_protected_paths()
+                    )
+                except BaseException as fixture_error:
+                    created = getattr(
+                        fixture_error,
+                        "scratch_synthetic_path_fixture_created",
+                        (),
+                    )
+                    if isinstance(created, tuple):
+                        synthetic_protected_path_dirs = created
+                    raise
             fault_site = "controller_host_guard"
             _scratch_host_guard("parent_before_unit_launch")
             # Do not let a termination signal land after the client process
@@ -8586,6 +8753,14 @@ def _run_isolated_restore_drill(
                 raise RuntimeError("Scratch restore worker result changed after completion authorization.")
             worker_result = decoded
         except BaseException as operation_error:
+            if synthetic_restore_diagnostic:
+                created = getattr(
+                    operation_error,
+                    "scratch_synthetic_path_fixture_created",
+                    None,
+                )
+                if isinstance(created, tuple):
+                    synthetic_protected_path_dirs = created
             # Record the first controller-side failure before any teardown can
             # raise or replace it. A separately validated worker frame, if
             # present, is more precise about the original child failure.
@@ -8878,6 +9053,18 @@ def _run_isolated_restore_drill(
             except BaseException as cleanup_error:
                 mountpoint_removed = False
                 final_cleanup_errors.append(cleanup_error)
+            protected_paths_cleaned = not synthetic_restore_diagnostic
+            if synthetic_restore_diagnostic:
+                try:
+                    _scratch_remove_created_protected_path_directories(
+                        synthetic_protected_path_dirs,
+                        owner_uid=0,
+                        owner_gid=0,
+                    )
+                    protected_paths_cleaned = True
+                except BaseException as cleanup_error:
+                    protected_paths_cleaned = False
+                    final_cleanup_errors.append(cleanup_error)
             if selector is not None:
                 try:
                     selector.close()
@@ -8890,9 +9077,14 @@ def _run_isolated_restore_drill(
                             stream.close()
                         except BaseException as cleanup_error:
                             final_cleanup_errors.append(cleanup_error)
-            if not service_stopped or not mount_absent or not mountpoint_removed:
+            if (
+                not service_stopped
+                or not mount_absent
+                or not mountpoint_removed
+                or not protected_paths_cleaned
+            ):
                 final_cleanup_errors.append(
-                    RuntimeError("Scratch restore unit or mount cleanup could not be confirmed.")
+                    RuntimeError("Scratch restore unit, mount, or fixture cleanup could not be confirmed.")
                 )
             cleanup_failure = _scratch_cleanup_failure(
                 sys.exc_info()[1],
@@ -8901,6 +9093,7 @@ def _run_isolated_restore_drill(
                 service_stopped=service_stopped,
                 mount_absent=mount_absent,
                 mountpoint_removed=mountpoint_removed,
+                protected_paths_cleaned=protected_paths_cleaned,
             )
             if cleanup_failure is not None:
                 raise cleanup_failure from final_cleanup_errors[0]

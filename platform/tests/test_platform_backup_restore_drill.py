@@ -1361,6 +1361,140 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 _run_synthetic_restore_diagnostic_for_ci(source_sha="e" * 40)
         self.assertIs(raised.exception, reporter_error)
 
+    def test_synthetic_protected_path_fixture_is_created_and_cleaned_by_identity(self) -> None:
+        owner_uid = os.geteuid()
+        owner_gid = os.getegid()
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            existing = root / "existing"
+            existing.mkdir()
+            sentinel = existing / "preserve.txt"
+            sentinel.write_text("pre-existing", encoding="ascii")
+            created = backup_drill._scratch_create_missing_protected_path_directories(
+                (existing, root / "missing" / "first", root / "missing" / "second"),
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+            )
+            self.assertEqual(
+                {path for path, _, _ in created},
+                {
+                    str(root / "missing"),
+                    str(root / "missing" / "first"),
+                    str(root / "missing" / "second"),
+                },
+            )
+            for path, _, _ in created:
+                info = pathlib.Path(path).lstat()
+                self.assertTrue(stat.S_ISDIR(info.st_mode))
+                self.assertEqual((info.st_uid, info.st_gid), (owner_uid, owner_gid))
+                self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
+            backup_drill._scratch_remove_created_protected_path_directories(
+                created, owner_uid=owner_uid, owner_gid=owner_gid
+            )
+            self.assertFalse((root / "missing").exists())
+            self.assertTrue(sentinel.is_file())
+            self.assertEqual(sentinel.read_text(encoding="ascii"), "pre-existing")
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            unverified = root / "unverified"
+            original_lstat = pathlib.Path.lstat
+            original_mkdir = os.mkdir
+            injected_error = OSError("injected post-mkdir identity read failure")
+            mkdir_succeeded = False
+            failed_once = False
+
+            def mark_fixture_mkdir(
+                path: str | os.PathLike[str], mode: int = 0o777
+            ) -> None:
+                nonlocal mkdir_succeeded
+                original_mkdir(path, mode)
+                if pathlib.Path(path) == unverified:
+                    mkdir_succeeded = True
+
+            def fail_first_unverified_lstat(path: pathlib.Path) -> os.stat_result:
+                nonlocal failed_once
+                if path == unverified and mkdir_succeeded and not failed_once:
+                    failed_once = True
+                    raise injected_error
+                return original_lstat(path)
+
+            with (
+                mock.patch.object(
+                    backup_drill.os, "mkdir", side_effect=mark_fixture_mkdir
+                ),
+                mock.patch.object(
+                    pathlib.Path,
+                    "lstat",
+                    autospec=True,
+                    side_effect=fail_first_unverified_lstat,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "directory could not be created"
+                ) as raised:
+                    backup_drill._scratch_create_missing_protected_path_directories(
+                        (unverified,), owner_uid=owner_uid, owner_gid=owner_gid
+                    )
+            self.assertIs(raised.exception.__cause__, injected_error)
+            self.assertTrue(failed_once)
+            self.assertEqual(
+                getattr(raised.exception, "scratch_synthetic_path_fixture_created"),
+                ((str(unverified), -1, -1),),
+            )
+            self.assertFalse(
+                getattr(
+                    raised.exception,
+                    "scratch_synthetic_path_fixture_cleanup_confirmed",
+                )
+            )
+            self.assertTrue(unverified.is_dir())
+            unverified.rmdir()
+
+    def test_synthetic_protected_path_fixture_refuses_symlinks_and_identity_drift(self) -> None:
+        owner_uid = os.geteuid()
+        owner_gid = os.getegid()
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            real = root / "real"
+            real.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "not a real directory"):
+                backup_drill._scratch_create_missing_protected_path_directories(
+                    (alias / "child",), owner_uid=owner_uid, owner_gid=owner_gid
+                )
+            self.assertFalse((real / "child").exists())
+
+            created = backup_drill._scratch_create_missing_protected_path_directories(
+                (root / "owned" / "leaf",),
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+            )
+            leaf = root / "owned" / "leaf"
+            leaf.rmdir()
+            leaf.mkdir(mode=0o700)
+            sentinel = leaf / "preserve.txt"
+            sentinel.write_text("replacement", encoding="ascii")
+            with self.assertRaisesRegex(RuntimeError, "cleanup could not be confirmed"):
+                backup_drill._scratch_remove_created_protected_path_directories(
+                    created, owner_uid=owner_uid, owner_gid=owner_gid
+                )
+            self.assertEqual(sentinel.read_text(encoding="ascii"), "replacement")
+
+    def test_synthetic_protected_path_fixture_requires_hosted_root_context(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "root GitHub-hosted Linux runner"):
+                backup_drill._scratch_prepare_synthetic_protected_paths()
+
+    def test_synthetic_protected_path_fixture_matches_complete_unit_policy(self) -> None:
+        targets = set(map(str, backup_drill._scratch_synthetic_protected_path_targets()))
+        expected = set(backup_drill._SCRATCH_INACCESSIBLE_PATHS)
+        if pathlib.Path("/var/run").is_symlink():
+            expected.discard("/var/run/postgresql")
+            expected.add("/run/postgresql")
+        self.assertEqual(targets, expected)
+
     def test_synthetic_pg16_restore_diagnostic_under_root(self) -> None:
         if (
             os.environ.get("GITHUB_ACTIONS") != "true"
@@ -3240,6 +3374,14 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         )
         self.assertNotIn("--collect", synthetic_command)
         self.assertIn("--property=CollectMode=inactive", synthetic_command)
+        self.assertEqual(
+            [
+                item.split("=", 2)[2]
+                for item in synthetic_command
+                if item.startswith("--property=InaccessiblePaths=")
+            ],
+            list(backup_drill._SCRATCH_INACCESSIBLE_PATHS),
+        )
         self.assertIn("--property=MemoryMax=" + str(backup_drill.SCRATCH_MEMORY_MAX_BYTES), synthetic_command)
         self.assertIn("--property=MemorySwapMax=0", synthetic_command)
         self.assertNotIn("--_scratch-archive", synthetic_command)
