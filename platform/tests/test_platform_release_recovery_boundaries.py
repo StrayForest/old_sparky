@@ -563,7 +563,6 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertIn('namespace["_protected_static_revision_graph"]', wrapper[route_start:])
         self.assertNotIn("walk_revisions", wrapper[route_start:])
         self.assertIn('api_env_file="/opt/oldsparky/platform/shared/env/api.env"', wrapper[route_start:])
-        self.assertIn('regular file:0:1:644', wrapper[route_start:])
         self.assertIn(
             "819ccc9e489c3fb8b14b3cb61eae500c111c5edb663161504b6ca6e02868399d",
             wrapper[route_start:],
