@@ -836,7 +836,6 @@ jobs:
       candidate_artifact_id: ${{ steps.publish-candidate.outputs.artifact-id }}
     env:
       TARGET_SHA: ${{ github.sha }}
-      PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}
       APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
       PROFILE_ID: ${{ inputs.profile_id }}
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
@@ -1068,6 +1067,8 @@ jobs:
       - name: Run checked-out external HTTP load client
         id: external-evaluate
         shell: bash
+        env:
+          PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           set -u
           artifact_dir="$RUNNER_TEMP/external-client"
@@ -1101,7 +1102,7 @@ jobs:
           [[ "$SOURCE_BINDING_BASE64" == "-" ]] && SOURCE_BINDING_BASE64=""
           [[ "$SOURCE_BINDING_SHA256" == "-" ]] && SOURCE_BINDING_SHA256=""
           run_checked_out_client() {
-            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 SOURCE_GIT_SHA="$SOURCE_GIT_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" SOURCE_BINDING_BASE64="$SOURCE_BINDING_BASE64" SOURCE_BINDING_SHA256="$SOURCE_BINDING_SHA256" GITHUB_RUN_ID="$GITHUB_RUN_ID" "$@"
+            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 PLATFORM_RUNNER_ENVIRONMENT="$PLATFORM_RUNNER_ENVIRONMENT" SOURCE_GIT_SHA="$SOURCE_GIT_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" SOURCE_BINDING_BASE64="$SOURCE_BINDING_BASE64" SOURCE_BINDING_SHA256="$SOURCE_BINDING_SHA256" GITHUB_RUN_ID="$GITHUB_RUN_ID" "$@"
           }
           load_status=1
           report_ready=0
@@ -1460,7 +1461,6 @@ jobs:
       TARGET_SHA: ${{ github.sha }}
       SOURCE_GIT_SHA: ${{ github.sha }}
       APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
-      PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
       MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}
     steps:
@@ -1612,6 +1612,7 @@ jobs:
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           set +e
           /usr/bin/python3 platform/tools/platform_ssr_capacity_diagnostic.py parent \

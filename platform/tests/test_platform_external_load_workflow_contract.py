@@ -1571,14 +1571,38 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 self.assertIn("runs-on: ubuntu-24.04", self.jobs[job_id])
         load_client = self.jobs["load-client"]
         self.assertIn("timeout-minutes: 270", load_client)
-        self.assertIn("PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}", load_client)
-        self.assertNotIn("PLATFORM_RUNNER_ENVIRONMENT: ${{ inputs.", load_client)
         self.assertNotIn("\n    container:", load_client)
         self.assertIn("Probe mandatory load PID-namespace containment", load_client)
         self.assertIn("probe_pid_namespace_capability", load_client)
         validator = self.jobs["validate-external-inputs"]
         self.assertIn("before fixture setup", validator)
         self.assertIn("probe_pid_namespace_capability", validator)
+
+    def test_runner_environment_context_is_scoped_to_sampler_steps(self) -> None:
+        jobs = yaml.safe_load(self.source)["jobs"]
+        load_job = jobs["load-client"]
+        self.assertNotIn("PLATFORM_RUNNER_ENVIRONMENT", load_job.get("env", {}))
+        load_step = next(
+            step for step in load_job["steps"] if step.get("id") == "external-evaluate"
+        )
+        self.assertEqual(
+            load_step["env"]["PLATFORM_RUNNER_ENVIRONMENT"],
+            "${{ runner.environment }}",
+        )
+        self.assertIn(
+            'PLATFORM_RUNNER_ENVIRONMENT="$PLATFORM_RUNNER_ENVIRONMENT"',
+            load_step["run"],
+        )
+
+        capacity_job = jobs["cpu-diagnostic-pair"]
+        self.assertNotIn("PLATFORM_RUNNER_ENVIRONMENT", capacity_job.get("env", {}))
+        capacity_step = next(
+            step for step in capacity_job["steps"] if step.get("id") == "ssr-capacity"
+        )
+        self.assertEqual(
+            capacity_step["env"]["PLATFORM_RUNNER_ENVIRONMENT"],
+            "${{ runner.environment }}",
+        )
 
     def test_containment_canary_is_safe_and_pinned(self) -> None:
         self.assertIn("runs-on: ubuntu-24.04", self.canary_source)
