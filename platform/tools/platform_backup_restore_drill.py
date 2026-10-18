@@ -281,11 +281,39 @@ _SCRATCH_DISK_MOUNT_FAILURE_REASONS = frozenset(
 _SCRATCH_VERIFICATION_SITES = frozenset(
     {
         "none",
+        "service_properties_shape",
+        "service_resource_policy",
+        "service_identity_state",
+        "service_cgroup_identity",
+        "service_pid_identity",
         "process_cgroup_read",
+        "process_cgroup_parse",
         "process_cgroup_mismatch",
         "expected_executable_stat",
         "proc_exe_stat",
         "proc_exe_mismatch",
+        "backend_mount_identity",
+        "credential_visibility",
+        "readonly_input_binds",
+        "archive_exclusion",
+        "controller_expected_executable_resolve",
+        "controller_snapshot_properties",
+        "controller_cgroup_snapshot",
+        "controller_invocation_identity",
+        "controller_image_mount_identity",
+        "controller_process_start_time",
+        "controller_cgroup_identity_compare",
+        "controller_process_start_time_compare",
+        "controller_second_snapshot_identity",
+        "controller_start_deadline",
+        "controller_process_state",
+        "controller_completion_unit_state",
+        "controller_completion_identity",
+        "worker_root_path_identity",
+        "worker_root_mode_identity",
+        "worker_mount_identity",
+        "worker_cgroup_identity",
+        "worker_postgres_account_identity",
         "other",
     }
 )
@@ -462,10 +490,14 @@ def valid_scratch_first_fault(value: Any) -> bool:
     base_fields = {"schema", "origin", "site", "exception_kind", "errno"}
     if not isinstance(value, dict) or set(value) not in (
         base_fields,
+        base_fields | {"verification_site"},
         base_fields | {"synthetic_path_fixture_rejection"},
         base_fields | {"synthetic_identity_snapshot_comparison"},
+        base_fields | {"synthetic_identity_snapshot_comparison", "verification_site"},
         base_fields | {"disk_mount_failure_reason"},
         base_fields | {"disk_mount_failure_reason", "disk_mount_predicates"},
+        base_fields | {"verification_site", "disk_mount_failure_reason"},
+        base_fields | {"verification_site", "disk_mount_failure_reason", "disk_mount_predicates"},
     ):
         return False
     if (
@@ -503,10 +535,29 @@ def valid_scratch_first_fault(value: Any) -> bool:
     if "synthetic_identity_snapshot_comparison" in value and (
         "synthetic_path_fixture_rejection" in value
         or value["origin"] != "controller"
-        or value["site"] != "controller_identity"
+        or value["site"] not in {
+            "controller_identity", "controller_completion_snapshot", "controller_final_snapshot"
+        }
         or value["exception_kind"] != "runtime"
         or value["errno"] is not None
         or not valid_scratch_identity_snapshot_comparison(identity_comparison)
+    ):
+        return False
+    if "verification_site" in value and (
+        type(value["verification_site"]) is not str
+        or value["verification_site"] not in _SCRATCH_VERIFICATION_SITES - {"none"}
+        or (
+            value["origin"] == "controller"
+            and value["site"] not in {
+                "controller_identity", "controller_completion_snapshot", "controller_final_snapshot"
+            }
+        )
+        or (
+            value["origin"] == "worker"
+            and value["site"] not in {
+                "worker_root_identity", "worker_mount_snapshot", "worker_cgroup_snapshot"
+            }
+        )
     ):
         return False
     if "disk_mount_failure_reason" in value and (
@@ -648,6 +699,21 @@ def _scratch_first_fault(error: BaseException, *, origin: str, site: str) -> dic
         "exception_kind": exception_kind,
         "errno": errno if exception_kind in {"permission", "os_error"} else None,
     }
+    verification_site = getattr(error, "scratch_verification_site", None)
+    if verification_site is not None:
+        if (
+            (origin == "controller" and site not in {
+                "controller_identity", "controller_completion_snapshot", "controller_final_snapshot"
+            })
+            or (origin == "worker" and site not in {
+                "worker_root_identity", "worker_mount_snapshot", "worker_cgroup_snapshot"
+            })
+            or origin not in {"controller", "worker"}
+            or type(verification_site) is not str
+            or verification_site not in _SCRATCH_VERIFICATION_SITES - {"none"}
+        ):
+            return None
+        value["verification_site"] = verification_site
     if path_rejection is not None:
         value["synthetic_path_fixture_rejection"] = path_rejection
     if identity_comparison is not None:
@@ -732,6 +798,8 @@ def _scratch_first_fault_frame(value: Any) -> bytes | None:
     if not valid_scratch_first_fault(value):
         return None
     payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("ascii")
+    if len(payload) > SCRATCH_FIRST_FAULT_FRAME_MAX_BYTES:
+        return None
     return SCRATCH_FIRST_FAULT_MARKER + payload + b"\n"
 
 
@@ -8288,6 +8356,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     root = pathlib.Path(args._scratch_root)
     scratch_backend = getattr(args, "_scratch_backend", SCRATCH_BACKEND_TMPFS_V1)
     args._scratch_fault_site = "worker_root_identity"
+    args._scratch_verification_site = "worker_root_path_identity"
     if (
         not re.fullmatch(r"/run/oldsparky-backup-restore-[0-9a-f]{24}", str(root))
         or not root.is_dir()
@@ -8295,6 +8364,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     ):
         raise RuntimeError("Scratch restore root is invalid.")
     if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+        args._scratch_verification_site = "worker_root_mode_identity"
         if os.geteuid() != 0:
             raise RuntimeError("Scratch disk-image worker is not root before filesystem setup.")
         os.chmod(root, 0o700)
@@ -8307,11 +8377,13 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         ):
             raise RuntimeError("Scratch ext4 root could not be secured root:root mode 0700.")
     args._scratch_fault_site = "worker_mount_snapshot"
+    args._scratch_verification_site = "worker_mount_identity"
     if scratch_backend == SCRATCH_BACKEND_TMPFS_V1:
         _scratch_mount_snapshot(root)
     else:
         _scratch_mount_snapshot(root, backend=scratch_backend)
     args._scratch_fault_site = "worker_cgroup_snapshot"
+    args._scratch_verification_site = "worker_cgroup_identity"
     _scratch_cgroup_snapshot()
     args._scratch_fault_site = "worker_host_reserve"
     if getattr(args, "_scratch_authorization_probe", False):
@@ -8333,6 +8405,8 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
         and not getattr(args, "_scratch_authorization_probe", False)
     ):
+        args._scratch_fault_site = "worker_postgres_tools"
+        args._scratch_verification_site = "worker_postgres_account_identity"
         postgres = pwd.getpwnam("postgres")
     if getattr(args, "_scratch_synthetic_restore_diagnostic", False):
         if getattr(args, "_scratch_authorization_probe", False) or any(
@@ -8529,6 +8603,17 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         )
     except BaseException as exc:
         if getattr(args, "private_scratch_diagnostics", False):
+            worker_identity_sites = {
+                "worker_root_identity": {"worker_root_path_identity", "worker_root_mode_identity"},
+                "worker_mount_snapshot": {"worker_mount_identity"},
+                "worker_cgroup_snapshot": {"worker_cgroup_identity"},
+                "worker_postgres_tools": {"worker_postgres_account_identity"},
+            }
+            verification_site = getattr(args, "_scratch_verification_site", None)
+            if verification_site in worker_identity_sites.get(
+                getattr(args, "_scratch_fault_site", "worker_entry"), set()
+            ):
+                setattr(exc, "scratch_verification_site", verification_site)
             _retain_first_scratch_fault(
                 exc,
                 origin="worker",
@@ -9601,6 +9686,37 @@ def _scratch_expected_properties(
     scratch_backend: str = SCRATCH_BACKEND_TMPFS_V1,
     scratch_image_path: pathlib.Path | None = None,
 ) -> str:
+    operation = ["service_properties_shape"]
+    try:
+        return _scratch_expected_properties_impl(
+            snapshot,
+            unit_name=unit_name,
+            mountpoint=mountpoint,
+            python_binary=python_binary,
+            authorization_probe=authorization_probe,
+            synthetic_restore_diagnostic=synthetic_restore_diagnostic,
+            scratch_backend=scratch_backend,
+            scratch_image_path=scratch_image_path,
+            operation=operation,
+        )
+    except BaseException as exc:
+        if _scratch_verification_site(exc) == "none":
+            setattr(exc, "scratch_verification_site", operation[0])
+        raise
+
+
+def _scratch_expected_properties_impl(
+    snapshot: dict[str, Any],
+    *,
+    unit_name: str,
+    mountpoint: pathlib.Path,
+    python_binary: pathlib.Path,
+    authorization_probe: bool,
+    synthetic_restore_diagnostic: bool,
+    scratch_backend: str,
+    scratch_image_path: pathlib.Path | None,
+    operation: list[str],
+) -> str:
     def fail(site: str, message: str, cause: BaseException | None = None) -> None:
         error = RuntimeError(message)
         setattr(error, "scratch_verification_site", site)
@@ -9610,9 +9726,11 @@ def _scratch_expected_properties(
 
     if authorization_probe and synthetic_restore_diagnostic:
         raise ValueError("Scratch authorization probe and synthetic diagnostic are mutually exclusive.")
+    operation[0] = "service_properties_shape"
     properties = snapshot.get("properties")
     if not isinstance(properties, dict):
         raise RuntimeError("Scratch restore service properties are malformed.")
+    operation[0] = "service_resource_policy"
     expected = {
         "MemoryMax": str(SCRATCH_MEMORY_MAX_BYTES),
         "MemorySwapMax": "0",
@@ -9625,23 +9743,28 @@ def _scratch_expected_properties(
     }
     if any(properties.get(key, "").lower() != value.lower() for key, value in expected.items()):
         raise RuntimeError("Scratch restore service properties do not match the closed policy.")
+    operation[0] = "service_identity_state"
     if properties.get("ReadWritePaths") not in {None, ""}:
         raise RuntimeError("Scratch restore service has an unexpected writable-path override.")
     if properties.get("LoadState") != "loaded" or properties.get("ActiveState") != "active":
         raise RuntimeError("Scratch restore service is not active while it is being checked.")
     if synthetic_restore_diagnostic and properties.get("CollectMode") != "inactive":
         raise RuntimeError("Synthetic restore unit does not retain failed state for diagnosis.")
+    operation[0] = "service_cgroup_identity"
     control_group = properties.get("ControlGroup", "")
     if not control_group.startswith("/system.slice/") or ".." in pathlib.PurePosixPath(control_group).parts:
         raise RuntimeError("Scratch restore service cgroup is invalid.")
     if control_group != f"/system.slice/{unit_name}":
         raise RuntimeError("Scratch restore service cgroup does not match its unique unit.")
+    operation[0] = "service_pid_identity"
     pid_text = properties.get("ExecMainPID", "0")
     if pid_text in {"", "0"} or not pid_text.isdecimal():
         raise RuntimeError("Scratch restore worker process identity is unavailable.")
     try:
+        operation[0] = "process_cgroup_read"
         process_cgroup = None
         for row in pathlib.Path(f"/proc/{pid_text}/cgroup").read_text(encoding="ascii").splitlines():
+            operation[0] = "process_cgroup_parse"
             fields = row.split(":", 2)
             if len(fields) == 3 and fields[0] == "0":
                 process_cgroup = fields[2]
@@ -9651,23 +9774,28 @@ def _scratch_expected_properties(
     if process_cgroup != control_group:
         fail("process_cgroup_mismatch", "Scratch restore worker is outside its reviewed systemd cgroup.")
     try:
+        operation[0] = "expected_executable_stat"
         expected_python = python_binary.stat()
     except OSError as exc:
         fail("expected_executable_stat", "Scratch restore interpreter identity disappeared during verification.", exc)
     try:
+        operation[0] = "proc_exe_stat"
         running_python = pathlib.Path(f"/proc/{pid_text}/exe").stat()
     except OSError as exc:
         fail("proc_exe_stat", "Scratch restore interpreter identity disappeared during verification.", exc)
+    operation[0] = "proc_exe_mismatch"
     if (running_python.st_dev, running_python.st_ino) != (
         expected_python.st_dev,
         expected_python.st_ino,
     ):
         fail("proc_exe_mismatch", "Scratch restore interpreter does not match the pinned host executable.")
     if scratch_backend == SCRATCH_BACKEND_TMPFS_V1:
+        operation[0] = "backend_mount_identity"
         tmpfs = properties.get("TemporaryFileSystem", "")
         if str(mountpoint) not in tmpfs or properties.get("MountImages", ""):
             raise RuntimeError("Scratch restore tmpfs request is not present in the active unit.")
     elif scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+        operation[0] = "backend_mount_identity"
         mount_images = properties.get("MountImages", "")
         if (
             scratch_image_path is None
@@ -9676,7 +9804,9 @@ def _scratch_expected_properties(
         ):
             raise RuntimeError("Scratch restore disk image request is not present in the active unit.")
     else:
+        operation[0] = "backend_mount_identity"
         raise RuntimeError("Scratch restore backend is not supported.")
+    operation[0] = "credential_visibility"
     inaccessible = properties.get("InaccessiblePaths", "")
     for required in _SCRATCH_INACCESSIBLE_PATHS:
         if required not in inaccessible:
@@ -9688,12 +9818,15 @@ def _scratch_expected_properties(
     ]
     if not authorization_probe and not synthetic_restore_diagnostic:
         required_binds.insert(0, str(mountpoint / "archive.dump"))
+    operation[0] = "readonly_input_binds"
     for required in required_binds:
         if required not in bind_paths:
             raise RuntimeError("Scratch restore service is missing a required read-only input bind.")
     if authorization_probe and str(mountpoint / "archive.dump") in bind_paths:
+        operation[0] = "archive_exclusion"
         raise RuntimeError("Scratch authorization probe has an unexpected archive bind.")
     if synthetic_restore_diagnostic and str(mountpoint / "archive.dump") in bind_paths:
+        operation[0] = "archive_exclusion"
         raise RuntimeError("Synthetic restore diagnostic has an unexpected archive bind.")
     return control_group
 
@@ -10346,6 +10479,7 @@ def _run_isolated_restore_drill(
         verification_error = "none"
         verification_errno: int | None = None
         verification_site = "none"
+        verification_operation: str | None = None
         active_control_group: str | None = None
         active_snapshot: dict[str, Any] | None = None
         active_identity: tuple[str, str, str] | None = None
@@ -10618,25 +10752,32 @@ def _run_isolated_restore_drill(
                     # is still a failed verification, but its bounded worker
                     # output must reach the existing private diagnostic path.
                     early_exit_snapshot = snapshot
+                    verification_operation = "controller_snapshot_properties"
                     try:
                         fault_site = "controller_identity"
+                        verification_operation = "controller_expected_executable_resolve"
+                        expected_python_binary = pathlib.Path(
+                            getattr(sys, "_base_executable", sys.executable)
+                        ).resolve(strict=True)
+                        verification_operation = "controller_snapshot_properties"
                         verified_control_group = _scratch_expected_properties(
                             snapshot,
                             unit_name=unit_name,
                             mountpoint=mountpoint,
-                            python_binary=pathlib.Path(
-                                getattr(sys, "_base_executable", sys.executable)
-                            ).resolve(strict=True),
+                            python_binary=expected_python_binary,
                             authorization_probe=authorization_probe,
                             synthetic_restore_diagnostic=synthetic_restore_diagnostic,
                             scratch_backend=scratch_backend,
                             scratch_image_path=image_path,
                         )
+                        verification_operation = "controller_cgroup_snapshot"
                         _scratch_control_group_snapshot(verified_control_group)
+                        verification_operation = "controller_invocation_identity"
                         invocation_id = properties.get("InvocationID", "")
                         if re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None:
                             raise RuntimeError("Scratch restore unit invocation identity is unavailable.")
                         if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+                            verification_operation = "controller_image_mount_identity"
                             assert image_path is not None and image_identity is not None
                             _scratch_verify_process_image_mount(
                                 pid=pid_text,
@@ -10644,14 +10785,18 @@ def _run_isolated_restore_drill(
                                 image_path=image_path,
                                 image_identity=image_identity,
                             )
+                        verification_operation = "controller_process_start_time"
                         process_start_time = _scratch_process_start_time(pid_text)
                         observed_identity = (pid_text, invocation_id, process_start_time)
+                        verification_operation = "controller_process_state"
                         if active_identity is not None and observed_identity != active_identity:
                             raise RuntimeError("Scratch restore worker identity changed during verification.")
                         if active_identity is None:
+                            verification_operation = "controller_start_deadline"
                             if time.monotonic() >= startup_deadline or process.poll() is not None:
                                 raise RuntimeError("Scratch restore worker exited before authorization.")
                             fault_site = "controller_identity"
+                            verification_operation = "controller_second_snapshot_identity"
                             second_snapshot = _scratch_service_snapshot(unit_name)
                             second_properties = second_snapshot.get("properties", {})
                             identity_failure = _scratch_second_snapshot_identity_failure(
@@ -10663,33 +10808,44 @@ def _run_isolated_restore_drill(
                             )
                             if identity_failure is not None:
                                 raise identity_failure
+                            verification_operation = "controller_snapshot_properties"
+                            second_python_binary = pathlib.Path(
+                                getattr(sys, "_base_executable", sys.executable)
+                            ).resolve(strict=True)
                             second_control_group = _scratch_expected_properties(
                                 second_snapshot,
                                 unit_name=unit_name,
                                 mountpoint=mountpoint,
-                                python_binary=pathlib.Path(
-                                    getattr(sys, "_base_executable", sys.executable)
-                                ).resolve(strict=True),
+                                python_binary=second_python_binary,
                                 authorization_probe=authorization_probe,
                                 synthetic_restore_diagnostic=synthetic_restore_diagnostic,
                                 scratch_backend=scratch_backend,
                                 scratch_image_path=image_path,
                             )
+                            verification_operation = "controller_cgroup_snapshot"
                             _scratch_control_group_snapshot(second_control_group)
                             if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+                                verification_operation = "controller_image_mount_identity"
                                 assert image_path is not None and image_identity is not None
                                 _scratch_verify_process_image_mount(
                                     pid=pid_text,
                                     mountpoint=mountpoint,
                                     image_path=image_path,
                                     image_identity=image_identity,
-                                )
-                            if (
-                                second_control_group != verified_control_group
-                                or _scratch_process_start_time(pid_text) != process_start_time
-                                or time.monotonic() >= startup_deadline
-                                or process.poll() is not None
-                            ):
+                            )
+                            verification_operation = "controller_process_start_time"
+                            second_process_start_time = _scratch_process_start_time(pid_text)
+                            verification_operation = "controller_cgroup_identity_compare"
+                            if second_control_group != verified_control_group:
+                                raise RuntimeError("Scratch restore worker identity changed before authorization.")
+                            verification_operation = "controller_process_start_time_compare"
+                            if second_process_start_time != process_start_time:
+                                raise RuntimeError("Scratch restore worker identity changed before authorization.")
+                            verification_operation = "controller_start_deadline"
+                            if time.monotonic() >= startup_deadline:
+                                raise RuntimeError("Scratch restore worker identity changed before authorization.")
+                            verification_operation = "controller_process_state"
+                            if process.poll() is not None:
                                 raise RuntimeError("Scratch restore worker identity changed before authorization.")
                             identity_checks_passed = True
                             active_identity = observed_identity
@@ -10710,6 +10866,12 @@ def _run_isolated_restore_drill(
                         else:
                             identity_checks_passed = True
                     except BaseException as verification_exception:
+                        if _scratch_verification_site(verification_exception) == "none":
+                            setattr(
+                                verification_exception,
+                                "scratch_verification_site",
+                                verification_operation,
+                            )
                         if identity_checks_passed and not completion_token_sent:
                             early_exit_phase = "authorization_failed"
                         elif active_control_group is not None:
@@ -10722,6 +10884,7 @@ def _run_isolated_restore_drill(
                         verification_site = _scratch_verification_site(verification_exception)
                         raise
                     early_exit_snapshot = None
+                    verification_operation = None
                 elif (
                     active_state in {"inactive", "activating", "active"}
                     and load_state in {"loaded", "not-found"}
@@ -10743,6 +10906,11 @@ def _run_isolated_restore_drill(
                 else:
                     early_exit_snapshot = snapshot
                     raise RuntimeError("Scratch restore service state cannot prove confinement startup.")
+                # Identity verification is complete for this iteration. Any
+                # later selector/read failure belongs to the bounded active
+                # poll, not to the prior controller identity check.
+                fault_site = "controller_active_poll"
+                verification_operation = None
                 last_tick = now
                 for key, _ in selector.select(timeout=SCRATCH_RUNTIME_SAMPLE_SECONDS):
                     try:
@@ -10780,19 +10948,23 @@ def _run_isolated_restore_drill(
                         else _scratch_worker_candidate(bytes(stdout_buffer))
                     )
                     if candidate is not None:
+                        verification_operation = "controller_completion_identity"
                         if active_identity is None or active_control_group is None:
                             raise RuntimeError("Scratch restore worker identity was not retained through completion.")
                         fault_site = "controller_completion_snapshot"
+                        verification_operation = "controller_completion_identity"
                         final_snapshot = _scratch_service_snapshot(unit_name)
                         final_properties = final_snapshot.get("properties", {})
                         final_pid = final_properties.get("ExecMainPID", "0")
                         final_invocation = final_properties.get("InvocationID", "")
-                        if (
-                            final_properties.get("LoadState") != "loaded"
-                            or final_properties.get("ActiveState") != "active"
-                            or (final_pid, final_invocation) != active_identity[:2]
-                            or time.monotonic() >= deadline
-                        ):
+                        verification_operation = "controller_completion_unit_state"
+                        if final_properties.get("LoadState") != "loaded" or final_properties.get("ActiveState") != "active":
+                            raise RuntimeError("Scratch restore worker identity changed before completion acknowledgement.")
+                        verification_operation = "controller_completion_identity"
+                        if (final_pid, final_invocation) != active_identity[:2]:
+                            raise RuntimeError("Scratch restore worker identity changed before completion acknowledgement.")
+                        verification_operation = "controller_start_deadline"
+                        if time.monotonic() >= deadline:
                             raise RuntimeError("Scratch restore worker identity changed before completion acknowledgement.")
                         final_control_group = _scratch_expected_properties(
                             final_snapshot,
@@ -10806,8 +10978,10 @@ def _run_isolated_restore_drill(
                             scratch_backend=scratch_backend,
                             scratch_image_path=image_path,
                         )
+                        verification_operation = "controller_cgroup_snapshot"
                         _scratch_control_group_snapshot(final_control_group)
                         if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+                            verification_operation = "controller_image_mount_identity"
                             assert image_path is not None and image_identity is not None
                             _scratch_verify_process_image_mount(
                                 pid=final_pid,
@@ -10815,10 +10989,13 @@ def _run_isolated_restore_drill(
                                 image_path=image_path,
                                 image_identity=image_identity,
                             )
-                        if (
-                            final_control_group != active_control_group
-                            or _scratch_process_start_time(final_pid) != active_identity[2]
-                        ):
+                        verification_operation = "controller_process_start_time"
+                        final_process_start_time = _scratch_process_start_time(final_pid)
+                        verification_operation = "controller_cgroup_identity_compare"
+                        if final_control_group != active_control_group:
+                            raise RuntimeError("Scratch restore worker identity changed before completion acknowledgement.")
+                        verification_operation = "controller_process_start_time_compare"
+                        if final_process_start_time != active_identity[2]:
                             raise RuntimeError("Scratch restore worker identity changed before completion acknowledgement.")
                         candidate_output = bytes(stdout_buffer)
                         worker_result = candidate
@@ -10942,6 +11119,17 @@ def _run_isolated_restore_drill(
                 raise RuntimeError("Scratch restore worker result changed after completion authorization.")
             worker_result = decoded
         except BaseException as operation_error:
+            if verification_operation is not None:
+                if _scratch_verification_site(operation_error) == "none":
+                    setattr(
+                        operation_error,
+                        "scratch_verification_site",
+                        verification_operation,
+                    )
+                verification_error, verification_errno = (
+                    _scratch_verification_error_details(operation_error)
+                )
+                verification_site = _scratch_verification_site(operation_error)
             if synthetic_restore_diagnostic:
                 created = getattr(
                     operation_error,
@@ -11964,6 +12152,17 @@ def main() -> int:
             try:
                 return _scratch_worker_main(args)
             except BaseException as exc:
+                verification_site = getattr(args, "_scratch_verification_site", None)
+                site_pairs = {
+                    "worker_root_identity": {"worker_root_path_identity", "worker_root_mode_identity"},
+                    "worker_mount_snapshot": {"worker_mount_identity"},
+                    "worker_cgroup_snapshot": {"worker_cgroup_identity"},
+                    "worker_postgres_tools": {"worker_postgres_account_identity"},
+                }
+                if verification_site in site_pairs.get(
+                    getattr(args, "_scratch_fault_site", "worker_entry"), set()
+                ):
+                    setattr(exc, "scratch_verification_site", verification_site)
                 _retain_first_scratch_fault(
                     exc,
                     origin="worker",

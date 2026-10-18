@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import re
+import selectors
 import shlex
 import shutil
 import signal
@@ -1630,6 +1631,112 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
             self.assertEqual(run_case(executable), "expected_executable_stat")
             self.assertEqual(run_case(pathlib.Path("/proc/4242/exe")), "proc_exe_stat")
+
+    def test_unexpected_identity_read_failure_survives_private_artifact_projection(self) -> None:
+        mountpoint = pathlib.Path("/run/oldsparky-backup-restore-" + ("d" * 24))
+        unit_name = mountpoint.name + ".service"
+        control_group = f"/system.slice/{unit_name}"
+        executable = pathlib.Path(sys.executable).resolve(strict=True)
+        properties = {
+            "MemoryMax": str(backup_drill.SCRATCH_MEMORY_MAX_BYTES),
+            "MemorySwapMax": "0",
+            "OOMPolicy": "kill",
+            "PrivateNetwork": "yes",
+            "RestrictAddressFamilies": "AF_UNIX",
+            "ProtectSystem": "strict",
+            "ProtectHome": "tmpfs",
+            "NoNewPrivileges": "yes",
+            "ReadWritePaths": "",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "ControlGroup": control_group,
+            "ExecMainPID": "4242",
+            "TemporaryFileSystem": f"{mountpoint}:rw,nosuid,nodev,noexec,size=512M",
+            "MountImages": "",
+            "InaccessiblePaths": " ".join(backup_drill._SCRATCH_INACCESSIBLE_PATHS),
+            "BindReadOnlyPaths": " ".join(
+                (
+                    str(mountpoint / "platform_backup_restore_drill.py"),
+                    str(mountpoint / "platform_disk_policy.py"),
+                )
+            ),
+        }
+        original_read_text = pathlib.Path.read_text
+
+        def unexpected_proc_parse(path: pathlib.Path, *args: Any, **kwargs: Any) -> str:
+            if str(path) == "/proc/4242/cgroup":
+                raise AttributeError("private proc detail must not enter the diagnostic frame")
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(pathlib.Path, "read_text", unexpected_proc_parse):
+            with self.assertRaises(AttributeError) as failure:
+                backup_drill._scratch_expected_properties(
+                    {"properties": properties},
+                    unit_name=unit_name,
+                    mountpoint=mountpoint,
+                    python_binary=executable,
+                    authorization_probe=True,
+                )
+
+        error = failure.exception
+        self.assertEqual(
+            backup_drill._scratch_verification_site(error),
+            "process_cgroup_read",
+        )
+        self.assertEqual(backup_drill._scratch_verification_error_details(error), ("other", None))
+        error.scratch_authorization_probe = True
+        first_fault = backup_drill._scratch_first_fault(
+            error,
+            origin="controller",
+            site="controller_identity",
+        )
+        self.assertEqual(
+            first_fault,
+            {
+                "schema": 1,
+                "origin": "controller",
+                "site": "controller_identity",
+                "exception_kind": "attribute",
+                "errno": None,
+                "verification_site": "process_cgroup_read",
+            },
+        )
+        error.scratch_first_fault = first_fault
+        error.scratch_unit_diagnostic = backup_drill._scratch_unit_diagnostic(
+            {"properties": {"ActiveState": "active", "SubState": "running", "Result": "success"}},
+            launcher_exit_status=1,
+            stdout_prefix=b"",
+            stdout_observed=0,
+            stdout_complete=True,
+            stderr_prefix=b"",
+            stderr_observed=0,
+            stderr_complete=True,
+            phase="confinement_verification_failed",
+            verification_error="other",
+            verification_site="process_cgroup_read",
+        )
+        error.scratch_cleanup_status = "confirmed"
+        report = backup_drill.failure_report_for_exception(
+            error,
+            private_scratch_diagnostics=True,
+        )
+        self.assertEqual(report["scratch_first_fault"], first_fault)
+        self.assertEqual(
+            report["scratch_unit_diagnostic"]["verification_site"],
+            first_fault["verification_site"],
+        )
+        frame = backup_drill.private_failure_frame_for_exception(error, enabled=True)
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.assertNotIn("private proc detail", frame)
+        self.assertNotIn("/proc/4242", frame)
+        parsed = backup_drill._parse_bound_scratch_first_fault(
+            (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+            frame.encode("ascii"),
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
+        self.assertEqual(parsed, first_fault)
 
     def test_scratch_disk_image_admission_reserves_floor_lead_and_full_image(self) -> None:
         total_bytes = 100 * 1024**3
@@ -5157,6 +5264,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             "Isolated ext4 scratch filesystem is below its bounded usable capacity."
         )
         projected_mount_failure.scratch_disk_mount_failure_reason = "statvfs_bound"
+        projected_mount_failure.scratch_verification_site = "worker_mount_identity"
         projected_mount_failure.scratch_first_fault = backup_drill._scratch_first_fault(
             projected_mount_failure,
             origin="worker",
@@ -5174,6 +5282,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "site": "worker_mount_snapshot",
                 "exception_kind": "runtime",
                 "errno": None,
+                "verification_site": "worker_mount_identity",
                 "disk_mount_failure_reason": "statvfs_bound",
             },
         )
@@ -5202,6 +5311,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             "site": "worker_mount_snapshot",
             "exception_kind": "runtime",
             "errno": None,
+            "verification_site": "worker_mount_identity",
             "disk_mount_failure_reason": "sysfs_not_loop_device",
             "disk_mount_predicates": {
                 "fs_ext4": True,
@@ -6146,6 +6256,29 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertEqual(verification_site["verification_site"], "proc_exe_stat")
         self.assertEqual(verification_site["terminal_snapshot"], terminal)
         self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(verification_site))
+        for site in (
+            "controller_cgroup_identity_compare",
+            "controller_process_start_time_compare",
+            "controller_completion_unit_state",
+        ):
+            with self.subTest(verification_site=site):
+                site_diagnostic = backup_drill._scratch_unit_diagnostic(
+                    {"properties": {"ActiveState": "active", "SubState": "running", "Result": "success"}},
+                    launcher_exit_status=1,
+                    stdout_prefix=b"",
+                    stdout_observed=0,
+                    stdout_complete=True,
+                    stderr_prefix=b"",
+                    stderr_observed=0,
+                    stderr_complete=True,
+                    phase="authorization_failed",
+                    verification_error="other",
+                    verification_site=site,
+                )
+                self.assertIsNotNone(site_diagnostic)
+                assert site_diagnostic is not None
+                self.assertEqual(site_diagnostic["verification_site"], site)
+                self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(site_diagnostic))
         malformed = dict(verification_site)
         malformed["verification_site"] = "/proc/private"
         self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
@@ -7423,7 +7556,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
     def _assert_scratch_final_identity_loss_blocks_done(self) -> None:
         for replacement in (
-            "pid", "invocation", "starttime", "cgroup", "missing", "late_start", "late_done"
+            "pid", "invocation", "starttime", "cgroup", "missing", "late_start", "late_done",
+            "poll_error",
         ):
             with self.subTest(final_identity=replacement), tempfile.TemporaryDirectory() as temporary_dir:
                 archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
@@ -7508,6 +7642,60 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         launched[0].kill()
                         launched[0].wait(timeout=2)
 
+                class PollFailureSelector:
+                    def __init__(self) -> None:
+                        self.registered: dict[int, object] = {}
+                        self.read_failure_sent = False
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_args: Any) -> None:
+                        return None
+
+                    def register(self, fileobj: object, events: int, data: object = None) -> None:
+                        self.registered[id(fileobj)] = types.SimpleNamespace(
+                            fileobj=fileobj, events=events, data=data
+                        )
+
+                    def select(self, timeout: float | None = None) -> list[object]:
+                        write_events = [
+                            key for key in self.registered.values()
+                            if key.events & selectors.EVENT_WRITE
+                        ]
+                        if write_events:
+                            return write_events
+                        if (
+                            backup_drill.SCRATCH_START_TOKEN in start_tokens
+                            and not self.read_failure_sent
+                        ):
+                            self.read_failure_sent = True
+                            raise OSError(5, "synthetic poll failure")
+                        if backup_drill.SCRATCH_START_TOKEN in start_tokens:
+                            return [
+                                key for key in self.registered.values()
+                                if key.events & selectors.EVENT_READ
+                            ]
+                        return []
+
+                    def unregister(self, *_args: Any) -> None:
+                        return None
+
+                    def get_key(self, fileobj: object) -> object:
+                        return self.registered[id(fileobj)]
+
+                    def get_map(self) -> dict[object, object]:
+                        return {}
+
+                    def close(self) -> None:
+                        return None
+
+                selector_factory = (
+                    PollFailureSelector
+                    if replacement == "poll_error"
+                    else backup_drill.selectors.DefaultSelector
+                )
+
                 unit_command = mock.Mock(return_value=command)
                 with (
                     mock.patch.object(backup_drill, "require_commands"),
@@ -7522,6 +7710,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit),
                     mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
                     mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
+                    mock.patch.object(backup_drill.selectors, "DefaultSelector", new=selector_factory),
                 ):
                     with self.assertRaises(Exception) as failure:
                         backup_drill._run_isolated_restore_drill(
@@ -7536,16 +7725,23 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 )
                 self.assertTrue(launched)
                 self.assertIsNotNone(launched[0].returncode)
-                self.assertEqual(
-                    getattr(failure.exception, "scratch_unit_diagnostic", {}).get("phase"),
-                    "authorization_failed",
-                )
+                if replacement != "poll_error":
+                    self.assertEqual(
+                        getattr(failure.exception, "scratch_unit_diagnostic", {}).get("phase"),
+                        "authorization_failed",
+                    )
                 self.assertEqual(
                     getattr(failure.exception, "scratch_unit_diagnostic", {}).get("terminal_snapshot", {}).get(
                         "completion_token_sent", False
                     ),
                     replacement == "late_done",
                 )
+                if replacement == "poll_error":
+                    first_fault = getattr(failure.exception, "scratch_first_fault", None)
+                    self.assertIsInstance(first_fault, dict)
+                    assert isinstance(first_fault, dict)
+                    self.assertEqual(first_fault.get("site"), "controller_active_poll")
+                    self.assertNotIn("verification_site", first_fault)
                 self.assertFalse(pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists())
 
     def _assert_worker_token_deadline_delivery_is_truthful(self) -> None:

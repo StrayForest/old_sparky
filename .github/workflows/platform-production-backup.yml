@@ -1732,11 +1732,30 @@ jobs:
                           "attribute", "index", "name", "type", "key", "value", "restore_guard_stop",
                           "backup_interrupted", "scratch_token_delivery", "runtime", "other",
                       }
+                      verification_sites = {
+                          "service_properties_shape", "service_resource_policy", "service_identity_state",
+                          "service_cgroup_identity", "service_pid_identity", "process_cgroup_read",
+                          "process_cgroup_parse", "process_cgroup_mismatch", "expected_executable_stat",
+                          "proc_exe_stat", "proc_exe_mismatch", "backend_mount_identity",
+                          "credential_visibility", "readonly_input_binds", "archive_exclusion",
+                          "controller_expected_executable_resolve", "controller_snapshot_properties",
+                          "controller_cgroup_snapshot", "controller_invocation_identity",
+                          "controller_image_mount_identity", "controller_process_start_time",
+                          "controller_second_snapshot_identity", "controller_start_deadline",
+                          "controller_process_state", "controller_cgroup_identity_compare",
+                          "controller_process_start_time_compare", "controller_completion_unit_state",
+                          "controller_completion_identity",
+                          "worker_root_path_identity", "worker_root_mode_identity", "worker_mount_identity",
+                          "worker_cgroup_identity", "worker_postgres_account_identity", "other",
+                      }
                       def valid_first_fault(value):
                           base = {"schema", "origin", "site", "exception_kind", "errno"}
                           allowed = {
                               frozenset(base), frozenset(base | {"disk_mount_failure_reason"}),
                               frozenset(base | {"disk_mount_failure_reason", "disk_mount_predicates"}),
+                              frozenset(base | {"verification_site"}),
+                              frozenset(base | {"verification_site", "disk_mount_failure_reason"}),
+                              frozenset(base | {"verification_site", "disk_mount_failure_reason", "disk_mount_predicates"}),
                           }
                           if (
                               not isinstance(value, dict)
@@ -1760,6 +1779,18 @@ jobs:
                                   return False
                           elif number is not None:
                               return False
+                          if "verification_site" in value:
+                              if (
+                                  type(value["verification_site"]) is not str
+                                  or value["verification_site"] not in verification_sites
+                                  or (value["origin"] == "controller" and value["site"] not in {
+                                      "controller_identity", "controller_completion_snapshot", "controller_final_snapshot",
+                                  })
+                                  or (value["origin"] == "worker" and value["site"] not in {
+                                      "worker_root_identity", "worker_mount_snapshot", "worker_cgroup_snapshot",
+                                  })
+                              ):
+                                  return False
                           if "disk_mount_failure_reason" not in value:
                               return True
                           reasons = {
@@ -1815,6 +1846,22 @@ jobs:
                                   "option_rw", "option_nosuid", "option_nodev", "option_noexec",
                               ))
                           return failed.get(reason) is True
+                      def valid_controller_identity_failure_binding(first_fault, scratch_unit):
+                          controller_identity_sites = {
+                              "controller_identity", "controller_completion_snapshot", "controller_final_snapshot",
+                          }
+                          if (
+                              not isinstance(first_fault, dict)
+                              or first_fault.get("origin") != "controller"
+                              or first_fault.get("site") not in controller_identity_sites
+                          ):
+                              return True
+                          return (
+                              "verification_site" in first_fault
+                              and isinstance(scratch_unit, dict)
+                              and scratch_unit.get("schema") == 3
+                              and scratch_unit.get("verification_site") == first_fault.get("verification_site")
+                          )
                       valid_first_fault = valid_first_fault(first_fault)
                       if "scratch_first_fault" in report and first_fault is None:
                           report_state = "unclassified_json"
@@ -2099,9 +2146,31 @@ jobs:
                               "stderr_sha256", "stderr_truncated", "verification_error",
                               "verification_errno",
                           }
+                          scratch_verification_sites = {
+                              "service_properties_shape", "service_resource_policy", "service_identity_state",
+                              "service_cgroup_identity", "service_pid_identity", "process_cgroup_read",
+                              "process_cgroup_parse", "process_cgroup_mismatch", "expected_executable_stat",
+                              "proc_exe_stat", "proc_exe_mismatch", "backend_mount_identity",
+                              "credential_visibility", "readonly_input_binds", "archive_exclusion",
+                              "controller_expected_executable_resolve", "controller_snapshot_properties",
+                              "controller_cgroup_snapshot", "controller_invocation_identity",
+                              "controller_image_mount_identity", "controller_process_start_time",
+                              "controller_cgroup_identity_compare", "controller_process_start_time_compare",
+                              "controller_second_snapshot_identity", "controller_start_deadline",
+                              "controller_process_state", "controller_completion_unit_state",
+                              "controller_completion_identity", "worker_root_path_identity",
+                              "worker_root_mode_identity", "worker_mount_identity", "worker_cgroup_identity",
+                              "worker_postgres_account_identity", "other",
+                          }
                           scratch_schema = scratch_unit.get("schema") if isinstance(scratch_unit, dict) else None
+                          if scratch_schema == 3:
+                              scratch_expected = scratch_expected | {"verification_site"}
                           scratch_terminal = scratch_unit.get("terminal_snapshot") if isinstance(scratch_unit, dict) else None
-                          scratch_terminal_valid = (type(scratch_schema) is int and scratch_schema == 1) or (
+                          scratch_terminal_valid = (
+                              type(scratch_schema) is int
+                              and scratch_schema in {1, 3}
+                              and scratch_terminal is None
+                          ) or (
                               isinstance(scratch_terminal, dict)
                               and set(scratch_terminal) == {
                                   "load_state", "active_state", "sub_state", "result",
@@ -2127,13 +2196,20 @@ jobs:
                               and type(scratch_terminal.get("start_token_sent")) is bool
                               and type(scratch_terminal.get("completion_token_sent")) is bool
                           )
-                          if scratch_schema == 2:
+                          if scratch_schema in {2, 3} and scratch_terminal is not None:
                               scratch_expected = scratch_expected | {"terminal_snapshot"}
                           valid_scratch = (
                               isinstance(scratch_unit, dict)
                               and set(scratch_unit) == scratch_expected
                               and type(scratch_unit.get("schema")) is int
-                              and scratch_unit["schema"] in {1, 2}
+                              and scratch_unit["schema"] in {1, 2, 3}
+                              and (
+                                  scratch_unit["schema"] != 3
+                                  or (
+                                  type(scratch_unit.get("verification_site")) is str
+                                      and scratch_unit.get("verification_site") in scratch_verification_sites
+                                  )
+                              )
                               and type(scratch_unit.get("phase")) is str
                               and scratch_unit["phase"] in {
                                   "unit_exited_before_confinement",
@@ -2143,7 +2219,7 @@ jobs:
                               }
                               and (
                                   scratch_unit["phase"] != "authorization_failed"
-                                  or scratch_unit.get("schema") == 2
+                                  or scratch_unit.get("schema") in {2, 3}
                               )
                               and type(scratch_unit.get("active_state")) is str
                               and (
@@ -2220,6 +2296,13 @@ jobs:
                               scratch_unit_diagnostic = scratch_unit
                           else:
                               report_state = "unclassified_json"
+                      if not valid_controller_identity_failure_binding(
+                          scratch_first_fault,
+                          scratch_unit_diagnostic,
+                      ):
+                          report_state = "unclassified_json"
+                          scratch_first_fault = None
+                          scratch_unit_diagnostic = None
                       if host_guard_invalid:
                           report_state = "unclassified_json"
                           restore_diagnostic = None
@@ -2893,8 +2976,27 @@ jobs:
               base_fields = {"schema", "origin", "site", "exception_kind", "errno"}
               allowed_fields = (
                   {frozenset(base_fields), frozenset(base_fields | {"disk_mount_failure_reason"}),
-                   frozenset(base_fields | {"disk_mount_failure_reason", "disk_mount_predicates"})}
+                   frozenset(base_fields | {"disk_mount_failure_reason", "disk_mount_predicates"}),
+                   frozenset(base_fields | {"verification_site"}),
+                   frozenset(base_fields | {"verification_site", "disk_mount_failure_reason"}),
+                   frozenset(base_fields | {"verification_site", "disk_mount_failure_reason", "disk_mount_predicates"})}
               )
+              verification_sites = {
+                  "service_properties_shape", "service_resource_policy", "service_identity_state",
+                  "service_cgroup_identity", "service_pid_identity", "process_cgroup_read",
+                  "process_cgroup_parse", "process_cgroup_mismatch", "expected_executable_stat",
+                  "proc_exe_stat", "proc_exe_mismatch", "backend_mount_identity",
+                  "credential_visibility", "readonly_input_binds", "archive_exclusion",
+                  "controller_expected_executable_resolve", "controller_snapshot_properties",
+                  "controller_cgroup_snapshot", "controller_invocation_identity",
+                  "controller_image_mount_identity", "controller_process_start_time",
+                  "controller_second_snapshot_identity", "controller_start_deadline",
+                  "controller_process_state", "controller_cgroup_identity_compare",
+                  "controller_process_start_time_compare", "controller_completion_unit_state",
+                  "controller_completion_identity",
+                  "worker_root_path_identity", "worker_root_mode_identity", "worker_mount_identity",
+                  "worker_cgroup_identity", "worker_postgres_account_identity", "other",
+              }
               if (
                   not isinstance(value, dict)
                   or frozenset(value) not in allowed_fields
@@ -2918,6 +3020,17 @@ jobs:
                   if error_number is None or type(error_number) is not int:
                       return False
               elif error_number is not None:
+                  return False
+              if "verification_site" in value and (
+                  type(value["verification_site"]) is not str
+                  or value["verification_site"] not in verification_sites
+                  or (value["origin"] == "controller" and value["site"] not in {
+                      "controller_identity", "controller_completion_snapshot", "controller_final_snapshot",
+                  })
+                  or (value["origin"] == "worker" and value["site"] not in {
+                      "worker_root_identity", "worker_mount_snapshot", "worker_cgroup_snapshot",
+                  })
+              ):
                   return False
               if "disk_mount_failure_reason" not in value:
                   return True

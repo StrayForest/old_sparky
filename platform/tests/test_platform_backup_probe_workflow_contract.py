@@ -280,6 +280,10 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         legacy_tree = ast.parse(legacy_handler)
         cls.backup_first_fault_sites = _literal_set_assignment(legacy_tree, "first_fault_sites")
         cls.backup_first_fault_kinds = _literal_set_assignment(legacy_tree, "first_fault_kinds")
+        cls.backup_verification_sites = _literal_set_assignment(legacy_tree, "verification_sites")
+        cls.workflow_unit_verification_sites = _literal_set_assignment(
+            legacy_tree, "scratch_verification_sites"
+        )
         cls.backup_host_guard_sites = _literal_set_assignment(legacy_tree, "host_guard_sites")
         resource_validator = next(
             (
@@ -358,14 +362,36 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             body=[validator_function], type_ignores=[]
         )
         cls.legacy_fault_validator = compile(ast.fix_missing_locations(validator_module), str(WORKFLOW), "exec")
+        identity_binding = next(
+            (
+                node
+                for node in ast.walk(legacy_tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "valid_controller_identity_failure_binding"
+            ),
+            None,
+        )
+        if identity_binding is None:
+            raise AssertionError("could not isolate the artifact controller identity-site binder")
+        cls.identity_binding_validator = compile(
+            ast.fix_missing_locations(ast.Module(body=[identity_binding], type_ignores=[])),
+            str(WORKFLOW),
+            "exec",
+        )
 
     def _legacy_first_fault_valid(self, value) -> bool:
         namespace = {
             "first_fault_sites": self.backup_first_fault_sites,
             "first_fault_kinds": self.backup_first_fault_kinds,
+            "verification_sites": self.backup_verification_sites,
         }
         exec(self.legacy_fault_validator, namespace)
         return namespace["valid_first_fault"](value)
+
+    def _controller_identity_binding_valid(self, first_fault, scratch_unit) -> bool:
+        namespace = {}
+        exec(self.identity_binding_validator, namespace)
+        return namespace["valid_controller_identity_failure_binding"](first_fault, scratch_unit)
 
     def _workflow_resource_attribution_valid(self, value) -> bool:
         namespace = {}
@@ -1212,6 +1238,57 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
 
     def test_first_fault_is_closed_frame_bound_private_data(self) -> None:
         self._assert_scratch_allocation_attribution_is_closed_private_and_frame_bound()
+        operation_fault = {
+            "schema": 1,
+            "origin": "controller",
+            "site": "controller_identity",
+            "exception_kind": "attribute",
+            "errno": None,
+            "verification_site": "process_cgroup_read",
+        }
+        self.assertTrue(self._legacy_first_fault_valid(operation_fault))
+        self.assertFalse(
+            self._legacy_first_fault_valid(
+                {**operation_fault, "verification_site": "/proc/4242/cgroup"}
+            )
+        )
+        self.assertFalse(
+            self._legacy_first_fault_valid(
+                {**operation_fault, "origin": "worker"}
+            )
+        )
+        self.assertFalse(
+            self._legacy_first_fault_valid(
+                {**operation_fault, "site": "controller_cleanup"}
+            )
+        )
+        operation_unit = {
+            "schema": 3,
+            "verification_site": "process_cgroup_read",
+        }
+        self.assertTrue(self._controller_identity_binding_valid(operation_fault, operation_unit))
+        self.assertFalse(self._controller_identity_binding_valid(operation_fault, {**operation_unit, "verification_site": "proc_exe_stat"}))
+        self.assertFalse(self._controller_identity_binding_valid(operation_fault, {"schema": 2}))
+        self.assertEqual(
+            self.workflow_unit_verification_sites,
+            platform_backup_restore_drill._SCRATCH_VERIFICATION_SITES - {"none"},
+        )
+        self.assertEqual(
+            self.backup_verification_sites,
+            platform_backup_restore_drill._SCRATCH_VERIFICATION_SITES - {"none"},
+        )
+        for site in (
+            "controller_cgroup_identity_compare",
+            "controller_process_start_time_compare",
+            "controller_completion_unit_state",
+        ):
+            with self.subTest(workflow_unit_site=site):
+                fault = {**operation_fault, "verification_site": site}
+                unit = {"schema": 3, "verification_site": site}
+                self.assertTrue(self._legacy_first_fault_valid(fault))
+                self.assertTrue(self._controller_identity_binding_valid(fault, unit))
+        worker_operation = {**operation_fault, "origin": "worker", "site": "worker_mount_snapshot"}
+        self.assertTrue(self._controller_identity_binding_valid(worker_operation, operation_unit))
         phase_names = (
             "archive_verify", "initdb", "postgres_start", "restore_platform",
             "restore_public", "alembic_verify",
