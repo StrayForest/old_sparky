@@ -5687,6 +5687,149 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ),
             expected,
         )
+
+        # Exercise the real child CLI argv and main() error branch. The typed
+        # synthetic worker emits only its canonical closed pair; the original
+        # exception text and any private output must not cross either channel.
+        mountpoint = pathlib.Path(
+            "/run/oldsparky-backup-restore-" + "a" * 24
+        )
+        unit_command = backup_drill._scratch_unit_command(
+            mountpoint=mountpoint,
+            archive_path=None,
+            archive_stat=None,
+            archive_sha256=None,
+            timestamp_slug="20261018T120000Z",
+            unit_name="oldsparky-backup-restore-" + "a" * 24 + ".service",
+            synthetic_restore_diagnostic=True,
+            scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+            scratch_image_path=(
+                backup_drill.SCRATCH_DISK_IMAGE_ROOT / ("a" * 24 + ".ext4")
+            ),
+        )
+        worker_mode_index = unit_command.index(backup_drill.SCRATCH_WORKER_MODE)
+        child_argv = unit_command[worker_mode_index:]
+        self.assertNotIn("--private-scratch-diagnostics", child_argv)
+        self.assertNotIn("--json", child_argv)
+        child_failure = RuntimeError("raw synthetic worker error must not escape")
+
+        def fail_synthetic_worker(args: argparse.Namespace) -> int:
+            args._scratch_fault_site = "worker_mount_snapshot"
+            raise child_failure
+
+        child_stdout = io.StringIO()
+        child_stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", [str(SCRIPT_PATH), *child_argv]),
+            mock.patch.object(backup_drill, "_scratch_worker_main", side_effect=fail_synthetic_worker),
+            contextlib.redirect_stdout(child_stdout),
+            contextlib.redirect_stderr(child_stderr),
+        ):
+            self.assertEqual(backup_drill.main(), 1)
+        emitted_stdout = child_stdout.getvalue().encode("utf-8")
+        emitted_stderr = child_stderr.getvalue().encode("ascii")
+        parsed_child_report = json.loads(emitted_stdout.decode("utf-8"))
+        self.assertEqual(
+            parsed_child_report,
+            {
+                "ok": False,
+                "error": "Synthetic restore worker failed.",
+                "scratch_first_fault": child_failure.scratch_first_fault,
+            },
+        )
+        self.assertEqual(
+            backup_drill._parse_bound_scratch_first_fault(
+                emitted_stdout,
+                emitted_stderr,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            ),
+            child_failure.scratch_first_fault,
+        )
+        self.assertNotIn(b"raw synthetic worker error must not escape", emitted_stdout)
+        self.assertNotIn(b"raw synthetic worker error must not escape", emitted_stderr)
+        self.assertEqual(
+            parsed_child_report["scratch_first_fault"]["site"],
+            "worker_mount_snapshot",
+        )
+        mismatch_fault = backup_drill._scratch_first_fault(
+            RuntimeError("second worker fault"),
+            origin="worker",
+            site="worker_cgroup_snapshot",
+        )
+        assert mismatch_fault is not None
+        mismatch_frame = backup_drill._scratch_first_fault_frame(mismatch_fault)
+        assert mismatch_frame is not None
+        self.assertIsNone(
+            backup_drill._parse_bound_scratch_first_fault(
+                emitted_stdout,
+                mismatch_frame,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+        )
+
+        # The same worker flag without the typed synthetic mode keeps the
+        # ordinary CLI error behavior and never emits this protocol frame.
+        ordinary_args = [
+            backup_drill.SCRATCH_WORKER_MODE,
+            "--_scratch-root",
+            str(mountpoint),
+            "--_scratch-timestamp-slug",
+            "20261018T120000Z",
+            "--_scratch-archive",
+            "/run/archive.dump",
+            "--_scratch-archive-dev",
+            "1",
+            "--_scratch-archive-ino",
+            "2",
+            "--_scratch-archive-size",
+            "8",
+            "--_scratch-archive-sha256",
+            "0" * 64,
+        ]
+        ordinary_stdout = io.StringIO()
+        ordinary_stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", [str(SCRIPT_PATH), *ordinary_args]),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_worker_main",
+                side_effect=RuntimeError("ordinary worker failure"),
+            ),
+            contextlib.redirect_stdout(ordinary_stdout),
+            contextlib.redirect_stderr(ordinary_stderr),
+        ):
+            self.assertEqual(backup_drill.main(), 1)
+        self.assertEqual(ordinary_stdout.getvalue(), "")
+        self.assertIn("[FAIL] ordinary worker failure", ordinary_stderr.getvalue())
+        self.assertNotIn("SCRATCH_FIRST_FAULT_V1", ordinary_stderr.getvalue())
+
+        # Invalid attached faults are not serialized, even in the synthetic
+        # worker mode; the typed pair is emitted only after closed validation.
+        invalid_stdout = io.StringIO()
+        invalid_stderr = io.StringIO()
+
+        def fail_with_invalid_fault(args: argparse.Namespace) -> int:
+            error = RuntimeError("invalid fault should not be projected")
+            error.scratch_first_fault = {"secret": "never serialize"}
+            raise error
+
+        with (
+            mock.patch.object(sys, "argv", [str(SCRIPT_PATH), *child_argv]),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_worker_main",
+                side_effect=fail_with_invalid_fault,
+            ),
+            contextlib.redirect_stdout(invalid_stdout),
+            contextlib.redirect_stderr(invalid_stderr),
+        ):
+            self.assertEqual(backup_drill.main(), 1)
+        self.assertNotIn("SCRATCH_FIRST_FAULT_V1", invalid_stderr.getvalue())
+        self.assertNotIn("never serialize", invalid_stdout.getvalue())
+        self.assertNotIn("never serialize", invalid_stderr.getvalue())
+
         probe_failure = RuntimeError("synthetic private failure text")
         probe_failure.scratch_authorization_probe = True
         probe_failure.scratch_unit_private_output = (b"raw stdout", b"raw stderr")

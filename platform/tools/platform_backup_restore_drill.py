@@ -12342,6 +12342,29 @@ def main() -> int:
         print_result(result, as_json=args.as_json)
         return 0
     except Exception as exc:
+        synthetic_worker_failure = (
+            getattr(args, "_scratch_restore_worker", False)
+            and getattr(args, "_scratch_synthetic_restore_diagnostic", False)
+        )
+        first_fault = getattr(exc, "scratch_first_fault", None)
+        first_fault_frame = _scratch_first_fault_frame(first_fault)
+        if (
+            synthetic_worker_failure
+            and valid_scratch_first_fault(first_fault)
+            and first_fault_frame is not None
+        ):
+            # This fixed internal worker protocol may expose only its closed
+            # first-fault frame. Keep the exception text and every optional
+            # private diagnostic out of the parent-visible channels.
+            report = {
+                "ok": False,
+                "error": "Synthetic restore worker failed.",
+                "scratch_first_fault": first_fault,
+            }
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            sys.stderr.write(first_fault_frame.decode("ascii"))
+            sys.stderr.flush()
+            return 1
         private_scratch_diagnostics = getattr(args, "private_scratch_diagnostics", False)
         report = failure_report_for_exception(
             exc, private_scratch_diagnostics=private_scratch_diagnostics
