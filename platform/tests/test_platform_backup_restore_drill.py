@@ -3070,28 +3070,16 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill._run_isolated_restore_drill
         )
         fixture_setup_start = isolated_run_source.index(
-            'fault_site = "controller_synthetic_path_fixture"'
+            '_scratch_prepare_synthetic_protected_paths(\n                        scratch_backend=scratch_backend'
         )
-        fixture_setup_end = isolated_run_source.index(
-            'fault_site = "controller_host_guard"', fixture_setup_start
+        image_setup_position = isolated_run_source.index(
+            "_scratch_prepare_disk_image(token)", fixture_setup_start
         )
-        fixture_setup = isolated_run_source[fixture_setup_start:fixture_setup_end]
-        prepare_position = fixture_setup.index(
-            "_scratch_prepare_synthetic_protected_paths()"
+        self.assertLess(fixture_setup_start, image_setup_position)
+        self.assertIn(
+            '"scratch_synthetic_path_fixture_created"',
+            isolated_run_source[fixture_setup_start:image_setup_position],
         )
-        normal_unblock_position = fixture_setup.rindex(
-            "signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)"
-        )
-        self.assertLess(prepare_position, normal_unblock_position)
-        fixture_error_position = fixture_setup.index("except BaseException as fixture_error:")
-        fixture_lease_capture_position = fixture_setup.index(
-            '"scratch_synthetic_opt_parent_adjustment"', fixture_error_position
-        )
-        exception_unblock_position = fixture_setup.index(
-            "signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)",
-            fixture_lease_capture_position,
-        )
-        self.assertLess(fixture_lease_capture_position, exception_unblock_position)
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = pathlib.Path(temporary_dir)
@@ -3148,6 +3136,93 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             )
             self.assertTrue(unverified.is_dir())
             unverified.rmdir()
+
+            if os.geteuid() == 0:
+                partial_root = root / "partial-fixture"
+                partial_target = partial_root / "created-before-lstat-failure"
+                partial_root.mkdir(mode=0o700)
+                partial_created = False
+                partial_lstat_failed = False
+                original_mkdir = os.mkdir
+
+                def create_partial_target(
+                    path: str | os.PathLike[str], mode: int = 0o777
+                ) -> None:
+                    nonlocal partial_created
+                    original_mkdir(path, mode)
+                    if pathlib.Path(path) == partial_target:
+                        partial_created = True
+
+                def fail_partial_target_lstat(
+                    path: pathlib.Path,
+                ) -> os.stat_result:
+                    nonlocal partial_lstat_failed
+                    if path == partial_target and partial_created and not partial_lstat_failed:
+                        partial_lstat_failed = True
+                        raise OSError("injected partial fixture lstat failure")
+                    return original_lstat(path)
+
+                expected_partial = ((str(partial_target), -1, -1),)
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            "GITHUB_ACTIONS": "true",
+                            "RUNNER_OS": "Linux",
+                            "RUNNER_ENVIRONMENT": "github-hosted",
+                        },
+                    ),
+                    mock.patch.object(
+                        backup_drill,
+                        "_scratch_synthetic_protected_path_targets",
+                        return_value=(partial_target,),
+                    ),
+                    mock.patch.object(
+                        backup_drill.os, "mkdir", side_effect=create_partial_target
+                    ),
+                    mock.patch.object(
+                        pathlib.Path,
+                        "lstat",
+                        autospec=True,
+                        side_effect=fail_partial_target_lstat,
+                    ),
+                    mock.patch.object(
+                        backup_drill,
+                        "_scratch_remove_created_protected_path_directories",
+                        side_effect=RuntimeError("injected initial cleanup failure"),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "directory could not be created"
+                    ) as prepared:
+                        backup_drill._scratch_prepare_synthetic_protected_paths(
+                            scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+                        )
+                self.assertTrue(partial_lstat_failed)
+                self.assertEqual(
+                    getattr(
+                        prepared.exception,
+                        "scratch_synthetic_path_fixture_created",
+                    ),
+                    expected_partial,
+                )
+                self.assertFalse(
+                    getattr(
+                        prepared.exception,
+                        "scratch_synthetic_path_fixture_cleanup_confirmed",
+                    )
+                )
+                self.assertTrue(partial_target.is_dir())
+                with self.assertRaisesRegex(
+                    RuntimeError, "cleanup could not be confirmed"
+                ):
+                    backup_drill._scratch_remove_created_protected_path_directories(
+                        expected_partial,
+                        owner_uid=0,
+                        owner_gid=0,
+                    )
+                self.assertTrue(partial_target.is_dir())
+                partial_target.rmdir()
 
         rejected_parent_cases = (
             (
@@ -3370,6 +3445,57 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "/root",
             ),
         )
+
+    def test_disk_synthetic_fixture_adds_only_the_fixed_image_parent_chain(self) -> None:
+        tmpfs_targets = backup_drill._scratch_synthetic_protected_path_targets(
+            scratch_backend=backup_drill.SCRATCH_BACKEND_TMPFS_V1
+        )
+        disk_targets = backup_drill._scratch_synthetic_protected_path_targets(
+            scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+        )
+        self.assertEqual(disk_targets[: len(tmpfs_targets)], tmpfs_targets)
+        self.assertEqual(
+            disk_targets[len(tmpfs_targets) :],
+            (
+                backup_drill.SCRATCH_DISK_IMAGE_ROOT.parent,
+                backup_drill.SCRATCH_DISK_IMAGE_ROOT,
+            ),
+        )
+
+    def test_disk_image_fixture_directory_validator_checks_identity_and_mode(self) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("disk fixture ownership checks require root in the privileged owner contour")
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            old_root = backup_drill.SCRATCH_DISK_IMAGE_ROOT
+            try:
+                backup_drill.SCRATCH_DISK_IMAGE_ROOT = root / "oldsparky" / "backup-restore-images"
+                created = backup_drill._scratch_create_missing_protected_path_directories(
+                    (
+                        backup_drill.SCRATCH_DISK_IMAGE_ROOT.parent,
+                        backup_drill.SCRATCH_DISK_IMAGE_ROOT,
+                    ),
+                    owner_uid=0,
+                    owner_gid=0,
+                )
+                backup_drill._scratch_validate_synthetic_disk_image_fixture_dirs(
+                    paths=(root, root / "oldsparky", backup_drill.SCRATCH_DISK_IMAGE_ROOT.parent, backup_drill.SCRATCH_DISK_IMAGE_ROOT)
+                )
+                self.assertEqual(len(created), 2)
+                self.assertEqual(
+                    stat.S_IMODE(backup_drill.SCRATCH_DISK_IMAGE_ROOT.parent.stat().st_mode),
+                    0o700,
+                )
+                self.assertEqual(
+                    stat.S_IMODE(backup_drill.SCRATCH_DISK_IMAGE_ROOT.stat().st_mode),
+                    0o700,
+                )
+                backup_drill._scratch_remove_created_protected_path_directories(
+                    created, owner_uid=0, owner_gid=0
+                )
+                self.assertFalse((root / "oldsparky").exists())
+            finally:
+                backup_drill.SCRATCH_DISK_IMAGE_ROOT = old_root
 
     def test_synthetic_pg16_restore_diagnostic_under_root(self) -> None:
         if (
@@ -3979,10 +4105,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def _create_protected_backup(
         self,
         output_dir: pathlib.Path,
-        manifest: pathlib.Path,
+        manifest: pathlib.Path | None,
         *,
         keep: int,
         restore_result: int = 12,
+        scratch_backend: str = backup_drill.SCRATCH_BACKEND_TMPFS_V1,
     ) -> dict[str, Any]:
         args = argparse.Namespace(
             env_file=output_dir.parent / ".env.platform",
@@ -3992,8 +4119,15 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             rotate_existing=True,
             protected_backup_manifest=manifest,
             private_scratch_diagnostics=False,
+            scratch_backend=scratch_backend,
         )
-        with self._project_manifest_owner(manifest, 0):
+        isolated_restore = mock.Mock(return_value=restore_result)
+        manifest_owner = (
+            self._project_manifest_owner(manifest, 0)
+            if manifest is not None
+            else contextlib.nullcontext()
+        )
+        with manifest_owner:
             with (
                 mock.patch.dict(
                     backup_drill.os.environ,
@@ -4010,7 +4144,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(
                     backup_drill,
                     "_run_isolated_restore_drill",
-                    return_value=restore_result,
+                    isolated_restore,
                 ),
                 mock.patch.object(
                     backup_drill,
@@ -4018,7 +4152,29 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     return_value=dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC),
                 ),
             ):
-                return backup_drill.create_backup(args)
+                result = backup_drill.create_backup(args)
+        self._last_isolated_restore_call = isolated_restore.call_args
+        return result
+
+    def test_create_backup_forwards_selected_scratch_backend(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported backup scratch backend"):
+            backup_drill.create_backup(argparse.Namespace(scratch_backend="unknown"))
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir) / "backups"
+            output_dir.mkdir()
+
+            self._create_protected_backup(
+                output_dir,
+                None,
+                keep=2,
+                scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+            )
+
+        self.assertEqual(
+            self._last_isolated_restore_call.kwargs["scratch_backend"],
+            backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+        )
 
     @contextlib.contextmanager
     def _project_manifest_owner(self, path: pathlib.Path, uid: int):

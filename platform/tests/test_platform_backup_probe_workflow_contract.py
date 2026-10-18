@@ -279,6 +279,7 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         legacy_handler = _heredoc_with_suffix_after(cls.source, "backup_failure_marker() {")
         legacy_tree = ast.parse(legacy_handler)
         cls.backup_first_fault_sites = _literal_set_assignment(legacy_tree, "first_fault_sites")
+        cls.backup_first_fault_kinds = _literal_set_assignment(legacy_tree, "first_fault_kinds")
         cls.backup_host_guard_sites = _literal_set_assignment(legacy_tree, "host_guard_sites")
         resource_validator = next(
             (
@@ -343,31 +344,28 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         probe_tree = ast.parse(handler)
         cls.probe_first_fault_sites = _literal_set_assignment(probe_tree, "sites")
         cls.probe_host_guard_sites = _literal_set_assignment(probe_tree, "host_guard_sites")
-        validator_names = {"first_fault_sites", "first_fault_kinds", "valid_first_fault"}
-        validator_assignments = sorted(
+        validator_function = next(
             (
                 node
                 for node in ast.walk(legacy_tree)
-                if isinstance(node, ast.Assign)
-                and any(isinstance(target, ast.Name) and target.id in validator_names for target in node.targets)
+                if isinstance(node, ast.FunctionDef) and node.name == "valid_first_fault"
             ),
-            key=lambda node: node.lineno,
+            None,
         )
-        assigned_names = {
-            target.id
-            for node in validator_assignments
-            for target in node.targets
-            if isinstance(target, ast.Name)
-        }
-        if assigned_names != validator_names:
+        if validator_function is None:
             raise AssertionError("could not isolate the exact backup first-fault validator")
-        validator_module = ast.Module(body=validator_assignments, type_ignores=[])
+        validator_module = ast.Module(
+            body=[validator_function], type_ignores=[]
+        )
         cls.legacy_fault_validator = compile(ast.fix_missing_locations(validator_module), str(WORKFLOW), "exec")
 
     def _legacy_first_fault_valid(self, value) -> bool:
-        namespace = {"first_fault": value}
+        namespace = {
+            "first_fault_sites": self.backup_first_fault_sites,
+            "first_fault_kinds": self.backup_first_fault_kinds,
+        }
         exec(self.legacy_fault_validator, namespace)
-        return namespace["valid_first_fault"]
+        return namespace["valid_first_fault"](value)
 
     def _workflow_resource_attribution_valid(self, value) -> bool:
         namespace = {}
@@ -710,24 +708,32 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             for line in self.source.splitlines()
             if line.strip().startswith('remote_arguments="$GITHUB_RUN_ID')
         )
-        self.assertIn('[[ "$#" = 14 ]]', self.source)
+        self.assertIn('[[ "$#" = 15 ]]', self.source)
         self.assertIn('security_run_id="${12:-}"', self.source)
         self.assertIn('security_run_attempt="${13:-}"', self.source)
         self.assertIn('retain_helper_stage="${14:-false}"', self.source)
+        self.assertIn('scratch_backend="${15:-}"', self.source)
         self.assertIn('root / "bundle.zip"', self.source)
         self.assertIn('root / "tools"', self.source)
 
-        def exercise_dispatch(operation: str, before_create: bool, probe_accepted: bool = True):
+        def exercise_dispatch(
+            operation: str,
+            before_create: bool,
+            probe_accepted: bool = True,
+            scratch_backend: str = "tmpfs_v1",
+        ):
             script = "\n".join((
                 "set -euo pipefail",
                 policy_guard,
                 "run_remote_operation() {",
                 "  local REMOTE_OPERATION=\"$1\"",
                 "  local retain_helper_stage=\"$2\"",
+                "  local scratch_backend=tmpfs_v1",
+                "  if [[ \"$REMOTE_OPERATION\" = create ]]; then scratch_backend=\"$SCRATCH_BACKEND\"; fi",
                 f"  {remote_arguments_assignment}",
                 "  local -a transported_args",
                 "  read -r -a transported_args <<<\"$remote_arguments\"",
-                "  [[ \"${#transported_args[@]}\" = 14 ]]",
+                "  [[ \"${#transported_args[@]}\" = 15 ]]",
                 "  printf '%s\\n' \"${transported_args[@]}\"",
                 "  if [[ \"$1\" = authorization-probe && \"$PROBE_ACCEPTED\" != true ]]; then return 1; fi",
                 "}",
@@ -750,6 +756,7 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                 "RESUME_COMPACTION_BUNDLE_SHA256": "none",
                 "SECURITY_RUN_ID": SECURITY_ID,
                 "SECURITY_RUN_ATTEMPT": SECURITY_ATTEMPT,
+                "SCRATCH_BACKEND": scratch_backend,
             })
             return subprocess.run(
                 ["bash", "-c", script],
@@ -759,17 +766,31 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                 text=True,
             )
 
-        def expected_transport(operation: str, retain: str) -> str:
+        def expected_transport(operation: str, retain: str, backend: str) -> str:
             return "\n".join((
                 RUN_ID, RUN_ATTEMPT, operation, SOURCE_SHA, BUNDLE_SHA,
                 "false", "false", "false", "none", "none", "none",
-                SECURITY_ID, SECURITY_ATTEMPT, retain, "",
-            ))
+                SECURITY_ID, SECURITY_ATTEMPT, retain,
+                backend,
+            )) + "\n"
 
         default_create = exercise_dispatch("create", False)
-        self.assertEqual((default_create.returncode, default_create.stdout), (0, expected_transport("create", "false")))
+        self.assertEqual(
+            (default_create.returncode, default_create.stdout),
+            (0, expected_transport("create", "false", "tmpfs_v1")),
+        )
+        disk_create = exercise_dispatch(
+            "create", False, scratch_backend="disk_ext4_image_v1"
+        )
+        self.assertEqual(
+            (disk_create.returncode, disk_create.stdout),
+            (0, expected_transport("create", "false", "disk_ext4_image_v1")),
+        )
         standalone_probe = exercise_dispatch("authorization-probe", False)
-        self.assertEqual((standalone_probe.returncode, standalone_probe.stdout), (0, expected_transport("authorization-probe", "false")))
+        self.assertEqual(
+            (standalone_probe.returncode, standalone_probe.stdout),
+            (0, expected_transport("authorization-probe", "false", "tmpfs_v1")),
+        )
         rejected_operation = exercise_dispatch("verify-existing", True)
         self.assertNotEqual(rejected_operation.returncode, 0)
         self.assertEqual(rejected_operation.stdout, "")
@@ -795,7 +816,11 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         accepted_create = exercise_dispatch("create", True, probe_accepted=marker_is_accepted(success_marker))
         self.assertEqual(
             (accepted_create.returncode, accepted_create.stdout),
-            (0, expected_transport("authorization-probe", "true") + expected_transport("create", "false")),
+            (
+                0,
+                expected_transport("authorization-probe", "true", "tmpfs_v1")
+                + expected_transport("create", "false", "tmpfs_v1"),
+            ),
         )
         rejected_markers = (
             ("failed", success_marker.replace(b"status=completed", b"status=failed")),
@@ -813,7 +838,10 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                 self.assertFalse(accepted)
                 rejected_create = exercise_dispatch("create", True, probe_accepted=accepted)
                 self.assertNotEqual(rejected_create.returncode, 0)
-                self.assertEqual(rejected_create.stdout, expected_transport("authorization-probe", "true"))
+                self.assertEqual(
+                    rejected_create.stdout,
+                    expected_transport("authorization-probe", "true", "tmpfs_v1"),
+                )
 
         self.assertIn('if: ${{ inputs.operation == \'create\' || inputs.operation == \'verify-existing\' || inputs.operation == \'authorization-probe\' }}', self.source)
         self.assertIn('if: ${{ success() && inputs.operation == \'create\' && steps.cleanup_ssh.outcome == \'success\' }}', self.source)
@@ -1370,8 +1398,6 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("SCRATCH_FIRST_FAULT_V1", public_summary)
         self.assertIn('"scratch_first_fault": scratch_first_fault', self.source)
         self.assertIn('"scratch_resource_attribution": scratch_resource_attribution', self.source)
-        self.assertIn('first_fault.get("site", "").startswith(first_fault.get("origin", "") + "_")', self.source)
-        self.assertIn('value["site"].startswith("worker_")', self.source)
         controller_fault = {
             "schema": 1,
             "origin": "controller",
@@ -1388,9 +1414,12 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             (dict(FAULT, errno=13.0), False),
             (dict(FAULT, exception_kind=7), False),
             (dict(FAULT, origin="controller"), False),
+            (dict(FAULT, site="controller_entry"), False),
+            (dict(FAULT, unexpected_private_field="must-not-pass"), False),
         ):
             with self.subTest(legacy_first_fault=fault):
                 self.assertIs(self._legacy_first_fault_valid(fault), expected)
+                self.assertIs(platform_backup_restore_drill.valid_scratch_first_fault(fault), expected)
 
     def _assert_probe_receipt_failure_keeps_only_pending_projection(self) -> None:
         scenarios = (

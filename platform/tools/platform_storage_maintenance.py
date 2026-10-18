@@ -391,6 +391,12 @@ def parse_args() -> argparse.Namespace:
         help="Private schema-1 list of exact backup dump basenames to preserve during rotation.",
     )
     parser.add_argument("--backup-max-age-hours", type=float, default=24.0)
+    parser.add_argument(
+        "--scratch-backend",
+        choices=sorted(backup_restore_drill.SCRATCH_BACKENDS),
+        default=backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
+        help="Scratch filesystem backend for a newly created backup restore check.",
+    )
     parser.add_argument("--release-keep", type=int, default=5)
     parser.add_argument("--test-artifact-max-age-days", type=int, default=7)
     parser.add_argument("--screenshot-max-age-days", type=int, default=30)
@@ -509,6 +515,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("--backup-max-age-hours must be finite and positive")
     if args.backup_only and args.skip_backup:
         parser.error("--backup-only cannot be combined with --skip-backup")
+    disk_backend_special_mode = (
+        args.skip_backup
+        or args.verify_existing_backup_only
+        or args.authorization_probe_only
+        or args.purge_profile_access_cache_after_restore
+        or args.evict_pinned_build_node_cache
+        or args.compact_legacy_fallback_runtime_cache
+        or args.resume_legacy_fallback_runtime_cache_compaction
+    )
+    if (
+        args.scratch_backend != backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1
+        and disk_backend_special_mode
+    ):
+        parser.error(
+            "a non-default scratch backend is valid only for full maintenance or a read-only full-maintenance preview"
+        )
     if args.protected_backup_manifest is not None and (
         args.skip_backup
         or args.verify_existing_backup_only
@@ -1006,9 +1028,15 @@ def run_backup(
     rotate_existing: bool = True,
     private_failure_diagnostics: bool = False,
     protected_backup_manifest: Path | None = None,
+    scratch_backend: str = backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
 ) -> dict[str, Any]:
     if not math.isfinite(max_age_hours) or max_age_hours <= 0:
         raise ValueError("backup max age must be finite and positive")
+    if (
+        type(scratch_backend) is not str
+        or scratch_backend not in backup_restore_drill.SCRATCH_BACKENDS
+    ):
+        raise ValueError("unsupported backup scratch backend")
     shared_dir = app_dir / "shared"
     backup_args = argparse.Namespace(
         env_file=shared_dir / ".env.platform",
@@ -1018,6 +1046,7 @@ def run_backup(
         rotate_existing=rotate_existing,
         private_scratch_diagnostics=private_failure_diagnostics,
         protected_backup_manifest=protected_backup_manifest,
+        scratch_backend=scratch_backend,
     )
 
     def raise_command_failure(exc: Exception) -> None:
@@ -2480,6 +2509,11 @@ def _plan_and_maybe_apply(
                     protected_backup_manifest=getattr(
                         args, "protected_backup_manifest", None
                     ),
+                    scratch_backend=getattr(
+                        args,
+                        "scratch_backend",
+                        backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
+                    ),
                 ),
             }
         apply_release_plan(production_plan, app_dir=app_dir)
@@ -2808,6 +2842,11 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                             ),
                             protected_backup_manifest=getattr(
                                 args, "protected_backup_manifest", None
+                            ),
+                            scratch_backend=getattr(
+                                args,
+                                "scratch_backend",
+                                backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
                             ),
                         ),
                     },

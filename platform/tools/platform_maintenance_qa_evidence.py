@@ -84,6 +84,8 @@ EXPECTED_MAINTENANCE_ARGV = (
     "/opt/oldsparky/platform/shared/venv/bin/python",
     "/opt/oldsparky/platform/current/tools/platform_storage_maintenance.py",
     "--apply",
+    "--scratch-backend",
+    "disk_ext4_image_v1",
     "--protected-backup-manifest",
     "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json",
     "--backup-keep",

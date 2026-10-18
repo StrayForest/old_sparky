@@ -535,6 +535,10 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
         source_bytes = source_path.read_bytes()
         preview_argv = evidence.maintenance_preview_argv()
         self.assertNotIn("--apply", preview_argv)
+        self.assertEqual(
+            preview_argv[preview_argv.index("--scratch-backend") + 1],
+            "disk_ext4_image_v1",
+        )
         self.assertIn("--json", preview_argv)
         self.assertIn("--protected-backup-manifest", preview_argv)
         self.assertIn("/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json", preview_argv)

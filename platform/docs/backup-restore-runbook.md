@@ -28,7 +28,7 @@ verification in-process, avoiding a second Python interpreter during the
 memory-intensive restore drill. The standalone helper CLI remains available
 for local diagnostics and checks. Do not run its mutating mode directly on the
 production host because it does not acquire the host-wide operation locks.
-Create a production backup through the lock-aware backup-only mode:
+Create production backups through the lock-aware backup-only mode. The candidate maintenance unit pins `disk_ext4_image_v1`, while the CLI/workflow defaults remain `tmpfs_v1`; create operations accept an explicit backend, but verify/probe stay tmpfs. The installed unit changes only after paired synthetic proof and exact Security, source-bound backup and deployment gates. A read-only full-maintenance preview retains the unit's disk choice without `--apply` and creates no image or backup. The hosted disk diagnostic prepares only missing fixed image-parent directories before allocation and removes only invocation-created empty directories after verified unit, mount and loop teardown.
 
 ```bash
 cd /opt/oldsparky/platform/current

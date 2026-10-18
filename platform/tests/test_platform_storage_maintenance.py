@@ -167,6 +167,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             skip_backup=True,
             apply=True,
             backup_only=False,
+            scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
             verify_existing_backup_only=False,
             preserve_existing_backups=False,
             purge_profile_access_cache_after_restore=False,
@@ -312,11 +313,145 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(args.minimum_free_gib, 5.0)
         self.assertEqual(args.maximum_used_percent, 85.0)
         self.assertEqual(args.backup_max_age_hours, 24.0)
+        self.assertEqual(
+            args.scratch_backend,
+            maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
+        )
         self.assertFalse(args.backup_only)
         self.assertFalse(args.preserve_existing_backups)
         self.assertIsNone(args.protected_backup_manifest)
         self.assertFalse(args.evict_pinned_build_node_cache)
         self.assertIsNone(args.eviction_run_id)
+
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--backup-only",
+                "--apply",
+                "--scratch-backend",
+                maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+            ],
+        ):
+            args = maintenance.parse_args()
+        self.assertEqual(
+            args.scratch_backend,
+            maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+        )
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--scratch-backend",
+                maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+            ],
+        ):
+            preview_args = maintenance.parse_args()
+        self.assertFalse(preview_args.apply)
+        self.assertEqual(
+            preview_args.scratch_backend,
+            maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+        )
+        for invalid_mode in (
+            ["--apply", "--skip-backup"],
+            ["--apply", "--verify-existing-backup-only"],
+        ):
+            with mock.patch.object(
+                maintenance.sys,
+                "argv",
+                [
+                    "platform_storage_maintenance.py",
+                    "--scratch-backend",
+                    maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                    *invalid_mode,
+                ],
+            ):
+                with self.assertRaises(SystemExit):
+                    maintenance.parse_args()
+
+    def test_disk_backend_full_maintenance_preview_is_read_only(self) -> None:
+        app_dir = self.root / "preview-app"
+        releases = app_dir / "releases"
+        releases.mkdir(parents=True)
+        source_dir = self.root / "preview-source"
+        source_dir.mkdir()
+        web_dir = self.root / "preview-web"
+        web_dir.mkdir()
+        current = releases / "current-release"
+        previous = releases / "previous-release"
+        current.mkdir()
+        previous.mkdir()
+        (app_dir / "current").symlink_to(current, target_is_directory=True)
+        (app_dir / "previous").symlink_to(previous, target_is_directory=True)
+        backup_dir = app_dir / "shared" / "backups"
+
+        argv = [
+            "platform_storage_maintenance.py",
+            "--app-dir",
+            str(app_dir),
+            "--source-release-dir",
+            str(source_dir),
+            "--web-artifact-dir",
+            str(web_dir),
+            "--scratch-backend",
+            "disk_ext4_image_v1",
+            "--protected-backup-manifest",
+            "/protected/provider-backups.json",
+            "--backup-keep",
+            "15",
+            "--protected-release",
+            "gha-38000614899-1-7e5769ba3f85",
+            "--protected-release",
+            "gha-37760797674-1-80e457e57081",
+            "--minimum-free-gib",
+            "0",
+        ]
+        before_links = {
+            "current": (app_dir / "current").resolve(strict=True),
+            "previous": (app_dir / "previous").resolve(strict=True),
+        }
+        healthy = snapshot_from_usage(
+            SimpleNamespace(total=100 * BYTES_PER_GIB, free=50 * BYTES_PER_GIB)
+        )
+        with (
+            mock.patch.object(maintenance.sys, "argv", argv),
+            mock.patch.object(maintenance, "disk_snapshot_for_path", return_value=healthy),
+            mock.patch.object(
+                maintenance,
+                "live_qa_guard",
+                SimpleNamespace(
+                    RUNNER_CACHE_ROOT=self.root / "runner-cache",
+                    prune_runtime_cache=mock.Mock(
+                        return_value=maintenance._EmptyLiveQARuntimeCachePlan((), (), (), ())
+                    )
+                ),
+            ),
+            mock.patch.object(maintenance, "run_backup", side_effect=AssertionError("preview created backup")) as backup,
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "_scratch_prepare_disk_image",
+                side_effect=AssertionError("preview created scratch image"),
+            ) as image,
+        ):
+            args = maintenance.parse_args()
+            report = maintenance.run_maintenance(args)
+
+        self.assertEqual(report["mode"], "dry-run")
+        self.assertEqual(report["backup"], {"status": "skipped"})
+        self.assertEqual(args.scratch_backend, "disk_ext4_image_v1")
+        self.assertFalse(args.apply)
+        backup.assert_not_called()
+        image.assert_not_called()
+        self.assertFalse(backup_dir.exists())
+        self.assertEqual(
+            {
+                "current": (app_dir / "current").resolve(strict=True),
+                "previous": (app_dir / "previous").resolve(strict=True),
+            },
+            before_links,
+        )
 
     def test_authorization_probe_mode_is_exclusive_and_requires_private_json(self) -> None:
         valid = [
@@ -681,6 +816,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             max_age_hours=24.0,
             rotate_existing=False,
             protected_backup_manifest=None,
+            scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
         )
         release_retention.assert_called_once()
         artifact_retention.assert_called_once()
@@ -1209,6 +1345,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 keep=14,
                 max_age_hours=24.0,
                 rotate_existing=False,
+                scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
             )
 
         self.assertEqual(create_backup.call_count, 2)
@@ -1223,6 +1360,14 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.root / "runtime" / "platform" / "shared" / "backups",
         )
         self.assertEqual(create_args.keep, 14)
+        self.assertEqual(
+            create_args.scratch_backend,
+            maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
+        )
+        self.assertEqual(
+            create_backup.call_args_list[1].args[0].scratch_backend,
+            maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+        )
         self.assertIsNone(create_args.protected_backup_manifest)
         self.assertIs(create_args.dump_only, False)
         self.assertIs(create_args.rotate_existing, True)
@@ -1841,6 +1986,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             max_age_hours=24.0,
             rotate_existing=True,
             protected_backup_manifest=manifest,
+            scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
         )
 
     def test_manifest_flag_requires_a_backup_creating_maintenance_mode(self) -> None:
@@ -2091,6 +2237,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         args = self.maintenance_args(app_dir)
         args.skip_backup = False
         args.backup_only = True
+        args.scratch_backend = maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
         events: list[str] = []
 
         @maintenance.contextmanager
@@ -2144,6 +2291,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             rotate_existing=False,
             private_failure_diagnostics=False,
             protected_backup_manifest=None,
+            scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
         )
         load_live_qa_guard.assert_not_called()
         retention_plan.assert_not_called()
@@ -2607,6 +2755,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "ExecStart=/opt/oldsparky/platform/shared/venv/bin/python "
                 "/opt/oldsparky/platform/current/tools/"
                 "platform_storage_maintenance.py --apply "
+                "--scratch-backend disk_ext4_image_v1 "
                 "--protected-backup-manifest "
                 "/opt/oldsparky/platform/shared/backup-retention/"
                 "protected-dump-files.json --backup-keep 15 "
@@ -2695,6 +2844,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertTrue(inputs["security_run_id"]["required"])
         self.assertTrue(inputs["security_run_attempt"]["required"])
         self.assertTrue(inputs["source_sha"]["required"])
+        self.assertEqual(inputs["scratch_backend"]["default"], "tmpfs_v1")
+        self.assertEqual(
+            set(inputs["scratch_backend"]["options"]),
+            {"tmpfs_v1", "disk_ext4_image_v1"},
+        )
+        self.assertIn('scratch_backend="${15:-}"', workflow)
+        self.assertIn('scratch_backend != "tmpfs_v1" and operation != "create"', workflow)
         self.assertIn("for poll in $(seq 1 360)", workflow)
         self.assertIn("time.monotonic_ns() + 1_800_000_000_000", workflow)
         self.assertIn('--max-time "$request_timeout"', workflow)
@@ -3811,6 +3967,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     time.monotonic_ns() + 7_200_000_000_000
                 ),
                 "BACKUP_OPERATION": "create",
+                "SCRATCH_BACKEND": "tmpfs_v1",
                 "AUTHORIZATION_PROBE_BEFORE_CREATE": "false",
                 "SOURCE_SHA": source_sha,
                 "BUNDLE_SHA256": bundle_sha,
@@ -4355,6 +4512,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "RESUME_COMPACTION_RUN_ID": "",
                 "RESUME_COMPACTION_RUN_ATTEMPT": "",
                 "RESUME_COMPACTION_BUNDLE_SHA256": "",
+                "SCRATCH_BACKEND": "tmpfs_v1",
                 "SOURCE_SHA": "a" * 40,
                 "CURRENT_DEV_REF": "refs/heads/dev",
                 "CURRENT_DEV_SHA": "a" * 40,
@@ -4579,7 +4737,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     [
                         "bash", "-s", "--", run_id, "1", operation, source_sha,
                         archive_sha, "false", "false", "false", "none", "none", "none",
-                        "123456", "1", "false",
+                        "123456", "1", "false", "tmpfs_v1",
                     ],
                     input=script,
                     capture_output=True,
@@ -4616,7 +4774,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 [
                     "bash", "-s", "--", str(900_000_000 + uuid.uuid4().int % 90_000_000), "1", "create", "a" * 40, archive_sha,
                     "false", "false", "false", "none", "none", "none",
-                    "123456", "1", "false",
+                    "123456", "1", "false", "tmpfs_v1",
                 ],
                 input=remote_script.replace(
                     "runtime=__TEST_RUNTIME__", f"runtime={runtime}"
@@ -4699,6 +4857,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "123456",
                     "1",
                     "false",
+                    "tmpfs_v1",
                 ],
                 input=remote_script,
                 text=True,
@@ -4849,6 +5008,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "123456",
                     "1",
                     "false",
+                    "tmpfs_v1",
                 ],
                 input=typed_script,
                 text=True,
@@ -5002,7 +5162,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 [
                     "bash", "-s", "--", "123460", "1", "create", "a" * 40,
                     "b" * 64, "false", "false", "false", "none", "none", "none",
-                    "123456", "1", "false",
+                    "123456", "1", "false", "tmpfs_v1",
                 ],
                 input=typed_script,
                 text=True,
@@ -5062,7 +5222,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 [
                     "bash", "-s", "--", "123461", "1", "create", "a" * 40,
                     "b" * 64, "false", "false", "false", "none", "none", "none",
-                    "123456", "1", "false",
+                    "123456", "1", "false", "tmpfs_v1",
                 ],
                 input=typed_script,
                 text=True,
@@ -5144,6 +5304,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "123456",
                     "1",
                     "false",
+                    "tmpfs_v1",
                 ],
                 input=typed_script,
                 text=True,
@@ -5207,7 +5368,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 [
                     "bash", "-s", "--", "123459", "1", "create", "a" * 40,
                     "b" * 64, "false", "false", "false", "none", "none", "none",
-                    "123456", "1", "false",
+                    "123456", "1", "false", "tmpfs_v1",
                 ],
                 input=overflow_script,
                 text=True,
@@ -6138,6 +6299,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 resume_run_id: str = "none",
                 resume_attempt: str = "none",
                 resume_bundle_sha: str = "none",
+                scratch_backend: str = "tmpfs_v1",
             ) -> list[str]:
                 report_path = fixture_root / f"report-{operation}-{evict}.json"
                 report_path.write_text("", encoding="utf-8")
@@ -6163,6 +6325,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         resume_bundle_sha,
                         source_sha,
                         bundle_sha,
+                        scratch_backend,
                     ],
                     input=bound_wrapper,
                     text=True,
@@ -6250,6 +6413,17 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 operation="create", evict="false", source_sha=source_sha, bundle_sha=bundle_sha
             )
             self.assertIn("--backup-only", create_argv)
+            disk_argv = invoke_wrapper(
+                operation="create",
+                evict="false",
+                source_sha=source_sha,
+                bundle_sha=bundle_sha,
+                scratch_backend="disk_ext4_image_v1",
+            )
+            self.assertEqual(
+                disk_argv[disk_argv.index("--scratch-backend") + 1],
+                "disk_ext4_image_v1",
+            )
             self.assertNotIn("--verify-existing-backup-only", create_argv)
             self.assertNotIn("--evict-pinned-build-node-cache", create_argv)
 
@@ -6291,6 +6465,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "none",
                     "none",
                     "none",
+                    "tmpfs_v1",
                 ],
                 input=wrapper_script,
                 text=True,

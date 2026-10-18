@@ -18,6 +18,14 @@ on:
         required: false
         type: boolean
         default: false
+      scratch_backend:
+        description: "Scratch backend for the new backup restore verification (create only)"
+        required: false
+        type: choice
+        options:
+          - tmpfs_v1
+          - disk_ext4_image_v1
+        default: tmpfs_v1
       security_run_id:
         description: "Exact Platform security and build push run ID for this dev SHA"
         required: true
@@ -79,11 +87,17 @@ jobs:
         env:
           BACKUP_OPERATION: ${{ inputs.operation }}
           AUTHORIZATION_PROBE_BEFORE_CREATE: ${{ inputs.authorization_probe_before_create }}
+          SCRATCH_BACKEND: ${{ inputs.scratch_backend }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production backup must run from the reviewed dev ref" >&2; exit 1; }
           [[ "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true || "$AUTHORIZATION_PROBE_BEFORE_CREATE" = false ]]
+          [[ "$SCRATCH_BACKEND" = tmpfs_v1 || "$SCRATCH_BACKEND" = disk_ext4_image_v1 ]]
+          if [[ "$SCRATCH_BACKEND" != tmpfs_v1 && "$BACKUP_OPERATION" != create ]]; then
+            echo "scratch_backend is only valid for create" >&2
+            exit 1
+          fi
           if [[ "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true && "$BACKUP_OPERATION" != create ]]; then
             echo "authorization_probe_before_create is only valid for create" >&2
             exit 1
@@ -791,6 +805,7 @@ jobs:
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           BACKUP_OPERATION: ${{ inputs.operation }}
           AUTHORIZATION_PROBE_BEFORE_CREATE: ${{ inputs.authorization_probe_before_create }}
+          SCRATCH_BACKEND: ${{ inputs.scratch_backend }}
           EVICT_BUILD_NODE_CACHE: ${{ inputs.evict_build_node_cache }}
           COMPACT_FALLBACK_RUNTIME_CACHE: ${{ inputs.compact_fallback_runtime_cache }}
           RESUME_FALLBACK_CACHE_COMPACTION: ${{ inputs.resume_fallback_cache_compaction }}
@@ -810,6 +825,11 @@ jobs:
           umask 077
           [[ "$BACKUP_OPERATION" = create || "$BACKUP_OPERATION" = verify-existing || "$BACKUP_OPERATION" = authorization-probe ]]
           [[ "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true || "$AUTHORIZATION_PROBE_BEFORE_CREATE" = false ]]
+          [[ "$SCRATCH_BACKEND" = tmpfs_v1 || "$SCRATCH_BACKEND" = disk_ext4_image_v1 ]]
+          if [[ "$SCRATCH_BACKEND" != tmpfs_v1 && "$BACKUP_OPERATION" != create ]]; then
+            echo "scratch_backend is only valid for create" >&2
+            exit 1
+          fi
           if [[ "$AUTHORIZATION_PROBE_BEFORE_CREATE" = true && "$BACKUP_OPERATION" != create ]]; then
             echo "authorization_probe_before_create is only valid for create" >&2
             exit 1
@@ -970,6 +990,10 @@ jobs:
           run_remote_operation() {
           local REMOTE_OPERATION="$1"
           local retain_helper_stage="$2"
+          local scratch_backend=tmpfs_v1
+          if [[ "$REMOTE_OPERATION" = create ]]; then
+            scratch_backend="$SCRATCH_BACKEND"
+          fi
           [[ "$REMOTE_OPERATION" = create || "$REMOTE_OPERATION" = verify-existing || "$REMOTE_OPERATION" = authorization-probe ]]
           [[ "$retain_helper_stage" = true || "$retain_helper_stage" = false ]]
           verify_current_dev_source
@@ -985,7 +1009,7 @@ jobs:
             cleanup_staged_helper_before_operation || echo "Source helper stage cleanup failed after deadline guard" >&2
             exit 1
           fi
-          remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $REMOTE_OPERATION $SOURCE_SHA $BUNDLE_SHA256 $EVICT_BUILD_NODE_CACHE $COMPACT_FALLBACK_RUNTIME_CACHE $RESUME_FALLBACK_CACHE_COMPACTION ${RESUME_COMPACTION_RUN_ID:-none} ${RESUME_COMPACTION_RUN_ATTEMPT:-none} ${RESUME_COMPACTION_BUNDLE_SHA256:-none} $SECURITY_RUN_ID $SECURITY_RUN_ATTEMPT $retain_helper_stage"
+          remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $REMOTE_OPERATION $SOURCE_SHA $BUNDLE_SHA256 $EVICT_BUILD_NODE_CACHE $COMPACT_FALLBACK_RUNTIME_CACHE $RESUME_FALLBACK_CACHE_COMPACTION ${RESUME_COMPACTION_RUN_ID:-none} ${RESUME_COMPACTION_RUN_ATTEMPT:-none} ${RESUME_COMPACTION_BUNDLE_SHA256:-none} $SECURITY_RUN_ID $SECURITY_RUN_ATTEMPT $retain_helper_stage $scratch_backend"
           : >"$remote_report"
           : >"$remote_error"
           chmod 600 "$remote_report" "$remote_error"
@@ -1003,7 +1027,7 @@ jobs:
             "bash -s -- $remote_arguments" >"$remote_report" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
 
-          [[ "$#" = 14 ]]
+          [[ "$#" = 15 ]]
           run_id="${1:-}"
           run_attempt="${2:-}"
           operation="${3:-}"
@@ -1018,12 +1042,18 @@ jobs:
           security_run_id="${12:-}"
           security_run_attempt="${13:-}"
           retain_helper_stage="${14:-false}"
+          scratch_backend="${15:-}"
           [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ "$operation" = create || "$operation" = verify-existing || "$operation" = authorization-probe ]]
           [[ "$security_run_id" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$security_run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ "$retain_helper_stage" = true || "$retain_helper_stage" = false ]]
+          [[ "$scratch_backend" = tmpfs_v1 || "$scratch_backend" = disk_ext4_image_v1 ]]
+          if [[ "$scratch_backend" != tmpfs_v1 && "$operation" != create ]]; then
+            echo "non-default scratch backend requires create" >&2
+            exit 1
+          fi
           test "$(id -u)" -eq 0 || { echo "Production backup must run as root" >&2; exit 1; }
           prepare_stage_lock() {
             local lock_parent=/run/lock
@@ -2598,7 +2628,7 @@ jobs:
             "$evict_build_node_cache" "$compact_fallback_runtime_cache" \
             "$resume_compaction" "$resume_compaction_run_id" \
             "$resume_compaction_run_attempt" "$resume_compaction_bundle_sha256" \
-            "$source_sha" "$bundle_sha" 7>&7 <<'PY'
+            "$source_sha" "$bundle_sha" "$scratch_backend" 7>&7 <<'PY'
           import os
           from pathlib import Path
           import re
@@ -2623,10 +2653,15 @@ jobs:
               resume_compaction_bundle_sha256,
               source_sha,
               bundle_sha,
+              scratch_backend,
           ) = sys.argv[1:]
           if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id):
               raise SystemExit(125)
           if not re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt):
+              raise SystemExit(125)
+          if scratch_backend not in {"tmpfs_v1", "disk_ext4_image_v1"}:
+              raise SystemExit(125)
+          if scratch_backend != "tmpfs_v1" and operation != "create":
               raise SystemExit(125)
           if compact_fallback_runtime_cache not in {"true", "false"} or resume_compaction not in {"true", "false"}:
               raise SystemExit(125)
@@ -2679,6 +2714,7 @@ jobs:
           ]
           if operation == "create":
               command.insert(-3, "--backup-only")
+              command.extend(("--scratch-backend", scratch_backend))
           elif operation == "verify-existing":
               command.insert(-3, "--verify-existing-backup-only")
               if evict_build_node_cache == "true":

@@ -9717,7 +9717,11 @@ def _scratch_mountpoint_is_mounted(path: pathlib.Path) -> bool:
     return False
 
 
-def _scratch_synthetic_protected_path_targets() -> tuple[pathlib.Path, ...]:
+def _scratch_synthetic_protected_path_targets(
+    *, scratch_backend: str = SCRATCH_BACKEND_TMPFS_V1
+) -> tuple[pathlib.Path, ...]:
+    if scratch_backend not in SCRATCH_BACKENDS:
+        raise RuntimeError("Synthetic protected path fixture backend is unsupported.")
     targets: list[pathlib.Path] = []
     var_run = pathlib.Path("/var/run")
     try:
@@ -9733,7 +9737,77 @@ def _scratch_synthetic_protected_path_targets() -> tuple[pathlib.Path, ...]:
             raise RuntimeError("Synthetic protected path fixture contains an invalid fixed target.")
         if target not in targets:
             targets.append(target)
+    if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+        for target in (SCRATCH_DISK_IMAGE_ROOT.parent, SCRATCH_DISK_IMAGE_ROOT):
+            if target not in targets:
+                targets.append(target)
     return tuple(targets)
+
+
+def _scratch_validate_synthetic_disk_image_fixture_dirs(
+    *, paths: tuple[pathlib.Path, ...] | None = None
+) -> None:
+    """Pin the fixed disk-image parent chain before creating an image or unit."""
+    if paths is None:
+        paths = (
+            pathlib.Path("/var"),
+            pathlib.Path("/var/lib"),
+            SCRATCH_DISK_IMAGE_ROOT.parent,
+            SCRATCH_DISK_IMAGE_ROOT,
+        )
+    if len(paths) != 4 or any(not path.is_absolute() for path in paths):
+        raise RuntimeError("Synthetic disk image fixture parent chain is invalid.")
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+    if any(not hasattr(os, flag) for flag in required_flags):
+        raise RuntimeError("Synthetic disk image fixture cannot pin its parent chain.")
+    for index, path in enumerate(paths):
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            os.set_inheritable(descriptor, False)
+            fd_info = os.fstat(descriptor)
+            path_info = path.lstat()
+            expected_mode = 0o700 if index >= 2 else None
+            invalid = (
+                not stat.S_ISDIR(fd_info.st_mode)
+                or stat.S_ISLNK(fd_info.st_mode)
+                or not stat.S_ISDIR(path_info.st_mode)
+                or stat.S_ISLNK(path_info.st_mode)
+                or (fd_info.st_dev, fd_info.st_ino)
+                != (path_info.st_dev, path_info.st_ino)
+                or fd_info.st_uid != 0
+                or fd_info.st_gid != 0
+                or path_info.st_uid != 0
+                or path_info.st_gid != 0
+                or (
+                    expected_mode is not None
+                    and (
+                        stat.S_IMODE(fd_info.st_mode) != expected_mode
+                        or stat.S_IMODE(path_info.st_mode) != expected_mode
+                    )
+                )
+                or (
+                    expected_mode is None
+                    and (
+                        stat.S_IMODE(fd_info.st_mode) & 0o022
+                        or stat.S_IMODE(path_info.st_mode) & 0o022
+                    )
+                )
+            )
+            if invalid:
+                raise RuntimeError(
+                    "Synthetic disk image fixture parent identity or mode is unsafe."
+                )
+        except OSError as exc:
+            raise RuntimeError(
+                "Synthetic disk image fixture parent could not be pinned."
+            ) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def _scratch_create_missing_protected_path_directories(
@@ -10018,7 +10092,9 @@ def _scratch_finish_opt_parent_adjustment(
         raise RuntimeError("Synthetic protected path fixture /opt cleanup could not be confirmed.") from cleanup_error
 
 
-def _scratch_prepare_synthetic_protected_paths() -> tuple[
+def _scratch_prepare_synthetic_protected_paths(
+    *, scratch_backend: str = SCRATCH_BACKEND_TMPFS_V1
+) -> tuple[
     tuple[tuple[str, int, int], ...], tuple[int, int, int, int, int, int, int] | None
 ]:
     """Prepare the fixed namespace targets only on the ephemeral hosted runner."""
@@ -10029,8 +10105,11 @@ def _scratch_prepare_synthetic_protected_paths() -> tuple[
         or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
     ):
         raise RuntimeError("Synthetic protected path fixture requires the root GitHub-hosted Linux runner.")
-    targets = _scratch_synthetic_protected_path_targets()
+    targets = _scratch_synthetic_protected_path_targets(
+        scratch_backend=scratch_backend
+    )
     adjustment: tuple[int, int, int, int, int, int, int] | None = None
+    created: tuple[tuple[str, int, int], ...] = ()
     try:
         # R6 proved that the hosted runner's fixed /opt parent can be
         # group/world writable while the first protected target is absent.
@@ -10046,12 +10125,21 @@ def _scratch_prepare_synthetic_protected_paths() -> tuple[
         created = _scratch_create_missing_protected_path_directories(
             targets, owner_uid=0, owner_gid=0
         )
+        if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+            _scratch_validate_synthetic_disk_image_fixture_dirs()
         return created, adjustment
     except BaseException as exc:
         if adjustment is None:
             pending = getattr(exc, "scratch_synthetic_opt_parent_adjustment", None)
             if isinstance(pending, tuple):
                 adjustment = pending
+        # The directory creator owns its partial ledger if it fails mid-walk.
+        # Preserve that exact evidence so the outer caller can retry cleanup or
+        # fail closed; only publish this layer's ledger when none was attached.
+        if not hasattr(exc, "scratch_synthetic_path_fixture_created"):
+            setattr(exc, "scratch_synthetic_path_fixture_created", created)
+        if not hasattr(exc, "scratch_synthetic_path_fixture_cleanup_confirmed"):
+            setattr(exc, "scratch_synthetic_path_fixture_cleanup_confirmed", False)
         if adjustment is not None:
             setattr(exc, "scratch_synthetic_opt_parent_adjustment", adjustment)
         raise
@@ -10282,6 +10370,31 @@ def _run_isolated_restore_drill(
         blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
         setup_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
         try:
+            if synthetic_restore_diagnostic:
+                fault_site = "controller_synthetic_path_fixture"
+                try:
+                    (
+                        synthetic_protected_path_dirs,
+                        synthetic_opt_parent_adjustment,
+                    ) = _scratch_prepare_synthetic_protected_paths(
+                        scratch_backend=scratch_backend
+                    )
+                except BaseException as fixture_error:
+                    created = getattr(
+                        fixture_error,
+                        "scratch_synthetic_path_fixture_created",
+                        (),
+                    )
+                    if isinstance(created, tuple):
+                        synthetic_protected_path_dirs = created
+                    adjustment = getattr(
+                        fixture_error,
+                        "scratch_synthetic_opt_parent_adjustment",
+                        None,
+                    )
+                    if isinstance(adjustment, tuple):
+                        synthetic_opt_parent_adjustment = adjustment
+                    raise
             os.mkdir(mountpoint, 0o700)
             mountpoint_stat = mountpoint.lstat()
             mountpoint_identity = (mountpoint_stat.st_dev, mountpoint_stat.st_ino)
@@ -10297,7 +10410,8 @@ def _run_isolated_restore_drill(
             if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
                 assert image_path is not None
                 image_path, image_identity = _scratch_prepare_disk_image(token)
-        except BaseException:
+        except BaseException as setup_error:
+            fixture_cleanup_failed = False
             if image_path is not None and image_identity is not None:
                 try:
                     current_image = _scratch_image_path_identity(image_path)
@@ -10322,45 +10436,36 @@ def _run_isolated_restore_drill(
                     mountpoint.rmdir()
             except BaseException:
                 pass
+            if synthetic_restore_diagnostic:
+                try:
+                    _scratch_remove_created_protected_path_directories(
+                        synthetic_protected_path_dirs,
+                        owner_uid=0,
+                        owner_gid=0,
+                    )
+                    synthetic_protected_path_dirs = ()
+                except BaseException:
+                    fixture_cleanup_failed = True
+                if synthetic_opt_parent_adjustment is not None:
+                    try:
+                        _scratch_finish_opt_parent_adjustment(
+                            synthetic_opt_parent_adjustment,
+                            restore=not fixture_cleanup_failed,
+                        )
+                        synthetic_opt_parent_adjustment = None
+                    except BaseException:
+                        fixture_cleanup_failed = True
             signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
+            if fixture_cleanup_failed:
+                raise RuntimeError(
+                    "Synthetic protected path fixture setup failed and cleanup could not be confirmed."
+                ) from setup_error
             raise
         try:
             # A pending TERM/INT is delivered only after the exact host
             # mountpoint and, for the synthetic lane, path-fixture lease are
             # ready for the normal cleanup path.
             if not synthetic_restore_diagnostic:
-                signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
-            if synthetic_restore_diagnostic:
-                fault_site = "controller_synthetic_path_fixture"
-                try:
-                    (
-                        synthetic_protected_path_dirs,
-                        synthetic_opt_parent_adjustment,
-                    ) = _scratch_prepare_synthetic_protected_paths()
-                except BaseException as fixture_error:
-                    created = getattr(
-                        fixture_error,
-                        "scratch_synthetic_path_fixture_created",
-                        (),
-                    )
-                    if isinstance(created, tuple):
-                        synthetic_protected_path_dirs = created
-                    adjustment = getattr(
-                        fixture_error,
-                        "scratch_synthetic_opt_parent_adjustment",
-                        None,
-                    )
-                    if isinstance(adjustment, tuple):
-                        synthetic_opt_parent_adjustment = adjustment
-                    try:
-                        signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
-                    except BaseException as mask_error:
-                        if hasattr(fixture_error, "add_note"):
-                            fixture_error.add_note(
-                                "Signal mask restoration also raised "
-                                f"{type(mask_error).__name__}."
-                            )
-                    raise
                 signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
             fault_site = "controller_host_guard"
             _scratch_host_guard("parent_before_unit_launch")
@@ -11185,16 +11290,33 @@ def _run_isolated_restore_drill(
                     )
             protected_paths_cleaned = not synthetic_restore_diagnostic
             if synthetic_restore_diagnostic:
-                try:
-                    _scratch_remove_created_protected_path_directories(
-                        synthetic_protected_path_dirs,
-                        owner_uid=0,
-                        owner_gid=0,
+                fixture_teardown_safe = (
+                    service_stopped
+                    and mount_absent
+                    and mountpoint_removed
+                    and (
+                        scratch_backend != SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+                        or image_removed is True
                     )
-                    protected_paths_cleaned = True
-                except BaseException as cleanup_error:
+                )
+                if fixture_teardown_safe:
+                    try:
+                        _scratch_remove_created_protected_path_directories(
+                            synthetic_protected_path_dirs,
+                            owner_uid=0,
+                            owner_gid=0,
+                        )
+                        protected_paths_cleaned = True
+                    except BaseException as cleanup_error:
+                        protected_paths_cleaned = False
+                        final_cleanup_errors.append(cleanup_error)
+                else:
                     protected_paths_cleaned = False
-                    final_cleanup_errors.append(cleanup_error)
+                    final_cleanup_errors.append(
+                        RuntimeError(
+                            "Synthetic protected paths were retained because disk teardown was not confirmed."
+                        )
+                    )
                 if synthetic_opt_parent_adjustment is not None:
                     try:
                         if not service_stopped or not protected_paths_cleaned:
@@ -11318,6 +11440,9 @@ def _validate_custom_archive_header(path: pathlib.Path) -> None:
 
 
 def create_backup(args: argparse.Namespace) -> dict[str, Any]:
+    scratch_backend = getattr(args, "scratch_backend", SCRATCH_BACKEND_TMPFS_V1)
+    if type(scratch_backend) is not str or scratch_backend not in SCRATCH_BACKENDS:
+        raise ValueError("unsupported backup scratch backend")
     env_file = pathlib.Path(args.env_file)
     output_dir = pathlib.Path(args.output_dir)
     protected_manifest = getattr(args, "protected_backup_manifest", None)
@@ -11424,6 +11549,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                 temporary_dump_path,
                 timestamp_slug=timestamp_slug,
                 private_scratch_diagnostics=getattr(args, "private_scratch_diagnostics", False),
+                scratch_backend=scratch_backend,
             )
             restore_verified = True
         else:
