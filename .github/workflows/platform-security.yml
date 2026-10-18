@@ -440,7 +440,11 @@ jobs:
               raise SystemExit("baseline proof parent dispatch step did not succeed exactly once")
 
           auto_jobs = jobs("autodeploy-jobs.json")
-          auto_dispatch = [item for item in auto_jobs if isinstance(item, dict) and item.get("name") == "dispatch"]
+          auto_dispatch = [
+              item for item in auto_jobs
+              if isinstance(item, dict)
+              and item.get("name") == "Revalidate exact source and dispatch normal production child"
+          ]
           if len(auto_dispatch) != 1 or auto_dispatch[0].get("status") != "completed" or auto_dispatch[0].get("conclusion") != "success":
               raise SystemExit("baseline proof auto-deploy dispatch job did not succeed exactly once")
           auto_steps = auto_dispatch[0].get("steps")

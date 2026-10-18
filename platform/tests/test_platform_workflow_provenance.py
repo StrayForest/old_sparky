@@ -1660,6 +1660,520 @@ class WorkflowProvenanceTests(unittest.TestCase):
         next(item for item in failed if item["name"] == "Trusted dev immutable release runtime")["conclusion"] = "failure"
         with self.assertRaises(SystemExit):
             validate(failed)
+
+        # Exercise the exact nested baseline-proof job/step selection against
+        # the producer's three-job AutoDeploy graph. The final POST belongs to
+        # dispatch-production, not the earlier preparation job named
+        # "dispatch".
+        autodeploy_source = yaml.safe_load(
+            (WORKFLOW_DIR / "platform-production-autodeploy.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        producer_job = autodeploy_source["jobs"]["dispatch-production"]
+        expected_job_name = "Revalidate exact source and dispatch normal production child"
+        self.assertEqual(producer_job["name"], expected_job_name)
+        self.assertEqual(set(producer_job["needs"]), {"dispatch", "host-readiness"})
+        producer_dispatch_steps = [
+            step for step in producer_job["steps"]
+            if isinstance(step, dict)
+            and step.get("name") == AUTODEPLOY_DISPATCH_STEP_NAME
+        ]
+        self.assertEqual(len(producer_dispatch_steps), 1)
+        producer_step = producer_dispatch_steps[0]
+        self.assertIn("actions/workflows/platform-production-deploy.yml/dispatches", producer_step["run"])
+        self.assertIn('"classifier_run_id": sys.argv[1]', producer_step["run"])
+        self.assertIn('"autodeploy_run_id": sys.argv[4]', producer_step["run"])
+        self.assertIn('"autodeploy_run_attempt": sys.argv[5]', producer_step["run"])
+
+        auth_script = steps[0].get("run")
+        auth_heredocs = re.findall(
+            r"<<['\"]PY['\"]\s*\n(.*?)^\s*PY\s*$",
+            auth_script,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        auth_source = textwrap.dedent(auth_heredocs[-1])
+        start = auth_source.index('auto_jobs = jobs("autodeploy-jobs.json")')
+        end = auth_source.index('source_jobs = jobs("security-jobs.json")', start)
+        selection_source = auth_source[start:end]
+        selection_source = selection_source.replace(
+            'auto_jobs = jobs("autodeploy-jobs.json")\n', "", 1
+        )
+        selection_namespace: dict[str, object] = {}
+        exec(
+            "def validate_autodeploy_final_dispatch(auto_jobs):\n"
+            + textwrap.indent(selection_source, "    ")
+            + "    return auto_dispatch\n",
+            selection_namespace,
+        )
+        validate_auto_dispatch = selection_namespace["validate_autodeploy_final_dispatch"]
+
+        def api_job(
+            job_id: int,
+            name: str,
+            step_names: tuple[str, ...],
+            *,
+            status: str = "completed",
+            conclusion: str = "success",
+        ) -> dict[str, object]:
+            return {
+                "id": job_id,
+                "run_id": 39166084690,
+                "run_attempt": 1,
+                "head_sha": "1da23ad07f8f5cfc626b168d07f6d560944e6846",
+                "name": name,
+                "status": status,
+                "conclusion": conclusion,
+                "steps": [
+                    {"name": step_name, "status": "completed", "conclusion": "success"}
+                    for step_name in step_names
+                ],
+            }
+
+        actual_shape = [
+            # Safe row identity projection from the correlated AutoDeploy
+            # run; the shape and row ordering include preparation, readiness,
+            # and the final POST job as separate rows.
+            api_job(117789198283, "dispatch", ("Verify exact source-bound restore-verified backup",)),
+            api_job(117789835258, "Wait for exact host-tools generation readiness", ("Verify exact installed generation with shared read-only verifier",)),
+            api_job(
+                117790141063,
+                producer_job["name"],
+                ("Revalidate exact successful source-bound backup", AUTODEPLOY_DISPATCH_STEP_NAME),
+            ),
+        ]
+        selected = validate_auto_dispatch(actual_shape)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["name"], producer_job["name"])
+
+        rejected_shapes = [
+            actual_shape[:1],  # the historical preflight-only selector shape
+            [*actual_shape, copy.deepcopy(actual_shape[2])],
+            [*actual_shape[:2], api_job(117790141063, "unexpected final job", (AUTODEPLOY_DISPATCH_STEP_NAME,))],
+            [*actual_shape[:2], api_job(117790141063, producer_job["name"], (AUTODEPLOY_DISPATCH_STEP_NAME,), conclusion="failure")],
+            [*actual_shape[:2], api_job(117790141063, producer_job["name"], (AUTODEPLOY_DISPATCH_STEP_NAME,), status="in_progress", conclusion="success")],
+            [*actual_shape[:2], api_job(117790141063, producer_job["name"], ("Revalidate exact successful source-bound backup",))],
+            [*actual_shape[:2], api_job(117790141063, producer_job["name"], (AUTODEPLOY_DISPATCH_STEP_NAME, AUTODEPLOY_DISPATCH_STEP_NAME))],
+            [*actual_shape[:2], api_job(117790141063, producer_job["name"], (AUTODEPLOY_DISPATCH_STEP_NAME,), status="completed", conclusion="skipped")],
+        ]
+        failed_step_shapes = []
+        for step_status, step_conclusion in (
+            ("completed", "failure"),
+            ("completed", "skipped"),
+            ("in_progress", None),
+        ):
+            candidate = copy.deepcopy(actual_shape)
+            candidate[2]["steps"][1].update(
+                {"status": step_status, "conclusion": step_conclusion}
+            )
+            failed_step_shapes.append(candidate)
+        for candidate in failed_step_shapes:
+            rejected_shapes.append(candidate)
+        for rejected in rejected_shapes:
+            with self.subTest(auto_deploy_jobs=rejected), self.assertRaises(SystemExit):
+                validate_auto_dispatch(rejected)
+
+        # Execute both producer payload builders with the safe correlated IDs
+        # used by the exact-proof validator fixture, then feed the emitted
+        # baseline proof correlation through the real validator.
+        auto_payload_blocks = re.findall(
+            r"<<['\"]PY['\"]\s*\n(.*?)^\s*PY\s*$",
+            producer_step["run"],
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        self.assertEqual(len(auto_payload_blocks), 1)
+        auto_payload_result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(auto_payload_blocks[0]), "567", "1", "baseline-reconcile", "678", "1"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(auto_payload_result.returncode, 0, auto_payload_result.stderr)
+        auto_payload = json.loads(auto_payload_result.stdout)
+        self.assertEqual(auto_payload["ref"], "dev")
+        self.assertEqual(
+            auto_payload["inputs"],
+            {
+                "mode": "baseline-reconcile",
+                "runtime_profile": "authenticated-read-admission-24x8",
+                "web_compression": "enabled",
+                "classifier_run_id": "567",
+                "classifier_run_attempt": "1",
+                "autodeploy_run_id": "678",
+                "autodeploy_run_attempt": "1",
+            },
+        )
+
+        deploy_workflow = yaml.safe_load(
+            (WORKFLOW_DIR / "platform-production-deploy.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        proof_producer = deploy_workflow["jobs"]["dispatch-baseline-runtime"]
+        proof_steps = [
+            step for step in proof_producer["steps"]
+            if isinstance(step, dict)
+            and step.get("name") == "Dispatch exact-target baseline runtime proof"
+        ]
+        self.assertEqual(len(proof_steps), 1)
+        proof_step = proof_steps[0]
+        self.assertIn("actions/workflows/platform-security.yml/dispatches", proof_step["run"])
+        self.assertEqual(proof_producer["env"]["SOURCE_SECURITY_RUN_ID"], "${{ inputs.classifier_run_id }}")
+        self.assertEqual(proof_producer["env"]["AUTODEPLOY_RUN_ID"], "${{ inputs.autodeploy_run_id }}")
+        proof_payload_blocks = re.findall(
+            r"<<['\"]PY['\"]\s*\n(.*?)^\s*PY\s*$",
+            proof_step["run"],
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        self.assertEqual(len(proof_payload_blocks), 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = Path(temporary) / "baseline-runtime-dispatch.json"
+            payload_env = os.environ.copy()
+            payload_env.update(
+                {
+                    "TARGET_SHA": self.SHA,
+                    "SOURCE_SECURITY_RUN_ID": auto_payload["inputs"]["classifier_run_id"],
+                    "SOURCE_SECURITY_RUN_ATTEMPT": auto_payload["inputs"]["classifier_run_attempt"],
+                    "AUTODEPLOY_RUN_ID": auto_payload["inputs"]["autodeploy_run_id"],
+                    "AUTODEPLOY_RUN_ATTEMPT": auto_payload["inputs"]["autodeploy_run_attempt"],
+                    "GITHUB_RUN_ID": "789",
+                    "GITHUB_RUN_ATTEMPT": "3",
+                }
+            )
+            proof_payload_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    textwrap.dedent(proof_payload_blocks[0]),
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=payload_env,
+                timeout=5,
+            )
+            self.assertEqual(proof_payload_result.returncode, 0, proof_payload_result.stderr)
+            self.assertEqual(output_path.stat().st_mode & 0o777, 0o600)
+            proof_payload = json.loads(output_path.read_text(encoding="ascii"))
+        security_workflow = yaml.safe_load(
+            (WORKFLOW_DIR / "platform-security.yml").read_text(encoding="utf-8")
+        )
+        workflow_triggers = security_workflow.get("on", security_workflow.get(True))
+        self.assertIsInstance(workflow_triggers, dict)
+        declared_inputs = workflow_triggers["workflow_dispatch"]["inputs"]
+        self.assertTrue(set(proof_payload["inputs"]) <= set(declared_inputs))
+        self.assertEqual(proof_payload["ref"], "dev")
+        self.assertEqual(
+            proof_payload["inputs"],
+            {
+                "proof_mode": "baseline-runtime",
+                "target_sha": self.SHA,
+                "source_security_run_id": "567",
+                "source_security_run_attempt": "1",
+                "autodeploy_run_id": "678",
+                "autodeploy_run_attempt": "1",
+                "production_deploy_run_id": "789",
+                "production_deploy_run_attempt": "3",
+            },
+        )
+        baseline_payload = self._baseline_runtime_payload()
+        self.assertEqual(
+            proof_payload["inputs"]["source_security_run_id"],
+            str(baseline_payload[5]["source_security_run_id"]),
+        )
+        self.assertEqual(
+            proof_payload["inputs"]["autodeploy_run_id"],
+            str(baseline_payload[5]["autodeploy_run_id"]),
+        )
+        self.assertEqual(
+            self._validate_baseline_runtime_payload(baseline_payload)["target_sha"],
+            proof_payload["inputs"]["target_sha"],
+        )
+
+        # Run the complete inline guard step, including every strict API fetch,
+        # against a closed fake API. This makes the cross-run/attempt/status
+        # plumbing executable and ensures the final-job selector is tested in
+        # the same context as its surrounding source-authentication checks.
+        fixture_dir = Path(tempfile.mkdtemp())
+        try:
+            fake_bin = fixture_dir / "bin"
+            fake_bin.mkdir()
+            runner_temp = fixture_dir / "runner"
+            runner_temp.mkdir()
+            api_dir = fixture_dir / "api"
+            api_dir.mkdir()
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/python3
+                    import json
+                    import os
+                    from pathlib import Path
+                    import sys
+
+                    args = sys.argv[1:]
+                    if "--request" in args:
+                        raise SystemExit("unexpected write request")
+                    url = next((arg for arg in args if arg.startswith("https://")), None)
+                    if url is None or "--output" not in args:
+                        raise SystemExit("unexpected fake API invocation")
+                    headers = [args[i + 1] for i, value in enumerate(args[:-1]) if value == "--header"]
+                    required = {
+                        "Authorization: Bearer fixture-token",
+                        "Accept: application/vnd.github+json",
+                        "X-GitHub-Api-Version: 2022-11-28",
+                    }
+                    if set(headers) != required:
+                        raise SystemExit("baseline guard API headers differ from the fixture contract")
+                    mapping = json.loads(Path(os.environ["API_FIXTURE_MAP"]).read_text())
+                    source = mapping.get(url)
+                    if source is None:
+                        raise SystemExit("unexpected baseline guard API endpoint")
+                    output = Path(args[args.index("--output") + 1])
+                    output.write_bytes(Path(source).read_bytes())
+                    with Path(os.environ["API_REQUEST_LOG"]).open("a", encoding="utf-8") as stream:
+                        stream.write(url + "\\n")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+
+            expected_parent_title = (
+                f"Platform production deploy mode=baseline-reconcile target={self.SHA} "
+                "source=567.1 auto=678.1"
+            )
+            api_base = "https://api.github.com/repos/StrayForest/old_sparky"
+            fixtures: dict[str, object] = {
+                f"{api_base}/branches/dev": {
+                    "name": "dev",
+                    "commit": {"sha": self.SHA},
+                },
+                f"{api_base}/actions/workflows/platform-security.yml": {
+                    "id": 77,
+                    "path": ".github/workflows/platform-security.yml",
+                    "name": "Platform security and build",
+                },
+                f"{api_base}/actions/workflows/platform-production-autodeploy.yml": {
+                    "id": 88,
+                    "path": ".github/workflows/platform-production-autodeploy.yml",
+                    "name": "Platform production auto-deploy",
+                },
+                f"{api_base}/actions/workflows/platform-production-deploy.yml": {
+                    "id": 99,
+                    "path": ".github/workflows/platform-production-deploy.yml",
+                    "name": "Platform production deploy",
+                },
+                f"{api_base}/actions/runs/567": {
+                    "id": 567,
+                    "workflow_id": 77,
+                    "run_attempt": 1,
+                    "event": "push",
+                    "head_branch": "dev",
+                    "head_sha": self.SHA,
+                    "path": ".github/workflows/platform-security.yml",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "repository": {"full_name": "StrayForest/old_sparky"},
+                },
+                f"{api_base}/actions/runs/678": {
+                    "id": 678,
+                    "workflow_id": 88,
+                    "run_attempt": 1,
+                    "event": "workflow_run",
+                    "head_branch": "dev",
+                    "head_sha": self.SHA,
+                    "path": ".github/workflows/platform-production-autodeploy.yml",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "repository": {"full_name": "StrayForest/old_sparky"},
+                },
+                f"{api_base}/actions/runs/789": {
+                    "id": 789,
+                    "workflow_id": 99,
+                    "run_attempt": 3,
+                    "event": "workflow_dispatch",
+                    "head_branch": "dev",
+                    "head_sha": self.SHA,
+                    "path": ".github/workflows/platform-production-deploy.yml",
+                    "name": expected_parent_title,
+                    "display_title": expected_parent_title,
+                    "status": "in_progress",
+                    "conclusion": None,
+                    "actor": {"login": "github-actions[bot]"},
+                    "repository": {"full_name": "StrayForest/old_sparky"},
+                },
+                f"{api_base}/actions/runs/789/attempts/3/jobs?per_page=100": {
+                    "total_count": 1,
+                    "jobs": [
+                        {
+                            "id": 7001,
+                            "run_id": 789,
+                            "run_attempt": 3,
+                            "head_sha": self.SHA,
+                            "name": "Dispatch exact-target baseline runtime proof",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "steps": [{
+                                "name": "Dispatch exact-target baseline runtime proof",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }],
+                        }
+                    ],
+                },
+                f"{api_base}/actions/runs/567/attempts/1/jobs?per_page=100": {
+                    "total_count": 14,
+                    "jobs": [
+                        {"name": name, "status": "completed", "conclusion": "success"}
+                        for name in (
+                            "Backend DB-free contours",
+                            "Backend PostgreSQL and Redis integration",
+                            "Backend privileged ephemeral contour",
+                            "Backend aggregate",
+                            "Python quality",
+                            "Security gates",
+                            "web-quality",
+                            "Web hermetic",
+                            "Documentation consistency",
+                            "Migration scenarios",
+                            "Verification contract",
+                            "Conditional release runtime fixture",
+                            "Trusted dev immutable release runtime",
+                            "status-final",
+                        )
+                    ],
+                },
+                f"{api_base}/actions/runs/678/attempts/1/jobs?per_page=100": {
+                    "total_count": 3,
+                    "jobs": [
+                        {
+                            "id": 7101,
+                            "run_id": 678,
+                            "run_attempt": 1,
+                            "head_sha": self.SHA,
+                            "name": "dispatch",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "steps": [{
+                                "name": "Verify exact source-bound restore-verified backup",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }],
+                        },
+                        {
+                            "id": 7102,
+                            "run_id": 678,
+                            "run_attempt": 1,
+                            "head_sha": self.SHA,
+                            "name": "Wait for exact host-tools generation readiness",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "steps": [{
+                                "name": "Verify exact installed generation with shared read-only verifier",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }],
+                        },
+                        {
+                            "id": 7103,
+                            "run_id": 678,
+                            "run_attempt": 1,
+                            "head_sha": self.SHA,
+                            "name": expected_job_name,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "steps": [
+                                {
+                                    "name": "Revalidate exact successful source-bound backup",
+                                    "status": "completed",
+                                    "conclusion": "success",
+                                },
+                                {
+                                    "name": AUTODEPLOY_DISPATCH_STEP_NAME,
+                                    "status": "completed",
+                                    "conclusion": "success",
+                                },
+                            ],
+                        },
+                    ],
+                },
+                f"{api_base}/commits/{self.SHA}/statuses?per_page=100&page=1": [
+                    {
+                        "id": 7201,
+                        "context": "platform-security-build",
+                        "state": "success",
+                        "description": "Platform security and build passed",
+                        "target_url": "https://github.com/StrayForest/old_sparky/actions/runs/567/attempts/1",
+                        "created_at": "2026-10-01T12:00:00Z",
+                        "updated_at": "2026-10-01T12:00:00Z",
+                        "creator": {
+                            "login": "github-actions[bot]",
+                            "type": "Bot",
+                            "id": 41898282,
+                        },
+                    }
+                ],
+            }
+            fixture_map: dict[str, str] = {}
+            for index, (url, value) in enumerate(fixtures.items()):
+                response_path = api_dir / f"response-{index}.json"
+                response_path.write_text(json.dumps(value), encoding="utf-8")
+                fixture_map[url] = str(response_path)
+            fixture_map_path = fixture_dir / "api-map.json"
+            fixture_map_path.write_text(json.dumps(fixture_map), encoding="utf-8")
+            request_log = fixture_dir / "requests.txt"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                    "GITHUB_SERVER_URL": "https://github.com",
+                    "GITHUB_API_URL": "https://api.github.com",
+                    "GITHUB_EVENT_NAME": "workflow_dispatch",
+                    "GITHUB_REF": "refs/heads/dev",
+                    "GITHUB_SHA": self.SHA,
+                    "GH_TOKEN": "fixture-token",
+                    "TARGET_SHA": self.SHA,
+                    "SOURCE_SECURITY_RUN_ID": "567",
+                    "SOURCE_SECURITY_RUN_ATTEMPT": "1",
+                    "AUTODEPLOY_RUN_ID": "678",
+                    "AUTODEPLOY_RUN_ATTEMPT": "1",
+                    "PRODUCTION_DEPLOY_RUN_ID": "789",
+                    "PRODUCTION_DEPLOY_RUN_ATTEMPT": "3",
+                    "PROOF_RUN_ID": "9876",
+                    "PROOF_RUN_ATTEMPT": "1",
+                    "API_FIXTURE_MAP": str(fixture_map_path),
+                    "API_REQUEST_LOG": str(request_log),
+                }
+            )
+            environment.pop("BASH_ENV", None)
+            environment.pop("ENV", None)
+            inline_result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", auth_script],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=10,
+            )
+            self.assertEqual(inline_result.returncode, 0, inline_result.stderr)
+            self.assertIn(
+                "Authenticated exact current dev target and correlated source, auto-deploy, and parent dispatch attempts.",
+                inline_result.stdout,
+            )
+            self.assertEqual(
+                set(request_log.read_text(encoding="utf-8").splitlines()),
+                set(fixtures),
+            )
+        finally:
+            import shutil
+
+            shutil.rmtree(fixture_dir)
         duplicate = rows("skipped")
         duplicate.append(dict(next(item for item in duplicate if item["name"] == "Conditional release runtime fixture")))
         with self.assertRaises(SystemExit):
