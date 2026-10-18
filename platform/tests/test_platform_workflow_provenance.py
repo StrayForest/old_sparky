@@ -25,7 +25,9 @@ STATUS_FINALIZER_WORKFLOW = WORKFLOW_DIR / "platform-security-status-finalizer.y
 sys.path.insert(0, str(TOOLS))
 
 from tools.platform_workflow_provenance import (  # noqa: E402
+    AUTODEPLOY_DISPATCH_JOB_NAME,
     AUTODEPLOY_DISPATCH_STEP_NAME,
+    AUTODEPLOY_JOB_NAME,
     AUTODEPLOY_WORKFLOW_NAME,
     AUTODEPLOY_WORKFLOW_PATH,
     DEPLOY_WORKFLOW_NAME,
@@ -1343,24 +1345,82 @@ class WorkflowProvenanceTests(unittest.TestCase):
         }
         jobs = [
             {
-                "id": 9901,
-                "name": "dispatch",
+                # Safe job/step projection from AutoDeploy run 39164167302/1:
+                # the preparation job and final POST live in distinct jobs.
+                "id": 117783514919,
+                "name": AUTODEPLOY_JOB_NAME,
                 "status": "completed",
                 "conclusion": "success",
                 "steps": [
-                    {"name": "Checkout", "status": "completed", "conclusion": "success"},
+                    {
+                        "name": "Verify exact source-bound restore-verified backup",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ],
+            },
+            {
+                "id": 117784140013,
+                "name": "Wait for exact host-tools generation readiness",
+                "status": "completed",
+                "conclusion": "success",
+                "steps": [
+                    {
+                        "name": "Verify exact installed generation with shared read-only verifier",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ],
+            },
+            {
+                "id": 117784562698,
+                "name": AUTODEPLOY_DISPATCH_JOB_NAME,
+                "status": "completed",
+                "conclusion": "success",
+                "steps": [
+                    {
+                        "name": "Revalidate exact successful source-bound backup",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
                     {
                         "name": AUTODEPLOY_DISPATCH_STEP_NAME,
                         "status": "completed",
                         "conclusion": "success",
                     },
                 ],
-            }
+            },
         ]
         return workflow, run, jobs
 
     def test_exact_autodeploy_dispatch_attempt_is_accepted(self) -> None:
         workflow, run, jobs = self._autodeploy_payload()
+        source = yaml.safe_load(
+            (WORKFLOW_DIR / "platform-production-autodeploy.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn("dispatch", source["jobs"])
+        self.assertEqual(
+            source["jobs"]["dispatch"].get("name", "dispatch"),
+            AUTODEPLOY_JOB_NAME,
+        )
+        preparation_jobs = [
+            job for job in jobs if job.get("name") == AUTODEPLOY_JOB_NAME
+        ]
+        self.assertEqual(len(preparation_jobs), 1)
+        # The previous validator selected this preparation job, which has no
+        # final child-POST step in the captured three-job API shape.
+        self.assertNotIn(
+            AUTODEPLOY_DISPATCH_STEP_NAME,
+            [step.get("name") for step in preparation_jobs[0]["steps"]],
+        )
+        dispatch_job = source["jobs"]["dispatch-production"]
+        self.assertEqual(dispatch_job["name"], AUTODEPLOY_DISPATCH_JOB_NAME)
+        self.assertIn(
+            AUTODEPLOY_DISPATCH_STEP_NAME,
+            [step.get("name") for step in dispatch_job["steps"]],
+        )
         self.assertEqual(
             validate_autodeploy_dispatch(
                 workflow,
@@ -1647,26 +1707,51 @@ class WorkflowProvenanceTests(unittest.TestCase):
                     )
 
         workflow, run, jobs = self._autodeploy_payload()
+        dispatch_job = jobs[2]
         for candidate_jobs in (
             [],
-            jobs + [{**jobs[0], "id": 9902}],
-            [{**jobs[0], "conclusion": "failure"}],
-            [{**jobs[0], "steps": []}],
+            jobs + [{**dispatch_job, "id": 9904}],
+            [*jobs[:2], {**dispatch_job, "conclusion": "failure"}],
+            [*jobs[:2], {**dispatch_job, "steps": []}],
             [
+                *jobs[:2],
                 {
-                    **jobs[0],
-                    "steps": jobs[0]["steps"]
-                    + [dict(jobs[0]["steps"][1], number=3)],
-                }
+                    **dispatch_job,
+                    "steps": dispatch_job["steps"]
+                    + [dict(dispatch_job["steps"][1], number=3)],
+                },
+            ],
+            [
+                *jobs[:2],
+                {
+                    **dispatch_job,
+                    "steps": [
+                        dispatch_job["steps"][0],
+                        {**dispatch_job["steps"][1], "conclusion": "failure"},
+                    ],
+                },
             ],
             [
                 {
                     **jobs[0],
                     "steps": [
-                        jobs[0]["steps"][0],
-                        {**jobs[0]["steps"][1], "conclusion": "failure"},
+                        *jobs[0]["steps"],
+                        {
+                            "name": AUTODEPLOY_DISPATCH_STEP_NAME,
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
                     ],
-                }
+                },
+                jobs[1],
+                {**dispatch_job, "steps": []},
+            ],
+            [
+                *jobs[:2],
+                {
+                    **dispatch_job,
+                    "name": "unexpected job containing dispatch step",
+                },
             ],
         ):
             with self.subTest(jobs=candidate_jobs):

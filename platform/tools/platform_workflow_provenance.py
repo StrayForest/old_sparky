@@ -45,6 +45,9 @@ DEPLOY_BASELINE_RUN_NAME_RE = re.compile(
 AUTODEPLOY_WORKFLOW_PATH = ".github/workflows/platform-production-autodeploy.yml"
 AUTODEPLOY_WORKFLOW_NAME = "Platform production auto-deploy"
 AUTODEPLOY_JOB_NAME = "dispatch"
+AUTODEPLOY_DISPATCH_JOB_NAME = (
+    "Revalidate exact source and dispatch normal production child"
+)
 AUTODEPLOY_DISPATCH_STEP_NAME = "Dispatch production deployment or baseline reconciliation"
 DEPLOY_JOB_NAME = "Deploy production"
 PREFLIGHT_JOB_NAME = "Production preflight"
@@ -405,8 +408,10 @@ def validate_autodeploy_dispatch(
 
     The production workflow consumes this only for automatic baseline
     reconciliation. The run must be the canonical successful workflow_run
-    attempt for the target SHA, and its one dispatch job and exact dispatch
-    step must both have completed successfully.
+    attempt for the target SHA, and its final child-dispatch job and exact
+    dispatch step must both have completed successfully. The workflow's earlier
+    ``dispatch`` job prepares the host-tools bundle; the child POST is in the
+    separate final revalidation job.
     """
 
     _validate_job_rows(jobs)
@@ -424,7 +429,9 @@ def validate_autodeploy_dispatch(
     )
     if run.get("display_title") != AUTODEPLOY_WORKFLOW_NAME:
         raise _fail("auto-deploy run title is not canonical")
-    matching_jobs = [job for job in jobs if job.get("name") == AUTODEPLOY_JOB_NAME]
+    matching_jobs = [
+        job for job in jobs if job.get("name") == AUTODEPLOY_DISPATCH_JOB_NAME
+    ]
     if len(matching_jobs) != 1:
         raise _fail("auto-deploy dispatch job is missing or ambiguous")
     job = matching_jobs[0]
