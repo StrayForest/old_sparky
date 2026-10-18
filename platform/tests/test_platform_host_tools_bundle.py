@@ -1342,17 +1342,24 @@ class HostToolsBundleTests(unittest.TestCase):
             root = Path(temporary)
             stdout = StringIO()
             stderr = StringIO()
+            target_sha = self._current_target_sha()
             arguments = [
                 "resolve",
                 "--source-root",
                 str(REPO_ROOT),
                 "--target-sha",
-                self._current_target_sha(),
+                target_sha,
                 "--expected-repository",
                 pin.EXPECTED_REPOSITORY,
             ]
+            resolve_call = {
+                "target_sha": target_sha,
+                "expected_repository": pin.EXPECTED_REPOSITORY,
+            }
             with redirect_stdout(stdout), redirect_stderr(stderr):
-                result = pin.main(arguments)
+                with patch.object(pin, "resolve_pin", return_value=PIN_SHA) as resolver:
+                    result = pin.main(arguments)
+            resolver.assert_called_once_with(Path(REPO_ROOT), **resolve_call)
             self.assertEqual(result, 0)
             self.assertEqual(stdout.getvalue(), f"{PIN_SHA}\n")
             self.assertEqual(stderr.getvalue(), "")
@@ -1365,9 +1372,15 @@ class HostToolsBundleTests(unittest.TestCase):
                     stdout.truncate(0)
                     stderr.seek(0)
                     stderr.truncate(0)
-                    result = pin.main([*arguments, "--private-output", str(private_output)])
+                    with patch.object(
+                        pin, "resolve_pin", return_value=PIN_SHA
+                    ) as resolver:
+                        result = pin.main(
+                            [*arguments, "--private-output", str(private_output)]
+                        )
             finally:
                 os.umask(old_umask)
+            resolver.assert_called_once_with(Path(REPO_ROOT), **resolve_call)
             self.assertEqual(result, 0)
             self.assertEqual(stdout.getvalue(), "")
             self.assertEqual(stderr.getvalue(), "")
