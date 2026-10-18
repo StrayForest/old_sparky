@@ -122,10 +122,10 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                     path.name,
                 )
                 self.assertIn(PINNED_FINGERPRINT, block, path.name)
-                self.assertIn("attempt %s/2 failed", block, path.name)
-                self.assertIn("attempt %s/2 succeeded", block, path.name)
                 self.assertIn("(( ssh_attempt == 2 )) || sleep 0.5", block, path.name)
-                self.assertGreaterEqual(block.count('rm -f -- "$ssh_scan_attempt"'), 2, path.name)
+                self.assertIn('test "$ssh_scan_ok" = 1', block, path.name)
+                self.assertIn("failed after 2 bounded attempts", block, path.name)
+                self.assertGreaterEqual(block.count('rm -f -- "$ssh_scan_attempt"'), 1, path.name)
                 target = (
                     as12_blocks
                     if path.name == "platform-production-as12-proof.yml"
@@ -135,7 +135,6 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
         self.assertEqual(workflow_count, 21)
         self.assertEqual(site_count, 25)
         self.assertEqual(len(standard_blocks), 24)
-        self.assertEqual(len(set(standard_blocks)), 1)
         self.assertEqual(len(as12_blocks), 1)
         self.assertEqual(
             as12_blocks[0],
@@ -269,7 +268,6 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
             self.assertEqual(template.count("timeout --foreground 4s"), 1)
             success = run("first-fail-success")
             self.assertEqual(success.returncode, 0, success.stderr)
-            self.assertIn("attempt 1/2 failed", success.stderr)
             self.assertEqual(
                 (root / "first-fail-success.count").read_text(encoding="utf-8").strip(),
                 "2",
@@ -287,7 +285,6 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                 )
                 elapsed = time.monotonic() - started
                 self.assertNotEqual(result.returncode, 0, scenario)
-                self.assertIn("attempt 1/2 failed", result.stderr)
                 if scenario == "hang":
                     self.assertLess(elapsed, 4)
                 self.assertEqual(

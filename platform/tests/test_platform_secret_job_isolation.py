@@ -143,9 +143,21 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
                     self.assertIn("path: trusted-classifier", body, f"{workflow_name}:{job_name}")
                     self.assertNotIn("ref: ${{ env.TARGET_SHA }}", body, f"{workflow_name}:{job_name}")
                 elif job_name == "host-capability-preflight":
-                    self.assertNotIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
+                    self.assertIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
+                    self.assertIn("ref: ${{ env.TARGET_SHA }}", body, f"{workflow_name}:{job_name}")
+                    self.assertIn("fetch-depth: 1", body, f"{workflow_name}:{job_name}")
+                    self.assertIn("persist-credentials: false", body, f"{workflow_name}:{job_name}")
+                    self.assertIn("path: target-source", body, f"{workflow_name}:{job_name}")
+                    self.assertIn("needs.validate-dispatch.result == 'success'", body)
+                    self.assertLess(
+                        body.index("Rebind outer artifact and attest exact inner bundle before extraction"),
+                        body.index("Validate root SSH identity and installed generation"),
+                    )
+                    self.assertIn(
+                        '"$GITHUB_WORKSPACE/target-source/platform/tools/platform_host_tools_installed_check.py"',
+                        body,
+                    )
                     self.assertNotIn("platform_host_tools_bundle.py", body, f"{workflow_name}:{job_name}")
-                    self.assertNotIn("ref: ${{ env.TARGET_SHA }}", body, f"{workflow_name}:{job_name}")
                 elif job_name == "cpu-diagnostic-pair":
                     self.assertIn("ref: ${{ env.TARGET_SHA }}", body)
                     self.assertIn("test \"$(git rev-parse HEAD)\" = \"$TARGET_SHA\"", body)

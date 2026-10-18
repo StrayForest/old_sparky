@@ -354,8 +354,8 @@ test("CPU memory and GC sampling is bounded to the exact diagnostic phase", () =
   const planModule = source("lib/performance-diagnostic-plan.ts");
   expect(planModule).toContain("const MEMORY_SAMPLE_LIMIT = 5;");
   expect(planModule).toContain("const MEMORY_SAMPLE_INTERVAL_MS = 4_000;");
-  expect(planModule).toContain("entry.startTime < phaseStartMonotonicMs");
-  expect(planModule).toContain("entry.startTime > phaseEndMonotonicMs");
+  expect(planModule).toContain("timelineEntryDurationWithinWindow(");
+  expect(planModule).toContain("new PerformanceObserver(");
   expect(planModule).toContain("cpu_diagnostic_memory service=web run_id=");
   for (const metric of [
     "memory.rss", "heap.total_heap_size", "heap.used_heap_size", "heap.heap_size_limit",
