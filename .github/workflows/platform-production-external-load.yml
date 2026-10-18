@@ -1385,6 +1385,7 @@ jobs:
       contents: read
     env:
       TARGET_SHA: ${{ github.sha }}
+      SOURCE_GIT_SHA: ${{ github.sha }}
       APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
       MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}

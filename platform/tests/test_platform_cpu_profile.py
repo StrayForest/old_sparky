@@ -237,7 +237,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 {
                     "tournament_slug": "same-workspace",
                     "session_token": f"s{index:031d}",
-                    "csrf_token": f"c{index:031d}",
+                    "csrf_token": f"c{index:042d}.{'a' * 64}",
                 }
                 for index in range(8)
             ],
@@ -522,7 +522,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 {
                     "tournament_slug": "same-workspace",
                     "session_token": f"s{index:031d}",
-                    "csrf_token": f"c{index:031d}",
+                    "csrf_token": f"c{index:042d}.{'a' * 64}",
                 }
                 for index in range(8)
             ],
@@ -533,6 +533,42 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         duplicated = {**payload, "actors": [*payload["actors"][:-1], payload["actors"][0]]}
         with self.assertRaises(cpu_pair.PairError):
             cpu_pair._validate_actor_payload(duplicated)
+
+    def test_pair_actor_payload_accepts_only_issued_csrf_token_shape(self) -> None:
+        payload = {
+            "schema": 1,
+            "workload": cpu_pair.WORKLOAD,
+            "origin": external_load.EXPECTED_ORIGIN,
+            "session_cookie_name": "session",
+            "csrf_cookie_name": "csrf",
+            "actors": [
+                {
+                    "tournament_slug": "same-workspace",
+                    "session_token": f"s{index:031d}",
+                    "csrf_token": f"c{index:042d}.{'b' * 64}",
+                }
+                for index in range(8)
+            ],
+        }
+        self.assertEqual(len(cpu_pair._validate_actor_payload(payload)), 8)
+
+        malformed_tokens = (
+            "c" * 43,
+            f"{'c' * 42}.{'b' * 64}",
+            f"{'c' * 43}.{'B' * 64}",
+            f"{'c' * 43}.{'b' * 63}g",
+        )
+        for token in malformed_tokens:
+            with self.subTest(token_shape=len(token)):
+                candidate = {
+                    **payload,
+                    "actors": [
+                        *payload["actors"][:-1],
+                        {**payload["actors"][-1], "csrf_token": token},
+                    ],
+                }
+                with self.assertRaises(cpu_pair.PairError):
+                    cpu_pair._validate_actor_payload(candidate)
 
     def test_controller_accepts_fixed_45_second_pair_and_rejects_bad_timing(self) -> None:
         approved = Namespace(

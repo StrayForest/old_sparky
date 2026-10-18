@@ -581,6 +581,8 @@ outcome. A performance result is incomplete unless correctness and exact
 cleanup pass. Canceled runs use the matching abort/cleanup workflow keyed by
 the exact run ID.
 
+CPU-pair contracts belong to `test_platform_cpu_profile` and `test_platform_external_load_workflow_contract`: bind runner `SOURCE_GIT_SHA` independently from application `APP_TARGET_SHA`, and validate CSRF as the issuer's 43 URL-safe characters, period, and 64 lowercase hexadecimal HMAC. Keep session-token validation separate and preserve authentication, profiling, pairing and threshold guards. Missing canonical interpreter means `LOCAL GATE BLOCKED`; supplemental tests are reported separately.
+
 ## Contract self-test
 
 The privileged contour owns immutable recovery-bootstrap tests (`tests.test_platform_recovery_bootstrap`); backend-tool-contract owns cumulative-baseline provenance tests (`tests.test_platform_workflow_provenance`).

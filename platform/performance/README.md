@@ -462,6 +462,16 @@ is evaluated from the observer's `pg_stat_activity` backend count and grouped
 separate `/proc/net/tcp*` socket diagnostic. Historical reports retain their
 original TCP-based wording and decisions.
 
+## External authenticated-page and CPU diagnostic checkpoint (2026-10-18)
+
+The deployed application source remained `3c3b060bfb8927aa3a9ee5896a40ed1a0f6c8c84` through both authenticated-page measurements and the CPU diagnostic attempt; the CPU pair itself did not start. Profile 10 (`authenticated-page-load-v1`, HTTP/1.1 close) completed 20,000/20,000 HTTP actions with no errors, retries or drops. HTTP p95/p99 were 3,095/3,935 ms; full user-observed logical p95/p99 were 587/618 seconds. Its report bindings and fixture freshness passed review, and authoritative cleanup reported `ok=true` and `control_account_preserved=true` after deleting the 20,000 test users and 40 tournaments. The result is a valid SLO failure.
+
+Profile 11 (`authenticated-page-load-v2`, HTTP/1.1 keep-alive) also completed 20,000/20,000 actions with no errors, retries, drops or duplicates. HTTP p95/p99 were 2,742/3,159 ms; logical p95/p99 were 522/542 seconds. Bindings, new-fixture identity and authoritative cleanup passed independent review; cleanup again preserved the control account. This is also a valid SLO failure. Keep HTTP request timing distinct from full logical user-observed timing; the latter includes bounded scheduling wait.
+
+The separate CPU diagnostic run `39099339471/1` is invalid/incomplete and earns no matrix credit or CPU-threshold result. Its client recorded 18,164 HTTP 200, 1,835 HTTP 502 and one HTTP 500; the bounded observer evidence confirms one `deadlock-web.service` cgroup OOM kill at `2026-10-18T05:27:31Z`, followed by one web restart. It does not establish the individual 502 causes. The CPU pair did not start: the pair runner rejected the missing `SOURCE_GIT_SHA` required to bind the runner source independently from `APP_TARGET_SHA`. Source review also found that the pair's CSRF validator rejected the issuer's canonical `43 URL-safe characters + '.' + 64 lowercase hex` token shape. A reviewed local tooling fix addresses those two defects without changing application behavior, authentication rules, or diagnostic thresholds. The run is not a threshold failure and does not support a CPU capacity conclusion.
+
+Before another CPU measurement, provide a separately guarded CPU-only path that preserves the eight-actor fixture, two Gunicorn workers plus one Node process, OFF/ON request counts, all pairing and no-restart checks, and existing thresholds. Do not rerun the current profile route blindly: it runs a 20,000-action load before the pair, and the observed web cgroup OOM makes that repeated stress inappropriate without a reviewed plan. Preserve the failed diagnostic evidence and keep production memory limits and security checks unchanged.
+
 ## Performance and backup checkpoint (2026-10-14)
 
 The five-run matrix remains **PASS / PASS / PASS / FAIL / FAIL** for

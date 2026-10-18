@@ -69,6 +69,7 @@ RELEASE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,512}$")
+CSRF_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}\.[0-9a-f]{64}$")
 SAFE_ERRORS = frozenset(
     {
         "unexpected_status",
@@ -238,7 +239,7 @@ def _validate_actor_payload(value: dict[str, Any]) -> list[external_load.Virtual
             raise PairError("actor workspace rejected")
         if not isinstance(session, str) or TOKEN_RE.fullmatch(session) is None:
             raise PairError("actor session token rejected")
-        if not isinstance(csrf, str) or TOKEN_RE.fullmatch(csrf) is None:
+        if not isinstance(csrf, str) or CSRF_TOKEN_RE.fullmatch(csrf) is None:
             raise PairError("actor CSRF token rejected")
         slugs.add(slug)
         sessions.add(session)

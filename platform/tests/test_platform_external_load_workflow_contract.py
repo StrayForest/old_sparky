@@ -167,6 +167,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("needs.fixture-setup.result == 'success'", pair)
         self.assertIn("needs.load-client.result", pair)
         self.assertIn("needs.namespace-containment-barrier.outputs.namespace_closed_status == '0'", pair)
+        pair_env = yaml.safe_load(self.source)["jobs"]["cpu-diagnostic-pair"]["env"]
+        self.assertEqual(pair_env["SOURCE_GIT_SHA"], "${{ github.sha }}")
+        self.assertEqual(pair_env["TARGET_SHA"], "${{ github.sha }}")
+        self.assertEqual(
+            pair_env["APP_TARGET_SHA"],
+            "${{ needs.validate-external-inputs.outputs.app_target_sha }}",
+        )
         dispatch_validation = self.jobs["validate-external-inputs"]
         self.assertIn(
             "false:authenticated-page-load-v1:RUN-PRODUCTION-EXTERNAL-LOAD:true",

@@ -2,11 +2,15 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-17
+- Last reviewed: 2026-10-18
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
-## Current production baseline — 2026-10-17
+## Current production baseline — 2026-10-18
+
+- Production remains on source `3c3b060bfb8927aa3a9ee5896a40ed1a0f6c8c84` (release `gha-39087568062-1-3c3b060bfb89`, previous `gha-39050502771-1-c9dff9f90369`); post-measurement source binding and localhost health checks passed read-only. Profiles 10/11 completed 20,000 actions without client errors/retries/drops, but logical p95/p99 were 587/618 and 522/542 seconds, so both are valid SLO failures; preserve all matrix outcomes, including profile 7's invalid earlier attempt, and do not treat logical latency as server-only timing. CPU diagnostic `39099339471/1` is **INVALID/incomplete**, not a threshold result: web-cgroup OOM/restart was observed but individual 502 causes are unknown; the CPU pair did not start because `SOURCE_GIT_SHA` was missing, and source review found a CSRF issuer-shape mismatch. The reviewed local fix is unpublished. Storage audit passed without cleanup; provider releases remain protected. Backup/deploy, final automated QA and healthy timer restoration remain pending. Manual auth/Turnstile QA is **NOT RUN** and deferred; canonical local backend verification is **LOCAL GATE BLOCKED** because `.venv_platform/bin/python` is absent. [Detailed performance evidence](../performance/README.md#external-authenticated-page-and-cpu-diagnostic-checkpoint-2026-10-18).
+
+## Historical production baseline — 2026-10-17
 
 - Production source `28734e3a3db3e807eaedbe3ca0714f5e2626c61e` is active on run [`39009907687`](https://github.com/StrayForest/old_sparky/actions/runs/39009907687); `previous` is the original 9ce release. The activation-pending transaction was recovered through the reviewed canonical path. Current/previous pointers are stable, the protected retention manifest is installed and validated, and maintenance timers remain held.
 - The latest source-bound backup is run [`39009005244`](https://github.com/StrayForest/old_sparky/actions/runs/39009005244). Its receipt reports restore verification and Alembic success. Those are receipt-reported fields; the production archive and restore logs were not independently re-read during this checkpoint.
