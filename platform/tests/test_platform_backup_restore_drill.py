@@ -160,11 +160,14 @@ _SYNTHETIC_RESTORE_STDERR_REASONS = frozenset(
         "unknown_unit_property",
         "systemd_bus_unavailable",
         "synthetic_backend_exit_observer_failed",
+        "synthetic_unknown_restore_phase",
     }
 )
 
 
 def _synthetic_restore_stderr_reason(line: str) -> str | None:
+    if line == "[FAIL] Synthetic restore reported an unknown phase.":
+        return "synthetic_unknown_restore_phase"
     if line == "[FAIL] Synthetic restore backend-exit observer failed.":
         return "synthetic_backend_exit_observer_failed"
     if re.fullmatch(
@@ -1046,6 +1049,17 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill.SCRATCH_SYNTHETIC_RESTORE_PHASES,
             ("restore_platform", "restore_public"),
         )
+        self.assertTrue(
+            backup_drill._scratch_synthetic_restore_metric_phase("restore_platform")
+        )
+        self.assertTrue(
+            backup_drill._scratch_synthetic_restore_metric_phase("restore_public")
+        )
+        self.assertFalse(
+            backup_drill._scratch_synthetic_restore_metric_phase("alembic_verify")
+        )
+        with self.assertRaisesRegex(RuntimeError, "unknown phase"):
+            backup_drill._scratch_synthetic_restore_metric_phase("unexpected_phase")
         control_target = backup_drill.DatabaseTarget(
             host="/run/oldsparky-backup-restore-deadbeef/socket",
             port=backup_drill.SCRATCH_PG_PORT,
@@ -1156,6 +1170,14 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ["synthetic_backend_exit_observer_failed"],
         )
         self.assertEqual(observer_failure["unknown_lines"], 0)
+        unknown_phase_failure = _classify_synthetic_restore_stderr(
+            b"[FAIL] Synthetic restore reported an unknown phase.\n",
+            complete=True,
+        )
+        self.assertEqual(unknown_phase_failure["classification"], "known")
+        self.assertEqual(
+            unknown_phase_failure["reasons"], ["synthetic_unknown_restore_phase"]
+        )
 
         report = {
             "kind": "synthetic_restore_diagnostic",
@@ -6074,6 +6096,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
         archive = io.BytesIO(b"PGDMPsynthetic archive")
         resource_guard = mock.Mock()
+        observed_phases: list[tuple[str, str]] = []
         self.assertEqual(
             inspect.signature(backup_drill.perform_restore_drill)
             .parameters["psql_binary"].default,
@@ -6102,6 +6125,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 psql_binary="/validated/pg16/bin/psql",
                 pg_restore_binary="/validated/pg16/bin/pg_restore",
                 resource_guard=resource_guard,
+                phase_observer=lambda phase, event: observed_phases.append((phase, event)),
             )
 
         self.assertEqual(table_count, 22)
@@ -6120,6 +6144,17 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertTrue(run_command.call_args_list[2].kwargs["capture_output"])
         self.assertIn("CREATE SCHEMA platform", run_command.call_args_list[2].args[0][-1])
         self.assertEqual(run_restore_command.call_count, 2)
+        self.assertEqual(
+            observed_phases,
+            [
+                ("restore_platform", "start"),
+                ("restore_platform", "end"),
+                ("restore_public", "start"),
+                ("restore_public", "end"),
+                ("alembic_verify", "start"),
+                ("alembic_verify", "end"),
+            ],
+        )
         for index, schema in enumerate(("--schema=platform", "--schema=public")):
             command = run_restore_command.call_args_list[index].args[0]
             self.assertEqual(command[:4], ["runuser", "-u", "postgres", "--"])

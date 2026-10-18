@@ -6810,6 +6810,15 @@ def _scratch_cleanup_synthetic_cluster(
             raise RuntimeError("Synthetic restore cluster contains an unsupported path type.")
 
 
+def _scratch_synthetic_restore_metric_phase(phase: str) -> bool:
+    """Return whether a fixed restore phase contributes diagnostic metrics."""
+    if phase == "alembic_verify":
+        return False
+    if phase in SCRATCH_SYNTHETIC_RESTORE_PHASES:
+        return True
+    raise RuntimeError("Synthetic restore reported an unknown phase.")
+
+
 def _scratch_synthetic_restore_diagnostic_worker(
     args: argparse.Namespace, root: pathlib.Path
 ) -> dict[str, Any]:
@@ -7109,8 +7118,8 @@ def _scratch_synthetic_restore_diagnostic_worker(
 
                 def phase_observer(phase: str, event: str) -> None:
                     nonlocal sampler
-                    if phase not in SCRATCH_SYNTHETIC_RESTORE_PHASES:
-                        raise RuntimeError("Synthetic restore reported an unknown phase.")
+                    if not _scratch_synthetic_restore_metric_phase(phase):
+                        return
                     if event == "start":
                         state = metric_state.get(phase)
                         if (
