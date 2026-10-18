@@ -490,6 +490,71 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         parser_source = textwrap.dedent(workflow_source[parser_heredoc:parser_end])
         workflow_parser: dict[str, object] = {"__name__": "probe_parser_contract"}
         exec(compile(parser_source, str(workflow_path), "exec"), workflow_parser)
+        successful_child_report = (
+            b'{"schema":1,"kind":"authorization_probe","status":"completed",'
+            b'"authorization_probe":{"schema":1,"status":"completed"}}\n'
+        )
+        self.assertEqual(
+            workflow_parser["parse_probe_report"](
+                successful_child_report,
+                b"",
+                "0",
+            ),
+            ("completed", "confirmed", None, None),
+        )
+        mount_fault = {
+            "schema": 1,
+            "origin": "worker",
+            "site": "worker_mount_snapshot",
+            "exception_kind": "runtime",
+            "errno": None,
+            "disk_mount_failure_reason": "sysfs_not_loop_device",
+            "disk_mount_predicates": {
+                "fs_ext4": True,
+                "source_canonical": True,
+                "device_major_minor_valid": True,
+                "sysfs_mount_verified": True,
+                "sysfs_device_resolved": True,
+                "sysfs_loop_device": False,
+                "sysfs_device_number_matches": True,
+                "sysfs_backing_file_present": False,
+                "root_expected": True,
+                "target_expected": True,
+                "option_rw": True,
+                "option_nosuid": True,
+                "option_nodev": True,
+                "option_noexec": True,
+            },
+        }
+        self.assertTrue(workflow_parser["valid_first_fault"](mount_fault))
+        mount_fault_frame = maintenance.backup_restore_drill._scratch_first_fault_frame(mount_fault)
+        assert mount_fault_frame is not None
+        mount_fault_report = json.dumps({
+            "schema": 1,
+            "kind": "authorization_probe",
+            "status": "failed",
+            "cleanup_status": "confirmed",
+            "first_fault": mount_fault,
+        }, separators=(",", ":")).encode("ascii") + b"\n"
+        self.assertEqual(
+            workflow_parser["parse_probe_report"](mount_fault_report, mount_fault_frame, "1"),
+            ("failed", "confirmed", mount_fault, None),
+        )
+        invalid_fault = {**mount_fault, "disk_mount_failure_reason": "sysfs_device_unavailable"}
+        invalid_frame = (
+            maintenance.backup_restore_drill.SCRATCH_FIRST_FAULT_MARKER
+            + json.dumps(invalid_fault, separators=(",", ":"), sort_keys=True).encode("ascii")
+            + b"\n"
+        )
+        invalid_report = json.dumps({
+            "schema": 1,
+            "kind": "authorization_probe",
+            "status": "failed",
+            "cleanup_status": "confirmed",
+            "first_fault": invalid_fault,
+        }, separators=(",", ":")).encode("ascii") + b"\n"
+        with self.assertRaises(ValueError):
+            workflow_parser["parse_probe_report"](invalid_report, invalid_frame, "1")
 
         def run_actual_probe(_args: object) -> dict[str, object]:
             return drill.run_scratch_authorization_probe()
@@ -5524,7 +5589,48 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 ),
             )
 
+            disk_fault = {
+                "schema": 1,
+                "origin": "worker",
+                "site": "worker_mount_snapshot",
+                "exception_kind": "runtime",
+                "errno": None,
+                "disk_mount_failure_reason": "sysfs_not_loop_device",
+                "disk_mount_predicates": {
+                    "fs_ext4": True,
+                    "source_canonical": True,
+                    "device_major_minor_valid": True,
+                    "sysfs_mount_verified": True,
+                    "sysfs_device_resolved": True,
+                    "sysfs_loop_device": False,
+                    "sysfs_device_number_matches": True,
+                    "sysfs_backing_file_present": False,
+                    "root_expected": True,
+                    "target_expected": True,
+                    "option_rw": True,
+                    "option_nosuid": True,
+                    "option_nodev": True,
+                    "option_noexec": True,
+                },
+            }
+            first_fault_report["scratch_first_fault"] = disk_fault
+            disk_frame = (
+                b"SCRATCH_FIRST_FAULT_V1\n"
+                + json.dumps(disk_fault, sort_keys=True, separators=(",", ":")).encode("ascii")
+                + b"\n"
+            )
+            disk_result = run_first_fault_trap("123463", disk_frame)
+            self.assertEqual(disk_result.returncode, 0, disk_result.stderr)
+            disk_receipt = json.loads(
+                (first_fault_shared / "backup-failure-123463-1.json").read_text(encoding="ascii")
+            )
+            self.assertEqual(disk_receipt["report_state"], "typed_failure")
+            self.assertEqual(disk_receipt["scratch_first_fault"], disk_fault)
+            self.assertGreater(len(disk_frame.split(b"\n", 1)[1].rstrip(b"\n")), 512)
+            self.assertLessEqual(len(disk_frame.split(b"\n", 1)[1].rstrip(b"\n")), 1024)
+
             mismatched_fault = dict(first_fault, site="worker_archive_open")
+            first_fault_report["scratch_first_fault"] = first_fault
             mismatched_frame = (
                 b"SCRATCH_FIRST_FAULT_V1\n"
                 + json.dumps(

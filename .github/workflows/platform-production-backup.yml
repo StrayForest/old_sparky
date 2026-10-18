@@ -1702,27 +1702,90 @@ jobs:
                           "attribute", "index", "name", "type", "key", "value", "restore_guard_stop",
                           "backup_interrupted", "scratch_token_delivery", "runtime", "other",
                       }
-                      valid_first_fault = (
-                          isinstance(first_fault, dict)
-                          and set(first_fault) == {"schema", "origin", "site", "exception_kind", "errno"}
-                          and type(first_fault.get("schema")) is int
-                          and first_fault.get("schema") == 1
-                          and type(first_fault.get("origin")) is str
-                          and first_fault.get("origin") in {"controller", "worker"}
-                          and type(first_fault.get("site")) is str
-                          and first_fault.get("site") in first_fault_sites
-                          and first_fault.get("site", "").startswith(first_fault.get("origin", "") + "_")
-                          and type(first_fault.get("exception_kind")) is str
-                          and first_fault.get("exception_kind") in first_fault_kinds
-                          and (
-                              first_fault.get("errno") is None
-                              or (type(first_fault["errno"]) is int and 1 <= first_fault["errno"] <= 4095)
-                          )
-                          and (
-                              first_fault.get("exception_kind") in {"permission", "os_error"}
-                              or first_fault.get("errno") is None
-                          )
-                      )
+                      def valid_first_fault(value):
+                          base = {"schema", "origin", "site", "exception_kind", "errno"}
+                          allowed = {
+                              frozenset(base), frozenset(base | {"disk_mount_failure_reason"}),
+                              frozenset(base | {"disk_mount_failure_reason", "disk_mount_predicates"}),
+                          }
+                          if (
+                              not isinstance(value, dict)
+                              or frozenset(value) not in allowed
+                              or type(value.get("schema")) is not int
+                              or value.get("schema") != 1
+                              or type(value.get("origin")) is not str
+                              or value.get("origin") not in {"controller", "worker"}
+                              or type(value.get("site")) is not str
+                              or value.get("site") not in first_fault_sites
+                              or not value["site"].startswith(value["origin"] + "_")
+                              or type(value.get("exception_kind")) is not str
+                              or value.get("exception_kind") not in first_fault_kinds
+                          ):
+                              return False
+                          number = value.get("errno")
+                          if number is not None and (type(number) is not int or not 1 <= number <= 4095):
+                              return False
+                          if value["exception_kind"] in {"permission", "os_error"}:
+                              if number is None:
+                                  return False
+                          elif number is not None:
+                              return False
+                          if "disk_mount_failure_reason" not in value:
+                              return True
+                          reasons = {
+                              "mount_row_missing", "mount_metadata", "filesystem_source_root_options",
+                              "filesystem_not_ext4", "source_noncanonical", "device_major_minor_invalid",
+                              "sysfs_mount_unverified", "sysfs_device_unavailable", "sysfs_not_loop_device",
+                              "sysfs_device_number_mismatch", "mount_root_not_global", "mountpoint_mismatch",
+                              "mount_options_missing", "root_owner_mode", "root_uid_mismatch",
+                              "root_gid_mismatch", "root_mode_mismatch", "statvfs_unavailable",
+                              "statvfs_bound", "total_capacity_out_of_bounds", "free_below_stop",
+                          }
+                          if (
+                              value["origin"] != "worker"
+                              or value["site"] != "worker_mount_snapshot"
+                              or value["exception_kind"] not in {"runtime", "os_error"}
+                              or type(value["disk_mount_failure_reason"]) is not str
+                              or value["disk_mount_failure_reason"] not in reasons
+                          ):
+                              return False
+                          if "disk_mount_predicates" not in value:
+                              return True
+                          predicates = value["disk_mount_predicates"]
+                          keys = {
+                              "fs_ext4", "source_canonical", "device_major_minor_valid",
+                              "sysfs_mount_verified", "sysfs_device_resolved", "sysfs_loop_device",
+                              "sysfs_device_number_matches", "sysfs_backing_file_present", "root_expected",
+                              "target_expected", "option_rw", "option_nosuid", "option_nodev", "option_noexec",
+                          }
+                          if (
+                              not isinstance(predicates, dict)
+                              or set(predicates) != keys
+                              or any(type(item) is not bool for item in predicates.values())
+                          ):
+                              return False
+                          reason = value["disk_mount_failure_reason"]
+                          failed = {
+                              "filesystem_not_ext4": not predicates["fs_ext4"],
+                              "source_noncanonical": not predicates["source_canonical"],
+                              "device_major_minor_invalid": not predicates["device_major_minor_valid"],
+                              "sysfs_mount_unverified": not predicates["sysfs_mount_verified"],
+                              "sysfs_device_unavailable": not predicates["sysfs_device_resolved"],
+                              "sysfs_not_loop_device": not predicates["sysfs_loop_device"] or not predicates["sysfs_backing_file_present"],
+                              "sysfs_device_number_mismatch": not predicates["sysfs_device_number_matches"],
+                              "mount_root_not_global": not predicates["root_expected"],
+                              "mountpoint_mismatch": not predicates["target_expected"],
+                              "mount_options_missing": not all(predicates[key] for key in (
+                                  "option_rw", "option_nosuid", "option_nodev", "option_noexec",
+                              )),
+                          }
+                          if reason == "filesystem_source_root_options":
+                              return any(not predicates[key] for key in (
+                                  "fs_ext4", "source_canonical", "root_expected", "target_expected",
+                                  "option_rw", "option_nosuid", "option_nodev", "option_noexec",
+                              ))
+                          return failed.get(reason) is True
+                      valid_first_fault = valid_first_fault(first_fault)
                       if "scratch_first_fault" in report and first_fault is None:
                           report_state = "unclassified_json"
                       elif first_fault is not None:
@@ -1738,7 +1801,7 @@ jobs:
                               except (UnicodeDecodeError, json.JSONDecodeError):
                                   frame = None
                               canonical_frame = json.dumps(first_fault, sort_keys=True, separators=(",", ":")).encode("ascii")
-                              if frame == first_fault and frame_bytes == canonical_frame and len(frame_bytes) <= 512:
+                              if frame == first_fault and frame_bytes == canonical_frame and len(frame_bytes) <= 1024:
                                   scratch_first_fault = first_fault
                               else:
                                   report_state = "unclassified_json"
@@ -2791,9 +2854,14 @@ jobs:
                   "attribute", "index", "name", "type", "key", "value", "restore_guard_stop",
                   "backup_interrupted", "scratch_token_delivery", "runtime", "other",
               }
+              base_fields = {"schema", "origin", "site", "exception_kind", "errno"}
+              allowed_fields = (
+                  {frozenset(base_fields), frozenset(base_fields | {"disk_mount_failure_reason"}),
+                   frozenset(base_fields | {"disk_mount_failure_reason", "disk_mount_predicates"})}
+              )
               if (
                   not isinstance(value, dict)
-                  or set(value) != {"schema", "origin", "site", "exception_kind", "errno"}
+                  or frozenset(value) not in allowed_fields
                   or type(value.get("schema")) is not int
                   or value["schema"] != 1
                   or type(value.get("origin")) is not str
@@ -2811,8 +2879,65 @@ jobs:
               if error_number is not None and (type(error_number) is not int or not 1 <= error_number <= 4095):
                   return False
               if value["exception_kind"] in {"permission", "os_error"}:
-                  return error_number is None or type(error_number) is int
-              return error_number is None
+                  if error_number is None or type(error_number) is not int:
+                      return False
+              elif error_number is not None:
+                  return False
+              if "disk_mount_failure_reason" not in value:
+                  return True
+              reasons = {
+                  "mount_row_missing", "mount_metadata", "filesystem_source_root_options",
+                  "filesystem_not_ext4", "source_noncanonical", "device_major_minor_invalid",
+                  "sysfs_mount_unverified", "sysfs_device_unavailable", "sysfs_not_loop_device",
+                  "sysfs_device_number_mismatch", "mount_root_not_global", "mountpoint_mismatch",
+                  "mount_options_missing", "root_owner_mode", "root_uid_mismatch",
+                  "root_gid_mismatch", "root_mode_mismatch", "statvfs_unavailable",
+                  "statvfs_bound", "total_capacity_out_of_bounds", "free_below_stop",
+              }
+              if (
+                  value["origin"] != "worker"
+                  or value["site"] != "worker_mount_snapshot"
+                  or value["exception_kind"] not in {"runtime", "os_error"}
+                  or type(value["disk_mount_failure_reason"]) is not str
+                  or value["disk_mount_failure_reason"] not in reasons
+              ):
+                  return False
+              if "disk_mount_predicates" not in value:
+                  return True
+              predicates = value["disk_mount_predicates"]
+              expected_predicates = {
+                  "fs_ext4", "source_canonical", "device_major_minor_valid",
+                  "sysfs_mount_verified", "sysfs_device_resolved", "sysfs_loop_device",
+                  "sysfs_device_number_matches", "sysfs_backing_file_present", "root_expected",
+                  "target_expected", "option_rw", "option_nosuid", "option_nodev", "option_noexec",
+              }
+              if (
+                  not isinstance(predicates, dict)
+                  or set(predicates) != expected_predicates
+                  or any(type(item) is not bool for item in predicates.values())
+              ):
+                  return False
+              reason = value["disk_mount_failure_reason"]
+              failed = {
+                  "filesystem_not_ext4": not predicates["fs_ext4"],
+                  "source_noncanonical": not predicates["source_canonical"],
+                  "device_major_minor_invalid": not predicates["device_major_minor_valid"],
+                  "sysfs_mount_unverified": not predicates["sysfs_mount_verified"],
+                  "sysfs_device_unavailable": not predicates["sysfs_device_resolved"],
+                  "sysfs_not_loop_device": not predicates["sysfs_loop_device"] or not predicates["sysfs_backing_file_present"],
+                  "sysfs_device_number_mismatch": not predicates["sysfs_device_number_matches"],
+                  "mount_root_not_global": not predicates["root_expected"],
+                  "mountpoint_mismatch": not predicates["target_expected"],
+                  "mount_options_missing": not all(predicates[key] for key in (
+                      "option_rw", "option_nosuid", "option_nodev", "option_noexec",
+                  )),
+              }
+              if reason == "filesystem_source_root_options":
+                  return any(not predicates[key] for key in (
+                      "fs_ext4", "source_canonical", "root_expected", "target_expected",
+                      "option_rw", "option_nosuid", "option_nodev", "option_noexec",
+                  ))
+              return failed.get(reason) is True
 
           host_guard_sites = {
               "parent_before_archive_open", "parent_before_authorization_probe",
@@ -2847,7 +2972,7 @@ jobs:
               frame_bytes = capture_bytes[start:end] if end >= 0 else b""
               if (
                   not frame_bytes
-                  or len(frame_bytes) > 512
+                  or len(frame_bytes) > 1024
                   or json.loads(frame_bytes.decode("ascii"), object_pairs_hook=reject_duplicate_keys) != expected
                   or frame_bytes != json.dumps(expected, separators=(",", ":"), sort_keys=True).encode("ascii")
               ):

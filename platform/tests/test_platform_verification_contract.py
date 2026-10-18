@@ -1589,6 +1589,18 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertNotIn("platform-backup-scratch-diagnostic", privileged_body)
         self.assertNotIn("Require focused scratch restore diagnostic", privileged_body)
         workflow_data = yaml.safe_load(workflow)
+        workflow_triggers = workflow_data.get("on", workflow_data.get(True, {}))
+        dispatch_inputs = workflow_triggers["workflow_dispatch"]["inputs"]
+        self.assertEqual(
+            dispatch_inputs["scratch_backend"],
+            {
+                "description": "Synthetic PG16 restore diagnostic backend (standard non-dev dispatch only)",
+                "required": True,
+                "default": "tmpfs_v1",
+                "type": "choice",
+                "options": ["tmpfs_v1", "disk_ext4_image_v1"],
+            },
+        )
         privileged_steps = workflow_data["jobs"]["backend-privileged"]["steps"]
         focused_step = next(
             step for step in privileged_steps
@@ -1602,6 +1614,36 @@ class PlatformVerificationContractTests(unittest.TestCase):
             "--focused tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_synthetic_pg16_restore_diagnostic_under_root",
             focused_step["run"],
         )
+        backend_expression = (
+            "${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'standard' "
+            "&& github.ref != 'refs/heads/dev' && inputs.scratch_backend == 'disk_ext4_image_v1' "
+            "&& 'disk_ext4_image_v1' || 'tmpfs_v1' }}"
+        )
+        self.assertEqual(focused_step["env"]["PLATFORM_SCRATCH_BACKEND"], backend_expression)
+        self.assertIn('PLATFORM_SCRATCH_BACKEND="$PLATFORM_SCRATCH_BACKEND"', focused_step["run"])
+
+        def effective_backend(event: str, proof_mode: str, ref: str, requested: str) -> str:
+            if (
+                event == "workflow_dispatch"
+                and proof_mode == "standard"
+                and ref != "refs/heads/dev"
+                and requested == "disk_ext4_image_v1"
+            ):
+                return "disk_ext4_image_v1"
+            return "tmpfs_v1"
+
+        for event, proof_mode, ref, requested, expected_backend in (
+            ("workflow_dispatch", "standard", "refs/heads/feature/probe", "disk_ext4_image_v1", "disk_ext4_image_v1"),
+            ("workflow_dispatch", "standard", "refs/heads/feature/probe", "tmpfs_v1", "tmpfs_v1"),
+            ("workflow_dispatch", "standard", "refs/heads/dev", "disk_ext4_image_v1", "tmpfs_v1"),
+            ("workflow_dispatch", "baseline-runtime", "refs/heads/feature/probe", "disk_ext4_image_v1", "tmpfs_v1"),
+            ("push", "standard", "refs/heads/dev", "disk_ext4_image_v1", "tmpfs_v1"),
+            ("pull_request", "standard", "refs/pull/12/merge", "disk_ext4_image_v1", "tmpfs_v1"),
+        ):
+            with self.subTest(event=event, proof_mode=proof_mode, ref=ref):
+                self.assertEqual(
+                    effective_backend(event, proof_mode, ref, requested), expected_backend
+                )
         self.assertNotIn("continue-on-error", focused_step)
         focused_cleanup = next(
             step for step in privileged_steps
@@ -1624,6 +1666,8 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertIn("success()", full_step["if"])
         self.assertIn("steps.synthetic_restore_first.outcome != 'failure'", full_step["if"])
         self.assertIn("platform_verify.py backend-privileged", full_step["run"])
+        self.assertEqual(full_step["env"]["PLATFORM_SCRATCH_BACKEND"], backend_expression)
+        self.assertIn('PLATFORM_SCRATCH_BACKEND="$PLATFORM_SCRATCH_BACKEND"', full_step["run"])
         self.assertIn("--manifest ci-backend/backend-privileged/manifest.json", full_step["run"])
         self.assertIn("--summary ci-backend/backend-privileged/summary.json", full_step["run"])
         self.assertIn("Upload backend privileged manifests", privileged_body)

@@ -65,6 +65,18 @@ RESTORE_DISK_SAMPLE_SECONDS = 0.25
 RESTORE_TERMINATE_TIMEOUT_SECONDS = 1.0
 RESTORE_DISK_MINIMUM_BYTES = minimum_free_bytes(DEFAULT_MIN_FREE_GIB)
 SCRATCH_TMPFS_BYTES = 512 * 1024**2
+SCRATCH_BACKEND_TMPFS_V1 = "tmpfs_v1"
+SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1 = "disk_ext4_image_v1"
+SCRATCH_BACKENDS = frozenset(
+    {SCRATCH_BACKEND_TMPFS_V1, SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1}
+)
+SCRATCH_DISK_IMAGE_ROOT = pathlib.Path("/var/lib/oldsparky/backup-restore-images")
+SCRATCH_SYS_BLOCK_ROOT = pathlib.Path("/sys/block")
+SCRATCH_SYS_DEV_BLOCK_ROOT = pathlib.Path("/sys/dev/block")
+SCRATCH_SYS_DEVICES_ROOT = pathlib.Path("/sys/devices")
+SCRATCH_DISK_IMAGE_BYTES = 576 * 1024**2
+SCRATCH_DISK_USABLE_MIN_BYTES = 512 * 1024**2
+SCRATCH_DISK_LOOP_TEARDOWN_SECONDS = 5.0
 SCRATCH_MEMORY_MAX_BYTES = 640 * 1024**2
 SCRATCH_MEMORY_RESERVE_BYTES = 384 * 1024**2
 SCRATCH_MEMORY_ADMISSION_BYTES = SCRATCH_MEMORY_MAX_BYTES + SCRATCH_MEMORY_RESERVE_BYTES
@@ -97,6 +109,7 @@ SCRATCH_DONE_TOKEN = b"OLDSPARKY_SCRATCH_RESTORE_DONE_V1\n"
 SCRATCH_APP_ROLE = "platform_user"
 SCRATCH_PRIVATE_OUTPUT_MARKER = b"SCRATCH_UNIT_PRIVATE_OUTPUT_V1\n"
 SCRATCH_FIRST_FAULT_MARKER = b"SCRATCH_FIRST_FAULT_V1\n"
+SCRATCH_FIRST_FAULT_FRAME_MAX_BYTES = 1024
 SCRATCH_PHASE_FRAME_MARKER = b"SCRATCH_PHASE_V1:"
 SCRATCH_PHASE_FRAME_MAX_BYTES = 192
 SCRATCH_PHASE_FRAME_MAX_COUNT = 12
@@ -147,6 +160,7 @@ SCRATCH_SYNTHETIC_WAL_SCOPE = "cluster_pg_stat_wal_delta_after_restore_db_backen
 SCRATCH_SYNTHETIC_ELAPSED_SCOPE = "monotonic_ns_around_pg_restore_command"
 SCRATCH_SYNTHETIC_PHASE_ELAPSED_SCOPE = "monotonic_ns_precheck_through_postcheck"
 SCRATCH_SYNTHETIC_TMPFS_SCOPE = "sampled_high_water_during_pg_restore_command"
+SCRATCH_SYNTHETIC_DISK_SCOPE = "sampled_high_water_during_pg_restore_command"
 SCRATCH_SYNTHETIC_WAL_BACKEND_DRAIN_SECONDS = 5.0
 SCRATCH_SYNTHETIC_WAL_QUERY_TIMEOUT_SECONDS = 1.0
 SCRATCH_SYNTHETIC_WAL_POLL_SECONDS = 0.05
@@ -236,6 +250,42 @@ _SCRATCH_FIRST_FAULT_KINDS = frozenset(
         "backup_interrupted",
         "scratch_token_delivery",
         "runtime",
+        "other",
+    }
+)
+_SCRATCH_DISK_MOUNT_FAILURE_REASONS = frozenset(
+    {
+        "mount_row_missing",
+        "mount_metadata",
+        "filesystem_source_root_options",
+        "filesystem_not_ext4",
+        "source_noncanonical",
+        "device_major_minor_invalid",
+        "sysfs_mount_unverified",
+        "sysfs_device_unavailable",
+        "sysfs_not_loop_device",
+        "sysfs_device_number_mismatch",
+        "mount_root_not_global",
+        "mountpoint_mismatch",
+        "mount_options_missing",
+        "root_owner_mode",
+        "root_uid_mismatch",
+        "root_gid_mismatch",
+        "root_mode_mismatch",
+        "statvfs_unavailable",
+        "statvfs_bound",
+        "total_capacity_out_of_bounds",
+        "free_below_stop",
+    }
+)
+_SCRATCH_VERIFICATION_SITES = frozenset(
+    {
+        "none",
+        "process_cgroup_read",
+        "process_cgroup_mismatch",
+        "expected_executable_stat",
+        "proc_exe_stat",
+        "proc_exe_mismatch",
         "other",
     }
 )
@@ -414,6 +464,8 @@ def valid_scratch_first_fault(value: Any) -> bool:
         base_fields,
         base_fields | {"synthetic_path_fixture_rejection"},
         base_fields | {"synthetic_identity_snapshot_comparison"},
+        base_fields | {"disk_mount_failure_reason"},
+        base_fields | {"disk_mount_failure_reason", "disk_mount_predicates"},
     ):
         return False
     if (
@@ -456,6 +508,67 @@ def valid_scratch_first_fault(value: Any) -> bool:
         or value["errno"] is not None
         or not valid_scratch_identity_snapshot_comparison(identity_comparison)
     ):
+        return False
+    if "disk_mount_failure_reason" in value and (
+        value["origin"] != "worker"
+        or value["site"] != "worker_mount_snapshot"
+        or value["exception_kind"] not in {"runtime", "os_error"}
+        or (value["exception_kind"] == "runtime" and value["errno"] is not None)
+        or (value["exception_kind"] == "os_error" and value["errno"] is None)
+        or type(value["disk_mount_failure_reason"]) is not str
+        or value["disk_mount_failure_reason"] not in _SCRATCH_DISK_MOUNT_FAILURE_REASONS
+    ):
+        return False
+    if "disk_mount_predicates" in value:
+        reason = value["disk_mount_failure_reason"]
+        predicates = value["disk_mount_predicates"]
+        mount_keys = {
+            "fs_ext4", "source_canonical", "device_major_minor_valid",
+            "sysfs_mount_verified", "sysfs_device_resolved", "sysfs_loop_device",
+            "sysfs_device_number_matches", "sysfs_backing_file_present", "root_expected",
+            "target_expected", "option_rw", "option_nosuid", "option_nodev",
+            "option_noexec",
+        }
+        root_keys = {"root_uid", "root_gid", "root_mode_0700"}
+        capacity_keys = {"total_capacity_bounded", "free_capacity_above_stop"}
+        if not isinstance(predicates, dict) or any(type(item) is not bool for item in predicates.values()):
+            return False
+        if set(predicates) == mount_keys:
+            failed = {
+                "filesystem_not_ext4": not predicates["fs_ext4"],
+                "source_noncanonical": not predicates["source_canonical"],
+                "device_major_minor_invalid": not predicates["device_major_minor_valid"],
+                "sysfs_mount_unverified": not predicates["sysfs_mount_verified"],
+                "sysfs_device_unavailable": not predicates["sysfs_device_resolved"],
+                "sysfs_not_loop_device": not predicates["sysfs_loop_device"] or not predicates["sysfs_backing_file_present"],
+                "sysfs_device_number_mismatch": not predicates["sysfs_device_number_matches"],
+                "mount_root_not_global": not predicates["root_expected"],
+                "mountpoint_mismatch": not predicates["target_expected"],
+                "mount_options_missing": not all(
+                    predicates[key] for key in ("option_rw", "option_nosuid", "option_nodev", "option_noexec")
+                ),
+            }
+            if reason == "filesystem_source_root_options":
+                return any(not predicates[key] for key in (
+                    "fs_ext4", "source_canonical", "root_expected",
+                    "target_expected", "option_rw", "option_nosuid", "option_nodev", "option_noexec",
+                ))
+            return failed.get(reason) is True
+        if set(predicates) == root_keys:
+            failed = {
+                "root_owner_mode": not all(predicates.values()),
+                "root_uid_mismatch": not predicates["root_uid"],
+                "root_gid_mismatch": not predicates["root_gid"],
+                "root_mode_mismatch": not predicates["root_mode_0700"],
+            }
+            return failed.get(reason) is True
+        if set(predicates) == capacity_keys:
+            failed = {
+                "statvfs_bound": not all(predicates.values()),
+                "total_capacity_out_of_bounds": not predicates["total_capacity_bounded"],
+                "free_below_stop": not predicates["free_capacity_above_stop"],
+            }
+            return failed.get(reason) is True
         return False
     if value["exception_kind"] in {"permission", "os_error"}:
         return value["errno"] is None or type(value["errno"]) is int
@@ -544,6 +657,16 @@ def _scratch_first_fault(error: BaseException, *, origin: str, site: str) -> dic
         value["exception_kind"] = exception_kind
         value["errno"] = errno
         value["synthetic_identity_snapshot_comparison"] = identity_comparison
+    disk_mount_reason = getattr(error, "scratch_disk_mount_failure_reason", None)
+    if disk_mount_reason is not None:
+        if disk_mount_reason not in _SCRATCH_DISK_MOUNT_FAILURE_REASONS:
+            return None
+        value["disk_mount_failure_reason"] = disk_mount_reason
+    disk_mount_predicates = getattr(error, "scratch_disk_mount_predicates", None)
+    if disk_mount_predicates is not None:
+        if disk_mount_reason is None:
+            return None
+        value["disk_mount_predicates"] = disk_mount_predicates
     return value if valid_scratch_first_fault(value) else None
 
 
@@ -563,10 +686,13 @@ def _scratch_cleanup_failure(
     service_stopped: bool | None = None,
     mount_absent: bool | None = None,
     mountpoint_removed: bool | None = None,
+    image_removed: bool | None = None,
     protected_paths_cleaned: bool | None = None,
 ) -> BaseException | None:
     """Keep cleanup status separate and never replace an existing first fault."""
     observed_cleanup = (service_stopped, mount_absent, mountpoint_removed)
+    if image_removed is not None:
+        observed_cleanup += (image_removed,)
     if protected_paths_cleaned is not None:
         observed_cleanup += (protected_paths_cleaned,)
     if all(type(value) is bool for value in observed_cleanup):
@@ -1557,7 +1683,7 @@ def _parse_bound_scratch_first_fault(
     if marker_end < 0:
         return None
     frame_bytes = stderr[marker_start:marker_end]
-    if not frame_bytes or len(frame_bytes) > 512:
+    if not frame_bytes or len(frame_bytes) > SCRATCH_FIRST_FAULT_FRAME_MAX_BYTES:
         return None
     try:
         frame = json.loads(frame_bytes.decode("ascii"))
@@ -1644,14 +1770,18 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         return False
     schema = value["schema"]
     expected_keys = base_keys if schema == 1 else base_keys | {"terminal_snapshot"}
+    if schema == 3:
+        expected_keys = base_keys | {"verification_site"}
     phases = {
         "unit_exited_before_confinement",
         "confinement_verification_failed",
         "unit_exited_after_confinement",
     }
-    if schema == 2:
+    if schema in {2, 3}:
         phases.add("authorization_failed")
-    if schema not in {1, 2} or set(value) != expected_keys:
+    if schema == 3 and "terminal_snapshot" in value:
+        expected_keys.add("terminal_snapshot")
+    if schema not in {1, 2, 3} or set(value) != expected_keys:
         return False
     if (
         type(value.get("schema")) is not int
@@ -1684,6 +1814,13 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         or type(value.get("verification_error")) is not str
         or value.get("verification_error") not in {"none", "os_error", "policy_error", "other"}
         or (
+            schema == 3
+            and (
+                type(value.get("verification_site")) is not str
+                or value.get("verification_site") not in _SCRATCH_VERIFICATION_SITES - {"none"}
+            )
+        )
+        or (
             value.get("verification_errno") is not None
             and (
                 type(value["verification_errno"]) is not int
@@ -1710,7 +1847,9 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         return False
     if value["verification_error"] != "os_error" and value["verification_errno"] is not None:
         return False
-    if schema == 2 and not valid_scratch_terminal_snapshot(value.get("terminal_snapshot")):
+    if schema in {2, 3} and "terminal_snapshot" in value and not valid_scratch_terminal_snapshot(
+        value.get("terminal_snapshot")
+    ):
         return False
     return True
 
@@ -2246,6 +2385,7 @@ def _scratch_unit_diagnostic(
     phase: str = "unit_exited_before_confinement",
     verification_error: str = "none",
     verification_errno: int | None = None,
+    verification_site: str = "none",
     terminal_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     properties = snapshot.get("properties", {})
@@ -2259,8 +2399,13 @@ def _scratch_unit_diagnostic(
     )
     stdout_prefix = stdout_prefix[:SCRATCH_PRIVATE_STDOUT_BYTES]
     stderr_prefix = stderr_prefix[:SCRATCH_PRIVATE_STDERR_BYTES]
+    schema = (
+        3 if verification_site != "none"
+        else 2 if valid_scratch_terminal_snapshot(terminal_snapshot)
+        else 1
+    )
     diagnostic = {
-        "schema": 2 if valid_scratch_terminal_snapshot(terminal_snapshot) else 1,
+        "schema": schema,
         "phase": phase,
         "active_state": properties.get("ActiveState"),
         "sub_state": properties.get("SubState"),
@@ -2276,7 +2421,9 @@ def _scratch_unit_diagnostic(
         "verification_error": verification_error,
         "verification_errno": verification_errno,
     }
-    if diagnostic["schema"] == 2:
+    if schema == 3:
+        diagnostic["verification_site"] = verification_site
+    if valid_scratch_terminal_snapshot(terminal_snapshot):
         diagnostic["terminal_snapshot"] = terminal_snapshot
     return diagnostic if valid_scratch_unit_diagnostic(diagnostic) else None
 
@@ -2297,6 +2444,21 @@ def _scratch_verification_error_details(error: BaseException) -> tuple[str, int 
     if isinstance(error, RuntimeError):
         return "policy_error", None
     return "other", None
+
+
+def _scratch_verification_site(error: BaseException) -> str:
+    """Return only an allowlisted controller verification operation name."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        site = getattr(current, "scratch_verification_site", None)
+        if type(site) is str and site in _SCRATCH_VERIFICATION_SITES - {"none"}:
+            return site
+        current = current.__cause__ or current.__context__
+    return "none"
 
 
 def _valid_restore_diagnostic(value: Any) -> bool:
@@ -2450,6 +2612,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(SCRATCH_WORKER_MODE, action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-root", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_scratch-backend", choices=sorted(SCRATCH_BACKENDS), default=SCRATCH_BACKEND_TMPFS_V1, help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-archive", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-archive-dev", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--_scratch-archive-ino", type=int, default=None, help=argparse.SUPPRESS)
@@ -2466,6 +2629,13 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.private_scratch_diagnostics and not args.as_json:
         parser.error("--private-scratch-diagnostics requires --json")
+    if (
+        args._scratch_backend != SCRATCH_BACKEND_TMPFS_V1
+        and not args._scratch_restore_worker
+        and not args._scratch_authorization_probe
+        and not args._scratch_synthetic_restore_diagnostic
+    ):
+        parser.error("A non-default scratch backend is restricted to a fixed diagnostic or worker.")
     if args.protected_backup_manifest is not None and (
         args.check_latest
         or args.verify_latest_existing
@@ -2579,6 +2749,492 @@ def require_restore_headroom(
                 required_free_bytes=required_free_bytes,
                 phase=phase,
             )
+
+
+def _scratch_mountinfo_escape(value: str) -> str:
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+
+
+def _scratch_mountinfo_for(path: pathlib.Path) -> tuple[str, str, str, str, str, str]:
+    """Return the deepest mount containing a fixed local path."""
+    target = str(path.resolve(strict=True))
+    try:
+        raw = pathlib.Path("/proc/self/mountinfo").read_text(encoding="ascii")
+    except OSError as exc:
+        error = RuntimeError("Scratch backing filesystem identity is unavailable.")
+        setattr(error, "scratch_disk_mount_failure_reason", "mount_metadata")
+        raise error from exc
+    if len(raw) > 1024 * 1024:
+        error = RuntimeError("Scratch backing filesystem metadata exceeded its bound.")
+        setattr(error, "scratch_disk_mount_failure_reason", "mount_metadata")
+        raise error
+    found: tuple[str, str, str, str] | None = None
+    for line in raw.splitlines():
+        left, separator, right = line.partition(" - ")
+        left_fields = left.split()
+        right_fields = right.split()
+        if not separator or len(left_fields) < 6 or len(right_fields) < 3:
+            continue
+        mountpoint = _scratch_mountinfo_escape(left_fields[4])
+        if target != mountpoint and not (
+            target.startswith("/")
+            if mountpoint == "/"
+            else target.startswith(mountpoint.rstrip("/") + "/")
+        ):
+            continue
+        candidate = (
+            mountpoint,
+            left_fields[2],
+            right_fields[0],
+            _scratch_mountinfo_escape(right_fields[1]),
+            _scratch_mountinfo_escape(left_fields[3]),
+            left_fields[5],
+        )
+        if found is None or len(candidate[0]) > len(found[0]):
+            found = candidate
+    if found is None:
+        error = RuntimeError("Scratch backing filesystem mount is not present.")
+        setattr(error, "scratch_disk_mount_failure_reason", "mount_row_missing")
+        raise error
+    return found
+
+
+def _scratch_validate_image_directory(path: pathlib.Path) -> os.stat_result:
+    if path != SCRATCH_DISK_IMAGE_ROOT:
+        raise RuntimeError("Scratch disk image directory path is outside its fixed owner location.")
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise RuntimeError("Scratch disk image directory identity is unavailable.") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise RuntimeError("Scratch disk image directory identity is unsafe.")
+    return info
+
+
+def _scratch_image_path_identity(path: pathlib.Path) -> tuple[int, int, int, int, int, int, int]:
+    """Validate the exact root-owned, fixed-size, fully allocated image inode."""
+    parent_before = _scratch_validate_image_directory(path.parent)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError("Scratch disk image identity is unavailable.") from exc
+    try:
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+        parent_after = _scratch_validate_image_directory(path.parent)
+        identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_uid,
+            opened.st_gid,
+            stat.S_IMODE(opened.st_mode),
+            opened.st_nlink,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or identity[2] != SCRATCH_DISK_IMAGE_BYTES
+            or identity[3:] != (0, 0, 0o600, 1)
+            or (opened.st_dev, opened.st_ino, opened.st_size)
+            != (current.st_dev, current.st_ino, current.st_size)
+            or (parent_before.st_dev, parent_before.st_ino)
+            != (parent_after.st_dev, parent_after.st_ino)
+            or opened.st_dev != parent_after.st_dev
+            or opened.st_blocks * 512 < opened.st_size
+        ):
+            raise RuntimeError("Scratch disk image inode failed its fixed allocation contract.")
+        return identity
+    finally:
+        os.close(descriptor)
+
+
+def _scratch_fsync_directory(path: pathlib.Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _scratch_disk_image_required_free_bytes(total_bytes: int) -> int:
+    """Keep the existing chain floor and lead after reserving the full image."""
+    return (
+        _required_disk_floor(total_bytes)
+        + RESTORE_DISK_LEAD_BYTES
+        + SCRATCH_DISK_IMAGE_BYTES
+    )
+
+
+def _scratch_prepare_disk_image(token: str) -> tuple[pathlib.Path, tuple[int, int, int, int, int, int, int]]:
+    """Create a fixed-size ext4 image after reserving its full disk allocation."""
+    if re.fullmatch(r"[0-9a-f]{24}", token) is None:
+        raise ValueError("Scratch image token is invalid.")
+    if os.geteuid() != 0:
+        raise RuntimeError("Scratch disk image creation requires the root maintenance owner.")
+    parent = SCRATCH_DISK_IMAGE_ROOT
+    parent_parent = parent.parent
+    parent_parent_info = parent_parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_parent_info.st_mode)
+        or parent_parent_info.st_uid != 0
+        or parent_parent_info.st_gid != 0
+        or stat.S_IMODE(parent_parent_info.st_mode) & 0o022
+    ):
+        raise RuntimeError("Scratch image parent directory identity is unsafe.")
+    mountpoint, device, fs_type, source, _mount_root, _mount_options = _scratch_mountinfo_for(parent_parent)
+    if (
+        fs_type != "ext4"
+        or not source.startswith("/dev/")
+        or os.stat(parent_parent).st_dev != os.stat("/").st_dev
+    ):
+        raise RuntimeError("Scratch image backing storage is not the verified disk-backed ext4 filesystem.")
+    del mountpoint, device
+    snapshot = snapshot_for_path(parent_parent)
+    if not snapshot.valid:
+        raise RestoreGuardStop("disk_unavailable", phase="scratch_image_admission")
+    required = _scratch_disk_image_required_free_bytes(snapshot.total_bytes)
+    if snapshot.free_bytes < required:
+        raise RestoreGuardStop(
+            "disk_floor",
+            free_bytes=snapshot.free_bytes,
+            required_free_bytes=required,
+            phase="scratch_image_admission",
+        )
+    try:
+        parent.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    parent_info = parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != 0
+        or parent_info.st_gid != 0
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+        or parent_info.st_dev != parent_parent_info.st_dev
+    ):
+        raise RuntimeError("Scratch image directory identity is unsafe.")
+    path = parent / f"restore-{token}.ext4"
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    created_identity: tuple[int, int] | None = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        info = os.fstat(descriptor)
+        created_identity = (info.st_dev, info.st_ino)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1:
+            raise RuntimeError("Scratch image file creation returned an unsafe inode.")
+        os.fchmod(descriptor, 0o600)
+        if not hasattr(os, "posix_fallocate"):
+            raise RuntimeError("Scratch image filesystem cannot guarantee full preallocation.")
+        os.posix_fallocate(descriptor, 0, SCRATCH_DISK_IMAGE_BYTES)
+        os.fsync(descriptor)
+        allocated = os.fstat(descriptor)
+        if allocated.st_size != SCRATCH_DISK_IMAGE_BYTES or allocated.st_blocks * 512 < allocated.st_size:
+            raise RuntimeError("Scratch image allocation is sparse or incomplete.")
+        mkfs_path = pathlib.Path("/usr/sbin/mkfs.ext4")
+        try:
+            mkfs_info = mkfs_path.lstat()
+            mkfs_target = mkfs_path.resolve(strict=True)
+            mkfs_target_info = mkfs_target.stat()
+        except OSError as exc:
+            raise RuntimeError("Scratch image formatter is unavailable.") from exc
+        if (
+            not (stat.S_ISREG(mkfs_info.st_mode) or stat.S_ISLNK(mkfs_info.st_mode))
+            or mkfs_info.st_uid != 0
+            or mkfs_info.st_gid != 0
+            or (
+                stat.S_ISREG(mkfs_info.st_mode)
+                and stat.S_IMODE(mkfs_info.st_mode) & 0o022
+            )
+            or mkfs_target not in {mkfs_path, pathlib.Path("/usr/sbin/mke2fs")}
+            or not stat.S_ISREG(mkfs_target_info.st_mode)
+            or mkfs_target_info.st_uid != 0
+            or mkfs_target_info.st_gid != 0
+            or stat.S_IMODE(mkfs_target_info.st_mode) & 0o022
+            or not stat.S_IMODE(mkfs_target_info.st_mode) & 0o111
+        ):
+            raise RuntimeError("Scratch image formatter identity is unsafe.")
+        subprocess.run(
+            [str(mkfs_path), "-F", "-q", "-m", "0", "-E", "nodiscard", str(path)],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
+        )
+        os.fsync(descriptor)
+        _scratch_fsync_directory(parent)
+        identity = _scratch_image_path_identity(path)
+        after = snapshot_for_path(parent)
+        after_required = _required_disk_floor(after.total_bytes) + RESTORE_DISK_LEAD_BYTES
+        if not after.valid or after.free_bytes < after_required:
+            raise RestoreGuardStop(
+                "disk_floor",
+                free_bytes=after.free_bytes,
+                required_free_bytes=after_required,
+                phase="scratch_image_postallocation",
+            )
+        return path, identity
+    except BaseException:
+        # This image has not been offered to systemd yet. Remove only the inode
+        # this call created; if identity changed, preserve it for investigation.
+        try:
+            if descriptor is not None and created_identity is not None:
+                current = os.fstat(descriptor)
+                path_info = path.lstat()
+                if (current.st_dev, current.st_ino) == created_identity == (
+                    path_info.st_dev, path_info.st_ino
+                ):
+                    try:
+                        path.unlink()
+                        _scratch_fsync_directory(parent)
+                    except BaseException:
+                        try:
+                            retained = path.lstat()
+                            if (retained.st_dev, retained.st_ino) == created_identity:
+                                retained_identity = (
+                                    retained.st_dev,
+                                    retained.st_ino,
+                                    retained.st_size,
+                                    retained.st_uid,
+                                    retained.st_gid,
+                                    stat.S_IMODE(retained.st_mode),
+                                    retained.st_nlink,
+                                )
+                                _scratch_write_image_cleanup_receipt(
+                                    path,
+                                    retained_identity,
+                                    unit_name=f"oldsparky-backup-restore-{token}.service",
+                                    reason="cleanup_observer_failed",
+                                )
+                        except FileNotFoundError:
+                            pass
+                elif (
+                    stat.S_ISREG(path_info.st_mode)
+                    and path_info.st_uid == 0
+                    and path_info.st_gid == 0
+                    and path_info.st_nlink == 1
+                ):
+                    retained_identity = (
+                        path_info.st_dev,
+                        path_info.st_ino,
+                        path_info.st_size,
+                        path_info.st_uid,
+                        path_info.st_gid,
+                        stat.S_IMODE(path_info.st_mode),
+                        path_info.st_nlink,
+                    )
+                    _scratch_write_image_cleanup_receipt(
+                        path,
+                        retained_identity,
+                        unit_name=f"oldsparky-backup-restore-{token}.service",
+                        reason="image_identity_changed",
+                    )
+        except BaseException:
+            # Preserve the first setup fault. The exact pathname and inode are
+            # left untouched whenever ownership cannot be proven.
+            pass
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _scratch_image_loop_matches(
+    image_path: pathlib.Path,
+    image_identity: tuple[int, int, int, int, int, int, int],
+) -> list[tuple[str, str]]:
+    """Find systemd-managed loop devices backed by this exact image inode."""
+    matches: list[tuple[str, str]] = []
+    loop_root = SCRATCH_SYS_BLOCK_ROOT
+    loop_root_info = loop_root.lstat()
+    mountpoint, _device, fs_type, _source, mount_root, _options = _scratch_mountinfo_for(loop_root)
+    if (
+        not stat.S_ISDIR(loop_root_info.st_mode)
+        or loop_root_info.st_uid != 0
+        or fs_type != "sysfs"
+        or mount_root != "/"
+        or not mountpoint.startswith("/sys")
+    ):
+        raise RuntimeError("Scratch loop inventory is not backed by the verified host sysfs mount.")
+    loop_directories: list[pathlib.Path] = []
+    try:
+        with os.scandir(loop_root) as entries:
+            for index, entry in enumerate(entries):
+                if index >= 128:
+                    raise RuntimeError("Scratch sysfs block inventory exceeded its fixed bound.")
+                if re.fullmatch(r"loop[0-9]{1,3}", entry.name):
+                    loop_directories.append(loop_root / entry.name)
+    except OSError as exc:
+        raise RuntimeError("Scratch sysfs block inventory could not be read.") from exc
+    if len(loop_directories) > 64:
+        raise RuntimeError("Scratch loop inventory exceeded its fixed bound.")
+    for loop_directory in sorted(loop_directories):
+        backing_file = loop_directory / "loop" / "backing_file"
+        try:
+            raw_path = backing_file.read_bytes()
+            if len(raw_path) > 4096:
+                raise RuntimeError("Scratch loop backing path exceeded its bound.")
+            value = raw_path.decode("utf-8", errors="strict").strip()
+            if not value:
+                continue
+            backing_path = pathlib.Path(_scratch_mountinfo_escape(value))
+            if not backing_path.is_absolute() or str(backing_path) != str(image_path):
+                continue
+            info = backing_path.lstat()
+            identity = _scratch_image_path_identity(backing_path)
+            if (
+                (info.st_dev, info.st_ino, info.st_size)
+                != (image_identity[0], image_identity[1], image_identity[2])
+                or identity[:3] != image_identity[:3]
+            ):
+                raise RuntimeError("Scratch loop backing image identity changed.")
+            loop_name = loop_directory.name
+            dev_path = loop_directory / "dev"
+            raw_dev = dev_path.read_text(encoding="ascii").strip()
+            if re.fullmatch(r"[0-9]+:[0-9]+", raw_dev) is None:
+                raise RuntimeError("Scratch loop device identity is invalid.")
+            matches.append((loop_name, raw_dev))
+        except FileNotFoundError:
+            # Loop devices may disappear between enumeration and read; the
+            # caller rechecks until the bounded teardown deadline.
+            continue
+        except OSError as exc:
+            raise RuntimeError("Scratch loop association could not be verified.") from exc
+    return matches
+
+
+def _scratch_verify_process_image_mount(
+    *,
+    pid: str,
+    mountpoint: pathlib.Path,
+    image_path: pathlib.Path,
+    image_identity: tuple[int, int, int, int, int, int, int],
+) -> str:
+    _scratch_image_path_identity(image_path)
+    matches = _scratch_image_loop_matches(image_path, image_identity)
+    if len(matches) != 1:
+        raise RuntimeError("Scratch image loop association is not unique for the active unit.")
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/mountinfo").read_text(encoding="ascii")
+    except OSError as exc:
+        raise RuntimeError("Scratch unit mount namespace is unavailable.") from exc
+    if len(raw) > 1024 * 1024:
+        raise RuntimeError("Scratch unit mount namespace metadata exceeded its bound.")
+    expected_mount: tuple[str, str, str, str] | None = None
+    for line in raw.splitlines():
+        left, separator, right = line.partition(" - ")
+        left_fields = left.split()
+        right_fields = right.split()
+        if not separator or len(left_fields) < 6 or len(right_fields) < 3:
+            continue
+        target = _scratch_mountinfo_escape(left_fields[4])
+        if target == str(mountpoint):
+            expected_mount = (
+                left_fields[2],
+                _scratch_mountinfo_escape(left_fields[3]),
+                right_fields[0],
+                left_fields[5],
+            )
+            break
+    if (
+        expected_mount is None
+        or expected_mount[0] != matches[0][1]
+        or expected_mount[1] != "/"
+        or expected_mount[2] != "ext4"
+        or not {"rw", "nosuid", "nodev", "noexec"}.issubset(
+            set(expected_mount[3].split(","))
+        )
+    ):
+        raise RuntimeError("Scratch unit mount does not match its exact loop-backed ext4 image.")
+    if _scratch_mountpoint_is_mounted(mountpoint):
+        raise RuntimeError("Scratch disk image mount unexpectedly appeared in the host namespace.")
+    return matches[0][1]
+
+
+def _scratch_wait_for_image_loop_release(
+    image_path: pathlib.Path,
+    image_identity: tuple[int, int, int, int, int, int, int],
+) -> bool:
+    deadline = time.monotonic() + SCRATCH_DISK_LOOP_TEARDOWN_SECONDS
+    while True:
+        if not _scratch_image_loop_matches(image_path, image_identity):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
+
+
+def _scratch_unlink_image_exact(
+    image_path: pathlib.Path,
+    image_identity: tuple[int, int, int, int, int, int, int],
+) -> None:
+    current = _scratch_image_path_identity(image_path)
+    if current != image_identity:
+        raise RuntimeError("Scratch image changed before its owned-inode cleanup.")
+    if _scratch_image_loop_matches(image_path, image_identity):
+        raise RuntimeError("Scratch image still has a systemd loop association.")
+    image_path.unlink()
+    _scratch_fsync_directory(image_path.parent)
+
+
+def _scratch_write_image_cleanup_receipt(
+    image_path: pathlib.Path,
+    image_identity: tuple[int, int, int, int, int, int, int],
+    *,
+    unit_name: str,
+    reason: str,
+) -> None:
+    allowed = {
+        "service_not_stopped",
+        "host_mount_present",
+        "mountpoint_not_removed",
+        "loop_association_persists",
+        "image_identity_changed",
+        "cleanup_observer_failed",
+    }
+    if reason not in allowed or image_path.parent != SCRATCH_DISK_IMAGE_ROOT:
+        raise ValueError("Scratch image cleanup receipt inputs are invalid.")
+    receipt = {
+        "schema": 1,
+        "unit_name": unit_name,
+        "image_name": image_path.name,
+        "image_dev": image_identity[0],
+        "image_ino": image_identity[1],
+        "image_size_bytes": image_identity[2],
+        "cleanup_status": "retained",
+        "reason": reason,
+    }
+    payload = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+    if len(payload) > 1024:
+        raise RuntimeError("Scratch image cleanup receipt exceeded its bound.")
+    path = SCRATCH_DISK_IMAGE_ROOT / f"cleanup-{image_path.stem}.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+        if os.write(descriptor, payload) != len(payload):
+            raise RuntimeError("Scratch image cleanup receipt was not written completely.")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _scratch_fsync_directory(path.parent)
 
 
 def _stop_owned_child(
@@ -5209,7 +5865,13 @@ def require_commands(*commands: str) -> None:
         raise RuntimeError(f"Missing required PostgreSQL command(s): {', '.join(missing)}")
 
 
-def _scratch_mount_snapshot(path: pathlib.Path) -> dict[str, int]:
+def _scratch_mount_snapshot(
+    path: pathlib.Path, *, backend: str = SCRATCH_BACKEND_TMPFS_V1
+) -> dict[str, int | str]:
+    if backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+        return _scratch_disk_mount_snapshot(path)
+    if backend != SCRATCH_BACKEND_TMPFS_V1:
+        raise RuntimeError("Scratch restore backend is not supported.")
     target = str(path)
     mount_row: tuple[list[str], list[str]] | None = None
     for line in pathlib.Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines():
@@ -5239,6 +5901,241 @@ def _scratch_mount_snapshot(path: pathlib.Path) -> dict[str, int]:
     if total != SCRATCH_TMPFS_BYTES or free <= SCRATCH_TMPFS_STOP_BYTES:
         raise RuntimeError("Isolated restore filesystem is below its bounded capacity.")
     return {"total_bytes": total, "free_bytes": free}
+
+
+def _scratch_prepare_disk_root_for_postgres(
+    root: pathlib.Path, *, postgres_uid: int, postgres_gid: int
+) -> None:
+    """Validate the private image root, then grant only the postgres owner access."""
+    before = root.lstat()
+    before_identity = (before.st_dev, before.st_ino)
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or before.st_uid != 0
+        or before.st_gid != 0
+        or stat.S_IMODE(before.st_mode) != 0o700
+        or type(postgres_uid) is not int
+        or type(postgres_gid) is not int
+        or postgres_uid <= 0
+        or postgres_gid < 0
+    ):
+        raise RuntimeError("Scratch ext4 root did not meet its root:root mode 0700 pre-PG contract.")
+    try:
+        os.chown(root, postgres_uid, postgres_gid, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError("Scratch ext4 root could not be assigned to the exact postgres identity.") from exc
+    after = root.lstat()
+    if (
+        not stat.S_ISDIR(after.st_mode)
+        or (after.st_dev, after.st_ino) != before_identity
+        or after.st_uid != postgres_uid
+        or after.st_gid != postgres_gid
+        or stat.S_IMODE(after.st_mode) != 0o700
+    ):
+        raise RuntimeError("Scratch ext4 root identity changed during the postgres ownership transition.")
+
+
+def _scratch_sysfs_loop_device_predicates(
+    device: str,
+) -> tuple[str | None, dict[str, bool]]:
+    """Resolve one mountinfo major:minor through sysfs to a loop device.
+
+    The caller's controller separately binds that same major:minor, worker PID,
+    invocation, and mountpoint to the exact admitted image inode before it
+    sends the start token and throughout the worker lifetime.  The mountinfo
+    SOURCE field is filesystem-specific and is not a device identity.
+    """
+    predicates = {
+        "device_major_minor_valid": bool(
+            re.fullmatch(r"(?:0|[1-9][0-9]*):(?:0|[1-9][0-9]*)", device)
+        ),
+        "sysfs_mount_verified": False,
+        "sysfs_device_resolved": False,
+        "sysfs_loop_device": False,
+        "sysfs_device_number_matches": False,
+        "sysfs_backing_file_present": False,
+    }
+    if not predicates["device_major_minor_valid"]:
+        return "device_major_minor_invalid", predicates
+
+    try:
+        sysfs_root = SCRATCH_SYS_DEV_BLOCK_ROOT
+        root_info = sysfs_root.lstat()
+        mountpoint, _mount_device, fs_type, _source, mount_root, _options = (
+            _scratch_mountinfo_for(sysfs_root)
+        )
+    except (OSError, RuntimeError):
+        return "sysfs_mount_unverified", predicates
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or fs_type != "sysfs"
+        or mountpoint != "/sys"
+        or mount_root != "/"
+    ):
+        return "sysfs_mount_unverified", predicates
+    predicates["sysfs_mount_verified"] = True
+
+    link = sysfs_root / device
+    try:
+        link_info = link.lstat()
+        devices_root = SCRATCH_SYS_DEVICES_ROOT.resolve(strict=True)
+        resolved = link.resolve(strict=True)
+        resolved_info = resolved.stat()
+    except (OSError, RuntimeError):
+        return "sysfs_device_unavailable", predicates
+    if (
+        not stat.S_ISLNK(link_info.st_mode)
+        or not resolved.is_relative_to(devices_root)
+        or resolved.parent.name != "block"
+        or re.fullmatch(r"loop[0-9]{1,3}", resolved.name) is None
+        or not stat.S_ISDIR(resolved_info.st_mode)
+    ):
+        predicates["sysfs_device_resolved"] = True
+        return "sysfs_not_loop_device", predicates
+    predicates["sysfs_device_resolved"] = True
+    predicates["sysfs_loop_device"] = True
+
+    try:
+        dev_path = resolved / "dev"
+        dev_info = dev_path.lstat()
+        dev_raw = dev_path.read_bytes()
+        if (
+            not stat.S_ISREG(dev_info.st_mode)
+            or len(dev_raw) > 64
+        ):
+            return "sysfs_device_number_mismatch", predicates
+        observed_device = dev_raw.decode("ascii", errors="strict").strip()
+    except (OSError, UnicodeDecodeError):
+        return "sysfs_device_number_mismatch", predicates
+    if re.fullmatch(r"(?:0|[1-9][0-9]*):(?:0|[1-9][0-9]*)", observed_device) is None:
+        return "sysfs_device_number_mismatch", predicates
+    predicates["sysfs_device_number_matches"] = observed_device == device
+    if not predicates["sysfs_device_number_matches"]:
+        return "sysfs_device_number_mismatch", predicates
+
+    try:
+        backing_path = resolved / "loop" / "backing_file"
+        backing_info = backing_path.lstat()
+        backing_raw = backing_path.read_bytes()
+        if (
+            not stat.S_ISREG(backing_info.st_mode)
+            or not backing_raw
+            or len(backing_raw) > 4096
+            or b"\x00" in backing_raw
+            or not backing_raw.startswith(b"/")
+        ):
+            return "sysfs_not_loop_device", predicates
+    except OSError:
+        return "sysfs_not_loop_device", predicates
+    predicates["sysfs_backing_file_present"] = True
+    return None, predicates
+
+
+def _scratch_disk_mount_snapshot(
+    path: pathlib.Path,
+    *,
+    expected_owner: tuple[int, int] = (0, 0),
+) -> dict[str, int | str]:
+    def fail(
+        reason: str,
+        message: str,
+        cause: BaseException | None = None,
+        predicates: dict[str, bool] | None = None,
+    ) -> None:
+        error = RuntimeError(message)
+        setattr(error, "scratch_disk_mount_failure_reason", reason)
+        if predicates is not None:
+            setattr(error, "scratch_disk_mount_predicates", predicates)
+        if cause is not None:
+            raise error from cause
+        raise error
+
+    try:
+        mountpoint, device, fs_type, source, mount_root, mount_options = _scratch_mountinfo_for(path)
+        mount_stat = path.lstat()
+    except (OSError, RuntimeError) as exc:
+        reason = getattr(exc, "scratch_disk_mount_failure_reason", "mount_metadata")
+        if type(reason) is not str or reason not in _SCRATCH_DISK_MOUNT_FAILURE_REASONS:
+            reason = "mount_metadata"
+        fail(reason, "Scratch mount metadata could not be verified.", exc)
+    options = set(mount_options.split(","))
+    device_reason, device_predicates = _scratch_sysfs_loop_device_predicates(device)
+    mount_predicates = {
+        "fs_ext4": fs_type == "ext4",
+        "source_canonical": source == source.strip(),
+        **device_predicates,
+        "root_expected": mount_root == "/",
+        "target_expected": mountpoint == str(path),
+        "option_rw": "rw" in options,
+        "option_nosuid": "nosuid" in options,
+        "option_nodev": "nodev" in options,
+        "option_noexec": "noexec" in options,
+    }
+    mount_failures = (
+        ("filesystem_not_ext4", "fs_ext4"),
+        ("source_noncanonical", "source_canonical"),
+        ("mount_root_not_global", "root_expected"),
+        ("mountpoint_mismatch", "target_expected"),
+    )
+    for reason, predicate in mount_failures:
+        if not mount_predicates[predicate]:
+            fail(
+                reason,
+                "Isolated restore filesystem is not the pinned private ext4 image mount.",
+                predicates=mount_predicates,
+            )
+    if device_reason is not None:
+        fail(
+            device_reason,
+            "Isolated restore filesystem device is not a verified loop device.",
+            predicates=mount_predicates,
+        )
+    if not all(mount_predicates[key] for key in (
+        "option_rw", "option_nosuid", "option_nodev", "option_noexec"
+    )):
+        fail(
+            "mount_options_missing",
+            "Isolated restore filesystem is not the pinned private ext4 image mount.",
+            predicates=mount_predicates,
+        )
+    root_predicates = {
+        "root_uid": mount_stat.st_uid == expected_owner[0],
+        "root_gid": mount_stat.st_gid == expected_owner[1],
+        "root_mode_0700": stat.S_IMODE(mount_stat.st_mode) == 0o700,
+    }
+    if not all(root_predicates.values()):
+        reason = (
+            "root_uid_mismatch" if not root_predicates["root_uid"]
+            else "root_gid_mismatch" if not root_predicates["root_gid"]
+            else "root_mode_mismatch"
+        )
+        fail(reason, "Isolated restore filesystem root identity is unsafe.", predicates=root_predicates)
+    try:
+        values = os.statvfs(path)
+    except OSError as exc:
+        fail("statvfs_unavailable", "Isolated ext4 filesystem capacity could not be verified.", exc)
+    total = values.f_blocks * values.f_frsize
+    free = values.f_bavail * values.f_frsize
+    capacity_predicates = {
+        "total_capacity_bounded": SCRATCH_DISK_USABLE_MIN_BYTES <= total <= SCRATCH_DISK_IMAGE_BYTES,
+        "free_capacity_above_stop": free > SCRATCH_TMPFS_STOP_BYTES,
+    }
+    if not all(capacity_predicates.values()):
+        reason = (
+            "total_capacity_out_of_bounds" if not capacity_predicates["total_capacity_bounded"]
+            else "free_below_stop"
+        )
+        fail(
+            reason,
+            "Isolated ext4 scratch filesystem is below its bounded usable capacity.",
+            predicates=capacity_predicates,
+        )
+    return {
+        "total_bytes": total,
+        "free_bytes": free,
+        "filesystem": "ext4",
+        "device": device,
+    }
 
 
 def _scratch_cgroup_snapshot() -> dict[str, int]:
@@ -6832,6 +7729,23 @@ def _scratch_synthetic_restore_diagnostic_worker(
         )
     ):
         raise RuntimeError("Synthetic restore diagnostic cannot receive an external archive.")
+    scratch_backend = getattr(args, "_scratch_backend", SCRATCH_BACKEND_TMPFS_V1)
+    if scratch_backend not in SCRATCH_BACKENDS:
+        raise RuntimeError("Synthetic restore diagnostic backend is unsupported.")
+    postgres_user = pwd.getpwnam("postgres")
+    if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+        _scratch_disk_mount_snapshot(root)
+        _scratch_prepare_disk_root_for_postgres(
+            root, postgres_uid=postgres_user.pw_uid, postgres_gid=postgres_user.pw_gid
+        )
+        filesystem_capacity_bytes = int(
+            _scratch_disk_mount_snapshot(
+                root, expected_owner=(postgres_user.pw_uid, postgres_user.pw_gid)
+            )["total_bytes"]
+        )
+    else:
+        os.chown(root, postgres_user.pw_uid, postgres_user.pw_gid)
+        filesystem_capacity_bytes = SCRATCH_TMPFS_BYTES
     require_commands("pg_config", "runuser")
     pg_config_path = shutil.which("pg_config")
     if pg_config_path is None:
@@ -6879,8 +7793,6 @@ def _scratch_synthetic_restore_diagnostic_worker(
         part for part in (str(bindir), os.environ.get("PATH", "")) if part
     )
 
-    postgres_user = pwd.getpwnam("postgres")
-    os.chown(root, postgres_user.pw_uid, postgres_user.pw_gid)
     root_device = os.stat(root).st_dev
     archive_path = root / "archive.dump"
     archive: BinaryIO | None = None
@@ -7072,7 +7984,7 @@ def _scratch_synthetic_restore_diagnostic_worker(
                 username="postgres", password=None, database="postgres",
             )
             target_started = False
-            sampler: _ScratchTmpfsPeakSampler | None = None
+            sampler: _ScratchFilesystemPeakSampler | None = None
             metric_state: dict[str, dict[str, int]] = {}
             validation: dict[str, Any] = {}
             arm_slug = f"{args._scratch_timestamp_slug}_arm{arm_index}"
@@ -7135,7 +8047,11 @@ def _scratch_synthetic_restore_diagnostic_worker(
                         state["memory_start_bytes"] = _scratch_read_or_reset_memory_peak(
                             peak_fd, reset=True
                         )
-                        sampler = _ScratchTmpfsPeakSampler(root)
+                        sampler = _ScratchFilesystemPeakSampler(
+                            root,
+                            backend=scratch_backend,
+                            postgres_owner=(postgres_user.pw_uid, postgres_user.pw_gid),
+                        )
                         sampler.start()
                         state["restore_command_started_ns"] = time.monotonic_ns()
                     elif event == "end":
@@ -7148,7 +8064,10 @@ def _scratch_synthetic_restore_diagnostic_worker(
                         ):
                             raise RuntimeError("Synthetic restore phase metrics ended out of order.")
                         state["restore_command_ended_ns"] = time.monotonic_ns()
-                        state["tmpfs_peak_sampled_bytes"] = sampler.stop()
+                        state["filesystem_peak_sampled_bytes"] = sampler.stop()
+                        if sampler.capacity_bytes != filesystem_capacity_bytes:
+                            raise RuntimeError("Synthetic restore filesystem capacity changed during the run.")
+                        state["filesystem_capacity_bytes"] = filesystem_capacity_bytes
                         sampler = None
                         state["memory_peak_bytes"] = _scratch_read_or_reset_memory_peak(peak_fd)
                         _scratch_wait_for_restore_database_backends_to_exit(
@@ -7220,7 +8139,8 @@ def _scratch_synthetic_restore_diagnostic_worker(
                         not {
                             "wal_before_bytes", "wal_after_bytes", "phase_started_ns",
                             "phase_ended_ns", "restore_command_started_ns",
-                            "restore_command_ended_ns", "tmpfs_peak_sampled_bytes",
+                            "restore_command_ended_ns", "filesystem_peak_sampled_bytes",
+                            "filesystem_capacity_bytes",
                             "memory_start_bytes", "memory_peak_bytes",
                         }.issubset(metric_state[phase])
                         for phase in SCRATCH_SYNTHETIC_RESTORE_PHASES
@@ -7247,8 +8167,7 @@ def _scratch_synthetic_restore_diagnostic_worker(
                         or state["memory_peak_bytes"] < state["memory_start_bytes"]
                     ):
                         raise RuntimeError("Synthetic restore phase metrics are outside their fixed bound.")
-                    phase_results.append(
-                        {
+                    phase_result = {
                             "phase": phase,
                             "wal_before_bytes": state["wal_before_bytes"],
                             "wal_after_bytes": state["wal_after_bytes"],
@@ -7257,17 +8176,29 @@ def _scratch_synthetic_restore_diagnostic_worker(
                             "phase_elapsed_us": phase_elapsed_us,
                             "memory_start_bytes": state["memory_start_bytes"],
                             "memory_peak_bytes": state["memory_peak_bytes"],
-                            "tmpfs_peak_sampled_bytes": state["tmpfs_peak_sampled_bytes"],
-                            "tmpfs_sample_period_ms": int(
-                                SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS * 1000
-                            ),
                             "memory_scope": SCRATCH_SYNTHETIC_MEMORY_SCOPE,
                             "wal_scope": SCRATCH_SYNTHETIC_WAL_SCOPE,
                             "elapsed_scope": SCRATCH_SYNTHETIC_ELAPSED_SCOPE,
                             "phase_elapsed_scope": SCRATCH_SYNTHETIC_PHASE_ELAPSED_SCOPE,
-                            "tmpfs_scope": SCRATCH_SYNTHETIC_TMPFS_SCOPE,
                         }
-                    )
+                    if scratch_backend == SCRATCH_BACKEND_TMPFS_V1:
+                        phase_result.update(
+                            {
+                                "tmpfs_peak_sampled_bytes": state["filesystem_peak_sampled_bytes"],
+                                "tmpfs_sample_period_ms": int(SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS * 1000),
+                                "tmpfs_scope": SCRATCH_SYNTHETIC_TMPFS_SCOPE,
+                            }
+                        )
+                    else:
+                        phase_result.update(
+                            {
+                                "disk_peak_sampled_bytes": state["filesystem_peak_sampled_bytes"],
+                                "disk_capacity_bytes": state["filesystem_capacity_bytes"],
+                                "disk_sample_period_ms": int(SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS * 1000),
+                                "disk_scope": SCRATCH_SYNTHETIC_DISK_SCOPE,
+                            }
+                        )
+                    phase_results.append(phase_result)
                 arm_results.append(
                     {
                         "name": name,
@@ -7306,8 +8237,10 @@ def _scratch_synthetic_restore_diagnostic_worker(
             raise RuntimeError("Synthetic restore archive changed during its diagnostic arms.")
         report = {
             "kind": "synthetic_restore_diagnostic",
-            "schema": 2,
+            "schema": 3,
             "status": "completed",
+            "scratch_backend": scratch_backend,
+            "scratch_filesystem_capacity_bytes": filesystem_capacity_bytes,
             "postgres_version": postgres_version,
             "source_fixture": SCRATCH_SYNTHETIC_FIXTURE_ID,
             "fixture_row_count": SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
@@ -7353,14 +8286,31 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         if name.startswith("PG"):
             os.environ.pop(name, None)
     root = pathlib.Path(args._scratch_root)
+    scratch_backend = getattr(args, "_scratch_backend", SCRATCH_BACKEND_TMPFS_V1)
     args._scratch_fault_site = "worker_root_identity"
     if (
         not re.fullmatch(r"/run/oldsparky-backup-restore-[0-9a-f]{24}", str(root))
         or not root.is_dir()
+        or scratch_backend not in SCRATCH_BACKENDS
     ):
         raise RuntimeError("Scratch restore root is invalid.")
+    if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+        if os.geteuid() != 0:
+            raise RuntimeError("Scratch disk-image worker is not root before filesystem setup.")
+        os.chmod(root, 0o700)
+        root_info = root.lstat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != 0
+            or root_info.st_gid != 0
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+        ):
+            raise RuntimeError("Scratch ext4 root could not be secured root:root mode 0700.")
     args._scratch_fault_site = "worker_mount_snapshot"
-    _scratch_mount_snapshot(root)
+    if scratch_backend == SCRATCH_BACKEND_TMPFS_V1:
+        _scratch_mount_snapshot(root)
+    else:
+        _scratch_mount_snapshot(root, backend=scratch_backend)
     args._scratch_fault_site = "worker_cgroup_snapshot"
     _scratch_cgroup_snapshot()
     args._scratch_fault_site = "worker_host_reserve"
@@ -7378,6 +8328,12 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         )
     if os.geteuid() != 0:
         raise RuntimeError("Scratch restore supervisor is not root.")
+    postgres = None
+    if (
+        scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+        and not getattr(args, "_scratch_authorization_probe", False)
+    ):
+        postgres = pwd.getpwnam("postgres")
     if getattr(args, "_scratch_synthetic_restore_diagnostic", False):
         if getattr(args, "_scratch_authorization_probe", False) or any(
             getattr(args, name, None) is not None
@@ -7455,9 +8411,19 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         verify_archive,
     )
 
-    postgres = pwd.getpwnam("postgres")
+    if postgres is None:
+        postgres = pwd.getpwnam("postgres")
     args._scratch_fault_site = "worker_directory_setup"
-    os.chown(root, postgres.pw_uid, postgres.pw_gid)
+    if scratch_backend == SCRATCH_BACKEND_TMPFS_V1:
+        os.chown(root, postgres.pw_uid, postgres.pw_gid)
+    else:
+        args._scratch_fault_site = "worker_disk_root_postgres_transition"
+        _scratch_prepare_disk_root_for_postgres(
+            root,
+            postgres_uid=postgres.pw_uid,
+            postgres_gid=postgres.pw_gid,
+        )
+        args._scratch_fault_site = "worker_directory_setup"
     pgdata = root / "data"
     socket_dir = root / "socket"
     pglog = root / "postgres.log"
@@ -7807,22 +8773,50 @@ def _scratch_tmpfs_used_bytes(root: pathlib.Path) -> int:
     return used
 
 
-class _ScratchTmpfsPeakSampler:
-    """Capture a bounded sampled tmpfs high-water mark during one restore."""
+class _ScratchFilesystemPeakSampler:
+    """Capture the bounded backend-specific filesystem high-water mark."""
 
-    def __init__(self, root: pathlib.Path) -> None:
+    def __init__(
+        self,
+        root: pathlib.Path,
+        *,
+        backend: str = SCRATCH_BACKEND_TMPFS_V1,
+        postgres_owner: tuple[int, int] | None = None,
+    ) -> None:
+        if type(backend) is not str or backend not in SCRATCH_BACKENDS:
+            raise ValueError("Scratch filesystem sampler backend is unsupported.")
+        if backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1 and postgres_owner is None:
+            raise ValueError("Disk filesystem sampler requires the exact postgres owner.")
         self.root = root
+        self.backend = backend
+        self.postgres_owner = postgres_owner
         self.stop_event = threading.Event()
         self.peak_bytes = 0
+        self.capacity_bytes: int | None = None
         self.error: BaseException | None = None
         self.thread = threading.Thread(
             target=self._run,
-            name="scratch-tmpfs-sampler",
+            name="scratch-filesystem-sampler",
             daemon=True,
         )
 
     def _sample(self) -> None:
-        self.peak_bytes = max(self.peak_bytes, _scratch_tmpfs_used_bytes(self.root))
+        if self.backend == SCRATCH_BACKEND_TMPFS_V1:
+            capacity = SCRATCH_TMPFS_BYTES
+            used = _scratch_tmpfs_used_bytes(self.root)
+        else:
+            assert self.postgres_owner is not None
+            snapshot = _scratch_disk_mount_snapshot(
+                self.root, expected_owner=self.postgres_owner
+            )
+            capacity = int(snapshot["total_bytes"])
+            used = capacity - int(snapshot["free_bytes"])
+            if used < 0 or used > capacity - SCRATCH_TMPFS_STOP_BYTES:
+                raise RuntimeError("Synthetic restore ext4 measurement is outside its stop bound.")
+        if self.capacity_bytes is not None and capacity != self.capacity_bytes:
+            raise RuntimeError("Synthetic restore filesystem capacity changed during sampling.")
+        self.capacity_bytes = capacity
+        self.peak_bytes = max(self.peak_bytes, used)
 
     def _run(self) -> None:
         try:
@@ -7942,7 +8936,23 @@ def _scratch_unit_command(
     private_scratch_diagnostics: bool = False,
     authorization_probe: bool = False,
     synthetic_restore_diagnostic: bool = False,
+    scratch_backend: str = SCRATCH_BACKEND_TMPFS_V1,
+    scratch_image_path: pathlib.Path | None = None,
 ) -> list[str]:
+    if scratch_backend not in SCRATCH_BACKENDS:
+        raise ValueError("Scratch restore backend is not supported.")
+    if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+        if (
+            scratch_image_path is None
+            or scratch_image_path.parent != SCRATCH_DISK_IMAGE_ROOT
+        ):
+            raise ValueError("Disk-image scratch backend requires one exact image and a supported protocol.")
+        if authorization_probe and any(
+            value is not None for value in (archive_path, archive_stat, archive_sha256)
+        ):
+            raise ValueError("Disk-image authorization probe cannot bind archive inputs.")
+    elif scratch_image_path is not None:
+        raise ValueError("Tmpfs scratch backend cannot bind a disk image.")
     source_script = pathlib.Path(__file__).resolve(strict=True)
     source_policy = source_script.with_name("platform_disk_policy.py").resolve(strict=True)
     python_binary = pathlib.Path(getattr(sys, "_base_executable", sys.executable)).resolve(strict=True)
@@ -7958,7 +8968,11 @@ def _scratch_unit_command(
         *([] if synthetic_restore_diagnostic else ["--collect"]),
         f"--unit={unit_name}",
         "--property=Type=exec",
-        f"--property=TemporaryFileSystem={mountpoint}:rw,size={SCRATCH_TMPFS_BYTES},mode=0700",
+        *(
+            [f"--property=MountImages={scratch_image_path}:{mountpoint}:rw,nosuid,nodev,noexec"]
+            if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+            else [f"--property=TemporaryFileSystem={mountpoint}:rw,size={SCRATCH_TMPFS_BYTES},mode=0700"]
+        ),
         f"--property=BindReadOnlyPaths={source_script}:{worker_target}",
         f"--property=BindReadOnlyPaths={source_policy}:{policy_target}",
         f"--property=MemoryMax={SCRATCH_MEMORY_MAX_BYTES}",
@@ -7997,6 +9011,8 @@ def _scratch_unit_command(
         SCRATCH_WORKER_MODE,
         "--_scratch-root",
         str(mountpoint),
+        "--_scratch-backend",
+        scratch_backend,
         "--_scratch-timestamp-slug",
         timestamp_slug,
     ]
@@ -8222,6 +9238,7 @@ def _scratch_service_snapshot(unit_name: str) -> dict[str, Any]:
         "CollectMode",
         "Result",
         "TemporaryFileSystem",
+        "MountImages",
         "BindReadOnlyPaths",
         "InaccessiblePaths",
         "RestrictAddressFamilies",
@@ -8372,18 +9389,52 @@ def _scratch_worker_candidate(stdout: bytes) -> dict[str, Any] | None:
 
 def valid_scratch_synthetic_restore_diagnostic(value: Any) -> bool:
     """Validate the diagnostic-only result; it is never a backup receipt."""
-    if not isinstance(value, dict) or set(value) != {
-        "kind", "schema", "status", "postgres_version", "source_fixture",
-        "fixture_row_count", "fixture_payload_bytes", "archive_format",
-        "archive_size_bytes", "archive_sha256", "arms",
-    }:
+    if not isinstance(value, dict):
+        return False
+    schema = value.get("schema")
+    if schema == 2:
+        expected_top_keys = {
+            "kind", "schema", "status", "postgres_version", "source_fixture",
+            "fixture_row_count", "fixture_payload_bytes", "archive_format",
+            "archive_size_bytes", "archive_sha256", "arms",
+        }
+        backend = SCRATCH_BACKEND_TMPFS_V1
+        filesystem_capacity = SCRATCH_TMPFS_BYTES
+    elif schema == 3:
+        expected_top_keys = {
+            "kind", "schema", "status", "scratch_backend",
+            "scratch_filesystem_capacity_bytes", "postgres_version", "source_fixture",
+            "fixture_row_count", "fixture_payload_bytes", "archive_format",
+            "archive_size_bytes", "archive_sha256", "arms",
+        }
+        backend = value.get("scratch_backend")
+        filesystem_capacity = value.get("scratch_filesystem_capacity_bytes")
+        if (
+            type(backend) is not str
+            or backend not in SCRATCH_BACKENDS
+            or type(filesystem_capacity) is not int
+            or (
+                backend == SCRATCH_BACKEND_TMPFS_V1
+                and filesystem_capacity != SCRATCH_TMPFS_BYTES
+            )
+            or (
+                backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+                and not SCRATCH_DISK_USABLE_MIN_BYTES
+                <= filesystem_capacity
+                <= SCRATCH_DISK_IMAGE_BYTES
+            )
+        ):
+            return False
+    else:
+        return False
+    if set(value) != expected_top_keys:
         return False
     archive_sha256 = value.get("archive_sha256")
     arms = value.get("arms")
     if (
         value.get("kind") != "synthetic_restore_diagnostic"
         or type(value.get("schema")) is not int
-        or value["schema"] != 2
+        or value["schema"] not in (2, 3)
         or value.get("status") != "completed"
         or type(value.get("postgres_version")) is not str
         or re.fullmatch(r"16\.\d+", value["postgres_version"]) is None
@@ -8431,21 +9482,40 @@ def valid_scratch_synthetic_restore_diagnostic(value: Any) -> bool:
         ):
             return False
         for phase_index, phase in enumerate(arm["phases"]):
-            phase_keys = {
+            common_phase_keys = {
                 "phase", "wal_before_bytes", "wal_after_bytes", "wal_delta_bytes",
                 "restore_command_elapsed_us", "phase_elapsed_us",
                 "memory_start_bytes", "memory_peak_bytes",
-                "tmpfs_peak_sampled_bytes", "tmpfs_sample_period_ms", "memory_scope",
-                "wal_scope", "elapsed_scope", "phase_elapsed_scope", "tmpfs_scope",
+                "memory_scope", "wal_scope", "elapsed_scope", "phase_elapsed_scope",
             }
+            if schema == 2 or backend == SCRATCH_BACKEND_TMPFS_V1:
+                phase_keys = common_phase_keys | {
+                    "tmpfs_peak_sampled_bytes", "tmpfs_sample_period_ms", "tmpfs_scope"
+                }
+                peak_key = "tmpfs_peak_sampled_bytes"
+                period_key = "tmpfs_sample_period_ms"
+                scope_key = "tmpfs_scope"
+                capacity = SCRATCH_TMPFS_BYTES
+                expected_scope = SCRATCH_SYNTHETIC_TMPFS_SCOPE
+            else:
+                phase_keys = common_phase_keys | {
+                    "disk_peak_sampled_bytes", "disk_capacity_bytes",
+                    "disk_sample_period_ms", "disk_scope",
+                }
+                peak_key = "disk_peak_sampled_bytes"
+                period_key = "disk_sample_period_ms"
+                scope_key = "disk_scope"
+                capacity = filesystem_capacity
+                expected_scope = SCRATCH_SYNTHETIC_DISK_SCOPE
             if not isinstance(phase, dict) or set(phase) != phase_keys:
                 return False
             integer_fields = (
                 "wal_before_bytes", "wal_after_bytes", "wal_delta_bytes",
                 "restore_command_elapsed_us", "phase_elapsed_us",
-                "memory_start_bytes", "memory_peak_bytes", "tmpfs_peak_sampled_bytes",
-                "tmpfs_sample_period_ms",
+                "memory_start_bytes", "memory_peak_bytes", peak_key, period_key,
             )
+            if schema == 3 and backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+                integer_fields += ("disk_capacity_bytes",)
             if (
                 phase.get("phase") != SCRATCH_SYNTHETIC_RESTORE_PHASES[phase_index]
                 or any(type(phase.get(field)) is not int for field in integer_fields)
@@ -8460,14 +9530,23 @@ def valid_scratch_synthetic_restore_diagnostic(value: Any) -> bool:
                 <= SCRATCH_RUNTIME_SECONDS * 1_000_000
                 or not 0 < phase["memory_start_bytes"] <= SCRATCH_MEMORY_MAX_BYTES
                 or not phase["memory_start_bytes"] <= phase["memory_peak_bytes"] <= SCRATCH_MEMORY_MAX_BYTES
-                or not 0 <= phase["tmpfs_peak_sampled_bytes"] <= SCRATCH_TMPFS_BYTES
-                or phase["tmpfs_sample_period_ms"]
+                or not 0 <= phase[peak_key] <= (
+                    capacity - SCRATCH_TMPFS_STOP_BYTES
+                    if backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+                    else capacity
+                )
+                or phase[period_key]
                 != int(SCRATCH_SYNTHETIC_TMPFS_SAMPLE_SECONDS * 1000)
+                or (
+                    schema == 3
+                    and backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+                    and phase["disk_capacity_bytes"] != filesystem_capacity
+                )
                 or phase.get("memory_scope") != SCRATCH_SYNTHETIC_MEMORY_SCOPE
                 or phase.get("wal_scope") != SCRATCH_SYNTHETIC_WAL_SCOPE
                 or phase.get("elapsed_scope") != SCRATCH_SYNTHETIC_ELAPSED_SCOPE
                 or phase.get("phase_elapsed_scope") != SCRATCH_SYNTHETIC_PHASE_ELAPSED_SCOPE
-                or phase.get("tmpfs_scope") != SCRATCH_SYNTHETIC_TMPFS_SCOPE
+                or phase.get(scope_key) != expected_scope
             ):
                 return False
     logical_digests = {arm["logical_sha256"] for arm in arms}
@@ -8519,7 +9598,16 @@ def _scratch_expected_properties(
     python_binary: pathlib.Path,
     authorization_probe: bool = False,
     synthetic_restore_diagnostic: bool = False,
+    scratch_backend: str = SCRATCH_BACKEND_TMPFS_V1,
+    scratch_image_path: pathlib.Path | None = None,
 ) -> str:
+    def fail(site: str, message: str, cause: BaseException | None = None) -> None:
+        error = RuntimeError(message)
+        setattr(error, "scratch_verification_site", site)
+        if cause is not None:
+            raise error from cause
+        raise error
+
     if authorization_probe and synthetic_restore_diagnostic:
         raise ValueError("Scratch authorization probe and synthetic diagnostic are mutually exclusive.")
     properties = snapshot.get("properties")
@@ -8559,22 +9647,36 @@ def _scratch_expected_properties(
                 process_cgroup = fields[2]
                 break
     except OSError as exc:
-        raise RuntimeError("Scratch restore worker process identity disappeared during verification.") from exc
+        fail("process_cgroup_read", "Scratch restore worker process identity disappeared during verification.", exc)
     if process_cgroup != control_group:
-        raise RuntimeError("Scratch restore worker is outside its reviewed systemd cgroup.")
+        fail("process_cgroup_mismatch", "Scratch restore worker is outside its reviewed systemd cgroup.")
     try:
         expected_python = python_binary.stat()
+    except OSError as exc:
+        fail("expected_executable_stat", "Scratch restore interpreter identity disappeared during verification.", exc)
+    try:
         running_python = pathlib.Path(f"/proc/{pid_text}/exe").stat()
     except OSError as exc:
-        raise RuntimeError("Scratch restore interpreter identity disappeared during verification.") from exc
+        fail("proc_exe_stat", "Scratch restore interpreter identity disappeared during verification.", exc)
     if (running_python.st_dev, running_python.st_ino) != (
         expected_python.st_dev,
         expected_python.st_ino,
     ):
-        raise RuntimeError("Scratch restore interpreter does not match the pinned host executable.")
-    tmpfs = properties.get("TemporaryFileSystem", "")
-    if str(mountpoint) not in tmpfs:
-        raise RuntimeError("Scratch restore tmpfs request is not present in the active unit.")
+        fail("proc_exe_mismatch", "Scratch restore interpreter does not match the pinned host executable.")
+    if scratch_backend == SCRATCH_BACKEND_TMPFS_V1:
+        tmpfs = properties.get("TemporaryFileSystem", "")
+        if str(mountpoint) not in tmpfs or properties.get("MountImages", ""):
+            raise RuntimeError("Scratch restore tmpfs request is not present in the active unit.")
+    elif scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+        mount_images = properties.get("MountImages", "")
+        if (
+            scratch_image_path is None
+            or f"{scratch_image_path}:{mountpoint}:" not in mount_images
+            or properties.get("TemporaryFileSystem", "")
+        ):
+            raise RuntimeError("Scratch restore disk image request is not present in the active unit.")
+    else:
+        raise RuntimeError("Scratch restore backend is not supported.")
     inaccessible = properties.get("InaccessiblePaths", "")
     for required in _SCRATCH_INACCESSIBLE_PATHS:
         if required not in inaccessible:
@@ -9018,6 +10120,7 @@ def _run_isolated_restore_drill(
     private_scratch_diagnostics: bool = False,
     authorization_probe: bool = False,
     synthetic_restore_diagnostic: bool = False,
+    scratch_backend: str = SCRATCH_BACKEND_TMPFS_V1,
 ) -> int | dict[str, Any]:
     """Run an existing-archive drill or one of the fixed no-input protocols."""
     fault_site = "controller_entry"
@@ -9028,6 +10131,8 @@ def _run_isolated_restore_drill(
             raise ValueError("Scratch restore timestamp identity is invalid.")
         if authorization_probe and synthetic_restore_diagnostic:
             raise ValueError("Scratch authorization probe and synthetic diagnostic are mutually exclusive.")
+        if scratch_backend not in SCRATCH_BACKENDS:
+            raise ValueError("Scratch restore backend is not supported.")
         if synthetic_restore_diagnostic and (dump_path is not None or private_scratch_diagnostics):
             raise ValueError("Synthetic restore diagnostic must not receive an archive or private archive diagnostics.")
         fault_site = "controller_entry"
@@ -9108,6 +10213,12 @@ def _run_isolated_restore_drill(
         token = secrets.token_hex(12)
         mountpoint = pathlib.Path(f"/run/oldsparky-backup-restore-{token}")
         unit_name = f"oldsparky-backup-restore-{token}.service"
+        image_path = (
+            SCRATCH_DISK_IMAGE_ROOT / f"restore-{token}.ext4"
+            if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+            else None
+        )
+        image_identity: tuple[int, int, int, int, int, int, int] | None = None
         fault_site = "controller_unit_setup"
         command = _scratch_unit_command(
             mountpoint=mountpoint,
@@ -9119,6 +10230,8 @@ def _run_isolated_restore_drill(
             private_scratch_diagnostics=private_scratch_diagnostics,
             authorization_probe=authorization_probe,
             synthetic_restore_diagnostic=synthetic_restore_diagnostic,
+            scratch_backend=scratch_backend,
+            scratch_image_path=image_path,
         )
         environment = {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -9144,6 +10257,7 @@ def _run_isolated_restore_drill(
         early_exit_phase = "unit_exited_before_confinement"
         verification_error = "none"
         verification_errno: int | None = None
+        verification_site = "none"
         active_control_group: str | None = None
         active_snapshot: dict[str, Any] | None = None
         active_identity: tuple[str, str, str] | None = None
@@ -9180,7 +10294,34 @@ def _run_isolated_restore_drill(
             ):
                 mountpoint.rmdir()
                 raise RuntimeError("Scratch restore mountpoint identity is unsafe.")
+            if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+                assert image_path is not None
+                image_path, image_identity = _scratch_prepare_disk_image(token)
         except BaseException:
+            if image_path is not None and image_identity is not None:
+                try:
+                    current_image = _scratch_image_path_identity(image_path)
+                    if current_image == image_identity:
+                        image_path.unlink()
+                        _scratch_fsync_directory(image_path.parent)
+                except BaseException:
+                    # Before systemd receives the source, uncertainty retains
+                    # the exact root-owned inode rather than risking a wrong delete.
+                    pass
+            try:
+                current_mountpoint = mountpoint.lstat()
+                if (
+                    (current_mountpoint.st_dev, current_mountpoint.st_ino)
+                    == mountpoint_identity
+                    and stat.S_ISDIR(current_mountpoint.st_mode)
+                    and current_mountpoint.st_uid == 0
+                    and current_mountpoint.st_gid == 0
+                    and stat.S_IMODE(current_mountpoint.st_mode) == 0o700
+                    and not any(mountpoint.iterdir())
+                ):
+                    mountpoint.rmdir()
+            except BaseException:
+                pass
             signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
             raise
         try:
@@ -9383,11 +10524,21 @@ def _run_isolated_restore_drill(
                             ).resolve(strict=True),
                             authorization_probe=authorization_probe,
                             synthetic_restore_diagnostic=synthetic_restore_diagnostic,
+                            scratch_backend=scratch_backend,
+                            scratch_image_path=image_path,
                         )
                         _scratch_control_group_snapshot(verified_control_group)
                         invocation_id = properties.get("InvocationID", "")
                         if re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None:
                             raise RuntimeError("Scratch restore unit invocation identity is unavailable.")
+                        if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+                            assert image_path is not None and image_identity is not None
+                            _scratch_verify_process_image_mount(
+                                pid=pid_text,
+                                mountpoint=mountpoint,
+                                image_path=image_path,
+                                image_identity=image_identity,
+                            )
                         process_start_time = _scratch_process_start_time(pid_text)
                         observed_identity = (pid_text, invocation_id, process_start_time)
                         if active_identity is not None and observed_identity != active_identity:
@@ -9416,8 +10567,18 @@ def _run_isolated_restore_drill(
                                 ).resolve(strict=True),
                                 authorization_probe=authorization_probe,
                                 synthetic_restore_diagnostic=synthetic_restore_diagnostic,
+                                scratch_backend=scratch_backend,
+                                scratch_image_path=image_path,
                             )
                             _scratch_control_group_snapshot(second_control_group)
+                            if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+                                assert image_path is not None and image_identity is not None
+                                _scratch_verify_process_image_mount(
+                                    pid=pid_text,
+                                    mountpoint=mountpoint,
+                                    image_path=image_path,
+                                    image_identity=image_identity,
+                                )
                             if (
                                 second_control_group != verified_control_group
                                 or _scratch_process_start_time(pid_text) != process_start_time
@@ -9453,6 +10614,7 @@ def _run_isolated_restore_drill(
                         verification_error, verification_errno = (
                             _scratch_verification_error_details(verification_exception)
                         )
+                        verification_site = _scratch_verification_site(verification_exception)
                         raise
                     early_exit_snapshot = None
                 elif (
@@ -9536,8 +10698,18 @@ def _run_isolated_restore_drill(
                             ).resolve(strict=True),
                             authorization_probe=authorization_probe,
                             synthetic_restore_diagnostic=synthetic_restore_diagnostic,
+                            scratch_backend=scratch_backend,
+                            scratch_image_path=image_path,
                         )
                         _scratch_control_group_snapshot(final_control_group)
+                        if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+                            assert image_path is not None and image_identity is not None
+                            _scratch_verify_process_image_mount(
+                                pid=final_pid,
+                                mountpoint=mountpoint,
+                                image_path=image_path,
+                                image_identity=image_identity,
+                            )
                         if (
                             final_control_group != active_control_group
                             or _scratch_process_start_time(final_pid) != active_identity[2]
@@ -9623,6 +10795,7 @@ def _run_isolated_restore_drill(
                     verification_error, verification_errno = (
                         _scratch_verification_error_details(snapshot_error)
                     )
+                    verification_site = _scratch_verification_site(snapshot_error)
                     raise RuntimeError(
                         "Scratch restore final service state could not be verified."
                     ) from snapshot_error
@@ -9830,6 +11003,7 @@ def _run_isolated_restore_drill(
                         phase=early_exit_phase,
                         verification_error=verification_error,
                         verification_errno=verification_errno,
+                        verification_site=verification_site,
                         terminal_snapshot=terminal_snapshot,
                     )
                     if diagnostic is not None:
@@ -9971,6 +11145,44 @@ def _run_isolated_restore_drill(
             except BaseException as cleanup_error:
                 mountpoint_removed = False
                 final_cleanup_errors.append(cleanup_error)
+            image_removed: bool | None = None
+            if image_path is not None and image_identity is not None:
+                image_removed = False
+                retain_reason = "cleanup_observer_failed"
+                try:
+                    if not service_stopped:
+                        retain_reason = "service_not_stopped"
+                    elif not mount_absent:
+                        retain_reason = "host_mount_present"
+                    elif not mountpoint_removed:
+                        retain_reason = "mountpoint_not_removed"
+                    elif not _scratch_wait_for_image_loop_release(image_path, image_identity):
+                        retain_reason = "loop_association_persists"
+                    else:
+                        _scratch_unlink_image_exact(image_path, image_identity)
+                        image_removed = True
+                except BaseException as cleanup_error:
+                    current_identity: tuple[int, int, int, int, int, int, int] | None
+                    try:
+                        current_identity = _scratch_image_path_identity(image_path)
+                    except BaseException:
+                        current_identity = None
+                    if current_identity is not None and current_identity != image_identity:
+                        retain_reason = "image_identity_changed"
+                    final_cleanup_errors.append(cleanup_error)
+                if not image_removed:
+                    try:
+                        _scratch_write_image_cleanup_receipt(
+                            image_path,
+                            image_identity,
+                            unit_name=unit_name,
+                            reason=retain_reason,
+                        )
+                    except BaseException as cleanup_error:
+                        final_cleanup_errors.append(cleanup_error)
+                    final_cleanup_errors.append(
+                        RuntimeError("Scratch disk image was retained because teardown was not proven.")
+                    )
             protected_paths_cleaned = not synthetic_restore_diagnostic
             if synthetic_restore_diagnostic:
                 try:
@@ -10016,6 +11228,7 @@ def _run_isolated_restore_drill(
                 not service_stopped
                 or not mount_absent
                 or not mountpoint_removed
+                or image_removed is False
                 or not protected_paths_cleaned
             ):
                 final_cleanup_errors.append(
@@ -10028,6 +11241,7 @@ def _run_isolated_restore_drill(
                 service_stopped=service_stopped,
                 mount_absent=mount_absent,
                 mountpoint_removed=mountpoint_removed,
+                image_removed=image_removed,
                 protected_paths_cleaned=protected_paths_cleaned,
             )
             if cleanup_failure is not None:
@@ -10074,13 +11288,16 @@ def _run_isolated_restore_drill(
             os.close(archive_descriptor)
 
 
-def run_synthetic_restore_diagnostic() -> dict[str, Any]:
+def run_synthetic_restore_diagnostic(
+    *, scratch_backend: str = SCRATCH_BACKEND_TMPFS_V1
+) -> dict[str, Any]:
     """Run the fixed three-arm synthetic diagnostic through the verified unit."""
     timestamp_slug = utc_now().strftime("%Y%m%dT%H%M%SZ")
     result = _run_isolated_restore_drill(
         None,
         timestamp_slug=timestamp_slug,
         synthetic_restore_diagnostic=True,
+        scratch_backend=scratch_backend,
     )
     if not valid_scratch_synthetic_restore_diagnostic(result):
         raise RuntimeError("Synthetic restore diagnostic did not return a complete report.")
@@ -10492,13 +11709,16 @@ def verify_existing_dump(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def run_scratch_authorization_probe() -> dict[str, Any]:
+def run_scratch_authorization_probe(
+    *, scratch_backend: str = SCRATCH_BACKEND_TMPFS_V1
+) -> dict[str, Any]:
     """Exercise only the staged helper's pre-archive authorization protocol."""
     _run_isolated_restore_drill(
         None,
         timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
         private_scratch_diagnostics=True,
         authorization_probe=True,
+        scratch_backend=scratch_backend,
     )
     return {"schema": 1, "status": "completed"}
 
@@ -10624,6 +11844,54 @@ def main() -> int:
                     site=getattr(args, "_scratch_fault_site", "worker_entry"),
                 )
                 raise
+        if getattr(args, "_scratch_authorization_probe", False):
+            if any(
+                (
+                    args.check_latest,
+                    args.verify_latest_existing,
+                    args.dump_only,
+                    args.verify_dump is not None,
+                    args.protected_backup_manifest is not None,
+                )
+            ):
+                raise ValueError("Scratch authorization probe cannot be combined with backup modes.")
+            result = run_scratch_authorization_probe(
+                scratch_backend=args._scratch_backend
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        if getattr(args, "_scratch_synthetic_restore_diagnostic", False):
+            if (
+                not args.as_json
+                or args.private_scratch_diagnostics
+                or args.check_latest
+                or args.verify_latest_existing
+                or args.dump_only
+                or args.verify_dump is not None
+                or args.protected_backup_manifest is not None
+                or args.admin_database_url is not None
+                or args.output_dir != str(DEFAULT_OUTPUT_DIR)
+                or args.env_file != str(DEFAULT_ENV_FILE)
+                or args.keep != 14
+                or args.rotate_existing is not True
+                or args.max_age_hours != 24.0
+                or getattr(args, "_scratch_authorization_probe", False)
+                or getattr(args, "_scratch_restore_worker", False)
+                or any(
+                    getattr(args, name, None) is not None
+                    for name in (
+                        "_scratch_root", "_scratch_archive", "_scratch_archive_dev",
+                        "_scratch_archive_ino", "_scratch_archive_size",
+                        "_scratch_archive_sha256", "_scratch_timestamp_slug",
+                    )
+                )
+            ):
+                raise ValueError("Synthetic restore diagnostic accepts only its typed JSON mode.")
+            result = run_synthetic_restore_diagnostic(
+                scratch_backend=args._scratch_backend
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         selected_modes = (
             int(args.check_latest)
             + int(getattr(args, "verify_latest_existing", False))

@@ -18,6 +18,14 @@ on:
         options:
           - standard
           - baseline-runtime
+      scratch_backend:
+        description: "Synthetic PG16 restore diagnostic backend (standard non-dev dispatch only)"
+        required: true
+        default: tmpfs_v1
+        type: choice
+        options:
+          - tmpfs_v1
+          - disk_ext4_image_v1
       target_sha:
         description: "Exact target SHA (baseline-runtime only)"
         required: false
@@ -775,12 +783,15 @@ jobs:
       - name: Run synthetic restore diagnostic first on feature dispatches
         id: synthetic_restore_first
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'standard' && github.ref != 'refs/heads/dev' }}
+        env:
+          PLATFORM_SCRATCH_BACKEND: ${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'standard' && github.ref != 'refs/heads/dev' && inputs.scratch_backend == 'disk_ext4_image_v1' && 'disk_ext4_image_v1' || 'tmpfs_v1' }}
         run: >-
           sudo -n env -i
           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
           HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
           GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          PLATFORM_SCRATCH_BACKEND="$PLATFORM_SCRATCH_BACKEND"
           PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
           PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
           PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials
@@ -799,12 +810,15 @@ jobs:
             "$GITHUB_WORKSPACE/platform/ci-backend/backend-privileged/synthetic-restore-diagnostic-failure.json"
       - name: Run serial privileged catalog contour exactly once as root
         if: ${{ success() && steps.synthetic_restore_first.outcome != 'failure' }}
+        env:
+          PLATFORM_SCRATCH_BACKEND: ${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'standard' && github.ref != 'refs/heads/dev' && inputs.scratch_backend == 'disk_ext4_image_v1' && 'disk_ext4_image_v1' || 'tmpfs_v1' }}
         run: >-
           sudo -n env -i
           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
           HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
           GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          PLATFORM_SCRATCH_BACKEND="$PLATFORM_SCRATCH_BACKEND"
           PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
           PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
           PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials

@@ -138,10 +138,14 @@ def _write_synthetic_restore_diagnostic_artifact(
         or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
     ):
         raise RuntimeError("Synthetic restore CI artifact context failed validation.")
+    scratch_backend = report.get("scratch_backend")
+    if type(scratch_backend) is not str or scratch_backend not in backup_drill.SCRATCH_BACKENDS:
+        raise RuntimeError("Synthetic restore CI artifact backend failed validation.")
     artifact = {
         "kind": "synthetic_restore_diagnostic_artifact",
         "schema": 1,
         "source_sha": source_sha,
+        "scratch_backend": scratch_backend,
         "diagnostic": report,
     }
     return _write_synthetic_restore_ci_artifact(
@@ -296,9 +300,16 @@ def _classify_synthetic_restore_stderr(
 
 
 def _write_synthetic_restore_failure_artifact(
-    failure: Exception, *, source_sha: str
+    failure: Exception,
+    *,
+    source_sha: str,
+    scratch_backend: str = backup_drill.SCRATCH_BACKEND_TMPFS_V1,
 ) -> pathlib.Path:
-    if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+        or type(scratch_backend) is not str
+        or scratch_backend not in backup_drill.SCRATCH_BACKENDS
+    ):
         raise RuntimeError("Synthetic restore failure artifact source failed validation.")
     unit_diagnostic = getattr(failure, "scratch_unit_diagnostic", None)
     if unit_diagnostic is not None and not backup_drill.valid_scratch_unit_diagnostic(
@@ -374,6 +385,7 @@ def _write_synthetic_restore_failure_artifact(
         "kind": "synthetic_restore_diagnostic_failure_artifact",
         "schema": 1,
         "source_sha": source_sha,
+        "scratch_backend": scratch_backend,
         "test_id": _SYNTHETIC_RESTORE_TEST_ID,
         "failure_stage": "run_synthetic_restore_diagnostic",
         "scratch_first_fault": first_fault,
@@ -389,12 +401,23 @@ def _write_synthetic_restore_failure_artifact(
     )
 
 
-def _run_synthetic_restore_diagnostic_for_ci(*, source_sha: str) -> dict[str, Any]:
+def _run_synthetic_restore_diagnostic_for_ci(
+    *, source_sha: str, scratch_backend: str | None = None
+) -> dict[str, Any]:
+    backend = (
+        os.environ.get("PLATFORM_SCRATCH_BACKEND", backup_drill.SCRATCH_BACKEND_TMPFS_V1)
+        if scratch_backend is None
+        else scratch_backend
+    )
+    if type(backend) is not str or backend not in backup_drill.SCRATCH_BACKENDS:
+        raise RuntimeError("Synthetic restore backend selection failed closed.")
     try:
-        return backup_drill.run_synthetic_restore_diagnostic()
+        return backup_drill.run_synthetic_restore_diagnostic(scratch_backend=backend)
     except Exception as failure:
         try:
-            _write_synthetic_restore_failure_artifact(failure, source_sha=source_sha)
+            _write_synthetic_restore_failure_artifact(
+                failure, source_sha=source_sha, scratch_backend=backend
+            )
         except Exception:
             # The original diagnostic exception remains the test failure if
             # secondary evidence cannot be retained; never serialize raw details.
@@ -973,6 +996,1135 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._proc_start_time_patch.start()
         self.addCleanup(self._proc_start_time_patch.stop)
 
+    def test_scratch_disk_image_backend_command_and_mount_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            scratch_root = pathlib.Path(temporary_dir) / "scratch"
+            scratch_root.mkdir(mode=0o700)
+            archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
+            archive_path.write_bytes(b"PGDMPsynthetic archive")
+            image_path = backup_drill.SCRATCH_DISK_IMAGE_ROOT / "restore-0123456789abcdef01234567.ext4"
+            common = {
+                "mountpoint": scratch_root,
+                "archive_path": archive_path,
+                "archive_stat": archive_path.stat(),
+                "archive_sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+                "timestamp_slug": "20261012T000000Z",
+                "unit_name": "oldsparky-backup-restore-0123456789abcdef01234567.service",
+            }
+            default_command = backup_drill._scratch_unit_command(**common)
+            self.assertTrue(any(
+                item.startswith("--property=TemporaryFileSystem=") for item in default_command
+            ))
+            self.assertFalse(any(item.startswith("--property=MountImages=") for item in default_command))
+
+            disk_command = backup_drill._scratch_unit_command(
+                **common,
+                scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                scratch_image_path=image_path,
+            )
+            self.assertIn(
+                f"--property=MountImages={image_path}:{scratch_root}:rw,nosuid,nodev,noexec",
+                disk_command,
+            )
+            self.assertFalse(any(
+                item.startswith("--property=TemporaryFileSystem=") for item in disk_command
+            ))
+            for invariant in (
+                "--property=MemoryMax=671088640",
+                "--property=MemorySwapMax=0",
+                "--property=PrivateNetwork=yes",
+                "--property=PrivateDevices=yes",
+                "--property=NoNewPrivileges=yes",
+            ):
+                self.assertIn(invariant, disk_command)
+            probe_command = backup_drill._scratch_unit_command(
+                mountpoint=scratch_root,
+                archive_path=None,
+                archive_stat=None,
+                archive_sha256=None,
+                timestamp_slug="20261012T000000Z",
+                unit_name="oldsparky-backup-restore-0123456789abcdef01234567.service",
+                authorization_probe=True,
+                scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                scratch_image_path=image_path,
+            )
+            self.assertIn("--_scratch-authorization-probe", probe_command)
+            self.assertFalse(any(
+                item.startswith("--property=BindReadOnlyPaths=") and "archive.dump" in item
+                for item in probe_command
+            ))
+            self.assertFalse(any("--_scratch-archive" in item for item in probe_command))
+            synthetic_disk_command = backup_drill._scratch_unit_command(
+                mountpoint=scratch_root,
+                archive_path=None,
+                archive_stat=None,
+                archive_sha256=None,
+                timestamp_slug="20261012T000000Z",
+                unit_name="oldsparky-backup-restore-0123456789abcdef01234567.service",
+                synthetic_restore_diagnostic=True,
+                scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                scratch_image_path=image_path,
+            )
+            self.assertIn(
+                f"--property=MountImages={image_path}:{scratch_root}:rw,nosuid,nodev,noexec",
+                synthetic_disk_command,
+            )
+            self.assertIn(backup_drill.SCRATCH_SYNTHETIC_RESTORE_DIAGNOSTIC_MODE, synthetic_disk_command)
+            self.assertIn("--property=MemorySwapMax=0", synthetic_disk_command)
+            self.assertIn("--property=PrivateDevices=yes", synthetic_disk_command)
+            self.assertFalse(any(
+                item.startswith("--property=BindReadOnlyPaths=") and "archive.dump" in item
+                for item in synthetic_disk_command
+            ))
+            self.assertFalse(any("--_scratch-archive" in item for item in synthetic_disk_command))
+            with self.assertRaisesRegex(ValueError, "cannot bind a disk image"):
+                backup_drill._scratch_unit_command(**common, scratch_image_path=image_path)
+
+    def test_synthetic_restore_diagnostic_cli_is_closed_and_backend_typed(self) -> None:
+        output = io.StringIO()
+        argv = [
+            str(backup_drill.__file__),
+            backup_drill.SCRATCH_SYNTHETIC_RESTORE_DIAGNOSTIC_MODE,
+            "--_scratch-backend",
+            backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+            "--json",
+        ]
+        result = {"kind": "synthetic_restore_diagnostic", "schema": 3}
+        with (
+            mock.patch.object(backup_drill.sys, "argv", argv),
+            mock.patch.object(
+                backup_drill, "run_synthetic_restore_diagnostic", return_value=result
+            ) as run_synthetic,
+            mock.patch.object(backup_drill, "create_backup") as create_backup,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(backup_drill.main(), 0)
+        run_synthetic.assert_called_once_with(
+            scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+        )
+        create_backup.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue()), result)
+
+        invalid = [*argv, "--verify-dump", "/root/protected.dump"]
+        with (
+            mock.patch.object(backup_drill.sys, "argv", invalid),
+            mock.patch.object(backup_drill, "run_synthetic_restore_diagnostic") as forbidden_run,
+            mock.patch.object(backup_drill, "create_backup") as forbidden_backup,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(backup_drill.main(), 1)
+        forbidden_run.assert_not_called()
+        forbidden_backup.assert_not_called()
+
+    def test_disk_image_authorization_probe_cli_is_typed_and_narrow(self) -> None:
+        argv = [
+            str(backup_drill.__file__),
+            "--_scratch-authorization-probe",
+            "--_scratch-backend",
+            backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+            "--json",
+            "--private-scratch-diagnostics",
+        ]
+        output = io.StringIO()
+        with (
+            mock.patch.object(backup_drill.sys, "argv", argv),
+            mock.patch.object(
+                backup_drill,
+                "run_scratch_authorization_probe",
+                return_value={"schema": 1, "status": "completed"},
+            ) as probe,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(backup_drill.main(), 0)
+        probe.assert_called_once_with(
+            scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+        )
+        self.assertEqual(json.loads(output.getvalue()), {"schema": 1, "status": "completed"})
+
+        invalid_argv = [
+            str(backup_drill.__file__),
+            "--_scratch-backend",
+            backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+        ]
+        with (
+            mock.patch.object(backup_drill.sys, "argv", invalid_argv),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            backup_drill.parse_args()
+
+    def test_scratch_disk_mount_snapshot_requires_exact_ext4_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            mountpoint = pathlib.Path(temporary_dir) / "scratch"
+            mountpoint.mkdir(mode=0o700)
+            mountpoint.chmod(0o700)
+            expected = (
+                str(mountpoint),
+                "7:42",
+                "ext4",
+                "/dev/disk/by-id/unit-private-alias",
+                "/",
+                "rw,nosuid,nodev,noexec,relatime",
+            )
+            statvfs_result = types.SimpleNamespace(
+                f_blocks=140_000,
+                f_frsize=4096,
+                f_bavail=20_000,
+            )
+            root_mount_stat = types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o700,
+                st_uid=0,
+                st_gid=0,
+                st_dev=mountpoint.stat().st_dev,
+                st_ino=mountpoint.stat().st_ino,
+            )
+            real_lstat = pathlib.Path.lstat
+
+            def root_owned_mount_lstat(path: pathlib.Path) -> os.stat_result:
+                if path == mountpoint:
+                    return root_mount_stat  # type: ignore[return-value]
+                return real_lstat(path)
+
+            with (
+                mock.patch.object(backup_drill, "_scratch_mountinfo_for", return_value=expected),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_sysfs_loop_device_predicates",
+                    return_value=(None, {
+                        "device_major_minor_valid": True,
+                        "sysfs_mount_verified": True,
+                        "sysfs_device_resolved": True,
+                        "sysfs_loop_device": True,
+                        "sysfs_device_number_matches": True,
+                        "sysfs_backing_file_present": True,
+                    }),
+                ),
+                mock.patch.object(backup_drill.os, "statvfs", return_value=statvfs_result),
+                mock.patch.object(pathlib.Path, "lstat", root_owned_mount_lstat),
+            ):
+                snapshot = backup_drill._scratch_disk_mount_snapshot(mountpoint)
+            self.assertEqual(snapshot["filesystem"], "ext4")
+            self.assertEqual(snapshot["device"], "7:42")
+            self.assertEqual(snapshot["total_bytes"], 140_000 * 4096)
+            self.assertEqual(snapshot["free_bytes"], 20_000 * 4096)
+
+            invalid_mounts = (
+                ((*expected[:2], "tmpfs", *expected[3:]), "filesystem_not_ext4", {"fs_ext4"}),
+                ((*expected[:4], "/nested", expected[5]), "mount_root_not_global", {"root_expected"}),
+                ((*expected[:5], "nosuid,nodev,noexec,relatime"), "mount_options_missing", {"option_rw"}),
+                ((*expected[:5], "rw,nodev,noexec,relatime"), "mount_options_missing", {"option_nosuid"}),
+                ((*expected[:5], "rw,nosuid,noexec,relatime"), "mount_options_missing", {"option_nodev"}),
+                ((*expected[:5], "rw,nosuid,nodev,relatime"), "mount_options_missing", {"option_noexec"}),
+                ((*expected[:3], " /dev/disk/by-id/unit-private-alias ", *expected[4:]), "source_noncanonical", {"source_canonical"}),
+                (("/other/mount", *expected[1:]), "mountpoint_mismatch", {"target_expected"}),
+            )
+            for invalid, expected_reason, failed_predicates in invalid_mounts:
+                with (
+                    self.subTest(invalid=invalid),
+                    mock.patch.object(backup_drill, "_scratch_mountinfo_for", return_value=invalid),
+                    mock.patch.object(
+                        backup_drill,
+                        "_scratch_sysfs_loop_device_predicates",
+                        return_value=(None, {
+                            "device_major_minor_valid": True,
+                            "sysfs_mount_verified": True,
+                            "sysfs_device_resolved": True,
+                            "sysfs_loop_device": True,
+                            "sysfs_device_number_matches": True,
+                            "sysfs_backing_file_present": True,
+                        }),
+                    ),
+                    mock.patch.object(backup_drill.os, "statvfs", return_value=statvfs_result),
+                    mock.patch.object(pathlib.Path, "lstat", root_owned_mount_lstat),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "pinned private ext4 image mount") as failure:
+                        backup_drill._scratch_disk_mount_snapshot(mountpoint)
+                    self.assertEqual(
+                        failure.exception.scratch_disk_mount_failure_reason,
+                        expected_reason,
+                    )
+                    predicates = failure.exception.scratch_disk_mount_predicates
+                    self.assertEqual(set(predicates), {
+                        "fs_ext4", "source_canonical", "device_major_minor_valid",
+                        "sysfs_mount_verified", "sysfs_device_resolved", "sysfs_loop_device",
+                        "sysfs_device_number_matches", "sysfs_backing_file_present", "root_expected",
+                        "target_expected", "option_rw", "option_nosuid", "option_nodev",
+                        "option_noexec",
+                    })
+                    self.assertEqual({key for key, value in predicates.items() if not value}, failed_predicates)
+                    first_fault = backup_drill._scratch_first_fault(
+                        failure.exception, origin="worker", site="worker_mount_snapshot"
+                    )
+                    self.assertTrue(backup_drill.valid_scratch_first_fault(first_fault))
+                    self.assertEqual(first_fault["disk_mount_failure_reason"], expected_reason)
+                    self.assertEqual(first_fault["disk_mount_predicates"], predicates)
+
+            for bad_stats, reason, expected_predicates in (
+                (
+                    types.SimpleNamespace(f_blocks=100_000, f_frsize=4096, f_bavail=20_000),
+                    "total_capacity_out_of_bounds",
+                    {"total_capacity_bounded": False, "free_capacity_above_stop": True},
+                ),
+                (
+                    types.SimpleNamespace(f_blocks=140_000, f_frsize=4096, f_bavail=1),
+                    "free_below_stop",
+                    {"total_capacity_bounded": True, "free_capacity_above_stop": False},
+                ),
+            ):
+                with (
+                    self.subTest(bad_stats=bad_stats),
+                    mock.patch.object(backup_drill, "_scratch_mountinfo_for", return_value=expected),
+                    mock.patch.object(
+                        backup_drill,
+                        "_scratch_sysfs_loop_device_predicates",
+                        return_value=(None, {
+                            "device_major_minor_valid": True,
+                            "sysfs_mount_verified": True,
+                            "sysfs_device_resolved": True,
+                            "sysfs_loop_device": True,
+                            "sysfs_device_number_matches": True,
+                            "sysfs_backing_file_present": True,
+                        }),
+                    ),
+                    mock.patch.object(backup_drill.os, "statvfs", return_value=bad_stats),
+                    mock.patch.object(pathlib.Path, "lstat", root_owned_mount_lstat),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "below its bounded usable capacity") as failure:
+                        backup_drill._scratch_disk_mount_snapshot(mountpoint)
+                    self.assertEqual(failure.exception.scratch_disk_mount_failure_reason, reason)
+                    self.assertEqual(failure.exception.scratch_disk_mount_predicates, expected_predicates)
+
+            with (
+                mock.patch.object(backup_drill, "_scratch_mountinfo_for", side_effect=OSError(2, "missing")),
+                mock.patch.object(pathlib.Path, "lstat", root_owned_mount_lstat),
+                self.assertRaises(RuntimeError) as failure,
+            ):
+                backup_drill._scratch_disk_mount_snapshot(mountpoint)
+            self.assertEqual(failure.exception.scratch_disk_mount_failure_reason, "mount_metadata")
+
+    def test_scratch_disk_mount_snapshot_projects_closed_failure_predicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            mountpoint = pathlib.Path(temporary_dir) / "scratch"
+            mountpoint.mkdir(mode=0o700)
+            mountpoint.chmod(0o700)
+            expected = (
+                str(mountpoint), "7:42", "ext4", "/dev/loop42", "/",
+                "rw,nosuid,nodev,noexec,relatime",
+            )
+            root_stat = types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o700,
+                st_uid=0,
+                st_gid=0,
+                st_dev=mountpoint.stat().st_dev,
+                st_ino=mountpoint.stat().st_ino,
+            )
+            real_lstat = pathlib.Path.lstat
+
+            def lstat(path: pathlib.Path) -> os.stat_result:
+                if path == mountpoint:
+                    return root_stat  # type: ignore[return-value]
+                return real_lstat(path)
+
+            bad_root = types.SimpleNamespace(**vars(root_stat))
+            bad_root.st_gid = 1
+            with (
+                mock.patch.object(backup_drill, "_scratch_mountinfo_for", return_value=expected),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_sysfs_loop_device_predicates",
+                    return_value=(None, {
+                        "device_major_minor_valid": True,
+                        "sysfs_mount_verified": True,
+                        "sysfs_device_resolved": True,
+                        "sysfs_loop_device": True,
+                        "sysfs_device_number_matches": True,
+                        "sysfs_backing_file_present": True,
+                    }),
+                ),
+                mock.patch.object(pathlib.Path, "lstat", lstat),
+                mock.patch.object(
+                    backup_drill.os,
+                    "statvfs",
+                    return_value=types.SimpleNamespace(
+                        f_blocks=100_000, f_frsize=4096, f_bavail=20_000
+                    ),
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as failure:
+                    backup_drill._scratch_disk_mount_snapshot(mountpoint)
+                self.assertEqual(
+                    failure.exception.scratch_disk_mount_failure_reason,
+                    "total_capacity_out_of_bounds",
+                )
+
+            with (
+                mock.patch.object(backup_drill, "_scratch_mountinfo_for", return_value=expected),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_sysfs_loop_device_predicates",
+                    return_value=(None, {
+                        "device_major_minor_valid": True,
+                        "sysfs_mount_verified": True,
+                        "sysfs_device_resolved": True,
+                        "sysfs_loop_device": True,
+                        "sysfs_device_number_matches": True,
+                        "sysfs_backing_file_present": True,
+                    }),
+                ),
+                mock.patch.object(pathlib.Path, "lstat", lambda path: bad_root if path == mountpoint else real_lstat(path)),
+            ):
+                with self.assertRaises(RuntimeError) as failure:
+                    backup_drill._scratch_disk_mount_snapshot(mountpoint)
+                self.assertEqual(
+                    failure.exception.scratch_disk_mount_failure_reason,
+                    "root_gid_mismatch",
+                )
+                self.assertEqual(failure.exception.scratch_disk_mount_predicates, {
+                    "root_uid": True, "root_gid": False, "root_mode_0700": True,
+                })
+
+            with (
+                mock.patch.object(backup_drill, "_scratch_mountinfo_for", return_value=expected),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_sysfs_loop_device_predicates",
+                    return_value=(None, {
+                        "device_major_minor_valid": True,
+                        "sysfs_mount_verified": True,
+                        "sysfs_device_resolved": True,
+                        "sysfs_loop_device": True,
+                        "sysfs_device_number_matches": True,
+                        "sysfs_backing_file_present": True,
+                    }),
+                ),
+                mock.patch.object(pathlib.Path, "lstat", lstat),
+                mock.patch.object(backup_drill.os, "statvfs", side_effect=OSError(5, "private")),
+            ):
+                with self.assertRaises(RuntimeError) as failure:
+                    backup_drill._scratch_disk_mount_snapshot(mountpoint)
+                self.assertEqual(
+                    failure.exception.scratch_disk_mount_failure_reason,
+                    "statvfs_unavailable",
+                )
+                self.assertEqual(backup_drill._scratch_exception_projection(failure.exception), ("os_error", 5))
+
+    def test_sysfs_mount_device_resolution_is_major_minor_bound_and_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            sys_root = pathlib.Path(temporary_dir) / "sys"
+            dev_block = sys_root / "dev" / "block"
+            devices = sys_root / "devices"
+            loop = devices / "virtual" / "block" / "loop42"
+            loop_loop = loop / "loop"
+            loop_loop.mkdir(parents=True)
+            dev_block.mkdir(parents=True)
+            (loop / "dev").write_text("7:42\n", encoding="ascii")
+            (loop_loop / "backing_file").write_text("/run/private/image.ext4\n", encoding="ascii")
+            (dev_block / "7:42").symlink_to(loop)
+
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_SYS_DEV_BLOCK_ROOT", dev_block),
+                mock.patch.object(backup_drill, "SCRATCH_SYS_DEVICES_ROOT", devices),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/sys", "0:1", "sysfs", "sysfs", "/", "ro,nosuid,nodev"),
+                ),
+            ):
+                reason, predicates = backup_drill._scratch_sysfs_loop_device_predicates("7:42")
+                self.assertIsNone(reason)
+                self.assertEqual(predicates, {
+                    "device_major_minor_valid": True,
+                    "sysfs_mount_verified": True,
+                    "sysfs_device_resolved": True,
+                    "sysfs_loop_device": True,
+                    "sysfs_device_number_matches": True,
+                    "sysfs_backing_file_present": True,
+                })
+                for malformed in ("7:042", "7/42", "7:42 "):
+                    with self.subTest(device=malformed):
+                        malformed_reason, malformed_predicates = (
+                            backup_drill._scratch_sysfs_loop_device_predicates(malformed)
+                        )
+                        self.assertEqual(malformed_reason, "device_major_minor_invalid")
+                        self.assertFalse(malformed_predicates["device_major_minor_valid"])
+
+                (dev_block / "7:43").symlink_to(loop)
+                mismatch_reason, mismatch = backup_drill._scratch_sysfs_loop_device_predicates("7:43")
+                self.assertEqual(mismatch_reason, "sysfs_device_number_mismatch")
+                self.assertTrue(mismatch["sysfs_loop_device"])
+                self.assertFalse(mismatch["sysfs_device_number_matches"])
+
+                not_loop = devices / "virtual" / "block" / "sda"
+                not_loop.mkdir(parents=True)
+                (not_loop / "dev").write_text("8:0\n", encoding="ascii")
+                (dev_block / "8:0").symlink_to(not_loop)
+                nonloop_reason, nonloop = backup_drill._scratch_sysfs_loop_device_predicates("8:0")
+                self.assertEqual(nonloop_reason, "sysfs_not_loop_device")
+                self.assertTrue(nonloop["sysfs_device_resolved"])
+                self.assertFalse(nonloop["sysfs_loop_device"])
+
+                (dev_block / "9:0").symlink_to(devices / "missing" / "loop9")
+                missing_reason, missing = backup_drill._scratch_sysfs_loop_device_predicates("9:0")
+                self.assertEqual(missing_reason, "sysfs_device_unavailable")
+                self.assertFalse(missing["sysfs_device_resolved"])
+
+                (loop_loop / "backing_file").unlink()
+                no_backing_reason, no_backing = backup_drill._scratch_sysfs_loop_device_predicates("7:42")
+                self.assertEqual(no_backing_reason, "sysfs_not_loop_device")
+                self.assertTrue(no_backing["sysfs_device_number_matches"])
+                self.assertFalse(no_backing["sysfs_backing_file_present"])
+
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_SYS_DEV_BLOCK_ROOT", dev_block),
+                mock.patch.object(backup_drill, "SCRATCH_SYS_DEVICES_ROOT", devices),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/sys", "0:1", "tmpfs", "tmpfs", "/", "ro"),
+                ),
+            ):
+                reason, predicates = backup_drill._scratch_sysfs_loop_device_predicates("7:42")
+                self.assertEqual(reason, "sysfs_mount_unverified")
+                self.assertFalse(predicates["sysfs_mount_verified"])
+
+    def test_process_image_mount_accepts_source_alias_only_with_exact_loop_join(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            mountpoint = pathlib.Path(temporary_dir) / "scratch"
+            mountpoint.mkdir(mode=0o700)
+            image_path = pathlib.Path(temporary_dir) / "image.ext4"
+            image_path.write_bytes(b"synthetic fixed image")
+            info = image_path.stat()
+            identity = (info.st_dev, info.st_ino, info.st_size, info.st_uid, info.st_gid, 0o600, 1)
+            loop_matches = [("loop42", "7:42")]
+            mountinfo = (
+                "1 0 7:42 / "
+                + str(mountpoint)
+                + " rw,nosuid,nodev,noexec,relatime - ext4 /dev/disk/by-id/private-alias rw\n"
+            )
+            with (
+                mock.patch.object(backup_drill, "_scratch_image_path_identity", return_value=identity),
+                mock.patch.object(backup_drill, "_scratch_image_loop_matches", return_value=loop_matches),
+                mock.patch.object(pathlib.Path, "read_text", return_value=mountinfo),
+                mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
+            ):
+                self.assertEqual(
+                    backup_drill._scratch_verify_process_image_mount(
+                        pid="123", mountpoint=mountpoint, image_path=image_path, image_identity=identity
+                    ),
+                    "7:42",
+                )
+                with mock.patch.object(
+                    backup_drill, "_scratch_image_loop_matches", return_value=[("loop43", "7:43")]
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "exact loop-backed"):
+                        backup_drill._scratch_verify_process_image_mount(
+                            pid="123", mountpoint=mountpoint, image_path=image_path, image_identity=identity
+                        )
+                with mock.patch.object(backup_drill, "_scratch_image_loop_matches", return_value=[]):
+                    with self.assertRaisesRegex(RuntimeError, "association is not unique"):
+                        backup_drill._scratch_verify_process_image_mount(
+                            pid="123", mountpoint=mountpoint, image_path=image_path, image_identity=identity
+                        )
+
+    def test_scratch_mountinfo_matches_root_and_projects_missing_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            target = pathlib.Path(temporary_dir) / "scratch"
+            target.mkdir()
+            original_read_text = pathlib.Path.read_text
+            root_row = "1 0 0:1 / / rw - ext4 /dev/root rw\n"
+
+            def read_root(path: pathlib.Path, *args, **kwargs) -> str:
+                if str(path) == "/proc/self/mountinfo":
+                    return root_row
+                return original_read_text(path, *args, **kwargs)
+
+            with mock.patch.object(pathlib.Path, "read_text", read_root):
+                self.assertEqual(
+                    backup_drill._scratch_mountinfo_for(target),
+                    ("/", "0:1", "ext4", "/dev/root", "/", "rw"),
+                )
+
+            nonmatching_row = "1 0 0:1 / /elsewhere rw - ext4 /dev/other rw\n"
+
+            def read_nonmatching(path: pathlib.Path, *args, **kwargs) -> str:
+                if str(path) == "/proc/self/mountinfo":
+                    return nonmatching_row
+                return original_read_text(path, *args, **kwargs)
+
+            with mock.patch.object(pathlib.Path, "read_text", read_nonmatching):
+                with self.assertRaises(RuntimeError) as failure:
+                    backup_drill._scratch_mountinfo_for(target)
+            self.assertEqual(
+                failure.exception.scratch_disk_mount_failure_reason,
+                "mount_row_missing",
+            )
+
+    def test_scratch_interpreter_identity_failure_names_exact_stat_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            executable = root / "python"
+            executable.write_bytes(b"python")
+            mountpoint = root / "mount"
+            image = root / "image.ext4"
+            image.write_bytes(b"image")
+            unit_name = "oldsparky-backup-restore-" + ("a" * 24) + ".service"
+            control_group = f"/system.slice/{unit_name}"
+            properties = {
+                "MemoryMax": str(backup_drill.SCRATCH_MEMORY_MAX_BYTES),
+                "MemorySwapMax": "0",
+                "OOMPolicy": "kill",
+                "PrivateNetwork": "yes",
+                "RestrictAddressFamilies": "AF_UNIX",
+                "ProtectSystem": "strict",
+                "ProtectHome": "tmpfs",
+                "NoNewPrivileges": "yes",
+                "ReadWritePaths": "",
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "ControlGroup": control_group,
+                "ExecMainPID": "4242",
+                "MountImages": f"{image}:{mountpoint}:",
+                "TemporaryFileSystem": "",
+                "InaccessiblePaths": " ".join(backup_drill._SCRATCH_INACCESSIBLE_PATHS),
+                "BindReadOnlyPaths": " ".join(
+                    (
+                        str(mountpoint / "platform_backup_restore_drill.py"),
+                        str(mountpoint / "platform_disk_policy.py"),
+                    )
+                ),
+            }
+            original_read_text = pathlib.Path.read_text
+            original_stat = pathlib.Path.stat
+
+            def read_text(path: pathlib.Path, *args, **kwargs) -> str:
+                if str(path) == "/proc/4242/cgroup":
+                    return f"0::{control_group}\n"
+                return original_read_text(path, *args, **kwargs)
+
+            def run_case(failing_path: pathlib.Path) -> str:
+                def stat(path: pathlib.Path, *args, **kwargs) -> os.stat_result:
+                    if path == failing_path:
+                        raise FileNotFoundError(2, "private", str(path))
+                    if str(path) == "/proc/4242/exe":
+                        return original_stat(executable, *args, **kwargs)
+                    return original_stat(path, *args, **kwargs)
+
+                with (
+                    mock.patch.object(pathlib.Path, "read_text", read_text),
+                    mock.patch.object(pathlib.Path, "stat", stat),
+                ):
+                    with self.assertRaises(RuntimeError) as failure:
+                        backup_drill._scratch_expected_properties(
+                            {"properties": properties},
+                            unit_name=unit_name,
+                            mountpoint=mountpoint,
+                            python_binary=executable,
+                            authorization_probe=True,
+                            scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                            scratch_image_path=image,
+                        )
+                site = backup_drill._scratch_verification_site(failure.exception)
+                self.assertNotIn(str(failing_path), str(failure.exception))
+                return site
+
+            self.assertEqual(run_case(executable), "expected_executable_stat")
+            self.assertEqual(run_case(pathlib.Path("/proc/4242/exe")), "proc_exe_stat")
+
+    def test_scratch_disk_image_admission_reserves_floor_lead_and_full_image(self) -> None:
+        total_bytes = 100 * 1024**3
+        required = backup_drill._scratch_disk_image_required_free_bytes(total_bytes)
+        self.assertEqual(
+            required,
+            backup_drill._required_disk_floor(total_bytes)
+            + backup_drill.RESTORE_DISK_LEAD_BYTES
+            + backup_drill.SCRATCH_DISK_IMAGE_BYTES,
+        )
+        self.assertEqual(
+            required - backup_drill._required_disk_floor(total_bytes)
+            - backup_drill.RESTORE_DISK_LEAD_BYTES,
+            576 * 1024**2,
+        )
+        with self.assertRaises(backup_drill.RestoreGuardStop):
+            backup_drill._scratch_disk_image_required_free_bytes(0)
+
+    def test_scratch_disk_image_builder_preallocates_before_fixed_mkfs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            temporary_root = pathlib.Path(temporary_dir)
+            image_root = temporary_root / "images"
+            parent_identity = temporary_root.stat()
+            total_bytes = 100 * 1024**3
+            required = (
+                backup_drill._required_disk_floor(total_bytes)
+                + backup_drill.RESTORE_DISK_LEAD_BYTES
+                + 4096
+            )
+            snapshot = types.SimpleNamespace(
+                valid=True,
+                total_bytes=total_bytes,
+                free_bytes=required + 1024**3,
+            )
+            real_fstat = os.fstat
+            real_lstat = pathlib.Path.lstat
+
+            def root_owned_lstat(path: pathlib.Path) -> os.stat_result:
+                if path in {temporary_root, image_root}:
+                    return types.SimpleNamespace(
+                        st_mode=stat.S_IFDIR | 0o700,
+                        st_uid=0,
+                        st_gid=0,
+                        st_dev=parent_identity.st_dev,
+                        st_ino=parent_identity.st_ino if path == temporary_root else 99,
+                    )  # type: ignore[return-value]
+                actual = real_lstat(path)
+                if path == image_root / "restore-0123456789abcdef01234567.ext4":
+                    return types.SimpleNamespace(
+                        st_mode=actual.st_mode,
+                        st_uid=0,
+                        st_gid=0,
+                        st_dev=actual.st_dev,
+                        st_ino=actual.st_ino,
+                        st_size=actual.st_size,
+                        st_nlink=1,
+                    )  # type: ignore[return-value]
+                return actual
+
+            def root_owned_fstat(descriptor: int) -> types.SimpleNamespace:
+                actual = real_fstat(descriptor)
+                return types.SimpleNamespace(
+                    st_mode=actual.st_mode,
+                    st_uid=0,
+                    st_gid=0,
+                    st_dev=actual.st_dev,
+                    st_ino=actual.st_ino,
+                    st_size=actual.st_size,
+                    st_nlink=1,
+                    st_blocks=actual.st_blocks,
+                )
+
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_BYTES", 4096),
+                mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
+                ),
+                mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
+                mock.patch.object(backup_drill.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as mkfs,
+                mock.patch.object(pathlib.Path, "lstat", root_owned_lstat),
+                mock.patch.object(backup_drill.os, "fstat", side_effect=root_owned_fstat),
+            ):
+                image_path, identity = backup_drill._scratch_prepare_disk_image(
+                    "0123456789abcdef01234567"
+                )
+            self.assertEqual(image_path.parent, image_root)
+            self.assertEqual(identity[2], 4096)
+            self.assertEqual(image_path.stat().st_blocks * 512, 4096)
+            self.assertEqual(
+                mkfs.call_args.args[0],
+                [
+                    "/usr/sbin/mkfs.ext4", "-F", "-q", "-m", "0",
+                    "-E", "nodiscard", str(image_path),
+                ],
+            )
+            self.assertTrue(mkfs.call_args.kwargs["check"])
+            self.assertEqual(mkfs.call_args.kwargs["timeout"], 30)
+
+            image_path.unlink()
+
+            def simulated_formatter_discard(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                # Model mke2fs discard punching holes in the regular-file image.
+                with pathlib.Path(argv[-1]).open("r+b") as image_file:
+                    image_file.truncate(0)
+                    image_file.truncate(4096)
+                return subprocess.CompletedProcess(argv, 0)
+
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_BYTES", 4096),
+                mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
+                ),
+                mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
+                mock.patch.object(backup_drill.subprocess, "run", side_effect=simulated_formatter_discard),
+                mock.patch.object(pathlib.Path, "lstat", root_owned_lstat),
+                mock.patch.object(backup_drill.os, "fstat", side_effect=root_owned_fstat),
+                self.assertRaisesRegex(RuntimeError, "fixed allocation contract"),
+            ):
+                backup_drill._scratch_prepare_disk_image("0123456789abcdef01234567")
+            self.assertFalse(image_path.exists())
+
+    def test_scratch_disk_image_identity_rejects_sparse_or_replaced_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            image_path = pathlib.Path(temporary_dir) / "image.ext4"
+            with mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_BYTES", 4096):
+                image_path.write_bytes(b"x" * 4096)
+                image_path.chmod(0o600)
+                real_fstat = os.fstat
+                real_lstat = pathlib.Path.lstat
+
+                def root_owned_file_stat(descriptor: int) -> types.SimpleNamespace:
+                    actual = real_fstat(descriptor)
+                    return types.SimpleNamespace(
+                        st_mode=actual.st_mode,
+                        st_dev=actual.st_dev,
+                        st_ino=actual.st_ino,
+                        st_size=actual.st_size,
+                        st_uid=0,
+                        st_gid=0,
+                        st_nlink=1,
+                        st_blocks=actual.st_blocks,
+                    )
+
+                def root_owned_path_lstat(path: pathlib.Path) -> os.stat_result:
+                    actual = real_lstat(path)
+                    if path == image_path.parent:
+                        return types.SimpleNamespace(
+                            st_mode=stat.S_IFDIR | 0o700,
+                            st_dev=actual.st_dev,
+                            st_ino=actual.st_ino,
+                            st_uid=0,
+                            st_gid=0,
+                        )  # type: ignore[return-value]
+                    return types.SimpleNamespace(
+                        st_mode=actual.st_mode,
+                        st_dev=actual.st_dev,
+                        st_ino=actual.st_ino,
+                        st_size=actual.st_size,
+                        st_uid=0,
+                        st_gid=0,
+                        st_nlink=1,
+                    ) if path == image_path else actual  # type: ignore[return-value]
+
+                with (
+                    mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_path.parent),
+                    mock.patch.object(backup_drill.os, "fstat", side_effect=root_owned_file_stat),
+                    mock.patch.object(pathlib.Path, "lstat", root_owned_path_lstat),
+                ):
+                    identity = backup_drill._scratch_image_path_identity(image_path)
+                self.assertEqual(identity[2], 4096)
+                image_path.unlink()
+                image_path.touch(mode=0o600)
+                image_path.chmod(0o600)
+                with image_path.open("r+b") as handle:
+                    handle.truncate(4096)
+                with (
+                    mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_path.parent),
+                    mock.patch.object(backup_drill.os, "fstat", side_effect=root_owned_file_stat),
+                    mock.patch.object(pathlib.Path, "lstat", root_owned_path_lstat),
+                    self.assertRaisesRegex(RuntimeError, "fixed allocation contract"),
+                ):
+                    backup_drill._scratch_image_path_identity(image_path)
+                image_path.unlink()
+                image_path.write_bytes(b"y" * 4096)
+                image_path.chmod(0o644)
+                with (
+                    mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_path.parent),
+                    mock.patch.object(backup_drill.os, "fstat", side_effect=root_owned_file_stat),
+                    mock.patch.object(pathlib.Path, "lstat", root_owned_path_lstat),
+                    self.assertRaisesRegex(RuntimeError, "fixed allocation contract"),
+                ):
+                    backup_drill._scratch_image_path_identity(image_path)
+
+    def test_scratch_disk_root_transition_checks_owner_mode_identity_and_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir) / "scratch"
+            root.mkdir(mode=0o700)
+            real_lstat = pathlib.Path.lstat
+            before = types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o700, st_uid=0, st_gid=0, st_dev=7, st_ino=11
+            )
+            after = types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o700, st_uid=1234, st_gid=5678, st_dev=7, st_ino=11
+            )
+            lstat_values = [before, after]
+
+            def staged_lstat(path: pathlib.Path) -> os.stat_result:
+                if path == root and lstat_values:
+                    return lstat_values.pop(0)  # type: ignore[return-value]
+                return real_lstat(path)
+
+            with (
+                mock.patch.object(pathlib.Path, "lstat", staged_lstat),
+                mock.patch.object(backup_drill.os, "chown") as chown,
+            ):
+                backup_drill._scratch_prepare_disk_root_for_postgres(
+                    root, postgres_uid=1234, postgres_gid=5678
+                )
+            chown.assert_called_once_with(root, 1234, 5678, follow_symlinks=False)
+
+            bad_preconditions = (
+                types.SimpleNamespace(
+                    st_mode=stat.S_IFDIR | 0o711, st_uid=0, st_gid=0, st_dev=7, st_ino=11
+                ),
+                types.SimpleNamespace(
+                    st_mode=stat.S_IFDIR | 0o700, st_uid=0, st_gid=9, st_dev=7, st_ino=11
+                ),
+            )
+            for bad_before in bad_preconditions:
+                with (
+                    self.subTest(bad_before=bad_before),
+                    mock.patch.object(pathlib.Path, "lstat", return_value=bad_before),
+                    mock.patch.object(backup_drill.os, "chown") as rejected_chown,
+                    self.assertRaisesRegex(RuntimeError, "root:root mode 0700 pre-PG contract"),
+                ):
+                    backup_drill._scratch_prepare_disk_root_for_postgres(
+                        root, postgres_uid=1234, postgres_gid=5678
+                    )
+                rejected_chown.assert_not_called()
+
+            with (
+                mock.patch.object(pathlib.Path, "lstat", side_effect=[before, after]),
+                mock.patch.object(backup_drill.os, "chown", side_effect=PermissionError),
+                self.assertRaisesRegex(RuntimeError, "could not be assigned to the exact postgres identity"),
+            ):
+                backup_drill._scratch_prepare_disk_root_for_postgres(
+                    root, postgres_uid=1234, postgres_gid=5678
+                )
+
+            wrong_after = types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o711, st_uid=1234, st_gid=5678, st_dev=7, st_ino=11
+            )
+            with (
+                mock.patch.object(pathlib.Path, "lstat", side_effect=[before, wrong_after]),
+                mock.patch.object(backup_drill.os, "chown"),
+                self.assertRaisesRegex(RuntimeError, "identity changed during the postgres ownership transition"),
+            ):
+                backup_drill._scratch_prepare_disk_root_for_postgres(
+                    root, postgres_uid=1234, postgres_gid=5678
+                )
+
+            worker_tree = ast.parse(inspect.getsource(backup_drill._scratch_worker_main))
+            direct_calls: list[tuple[str, int]] = []
+            for node in ast.walk(worker_tree):
+                if isinstance(node, ast.Call):
+                    function_name = (
+                        node.func.id if isinstance(node.func, ast.Name) else None
+                    )
+                    if function_name in {
+                        "_scratch_prepare_disk_root_for_postgres",
+                        "_scratch_run_observed_phase",
+                        "_scratch_prepare_postgres_directory",
+                        "run_command",
+                    }:
+                        direct_calls.append((function_name, node.lineno))
+            transition_line = min(
+                line for name, line in direct_calls
+                if name == "_scratch_prepare_disk_root_for_postgres"
+            )
+            archive_verify_line = min(
+                line for name, line in direct_calls
+                if name == "_scratch_run_observed_phase"
+            )
+            first_pg_directory_line = min(
+                line for name, line in direct_calls
+                if name == "_scratch_prepare_postgres_directory"
+            )
+            first_pg_command_line = min(
+                line for name, line in direct_calls if name == "run_command"
+            )
+            self.assertLess(archive_verify_line, transition_line)
+            self.assertLess(transition_line, first_pg_directory_line)
+            self.assertLess(transition_line, first_pg_command_line)
+
+    def test_synthetic_disk_worker_transitions_root_before_postgres_discovery(self) -> None:
+        events: list[str] = []
+        args = argparse.Namespace(
+            _scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+            _scratch_archive=None,
+            _scratch_archive_dev=None,
+            _scratch_archive_ino=None,
+            _scratch_archive_size=None,
+            _scratch_archive_sha256=None,
+        )
+
+        def transition(*_args: Any, **_kwargs: Any) -> None:
+            events.append("ownership_transition")
+
+        def require_pg_commands(*_commands: str) -> None:
+            events.append("postgres_discovery")
+            raise RuntimeError("stop before any PostgreSQL executable")
+
+        with (
+            mock.patch.object(
+                backup_drill.pwd,
+                "getpwnam",
+                return_value=types.SimpleNamespace(pw_uid=1234, pw_gid=5678),
+            ),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_disk_mount_snapshot",
+                side_effect=[
+                    {"total_bytes": 560 * 1024**2, "free_bytes": 500 * 1024**2},
+                    {"total_bytes": 560 * 1024**2, "free_bytes": 500 * 1024**2},
+                ],
+            ) as snapshot,
+            mock.patch.object(
+                backup_drill,
+                "_scratch_prepare_disk_root_for_postgres",
+                side_effect=transition,
+            ),
+            mock.patch.object(backup_drill, "require_commands", side_effect=require_pg_commands),
+            self.assertRaisesRegex(RuntimeError, "stop before any PostgreSQL executable"),
+        ):
+            backup_drill._scratch_synthetic_restore_diagnostic_worker(
+                args,
+                pathlib.Path("/run/oldsparky-backup-restore-0123456789abcdef01234567"),
+            )
+        self.assertEqual(events, ["ownership_transition", "postgres_discovery"])
+        self.assertEqual(snapshot.call_count, 2)
+
+    def test_scratch_disk_filesystem_peak_sampler_is_capacity_bounded_and_stable(self) -> None:
+        root = pathlib.Path("/run/oldsparky-backup-restore-0123456789abcdef01234567")
+        capacity = 560 * 1024**2
+        sampler = backup_drill._ScratchFilesystemPeakSampler(
+            root,
+            backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+            postgres_owner=(1234, 5678),
+        )
+        with mock.patch.object(
+            backup_drill,
+            "_scratch_disk_mount_snapshot",
+            side_effect=[
+                {"total_bytes": capacity, "free_bytes": capacity - 10 * 1024**2},
+                {"total_bytes": capacity, "free_bytes": capacity - 20 * 1024**2},
+            ],
+        ):
+            sampler._sample()
+            sampler._sample()
+        self.assertEqual(sampler.capacity_bytes, capacity)
+        self.assertEqual(sampler.peak_bytes, 20 * 1024**2)
+        with mock.patch.object(
+            backup_drill,
+            "_scratch_disk_mount_snapshot",
+            return_value={"total_bytes": capacity + 1, "free_bytes": capacity - 20 * 1024**2},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "capacity changed during sampling"):
+                sampler._sample()
+
+    def test_scratch_disk_image_cleanup_requires_loop_release_and_exact_inode(self) -> None:
+        identity = (1, 2, 4096, 0, 0, 0o600, 1)
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            image_path = pathlib.Path(temporary_dir) / "image.ext4"
+            image_path.write_bytes(b"x" * 4096)
+            with (
+                mock.patch.object(backup_drill, "_scratch_image_path_identity", return_value=identity),
+                mock.patch.object(backup_drill, "_scratch_image_loop_matches", return_value=[("loop1", "7:1")]),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "still has a systemd loop association"):
+                    backup_drill._scratch_unlink_image_exact(image_path, identity)
+            self.assertTrue(image_path.exists())
+            with (
+                mock.patch.object(backup_drill, "_scratch_image_path_identity", return_value=identity),
+                mock.patch.object(backup_drill, "_scratch_image_loop_matches", return_value=[]),
+                mock.patch.object(backup_drill, "_scratch_fsync_directory"),
+            ):
+                backup_drill._scratch_unlink_image_exact(image_path, identity)
+            self.assertFalse(image_path.exists())
+
+    def test_scratch_disk_loop_inventory_requires_verified_sysfs_and_exact_backing_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir) / "sys-block"
+            loop = root / "loop42"
+            (loop / "loop").mkdir(parents=True)
+            image_path = pathlib.Path(temporary_dir) / "image.ext4"
+            image_path.write_bytes(b"image")
+            backing_file = loop / "loop" / "backing_file"
+            backing_file.write_text(str(image_path) + "\n", encoding="utf-8")
+            (loop / "dev").write_text("7:42\n", encoding="ascii")
+            root_info = types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o555, st_uid=0, st_gid=0
+            )
+            real_lstat = pathlib.Path.lstat
+
+            def sysfs_root_lstat(path: pathlib.Path) -> os.stat_result:
+                if path == root:
+                    return root_info  # type: ignore[return-value]
+                return real_lstat(path)
+
+            identity = (
+                image_path.stat().st_dev,
+                image_path.stat().st_ino,
+                image_path.stat().st_size,
+                0,
+                0,
+                0o600,
+                1,
+            )
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_SYS_BLOCK_ROOT", root),
+                mock.patch.object(pathlib.Path, "lstat", sysfs_root_lstat),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/sys", "0:42", "sysfs", "sysfs", "/", "ro,nosuid,nodev"),
+                ),
+                mock.patch.object(backup_drill, "_scratch_image_path_identity", return_value=identity),
+            ):
+                self.assertEqual(
+                    backup_drill._scratch_image_loop_matches(image_path, identity),
+                    [("loop42", "7:42")],
+                )
+                backing_file.write_text(str(pathlib.Path(temporary_dir) / "other-image.ext4") + "\n", encoding="utf-8")
+                self.assertEqual(backup_drill._scratch_image_loop_matches(image_path, identity), [])
+                backing_file.write_text(str(image_path) + "\n", encoding="utf-8")
+                wrong_identity = (identity[0], identity[1] + 1, *identity[2:])
+                with mock.patch.object(
+                    backup_drill, "_scratch_image_path_identity", return_value=wrong_identity
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "backing image identity changed"):
+                        backup_drill._scratch_image_loop_matches(image_path, identity)
+                with mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/sys", "0:42", "tmpfs", "tmpfs", "/", "ro"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "verified host sysfs mount"):
+                        backup_drill._scratch_image_loop_matches(image_path, identity)
+
+    def test_scratch_disk_image_uncertain_cleanup_writes_closed_private_receipt(self) -> None:
+        identity = (1, 2, 4096, 0, 0, 0o600, 1)
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            receipt_root = pathlib.Path(temporary_dir) / "images"
+            receipt_root.mkdir(mode=0o700)
+            image_path = receipt_root / "restore-0123456789abcdef01234567.ext4"
+            with mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", receipt_root):
+                with mock.patch.object(backup_drill.os, "fchown") as fchown:
+                    backup_drill._scratch_write_image_cleanup_receipt(
+                        image_path,
+                        identity,
+                        unit_name="oldsparky-backup-restore-0123456789abcdef01234567.service",
+                        reason="loop_association_persists",
+                    )
+                    fchown.assert_called_once_with(mock.ANY, 0, 0)
+                receipt_path = receipt_root / "cleanup-restore-0123456789abcdef01234567.json"
+                info = receipt_path.lstat()
+                self.assertTrue(stat.S_ISREG(info.st_mode))
+                self.assertEqual(
+                    (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)),
+                    (os.geteuid(), os.getegid(), 0o600),
+                )
+                receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+                self.assertEqual(receipt["cleanup_status"], "retained")
+                self.assertEqual(receipt["reason"], "loop_association_persists")
+                self.assertEqual(receipt["image_ino"], identity[1])
+                self.assertEqual(set(receipt), {
+                    "schema", "unit_name", "image_name", "image_dev", "image_ino",
+                    "image_size_bytes", "cleanup_status", "reason",
+                })
+                with self.assertRaisesRegex(ValueError, "inputs are invalid"):
+                    backup_drill._scratch_write_image_cleanup_receipt(
+                        image_path,
+                        identity,
+                        unit_name="untrusted.service",
+                        reason="raw_exception_text",
+                    )
+
     def test_scratch_postgres_memory_setting_is_paired_and_safety_options_stay_fixed(self) -> None:
         socket_dir = pathlib.Path("/run/oldsparky-backup-restore-deadbeef/socket")
         initdb_command = backup_drill._scratch_initdb_command(
@@ -1017,6 +2169,46 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertNotIn("huge_pages", start_settings)
 
     def test_synthetic_restore_diagnostic_arms_are_fixed_and_report_requires_all_three(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(
+                backup_drill,
+                "run_synthetic_restore_diagnostic",
+                return_value={"backend": backup_drill.SCRATCH_BACKEND_TMPFS_V1},
+            ) as run_diagnostic:
+                self.assertEqual(
+                    _run_synthetic_restore_diagnostic_for_ci(source_sha="a" * 40),
+                    {"backend": backup_drill.SCRATCH_BACKEND_TMPFS_V1},
+                )
+            run_diagnostic.assert_called_once_with(
+                scratch_backend=backup_drill.SCRATCH_BACKEND_TMPFS_V1
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {"PLATFORM_SCRATCH_BACKEND": backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1},
+            clear=True,
+        ):
+            with mock.patch.object(
+                backup_drill,
+                "run_synthetic_restore_diagnostic",
+                return_value={"backend": backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1},
+            ) as run_diagnostic:
+                self.assertEqual(
+                    _run_synthetic_restore_diagnostic_for_ci(source_sha="b" * 40),
+                    {"backend": backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1},
+                )
+            run_diagnostic.assert_called_once_with(
+                scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+            )
+
+        with mock.patch.dict(os.environ, {"PLATFORM_SCRATCH_BACKEND": "unknown"}, clear=True):
+            with mock.patch.object(
+                backup_drill, "run_synthetic_restore_diagnostic"
+            ) as run_diagnostic:
+                with self.assertRaisesRegex(RuntimeError, "backend selection failed closed"):
+                    _run_synthetic_restore_diagnostic_for_ci(source_sha="c" * 40)
+            run_diagnostic.assert_not_called()
+
         socket_dir = pathlib.Path("/run/oldsparky-backup-restore-deadbeef/socket")
         production_options = backup_drill._scratch_postgres_start_options(socket_dir)
         arms = backup_drill.SCRATCH_SYNTHETIC_RESTORE_ARMS
@@ -1325,6 +2517,44 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ],
         }
         self.assertTrue(backup_drill.valid_scratch_synthetic_restore_diagnostic(report))
+        schema3_tmpfs = json.loads(json.dumps(report))
+        schema3_tmpfs["schema"] = 3
+        schema3_tmpfs["scratch_backend"] = backup_drill.SCRATCH_BACKEND_TMPFS_V1
+        schema3_tmpfs["scratch_filesystem_capacity_bytes"] = backup_drill.SCRATCH_TMPFS_BYTES
+        self.assertTrue(backup_drill.valid_scratch_synthetic_restore_diagnostic(schema3_tmpfs))
+
+        schema3_disk = json.loads(json.dumps(report))
+        schema3_disk["schema"] = 3
+        schema3_disk["scratch_backend"] = backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+        disk_capacity = 560 * 1024**2
+        schema3_disk["scratch_filesystem_capacity_bytes"] = disk_capacity
+        for arm in schema3_disk["arms"]:
+            for phase in arm["phases"]:
+                phase.pop("tmpfs_peak_sampled_bytes")
+                phase.pop("tmpfs_sample_period_ms")
+                phase.pop("tmpfs_scope")
+                phase["disk_peak_sampled_bytes"] = 16 * 1024**2
+                phase["disk_capacity_bytes"] = disk_capacity
+                phase["disk_sample_period_ms"] = 10
+                phase["disk_scope"] = backup_drill.SCRATCH_SYNTHETIC_DISK_SCOPE
+        self.assertTrue(backup_drill.valid_scratch_synthetic_restore_diagnostic(schema3_disk))
+        wrong_backend_metric = json.loads(json.dumps(schema3_disk))
+        wrong_backend_metric["arms"][0]["phases"][0]["tmpfs_peak_sampled_bytes"] = 1
+        self.assertFalse(
+            backup_drill.valid_scratch_synthetic_restore_diagnostic(wrong_backend_metric)
+        )
+        over_disk_stop = json.loads(json.dumps(schema3_disk))
+        over_disk_stop["arms"][0]["phases"][0]["disk_peak_sampled_bytes"] = (
+            disk_capacity - backup_drill.SCRATCH_TMPFS_STOP_BYTES + 1
+        )
+        self.assertFalse(
+            backup_drill.valid_scratch_synthetic_restore_diagnostic(over_disk_stop)
+        )
+        wrong_capacity = json.loads(json.dumps(schema3_disk))
+        wrong_capacity["arms"][0]["phases"][0]["disk_capacity_bytes"] -= 1
+        self.assertFalse(
+            backup_drill.valid_scratch_synthetic_restore_diagnostic(wrong_capacity)
+        )
         result_frame = (
             json.dumps(report, separators=(",", ":"), sort_keys=True) + "\n"
         ).encode("ascii")
@@ -1391,7 +2621,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             (temporary_root / "platform").mkdir()
             with mock.patch.object(sys.modules[__name__], "REPO_ROOT", temporary_root):
                 artifact_path = _write_synthetic_restore_diagnostic_artifact(
-                    report, source_sha="c" * 40
+                    schema3_tmpfs, source_sha="c" * 40
                 )
             self.assertEqual(
                 json.loads(artifact_path.read_text(encoding="ascii")),
@@ -1399,7 +2629,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "kind": "synthetic_restore_diagnostic_artifact",
                     "schema": 1,
                     "source_sha": "c" * 40,
-                    "diagnostic": report,
+                    "scratch_backend": schema3_tmpfs["scratch_backend"],
+                    "diagnostic": schema3_tmpfs,
                 },
             )
             self.assertEqual(stat.S_IMODE(artifact_path.stat().st_mode), 0o644)
@@ -1481,7 +2712,10 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaises(RuntimeError) as raised:
-                    _run_synthetic_restore_diagnostic_for_ci(source_sha="e" * 40)
+                    _run_synthetic_restore_diagnostic_for_ci(
+                        source_sha="e" * 40,
+                        scratch_backend=backup_drill.SCRATCH_BACKEND_TMPFS_V1,
+                    )
             self.assertIs(raised.exception, failure)
             failure_artifact_path = (
                 temporary_root
@@ -1499,6 +2733,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "kind",
                     "schema",
                     "source_sha",
+                    "scratch_backend",
                     "test_id",
                     "failure_stage",
                     "scratch_first_fault",
@@ -1513,6 +2748,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "synthetic_restore_diagnostic_failure_artifact",
             )
             self.assertEqual(failure_artifact["source_sha"], "e" * 40)
+            self.assertEqual(
+                failure_artifact["scratch_backend"], backup_drill.SCRATCH_BACKEND_TMPFS_V1
+            )
             self.assertEqual(failure_artifact["test_id"], _SYNTHETIC_RESTORE_TEST_ID)
             self.assertEqual(failure_artifact["failure_stage"], "run_synthetic_restore_diagnostic")
             self.assertEqual(
@@ -1593,7 +2831,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             malformed_failure = RuntimeError("private")
             malformed_failure.scratch_unit_diagnostic = {"schema": 1}
             _write_synthetic_restore_failure_artifact(
-                malformed_failure, source_sha="e" * 40
+                malformed_failure,
+                source_sha="e" * 40,
+                scratch_backend=backup_drill.SCRATCH_BACKEND_TMPFS_V1,
             )
         with self.assertRaisesRegex(RuntimeError, "closed bounds"):
             oversized_failure = RuntimeError("private")
@@ -1602,7 +2842,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 b"",
             )
             _write_synthetic_restore_failure_artifact(
-                oversized_failure, source_sha="e" * 40
+                oversized_failure,
+                source_sha="e" * 40,
+                scratch_backend=backup_drill.SCRATCH_BACKEND_TMPFS_V1,
             )
         with self.assertRaisesRegex(RuntimeError, "evidence bound"):
             _classify_synthetic_restore_stderr(
@@ -2138,7 +3380,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertEqual(os.geteuid(), 0)
         source_sha = os.environ.get("GITHUB_SHA", "")
         self.assertRegex(source_sha, r"^[0-9a-f]{40}$")
-        report = _run_synthetic_restore_diagnostic_for_ci(source_sha=source_sha)
+        scratch_backend = os.environ.get(
+            "PLATFORM_SCRATCH_BACKEND", backup_drill.SCRATCH_BACKEND_TMPFS_V1
+        )
+        self.assertIn(scratch_backend, backup_drill.SCRATCH_BACKENDS)
+        report = _run_synthetic_restore_diagnostic_for_ci(
+            source_sha=source_sha, scratch_backend=scratch_backend
+        )
         self.assertTrue(backup_drill.valid_scratch_synthetic_restore_diagnostic(report))
         self.assertEqual(
             [arm["name"] for arm in report["arms"]],
@@ -2155,7 +3403,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 )
                 for phase in arm["phases"]:
                     self.assertGreater(phase["memory_peak_bytes"], 0)
-                    self.assertGreater(phase["tmpfs_peak_sampled_bytes"], 0)
+                    if scratch_backend == backup_drill.SCRATCH_BACKEND_TMPFS_V1:
+                        self.assertGreater(phase["tmpfs_peak_sampled_bytes"], 0)
+                    else:
+                        self.assertGreater(phase["disk_peak_sampled_bytes"], 0)
+                        self.assertGreater(
+                            phase["disk_capacity_bytes"], phase["disk_peak_sampled_bytes"]
+                        )
                     self.assertGreaterEqual(phase["wal_delta_bytes"], 0)
                     self.assertGreater(phase["restore_command_elapsed_us"], 0)
                     self.assertGreaterEqual(
@@ -2170,6 +3424,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "kind": "synthetic_restore_diagnostic_artifact",
                 "schema": 1,
                 "source_sha": source_sha,
+                "scratch_backend": scratch_backend,
                 "diagnostic": report,
             },
         )
@@ -3734,6 +4989,145 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 {**controller_fault, "site": "worker_role_setup"}
             )
         )
+        disk_mount_failure = {
+            **expected,
+            "site": "worker_mount_snapshot",
+            "exception_kind": "runtime",
+            "errno": None,
+            "disk_mount_failure_reason": "filesystem_source_root_options",
+        }
+        self.assertTrue(backup_drill.valid_scratch_first_fault(disk_mount_failure))
+        projected_mount_failure = RuntimeError(
+            "Isolated ext4 scratch filesystem is below its bounded usable capacity."
+        )
+        projected_mount_failure.scratch_disk_mount_failure_reason = "statvfs_bound"
+        projected_mount_failure.scratch_first_fault = backup_drill._scratch_first_fault(
+            projected_mount_failure,
+            origin="worker",
+            site="worker_mount_snapshot",
+        )
+        self.assertEqual(
+            backup_drill._scratch_first_fault(
+                projected_mount_failure,
+                origin="worker",
+                site="worker_mount_snapshot",
+            ),
+            {
+                "schema": 1,
+                "origin": "worker",
+                "site": "worker_mount_snapshot",
+                "exception_kind": "runtime",
+                "errno": None,
+                "disk_mount_failure_reason": "statvfs_bound",
+            },
+        )
+        bound_report = backup_drill.failure_report_for_exception(
+            projected_mount_failure,
+            private_scratch_diagnostics=True,
+        )
+        stdout = json.dumps(bound_report, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        stderr = backup_drill._scratch_first_fault_frame(
+            projected_mount_failure.scratch_first_fault
+        )
+        self.assertIsNotNone(stderr)
+        self.assertEqual(
+            backup_drill._parse_bound_scratch_first_fault(
+                stdout,
+                stderr or b"",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            ),
+            bound_report["scratch_first_fault"],
+        )
+        self.assertNotIn(b"/private/path", stdout + (stderr or b""))
+        sysfs_fault = {
+            "schema": 1,
+            "origin": "worker",
+            "site": "worker_mount_snapshot",
+            "exception_kind": "runtime",
+            "errno": None,
+            "disk_mount_failure_reason": "sysfs_not_loop_device",
+            "disk_mount_predicates": {
+                "fs_ext4": True,
+                "source_canonical": True,
+                "device_major_minor_valid": True,
+                "sysfs_mount_verified": True,
+                "sysfs_device_resolved": True,
+                "sysfs_loop_device": False,
+                "sysfs_device_number_matches": True,
+                "sysfs_backing_file_present": False,
+                "root_expected": True,
+                "target_expected": True,
+                "option_rw": True,
+                "option_nosuid": True,
+                "option_nodev": True,
+                "option_noexec": True,
+            },
+        }
+        self.assertTrue(backup_drill.valid_scratch_first_fault(sysfs_fault))
+        sysfs_error = RuntimeError("private mount detail")
+        sysfs_error.scratch_first_fault = sysfs_fault
+        sysfs_report = backup_drill.failure_report_for_exception(
+            sysfs_error, private_scratch_diagnostics=True
+        )
+        sysfs_stdout = json.dumps(sysfs_report, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        sysfs_stderr = backup_drill._scratch_first_fault_frame(sysfs_fault)
+        self.assertIsNotNone(sysfs_stderr)
+        self.assertGreater(len(sysfs_stderr or b"") - len(backup_drill.SCRATCH_FIRST_FAULT_MARKER) - 1, 512)
+        self.assertLessEqual(len(sysfs_stderr or b"") - len(backup_drill.SCRATCH_FIRST_FAULT_MARKER) - 1,
+                             backup_drill.SCRATCH_FIRST_FAULT_FRAME_MAX_BYTES)
+        self.assertEqual(
+            backup_drill._parse_bound_scratch_first_fault(
+                sysfs_stdout,
+                sysfs_stderr or b"",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            ),
+            sysfs_fault,
+        )
+        # The largest reachable full-mount predicate frame is the last sysfs
+        # leaf before option checks. Earlier source/fs/root/target predicates
+        # must be true or the producer would report an earlier failure.
+        worst_reason = "sysfs_device_number_mismatch"
+        worst_case_fault = {
+            **sysfs_fault,
+            "disk_mount_failure_reason": worst_reason,
+            "disk_mount_predicates": {
+                **{key: True for key in sysfs_fault["disk_mount_predicates"]},
+                "sysfs_device_number_matches": False,
+                "sysfs_backing_file_present": False,
+            },
+        }
+        self.assertTrue(backup_drill.valid_scratch_first_fault(worst_case_fault))
+        worst_case_frame = backup_drill._scratch_first_fault_frame(worst_case_fault)
+        self.assertIsNotNone(worst_case_frame)
+        worst_case_payload = (worst_case_frame or b"").removeprefix(
+            backup_drill.SCRATCH_FIRST_FAULT_MARKER
+        ).rstrip(b"\n")
+        self.assertEqual(
+            worst_case_payload,
+            json.dumps(worst_case_fault, sort_keys=True, separators=(",", ":")).encode("ascii"),
+        )
+        self.assertGreater(len(worst_case_payload), 512)
+        self.assertLessEqual(len(worst_case_payload), backup_drill.SCRATCH_FIRST_FAULT_FRAME_MAX_BYTES)
+        too_large_frame = (
+            backup_drill.SCRATCH_FIRST_FAULT_MARKER
+            + b"{" + b" " * backup_drill.SCRATCH_FIRST_FAULT_FRAME_MAX_BYTES + b"}\n"
+        )
+        self.assertIsNone(
+            backup_drill._parse_bound_scratch_first_fault(
+                sysfs_stdout,
+                too_large_frame,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+        )
+        for malformed_mount_failure in (
+            {**disk_mount_failure, "disk_mount_failure_reason": "private_path"},
+            {**disk_mount_failure, "origin": "controller"},
+            {**disk_mount_failure, "exception_kind": "os_error"},
+        ):
+            self.assertFalse(backup_drill.valid_scratch_first_fault(malformed_mount_failure))
 
         first_properties = {
             "LoadState": "loaded",
@@ -4568,6 +5962,37 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertEqual(schema2["schema"], 2)
         self.assertEqual(schema2["active_state"], "active")
         self.assertEqual(schema2["terminal_snapshot"], terminal)
+        verification_site = backup_drill._scratch_unit_diagnostic(
+            {
+                "properties": {
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                }
+            },
+            launcher_exit_status=1,
+            stdout_prefix=b"bounded",
+            stdout_observed=7,
+            stdout_complete=True,
+            stderr_prefix=b"",
+            stderr_observed=0,
+            stderr_complete=True,
+            phase="authorization_failed",
+            verification_error="os_error",
+            verification_errno=2,
+            verification_site="proc_exe_stat",
+            terminal_snapshot=terminal,
+        )
+        self.assertIsNotNone(verification_site)
+        assert verification_site is not None
+        self.assertEqual(verification_site["schema"], 3)
+        self.assertEqual(verification_site["verification_site"], "proc_exe_stat")
+        self.assertEqual(verification_site["terminal_snapshot"], terminal)
+        self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(verification_site))
+        malformed = dict(verification_site)
+        malformed["verification_site"] = "/proc/private"
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
         malformed = dict(schema2)
         malformed["terminal_snapshot"] = {**terminal, "private_path": "/secret"}
         self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed))
