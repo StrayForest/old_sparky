@@ -2146,6 +2146,19 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("fetch-depth: 0", exact_source_checkout)
         self.assertIn("persist-credentials: false", exact_source_checkout)
         self.assertLess(exact_source_checkout_start, pin_resolution)
+        final_source_checkout_start = auto.index(
+            "      - name: Checkout exact source for final provenance revalidation"
+        )
+        final_source_checkout_end = auto.index(
+            "      - name:", final_source_checkout_start + 1
+        )
+        final_source_checkout = auto[final_source_checkout_start:final_source_checkout_end]
+        final_pin_resolution = auto.index(
+            "      - name: Revalidate requested host-tools pin before child dispatch"
+        )
+        self.assertIn("fetch-depth: 0", final_source_checkout)
+        self.assertIn("persist-credentials: false", final_source_checkout)
+        self.assertLess(final_source_checkout_start, final_pin_resolution)
         dispatch = workflow_job(auto, "dispatch")
         self.assertIn("candidate_packaging_reason =", dispatch)
         self.assertIn("candidate_packaging_only = bool(", dispatch)

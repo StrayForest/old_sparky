@@ -4,7 +4,7 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
 import re
@@ -356,26 +356,69 @@ class HostToolsBundleTests(unittest.TestCase):
             parser_calls = [call for call in parser_run.call_args_list if call.args[0][:2] == ["/usr/bin/ssh-keygen", "-y"]]
             self.assertEqual(len(parser_calls), 1)
 
-            for bad_host, bad_user, bad_key in (
-                ("", "operator", private_key),
-                ("production.example.test:22", "operator", private_key),
-                ("production.example.test", "operator/user", private_key),
-                ("production.example.test", "operator", ""),
-                ("production.example.test", "operator", private_key.replace("\n", "\r\n")),
-                ("production.example.test", "operator", private_key + "\x00"),
-                ("production.example.test", "operator", private_key + "é"),
-                ("production.example.test", "operator", "x" * (installed_check.MAX_SSH_PRIVATE_KEY_BYTES + 1)),
-                ("production.example.test", "operator", "not an OpenSSH private key\n"),
-            ):
-                with self.subTest(host_valid=bad_host == "production.example.test", user_valid=bad_user == "operator", key_length=len(bad_key)):
-                    rejected_root = root / f"rejected-{len(list(root.glob('rejected-*')))}"
-                    rejected_root.mkdir(mode=0o700)
-                    with patch.object(installed_check, "_run") as ssh_run:
-                        with self.assertRaises(installed_check.VerificationError) as failure:
-                            installed_check._safe_host_ssh(bad_host, bad_user, bad_key, rejected_root)
-                    self.assertFalse(bad_key and bad_key in str(failure.exception))
-                    self.assertFalse((rejected_root / "platform-host-capability-ssh").exists())
+            bad_inputs = (
+                ("", "operator", private_key, "ssh_host_format", None, "production SSH configuration is malformed"),
+                ("production.example.test:22", "operator", private_key, "ssh_host_format", None, "production SSH configuration is malformed"),
+                ("production.example.test", "operator/user", private_key, "ssh_user_format", None, "production SSH configuration is malformed"),
+                ("production.example.test", "operator", "", "ssh_key_shape", None, "production SSH configuration is malformed"),
+                ("production.example.test", "operator", private_key.replace("\n", "\r\n"), "ssh_key_shape", None, "production SSH configuration is malformed"),
+                ("production.example.test", "operator", private_key + "é", "ssh_key_shape", None, "production SSH configuration is malformed"),
+                ("production.example.test", "operator", "x" * (installed_check.MAX_SSH_PRIVATE_KEY_BYTES + 1), "ssh_key_shape", None, "production SSH configuration is malformed"),
+                ("production.example.test", "operator", "not an OpenSSH private key\n", "ssh_key_parser_invalid", None, "production SSH private key is invalid"),
+                ("production.example.test", "operator", private_key, "ssh_key_parser_unavailable", FileNotFoundError(), "production SSH private key validation failed"),
+                ("production.example.test", "operator", private_key, "ssh_key_parser_timeout", subprocess.TimeoutExpired("ssh-keygen", installed_check.SSH_PRIVATE_KEY_PARSE_TIMEOUT_SECONDS), "production SSH private key validation failed"),
+            )
+            for index, (bad_host, bad_user, bad_key, reason, parser_error, message) in enumerate(bad_inputs):
+                with self.subTest(reason=reason, case=index):
+                    case_root = root / f"rejected-{index}"
+                    case_root.mkdir(mode=0o700)
+                    runner_temp = case_root / "runner-temp"
+                    runner_temp.mkdir(mode=0o700)
+                    contract = self._installed_checker_contract(case_root)
+                    stderr = StringIO()
+                    with ExitStack() as stack:
+                        stack.enter_context(patch.dict(os.environ, {
+                            "RUNNER_TEMP": str(runner_temp),
+                            "GITHUB_ENV": str(case_root / "github-env"),
+                            "PROD_SSH_HOST": bad_host,
+                            "PROD_SSH_USER": bad_user,
+                            "PROD_SSH_KEY": bad_key,
+                        }))
+                        ssh_run = stack.enter_context(patch.object(installed_check, "_run"))
+                        if parser_error is not None:
+                            stack.enter_context(patch.object(installed_check.subprocess, "run", side_effect=parser_error))
+                        with redirect_stderr(stderr):
+                            result = installed_check.main([
+                                "--source-sha", SOURCE_SHA,
+                                "--toolset-version", "production-host-tools-v4",
+                                "--contract-dir", str(contract),
+                            ])
+                    self.assertEqual(result, 1)
+                    self.assertEqual(
+                        stderr.getvalue(),
+                        f"{message} [reason={reason}]\n",
+                    )
+                    if bad_key:
+                        self.assertNotIn(bad_key, stderr.getvalue())
+                    if bad_host:
+                        self.assertNotIn(bad_host, stderr.getvalue())
+                    if bad_user:
+                        self.assertNotIn(bad_user, stderr.getvalue())
+                    self.assertFalse((runner_temp / "platform-host-capability-ssh").exists())
                     ssh_run.assert_not_called()
+
+            with self.subTest(reason="ssh_key_shape", case="embedded_nul"):
+                nul_root = root / "rejected-embedded-nul"
+                nul_root.mkdir(mode=0o700)
+                with patch.object(installed_check, "_run") as ssh_run:
+                    with self.assertRaises(installed_check.VerificationError) as failure:
+                        installed_check._safe_host_ssh(
+                            "production.example.test", "operator", private_key + "\x00", nul_root
+                        )
+                self.assertEqual(failure.exception.diagnostic_code, "ssh_key_shape")
+                self.assertNotIn("\x00", str(failure.exception))
+                self.assertFalse((nul_root / "platform-host-capability-ssh").exists())
+                ssh_run.assert_not_called()
 
             ssh_dir = root / "platform-host-capability-ssh"
             ssh_dir.mkdir(mode=0o700)

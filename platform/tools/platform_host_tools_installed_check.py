@@ -32,10 +32,26 @@ MAX_REMOTE_OUTPUT = 16384
 # while preventing an unbounded secret from reaching the runner's SSH directory.
 MAX_SSH_PRIVATE_KEY_BYTES = 65536
 SSH_PRIVATE_KEY_PARSE_TIMEOUT_SECONDS = 5
+SSH_DIAGNOSTIC_CODES = frozenset(
+    {
+        "ssh_host_format",
+        "ssh_user_format",
+        "ssh_key_shape",
+        "ssh_key_parser_invalid",
+        "ssh_key_parser_unavailable",
+        "ssh_key_parser_timeout",
+    }
+)
 
 
 class VerificationError(RuntimeError):
     """Closed, safe verification failure."""
+
+    def __init__(self, message: str, *, diagnostic_code: str | None = None) -> None:
+        if diagnostic_code is not None and diagnostic_code not in SSH_DIAGNOSTIC_CODES:
+            raise ValueError("unsupported host-tools verification diagnostic")
+        super().__init__(message)
+        self.diagnostic_code = diagnostic_code
 
 
 class RemoteCommandFailure(VerificationError):
@@ -136,15 +152,15 @@ def _run(argv: list[str], *, timeout: int, max_output: int = MAX_REMOTE_OUTPUT) 
 
 def _safe_host_ssh(host: str, user: str, key: str, temp_root: Path) -> tuple[Path, list[str], bool]:
     if not isinstance(host, str) or HOST_RE.fullmatch(host) is None:
-        raise VerificationError("production SSH configuration is malformed")
+        raise VerificationError("production SSH configuration is malformed", diagnostic_code="ssh_host_format")
     if not isinstance(user, str) or USER_RE.fullmatch(user) is None:
-        raise VerificationError("production SSH configuration is malformed")
+        raise VerificationError("production SSH configuration is malformed", diagnostic_code="ssh_user_format")
     if not isinstance(key, str):
-        raise VerificationError("production SSH configuration is malformed")
+        raise VerificationError("production SSH configuration is malformed", diagnostic_code="ssh_key_shape")
     try:
         key_bytes = key.encode("ascii")
     except UnicodeEncodeError as exc:
-        raise VerificationError("production SSH private key is invalid") from exc
+        raise VerificationError("production SSH configuration is malformed", diagnostic_code="ssh_key_shape") from exc
     if (
         not key_bytes
         or len(key_bytes) > MAX_SSH_PRIVATE_KEY_BYTES
@@ -152,7 +168,7 @@ def _safe_host_ssh(host: str, user: str, key: str, temp_root: Path) -> tuple[Pat
         or b"\x00" in key_bytes
         or any(byte != 0x0A and not 0x20 <= byte <= 0x7E for byte in key_bytes)
     ):
-        raise VerificationError("production SSH configuration is malformed")
+        raise VerificationError("production SSH configuration is malformed", diagnostic_code="ssh_key_shape")
     ssh_dir = temp_root / "platform-host-capability-ssh"
     created = not ssh_dir.exists() and not ssh_dir.is_symlink()
     if created:
@@ -192,10 +208,21 @@ def _safe_host_ssh(host: str, user: str, key: str, temp_root: Path) -> tuple[Pat
                 timeout=SSH_PRIVATE_KEY_PARSE_TIMEOUT_SECONDS,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise VerificationError("production SSH private key validation failed") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise VerificationError(
+                "production SSH private key validation failed",
+                diagnostic_code="ssh_key_parser_timeout",
+            ) from exc
+        except OSError as exc:
+            raise VerificationError(
+                "production SSH private key validation failed",
+                diagnostic_code="ssh_key_parser_unavailable",
+            ) from exc
         if parsed_key.returncode != 0:
-            raise VerificationError("production SSH private key is invalid")
+            raise VerificationError(
+                "production SSH private key is invalid",
+                diagnostic_code="ssh_key_parser_invalid",
+            )
 
         if created:
             scanned = _run(["/usr/bin/timeout", "--foreground", "4s", "/usr/bin/ssh-keyscan", "-T", "3", "-t", "ed25519", host], timeout=6)
@@ -383,7 +410,10 @@ def main(argv: list[str] | None = None) -> int:
         print("Exact host-tools generation is not installed yet.", file=sys.stderr)
         return 10
     except (KeyError, OSError, UnicodeError, VerificationError) as exc:
-        print(str(exc), file=sys.stderr)
+        if isinstance(exc, VerificationError) and exc.diagnostic_code is not None:
+            print(f"{exc} [reason={exc.diagnostic_code}]", file=sys.stderr)
+        else:
+            print(str(exc), file=sys.stderr)
         return 1
 
 
