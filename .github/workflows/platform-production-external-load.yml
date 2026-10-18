@@ -2996,6 +2996,7 @@ jobs:
       - fixture-setup
       - fixture-finalize
       - load-client
+      - cpu-diagnostic-pair
       - namespace-containment-barrier
       - namespace-containment-manual-barrier
     if: ${{ always() }}

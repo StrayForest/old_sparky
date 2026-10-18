@@ -29,7 +29,7 @@ The planner maps changed sources to complete owners; unknown or malformed paths 
 | `docs` | platform maintainers | repository checkout; Markdown docs and project skill metadata | local feedback + CI |
 | `web-quality` | web owners | Node 26.3.1 and locked dependencies | local feedback + CI |
 | `web-hermetic` | web owners | local/mocked API and Chromium | local feedback + CI |
-| `verification-contract` | platform tooling owners | repository checkout | CI |
+| `verification-contract` | platform tooling owners | repository checkout; attested actionlint 1.7.12 | local feedback + CI |
 | `release-runtime` | release owners | root test user; disposable staged checkout and local ZIP fixtures | conditional runtime-sensitive/fallback fixture route |
 | `server-smoke` | release owners | exact deployed SHA | deployment workflow |
 | `live-public` | production operators | canonical public origin and dedicated QA identity | explicit/release workflow |
@@ -289,9 +289,27 @@ The `platform-host-tools-candidate.yml` workflow is a separate trusted `workflow
 a production gate. Its validator and bundle tests belong to `backend-tool-contract` through
 `test_platform_host_tools_bundle`, except the active-baseline reader test, which exercises
 root-owned release metadata and belongs to `backend-privileged`; catalog snapshots track both.
-The verification-contract gate invokes `host_tools_candidate_workflow_issues()` so default-branch
-guards, narrow permissions, pinned actions, data-only candidate handling, isolated-Python use,
-TOCTOU rechecks and production artifact isolation fail closed. The workflow returns a successful no-op for a base-reachable pin; only a novel eligible pin reaches build, attestation and upload. `test_platform_noop_source_binding` belongs to `backend-tool-contract`: its hermetic cases validate the closed no-op receipt, distinct runner/application SHA binding, authenticated artifact metadata, bounded archive extraction, and redirect credential handling without production access.
+The `verification-contract` gate invokes a pinned actionlint 1.7.12 binary against every
+`.github/workflows/*.yml` and `*.yaml` file with shellcheck and pyflakes integrations explicitly
+disabled. Canonical Security CI downloads the official Linux archive into private `RUNNER_TEMP`,
+checks its fixed SHA-256, verifies its GitHub artifact attestation before extraction or execution,
+and binds the attestation to the upstream
+[v1.7.12 release workflow](https://github.com/rhysd/actionlint/blob/v1.7.12/.github/workflows/release.yaml)
+and exact release tag. It exposes only that exact binary to the gate. The gate also runs positive and negative
+`runner.environment` context fixtures, guarding step-level availability and rejecting job-level
+use. The upstream [v1.7.12 installation guide](https://github.com/rhysd/actionlint/blob/v1.7.12/docs/install.md)
+recommends verifying release-archive attestations with the
+[GitHub CLI attestation command](https://cli.github.com/manual/gh_attestation_verify). A local
+machine without the exact pinned binary reports `LOCAL GATE BLOCKED`; it does not skip workflow
+validation. The verification-contract gate also invokes
+`host_tools_candidate_workflow_issues()` so default-branch guards, narrow permissions, pinned
+actions, data-only candidate handling, isolated-Python use, TOCTOU rechecks and production
+artifact isolation fail closed. The workflow returns a successful no-op for a base-reachable
+pin; only a novel eligible pin reaches build, attestation and upload.
+`test_platform_noop_source_binding` belongs to `backend-tool-contract`: its hermetic cases
+validate the closed no-op receipt, distinct runner/application SHA binding, authenticated
+artifact metadata, bounded archive extraction, and redirect credential handling without
+production access.
 That output is review evidence only: it grants no deploy/provision authority, and production
 workflows must not consume its artifact prefixes.
 

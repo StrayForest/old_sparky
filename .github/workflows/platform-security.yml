@@ -1033,7 +1033,7 @@ jobs:
     name: Verification contract
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
     if: ${{ always() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -1052,6 +1052,35 @@ jobs:
           cache-dependency-path: platform/requirements-ci.lock.txt
       - name: Install canonical hash-locked Python CI environment
         run: platform/tools/platform_install_ci_python.sh
+      - name: Install attested pinned actionlint in runner temp
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/platform-actionlint-1.7.12"
+          archive="$install_root/actionlint_1.7.12_linux_amd64.tar.gz"
+          archive_sha256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          if [[ -e "$install_root" || -L "$install_root" ]]; then
+            printf '%s\n' 'actionlint private install path already exists' >&2
+            exit 1
+          fi
+          install -d -m 0700 -- "$install_root"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --output "$archive" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          printf '%s  %s\n' "$archive_sha256" "$archive" | sha256sum --check --status
+          gh attestation verify --repo rhysd/actionlint \
+            --signer-workflow rhysd/actionlint/.github/workflows/release.yaml \
+            --source-ref refs/tags/v1.7.12 "$archive"
+          tar --extract --gzip --file "$archive" --directory "$install_root" \
+            --no-same-owner --no-same-permissions -- actionlint
+          tool="$install_root/actionlint"
+          test -f "$tool" && test ! -L "$tool"
+          chmod 0500 -- "$tool"
+          test "$("$tool" -version | head -n 1)" = 1.7.12
+          printf 'ACTIONLINT_BIN=%s\n' "$tool" >> "$GITHUB_ENV"
       - name: Run canonical verification contract and external catalog contour once
         run: |
           set -euo pipefail

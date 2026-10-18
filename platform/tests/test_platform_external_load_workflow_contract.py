@@ -321,6 +321,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         validate = self.jobs["validate-external-inputs"]
         pair = self.jobs["cpu-diagnostic-pair"]
         load = self.jobs["load-client"]
+        jobs = yaml.safe_load(self.source)["jobs"]
+        evaluator = jobs["evaluate-load"]
+        self.assertIn("cpu-diagnostic-pair", evaluator["needs"])
+        self.assertEqual(evaluator["if"], "${{ always() }}")
         self.assertIn(
             "false:authenticated-page-load-v1:RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC:false:false:true",
             validate,

@@ -106,6 +106,7 @@ from tools.platform_verify_contract import (
     SECURITY_WORKFLOW,
     _production_secret_scope_issues,
     _backend_workflow_issues,
+    actionlint_workflow_issues,
     action_pin_issues,
     collect_issues,
     _ci_dependency_issues,
@@ -3019,9 +3020,14 @@ except lock.VerificationLockError as exc:
         self.assertIn("run the migration gate", str(missing_seed))
         self.assertIn("`alembic upgrade head`", str(missing_seed))
         self.assertIn("disposable platformdb_test", str(missing_seed))
+        contract_command, test_command = _verification_contract_commands()
+        actionlint_command = [
+            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "tools/platform_actionlint.py"),
+        ]
         self.assertEqual(
             [call.args[1] for call in run.call_args_list],
-            list(_verification_contract_commands()),
+            [contract_command, actionlint_command, test_command],
         )
 
     def test_production_contours_are_not_dispatchable_as_local_gates(self) -> None:
@@ -3163,6 +3169,52 @@ except lock.VerificationLockError as exc:
             [],
         )
         self.assertEqual(host_tools_pin_verification_issues(workflow_text), [])
+        self.assertEqual(actionlint_workflow_issues(workflow_text), [])
+        missing_actionlint_attestation = workflow_text.replace(
+            "gh attestation verify --repo rhysd/actionlint \\\n",
+            "gh attestation verify --repo other/tool \\\n",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "pinned upstream release attestation identity" in issue
+                for issue in actionlint_workflow_issues(missing_actionlint_attestation)
+            )
+        )
+        missing_actionlint_signer = workflow_text.replace(
+            "--signer-workflow rhysd/actionlint/.github/workflows/release.yaml",
+            "--signer-workflow rhysd/actionlint/.github/workflows/other.yaml",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "pinned upstream release attestation identity" in issue
+                for issue in actionlint_workflow_issues(missing_actionlint_signer)
+            )
+        )
+        missing_actionlint_checksum = workflow_text.replace(
+            "sha256sum --check --status", "sha256sum --check", 1
+        )
+        self.assertTrue(
+            any(
+                "checksum verification" in issue
+                for issue in actionlint_workflow_issues(missing_actionlint_checksum)
+            )
+        )
+        actionlint_tool = Path(__file__).resolve().parents[1] / "tools/platform_actionlint.py"
+        blocked_environment = os.environ.copy()
+        blocked_environment.pop("ACTIONLINT_BIN", None)
+        blocked_environment["PATH"] = ""
+        blocked = subprocess.run(
+            [sys.executable, str(actionlint_tool)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=blocked_environment,
+            timeout=20,
+        )
+        self.assertEqual(blocked.returncode, 2, blocked.stdout + blocked.stderr)
+        self.assertIn("LOCAL GATE BLOCKED", blocked.stderr)
         missing_pin_resolver = workflow_text.replace(
             "platform/tools/platform_host_tools_pin.py resolve",
             "platform/tools/platform_host_tools_pin.py inspect",

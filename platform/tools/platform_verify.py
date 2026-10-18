@@ -521,11 +521,17 @@ GATES: tuple[Gate, ...] = (
     ),
     Gate(
         id="verification-contract",
-        description="Self-test for registry, workflow, suite and load-profile ownership.",
+        description=(
+            "Self-test for registry, workflow, suite and load-profile ownership, "
+            "including pinned actionlint workflow-expression validation."
+        ),
         deterministic=True,
         local_safe=True,
         ci_required=True,
-        environment_requirements=("repository checkout",),
+        environment_requirements=(
+            "repository checkout",
+            "actionlint 1.7.12 (checksum-verified in canonical CI)",
+        ),
         canonical_runner="tools/platform_verify_contract.py",
         timeout_class="short",
         owner="platform-tooling",
@@ -1441,6 +1447,13 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
         status = _run(
             gate_id,
             contract_command,
+            timeout_seconds=timeout_seconds,
+        )
+        if status:
+            return status
+        status = _run(
+            f"{gate_id}/actionlint",
+            [sys.executable, _tool("platform_actionlint.py")],
             timeout_seconds=timeout_seconds,
         )
         if status:

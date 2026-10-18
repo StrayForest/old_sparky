@@ -1727,6 +1727,71 @@ def host_tools_pin_verification_issues(security_text: str) -> list[str]:
     return issues
 
 
+def actionlint_workflow_issues(security_text: str) -> list[str]:
+    """Require authenticated, checksum-pinned workflow-expression linting."""
+
+    issues: list[str] = []
+    block = _workflow_job_block(security_text, "verification-contract")
+    if not block:
+        return ["platform-security.yml is missing verification-contract"]
+    if "runs-on: ubuntu-24.04" not in block:
+        issues.append("verification-contract must use the supported Ubuntu 24.04 gh runner")
+    installer_steps = tuple(
+        step for step in _workflow_step_blocks(block)
+        if "Install attested pinned actionlint in runner temp" in step
+    )
+    if len(installer_steps) != 1:
+        issues.append("verification-contract must install pinned actionlint exactly once")
+    else:
+        installer = installer_steps[0]
+        for marker, description in (
+            ("RUNNER_TEMP/platform-actionlint-1.7.12", "private RUNNER_TEMP installation"),
+            ("actionlint_1.7.12_linux_amd64.tar.gz", "pinned Linux archive"),
+            ("8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8", "official archive SHA-256"),
+            ("sha256sum --check --status", "checksum verification before extraction"),
+            (
+                "gh attestation verify --repo rhysd/actionlint \\\n"
+                "            --signer-workflow rhysd/actionlint/.github/workflows/release.yaml \\\n"
+                "            --source-ref refs/tags/v1.7.12",
+                "pinned upstream release attestation identity",
+            ),
+            ("test \"$(\"$tool\" -version | head -n 1)\" = 1.7.12", "exact actionlint version check"),
+            ("ACTIONLINT_BIN=", "pinned binary passed to canonical gate"),
+        ):
+            if marker not in installer:
+                issues.append(f"verification-contract actionlint installer is missing {description}")
+        if "GH_TOKEN: ${{ github.token }}" not in installer:
+            issues.append("verification-contract actionlint attestation must use the job token")
+        checksum_at = installer.find("sha256sum --check --status")
+        attestation_at = installer.find(
+            "gh attestation verify --repo rhysd/actionlint"
+        )
+        extraction_at = installer.find("tar --extract --gzip")
+        if not (0 <= checksum_at < attestation_at < extraction_at):
+            issues.append(
+                "verification-contract must checksum and attest the archive before extraction"
+            )
+    if "attestations: write" not in block or "contents: read" not in block:
+        issues.append("verification-contract must retain read-only source and attestation permissions")
+    gate_source = (PLATFORM_ROOT / "tools" / "platform_verify.py").read_text(
+        encoding="utf-8"
+    )
+    if '[sys.executable, _tool("platform_actionlint.py")]' not in gate_source:
+        issues.append("verification-contract must execute the pinned actionlint wrapper")
+    wrapper_source = (PLATFORM_ROOT / "tools" / "platform_actionlint.py").read_text(
+        encoding="utf-8"
+    )
+    for marker, description in (
+        ('"-shellcheck", "", "-pyflakes", ""', "disabled shellcheck/pyflakes integrations"),
+        ("runner.environment", "runner-context fixture regression"),
+        ('"*.yml"', "YAML workflow discovery"),
+        ('"*.yaml"', "YAML workflow discovery"),
+    ):
+        if marker not in wrapper_source:
+            issues.append(f"actionlint wrapper must retain {description}")
+    return issues
+
+
 def release_runtime_workflow_issues(security_text: str) -> list[str]:
     """Keep fixture and trusted-dev release contours separate and fail-closed."""
 
@@ -2122,6 +2187,7 @@ def collect_issues() -> list[str]:
     issues.extend(_backend_workflow_issues(security_text))
     issues.extend(_migration_contract_issues(security_text))
     issues.extend(host_tools_pin_verification_issues(security_text))
+    issues.extend(actionlint_workflow_issues(security_text))
     issues.extend(release_runtime_workflow_issues(security_text))
     issues.extend(
         _backend_timeout_budget_issues(
