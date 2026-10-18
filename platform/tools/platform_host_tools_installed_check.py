@@ -27,6 +27,11 @@ USER_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 HOST_RE = re.compile(r"[A-Za-z0-9.-]{1,253}\Z")
 MAX_CONTRACT_ROWS = 32
 MAX_REMOTE_OUTPUT = 16384
+# OpenSSH private-key files are multiline text. GitHub Actions secrets are
+# limited to 48 KiB; reserve another 16 KiB for envelope/formatting overhead
+# while preventing an unbounded secret from reaching the runner's SSH directory.
+MAX_SSH_PRIVATE_KEY_BYTES = 65536
+SSH_PRIVATE_KEY_PARSE_TIMEOUT_SECONDS = 5
 
 
 class VerificationError(RuntimeError):
@@ -130,7 +135,23 @@ def _run(argv: list[str], *, timeout: int, max_output: int = MAX_REMOTE_OUTPUT) 
 
 
 def _safe_host_ssh(host: str, user: str, key: str, temp_root: Path) -> tuple[Path, list[str], bool]:
-    if HOST_RE.fullmatch(host) is None or USER_RE.fullmatch(user) is None or "\n" in key or "\r" in key:
+    if not isinstance(host, str) or HOST_RE.fullmatch(host) is None:
+        raise VerificationError("production SSH configuration is malformed")
+    if not isinstance(user, str) or USER_RE.fullmatch(user) is None:
+        raise VerificationError("production SSH configuration is malformed")
+    if not isinstance(key, str):
+        raise VerificationError("production SSH configuration is malformed")
+    try:
+        key_bytes = key.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise VerificationError("production SSH private key is invalid") from exc
+    if (
+        not key_bytes
+        or len(key_bytes) > MAX_SSH_PRIVATE_KEY_BYTES
+        or b"\r" in key_bytes
+        or b"\x00" in key_bytes
+        or any(byte != 0x0A and not 0x20 <= byte <= 0x7E for byte in key_bytes)
+    ):
         raise VerificationError("production SSH configuration is malformed")
     ssh_dir = temp_root / "platform-host-capability-ssh"
     created = not ssh_dir.exists() and not ssh_dir.is_symlink()
@@ -144,8 +165,39 @@ def _safe_host_ssh(host: str, user: str, key: str, temp_root: Path) -> tuple[Pat
     config_path = ssh_dir / "config"
     try:
         if created:
-            key_path.write_text(key.rstrip("\n") + "\n", encoding="utf-8")
-            key_path.chmod(0o600)
+            key_fd = os.open(
+                key_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(key_fd, "wb") as key_file:
+                os.fchmod(key_file.fileno(), 0o600)
+                key_file.write(key_bytes.rstrip(b"\n") + b"\n")
+                key_file.flush()
+                os.fsync(key_file.fileno())
+        else:
+            for path in (key_path, known_hosts_path, config_path):
+                metadata = path.lstat()
+                if path.is_symlink() or not path.is_file() or metadata.st_nlink != 1 or metadata.st_mode & 0o777 != 0o600:
+                    raise VerificationError("existing production SSH files are unsafe")
+            if key_path.read_bytes() != key_bytes.rstrip(b"\n") + b"\n":
+                raise VerificationError("existing production SSH key differs from the supplied identity")
+
+        try:
+            parsed_key = subprocess.run(
+                ["/usr/bin/ssh-keygen", "-y", "-P", "", "-f", str(key_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=SSH_PRIVATE_KEY_PARSE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise VerificationError("production SSH private key validation failed") from exc
+        if parsed_key.returncode != 0:
+            raise VerificationError("production SSH private key is invalid")
+
+        if created:
             scanned = _run(["/usr/bin/timeout", "--foreground", "4s", "/usr/bin/ssh-keyscan", "-T", "3", "-t", "ed25519", host], timeout=6)
             lines = scanned.decode("ascii", "strict").splitlines()
             if len(lines) != 1 or not lines[0].startswith(host + " ssh-ed25519 "):
@@ -154,12 +206,6 @@ def _safe_host_ssh(host: str, user: str, key: str, temp_root: Path) -> tuple[Pat
             scan_path.chmod(0o600)
             fingerprint_path = scan_path
         else:
-            for path in (key_path, known_hosts_path, config_path):
-                metadata = path.lstat()
-                if path.is_symlink() or not path.is_file() or metadata.st_nlink != 1 or metadata.st_mode & 0o777 != 0o600:
-                    raise VerificationError("existing production SSH files are unsafe")
-            if key_path.read_text(encoding="utf-8") != key.rstrip("\n") + "\n":
-                raise VerificationError("existing production SSH key differs from the supplied identity")
             known_hosts_text = known_hosts_path.read_text(encoding="ascii")
             known_hosts_rows = known_hosts_text.splitlines()
             if (

@@ -113,6 +113,19 @@ class HostToolsBundleTests(unittest.TestCase):
             path.chmod(0o600)
         return contract
 
+    def _temporary_ed25519_private_key(self, root: Path) -> str:
+        key_path = root / "fixture-id-ed25519"
+        subprocess.run(
+            ["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=True,
+        )
+        key_path.chmod(0o600)
+        return key_path.read_text(encoding="ascii")
+
     def test_host_generation_checker_removes_created_ssh_material_on_failure_before_export(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -300,6 +313,70 @@ class HostToolsBundleTests(unittest.TestCase):
     def test_existing_host_ssh_dir_never_writes_through_scan_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            private_key = self._temporary_ed25519_private_key(root)
+
+            fresh_root = root / "fresh-runner-temp"
+            fresh_root.mkdir(mode=0o700)
+            fresh_ssh_dir = fresh_root / "platform-host-capability-ssh"
+
+            def fake_ssh_outputs(argv: list[str], **_kwargs: object) -> bytes:
+                if argv[0] == "/usr/bin/timeout":
+                    return b"production.example.test ssh-ed25519 AAAA\n"
+                if argv[0] == "/usr/bin/ssh-keygen":
+                    return f"256 {installed_check.HOST_KEY_FINGERPRINT} production.example.test (ED25519)\n".encode()
+                raise AssertionError("unexpected SSH helper process")
+
+            real_run = subprocess.run
+
+            def record_private_key_parser(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                if argv[:5] == ["/usr/bin/ssh-keygen", "-y", "-P", "", "-f"]:
+                    parsed_path = Path(argv[5])
+                    parsed_metadata = parsed_path.lstat()
+                    self.assertEqual(parsed_metadata.st_mode & 0o777, 0o600)
+                    self.assertEqual(parsed_metadata.st_nlink, 1)
+                    self.assertIs(kwargs.get("stdin"), subprocess.DEVNULL)
+                    self.assertIs(kwargs.get("stdout"), subprocess.DEVNULL)
+                    self.assertIs(kwargs.get("stderr"), subprocess.DEVNULL)
+                    self.assertEqual(kwargs.get("timeout"), installed_check.SSH_PRIVATE_KEY_PARSE_TIMEOUT_SECONDS)
+                    self.assertFalse(kwargs.get("check"))
+                return real_run(argv, **kwargs)
+
+            with patch.object(installed_check, "_run", side_effect=fake_ssh_outputs), patch.object(
+                installed_check.subprocess, "run", side_effect=record_private_key_parser
+            ) as parser_run:
+                returned_dir, remote, created = installed_check._safe_host_ssh(
+                    "production.example.test", "operator", private_key, fresh_root
+                )
+
+            self.assertEqual(returned_dir, fresh_ssh_dir)
+            self.assertTrue(created)
+            self.assertIn("operator@production.example.test", remote)
+            self.assertEqual((fresh_ssh_dir / "id_ed25519").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((fresh_ssh_dir / "id_ed25519").read_text(encoding="ascii"), private_key.rstrip("\n") + "\n")
+            parser_calls = [call for call in parser_run.call_args_list if call.args[0][:2] == ["/usr/bin/ssh-keygen", "-y"]]
+            self.assertEqual(len(parser_calls), 1)
+
+            for bad_host, bad_user, bad_key in (
+                ("", "operator", private_key),
+                ("production.example.test:22", "operator", private_key),
+                ("production.example.test", "operator/user", private_key),
+                ("production.example.test", "operator", ""),
+                ("production.example.test", "operator", private_key.replace("\n", "\r\n")),
+                ("production.example.test", "operator", private_key + "\x00"),
+                ("production.example.test", "operator", private_key + "é"),
+                ("production.example.test", "operator", "x" * (installed_check.MAX_SSH_PRIVATE_KEY_BYTES + 1)),
+                ("production.example.test", "operator", "not an OpenSSH private key\n"),
+            ):
+                with self.subTest(host_valid=bad_host == "production.example.test", user_valid=bad_user == "operator", key_length=len(bad_key)):
+                    rejected_root = root / f"rejected-{len(list(root.glob('rejected-*')))}"
+                    rejected_root.mkdir(mode=0o700)
+                    with patch.object(installed_check, "_run") as ssh_run:
+                        with self.assertRaises(installed_check.VerificationError) as failure:
+                            installed_check._safe_host_ssh(bad_host, bad_user, bad_key, rejected_root)
+                    self.assertFalse(bad_key and bad_key in str(failure.exception))
+                    self.assertFalse((rejected_root / "platform-host-capability-ssh").exists())
+                    ssh_run.assert_not_called()
+
             ssh_dir = root / "platform-host-capability-ssh"
             ssh_dir.mkdir(mode=0o700)
             known_hosts = ssh_dir / "known_hosts"
@@ -308,7 +385,7 @@ class HostToolsBundleTests(unittest.TestCase):
             for path, contents in (
                 (known_hosts, "production.example.test ssh-ed25519 AAAA\n"),
                 (config, f"Host *\n  StrictHostKeyChecking yes\n  UserKnownHostsFile {known_hosts}\n"),
-                (key, "synthetic-private-key\n"),
+                (key, private_key.rstrip("\n") + "\n"),
             ):
                 path.write_text(contents, encoding="ascii")
                 path.chmod(0o600)
@@ -323,7 +400,7 @@ class HostToolsBundleTests(unittest.TestCase):
                 return_value=f"256 {installed_check.HOST_KEY_FINGERPRINT} production.example.test (ED25519)\n".encode(),
             ):
                 returned_dir, remote, created = installed_check._safe_host_ssh(
-                    "production.example.test", "operator", "synthetic-private-key", root
+                    "production.example.test", "operator", private_key, root
                 )
 
             self.assertEqual(returned_dir, ssh_dir)
@@ -338,7 +415,7 @@ class HostToolsBundleTests(unittest.TestCase):
             with patch.object(installed_check, "_run") as run:
                 with self.assertRaises(installed_check.VerificationError):
                     installed_check._safe_host_ssh(
-                        "production.example.test", "operator", "synthetic-private-key", root
+                        "production.example.test", "operator", private_key, root
                     )
             run.assert_not_called()
             self.assertEqual(victim.read_text(encoding="ascii"), "do not overwrite\n")
