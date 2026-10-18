@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import stat
+import subprocess
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -87,6 +88,10 @@ EXPECTED_MAINTENANCE_ARGV = (
     "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json",
     "--backup-keep",
     "15",
+    "--protected-release",
+    "gha-38000614899-1-7e5769ba3f85",
+    "--protected-release",
+    "gha-37760797674-1-80e457e57081",
     "--release-keep",
     "5",
     "--test-artifact-max-age-days",
@@ -100,6 +105,32 @@ EXPECTED_MAINTENANCE_ARGV = (
     "--maximum-used-percent",
     "85",
 )
+
+
+def maintenance_preview_argv() -> tuple[str, ...]:
+    """Derive the read-only retention CLI from the reviewed service argv."""
+    argv = list(EXPECTED_MAINTENANCE_ARGV)
+    if argv.count("--apply") != 1 or "--json" in argv:
+        _fail()
+    argv.remove("--apply")
+    argv.insert(2, "--json")
+    return tuple(argv)
+
+
+def run_validated_maintenance_preview(
+    source_path: str, installed_path: str, properties: str
+) -> int:
+    """Run only the read-only preview derived from an exactly bound unit."""
+    validate_loaded_maintenance_unit(source_path, installed_path, properties)
+    completed = subprocess.run(
+        maintenance_preview_argv(),
+        stdin=subprocess.DEVNULL,
+        stdout=sys.stdout.buffer,
+        stderr=subprocess.DEVNULL,
+        timeout=180,
+        check=False,
+    )
+    return completed.returncode
 MAX_UNIT_BYTES = 64 * 1024
 
 LAUNCH_LOGICAL_FIELDS = (
@@ -1103,6 +1134,21 @@ def main(argv: list[str] | None = None) -> int:
             print("MAINTENANCE_UNIT_CONTRACT schema=1 status=unavailable", file=sys.stderr)
             return 1
         return 0
+    if actual_argv[:1] == ["run-retention-preview"]:
+        preview_parser = argparse.ArgumentParser(description=__doc__)
+        preview_parser.add_argument("mode")
+        preview_parser.add_argument("source_path")
+        preview_parser.add_argument("installed_path")
+        args = preview_parser.parse_args(actual_argv)
+        try:
+            properties = sys.stdin.read(MAX_UNIT_BYTES + 1)
+            if len(properties.encode("utf-8")) > MAX_UNIT_BYTES:
+                _fail()
+            return run_validated_maintenance_preview(
+                args.source_path, args.installed_path, properties
+            )
+        except Exception:
+            return 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-sha", required=True)
     parser.add_argument("--live-launch-run-id", required=True)

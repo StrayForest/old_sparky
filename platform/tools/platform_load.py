@@ -2111,8 +2111,12 @@ def run_profile(
     max_runner_minutes = float(cost_budget["max_runner_minutes"])
     try:
         from tools.platform_load_runtime import run_supervised
+        from tools.platform_load_runtime import _write_json_atomic
+        from tools.platform_external_load import RunnerCgroupSampler, _capacity_attribution
     except ModuleNotFoundError:  # Direct execution from platform/tools.
         from platform_load_runtime import run_supervised
+        from platform_load_runtime import _write_json_atomic
+        from platform_external_load import RunnerCgroupSampler, _capacity_attribution
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
@@ -2135,6 +2139,18 @@ def run_profile(
             "progress_checkpoint_path": str(progress_path),
             "progress_context": progress_context,
         }
+        runner_environment = os.environ.get("PLATFORM_RUNNER_ENVIRONMENT")
+        runner_sampler = RunnerCgroupSampler(runner_environment=runner_environment)
+        runner_usage_at_exit: list[dict[str, Any]] = []
+
+        def stop_runner_sampler(namespace_pid: int, namespace_starttime: int) -> None:
+            runner_usage_at_exit.append(
+                runner_sampler.stop(
+                    namespace_pid=namespace_pid,
+                    namespace_starttime=namespace_starttime,
+                )
+            )
+
         result = run_supervised(
             worker_command=(
                 sys.executable,
@@ -2145,6 +2161,8 @@ def run_profile(
             max_duration_seconds=max_duration_seconds,
             max_runner_minutes=max_runner_minutes,
             worker_config=worker_config,
+            on_namespace_init=runner_sampler.start if runner_environment == "github-hosted" else None,
+            on_namespace_exit=stop_runner_sampler if runner_environment == "github-hosted" else None,
         )
         progress_snapshot = None
         if result.namespace_closed is True and result.descendants_reaped is True:
@@ -2174,6 +2192,24 @@ def run_profile(
             pass
 
     payload = result.report
+    if os.environ.get("PLATFORM_RUNNER_ENVIRONMENT") == "github-hosted":
+        runner_usage = (
+            runner_usage_at_exit[0]
+            if runner_usage_at_exit
+            else runner_sampler.stop()
+        )
+        payload["runner_cgroup_usage"] = runner_usage
+        client_usage = payload.get("client_resource_usage")
+        if isinstance(client_usage, Mapping):
+            payload["capacity_attribution"] = _capacity_attribution(
+                payload, client_usage, runner_usage
+            )
+        try:
+            _write_json_atomic(report_path, payload)
+        except (OSError, TypeError, ValueError):
+            # The supervisor's already-published report remains valid; host
+            # resource evidence is optional and cannot alter load acceptance.
+            pass
     decision = (
         payload.get("acceptance", {}).get("decision")
         if isinstance(payload.get("acceptance"), Mapping)

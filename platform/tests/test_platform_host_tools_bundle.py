@@ -16,12 +16,14 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 import zipfile
 from unittest.mock import patch
 
 from tools import platform_host_tools_bundle as bundle
+from tools import platform_host_tools_installed_check as installed_check
 from tools import platform_host_tools_candidate as candidate
 from tools import platform_host_tools_pin as pin
 from tools import platform_workflow_remote_dispatch as dispatcher
@@ -83,6 +85,264 @@ def _release_receipt(
 
 
 class HostToolsBundleTests(unittest.TestCase):
+    def test_installed_checker_caps_stdout_while_child_is_running(self) -> None:
+        child = [
+            sys.executable,
+            "-c",
+            "import os,time; os.write(1,b'x'*1048576); time.sleep(10)",
+        ]
+        started = time.monotonic()
+        with self.assertRaises(installed_check.VerificationError):
+            installed_check._run(child, timeout=3, max_output=128)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def _installed_checker_contract(self, root: Path) -> Path:
+        contract = root / "contract"
+        contract.mkdir()
+        tool = b"fixture host tool\n"
+        (contract / "platform_example.py").write_bytes(tool)
+        (contract / "files.sha256").write_text(
+            f"{hashlib.sha256(tool).hexdigest()} platform_example.py\n", encoding="ascii"
+        )
+        (contract / "files.modes").write_text("555 platform_example.py\n", encoding="ascii")
+        (contract / "manifest.sha256").write_text(f"{'b' * 64}\n", encoding="ascii")
+        (contract / "capabilities.sha256").write_text(f"{'c' * 64}\n", encoding="ascii")
+        (contract / "source_sha").write_text(f"{SOURCE_SHA}\n", encoding="ascii")
+        (contract / "toolset_version").write_text("production-host-tools-v4\n", encoding="ascii")
+        for path in contract.iterdir():
+            path.chmod(0o600)
+        return contract
+
+    def test_host_generation_checker_removes_created_ssh_material_on_failure_before_export(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            contract = self._installed_checker_contract(root)
+            ssh_dir = runner_temp / "platform-host-capability-ssh"
+            github_env = root / "github-env"
+
+            def create_ssh(*_args: object, **_kwargs: object) -> tuple[Path, list[str], bool]:
+                ssh_dir.mkdir(mode=0o700)
+                (ssh_dir / "id_ed25519").write_text("synthetic-private-key\n", encoding="ascii")
+                (ssh_dir / "id_ed25519").chmod(0o600)
+                return ssh_dir, ["ssh", "fixed"], True
+
+            def remote(_argv: list[str], *args: str, **_kwargs: object) -> bytes:
+                if args == ("/usr/bin/id", "-u"):
+                    return b"0\n"
+                if args[:3] == ("/usr/bin/test", "-d", f"{installed_check.GENERATION_ROOT}/{SOURCE_SHA}"):
+                    raise installed_check.RemoteCommandFailure(1)
+                raise AssertionError("unexpected remote operation")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_ENV": str(github_env),
+                    "PROD_SSH_HOST": "production.example.test",
+                    "PROD_SSH_USER": "operator",
+                    "PROD_SSH_KEY": "synthetic-private-key",
+                },
+            ), patch.object(installed_check, "_safe_host_ssh", side_effect=create_ssh), patch.object(
+                installed_check, "_remote", side_effect=remote
+            ):
+                output = StringIO()
+                with redirect_stdout(output):
+                    result = installed_check.main(
+                        ["--source-sha", SOURCE_SHA, "--toolset-version", "production-host-tools-v4",
+                         "--contract-dir", str(contract)]
+                    )
+
+            self.assertEqual(result, 10)
+            self.assertFalse(ssh_dir.exists())
+            self.assertFalse(github_env.exists())
+            self.assertNotIn("synthetic-private-key", output.getvalue())
+
+    def test_shared_host_generation_verifier_accepts_exact_generation_and_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            contract = self._installed_checker_contract(root)
+            generation = f"{installed_check.GENERATION_ROOT}/{SOURCE_SHA}"
+            digests, _modes, manifest_hash, capabilities_hash = installed_check._contract_rows(contract)
+            expected_names = {"manifest.json", "capabilities.txt", *(path for _digest, path in digests)}
+            payloads = {path: digest for digest, path in digests}
+            payloads.update({"manifest.json": manifest_hash, "capabilities.txt": capabilities_hash})
+            capability = (
+                f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} dispatcher=4 artifact_prepare=2 "
+                "supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 "
+                "retained_load_source_binding=1 cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1\n"
+            ).encode("ascii")
+
+            def remote(_argv: list[str], *args: str, **kwargs: object) -> bytes:
+                if args == ("/usr/bin/id", "-u"):
+                    return b"0\n"
+                if args == ("/usr/bin/test", "-d", generation):
+                    return b""
+                if args == ("/usr/bin/test", "!", "-L", generation):
+                    return b""
+                if args[:3] == ("/usr/bin/stat", "-c", "%F:%u:%g:%h:%a"):
+                    path = args[-1]
+                    if path == generation:
+                        return b"directory:0:0:2:555\n"
+                    relative = path.removeprefix(generation + "/")
+                    mode = "444" if relative in {"manifest.json", "capabilities.txt"} else "555"
+                    return f"regular file:0:0:1:{mode}\n".encode("ascii")
+                if args[:2] == ("/usr/bin/sha256sum", "--"):
+                    path = args[2]
+                    relative = path.removeprefix(generation + "/")
+                    return f"{payloads[relative]}  {path}\n".encode("ascii")
+                if args[:2] == ("/usr/bin/find", "--"):
+                    return b"".join(
+                        f"{generation}/{name}".encode("ascii") + b"\0"
+                        for name in sorted(expected_names)
+                    )
+                if args[:3] == ("/usr/bin/python3.12", "-I", "-B"):
+                    self.assertEqual(args[3:], (f"{generation}/platform_workflow_remote_dispatch.py", "host-capabilities"))
+                    self.assertEqual(kwargs.get("max_output"), 512)
+                    return capability
+                raise AssertionError(f"unexpected fixed remote command: {args!r}")
+
+            ssh_dir = runner_temp / "platform-host-capability-ssh"
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}), patch.object(
+                installed_check, "_safe_host_ssh", return_value=(ssh_dir, ["ssh", "fixed"], True)
+            ), patch.object(installed_check, "_remote", side_effect=remote):
+                checked_dir, checked_generation, created = installed_check.verify_installed_generation(
+                    SOURCE_SHA, "production-host-tools-v4", contract
+                )
+            self.assertEqual(checked_dir, ssh_dir)
+            self.assertEqual(str(checked_generation), generation)
+            self.assertTrue(created)
+
+    def test_host_generation_checker_retries_only_missing_generation_and_cleans_after_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            contract = self._installed_checker_contract(root)
+            ssh_dir = runner_temp / "platform-host-capability-ssh"
+            generation = f"{installed_check.GENERATION_ROOT}/{SOURCE_SHA}"
+            generation_attempts = 0
+
+            def create_ssh(*_args: object, **_kwargs: object) -> tuple[Path, list[str], bool]:
+                ssh_dir.mkdir(mode=0o700)
+                (ssh_dir / "id_ed25519").write_text("synthetic-private-key\n", encoding="ascii")
+                (ssh_dir / "id_ed25519").chmod(0o600)
+                return ssh_dir, ["ssh", "fixed"], True
+
+            def remote(_argv: list[str], *args: str, **_kwargs: object) -> bytes:
+                nonlocal generation_attempts
+                if args == ("/usr/bin/id", "-u"):
+                    return b"0\n"
+                if args[:3] == ("/usr/bin/test", "-d", generation):
+                    generation_attempts += 1
+                    raise installed_check.RemoteCommandFailure(1)
+                raise AssertionError("missing-generation retries must not run other remote checks")
+
+            clock = iter((100.0, 100.5, 100.9, 101.1))
+            with patch.dict(
+                os.environ,
+                {
+                    "RUNNER_TEMP": str(runner_temp),
+                    "PROD_SSH_HOST": "production.example.test",
+                    "PROD_SSH_USER": "operator",
+                    "PROD_SSH_KEY": "synthetic-private-key",
+                },
+            ), patch.object(installed_check, "_safe_host_ssh", side_effect=create_ssh), patch.object(
+                installed_check, "_remote", side_effect=remote
+            ), patch.object(installed_check.time, "monotonic", side_effect=lambda: next(clock)), patch.object(
+                installed_check.time, "sleep"
+            ):
+                with self.assertRaises(installed_check.GenerationAbsent):
+                    installed_check.verify_installed_generation(
+                        SOURCE_SHA, "production-host-tools-v4", contract, wait_seconds=1
+                    )
+
+            self.assertEqual(generation_attempts, 2)
+            self.assertFalse(ssh_dir.exists())
+
+    def test_installed_generation_checker_closes_local_contract_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            contract = Path(temporary)
+            payload = {
+                "files.sha256": f"{'a' * 64} platform_example.py\n",
+                "files.modes": "555 platform_example.py\n",
+                "manifest.sha256": f"{'b' * 64}\n",
+                "capabilities.sha256": f"{'c' * 64}\n",
+            }
+            for name, contents in payload.items():
+                path = contract / name
+                path.write_text(contents, encoding="ascii")
+                path.chmod(0o600)
+            digests, modes, manifest, capabilities = installed_check._contract_rows(contract)
+            self.assertEqual(digests, [("a" * 64, "platform_example.py")])
+            self.assertEqual(modes, [("555", "platform_example.py")])
+            self.assertEqual(manifest, "b" * 64)
+            self.assertEqual(capabilities, "c" * 64)
+            (contract / "files.sha256").write_text(f"{'a' * 64} ../escape\n", encoding="ascii")
+            (contract / "files.sha256").chmod(0o600)
+            with self.assertRaises(installed_check.VerificationError):
+                installed_check._contract_rows(contract)
+
+    def test_host_generation_checker_reusable_wait_api_rejects_invalid_bounds(self) -> None:
+        for wait_seconds in (-1, 1801, True, 1.5):
+            with self.subTest(wait_seconds=wait_seconds):
+                with self.assertRaises(installed_check.VerificationError):
+                    installed_check.verify_installed_generation(
+                        SOURCE_SHA,
+                        "production-host-tools-v4",
+                        Path("unused"),
+                        wait_seconds=wait_seconds,  # type: ignore[arg-type]
+                    )
+
+    def test_existing_host_ssh_dir_never_writes_through_scan_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ssh_dir = root / "platform-host-capability-ssh"
+            ssh_dir.mkdir(mode=0o700)
+            known_hosts = ssh_dir / "known_hosts"
+            config = ssh_dir / "config"
+            key = ssh_dir / "id_ed25519"
+            for path, contents in (
+                (known_hosts, "production.example.test ssh-ed25519 AAAA\n"),
+                (config, f"Host *\n  StrictHostKeyChecking yes\n  UserKnownHostsFile {known_hosts}\n"),
+                (key, "synthetic-private-key\n"),
+            ):
+                path.write_text(contents, encoding="ascii")
+                path.chmod(0o600)
+            victim = root / "outside-target"
+            victim.write_text("do not overwrite\n", encoding="ascii")
+            scan_path = ssh_dir / "known_hosts.scan"
+            scan_path.symlink_to(victim)
+
+            with patch.object(
+                installed_check,
+                "_run",
+                return_value=f"256 {installed_check.HOST_KEY_FINGERPRINT} production.example.test (ED25519)\n".encode(),
+            ):
+                returned_dir, remote, created = installed_check._safe_host_ssh(
+                    "production.example.test", "operator", "synthetic-private-key", root
+                )
+
+            self.assertEqual(returned_dir, ssh_dir)
+            self.assertFalse(created)
+            self.assertIn("operator@production.example.test", remote)
+            self.assertTrue(scan_path.is_symlink())
+            self.assertEqual(victim.read_text(encoding="ascii"), "do not overwrite\n")
+            known_hosts.write_text(
+                "production.example.test ssh-ed25519 AAAA\nother.example.test ssh-ed25519 BBBB\n",
+                encoding="ascii",
+            )
+            with patch.object(installed_check, "_run") as run:
+                with self.assertRaises(installed_check.VerificationError):
+                    installed_check._safe_host_ssh(
+                        "production.example.test", "operator", "synthetic-private-key", root
+                    )
+            run.assert_not_called()
+            self.assertEqual(victim.read_text(encoding="ascii"), "do not overwrite\n")
+
     def test_external_cleanup_dispatch_uses_validated_equal_run_ids(self) -> None:
         target_sha = "a" * 40
         load_run_id = "37556438370"
@@ -1002,8 +1262,9 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertIn('--source-sha "$HOST_TOOLS_SHA"', host_build_step)
         self.assertNotIn('--source-sha "$TARGET_SHA"', host_build_step)
         self.assertNotIn("/opt/oldsparky/platform/shared/host-tools/${{ github.sha }}", workflow)
-        self.assertIn("source_sha=$HOST_TOOLS_SHA", host_preflight)
-        self.assertIn("generation=$HOST_TOOLS_SHA", host_preflight)
+        self.assertIn('"$HOST_TOOLS_SHA"', host_preflight)
+        self.assertIn('"$HOST_TOOLS_TOOLSET_VERSION"', host_preflight)
+        self.assertIn("Checkout exact source containing shared host verifier", host_preflight)
         artifact_validation = host_preflight.split(
             "      - name: Validate host-tools artifact envelope and bundle", 1
         )[1].split("      - name: Validate root SSH identity and installed generation", 1)[0]
@@ -2401,435 +2662,30 @@ raise SystemExit(module.main(["host-capabilities"]))
         self.assertIn("platform_unlisted_local.py", mutated_discovered - names)
         self.assertNotEqual(mutated_discovered - names - boundary_allowlist, set())
 
-    def test_remote_integrity_block_processes_every_digest_and_mode_sidecar_row(self) -> None:
-        """Execute the active YAML block against an SSH that consumes stdin.
-
-        The sidecars contain one row for each of the 13 host helpers plus
-        ``capabilities.txt``.  A remote SSH command without ``-n`` inherits
-        the sidecar as stdin and steals rows from the enclosing ``while``;
-        this fixture therefore fails on the vulnerable block and passes only
-        when the read-only SSH array is detached from runner stdin.
-        """
-
-        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
-            encoding="utf-8"
-        )
-        preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
-            "  build-release:", 1
-        )[0]
-        integrity_steps = [
-            step
-            for step in _workflow_step_blocks(preflight)
-            if "- name: Validate root SSH identity and installed generation" in step
-        ]
-        self.assertEqual(len(integrity_steps), 1)
-        run_marker = "        run: |\n"
-        self.assertIn(run_marker, integrity_steps[0])
-        shell_block = integrity_steps[0].split(run_marker, 1)[1]
-        shell_block = "\n".join(
-            line[10:] if line.startswith("          ") else line
-            for line in shell_block.splitlines()
-        )
-        self.assertIn("remote=(ssh -n ", shell_block)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = self._source_fixture(root)
-            archive = root / "host-tools.zip"
-            summary = bundle.build_bundle(source, SOURCE_SHA, archive)
-            verified = bundle.verify_bundle(archive, expected_source_sha=SOURCE_SHA)
-            self.assertIsInstance(summary["manifest"], dict)
-
-            runner_temp = root / "runner-temp"
-            contract = runner_temp / "host-tools-download" / "contract"
-            contract.mkdir(parents=True)
-            bundle.write_contract_files(verified, contract)
-
-            unpacked = root / "remote-unpacked"
-            unpacked.mkdir()
-            with zipfile.ZipFile(archive) as bundle_zip:
-                bundle_zip.extractall(unpacked)
-            generation_root = unpacked / "platform-host-tools"
-            self.assertTrue(generation_root.is_dir())
-            os.chmod(generation_root, 0o555)
-            for member in generation_root.iterdir():
-                os.chmod(
-                    member,
-                    0o444
-                    if member.name in {"capabilities.txt", "manifest.json"}
-                    else 0o555,
-                )
-
-            fake_bin = root / "fake-bin"
-            fake_bin.mkdir()
-            ssh_log = root / "ssh.log"
-            fake_ssh = fake_bin / "ssh"
-            fake_ssh.write_text(
-                """#!/usr/bin/env python3
-from pathlib import Path
-import hashlib
-import os
-import sys
-
-if "-n" not in sys.argv[1:]:
-    sys.stdin.readline()
-arguments = sys.argv[1:]
-destination = next(
-    (index for index, argument in enumerate(arguments) if "@" in argument),
-    None,
-)
-if destination is None:
-    raise SystemExit("fake SSH destination is missing")
-command = arguments[destination + 1 :]
-log_path = Path(os.environ["FAKE_SSH_LOG"])
-with log_path.open("a", encoding="utf-8") as log:
-    log.write(" ".join(command) + "\\n")
-remote_path = command[-1] if command else ""
-if command[0] == "/usr/bin/id":
-    print(os.environ.get("FAKE_REMOTE_UID", "0"))
-elif command[0] == "/usr/bin/test":
-    if (
-        os.environ.get("FAKE_MISSING_GENERATION") == "1"
-        and command[1:2] == ["-d"]
-        and remote_path.endswith("/" + os.environ["FAKE_SOURCE_SHA"])
-    ):
-        raise SystemExit(1)
-elif command[0] == "/usr/bin/stat":
-    format_value = command[2]
-    if format_value == "%a":
-        with log_path.open("a", encoding="utf-8") as log:
-            log.write(f"mode:{Path(remote_path).name}\\n")
-        print(
-            "444"
-            if remote_path.endswith("/capabilities.txt")
-            or remote_path.endswith("/manifest.json")
-            else "555"
-        )
-    elif remote_path.endswith("/" + os.environ["FAKE_SOURCE_SHA"]):
-        print(
-            "directory:0:0:2:755"
-            if os.environ.get("FAKE_WRONG_GENERATION_METADATA") == "1"
-            else "directory:0:0:2:555"
-        )
-    else:
-        mode = (
-            "444"
-            if remote_path.endswith("/capabilities.txt")
-            or remote_path.endswith("/manifest.json")
-            else "555"
-        )
-        print(f"regular file:0:0:1:{mode}")
-elif command[0] == "/usr/bin/sha256sum":
-    local_path = Path(os.environ["FAKE_GENERATION"]) / Path(remote_path).name
-    digest = hashlib.sha256(local_path.read_bytes()).hexdigest()
-    if os.environ.get("FAKE_WRONG_PAYLOAD_HASH") == "1":
-        digest = "0" * 64
-    with log_path.open("a", encoding="utf-8") as log:
-        log.write(f"digest:{local_path.name}\\n")
-    print(f"{digest}  {remote_path}")
-elif command[0] == "/usr/bin/find":
-    remote_generation = command[2]
-    for local_path in sorted(Path(os.environ["FAKE_GENERATION"]).glob("*")):
-        with log_path.open("a", encoding="utf-8") as log:
-            log.write(f"inventory:{local_path.name}\\n")
-        sys.stdout.buffer.write(
-            f"{remote_generation}/{local_path.name}\\0".encode("utf-8")
-        )
-else:
-    raise SystemExit(f"unexpected fake SSH command: {command!r}")
-""",
-                encoding="utf-8",
-            )
-            fake_ssh.chmod(0o755)
-            fake_keyscan = fake_bin / "ssh-keyscan"
-            fake_keyscan.write_text(
-                """#!/usr/bin/env python3
-import os
-print(f"{os.environ['FAKE_SSH_HOST']} ssh-ed25519 AAAA")
-""",
-                encoding="utf-8",
-            )
-            fake_keyscan.chmod(0o755)
-            fake_keygen = fake_bin / "ssh-keygen"
-            fake_keygen.write_text(
-                """#!/usr/bin/env python3
-print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
-""",
-                encoding="utf-8",
-            )
-            fake_keygen.chmod(0o755)
-
-            env = os.environ.copy()
-            env.update(
-                {
-                    "RUNNER_TEMP": str(runner_temp),
-                    "GITHUB_ENV": str(root / "github-env"),
-                    "PROD_SSH_HOST": "production.example.test",
-                    "PROD_SSH_USER": "operator",
-                    "PROD_SSH_KEY": "fixture-key",
-                    "HOST_TOOLS_SHA": SOURCE_SHA,
-                    "FAKE_SSH_HOST": "production.example.test",
-                    "FAKE_SSH_LOG": str(ssh_log),
-                    "FAKE_GENERATION": str(generation_root),
-                    "FAKE_SOURCE_SHA": SOURCE_SHA,
-                    "FAKE_REMOTE_UID": "0",
-                    "FAKE_MISSING_GENERATION": "0",
-                    "FAKE_WRONG_GENERATION_METADATA": "0",
-                    "FAKE_WRONG_PAYLOAD_HASH": "0",
-                    "PATH": f"{fake_bin}:{env['PATH']}",
-                }
-            )
-
-            def run_block(block: str) -> subprocess.CompletedProcess[str]:
-                return subprocess.run(
-                    ["bash", "-c", block],
-                    cwd=REPO_ROOT,
-                    env=env,
-                    input="",
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-
-            completed = run_block(shell_block)
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            expected_names = set(bundle.HOST_TOOL_FILES) | {"capabilities.txt"}
-            log_lines = ssh_log.read_text(encoding="utf-8").splitlines()
-            digest_records = [
-                line.removeprefix("digest:")
-                for line in log_lines
-                if line.startswith("digest:")
-            ]
-            mode_records = [
-                line.removeprefix("mode:")
-                for line in log_lines
-                if line.startswith("mode:")
-            ]
-            self.assertEqual(len(digest_records), len(expected_names) + 2)
-            self.assertEqual(
-                digest_records[: len(expected_names)], sorted(expected_names)
-            )
-            self.assertEqual(len(mode_records), len(expected_names))
-            self.assertEqual(set(mode_records), expected_names)
-            self.assertIn("HOST_CAPABILITY_CHECK remote_identity_root PASS", completed.stdout)
-            self.assertIn("HOST_CAPABILITY_CHECK generation_directory_exists PASS", completed.stdout)
-            self.assertIn("HOST_CAPABILITY_CHECK generation_metadata PASS", completed.stdout)
-            inventory_records = [
-                line.removeprefix("inventory:")
-                for line in log_lines
-                if line.startswith("inventory:")
-            ]
-            expected_inventory = expected_names | {"manifest.json"}
-            self.assertEqual(len(inventory_records), len(expected_inventory))
-            self.assertEqual(set(inventory_records), expected_inventory)
-
-            # Preserve the intentional stdin handoff used by the production
-            # dispatcher while proving the read-only verifier is detached.
-            self.assertIn('production-prepare-artifact < "$input_path"', workflow)
-            self.assertIn('production-deploy < "$input_path"', workflow)
-
-            def run_diagnostic_case(**overrides: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-                original = {key: env[key] for key in overrides}
-                env.update(overrides)
-                ssh_log.write_text("", encoding="utf-8")
-                try:
-                    result = run_block(shell_block)
-                    calls = ssh_log.read_text(encoding="utf-8").splitlines()
-                finally:
-                    env.update(original)
-                return result, calls
-
-            nonroot, nonroot_calls = run_diagnostic_case(FAKE_REMOTE_UID="1000")
-            self.assertNotEqual(nonroot.returncode, 0)
-            self.assertIn("HOST_CAPABILITY_CHECK remote_identity_root FAIL", nonroot.stderr)
-            self.assertNotIn("HOST_CAPABILITY_CHECK generation_directory_exists", nonroot.stdout)
-            self.assertTrue(any("/usr/bin/id -u" in call for call in nonroot_calls))
-            self.assertFalse(any("/usr/bin/test -d" in call for call in nonroot_calls))
-
-            missing, missing_calls = run_diagnostic_case(FAKE_MISSING_GENERATION="1")
-            self.assertNotEqual(missing.returncode, 0)
-            self.assertIn("HOST_CAPABILITY_CHECK remote_identity_root PASS", missing.stdout)
-            self.assertIn("HOST_CAPABILITY_CHECK generation_directory_exists FAIL", missing.stderr)
-            self.assertNotIn("HOST_CAPABILITY_CHECK generation_not_symlink", missing.stdout)
-            self.assertFalse(any("/usr/bin/stat" in call for call in missing_calls))
-
-            bad_metadata, metadata_calls = run_diagnostic_case(
-                FAKE_WRONG_GENERATION_METADATA="1"
-            )
-            self.assertNotEqual(bad_metadata.returncode, 0)
-            self.assertIn("HOST_CAPABILITY_CHECK generation_metadata FAIL", bad_metadata.stderr)
-            self.assertFalse(any("/usr/bin/sha256sum" in call for call in metadata_calls))
-
-            bad_hash, hash_calls = run_diagnostic_case(FAKE_WRONG_PAYLOAD_HASH="1")
-            self.assertNotEqual(bad_hash.returncode, 0)
-            self.assertRegex(
-                bad_hash.stderr,
-                r"HOST_CAPABILITY_CHECK payload_\d{2}_digest FAIL",
-            )
-            self.assertEqual(
-                sum("/usr/bin/sha256sum" in call for call in hash_calls),
-                1,
-            )
-
-            # Re-run the active block with only the protective ``-n`` removed.
-            # The adversarial fake consumes one sidecar row per SSH call, so
-            # the digest count guard must fail closed before inventory.
-            ssh_log.write_text("", encoding="utf-8")
-            vulnerable = shell_block.replace("remote=(ssh -n ", "remote=(ssh ", 1)
-            self.assertNotEqual(run_block(vulnerable).returncode, 0)
-            vulnerable_digests = [
-                line
-                for line in ssh_log.read_text(encoding="utf-8").splitlines()
-                if line.startswith("digest:")
-            ]
-            self.assertLess(len(vulnerable_digests), len(expected_names))
-
-            digest_sidecar = contract / "files.sha256"
-            mode_sidecar = contract / "files.modes"
-            original_digest = digest_sidecar.read_text(encoding="ascii")
-            original_modes = mode_sidecar.read_text(encoding="ascii")
-            digest_lines = original_digest.splitlines(keepends=True)
-            mode_lines = original_modes.splitlines(keepends=True)
-
-            def assert_block_fails(
-                *, digest_text: str = original_digest, mode_text: str = original_modes
-            ) -> None:
-                digest_sidecar.write_text(digest_text, encoding="ascii")
-                mode_sidecar.write_text(mode_text, encoding="ascii")
-                ssh_log.write_text("", encoding="utf-8")
-                failed = run_block(shell_block)
-                self.assertNotEqual(failed.returncode, 0, failed.stderr)
-
-            malformed_digest = digest_lines[0].replace(
-                digest_lines[0].split("  ", 1)[0], "not-a-digest", 1
-            )
-            assert_block_fails(digest_text=malformed_digest + "".join(digest_lines[1:]))
-            assert_block_fails(digest_text="".join(digest_lines[:-1]))
-
-            malformed_mode = "444  ../unexpected\n" + "".join(mode_lines[1:])
-            assert_block_fails(mode_text=malformed_mode)
-            assert_block_fails(mode_text="".join(mode_lines[:-1]))
-
-    def test_remote_capability_inventory_is_nul_safe_and_exact(self) -> None:
-        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
-            encoding="utf-8"
-        )
-        preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
-            "  build-release:", 1
-        )[0]
-        self.assertIn(
-            "find -- \"$generation\" -mindepth 1 -maxdepth 1 -print0",
-            preflight,
-        )
-        self.assertIn("base64 --decode", preflight)
-        self.assertIn("mapfile -d '' -t remote_names", preflight)
-        self.assertIn('test "${#remote_names[@]}" -eq "$expected_entry_count"', preflight)
-        self.assertIn("seen_entries", preflight)
-        self.assertNotIn("expected_members=(", preflight)
-        self.assertNotIn('"$generation"/*', preflight)
-
+    def test_deploy_and_coordinator_use_shared_host_generation_verifier(self) -> None:
+        deploy = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(encoding="utf-8")
+        coordinator = (REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml").read_text(encoding="utf-8")
+        helper = (TOOLS_ROOT / "platform_host_tools_installed_check.py").read_text(encoding="utf-8")
+        preflight = deploy.split("  host-capability-preflight:", 1)[1].split("  build-release:", 1)[0]
+        self.assertIn("platform_host_tools_installed_check.py", preflight)
+        self.assertIn("--contract-dir", preflight)
+        self.assertIn("platform_host_tools_installed_check.py", coordinator)
+        self.assertIn("subprocess.Popen", helper)
+        self.assertIn("selectors.DefaultSelector", helper)
+        self.assertIn("if len(output) > max_output", helper)
         steps = _workflow_step_blocks(preflight)
-        integrity_steps = [
-            step
-            for step in steps
-            if "- name: Validate root SSH identity and installed generation" in step
-        ]
-        probe_steps = [
-            step
-            for step in steps
-            if "- name: Probe immutable host dispatcher capabilities" in step
-        ]
-        self.assertEqual(len(integrity_steps), 1)
-        self.assertEqual(len(probe_steps), 1)
-        self.assertLess(steps.index(integrity_steps[0]), steps.index(probe_steps[0]))
-        probe = probe_steps[0]
-        self.assertEqual(
-            len(
-                re.findall(
-                    r'^\s+"\$\{remote\[@\]\}" /usr/bin/python3\.12 -I -B '
-                    r'"\$HOST_TOOLS_DISPATCHER" host-capabilities$',
-                    probe,
-                    re.MULTILINE,
-                )
-            ),
-            1,
-        )
-        self.assertIn("/usr/bin/timeout --signal=TERM --kill-after=2s 15s", probe)
-        self.assertIn("ulimit -f 1", probe)
-        self.assertIn("remote=(ssh -n -T ", probe)
-        self.assertIn("< /dev/null", probe)
-        self.assertIn("/usr/bin/head -c 512", probe)
-        self.assertIn(
-            'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA '
-            'generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 '
-            'input_guard=2 release_baseline=1 retained_load_export_cleanup=1 '
-            'retained_load_source_binding=1 '
-            'cpu_diagnostic_plan_control=1 '
-            'python_isolated=1 python_bytecode_disabled=1"',
-            probe,
-        )
-        self.assertIn('printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"', probe)
-        for marker in (
-            "command_rc=",
-            "expected_bytes=",
-            "actual_bytes=",
-            "expected_sha256=",
-            "actual_sha256=",
-            "actual_cr_count=",
-            "actual_lf_count=",
-            "exact_one_line=",
-        ):
-            self.assertIn(marker, probe)
-        self.assertNotIn("platform/tools/platform_workflow_remote_dispatch.py", probe)
-        self.assertNotIn("platform_host_tools_bundle.py", probe)
+        cleanup = [step for step in steps if "- name: Remove host capability verifier material" in step]
+        self.assertEqual(len(cleanup), 1)
+        self.assertIn("if: ${{ always() }}", cleanup[0])
 
-        # All trusted dispatcher call sites must carry both isolation flags;
-        # an isolated interpreter without -B can write a truncated pyc into
-        # an immutable/root-owned generation under a tight file-size limit.
-        invocation_sources = (
-            REPO_ROOT / ".github/workflows/platform-production-deploy.yml",
-            REPO_ROOT / ".github/workflows/platform-production-external-load.yml",
-            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml",
-            REPO_ROOT / ".github/workflows/platform-live-launch.yml",
-            TOOLS_ROOT / "platform_live_user_qa_trusted.sh",
-            TOOLS_ROOT / "platform_live_launch_trusted.sh",
-        )
-        for source_path in invocation_sources:
-            lines = source_path.read_text(encoding="utf-8").splitlines()
-            for index, line in enumerate(lines):
-                if "platform_workflow_remote_dispatch.py" not in line:
-                    continue
-                window = "\n".join(lines[max(0, index - 1) : index + 1])
-                if "python3.12" not in window:
-                    continue
-                self.assertIn("-I -B", window, source_path.name)
-            for line in lines:
-                if "python3.12" in line and "HOST_TOOLS_DISPATCHER" in line:
-                    self.assertIn("-I -B", line, source_path.name)
-            if source_path.name in {
-                "platform_live_user_qa_trusted.sh",
-                "platform_live_launch_trusted.sh",
-            }:
-                for line in lines:
-                    if '"$DISPATCHER"' in line and "python3.12" in line:
-                        self.assertIn("-I -B", line, source_path.name)
 
-        expected = set(bundle.HOST_TOOL_FILES) | {"capabilities.txt", "manifest.json"}
-        safe_name = re.compile(r"^[A-Za-z0-9_.-]+$")
+    def test_shared_host_generation_verifier_has_nul_safe_closed_inventory(self) -> None:
+        helper = (TOOLS_ROOT / "platform_host_tools_installed_check.py").read_text(encoding="utf-8")
+        self.assertIn('"/usr/bin/find", "--", generation, "-mindepth", "1", "-maxdepth", "1", "-print0"', helper)
+        self.assertIn('inventory.split(b"\\x00")', helper)
+        self.assertIn("len(names) != len(expected)", helper)
+        self.assertIn("set(relatives) != expected", helper)
 
-        def accepted(names: list[str]) -> bool:
-            return (
-                len(names) == len(expected)
-                and all(safe_name.fullmatch(name) and name in expected for name in names)
-                and len(set(names)) == len(names)
-                and set(names) == expected
-            )
-
-        self.assertFalse(accepted(sorted(expected | {".unexpected"})))
-        self.assertFalse(accepted(sorted(expected | {"nested/child"})))
-        self.assertFalse(accepted(sorted(expected | {"symlink"})))
-        self.assertFalse(accepted(sorted(expected | {"bad\nname"})))
-        self.assertTrue(accepted(sorted(expected)))
 
     def test_remote_inventory_shell_fixture_carries_dotfiles_and_extras_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2858,295 +2714,13 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
             self.assertNotEqual(set(names), expected)
             self.assertEqual(len(names), 3)
 
-    def test_host_capability_probe_is_strict_and_bounds_diagnostics(self) -> None:
-        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
-            encoding="utf-8"
-        )
-        preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
-            "  validate-active-baseline:", 1
-        )[0]
-        probe_steps = [
-            step
-            for step in _workflow_step_blocks(preflight)
-            if "- name: Probe immutable host dispatcher capabilities" in step
-        ]
-        self.assertEqual(len(probe_steps), 1)
-        run_marker = "        run: |\n"
-        self.assertIn(run_marker, probe_steps[0])
-        shell_block = probe_steps[0].split(run_marker, 1)[1]
-        shell_block = "\n".join(
-            line[10:] if line.startswith("          ") else line
-            for line in shell_block.splitlines()
-        )
-        self.assertIn("remote=(ssh -n -T ", shell_block)
-        self.assertIn(
-            '"${remote[@]}" /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-capabilities',
-            shell_block,
-        )
-        self.assertIn("< /dev/null", shell_block)
-        self.assertIn("ulimit -f 1", shell_block)
-        self.assertIn("printf '%s\\n' \"$expected_output\" | cmp -s - \"$probe_output\"", shell_block)
-        self.assertIn(
-            'stat -c \'%u:%g\' -- "$HOST_TOOLS_SSH_DIR"',
-            shell_block,
-        )
-        for filename in ("config", "known_hosts", "id_ed25519"):
-            self.assertIn(
-                f'test "$(stat -c \'%F:%h:%a\' -- "$HOST_TOOLS_SSH_DIR/{filename}")" = "regular file:1:600"',
-                shell_block,
-            )
+    def test_host_verifier_reuses_pinned_dispatcher_with_bounded_output(self) -> None:
+        helper = (TOOLS_ROOT / "platform_host_tools_installed_check.py").read_text(encoding="utf-8")
+        self.assertIn('"/usr/bin/python3.12", "-I", "-B", dispatcher, "host-capabilities"', helper)
+        self.assertIn("max_output=512", helper)
+        self.assertIn("MAX_REMOTE_OUTPUT = 16384", helper)
+        self.assertIn("HOST_KEY_FINGERPRINT =", helper)
 
-        cleanup_steps = [
-            step
-            for step in _workflow_step_blocks(preflight)
-            if "- name: Remove host capability verifier material" in step
-        ]
-        self.assertEqual(len(cleanup_steps), 1)
-        self.assertIn(run_marker, cleanup_steps[0])
-        cleanup_shell_block = cleanup_steps[0].split(run_marker, 1)[1]
-        cleanup_shell_block = "\n".join(
-            line[10:] if line.startswith("          ") else line
-            for line in cleanup_shell_block.splitlines()
-        )
-        self.assertIn('"$RUNNER_TEMP/platform-host-capabilities-output"', cleanup_shell_block)
-        self.assertIn('rmdir -- "$ssh_dir"', cleanup_shell_block)
-
-        expected_line = (
-            f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
-            "dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 "
-            "retained_load_export_cleanup=1 retained_load_source_binding=1 cpu_diagnostic_plan_control=1 "
-            "python_isolated=1 python_bytecode_disabled=1"
-        )
-        expected_payload = (expected_line + "\n").encode("ascii")
-        expected_sha256 = hashlib.sha256(expected_payload).hexdigest()
-        expected_bytes = len(expected_payload)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            runner_temp = root / "runner-temp"
-            runner_temp.mkdir()
-            ssh_dir = runner_temp / "platform-host-capability-ssh"
-            ssh_dir.mkdir(mode=0o700)
-            for name in ("config", "known_hosts", "id_ed25519"):
-                path = ssh_dir / name
-                path.write_text("fixture\n", encoding="ascii")
-                path.chmod(0o600)
-            payload_path = root / "probe-payload"
-            output_path = runner_temp / "platform-host-capabilities-output"
-            invocation_log = root / "ssh-invocations.jsonl"
-            fake_bin = root / "fake-bin"
-            fake_bin.mkdir()
-            fake_ssh = fake_bin / "ssh"
-            fake_ssh.write_text(
-                """#!/usr/bin/env python3
-import json
-import os
-from pathlib import Path
-import sys
-
-arguments = sys.argv[1:]
-destination_index = next(
-    (index for index, argument in enumerate(arguments) if "@" in argument),
-    None,
-)
-if destination_index is None:
-    raise SystemExit("missing destination")
-command = arguments[destination_index + 1 :]
-expected_command = [
-    "/usr/bin/python3.12",
-    "-I",
-    "-B",
-    os.environ["FAKE_EXPECTED_DISPATCHER"],
-    "host-capabilities",
-]
-if command != expected_command:
-    raise SystemExit("unexpected remote command")
-with Path(os.environ["FAKE_SSH_LOG"]).open("a", encoding="ascii") as log:
-    json.dump(arguments, log)
-    log.write("\\n")
-if sys.stdin.read() != "":
-    raise SystemExit("stdin was not at EOF")
-stderr_text = os.environ.get("FAKE_SSH_STDERR", "")
-if stderr_text:
-    sys.stderr.write(stderr_text)
-sys.stdout.buffer.write(Path(os.environ["FAKE_PROBE_PAYLOAD"]).read_bytes())
-sys.stdout.flush()
-raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
-""",
-                encoding="utf-8",
-            )
-            fake_ssh.chmod(0o755)
-            self.assertEqual([path.name for path in fake_bin.iterdir()], ["ssh"])
-            expected_generation = f"/opt/oldsparky/platform/shared/host-tools/{SOURCE_SHA}"
-            expected_dispatcher = f"{expected_generation}/platform_workflow_remote_dispatch.py"
-            env = os.environ.copy()
-            env.update(
-                {
-                    "RUNNER_TEMP": str(runner_temp),
-                    "GITHUB_ENV": str(root / "github-env"),
-                    "PROD_SSH_HOST": "production.example.test",
-                    "PROD_SSH_USER": "operator",
-                    "PROD_SSH_KEY": "fixture-key",
-                    "HOST_TOOLS_SHA": SOURCE_SHA,
-                    "HOST_TOOLS_TOOLSET_VERSION": "production-host-tools-v4",
-                    "HOST_TOOLS_GENERATION": expected_generation,
-                    "HOST_TOOLS_DISPATCHER": expected_dispatcher,
-                    "HOST_TOOLS_SSH_DIR": str(ssh_dir),
-                    "FAKE_SSH_LOG": str(invocation_log),
-                    "FAKE_PROBE_PAYLOAD": str(payload_path),
-                    "FAKE_EXPECTED_DISPATCHER": expected_dispatcher,
-                    "FAKE_SSH_STDERR": "",
-                    "FAKE_SSH_RC": "0",
-                    "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
-                }
-            )
-
-            cleanup_files = (
-                runner_temp / "platform-host-tools-artifact.zip",
-                runner_temp / "platform-host-capabilities-output",
-                runner_temp / "host-tools-remote-entries.b64",
-                runner_temp / "host-tools-remote-entries",
-                runner_temp / "platform-host-tools-expected-members",
-                runner_temp / "platform-host-tools-actual-members",
-            )
-            cleanup_directories = (
-                runner_temp / "host-tools-download",
-                runner_temp / "platform-host-tools-inner",
-            )
-            for path in cleanup_files:
-                path.write_bytes(b"fixture")
-            for path in cleanup_directories:
-                path.mkdir()
-
-            def invoke(
-                payload: bytes,
-                *,
-                stderr_text: str = "",
-                ssh_rc: int = 0,
-            ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
-                payload_path.write_bytes(payload)
-                invocation_log.write_text("", encoding="ascii")
-                env["FAKE_SSH_STDERR"] = stderr_text
-                env["FAKE_SSH_RC"] = str(ssh_rc)
-                completed = subprocess.run(
-                    ["bash", "-c", shell_block],
-                    cwd=REPO_ROOT,
-                    env=env,
-                    input="",
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                invocations = [
-                    json.loads(line)
-                    for line in invocation_log.read_text(encoding="ascii").splitlines()
-                ]
-                return completed, invocations
-
-            try:
-                passed, invocations = invoke(expected_payload, stderr_text="RAW_STDERR_SENTINEL")
-                self.assertEqual(passed.returncode, 0, passed.stderr)
-                self.assertEqual(passed.stdout, "")
-                self.assertEqual(passed.stderr, "")
-                self.assertEqual(len(invocations), 1)
-                self.assertIn("-n", invocations[0])
-                self.assertIn("-T", invocations[0])
-                self.assertEqual(
-                    subprocess.run(
-                        ["/usr/bin/stat", "-c", "%F:%h:%a", "--", str(ssh_dir)],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    ).stdout.strip(),
-                    "directory:2:700",
-                )
-                self.assertEqual(
-                    subprocess.run(
-                        ["/usr/bin/stat", "-c", "%u:%g", "--", str(ssh_dir)],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    ).stdout.strip(),
-                    f"{os.getuid()}:{os.getgid()}",
-                )
-
-                # The former assertion rejected the real directory created by
-                # ``install -d`` (nlink 2) and exited before the SSH boundary.
-                invocation_log.write_text("", encoding="ascii")
-                old_base = shell_block.replace(
-                    'stat -c \'%F:%a\' -- "$HOST_TOOLS_SSH_DIR"',
-                    'stat -c \'%F:%h:%a\' -- "$HOST_TOOLS_SSH_DIR"',
-                    1,
-                ).replace('= "directory:700"', '= "directory:1:700"', 1)
-                vulnerable = subprocess.run(
-                    ["bash", "-c", old_base],
-                    cwd=REPO_ROOT,
-                    env=env,
-                    input="",
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                self.assertNotEqual(vulnerable.returncode, 0)
-                self.assertEqual(invocation_log.read_text(encoding="ascii"), "")
-
-                malformed_payloads = {
-                    "prepended banner": b"RAW_SENTINEL\n" + expected_payload,
-                    "appended banner": expected_payload + b"RAW_SENTINEL\n",
-                    "crlf": expected_payload.replace(b"\n", b"\r\n"),
-                    "hostname": b"RAW_SENTINEL production.example.test\n",
-                    "duplicate output": expected_payload + expected_payload,
-                }
-                diagnostic_pattern = re.compile(
-                    r"immutable host capability probe diagnostics: command_rc=[0-9]+ "
-                    rf"expected_bytes={expected_bytes} actual_bytes=[0-9]+ "
-                    r"expected_sha256=[0-9a-f]{64} actual_sha256=[0-9a-f]{64} "
-                    r"expected_cr_count=0 actual_cr_count=[0-9]+ "
-                    r"expected_lf_count=1 actual_lf_count=[0-9]+ exact_one_line=[01]\n$"
-                )
-                for label, payload in malformed_payloads.items():
-                    with self.subTest(payload=label):
-                        failed, invocations = invoke(payload)
-                        self.assertNotEqual(failed.returncode, 0)
-                        self.assertEqual(failed.stdout, "")
-                        self.assertEqual(len(invocations), 1)
-                        self.assertRegex(failed.stderr, diagnostic_pattern)
-                        self.assertIn(f"expected_sha256={expected_sha256}", failed.stderr)
-                        self.assertNotIn("RAW_SENTINEL", failed.stderr)
-                        self.assertNotIn(expected_line, failed.stderr)
-
-                first_failure, _ = invoke(malformed_payloads["appended banner"])
-                second_failure, _ = invoke(malformed_payloads["appended banner"])
-                self.assertEqual(first_failure.stderr, second_failure.stderr)
-
-                remote_failure, invocations = invoke(b"", ssh_rc=7)
-                self.assertNotEqual(remote_failure.returncode, 0)
-                self.assertEqual(len(invocations), 1)
-                self.assertIn("command_rc=7", remote_failure.stderr)
-                self.assertNotIn("RAW_SENTINEL", remote_failure.stderr)
-
-                oversized, invocations = invoke(b"RAW_SENTINEL" * 200)
-                self.assertNotEqual(oversized.returncode, 0)
-                self.assertEqual(len(invocations), 1)
-                self.assertLessEqual(output_path.stat().st_size, 512)
-                self.assertRegex(oversized.stderr, diagnostic_pattern)
-                self.assertNotIn("RAW_SENTINEL", oversized.stderr)
-            finally:
-                cleanup_result = subprocess.run(
-                    ["bash", "-c", cleanup_shell_block],
-                    cwd=REPO_ROOT,
-                    env=env,
-                    input="",
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                self.assertEqual(cleanup_result.returncode, 0, cleanup_result.stderr)
-                for path in (*cleanup_files, *cleanup_directories, output_path, ssh_dir):
-                    self.assertFalse(
-                        path.exists() or path.is_symlink(),
-                        f"cleanup left temporary artifact: {path}",
-                    )
 
     def test_host_capability_probe_checks_closed_generation_metadata(self) -> None:
         pin_payload = json.loads(

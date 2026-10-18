@@ -40,9 +40,15 @@ MAX_JOURNAL_LINE_BYTES = 16_384
 MAX_JOURNAL_ROWS = 128
 JOURNAL_TIMEOUT_SECONDS = 3
 MAX_SAMPLES_PROFILE = 1200
+MEMORY_SAMPLE_COUNT = 5
+SSR_CAPACITY_MEMORY_MAX_BYTES = 1_073_741_824
+SSR_CAPACITY_ABORT_FLOOR_BYTES = 768 * 1024 * 1024
+SSR_CAPACITY_WATCH_INTERVAL_SECONDS = 0.25
 MIN_PLAN_LEAD_MS = 45_000
 MAX_PLAN_LEAD_MS = 60_000
 WORKLOAD = "authenticated_workspace_read_pair_v1"
+CAPACITY_WORKLOAD = "authenticated_workspace_read_capacity_v1"
+SUPPORTED_WORKLOADS = frozenset({WORKLOAD, CAPACITY_WORKLOAD})
 OFF_WINDOW_MS = 20_000
 IDLE_WINDOW_MS = 5_000
 ON_WINDOW_MS = 20_000
@@ -109,6 +115,18 @@ def _read_request(command: str, stream: Any = None) -> argparse.Namespace:
                 or RUN_RE.fullmatch(payload["run_id"]) is None):
             raise PlanError("cleanup request fields are invalid")
         return argparse.Namespace(command="cleanup", run_id=payload["run_id"])
+    if command == "memory-watch-stdin":
+        if (set(payload) != {"schema", "run_id", "source_sha", "workload"}
+                or type(payload.get("schema")) is not int or payload.get("schema") != 1
+                or payload.get("workload") != CAPACITY_WORKLOAD
+                or not isinstance(payload.get("run_id"), str)
+                or RUN_RE.fullmatch(payload["run_id"]) is None
+                or not isinstance(payload.get("source_sha"), str)
+                or SHA_RE.fullmatch(payload["source_sha"]) is None):
+            raise PlanError("memory watch request fields are invalid")
+        return argparse.Namespace(command="memory-watch", **{
+            key: payload[key] for key in ("run_id", "source_sha", "workload")
+        })
     raise PlanError("unsupported request operation")
 
 
@@ -237,6 +255,24 @@ def _systemd_unit(service: str, *, timeout_seconds: float = 5) -> dict[str, str]
     if not fields["MainPID"].isdigit() or int(fields["MainPID"]) <= 1:
         raise PlanError("service main process identity is invalid")
     return fields
+
+
+def _systemd_memory_max() -> int:
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/systemctl", "show", "--no-pager", "--property=MemoryMax", "deadlock-web.service"],
+            check=False, capture_output=True, timeout=3, text=True,
+            encoding="ascii", errors="strict",
+            env={"LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+            close_fds=True,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
+        raise PlanError("capacity memory limit query failed") from exc
+    value = completed.stdout.strip()
+    if (completed.returncode != 0 or completed.stderr or len(completed.stdout) > 128
+            or not re.fullmatch(r"MemoryMax=[1-9][0-9]{0,15}", value)):
+        raise PlanError("capacity memory limit query failed")
+    return int(value.partition("=")[2])
 
 
 def _process_start_ticks(pid: int) -> int:
@@ -477,7 +513,7 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
         raise PlanError("root identity required")
     if RUN_RE.fullmatch(args.run_id) is None or SHA_RE.fullmatch(args.source_sha) is None:
         raise PlanError("run or source identity is invalid")
-    if args.workload != WORKLOAD:
+    if args.workload not in SUPPORTED_WORKLOADS:
         raise PlanError("unsupported diagnostic workload")
     now_ms = time.time_ns() // 1_000_000
     _validate_windows(args, now_ms=now_ms)
@@ -516,7 +552,7 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
             "run_id": args.run_id,
             "source_sha": source_sha,
             "release_slug": release_slug,
-            "workload": WORKLOAD,
+            "workload": args.workload,
             "off_start_ms": args.off_start_ms,
             "off_end_ms": args.off_end_ms,
             "on_start_ms": args.on_start_ms,
@@ -735,6 +771,29 @@ PROFILE_WEB_MESSAGE_RE = re.compile(
     r"timer=v8_cpu start_lag_ms=([0-9]{1,8}) elapsed_ms=([0-9]{1,8}) "
     r"sample_interval_us=100000 sample_count=([0-9]{1,8}) categories=(.*)$"
 )
+NODE_MEMORY_FIELDS = frozenset({
+    "service", "run_id", "phase", "sample_count", "status",
+    "rss_min_bytes", "rss_max_bytes", "rss_mean_bytes",
+    "heap_total_min_bytes", "heap_total_max_bytes", "heap_total_mean_bytes",
+    "heap_used_min_bytes", "heap_used_max_bytes", "heap_used_mean_bytes",
+    "heap_limit_min_bytes", "heap_limit_max_bytes", "heap_limit_mean_bytes",
+    "external_min_bytes", "external_max_bytes", "external_mean_bytes",
+    "array_buffers_min_bytes", "array_buffers_max_bytes", "array_buffers_mean_bytes",
+    "sampled_window_start_elapsed_ms", "sampled_window_end_elapsed_ms", "sampled_window_duration_ms",
+    "cgroup_sample_count", "cgroup_memory_current_start_bytes",
+    "cgroup_memory_current_end_bytes", "cgroup_memory_current_sampled_max_bytes",
+    "cgroup_memory_peak_start_bytes", "cgroup_memory_peak_end_bytes",
+    "cgroup_memory_peak_sampled_max_bytes", "cgroup_memory_status", "cgroup_memory_reason",
+    "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
+    "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
+    "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
+    "gc_count", "gc_duration_ms", "gc_status", "gc_major_count", "gc_minor_count",
+    "gc_incremental_count", "gc_weakcb_count", "gc_other_count", "gc_overflow",
+})
+NODE_MEMORY_INTEGER_FIELDS = NODE_MEMORY_FIELDS - {
+    "service", "run_id", "phase", "status", "gc_duration_ms", "gc_status", "gc_overflow",
+    "cgroup_memory_status", "cgroup_memory_reason",
+}
 API_PROFILE_CATEGORIES = frozenset({
     "other", "serialization_validation", "orm_result", "db_driver",
     "async_event_loop", "crypto", "repo.get_tournament_workspace",
@@ -772,6 +831,68 @@ def _parse_profile_categories(
         seen.add(parts[0])
         parsed.append({"category": parts[0], "cpu_us": cpu_us, "observations": observations})
     return parsed
+
+
+def _parse_node_memory_event(message: str) -> dict[str, Any] | None:
+    """Project one bounded Node/cgroup aggregate from its closed log schema."""
+    if not message.startswith("cpu_diagnostic_memory ") or len(message) > 4096:
+        return None
+    values: dict[str, str] = {}
+    for token in message.split()[1:]:
+        if token.count("=") != 1:
+            return None
+        key, value = token.split("=", 1)
+        if key not in NODE_MEMORY_FIELDS or key in values or not value:
+            return None
+        values[key] = value
+    if set(values) != NODE_MEMORY_FIELDS:
+        return None
+    if (values["service"] != "web" or RUN_RE.fullmatch(values["run_id"]) is None
+            or values["phase"] not in {"off", "on"}
+            or values["status"] not in {"complete", "incomplete"}
+            or values["gc_status"] not in {"complete", "incomplete", "unavailable"}
+            or values["cgroup_memory_status"] not in {"complete", "unavailable", "invalid"}
+            or values["cgroup_memory_reason"] not in {"none", "hierarchy_unavailable", "file_unavailable", "invalid_snapshot"}
+            or values["gc_overflow"] not in {"true", "false"}
+            or not re.fullmatch(r"[0-9]{1,5}\.[0-9]{3}", values["gc_duration_ms"])):
+        return None
+    result: dict[str, Any] = {"service": "web", "run_id": values["run_id"], "phase": values["phase"]}
+    for key in NODE_MEMORY_INTEGER_FIELDS:
+        raw = values[key]
+        if raw == "unknown" and key.startswith(("cgroup_", "memory_events_", "sampled_window_")):
+            result[key] = None
+            continue
+        if not raw.isdecimal() or len(raw) > 16:
+            return None
+        result[key] = int(raw)
+    for key in ("sample_count", "cgroup_sample_count"):
+        if result[key] > 5:
+            return None
+    if result["sample_count"] > 0 and values["status"] == "complete" and result["sample_count"] != 5:
+        return None
+    if result["sampled_window_duration_ms"] is not None and result["sampled_window_duration_ms"] > 20_000:
+        return None
+    if values["cgroup_memory_status"] == "complete" and values["cgroup_memory_reason"] != "none":
+        return None
+    if values["cgroup_memory_status"] == "invalid" and values["cgroup_memory_reason"] != "invalid_snapshot":
+        return None
+    if values["cgroup_memory_status"] == "unavailable" and values["cgroup_memory_reason"] == "none":
+        return None
+    try:
+        duration = float(values["gc_duration_ms"])
+    except ValueError:
+        return None
+    if not 0 <= duration <= 20_000 or result["gc_count"] > 10_000:
+        return None
+    result.update({
+        "status": values["status"],
+        "gc_status": values["gc_status"],
+        "gc_overflow": values["gc_overflow"] == "true",
+        "cgroup_memory_status": values["cgroup_memory_status"],
+        "cgroup_memory_reason": values["cgroup_memory_reason"],
+        "gc_duration_ms": duration,
+    })
+    return result
 
 
 def _usage_summary(
@@ -836,6 +957,11 @@ def _usage_summary(
                 else reason
             ),
             "profile_rows": empty_profile_rows(),
+            "memory_status": "incomplete",
+            "memory_reason": "incomplete",
+            "cgroup_memory_status": "unknown",
+            "cgroup_memory_reason": "hierarchy_unavailable",
+            "memory_rows": [],
         }
 
     targets: dict[str, dict[int, tuple[int, str]]] = {}
@@ -851,6 +977,7 @@ def _usage_summary(
             if (payload.get("run_id") != plans["api"].get("run_id")
                     or payload.get("source_sha") != plans["api"].get("source_sha")
                     or payload.get("release_slug") != plans["api"].get("release_slug")
+                    or payload.get("workload") != plans["api"].get("workload")
                     or payload.get("off_start_ms") != plans["api"].get("off_start_ms")
                     or payload.get("off_end_ms") != plans["api"].get("off_end_ms")
                     or payload.get("on_start_ms") != plans["api"].get("on_start_ms")
@@ -884,8 +1011,10 @@ def _usage_summary(
     capture_status, records = _journal_rows(plans)
     events: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
     profiles: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    memory_samples: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
     invalid_event = False
     invalid_profile = False
+    invalid_memory = False
     expected_units = {"api": "deadlock-api.service", "web": "deadlock-web.service"}
     expected_cgroups = {service: f"/system.slice/{unit}" for service, unit in expected_units.items()}
     run_id = str(plans["api"]["run_id"])
@@ -906,24 +1035,34 @@ def _usage_summary(
             continue
         is_usage = message.startswith("cpu_diagnostic_usage")
         is_profile = message.startswith("cpu_diagnostic_complete")
-        if not is_usage and not is_profile:
+        is_memory = message.startswith("cpu_diagnostic_memory")
+        if not is_usage and not is_profile and not is_memory:
             continue
         usage_match = USAGE_MESSAGE_RE.fullmatch(message) if is_usage else None
         profile_api_match = PROFILE_API_MESSAGE_RE.fullmatch(message) if is_profile else None
         profile_web_match = PROFILE_WEB_MESSAGE_RE.fullmatch(message) if is_profile else None
+        memory_match = _parse_node_memory_event(message) if is_memory else None
+        if memory_match is not None and memory_match["run_id"] != run_id:
+            continue
         if is_usage and usage_match is None:
             invalid_event = True
             continue
         if is_profile and profile_api_match is None and profile_web_match is None:
             invalid_profile = True
             continue
+        if is_memory and memory_match is None:
+            invalid_memory = True
+            continue
         if usage_match is not None:
             service, event_run, phase = usage_match.group(1), usage_match.group(2), usage_match.group(3)
         elif profile_api_match is not None:
             service, event_run, phase = "api", profile_api_match.group(1), "on"
-        else:
+        elif profile_web_match is not None:
             assert profile_web_match is not None
             service, event_run, phase = "web", profile_web_match.group(1), "on"
+        else:
+            assert memory_match is not None
+            service, event_run, phase = "web", run_id, str(memory_match["phase"])
         if event_run != run_id:
             continue
         try:
@@ -933,22 +1072,26 @@ def _usage_summary(
             unit = str(record.get("_SYSTEMD_UNIT", ""))
             cgroup = str(record.get("_SYSTEMD_CGROUP", ""))
             start_ticks, expected_invocation = targets[service][pid]
-            min_timestamp = (
-                int(plans[service]["on_start_ms"]) * 1000 - 1_000_000
-                if is_profile else int(plans[service]["off_start_ms"]) * 1000 - 1_000_000
-            )
+            min_timestamp_key = "on_start_ms" if is_profile or (is_memory and phase == "on") else "off_start_ms"
+            max_timestamp_key = "on_end_ms" if is_profile or is_usage else ("on_end_ms" if phase == "on" else "off_end_ms")
+            min_timestamp = int(plans[service][min_timestamp_key]) * 1000 - 1_000_000
+            max_timestamp = int(plans[service][max_timestamp_key]) * 1000 + 5_000_000
             if (timestamp_us < min_timestamp
-                    or timestamp_us > int(plans[service]["on_end_ms"]) * 1000 + 5_000_000
+                    or timestamp_us > max_timestamp
                     or invocation != expected_invocation or unit != expected_units[service]
                     or cgroup != expected_cgroups[service]
                     or invocation != str(plans[service]["targets"][0]["invocation_id"]).lower()
                     or _process_start_ticks(pid) != start_ticks):
-                if is_profile:
+                if is_memory:
+                    invalid_memory = True
+                elif is_profile:
                     invalid_profile = True
                 else:
                     invalid_event = True
                 continue
-            if usage_match is not None:
+            if memory_match is not None:
+                memory_samples.setdefault((service, pid, phase), []).append(memory_match)
+            elif usage_match is not None:
                 event = {
                     "window_ms": int(usage_match.group(4)),
                     "cpu_ns": int(usage_match.group(5)),
@@ -1011,7 +1154,9 @@ def _usage_summary(
                     "categories": categories,
                 })
         except (KeyError, OSError, ValueError):
-            if is_profile:
+            if is_memory:
+                invalid_memory = True
+            elif is_profile:
                 invalid_profile = True
             else:
                 invalid_event = True
@@ -1150,6 +1295,95 @@ def _usage_summary(
         })
     if not profile_complete and profile_reason == "none":
         profile_reason = "invalid_profile"
+    memory_rows: list[dict[str, Any]] = []
+    memory_complete = capture_status == "complete" and not invalid_memory
+    cgroup_memory_complete = memory_complete
+    for phase in ("off", "on"):
+        selected = [
+            rows_for_target
+            for (event_service, _pid, event_phase), rows_for_target in memory_samples.items()
+            if event_service == "web" and event_phase == phase
+        ]
+        flat_memory = [item for rows_for_target in selected for item in rows_for_target]
+        duplicate_count = sum(max(0, len(values) - 1) for values in selected)
+        row_complete = (
+            len(selected) == 1 and len(flat_memory) == 1 and duplicate_count == 0
+            and flat_memory[0].get("status") == "complete"
+            and flat_memory[0].get("sample_count") == MEMORY_SAMPLE_COUNT
+            and flat_memory[0].get("gc_status") == "complete"
+            and flat_memory[0].get("gc_overflow") is False
+        ) if flat_memory else False
+        cgroup_complete = (
+            row_complete and flat_memory[0].get("cgroup_sample_count") == MEMORY_SAMPLE_COUNT
+            and flat_memory[0].get("cgroup_memory_status") == "complete"
+            and flat_memory[0].get("cgroup_memory_reason") == "none"
+            and all(flat_memory[0].get(name) is not None for name in (
+                "cgroup_memory_current_start_bytes", "cgroup_memory_current_end_bytes",
+                "cgroup_memory_current_sampled_max_bytes", "cgroup_memory_peak_start_bytes",
+                "cgroup_memory_peak_end_bytes", "cgroup_memory_peak_sampled_max_bytes",
+                "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
+                "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
+                "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
+            ))
+        )
+        cgroup_invalid = any(item.get("cgroup_memory_status") == "invalid" for item in flat_memory)
+        cgroup_claim_invalid = any(
+            item.get("cgroup_memory_status") == "complete"
+            and (
+                item.get("cgroup_sample_count") != MEMORY_SAMPLE_COUNT
+                or any(item.get(name) is None for name in (
+                    "cgroup_memory_current_start_bytes", "cgroup_memory_current_end_bytes",
+                    "cgroup_memory_current_sampled_max_bytes", "cgroup_memory_peak_start_bytes",
+                    "cgroup_memory_peak_end_bytes", "cgroup_memory_peak_sampled_max_bytes",
+                    "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
+                    "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
+                    "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
+                ))
+            ) for item in flat_memory
+        )
+        cgroup_invalid = cgroup_invalid or cgroup_claim_invalid
+        if not row_complete:
+            memory_complete = False
+        if not cgroup_complete and not cgroup_invalid:
+            cgroup_memory_complete = False
+        row: dict[str, Any] = {
+            "service": "web", "run_id": plans["web"]["run_id"],
+            "phase": phase, "expected_targets": 1,
+            "observed_targets": 1 if selected else 0,
+            "event_count": sum(len(values) for values in selected),
+            "duplicate_count": duplicate_count,
+            "status": "complete" if row_complete else "incomplete",
+            "cgroup_memory_status": "complete" if cgroup_complete else "invalid" if cgroup_invalid else "unknown",
+            "cgroup_memory_reason": (
+                "invalid_snapshot" if cgroup_invalid else
+                flat_memory[0].get("cgroup_memory_reason", "hierarchy_unavailable") if flat_memory else
+                "hierarchy_unavailable"
+            ),
+        }
+        if flat_memory:
+            for key, value in flat_memory[0].items():
+                if key not in {"service", "phase", "status", "gc_status", "gc_overflow", "cgroup_memory_status"}:
+                    row[key] = value
+            row["gc_status"] = flat_memory[0]["gc_status"]
+            row["gc_overflow"] = flat_memory[0]["gc_overflow"]
+        for key in NODE_MEMORY_FIELDS - {
+            "service", "run_id", "phase", "status", "gc_status", "gc_overflow",
+            "cgroup_memory_status", "cgroup_memory_reason",
+        }:
+            row.setdefault(key, None)
+        memory_rows.append(row)
+    if invalid_memory:
+        memory_complete = False
+        cgroup_memory_complete = False
+    cgroup_memory_invalid = invalid_memory or any(
+        row.get("cgroup_memory_status") == "invalid" for row in memory_rows
+    )
+    cgroup_memory_reason = (
+        "invalid_snapshot" if cgroup_memory_invalid
+        else next((str(row["cgroup_memory_reason"]) for row in memory_rows
+                   if row.get("cgroup_memory_reason") in {"file_unavailable", "hierarchy_unavailable"}),
+                  "none" if cgroup_memory_complete else "hierarchy_unavailable")
+    )
     return {
         "usage_status": "complete" if all_complete else "incomplete",
         "usage_reason": reason,
@@ -1157,6 +1391,11 @@ def _usage_summary(
         "profile_status": "complete" if profile_complete else "incomplete",
         "profile_reason": profile_reason,
         "profile_rows": profile_rows,
+        "memory_status": "complete" if memory_complete else "incomplete",
+        "memory_reason": "none" if memory_complete else "incomplete",
+        "cgroup_memory_status": "invalid" if cgroup_memory_invalid else "complete" if cgroup_memory_complete else "unknown",
+        "cgroup_memory_reason": cgroup_memory_reason,
+        "memory_rows": memory_rows,
     }
 
 
@@ -1186,7 +1425,7 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                     or raw != _canonical_json(payload)
                     or payload.get("run_id") != args.run_id
                     or payload.get("schema") != 1
-                    or payload.get("workload") != WORKLOAD
+                    or payload.get("workload") not in SUPPORTED_WORKLOADS
                     or payload.get("expires_at_ms") != payload.get("on_end_ms")
                     or any(type(payload.get(key)) is not int for key in (
                         "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms", "expires_at_ms"
@@ -1269,6 +1508,11 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                         }
                         for service, expected in (("api", 2), ("web", 1))
                     ],
+                    "memory_status": "incomplete",
+                    "memory_reason": "incomplete",
+                    "cgroup_memory_status": "unknown",
+                    "cgroup_memory_reason": "hierarchy_unavailable",
+                    "memory_rows": [],
                 }
         else:
             usage = {
@@ -1278,6 +1522,11 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                 "profile_status": "unavailable",
                 "profile_reason": "missing",
                 "profile_rows": [],
+                "memory_status": "unavailable",
+                "memory_reason": "unavailable",
+                "cgroup_memory_status": "unknown",
+                "cgroup_memory_reason": "hierarchy_unavailable",
+                "memory_rows": [],
             }
 
         # Plan removal remains an exact, separately verified operation even
@@ -1306,6 +1555,189 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _read_cgroup_pseudo(path: Path, *, maximum: int) -> str:
+    """Read one fixed, derived cgroup pseudo-file without trusting st_size."""
+
+    fd = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise PlanError("cgroup file type is invalid")
+        raw = bytearray()
+        while len(raw) <= maximum:
+            block = os.read(fd, min(1024, maximum + 1 - len(raw)))
+            if not block:
+                break
+            raw.extend(block)
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        if (not raw or len(raw) > maximum
+                or (before.st_dev, before.st_ino, before.st_mode)
+                != (after.st_dev, after.st_ino, after.st_mode)
+                or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)):
+            raise PlanError("cgroup file changed")
+        return bytes(raw).decode("ascii").strip()
+    finally:
+        os.close(fd)
+
+
+def _capacity_plan_identity(
+    run_id: str, source_sha: str
+) -> tuple[dict[str, str], dict[str, Any], dict[str, Any]]:
+    if RUN_RE.fullmatch(run_id) is None or SHA_RE.fullmatch(source_sha) is None:
+        raise PlanError("capacity watch identity is invalid")
+    if _release_identity()[0] != source_sha:
+        raise PlanError("capacity watch release source changed")
+    directory_fd = _validate_plan_directory(create=False)
+    try:
+        raw, _metadata = _read_bounded_at(directory_fd, PLAN_NAMES["web"], MAX_PLAN_BYTES)
+    finally:
+        os.close(directory_fd)
+    try:
+        plan = json.loads(raw.decode("ascii"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeError, json.JSONDecodeError, PlanError) as exc:
+        raise PlanError("capacity watch plan is invalid") from exc
+    if (not isinstance(plan, dict) or raw != _canonical_json(plan)
+            or plan.get("schema") != 1
+            or plan.get("run_id") != run_id or plan.get("source_sha") != source_sha
+            or plan.get("workload") != CAPACITY_WORKLOAD
+            or plan.get("expires_at_ms") != plan.get("on_end_ms")
+            or any(type(plan.get(key)) is not int for key in (
+                "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms", "expires_at_ms"
+            ))):
+        raise PlanError("capacity watch plan binding failed")
+    if (plan["off_start_ms"] >= plan["off_end_ms"]
+            or plan["off_end_ms"] >= plan["on_start_ms"]
+            or plan["on_start_ms"] >= plan["on_end_ms"]
+            or plan["off_end_ms"] - plan["off_start_ms"] != OFF_WINDOW_MS
+            or plan["on_start_ms"] - plan["off_end_ms"] != IDLE_WINDOW_MS
+            or plan["on_end_ms"] - plan["on_start_ms"] != ON_WINDOW_MS
+            or plan["expires_at_ms"] != plan["on_end_ms"]):
+        raise PlanError("capacity watch plan timing is invalid")
+    web_unit = _systemd_unit("web")
+    targets = _service_targets("web", web_unit)
+    if len(targets) != 1 or targets[0]["pid"] != int(web_unit["MainPID"]):
+        raise PlanError("capacity watch web process topology changed")
+    return web_unit, targets[0], plan
+
+
+def watch_capacity_memory(args: argparse.Namespace):
+    """Stream bounded read-only memory observations for the fixed web unit."""
+
+    if os.geteuid() != 0:
+        raise PlanError("root identity required")
+    web_unit, target, plan = _capacity_plan_identity(args.run_id, args.source_sha)
+    control_group = web_unit["ControlGroup"]
+    if control_group != "/system.slice/deadlock-web.service":
+        raise PlanError("capacity watch control group changed")
+    cgroup_dir = Path("/sys/fs/cgroup/system.slice/deadlock-web.service")
+    if _systemd_memory_max() != SSR_CAPACITY_MEMORY_MAX_BYTES:
+        raise PlanError("capacity watch declared memory limit changed")
+    off_start_ms = plan["off_start_ms"]
+    on_end_ms = plan["on_end_ms"]
+    if type(off_start_ms) is not int or type(on_end_ms) is not int:
+        raise PlanError("capacity watch plan timing is invalid")
+    initial_events: dict[str, int] | None = None
+    sequence = 0
+    abort_reason: str | None = None
+    while True:
+        now_ms = time.time_ns() // 1_000_000
+        reason = "none"
+        decision = "continue"
+        identity_status = "complete"
+        memory_current = memory_peak = memory_max = None
+        deltas: dict[str, int] | None = None
+        current_unit: dict[str, str] | None = None
+        try:
+            current_unit = _systemd_unit("web", timeout_seconds=2)
+            current_targets = _service_targets("web", current_unit)
+            memory_current = int(_read_cgroup_pseudo(cgroup_dir / "memory.current", maximum=64))
+            memory_peak = int(_read_cgroup_pseudo(cgroup_dir / "memory.peak", maximum=64))
+            memory_max = _read_cgroup_pseudo(cgroup_dir / "memory.max", maximum=64)
+            if (memory_max != str(SSR_CAPACITY_MEMORY_MAX_BYTES)
+                    or _systemd_memory_max() != SSR_CAPACITY_MEMORY_MAX_BYTES
+                    or current_unit != web_unit or len(current_targets) != 1
+                    or current_targets[0] != target):
+                raise PlanError("capacity watch service identity changed")
+            events_text = _read_cgroup_pseudo(cgroup_dir / "memory.events", maximum=512)
+            events: dict[str, int] = {}
+            for line in events_text.splitlines():
+                fields = line.split()
+                if len(fields) != 2 or fields[0] not in {
+                    "low", "high", "max", "oom", "oom_kill", "oom_group_kill",
+                } or fields[0] in events or not fields[1].isdecimal():
+                    raise PlanError("capacity watch event schema changed")
+                events[fields[0]] = int(fields[1])
+            if set(events) != {"low", "high", "max", "oom", "oom_kill", "oom_group_kill"}:
+                raise PlanError("capacity watch event schema incomplete")
+            if initial_events is None:
+                initial_events = events.copy()
+            deltas = {key: events[key] - initial_events[key] for key in events}
+            if any(value < 0 for value in deltas.values()):
+                raise PlanError("capacity watch event counters reset")
+            reason = "none"
+            if memory_current >= SSR_CAPACITY_ABORT_FLOOR_BYTES:
+                reason = "memory_floor"
+            elif any(deltas[key] > 0 for key in ("high", "max", "oom", "oom_kill", "oom_group_kill")):
+                reason = "memory_event"
+            if reason != "none":
+                abort_reason = reason
+        except (OSError, ValueError, TypeError, KeyError, PlanError):
+            memory_current = memory_peak = None
+            memory_max = None
+            deltas = None
+            reason = "identity_changed" if current_unit is not None else "collection_error"
+            abort_reason = reason
+            identity_status = "invalid"
+        if abort_reason is not None:
+            decision = "abort"
+            reason = abort_reason
+        elif now_ms >= on_end_ms:
+            decision = "abort" if now_ms > on_end_ms + 1_000 else "complete"
+            reason = "collection_error" if decision == "abort" else "none"
+        phase = (
+            "off" if now_ms < plan["off_end_ms"]
+            else "idle" if now_ms < plan["on_start_ms"]
+            else "on" if now_ms < on_end_ms
+            else "complete" if decision == "complete"
+            else "abort"
+        )
+        sequence += 1
+        yield {
+            "schema": 1,
+            "run_id": args.run_id,
+            "source_sha": args.source_sha,
+            "workload": CAPACITY_WORKLOAD,
+            "sequence": sequence,
+            "elapsed_ms": max(0, now_ms - off_start_ms),
+            "phase": phase,
+            "sampled_at_ms": now_ms,
+            "plan_off_start_ms": off_start_ms,
+            "plan_on_start_ms": plan["on_start_ms"],
+            "plan_on_end_ms": on_end_ms,
+            "decision": decision,
+            "reason": reason,
+            "memory_current_bytes": memory_current,
+            "memory_peak_bytes": memory_peak,
+            "memory_max_bytes": int(memory_max) if isinstance(memory_max, str) and memory_max.isdecimal() else None,
+            "memory_events_delta": deltas,
+            "target_pid": int(target["pid"]),
+            "target_start_ticks": int(target["start_ticks"]),
+            "target_invocation_id": str(target["invocation_id"]),
+            "identity_status": identity_status,
+        }
+        if decision in {"abort", "complete"}:
+            return
+        next_boundary_ms = min(
+            on_end_ms,
+            max(off_start_ms, now_ms + round(SSR_CAPACITY_WATCH_INTERVAL_SECONDS * 1000)),
+        )
+        time.sleep(max(0.0, (next_boundary_ms - now_ms) / 1000))
+
+
 def _parser() -> argparse.ArgumentParser:
     class ClosedArgumentParser(argparse.ArgumentParser):
         def error(self, _message: str) -> None:
@@ -1315,6 +1747,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("prepare-stdin")
     subparsers.add_parser("cleanup-stdin")
+    subparsers.add_parser("memory-watch-stdin")
     return parser
 
 
@@ -1322,6 +1755,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
         request = _read_request(args.command)
+        if request.command == "memory-watch":
+            for sample in watch_capacity_memory(request):
+                print(
+                    "CAPACITY_MEMORY_GUARD "
+                    + json.dumps(sample, sort_keys=True, separators=(",", ":")),
+                    flush=True,
+                )
+            return 0
         result = prepare(request) if request.command == "prepare" else cleanup(request)
     except Exception as exc:
         known_class = type(exc).__name__

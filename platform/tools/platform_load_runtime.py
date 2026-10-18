@@ -1874,6 +1874,8 @@ def run_supervised(
     worker_stdin_payload: bytes | None = None,
     worker_stdin_payload_max_bytes: int = 0,
     clear_worker_environment: bool = False,
+    on_namespace_init: Callable[[int, int], None] | None = None,
+    on_namespace_exit: Callable[[int, int], None] | None = None,
 ) -> SupervisorResult:
     """Run one worker in a mandatory, killable PID namespace.
 
@@ -1889,6 +1891,14 @@ def run_supervised(
     descendant boundary; process groups are not a correctness fallback.  The
     final report is published only after the wrapper and a reaped namespace
     PID 1 prove teardown.
+
+    ``on_namespace_init`` is a trusted-parent diagnostic hook invoked once
+    after the exact namespace-init PID and starttime have been captured. Its
+    failures are diagnostic-only and cannot change the load or containment
+    outcome. ``on_namespace_exit`` is invoked after the worker wrapper exits,
+    while the captured namespace-init identity is still unreaped, so bounded
+    diagnostics can take their final snapshot before the parent proves teardown.
+    Its failures are also diagnostic-only.
     """
 
     duration = _finite_positive(max_duration_seconds, field="max_duration_seconds")
@@ -2106,6 +2116,7 @@ def run_supervised(
     report_error: str | None = None
     namespace_closed = False
     namespace_reaped = False
+    namespace_exit_callback_called = False
     external_signal: int | None = None
     previous_handlers: dict[int, Any] = {}
     previous_subreaper: int | None = None
@@ -2129,6 +2140,22 @@ def run_supervised(
         _signal_pidfd(namespace_init_pidfd, signal.SIGKILL)
         for _starttime, pidfd in wrapper_chain_identities.values():
             _signal_pidfd(pidfd, signal.SIGKILL)
+
+    def capture_namespace_exit_diagnostics() -> None:
+        nonlocal namespace_exit_callback_called
+        if (
+            on_namespace_exit is None
+            or namespace_exit_callback_called
+            or namespace_init_pid is None
+            or namespace_init_starttime is None
+        ):
+            return
+        namespace_exit_callback_called = True
+        try:
+            on_namespace_exit(namespace_init_pid, namespace_init_starttime)
+        except Exception:
+            # Optional observation cannot change containment or load outcome.
+            return
 
     for signum in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -2227,6 +2254,13 @@ def run_supervised(
                         namespace_init_pid = candidate
                         namespace_init_starttime = candidate_starttime
                         namespace_init_pidfd = candidate_pidfd
+                        if on_namespace_init is not None:
+                            try:
+                                on_namespace_init(candidate, candidate_starttime)
+                            except Exception:
+                                # Optional host resource observation must not
+                                # affect worker containment or load results.
+                                pass
                 if namespace_init_pid is None:
                     if process.poll() is not None:
                         raise NamespaceIntegrityError(
@@ -2331,6 +2365,7 @@ def run_supervised(
         # fails, so a partially started namespace cannot linger as an
         # unverified child.
         if process is not None and returncode is not None:
+            capture_namespace_exit_diagnostics()
             namespace_reaped = _reap_namespace_init(
                 namespace_init_pid,
                 namespace_starttime=namespace_init_starttime,
@@ -2368,6 +2403,7 @@ def run_supervised(
             if killed:
                 force_kill_captured_chain()
         if process is not None and returncode is not None:
+            capture_namespace_exit_diagnostics()
             namespace_reaped = _reap_namespace_init(
                 namespace_init_pid,
                 namespace_starttime=namespace_init_starttime,

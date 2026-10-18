@@ -397,7 +397,9 @@ tournament_ids = report.get("tournament_ids") if isinstance(report.get("tourname
 passed = int(status) == 0 and report.get("passed") is True
 summary = {
     "mode": "write-burst",
-    "control_account_preserved": False,
+    # This is emitted before cleanup.  Only the independent final cleanup
+    # receipt can authoritatively state whether the control account survived.
+    "control_account_preserved": None,
     "planned_tournaments": int(tournament_count),
     "completed_tournaments": len(tournament_ids),
     "planned_users": int(tournament_count) * int(users_per_tournament),

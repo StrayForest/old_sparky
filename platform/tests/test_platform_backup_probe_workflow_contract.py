@@ -819,6 +819,11 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertIn('if: ${{ success() && inputs.operation == \'create\' && steps.cleanup_ssh.outcome == \'success\' }}', self.source)
         self.assertNotIn("platform-authorization-probe-success", self.source)
         autodeploy = (REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "group: platform-production-auto-deploy-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
+            autodeploy,
+        )
+        self.assertIn("cancel-in-progress: false", autodeploy)
         backup_guard = autodeploy.index("- name: Verify exact source-bound restore-verified backup")
         child_dispatch = autodeploy.index("- name: Dispatch production deployment or baseline reconciliation")
         self.assertLess(backup_guard, child_dispatch)
@@ -827,6 +832,22 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertIn("BACKUP_GUARD_TOOL: ${{ github.workspace }}/platform/tools/platform_backup_success_guard.py", autodeploy)
         self.assertIn("github.event.workflow_run.status == 'completed'", autodeploy)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", autodeploy)
+        self.assertIn("host-readiness:\n    name: Wait for exact host-tools generation readiness", autodeploy)
+        readiness_start = autodeploy.index("  host-readiness:")
+        readiness_end = autodeploy.index("  dispatch-production:", readiness_start)
+        readiness_job = autodeploy[readiness_start:readiness_end]
+        self.assertIn("environment: production", readiness_job)
+        self.assertIn("needs.dispatch.outputs.deploy == 'true'", readiness_job)
+        self.assertIn("platform_host_tools_installed_check.py", readiness_job)
+        self.assertIn("--wait-for-generation-seconds 1800", readiness_job)
+        self.assertIn("if: ${{ always() }}", readiness_job)
+        self.assertIn('rm -rf -- "$RUNNER_TEMP/host-tools-bootstrap" "$RUNNER_TEMP/platform-host-capability-ssh"', readiness_job)
+        final_dispatch = autodeploy[readiness_end:]
+        self.assertIn("needs.host-readiness.result == 'success'", final_dispatch)
+        self.assertIn("Revalidate current dev and exact successful Security run", final_dispatch)
+        self.assertIn("Revalidate exact successful source-bound backup", final_dispatch)
+        self.assertIn("platform-production-deploy.yml/dispatches", final_dispatch)
+        self.assertNotIn("workflow_run:\n    workflows:\n      - Platform production auto-deploy", autodeploy)
 
     def test_probe_skips_database_env_and_backup_summary_paths(self) -> None:
         self.assertIn('if [[ "$operation" != authorization-probe ]]; then\n            test -f "$runtime/shared/.env.platform"', self.source)

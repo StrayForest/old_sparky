@@ -297,7 +297,7 @@ class ProductionQaContractTests(unittest.TestCase):
 
             source_summary = {
                 "mode": "write-burst",
-                "control_account_preserved": False,
+                "control_account_preserved": None,
                 "planned_tournaments": 1,
                 "completed_tournaments": 1,
                 "planned_users": 14,
@@ -330,6 +330,7 @@ class ProductionQaContractTests(unittest.TestCase):
                 qa_succeeded=True,
             )
             projected = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertIsNone(projected["control_account_preserved"])
             timing_projection = projected["external_vote_fixture"]["fixture_setup_timings"]
             self.assertEqual(
                 set(projected),
@@ -407,6 +408,53 @@ class ProductionQaContractTests(unittest.TestCase):
                             summary_path,
                             qa_succeeded=True,
                         )
+
+            receipt_path.write_text(json.dumps(malformed), encoding="utf-8")
+            receipt_path.chmod(0o600)
+            for invalid_preservation in ("unknown", 0, []):
+                source_summary_path.write_text(
+                    json.dumps({**source_summary, "control_account_preserved": invalid_preservation}),
+                    encoding="utf-8",
+                )
+                source_summary_path.chmod(0o600)
+                with self.subTest(control_account_preserved=invalid_preservation), self.assertRaises(ValueError):
+                    project_fixture_timing_summary(
+                        receipt_path,
+                        source_summary_path,
+                        summary_path,
+                        qa_succeeded=True,
+                    )
+
+            source_summary_path.write_text(
+                json.dumps({**source_summary, "control_account_preserved": False}),
+                encoding="utf-8",
+            )
+            source_summary_path.chmod(0o600)
+            project_fixture_timing_summary(
+                receipt_path,
+                source_summary_path,
+                summary_path,
+                qa_succeeded=True,
+            )
+            self.assertIs(
+                json.loads(summary_path.read_text(encoding="utf-8"))["control_account_preserved"],
+                False,
+            )
+
+            source_summary_path.write_text(
+                json.dumps({key: value for key, value in source_summary.items() if key != "control_account_preserved"}),
+                encoding="utf-8",
+            )
+            source_summary_path.chmod(0o600)
+            project_fixture_timing_summary(
+                receipt_path,
+                source_summary_path,
+                summary_path,
+                qa_succeeded=True,
+            )
+            self.assertIsNone(
+                json.loads(summary_path.read_text(encoding="utf-8"))["control_account_preserved"]
+            )
 
             partial_timings = FixtureStageTimings()
             with patch(

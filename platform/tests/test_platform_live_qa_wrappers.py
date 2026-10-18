@@ -590,6 +590,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     "categories": [{"category": "other", "cpu_us": 1_000_000, "observations": 100}],
                 },
             ],
+            "memory_status": "incomplete", "memory_reason": "incomplete",
+            "cgroup_memory_status": "unknown",
+            "cgroup_memory_reason": "hierarchy_unavailable", "memory_rows": [],
         }
         real_popen = subprocess.Popen
 

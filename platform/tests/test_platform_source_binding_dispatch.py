@@ -24,6 +24,10 @@ from tools.platform_workflow_input_guard import (  # noqa: E402
     validate_external_payload,
     validate_live_payload,
 )
+from tools.platform_autodeploy_freshness_guard import (  # noqa: E402
+    main as freshness_guard_main,
+    validate_dev_response,
+)
 
 
 RUNNER_SHA = "a" * 40
@@ -90,6 +94,47 @@ def _external_payload(schema: int = 2) -> dict[str, object]:
 
 
 class SourceBindingDispatchTests(unittest.TestCase):
+    def test_autodeploy_freshness_guard_binds_exact_live_dev_sha(self) -> None:
+        tested_sha = "a" * 40
+        exact_response = json.dumps(
+            {"name": "dev", "commit": {"sha": tested_sha}},
+            separators=(",", ":"),
+        ).encode("ascii")
+        moved_response = json.dumps(
+            {"name": "dev", "commit": {"sha": "b" * 40}},
+            separators=(",", ":"),
+        ).encode("ascii")
+
+        self.assertTrue(validate_dev_response(exact_response, tested_sha))
+        self.assertFalse(validate_dev_response(moved_response, tested_sha))
+        self.assertFalse(validate_dev_response(b'{"name":"dev","commit":{}}', tested_sha))
+        self.assertFalse(validate_dev_response(exact_response, ""))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            response_path = Path(temp_dir) / "branch-response.json"
+            response_path.write_bytes(exact_response)
+            self.assertEqual(
+                freshness_guard_main([
+                    "--response", str(response_path), "--expected-sha", tested_sha,
+                ]),
+                0,
+            )
+            response_path.write_bytes(moved_response)
+            with patch("sys.stderr", new=io.StringIO()):
+                self.assertEqual(
+                    freshness_guard_main([
+                        "--response", str(response_path), "--expected-sha", tested_sha,
+                    ]),
+                    1,
+                )
+            response_path.write_bytes(b'{"name":"dev","commit":{}}')
+            with patch("sys.stderr", new=io.StringIO()):
+                self.assertEqual(
+                    freshness_guard_main([
+                        "--response", str(response_path), "--expected-sha", tested_sha,
+                    ]),
+                    1,
+                )
+
     def test_schema_two_is_closed_across_load_cleanup_and_live_inputs(self) -> None:
         external = validate_external_payload(_external_payload())
         self.assertEqual(external["schema"], "2")
@@ -133,6 +178,49 @@ class SourceBindingDispatchTests(unittest.TestCase):
         }
         with self.assertRaises(WorkflowInputError):
             validate_external_payload(oversized)
+
+    def test_cpu_only_fixture_is_explicit_and_fixed_to_qa_minimum(self) -> None:
+        payload = _external_payload()
+        payload.update(
+            confirmation="RUN-PRODUCTION-CPU-DIAGNOSTIC",
+            fixture_kind="cpu_diagnostic_only_v1",
+            tournament_count="1",
+            users_per_tournament="14",
+        )
+        validated = validate_external_payload(payload)
+        self.assertEqual(validated["fixture_kind"], "cpu_diagnostic_only_v1")
+        for mutation in (
+            {**payload, "tournament_count": "2"},
+            {**payload, "users_per_tournament": "500"},
+            {**payload, "timeout_diagnostics": "true"},
+            {**payload, "fixture_kind": "external_load"},
+            {**payload, "fixture_kind": "cpu_diagnostic_only_v1", "confirmation": EXTERNAL_CONFIRMATION},
+        ):
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(WorkflowInputError):
+                    validate_external_payload(mutation)
+
+    def test_ssr_capacity_fixture_is_a_separate_fixed_zero_credit_route(self) -> None:
+        payload = _external_payload()
+        payload.update(
+            confirmation="RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC",
+            fixture_kind="ssr_capacity_diagnostic_v1",
+            tournament_count="1",
+            users_per_tournament="14",
+        )
+        validated = validate_external_payload(payload)
+        self.assertEqual(validated["fixture_kind"], "ssr_capacity_diagnostic_v1")
+        for mutation in (
+            {**payload, "confirmation": EXTERNAL_CONFIRMATION},
+            {**payload, "tournament_count": "2"},
+            {**payload, "users_per_tournament": "500"},
+            {**payload, "timeout_diagnostics": "true"},
+            {**payload, "fixture_kind": "cpu_diagnostic_only_v1"},
+            {**payload, "fixture_kind": "external_load"},
+        ):
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(WorkflowInputError):
+                    validate_external_payload(mutation)
 
     def test_legacy_schema_one_preserves_same_source_shape(self) -> None:
         payload = _external_payload(schema=1)

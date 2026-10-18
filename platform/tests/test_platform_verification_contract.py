@@ -3104,7 +3104,7 @@ except lock.VerificationLockError as exc:
         for index, malformed in enumerate(mutations):
             with self.subTest(mutation=index):
                 self.assertTrue(source_bound_backup_dispatch_issues(malformed))
-        dispatch_end = autodeploy.index("\n      - name: Auto-deploy summary", dispatch_start)
+        dispatch_end = autodeploy.index("\n      - name: Auto-deploy dispatch summary", dispatch_start)
         dispatch_step = autodeploy[dispatch_start:dispatch_end]
         moved_dispatch = autodeploy[:dispatch_start] + autodeploy[dispatch_end:]
         moved_dispatch = moved_dispatch.replace(
@@ -3116,7 +3116,7 @@ except lock.VerificationLockError as exc:
         )
         self.assertTrue(
             any(
-                "must be in the same job" in issue
+                "final backup proof and production dispatch must share" in issue
                 for issue in source_bound_backup_dispatch_issues(moved_dispatch)
             )
         )
@@ -3417,6 +3417,47 @@ except lock.VerificationLockError as exc:
             self.assertTrue(any("owner 'unapproved'" in item for item in action_issues))
         production_text = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(_production_secret_scope_issues(production_text), [])
+        host_start = production_text.index("  host-capability-preflight:")
+        host_end = production_text.index("  build-release:", host_start)
+        host_block = production_text[host_start:host_end]
+        wrong_source_ref = host_block.replace(
+            "ref: ${{ env.TARGET_SHA }}", "ref: refs/heads/dev", 1
+        )
+        with self.subTest(host_verifier_checkout="wrong source ref"):
+            self.assertTrue(
+                any(
+                    "checkout the exact target" in issue
+                    for issue in _production_secret_scope_issues(
+                        production_text[:host_start] + wrong_source_ref + production_text[host_end:]
+                    )
+                )
+            )
+        missing_dispatch_binding = host_block.replace(
+            "needs.validate-dispatch.result == 'success'", "needs.validate-dispatch.result == 'skipped'", 1
+        )
+        with self.subTest(host_verifier_checkout="missing provenance dependency"):
+            self.assertTrue(
+                any(
+                    "exact dispatch provenance" in issue
+                    for issue in _production_secret_scope_issues(
+                        production_text[:host_start] + missing_dispatch_binding + production_text[host_end:]
+                    )
+                )
+            )
+        missing_shared_verifier = host_block.replace(
+            '"$GITHUB_WORKSPACE/target-source/platform/tools/platform_host_tools_installed_check.py"',
+            '"$GITHUB_WORKSPACE/target-source/platform/tools/other.py"',
+            1,
+        )
+        with self.subTest(host_verifier_checkout="missing shared verifier"):
+            self.assertTrue(
+                any(
+                    "shared verifier" in issue
+                    for issue in _production_secret_scope_issues(
+                        production_text[:host_start] + missing_shared_verifier + production_text[host_end:]
+                    )
+                )
+            )
         capability_audit_issue = "exact v3/v4 capability layout"
         for marker in (
             'source_sha != sys.argv[8] or version != sys.argv[9]',

@@ -23,6 +23,7 @@ from typing import Any, Iterable, Iterator
 from urllib.parse import urlsplit
 
 
+CAPACITY_ATTRIBUTION_LAG_FLOOR_MS = 2.0
 SAFE_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
 SAFE_ROUTE_CLASSES = frozenset(
     {
@@ -1226,6 +1227,47 @@ def _project_metric(value: Any) -> dict[str, Any]:
     return output
 
 
+def _project_ready_vote_unit_metrics(value: Any) -> dict[str, Any]:
+    """Project unit-labelled ready-vote gauges without treating them as time."""
+
+    source = _mapping(value)
+    output: dict[str, Any] = {}
+    percent = _mapping(source.get("ready_vote_cpu_pressure_percent"))
+    percent_output: dict[str, Any] = {}
+    for key in ("sample_count", "avg_percent", "p50_percent", "p95_percent", "p99_percent", "max_percent"):
+        selected = safe_int(percent.get(key)) if key == "sample_count" else finite_number(percent.get(key))
+        if selected is not None:
+            percent_output[key] = selected
+    if percent_output:
+        output["ready_vote_cpu_pressure_percent"] = percent_output
+    counts = _mapping(source.get("ready_vote_count_metrics"))
+    count_keys = (
+        "ready_vote_checkout_count",
+        "ready_vote_admission_inflight",
+        "ready_vote_admission_limit",
+        "ready_vote_admitted_total",
+        "ready_vote_shed_total",
+        "ready_vote_controller_limit_changes",
+        "ready_vote_cpu_monitor_samples",
+    )
+    count_output: dict[str, Any] = {}
+    for name in count_keys:
+        metric = _mapping(counts.get(name))
+        projected: dict[str, Any] = {}
+        for key in ("sample_count", "avg_count", "p50_count", "p95_count", "p99_count", "max_count"):
+            selected = safe_int(metric.get(key)) if key == "sample_count" else finite_number(metric.get(key))
+            if selected is not None:
+                projected[key] = selected
+        if projected:
+            count_output[name] = projected
+    if count_output:
+        output["ready_vote_count_metrics"] = count_output
+    deprecated = source.get("legacy_ready_vote_fields_deprecated")
+    if type(deprecated) is bool:
+        output["legacy_ready_vote_fields_deprecated"] = deprecated
+    return output
+
+
 def _project_counter(value: Any, allowed: frozenset[str]) -> dict[str, int]:
     source = _mapping(value)
     output: dict[str, int] = {}
@@ -1635,6 +1677,7 @@ def _project_summary(value: Any) -> dict[str, Any]:
         )
         if stage_metrics:
             output[key] = stage_metrics
+    output.update(_project_ready_vote_unit_metrics(source))
     controller_states = _project_counter(
         source.get("ready_vote_controller_state_counts"), PUBLIC_CONTROLLER_STATES
     )
@@ -2161,6 +2204,11 @@ def _project_external_load(value: Any) -> dict[str, Any]:
         is not None
         else "other"
     )
+    arrival_model = source.get("arrival_model")
+    if arrival_model in {
+        "open_loop_scheduled_rate", "closed_loop_concurrency_ramp", "closed_loop_staggered_cohort"
+    }:
+        output["arrival_model"] = arrival_model
     scope = source.get("scope")
     if _allowed_string(
         scope, frozenset({"full_population", "logical_user_actions", "other"})
@@ -2329,6 +2377,29 @@ def _project_external_load(value: Any) -> dict[str, Any]:
         run_started_at=run_started_at,
         run_finished_at=run_finished_at,
     )
+    runner_cgroup_usage = _project_runner_cgroup_usage(source.get("runner_cgroup_usage"))
+    if runner_cgroup_usage is not None:
+        output["runner_cgroup_usage"] = runner_cgroup_usage
+    capacity_attribution = _project_capacity_attribution(source.get("capacity_attribution"))
+    if capacity_attribution is not None:
+        if capacity_attribution.get("status") == "eligible" and not _capacity_claim_has_complete_inputs(
+            source, output.get("client_resource_usage"), runner_cgroup_usage, capacity_attribution
+        ):
+            capacity_attribution = {
+                "schema": 1,
+                "status": "unknown",
+                "reason": "effective_generator_quota_unknown",
+                "capacity_attribution_eligible": None,
+                "server_capacity_claim": None,
+                "server_capacity_claim_status": "unknown",
+                "server_capacity_claim_reason": "resource_correlation_not_provided",
+                "capacity_scope": "generator_headroom_only",
+                **(
+                    {"load_model": capacity_attribution["load_model"]}
+                    if "load_model" in capacity_attribution else {}
+                ),
+            }
+        output["capacity_attribution"] = capacity_attribution
     timeout = _mapping(source.get("timeout_path_diagnostics"))
     if timeout:
         timeout_output: dict[str, Any] = {}
@@ -2446,6 +2517,287 @@ def _project_process_metrics(value: Any) -> dict[str, dict[str, Any]]:
         if projected:
             output[label] = projected
     return dict(sorted(output.items()))
+
+
+def _project_runner_cgroup_usage(value: Any) -> dict[str, Any] | None:
+    """Project host-side runner evidence without PID, path or raw cgroup data."""
+
+    source = _mapping(value)
+    if type(source.get("schema")) is not int or source.get("schema") != 1:
+        return None
+    status = source.get("status")
+    reason = source.get("reason")
+    allowed_reasons = {
+        "none", "trusted_runner_context_unavailable", "workload_cgroup_mismatch",
+        "runner_namespace_binding_invalid", "runner_cgroup_snapshot_incomplete",
+        "workload_identity_changed", "runner_cgroup_identity_changed", "runner_sample_limit",
+        "runner_sampler_join_timeout", "runner_membership_changed", "runner_final_snapshot_invalid",
+        "runner_samples_incomplete", "runner_hierarchy_changed", "runner_cpuset_incomplete",
+        "runner_cpu_quota_changed", "runner_cpu_quota_incomplete", "runner_sample_clock_invalid",
+        "runner_cpu_stat_incomplete", "runner_cpu_counter_reset", "runner_throttle_evidence_unavailable", "runner_snapshot_unavailable",
+        "runner_snapshot_invalid", "runner_context_unavailable",
+    }
+    if status not in {"complete", "unknown"} or reason not in allowed_reasons:
+        return None
+    environment = source.get("runner_environment")
+    if environment not in {"github-hosted", "unknown"}:
+        return None
+    identity_source = _mapping(source.get("identity"))
+    identity_keys = {
+        "outer_pid_namespace_matches_pid1", "outer_mount_namespace_matches_pid1",
+        "outer_cgroup_namespace_matches_pid1", "target_cgroup_namespace_matches_outer",
+        "target_mount_namespace_is_isolated", "target_pid_namespace_is_isolated",
+        "global_cgroup2_mount", "workload_membership_matches_outer",
+    }
+    identity: dict[str, bool] = {}
+    if identity_source:
+        if set(identity_source) != identity_keys or any(type(v) is not bool for v in identity_source.values()):
+            return None
+        identity = dict(identity_source)
+    output: dict[str, Any] = {
+        "schema": 1, "status": status, "reason": reason,
+        "runner_environment": environment,
+        "sample_count": safe_int(source.get("sample_count"), maximum=4096) or 0,
+        "identity": identity,
+    }
+    if status == "unknown":
+        return output
+    if (
+        reason != "none" or environment != "github-hosted"
+        or set(identity) != identity_keys or any(value is not True for value in identity.values())
+    ):
+        return {**output, "status": "unknown", "reason": "runner_namespace_binding_invalid"}
+    window = finite_number(source.get("window_seconds"))
+    capacity = finite_number(source.get("effective_cpu_capacity_cores"))
+    usage = finite_number(source.get("max_cgroup_cpu_usage_cores"))
+    throttled = safe_int(source.get("max_visible_throttled_periods_delta"), maximum=10**15)
+    sample_count = safe_int(source.get("sample_count"), maximum=4096)
+    if (
+        window is None or not 0 < window <= 14400
+        or capacity is None or not 0 < capacity <= 4096
+        or usage is None or not 0 <= usage <= 4096
+        or throttled is None or sample_count is None or sample_count < 3
+    ):
+        return {**output, "status": "unknown", "reason": "runner_samples_incomplete"}
+    output.update({
+        "sample_count": sample_count,
+        "window_seconds": window,
+        "effective_cpu_capacity_cores": capacity,
+        "max_cgroup_cpu_usage_cores": usage,
+        "max_visible_throttled_periods_delta": throttled,
+    })
+    return output
+
+
+def _project_capacity_attribution(value: Any) -> dict[str, Any] | None:
+    source = _mapping(value)
+    if type(source.get("schema")) is not int or source.get("schema") != 1:
+        return None
+    status = source.get("status")
+    reason = source.get("reason")
+    load_model = source.get("load_model")
+    allowed = {
+        "headroom_observed", "client_queue_lag", "work_under_delivered",
+        "generator_quota_throttled", "generator_cpu_saturated",
+        "effective_generator_quota_unknown", "quota_hierarchy_incomplete",
+        "generator_cpu_evidence_invalid", "delivery_evidence_missing",
+        "delivery_evidence_invalid", "queue_evidence_missing", "queue_evidence_invalid",
+        "invalid_load_model", "not_capacity_profile",
+        "trusted_runner_evidence_missing", "trusted_runner_evidence_incomplete",
+        "runner_window_incomplete",
+    }
+    if status not in {"eligible", "ineligible", "unknown", "not_applicable"} or reason not in allowed:
+        return None
+    if load_model not in {
+        "open_loop_scheduled_rate", "closed_loop_concurrency_ramp", "closed_loop_staggered_cohort"
+    }:
+        if reason != "invalid_load_model" or status != "unknown":
+            return None
+    claim = source.get("server_capacity_claim")
+    attribution_eligible = source.get("capacity_attribution_eligible")
+    expected_eligible = True if status == "eligible" else False if status == "ineligible" else None
+    if (
+        claim is not None
+        or source.get("server_capacity_claim_status") != "unknown"
+        or source.get("server_capacity_claim_reason") != "resource_correlation_not_provided"
+        or attribution_eligible is not expected_eligible
+        or source.get("capacity_scope") != "generator_headroom_only"
+    ):
+        return None
+    if status == "eligible" and reason != "headroom_observed":
+        return None
+    if status == "not_applicable" and reason != "not_capacity_profile":
+        return None
+    if status == "unknown" and reason not in {
+        "effective_generator_quota_unknown", "quota_hierarchy_incomplete",
+        "generator_cpu_evidence_invalid", "delivery_evidence_missing",
+        "delivery_evidence_invalid", "queue_evidence_missing", "queue_evidence_invalid",
+        "invalid_load_model",
+        "trusted_runner_evidence_missing", "trusted_runner_evidence_incomplete",
+        "runner_window_incomplete",
+    }:
+        return None
+    output: dict[str, Any] = {
+        "schema": 1, "status": status, "reason": reason,
+        "capacity_attribution_eligible": attribution_eligible,
+        "server_capacity_claim": None,
+        "server_capacity_claim_status": "unknown",
+        "server_capacity_claim_reason": "resource_correlation_not_provided",
+        "capacity_scope": "generator_headroom_only",
+    }
+    if load_model in {"open_loop_scheduled_rate", "closed_loop_concurrency_ramp", "closed_loop_staggered_cohort"}:
+        output["load_model"] = load_model
+    for key in ("offered_actions", "started_actions", "max_visible_throttled_periods_delta"):
+        number = _copy_int(source, key)
+        if number is not None and number >= 0:
+            output[key] = number
+    for key in (
+        "effective_cpu_capacity_cores", "max_process_cpu_percent", "max_cgroup_cpu_usage_cores",
+        "client_queue_lag_floor_ms", "executor_queue_p95_ms", "executor_queue_p99_ms",
+        "schedule_delay_p95_ms", "schedule_delay_p99_ms",
+    ):
+        number = _copy_number(source, key)
+        if number is not None and number >= 0:
+            output[key] = number
+    if status == "eligible" and (
+        output.get("client_queue_lag_floor_ms") != CAPACITY_ATTRIBUTION_LAG_FLOOR_MS
+        or output.get("executor_queue_p95_ms") is None
+        or output.get("executor_queue_p99_ms") is None
+        or (load_model == "open_loop_scheduled_rate" and (
+            output.get("schedule_delay_p95_ms") is None or output.get("schedule_delay_p99_ms") is None
+        ))
+        or (load_model != "open_loop_scheduled_rate" and (
+            output.get("schedule_delay_p95_ms") is not None or output.get("schedule_delay_p99_ms") is not None
+        ))
+    ):
+        return None
+    return output
+
+
+def _capacity_claim_has_complete_inputs(
+    report: Mapping[str, Any], usage: Any, runner_usage: Any,
+    attribution: Mapping[str, Any],
+) -> bool:
+    """Refuse server-capacity claims without complete quota and delivery proof."""
+
+    usage_row = _mapping(usage)
+    cgroup = _mapping(usage_row.get("cgroup_diagnostics"))
+    if (
+        usage_row.get("status") != "complete"
+        or usage_row.get("cpu_capacity_status") not in {"known", "unknown"}
+        or cgroup.get("status") != "complete"
+    ):
+        return False
+    runner = _mapping(runner_usage)
+    identity = _mapping(runner.get("identity"))
+    if (
+        runner.get("status") != "complete"
+        or runner.get("reason") != "none"
+        or runner.get("runner_environment") != "github-hosted"
+        or not identity or any(value is not True for value in identity.values())
+        or (safe_int(runner.get("sample_count"), maximum=4096) or 0) < 3
+        or (finite_number(runner.get("window_seconds")) or 0) <= 0
+    ):
+        return False
+    runner_capacity = runner.get("effective_cpu_capacity_cores")
+    samples = usage_row.get("samples")
+    ancestors = cgroup.get("visible_ancestors")
+    if (
+        isinstance(runner_capacity, bool) or not isinstance(runner_capacity, (int, float))
+        or not math.isfinite(runner_capacity) or runner_capacity <= 0
+        or not isinstance(samples, list) or not samples
+        or type(usage_row.get("sample_count")) is not int
+        or usage_row["sample_count"] != len(samples)
+        or not isinstance(ancestors, list) or not ancestors
+    ):
+        return False
+    process_cpu_values = []
+    for sample in samples:
+        row = _mapping(sample)
+        value = finite_number(row.get("process_cpu_percent"))
+        if value is None or value < 0:
+            return False
+        process_cpu_values.append(value)
+    throttled_values = []
+    for ancestor in ancestors:
+        row = _mapping(ancestor)
+        delta = _mapping(row.get("cpu_stat_delta"))
+        value = safe_int(delta.get("nr_throttled"), maximum=10**15)
+        if row.get("cpu_stat_completeness") != "complete" or value is None:
+            return False
+        throttled_values.append(value)
+    if (
+        attribution.get("max_process_cpu_percent") != round(max(process_cpu_values), 4)
+        or attribution.get("max_visible_throttled_periods_delta") != max(throttled_values)
+        or attribution.get("max_visible_throttled_periods_delta") != 0
+        or attribution.get("effective_cpu_capacity_cores") != runner_capacity
+        or attribution.get("max_cgroup_cpu_usage_cores") != runner.get("max_cgroup_cpu_usage_cores")
+        or runner.get("max_visible_throttled_periods_delta") != 0
+        or runner.get("max_cgroup_cpu_usage_cores", math.inf) >= runner.get("effective_cpu_capacity_cores", 0)
+    ):
+        return False
+    timing_root = _mapping(report.get("logical"))
+    timing = _mapping(timing_root.get("timing"))
+    names = (
+        "expected_count", "submitted_count", "started_count", "completed_count",
+        "scheduled_count", "response_completion_count", "user_observed_count",
+    )
+    values = [timing.get(name) for name in names]
+    dropped = timing.get("dropped_work")
+    late_starts = timing.get("late_start_count")
+    if (
+        timing.get("partial") is not False
+        or any(type(value) is not int or value < 0 for value in values)
+        or len(set(values)) != 1
+        or type(dropped) is not int or dropped != 0
+        or type(late_starts) is not int or late_starts < 0
+    ):
+        return False
+    queue = _mapping(timing.get("executor_queue_wait"))
+    queue_count, queue_max = queue.get("count"), queue.get("max_ms")
+    queue_p95, queue_p99 = queue.get("p95_ms"), queue.get("p99_ms")
+    schedule = _mapping(timing.get("schedule_delay"))
+    schedule_p95, schedule_p99 = schedule.get("p95_ms"), schedule.get("p99_ms")
+    model = attribution.get("load_model")
+    if report.get("arrival_model") != model:
+        return False
+    if (
+        type(queue_count) is not int or queue_count != values[3]
+        or isinstance(queue_max, bool) or not isinstance(queue_max, (int, float))
+        or not math.isfinite(queue_max) or queue_max < 0
+        or isinstance(queue_p95, bool) or not isinstance(queue_p95, (int, float))
+        or not math.isfinite(queue_p95) or not 0 <= queue_p95 <= queue_max
+        or isinstance(queue_p99, bool) or not isinstance(queue_p99, (int, float))
+        or not math.isfinite(queue_p99) or not queue_p95 <= queue_p99 <= queue_max
+        or attribution.get("client_queue_lag_floor_ms") != CAPACITY_ATTRIBUTION_LAG_FLOOR_MS
+        or attribution.get("executor_queue_p95_ms") != round(float(queue_p95), 3)
+        or attribution.get("executor_queue_p99_ms") != round(float(queue_p99), 3)
+        or queue_p99 > CAPACITY_ATTRIBUTION_LAG_FLOOR_MS
+    ):
+        return False
+    if model == "open_loop_scheduled_rate":
+        if (
+            isinstance(schedule_p95, bool) or not isinstance(schedule_p95, (int, float))
+            or not math.isfinite(schedule_p95) or schedule_p95 < 0
+            or isinstance(schedule_p99, bool) or not isinstance(schedule_p99, (int, float))
+            or not math.isfinite(schedule_p99) or schedule_p99 < schedule_p95
+            or schedule_p99 > CAPACITY_ATTRIBUTION_LAG_FLOOR_MS
+            or attribution.get("schedule_delay_p95_ms") != round(float(schedule_p95), 3)
+            or attribution.get("schedule_delay_p99_ms") != round(float(schedule_p99), 3)
+        ):
+            return False
+    elif attribution.get("schedule_delay_p95_ms") is not None or attribution.get("schedule_delay_p99_ms") is not None:
+        return False
+    return (
+        attribution.get("reason") == "headroom_observed"
+        and attribution.get("capacity_attribution_eligible") is True
+        and attribution.get("server_capacity_claim") is None
+        and attribution.get("server_capacity_claim_status") == "unknown"
+        and attribution.get("server_capacity_claim_reason") == "resource_correlation_not_provided"
+        and attribution.get("capacity_scope") == "generator_headroom_only"
+        and attribution.get("offered_actions") == values[0]
+        and attribution.get("started_actions") == values[2]
+    )
 
 
 def _project_cpu_core_percent(value: Any) -> dict[str, float]:
@@ -2991,6 +3343,12 @@ def _project_cgroup_diagnostics(value: Any) -> dict[str, Any] | None:
                 malformed = True
                 break
             projected_row["cpu_stat_completeness"] = counter_completeness
+            cpuset_count = safe_int(row.get("cpuset_cpu_count"), maximum=4096)
+            if cpuset_count is not None:
+                if cpuset_count <= 0:
+                    malformed = True
+                    break
+                projected_row["cpuset_cpu_count"] = cpuset_count
             if kind in {"max", "quota"}:
                 if period is None or period <= 0:
                     malformed = True

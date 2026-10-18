@@ -31,11 +31,15 @@ MAX_LIVE_MARKER_LENGTH = 63
 EXPECTED_ORIGIN = "https://old-sparky.com"
 EXTERNAL_CONFIRMATION = "RUN-PRODUCTION-EXTERNAL-LOAD"
 TIMEOUT_DIAGNOSTICS_CONFIRMATION = "RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS"
+CPU_DIAGNOSTIC_CONFIRMATION = "RUN-PRODUCTION-CPU-DIAGNOSTIC"
+SSR_CAPACITY_CONFIRMATION = "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC"
 DELETE_CONFIRMATION = "DELETE-PRODUCTION-RETAINED-LOAD"
 CONFIRMATION_PHRASES = frozenset(
     {
         EXTERNAL_CONFIRMATION,
         TIMEOUT_DIAGNOSTICS_CONFIRMATION,
+        CPU_DIAGNOSTIC_CONFIRMATION,
+        SSR_CAPACITY_CONFIRMATION,
         DELETE_CONFIRMATION,
         "RUN-LIVE-USER-QA",
         "RUN-PRODUCTION-PROFILE-REVIEW",
@@ -97,6 +101,7 @@ HOST_TOOLS_ARTIFACT_NAME_RE = re.compile(
 HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 CPU_DIAGNOSTIC_RUN_RE = re.compile(r"^[0-9a-f]{32}$")
 CPU_DIAGNOSTIC_WORKLOAD = "authenticated_workspace_read_pair_v1"
+SSR_CAPACITY_DIAGNOSTIC_WORKLOAD = "authenticated_workspace_read_capacity_v1"
 HOST_TOOLS_SIGNER_WORKFLOW = (
     "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml"
 )
@@ -399,8 +404,11 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "timeout_diagnostics",
     }
     schema, source_binding = _validate_source_binding_schema(payload)
-    keys = base_keys if schema == 1 else base_keys | {"source_binding"}
-    _require_exact_keys(payload, keys)
+    keys = base_keys | {"fixture_kind"}
+    if schema == 2:
+        keys.add("source_binding")
+    if set(payload) != keys and set(payload) != keys - {"fixture_kind"}:
+        _require_exact_keys(payload, keys)
     confirmation = _require_string(payload, "confirmation")
     target_sha = _require_string(payload, "target_sha")
     control_email = validate_control_email(payload.get("control_email"))
@@ -422,7 +430,26 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     timeout_diagnostics = _require_string(payload, "timeout_diagnostics")
     if timeout_diagnostics not in {"true", "false"}:
         raise _invalid()
-    if timeout_diagnostics == "true":
+    fixture_kind = payload.get("fixture_kind", "external_load")
+    if not isinstance(fixture_kind, str):
+        raise _invalid()
+    if fixture_kind not in {
+        "external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1",
+    }:
+        raise _invalid()
+    if fixture_kind in {"cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1"}:
+        expected_confirmation = (
+            CPU_DIAGNOSTIC_CONFIRMATION if fixture_kind == "cpu_diagnostic_only_v1"
+            else SSR_CAPACITY_CONFIRMATION
+        )
+        if (
+            confirmation != expected_confirmation
+            or timeout_diagnostics != "false"
+            or tournament_count != "1"
+            or users_per_tournament != "14"
+        ):
+            raise _invalid()
+    elif timeout_diagnostics == "true":
         if confirmation != TIMEOUT_DIAGNOSTICS_CONFIRMATION:
             raise _invalid()
     elif confirmation != EXTERNAL_CONFIRMATION:
@@ -443,6 +470,8 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "users_per_tournament": users_per_tournament,
         "timeout_diagnostics": timeout_diagnostics,
     }
+    if "fixture_kind" in payload:
+        result["fixture_kind"] = fixture_kind
     if source_binding is not None:
         result["source_binding"] = source_binding
     return result
@@ -476,7 +505,9 @@ def validate_cpu_diagnostic_payload(payload: Mapping[str, Any]) -> dict[str, Any
         raise _invalid()
     if not isinstance(source_sha, str) or SHA_RE.fullmatch(source_sha) is None:
         raise _invalid()
-    if payload.get("workload") != CPU_DIAGNOSTIC_WORKLOAD:
+    if payload.get("workload") not in {
+        CPU_DIAGNOSTIC_WORKLOAD, SSR_CAPACITY_DIAGNOSTIC_WORKLOAD,
+    }:
         raise _invalid()
     times = [payload.get(name) for name in (
         "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms"
@@ -491,6 +522,24 @@ def validate_cpu_diagnostic_payload(payload: Mapping[str, Any]) -> dict[str, Any
         and on_end - on_start == 20_000
         and on_end - off_start == 45_000
     ):
+        raise _invalid()
+    return dict(payload)
+
+
+def validate_ssr_capacity_memory_watch_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the one fixed, read-only 45-second web-cgroup observer."""
+
+    payload = _require_mapping(payload)
+    _require_exact_keys(payload, {"schema", "operation", "run_id", "source_sha", "workload"})
+    if (type(payload.get("schema")) is not int or payload["schema"] != 1
+            or payload.get("operation") != "memory-watch"
+            or payload.get("workload") != SSR_CAPACITY_DIAGNOSTIC_WORKLOAD):
+        raise _invalid()
+    run_id = payload.get("run_id")
+    source_sha = payload.get("source_sha")
+    if not isinstance(run_id, str) or CPU_DIAGNOSTIC_RUN_RE.fullmatch(run_id) is None:
+        raise _invalid()
+    if not isinstance(source_sha, str) or SHA_RE.fullmatch(source_sha) is None:
         raise _invalid()
     return dict(payload)
 
@@ -885,6 +934,23 @@ def load_stdin_payload(*, mode: str) -> dict[str, Any]:
         if raw != canonical:
             raise _invalid()
         return validate_cpu_diagnostic_payload(payload)
+    if mode == "cpu-memory-watch":
+        try:
+            raw = sys.stdin.buffer.read(MAX_CPU_DIAGNOSTIC_INPUT_BYTES + 1)
+        except (AttributeError, OSError) as exc:
+            raise _invalid() from exc
+        if len(raw) > MAX_CPU_DIAGNOSTIC_INPUT_BYTES:
+            raise _invalid()
+        payload = _load_json_bytes(raw)
+        try:
+            canonical = json.dumps(
+                payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+            ).encode("ascii") + b"\n"
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise _invalid() from exc
+        if raw != canonical:
+            raise _invalid()
+        return validate_ssr_capacity_memory_watch_payload(payload)
     try:
         raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
     except OSError as exc:

@@ -604,10 +604,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 170,
     "module_digest": "514ecaf735c3c338cc9d1759bdeadea72fbafdc819d17a6fe2d031dce6f684f6",
-    "test_count": 2003,
-    "test_id_digest": "8733b068f8a5a645271f06d7214d5ce61133b50a8d0f4a97b91b4160eda6c6ca",
-    "backend_test_count": 1929,
-    "backend_test_id_digest": "f6d10e98c2e907111c2ce0b27afac70745fcd4c5924b427173b28fa2c164bb0d",
+    "test_count": 2043,
+    "test_id_digest": "3c4e0bd5c59402df5f25d9d1a1b4fe6bc440d70d9b2f631402a075d8f619c82c",
+    "backend_test_count": 1969,
+    "backend_test_id_digest": "79dd4b2f0e67415a8e31e451b4ca92b47f8de805ad49b01df288fd06ba79906a",
     "verification_test_count": 74,
     "verification_test_id_digest": "757f12e70c708e7b69affcdd79cfdb963a06bac46e4c2b022b3b6db7c101c783",
     "verification_classifier_test_count": 38,
@@ -636,8 +636,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 52,
         "module_digest": "88caec1d7501a955a7d663309dcffb8ed6b0c178445690524f3597b9a892f2c4",
-        "test_count": 517,
-        "test_id_digest": "168ebde07e2bd4fdb4f06d0feadab8ba1ee7846ea7e44e921c5f572fa68b7077",
+        "test_count": 531,
+        "test_id_digest": "321c2bc73d76044c50c7289fb50967525fb537746b70610ae2b44b10e0439b34",
     },
     "backend-integration": {
         "module_count": 41,
@@ -648,14 +648,14 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 26,
         "module_digest": "210efce670a082b8360377da86457b71db79310b02abffc0d3849445b073748a",
-        "test_count": 635,
-        "test_id_digest": "d9bba537d10011067952606fb2937ffb7b80c249f30290eb7cbfa635f4d998b7",
+        "test_count": 638,
+        "test_id_digest": "26a8e97d608af5ee61a53fb2cf947821b8a04ed570500430fb6638d671cb034a",
     },
     "performance-contract": {
         "module_count": 11,
         "module_digest": "ac879f1b292f00df28f399af5e34ed8995b39878e1961386b8eb055bb1d025e0",
-        "test_count": 213,
-        "test_id_digest": "80f082c59c86d69849f08e019a49d16bb0472132b1db539e5a147aec4ef9786e",
+        "test_count": 236,
+        "test_id_digest": "349c23d4961c5d70e94ec8c46ceb0726d631f1ed15cec78ad10c48f050dc5b6c",
     },
     VERIFICATION_CONTOUR: {
         "module_count": 3,

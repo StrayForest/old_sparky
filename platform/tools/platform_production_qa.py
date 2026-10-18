@@ -132,6 +132,15 @@ READY_VOTE_PERF_KEYS = (
     "ready_vote_commit_ms",
     "ready_vote_response_ms",
 )
+READY_VOTE_COUNT_KEYS = (
+    "ready_vote_checkout_count",
+    "ready_vote_admission_inflight",
+    "ready_vote_admission_limit",
+    "ready_vote_admitted_total",
+    "ready_vote_shed_total",
+    "ready_vote_controller_limit_changes",
+    "ready_vote_cpu_monitor_samples",
+)
 PROCESS_CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 # Progress checkpoints are written while a retained fixture is being built.
 # Do not serialize the complete 10k-user identity inventory on every batch;
@@ -1958,6 +1967,46 @@ def summarize_request_perf_logs(
         values = [float(row[key]) for row in row_values if isinstance(row.get(key), (int, float))]
         return metric_stats(values)
 
+    def ready_vote_unit_stats(
+        key: str, row_values: list[dict[str, Any]], *, unit: str
+    ) -> dict[str, Any]:
+        values = [
+            float(row[key])
+            for row in row_values
+            if isinstance(row.get(key), (int, float))
+            and not isinstance(row.get(key), bool)
+        ]
+        suffix = "percent" if unit == "percent" else "count"
+        if not values:
+            return {
+                "sample_count": 0,
+                f"avg_{suffix}": None,
+                f"p50_{suffix}": None,
+                f"p95_{suffix}": None,
+                f"p99_{suffix}": None,
+                f"max_{suffix}": None,
+            }
+        return {
+            "sample_count": len(values),
+            f"avg_{suffix}": round(sum(values) / len(values), 3),
+            f"p50_{suffix}": round(percentile(values, 50) or 0, 3),
+            f"p95_{suffix}": round(percentile(values, 95) or 0, 3),
+            f"p99_{suffix}": round(percentile(values, 99) or 0, 3),
+            f"max_{suffix}": round(max(values), 3),
+        }
+
+    def ready_vote_unit_summary(row_values: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "ready_vote_cpu_pressure_percent": ready_vote_unit_stats(
+                "ready_vote_cpu_pressure", row_values, unit="percent"
+            ),
+            "ready_vote_count_metrics": {
+                key: ready_vote_unit_stats(key, row_values, unit="count")
+                for key in READY_VOTE_COUNT_KEYS
+            },
+            "legacy_ready_vote_fields_deprecated": True,
+        }
+
     def admission_shed_counts(row_values: list[dict[str, Any]]) -> dict[str, int]:
         observed = [
             row["authenticated_read_admission_shed"]
@@ -2102,6 +2151,7 @@ def summarize_request_perf_logs(
             for key in READY_VOTE_PERF_KEYS
             if any(isinstance(row.get(key), (int, float)) for row in row_values)
         }
+        ready_vote_units = ready_vote_unit_summary(row_values)
         workspace_stages = {
             key: row_metric_stats(key, row_values)
             for key in WORKSPACE_PERF_KEYS
@@ -2150,6 +2200,7 @@ def summarize_request_perf_logs(
             ),
             "authenticated_read_admission_shed": admission_shed_counts(row_values),
             "ready_vote": ready_vote_spans,
+            **ready_vote_units,
             "ready_vote_controller_state_counts": controller_state_counts(row_values),
             "redis_read_models": read_model_summary(row_values),
             "workspace": workspace_stages,
@@ -2189,6 +2240,7 @@ def summarize_request_perf_logs(
             for key in READY_VOTE_PERF_KEYS
             if any(isinstance(row.get(key), (int, float)) for row in rows)
         },
+        **ready_vote_unit_summary(rows),
         "ready_vote_controller_state_counts": controller_state_counts(rows),
         "redis_read_models": read_model_summary(rows),
         "workspace": {

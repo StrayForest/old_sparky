@@ -33,6 +33,7 @@ from tools.platform_external_load import (
     percentile,
     run_load,
     run_phase,
+    run_authenticated_workspace_capacity_phase,
     run_rate_phase,
     spread_offsets,
     summarize_logical_results,
@@ -153,6 +154,34 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def test_capacity_closed_loop_guard_stops_refill_and_drains_inflight(self) -> None:
+        actors = [VirtualUser(f"actor-{index}", "fixture", "s" * 32, "c" * 32) for index in range(2)]
+        both_started = threading.Barrier(2)
+        guard_tripped = threading.Event()
+
+        def request(_origin: str, _user: VirtualUser, phase: str, _timeout: float) -> RequestResult:
+            both_started.wait(timeout=1)
+            guard_tripped.set()
+            return RequestResult(phase, "GET", "/workspace", 200, 1.0, True, 0)
+
+        def guard() -> str | None:
+            return "memory_floor" if guard_tripped.is_set() else None
+
+        start_at = time.time_ns() // 1_000_000 + 25
+        result = run_authenticated_workspace_capacity_phase(
+            "https://example.invalid", actors, phase="ssr-capacity",
+            duration_seconds=20, start_at_epoch_ms=start_at, end_at_epoch_ms=start_at + 20_000,
+            concurrency=2, timeout=1,
+            request_builder=request, stop_requested=guard,
+        )
+        self.assertEqual(result["submitted"], 2)
+        self.assertEqual(result["completed"], 2)
+        self.assertTrue(result["aborted"])
+        self.assertEqual(result["abort_reason"], "memory_floor")
+        self.assertEqual(result["window_start_at_ms"], start_at)
+        self.assertEqual(result["window_end_at_ms"], start_at + 20_000)
+        self.assertEqual([item.status for item in result["results"]], [200, 200])
+
     @staticmethod
     def _cgroup_diagnostic_snapshot(
         *,
@@ -185,6 +214,8 @@ class ExternalLoadTests(unittest.TestCase):
                     "throttled_usec": 2,
                 }
                 return "".join(f"{key} {value}\n" for key, value in values.items())
+            if path.name == "cpuset.cpus.effective":
+                return "0-3\n"
             raise AssertionError("unexpected cgroup diagnostic file")
 
         return external_load._read_cgroup_diagnostic_snapshot(
@@ -304,6 +335,78 @@ class ExternalLoadTests(unittest.TestCase):
                 file_reader=lambda _path: "max 100000\n",
             )
         self.assertEqual(ambiguous.exception.reason, "cgroup2_mount_ambiguous")
+
+    def test_global_cgroup_root_without_cpu_max_is_unlimited_but_leaf_missing_is_invalid(self) -> None:
+        mountinfo = "36 25 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+        stat = "usage_usec 10\nuser_usec 5\nsystem_usec 5\nnr_periods 1\nnr_throttled 0\nthrottled_usec 0\n"
+
+        def root_missing_reader(path: Path) -> str:
+            if path == Path("/sys/fs/cgroup/cpu.max"):
+                raise FileNotFoundError(path)
+            if path.name == "cpu.max":
+                return "max 100000\n"
+            if path.name == "cpu.stat":
+                return stat
+            if path.name == "cpuset.cpus.effective":
+                return "0-3\n"
+            raise FileNotFoundError(path)
+
+        snapshot = external_load._read_cgroup_diagnostic_snapshot(
+            cgroup_text="0::/job\n", mountinfo_text=mountinfo,
+            namespace_identity=(1, 2), file_reader=root_missing_reader,
+        )
+        self.assertEqual(snapshot["reasons"], [])
+        self.assertEqual(snapshot["ancestors"][-1]["cpu_max"], (None, 100_000))
+
+        def leaf_missing_reader(path: Path) -> str:
+            if path == Path("/sys/fs/cgroup/job/cpu.max"):
+                raise FileNotFoundError(path)
+            if path.name == "cpu.max":
+                return "max 100000\n"
+            if path.name == "cpu.stat":
+                return stat
+            if path.name == "cpuset.cpus.effective":
+                return "0-3\n"
+            raise FileNotFoundError(path)
+
+        incomplete = external_load._read_cgroup_diagnostic_snapshot(
+            cgroup_text="0::/job\n", mountinfo_text=mountinfo,
+            namespace_identity=(1, 2), file_reader=leaf_missing_reader,
+        )
+        self.assertIn("cpu_max_unavailable", incomplete["reasons"])
+
+        root_usage_only = "usage_usec 100\nuser_usec 50\nsystem_usec 50\n"
+        def root_usage_reader(path: Path) -> str:
+            if path == Path("/sys/fs/cgroup/cpu.stat"):
+                return root_usage_only
+            if path.name == "cpu.max":
+                if path == Path("/sys/fs/cgroup/cpu.max"):
+                    raise FileNotFoundError(path)
+                return "200000 100000\n"
+            if path.name == "cpu.stat":
+                return stat
+            if path.name == "cpuset.cpus.effective":
+                return "0-3\n"
+            raise FileNotFoundError(path)
+
+        root_usage_snapshot = external_load._read_cgroup_diagnostic_snapshot(
+            cgroup_text="0::/job\n", mountinfo_text=mountinfo,
+            namespace_identity=(1, 2), file_reader=root_usage_reader,
+        )
+        self.assertEqual(root_usage_snapshot["reasons"], [])
+        self.assertEqual(root_usage_snapshot["ancestors"][-1]["cpu_stat_optional_status"], "not_applicable")
+        self.assertEqual(set(root_usage_snapshot["ancestors"][-1]["cpu_stat"]), {"usage_usec", "user_usec", "system_usec"})
+
+        def missing_leaf_throttle_reader(path: Path) -> str:
+            if path == Path("/sys/fs/cgroup/job/cpu.stat"):
+                return root_usage_only
+            return root_usage_reader(path)
+
+        missing_leaf_throttle = external_load._read_cgroup_diagnostic_snapshot(
+            cgroup_text="0::/job\n", mountinfo_text=mountinfo,
+            namespace_identity=(1, 2), file_reader=missing_leaf_throttle_reader,
+        )
+        self.assertIn("cpu_stat_partial", missing_leaf_throttle["reasons"])
 
         duplicate_stat = "".join(
             f"{key} {value}\n"
@@ -535,6 +638,351 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(usage["status"], "complete")
         self.assertEqual(usage["sample_count"], 1)
         self.assertEqual(usage["samples"][0]["timestamp"], "2026-10-11T10:00:02Z")
+
+    def test_effective_cpu_set_parser_is_bounded_and_closed(self) -> None:
+        self.assertEqual(external_load._parse_effective_cpu_set("0-3,6,8-9\n"), 7)
+        for invalid in ("", "0-", "3-1", "0-1,1-2", "0,,2", "0-5000", "x"):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(external_load._parse_effective_cpu_set(invalid))
+        sampler = external_load.RunnerCgroupSampler(runner_environment="self-hosted")
+        sampler.start(2, 1)
+        result = sampler.stop()
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "trusted_runner_context_unavailable")
+
+    def test_runner_cgroup_sampler_requires_and_aggregates_stable_host_binding(self) -> None:
+        sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        sampler.SAMPLE_INTERVAL_SECONDS = 0.005
+        membership = "0::/runner/load\n"
+        mount_identity = (31, 17, "0:29", "/", "/sys/fs/cgroup", "rw")
+        namespace_ids = {
+            "/proc/self/ns/pid": (1, 1), "/proc/1/ns/pid": (1, 1),
+            "/proc/self/ns/mnt": (1, 2), "/proc/1/ns/mnt": (1, 2),
+            "/proc/self/ns/cgroup": (1, 3), "/proc/1/ns/cgroup": (1, 3),
+            "/proc/4321/ns/pid": (1, 5), "/proc/4321/ns/mnt": (1, 4),
+            "/proc/4321/ns/cgroup": (1, 3),
+        }
+        reads = [0]
+
+        def snapshot(**_kwargs: object) -> dict[str, object]:
+            reads[0] += 1
+            value = reads[0] * 10
+            return {
+                "membership": "/runner/load", "mount_identity": mount_identity,
+                "namespace_identity": (1, 3), "mount_root_is_global": True,
+                "reasons": [],
+                "ancestors": [
+                    {
+                        "path": Path("/sys/fs/cgroup/runner/load"),
+                        "cpu_max": (200_000, 100_000), "cpuset_count": 4,
+                        "cpu_stat_optional_status": "available",
+                        "cpu_stat": {
+                            "usage_usec": value, "user_usec": value // 2,
+                            "system_usec": value // 2, "nr_periods": value // 1000,
+                            "nr_throttled": 0, "throttled_usec": 0,
+                        },
+                    },
+                    {
+                        "path": Path("/sys/fs/cgroup"),
+                        "cpu_max": (None, 100_000), "cpuset_count": 4,
+                        "cpu_stat_optional_status": "not_applicable",
+                        "cpu_stat": {
+                            "usage_usec": value, "user_usec": value // 2,
+                            "system_usec": value // 2,
+                        },
+                    },
+                ],
+            }
+
+        mapping = {
+            "root": Path("/"), "mountpoint": Path("/sys/fs/cgroup"),
+            "mount_identity": mount_identity,
+        }
+        with (
+            patch.object(sampler, "_namespace_identity", side_effect=lambda path: namespace_ids[path]),
+            patch.object(sampler, "_target_is_stable", return_value=True),
+            patch("tools.platform_external_load._read_bounded_ascii", return_value=membership),
+            patch("tools.platform_external_load._bounded_proc_text", return_value="mountinfo"),
+            patch("tools.platform_external_load._cgroup2_membership_mapping", return_value=mapping),
+            patch("tools.platform_external_load._read_cgroup_diagnostic_snapshot", side_effect=snapshot),
+            patch("tools.platform_load_runtime._read_process_starttime", return_value=77),
+            patch.object(Path, "exists", return_value=True),
+        ):
+            sampler.start(4321, 77)
+            time.sleep(0.13)
+            result = sampler.stop()
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["reason"], "none")
+        self.assertGreaterEqual(result["sample_count"], 3)
+        self.assertEqual(result["effective_cpu_capacity_cores"], 2.0)
+        self.assertGreater(result["window_seconds"], 0)
+        self.assertEqual(result["max_visible_throttled_periods_delta"], 0)
+        self.assertEqual(result["identity"]["global_cgroup2_mount"], True)
+
+        started_at = "2026-10-18T10:00:00.000Z"
+        finished_at = "2026-10-18T10:00:00.110Z"
+        timing = {
+            "expected_count": 10, "submitted_count": 10, "started_count": 10,
+            "completed_count": 10, "scheduled_count": 10,
+            "response_completion_count": 10, "user_observed_count": 10,
+            "dropped_work": 0, "partial": False, "late_start_count": 10,
+            "executor_queue_wait": {
+                "count": 10, "avg_ms": 0.5, "p50_ms": 0.5,
+                "p95_ms": 0.5, "p99_ms": 0.8, "max_ms": 0.8,
+            },
+        }
+        usage = {
+            "schema": 1, "status": "complete", "scope": "load_worker_process",
+            "sample_interval_ms": 1000, "cpu_capacity_status": "unknown",
+            "cpu_capacity_reason": "trusted_host_root_unproven", "sample_count": 1,
+            "samples": [{
+                "interval_started_at": "2026-10-18T10:00:00.001Z",
+                "timestamp": "2026-10-18T10:00:00.101Z",
+                "interval_elapsed_ms": 100.0, "process_cpu_percent": 20.0,
+            }],
+            "cgroup_diagnostics": {
+                "schema": 1, "status": "complete", "visible_evidence_status": "complete",
+                "quota_completeness": "unknown", "visible_ancestor_count": 1,
+                "namespace_identity_stable": True, "membership_stable": True,
+                "mount_identity_stable": True, "visible_mount_root_is_global": False,
+                "visible_ancestors": [{
+                    "cpu_max_kind": "max", "cpu_max_period_us": 100000,
+                    "cpu_stat_completeness": "complete",
+                    "cpu_stat_delta": {
+                        "usage_usec": 10, "user_usec": 5, "system_usec": 5,
+                        "nr_periods": 1, "nr_throttled": 0, "throttled_usec": 0,
+                    },
+                }], "reasons": ["trusted_host_root_unproven"],
+            },
+        }
+        report = {
+            "schema": 1, "measurement_schema": 2, "mode": "read-mix",
+            "arrival_model": "closed_loop_concurrency_ramp", "scenario_kind": "stress",
+            "concurrency_stages": [8], "wall_seconds": 0.105,
+            "started_at": started_at, "finished_at": finished_at,
+            "logical": {"timing": timing}, "client_resource_usage": usage,
+            "runner_cgroup_usage": result,
+        }
+        report["capacity_attribution"] = external_load._capacity_attribution(
+            report, usage, result
+        )
+        sanitized = project_public_artifact("external_load", report)
+        self.assertEqual(sanitized["runner_cgroup_usage"]["status"], "complete")
+        self.assertEqual(sanitized["capacity_attribution"]["status"], "eligible", {
+            "attribution": sanitized["capacity_attribution"],
+            "runner": sanitized.get("runner_cgroup_usage"),
+            "client": sanitized.get("client_resource_usage"),
+        })
+        self.assertIsNone(sanitized["capacity_attribution"]["server_capacity_claim"])
+        self.assertEqual(sanitized["capacity_attribution"]["capacity_scope"], "generator_headroom_only")
+        changed_identity = sampler.stop(namespace_pid=4322, namespace_starttime=77)
+        self.assertEqual(changed_identity["status"], "unknown")
+        self.assertEqual(changed_identity["reason"], "workload_identity_changed")
+
+    def test_capacity_attribution_stays_unknown_without_trusted_effective_quota(self) -> None:
+        report = {
+            "mode": "read-mix", "scenario_kind": "stress",
+            "arrival_model": "closed_loop_concurrency_ramp", "concurrency_stages": [16, 32],
+            "acceptance": {"decision": "STRESS BEHAVIOR FAIL"},
+            "logical": {"timing": {
+                "expected_count": 100, "submitted_count": 100, "started_count": 100,
+                "completed_count": 100, "scheduled_count": 100,
+                "response_completion_count": 100, "user_observed_count": 100,
+                "dropped_work": 0, "partial": False, "late_start_count": 0,
+                "executor_queue_wait": {"count": 100, "p95_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0},
+                "schedule_delay": {"p95_ms": 0.0, "p99_ms": 0.0},
+            }},
+        }
+        sampler = external_load._ProcessCpuSampler()
+        sampler.start()
+        time.sleep(external_load.CLIENT_CPU_SAMPLE_INTERVAL_SECONDS + 0.05)
+        usage = sampler.stop()
+        result = external_load._capacity_attribution(report, usage)
+        self.assertEqual(result["status"], "unknown")
+        self.assertIsNone(result["server_capacity_claim"])
+        self.assertEqual(result["reason"], "trusted_runner_evidence_missing")
+        self.assertEqual(report["acceptance"]["decision"], "STRESS BEHAVIOR FAIL")
+
+        # Open-loop scheduling and slow SUT status do not convert missing
+        # generator-quota proof into a server-capacity claim.
+        report["mode"] = "ready-vote"
+        report["scenario_kind"] = "capacity"
+        report["arrival_model"] = "open_loop_scheduled_rate"
+        open_loop = external_load._capacity_attribution(report, usage)
+        self.assertEqual(open_loop["status"], "unknown")
+        self.assertEqual(open_loop["reason"], "trusted_runner_evidence_missing")
+        self.assertIsNone(open_loop["server_capacity_claim"])
+
+    def test_capacity_attribution_excludes_generator_limits_and_keeps_unknown_quota_unknown(self) -> None:
+        report = {
+            "mode": "read-mix", "scenario_kind": "stress",
+            "arrival_model": "closed_loop_concurrency_ramp", "concurrency_stages": [16],
+            "logical": {"timing": {
+                "expected_count": 10, "submitted_count": 10, "started_count": 10,
+                "completed_count": 10, "scheduled_count": 10,
+                "response_completion_count": 10, "user_observed_count": 10,
+                "dropped_work": 0, "partial": False, "late_start_count": 0,
+                "executor_queue_wait": {"count": 10, "p95_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0},
+            }},
+        }
+        usage = {
+            "status": "complete", "cpu_capacity_status": "known", "cpu_capacity_reason": "known",
+            "effective_cpu_capacity_cores": 2.0, "samples": [{"process_cpu_percent": 50.0}],
+            "cgroup_diagnostics": {
+                "status": "complete", "quota_completeness": "complete",
+                "visible_ancestors": [{"cpu_stat_completeness": "complete", "cpu_stat_delta": {"nr_throttled": 0}}],
+            },
+        }
+        report["logical"]["timing"]["executor_queue_wait"]["p95_ms"] = 2.1
+        report["logical"]["timing"]["executor_queue_wait"]["p99_ms"] = 2.1
+        report["logical"]["timing"]["executor_queue_wait"]["max_ms"] = 2.1
+        queue_limited = external_load._capacity_attribution(report, usage)
+        self.assertEqual((queue_limited["status"], queue_limited["reason"]), ("ineligible", "client_queue_lag"))
+        report["logical"]["timing"]["executor_queue_wait"]["p95_ms"] = 0.0
+        report["logical"]["timing"]["executor_queue_wait"]["p99_ms"] = 0.0
+        report["logical"]["timing"]["executor_queue_wait"]["max_ms"] = 0.0
+        report["logical"]["timing"]["completed_count"] = 9
+        underdelivered = external_load._capacity_attribution(report, usage)
+        self.assertEqual((underdelivered["status"], underdelivered["reason"]), ("ineligible", "work_under_delivered"))
+        report["logical"]["timing"]["completed_count"] = 10
+        usage["cgroup_diagnostics"]["visible_ancestors"][0]["cpu_stat_delta"]["nr_throttled"] = 1
+        throttled = external_load._capacity_attribution(report, usage)
+        self.assertEqual((throttled["status"], throttled["reason"]), ("ineligible", "generator_quota_throttled"))
+        usage["cgroup_diagnostics"]["visible_ancestors"][0]["cpu_stat_delta"]["nr_throttled"] = 0
+        usage["samples"][0]["process_cpu_percent"] = 200.0
+        saturated = external_load._capacity_attribution(report, usage)
+        self.assertEqual((saturated["status"], saturated["reason"]), ("unknown", "trusted_runner_evidence_missing"))
+        usage["samples"][0]["process_cpu_percent"] = 50.0
+        usage["cgroup_diagnostics"]["visible_ancestors"] = []
+        incomplete_hierarchy = external_load._capacity_attribution(report, usage)
+        self.assertEqual((incomplete_hierarchy["status"], incomplete_hierarchy["reason"]), ("unknown", "trusted_runner_evidence_missing"))
+        usage["cgroup_diagnostics"]["visible_ancestors"] = [{
+            "cpu_stat_completeness": "incomplete", "cpu_stat_delta": {"nr_throttled": 0},
+        }]
+        malformed_hierarchy = external_load._capacity_attribution(report, usage)
+        self.assertEqual((malformed_hierarchy["status"], malformed_hierarchy["reason"]), ("unknown", "trusted_runner_evidence_missing"))
+        usage["cgroup_diagnostics"]["visible_ancestors"] = [{
+            "cpu_stat_completeness": "complete", "cpu_stat_delta": {"nr_throttled": 0},
+        }]
+        usage["cpu_capacity_status"] = "unknown"
+        unknown = external_load._capacity_attribution(report, usage)
+        self.assertEqual((unknown["status"], unknown["reason"]), ("unknown", "trusted_runner_evidence_missing"))
+        self.assertIsNone(unknown["server_capacity_claim"])
+
+    def test_real_closed_loop_producer_positive_jitter_does_not_block_headroom(self) -> None:
+        users = [VirtualUser(f"fast-{index}", "synthetic", "s" * 32, "c" * 32) for index in range(8)]
+
+        def immediate(_origin: str, _user: VirtualUser, phase: str, _timeout: float) -> RequestResult:
+            started = time.monotonic()
+            return RequestResult(
+                phase, "GET", "/synthetic", 200, 0.1, True, 0,
+                started_at_monotonic=started, finished_at_monotonic=started + 0.0001,
+            )
+
+        results = run_phase(
+            "https://example.invalid", users, phase="capacity-jitter",
+            spread_seconds=0, concurrency=8, timeout=1, request_builder=immediate,
+        )
+        accumulator = external_load._TimingAccumulator()
+        for result in results:
+            accumulator.add(result)
+        timing = accumulator.summary(unit="actions", expected_count=8, submitted_count=8)
+        self.assertEqual(timing["late_start_count"], 8)
+        self.assertGreater(timing["executor_queue_wait"]["p95_ms"], 0)
+        self.assertLessEqual(
+            timing["executor_queue_wait"]["p95_ms"],
+            external_load.CAPACITY_ATTRIBUTION_LAG_FLOOR_MS,
+        )
+        self.assertLessEqual(
+            timing["executor_queue_wait"]["p99_ms"],
+            external_load.CAPACITY_ATTRIBUTION_LAG_FLOOR_MS,
+        )
+        report = {
+            "mode": "read-mix", "scenario_kind": "stress",
+            "arrival_model": "closed_loop_concurrency_ramp", "concurrency_stages": [8],
+            "wall_seconds": 1.0, "logical": {"timing": timing},
+        }
+        usage = {
+            "status": "complete", "cpu_capacity_status": "unknown",
+            "samples": [{"process_cpu_percent": 20.0}],
+        }
+        identity = {
+            "outer_pid_namespace_matches_pid1": True,
+            "outer_mount_namespace_matches_pid1": True,
+            "outer_cgroup_namespace_matches_pid1": True,
+            "target_cgroup_namespace_matches_outer": True,
+            "target_mount_namespace_is_isolated": True,
+            "target_pid_namespace_is_isolated": True,
+            "global_cgroup2_mount": True,
+            "workload_membership_matches_outer": True,
+        }
+        runner = {
+            "status": "complete", "reason": "none", "runner_environment": "github-hosted",
+            "identity": identity, "effective_cpu_capacity_cores": 2.0,
+            "max_cgroup_cpu_usage_cores": 0.2, "max_visible_throttled_periods_delta": 0,
+            "window_seconds": 2.0,
+        }
+        attribution = external_load._capacity_attribution(report, usage, runner)
+        self.assertEqual(attribution["status"], "eligible")
+        self.assertEqual(attribution["reason"], "headroom_observed")
+        self.assertIsNone(attribution["schedule_delay_p95_ms"])
+
+    def test_real_open_loop_pacing_uses_material_schedule_lag_floor(self) -> None:
+        users = [VirtualUser(f"paced-{index}", "synthetic", "s" * 32, "c" * 32) for index in range(40)]
+
+        def immediate(_origin: str, _user: VirtualUser, phase: str, _timeout: float) -> RequestResult:
+            started = time.monotonic()
+            return RequestResult(
+                phase, "GET", "/synthetic", 200, 0.1, True, 0,
+                started_at_monotonic=started, finished_at_monotonic=started + 0.0001,
+            )
+
+        results, _window = run_rate_phase(
+            "https://example.invalid", users, phase="capacity-paced",
+            duration_seconds=1.0, concurrency=8, timeout=1, request_builder=immediate,
+        )
+        accumulator = external_load._TimingAccumulator()
+        for result in results:
+            accumulator.add(result)
+        timing = accumulator.summary(unit="actions", expected_count=40, submitted_count=40)
+        self.assertEqual(timing["late_start_count"], 40)
+        self.assertGreater(timing["schedule_delay"]["p95_ms"], 0)
+        self.assertLessEqual(timing["schedule_delay"]["p95_ms"], external_load.CAPACITY_ATTRIBUTION_LAG_FLOOR_MS)
+        report = {
+            "mode": "ready-vote", "scenario_kind": "capacity",
+            "arrival_model": "open_loop_scheduled_rate", "wall_seconds": 1.0,
+            "logical": {"timing": timing},
+        }
+        usage = {"status": "complete", "cpu_capacity_status": "unknown", "samples": [{"process_cpu_percent": 20.0}]}
+        identity = {
+            "outer_pid_namespace_matches_pid1": True,
+            "outer_mount_namespace_matches_pid1": True,
+            "outer_cgroup_namespace_matches_pid1": True,
+            "target_cgroup_namespace_matches_outer": True,
+            "target_mount_namespace_is_isolated": True,
+            "target_pid_namespace_is_isolated": True,
+            "global_cgroup2_mount": True,
+            "workload_membership_matches_outer": True,
+        }
+        runner = {
+            "status": "complete", "reason": "none", "runner_environment": "github-hosted",
+            "identity": identity, "effective_cpu_capacity_cores": 2.0,
+            "max_cgroup_cpu_usage_cores": 0.2, "max_visible_throttled_periods_delta": 0,
+            "window_seconds": 2.0,
+        }
+        attribution = external_load._capacity_attribution(report, usage, runner)
+        self.assertEqual(attribution["status"], "eligible")
+        self.assertEqual(attribution["schedule_delay_p95_ms"], timing["schedule_delay"]["p95_ms"])
+
+        report["logical"]["timing"]["schedule_delay"]["p95_ms"] = (
+            external_load.CAPACITY_ATTRIBUTION_LAG_FLOOR_MS + 0.001
+        )
+        report["logical"]["timing"]["schedule_delay"]["p99_ms"] = (
+            external_load.CAPACITY_ATTRIBUTION_LAG_FLOOR_MS + 0.001
+        )
+        material_delay = external_load._capacity_attribution(report, usage, runner)
+        self.assertEqual((material_delay["status"], material_delay["reason"]), ("ineligible", "client_queue_lag"))
 
     def test_progress_callback_reports_only_completed_status_aggregates(self) -> None:
         users = [

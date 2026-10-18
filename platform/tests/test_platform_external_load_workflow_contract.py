@@ -166,7 +166,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         pair = self.jobs["cpu-diagnostic-pair"]
         self.assertIn("needs.fixture-setup.result == 'success'", pair)
         self.assertIn("needs.load-client.result", pair)
-        self.assertIn("needs.namespace-containment-barrier.outputs.namespace_closed_status == '0'", pair)
+        self.assertIn("Require closed matrix worker before the optional CPU pair", pair)
+        self.assertNotIn("needs.namespace-containment-barrier", pair)
+        self.assertIn("needs['cpu-diagnostic-pair']", self.jobs["namespace-containment-barrier"])
         pair_env = yaml.safe_load(self.source)["jobs"]["cpu-diagnostic-pair"]["env"]
         self.assertEqual(pair_env["SOURCE_GIT_SHA"], "${{ github.sha }}")
         self.assertEqual(pair_env["TARGET_SHA"], "${{ github.sha }}")
@@ -185,11 +187,184 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         finalize_job = yaml.safe_load(self.source)["jobs"]["fixture-finalize"]
         self.assertIn("cpu-diagnostic-pair", finalize_job["needs"])
         self.assertIn("platform_cpu_diagnostic_pair.py parent", pair)
+        self.assertIn("inputs.cpu_diagnostic_only != true", self.jobs["load-client"])
+        self.assertIn("cpu_diagnostic_only:", self.source)
+        self.assertIn("Evaluate typed CPU-only diagnostic without matrix credit", self.jobs["evaluate-load"])
+        self.assertIn("Enforce CPU-only diagnostic and exact cleanup gates", self.jobs["evaluate-load"])
+        self.assertIn('cleanup.get("users_deleted") != 14', self.jobs["evaluate-load"])
+        self.assertIn('cleanup.get("tournaments_deleted") != 1', self.jobs["evaluate-load"])
+        self.assertIn("inputs.cpu_diagnostic_only == true", self.jobs["namespace-containment-barrier"])
+        self.assertIn("/external-client/external-load.json", self.jobs["namespace-containment-barrier"])
+        self.assertIn("/cpu-diagnostic-report/cpu-diagnostic.json", self.jobs["namespace-containment-barrier"])
+        self.assertNotIn('candidate_state', self.jobs["cpu-diagnostic-pair"].split("Project the CPU diagnostic report through its closed schema", 1)[1])
         self.assertIn("emergency/manual", self.jobs["namespace-containment-manual-barrier"])
         for name in ("Exact cleanup of external fixture", "Remove finalizer SSH material"):
             self.assertIn(f"- name: {name}", self.jobs["fixture-finalize"])
             step = self.jobs["fixture-finalize"].split(f"- name: {name}", 1)[1]
             self.assertIn("if: ${{ always() }}", step)
+
+    def test_namespace_barrier_accepts_only_closed_typed_reports(self) -> None:
+        """Run the workflow's actual barrier script against representative reports."""
+        script = _step_script(
+            self.jobs["namespace-containment-barrier"],
+            "Enforce mandatory namespace closure before finalizer",
+        )
+
+        matrix_report = {
+            "worker_report_schema": 2,
+            "report_complete": True,
+            "namespace_closed": True,
+            "runtime_supervisor": {
+                "isolation": "pid_namespace",
+                "namespace_closed": True,
+            },
+        }
+        cpu_report = {
+            "fixture_kind": "cpu_diagnostic_only_v1",
+            "namespace_closed": True,
+            "capacity_slo_credit": False,
+            "diagnostic_credit": False,
+        }
+        capacity_report = {
+            "schema": 1,
+            "workload": "authenticated_workspace_read_capacity_v1",
+            "fixture_kind": "ssr_capacity_diagnostic_v1",
+            "report_complete": True,
+            "namespace_closed": True,
+            "matrix_credit": False,
+            "slo_credit": False,
+            "diagnostic_credit": False,
+            "server_capacity_claim": None,
+        }
+
+        def evaluate(
+            payload: dict[str, object], *, cpu_only: bool = False,
+            capacity_only: bool = False,
+        ) -> dict[str, str]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp = Path(temp_dir)
+                report_dir_name = (
+                    "cpu-diagnostic-report" if cpu_only else
+                    "ssr-capacity-report" if capacity_only else "external-client"
+                )
+                report_dir = temp / report_dir_name
+                report_dir.mkdir()
+                report_name = (
+                    "cpu-diagnostic.json" if cpu_only else
+                    "ssr-capacity.json" if capacity_only else "external-load.json"
+                )
+                (report_dir / report_name).write_text(json.dumps(payload), encoding="utf-8")
+                output_file = temp / "github-output"
+                env = {
+                    **os.environ,
+                    "RUNNER_TEMP": str(temp),
+                    "GITHUB_OUTPUT": str(output_file),
+                }
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        "-euo",
+                        "pipefail",
+                        "-c",
+                        script.replace(
+                            "${{ inputs.cpu_diagnostic_only }}",
+                            "true" if cpu_only else "false",
+                        ).replace(
+                            "${{ inputs.ssr_capacity_diagnostic_only }}",
+                            "true" if capacity_only else "false",
+                        ),
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return dict(
+                    line.split("=", 1)
+                    for line in output_file.read_text(encoding="utf-8").splitlines()
+                )
+
+        self.assertEqual(evaluate(matrix_report)["namespace_closed_status"], "0")
+        self.assertEqual(
+            evaluate({**matrix_report, "namespace_closed": False})["namespace_closed_status"],
+            "1",
+        )
+        self.assertEqual(
+            evaluate(
+                {
+                    **matrix_report,
+                    "runtime_supervisor": {"isolation": "process_group", "namespace_closed": True},
+                }
+            )["namespace_closed_status"],
+            "1",
+        )
+        self.assertEqual(evaluate(cpu_report, cpu_only=True)["namespace_closed_status"], "0")
+        self.assertEqual(
+            evaluate({**cpu_report, "capacity_slo_credit": True}, cpu_only=True)[
+                "namespace_closed_status"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            evaluate(capacity_report, capacity_only=True)["namespace_closed_status"],
+            "0",
+        )
+        self.assertEqual(
+            evaluate({**capacity_report, "matrix_credit": True}, capacity_only=True)[
+                "namespace_closed_status"
+            ],
+            "1",
+        )
+
+    def test_capacity_dispatch_runs_only_the_typed_client_and_14_user_fixture(self) -> None:
+        validate = self.jobs["validate-external-inputs"]
+        pair = self.jobs["cpu-diagnostic-pair"]
+        load = self.jobs["load-client"]
+        self.assertIn(
+            "false:authenticated-page-load-v1:RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC:false:false:true",
+            validate,
+        )
+        self.assertIn("inputs.ssr_capacity_diagnostic_only != true", load)
+        self.assertIn("inputs.ssr_capacity_diagnostic_only == true", pair)
+        self.assertIn("Run only the guarded SSR capacity diagnostic", pair)
+        self.assertIn("inputs.ssr_capacity_diagnostic_only != true", pair.split(
+            "Run the fixed authenticated workspace CPU pair", 1
+        )[1])
+        self.assertIn("--concurrency 8", pair)
+        self.assertNotIn("platform_external_load.py", pair)
+        self.assertIn('"tournament_count": "1" if diagnostic_only else tournaments', validate)
+        self.assertIn('"users_per_tournament": "14" if diagnostic_only else users', validate)
+        self.assertIn('"ssr_capacity_diagnostic_v1" if ssr_capacity_diagnostic_only == "true"', validate)
+
+        guard_script = _step_script(
+            validate, "Reject invalid external-load dispatch before checkout"
+        ).replace("${{ inputs.cpu_diagnostic_pair }}", "false").replace(
+            "${{ inputs.ssr_capacity_diagnostic_only }}", "true"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = {
+                **os.environ,
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "GITHUB_REF": "refs/heads/dev",
+                "TARGET_SHA": "a" * 40,
+                "TIMEOUT_DIAGNOSTICS": "false",
+                "PROFILE_ID": "authenticated-page-load-v1",
+                "QA_CONFIRMATION": "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC",
+                "CPU_DIAGNOSTIC_ONLY": "false",
+                "RUNNER_TEMP": temp_dir,
+            }
+            accepted = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", guard_script],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            rejected = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", guard_script],
+                env={**env, "QA_CONFIRMATION": "RUN-PRODUCTION-EXTERNAL-LOAD"},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
 
     def test_every_authoritative_status_is_consumed_by_the_gate(self) -> None:
         gate = self.jobs["evaluate-load"].split("- name: Enforce external load", 1)[1]
@@ -359,6 +534,51 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             step for step in evaluator["steps"]
             if step.get("name") == "Enforce external load and exact cleanup gates"
         )
+        self.assertIn('cleanup.get("control_account_preserved") is not True', sanitize_step["run"])
+
+        import re
+
+        sanitizer_match = re.search(
+            r'/usr/bin/python3 - "\$RUNNER_TEMP/external-evidence/matrix-summary\.json" '
+            r'"\$RUNNER_TEMP/external-evidence/cleanup-summary\.json" <<\'PY\'\n(.*?)\n\s*PY',
+            sanitize_step["run"],
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(sanitizer_match)
+        with tempfile.TemporaryDirectory(prefix="external-load-final-cleanup-guard-") as temporary:
+            root = Path(temporary)
+            matrix_path = root / "matrix.json"
+            cleanup_path = root / "cleanup.json"
+            matrix_path.write_text('{"passed":true}\n', encoding="utf-8")
+            script = sanitizer_match.group(1)  # type: ignore[union-attr]
+            accepted = {
+                "ok": True,
+                "control_account_preserved": True,
+            }
+            cleanup_path.write_text(json.dumps(accepted), encoding="utf-8")
+            self.assertEqual(
+                subprocess.run(
+                    [sys.executable, "-c", script, str(matrix_path), str(cleanup_path)],
+                    capture_output=True,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            for invalid_cleanup in (
+                {"ok": True, "control_account_preserved": False},
+                {"ok": True, "control_account_preserved": None},
+                {"ok": True},
+            ):
+                cleanup_path.write_text(json.dumps(invalid_cleanup), encoding="utf-8")
+                with self.subTest(cleanup=invalid_cleanup):
+                    self.assertNotEqual(
+                        subprocess.run(
+                            [sys.executable, "-c", script, str(matrix_path), str(cleanup_path)],
+                            capture_output=True,
+                            check=False,
+                        ).returncode,
+                        0,
+                    )
 
         with tempfile.TemporaryDirectory(prefix="external-load-cleanup-evidence-") as temporary:
             root = Path(temporary)
@@ -955,6 +1175,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "profile_id": "ready-vote-slo-v2",
             "timeout_diagnostics": False,
             "cpu_diagnostic_pair": False,
+            "cpu_diagnostic_only": False,
+            "ssr_capacity_diagnostic_only": False,
         }
         invalid_payloads = (
             json.dumps({"inputs": {**valid_inputs, "unexpected": "value"}}),
@@ -1349,6 +1571,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 self.assertIn("runs-on: ubuntu-24.04", self.jobs[job_id])
         load_client = self.jobs["load-client"]
         self.assertIn("timeout-minutes: 270", load_client)
+        self.assertIn("PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}", load_client)
+        self.assertNotIn("PLATFORM_RUNNER_ENVIRONMENT: ${{ inputs.", load_client)
+        self.assertNotIn("\n    container:", load_client)
         self.assertIn("Probe mandatory load PID-namespace containment", load_client)
         self.assertIn("probe_pid_namespace_capability", load_client)
         validator = self.jobs["validate-external-inputs"]
@@ -1668,20 +1893,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual(
             upload_step.get("if"),
-            "${{ always() && steps.remove-diagnostic-ssh-material.outcome == 'success' }}",
+            "${{ always() && steps.sanitize-cpu-report.outcome == 'success' }}",
         )
-        # Pair failure still permits publication of its sanitized report once
-        # cleanup succeeds; cleanup failure blocks third-party upload.
+        # The sanitized diagnostic remains useful evidence even when SSH
+        # material cleanup fails. The workflow itself still fails closed.
         self.assertNotIn("steps.cpu-pair.outcome", upload_step["if"])
-        for pair_outcome in ("success", "failure", "cancelled"):
-            for cleanup_outcome, expected_upload in (
-                ("success", True),
-                ("failure", False),
-                ("cancelled", False),
-                ("skipped", False),
-            ):
-                with self.subTest(pair_outcome=pair_outcome, cleanup_outcome=cleanup_outcome):
-                    self.assertEqual(cleanup_outcome == "success", expected_upload)
+        self.assertNotIn("steps.remove-diagnostic-ssh-material.outcome", upload_step["if"])
+        self.assertIn("steps.sanitize-cpu-report.outcome == 'success'", upload_step["if"])
         cpu_configure = _step_script(
             cpu_job, "Configure pinned production SSH for the trusted parent"
         )

@@ -15,6 +15,9 @@ from unittest import mock
 import httpx
 
 from tools.platform_evidence_sanitizer import (
+    _capacity_claim_has_complete_inputs,
+    _project_capacity_attribution,
+    _project_runner_cgroup_usage,
     project_public_artifact,
     safe_error_class,
     sanitized_log_summary,
@@ -55,6 +58,152 @@ def serialized(value: object) -> str:
 
 
 class EvidencePrivacyTests(unittest.TestCase):
+    def test_capacity_attribution_projection_preserves_closed_claim_and_unknowns(self) -> None:
+        eligible = {
+            "schema": 1, "status": "eligible", "reason": "headroom_observed",
+            "load_model": "closed_loop_concurrency_ramp", "server_capacity_claim": None,
+            "capacity_attribution_eligible": True,
+            "server_capacity_claim_status": "unknown",
+            "server_capacity_claim_reason": "resource_correlation_not_provided",
+            "capacity_scope": "generator_headroom_only",
+            "effective_cpu_capacity_cores": 2.0, "max_process_cpu_percent": 125.0,
+            "max_cgroup_cpu_usage_cores": 0.5,
+            "max_visible_throttled_periods_delta": 0, "offered_actions": 100, "started_actions": 100,
+            "client_queue_lag_floor_ms": 2.0, "executor_queue_p95_ms": 0.5,
+            "executor_queue_p99_ms": 0.8, "schedule_delay_p95_ms": None,
+            "schedule_delay_p99_ms": None,
+            "private_path": "/private/report.json",
+        }
+        self.assertEqual(
+            _project_capacity_attribution(eligible),
+            {
+                "schema": 1, "status": "eligible", "reason": "headroom_observed",
+                "server_capacity_claim": None, "capacity_scope": "generator_headroom_only",
+                "capacity_attribution_eligible": True,
+                "server_capacity_claim_status": "unknown",
+                "server_capacity_claim_reason": "resource_correlation_not_provided",
+                "load_model": "closed_loop_concurrency_ramp",
+                "effective_cpu_capacity_cores": 2.0, "max_process_cpu_percent": 125.0,
+                "max_cgroup_cpu_usage_cores": 0.5,
+                "offered_actions": 100, "started_actions": 100,
+                "max_visible_throttled_periods_delta": 0,
+                "client_queue_lag_floor_ms": 2.0, "executor_queue_p95_ms": 0.5,
+                "executor_queue_p99_ms": 0.8,
+            },
+        )
+        unknown = {
+            "schema": 1, "status": "unknown", "reason": "effective_generator_quota_unknown",
+            "load_model": "open_loop_scheduled_rate", "server_capacity_claim": None,
+            "capacity_attribution_eligible": None,
+            "server_capacity_claim_status": "unknown",
+            "server_capacity_claim_reason": "resource_correlation_not_provided",
+            "capacity_scope": "generator_headroom_only",
+        }
+        self.assertEqual(_project_capacity_attribution(unknown)["status"], "unknown")
+        forged = copy.deepcopy(eligible)
+        forged["capacity_scope"] = "server_capacity_proven"
+        self.assertIsNone(_project_capacity_attribution(forged))
+        forged_claim = copy.deepcopy(eligible)
+        forged_claim["server_capacity_claim"] = True
+        self.assertIsNone(_project_capacity_attribution(forged_claim))
+        forged_eligibility = copy.deepcopy(eligible)
+        forged_eligibility["capacity_attribution_eligible"] = False
+        self.assertIsNone(_project_capacity_attribution(forged_eligibility))
+        legacy_eligible = copy.deepcopy(eligible)
+        for key in ("capacity_attribution_eligible", "server_capacity_claim_status", "server_capacity_claim_reason"):
+            legacy_eligible.pop(key)
+        self.assertIsNone(_project_capacity_attribution(legacy_eligible))
+
+        report = {
+            "capacity_attribution": eligible,
+            "arrival_model": "closed_loop_concurrency_ramp",
+            "logical": {"timing": {
+                "expected_count": 10, "submitted_count": 10, "started_count": 10,
+                "completed_count": 10, "scheduled_count": 10,
+                "response_completion_count": 10, "user_observed_count": 10,
+                "dropped_work": 0, "late_start_count": 0, "partial": False,
+                "executor_queue_wait": {"count": 10, "p95_ms": 0.5, "p99_ms": 0.8, "max_ms": 0.8},
+            }},
+            "client_resource_usage": {
+                "schema": 1, "status": "complete", "scope": "load_worker_process",
+                "cpu_capacity_status": "unknown", "cpu_capacity_reason": "trusted_host_root_unproven",
+                "sample_count": 0, "samples": [],
+                "cgroup_diagnostics": {
+                    "schema": 1, "status": "complete", "visible_evidence_status": "complete",
+                    "quota_completeness": "unknown", "visible_ancestor_count": 0,
+                    "visible_ancestors": [], "reasons": ["trusted_host_root_unproven"],
+                },
+            },
+        }
+        projected = project_public_artifact("external_load", report)
+        self.assertEqual(projected["capacity_attribution"]["status"], "unknown")
+        self.assertEqual(projected["capacity_attribution"]["reason"], "effective_generator_quota_unknown")
+        self.assertIsNone(projected["capacity_attribution"]["server_capacity_claim"])
+
+        complete_usage = {
+            "status": "complete", "cpu_capacity_status": "known",
+            "cpu_capacity_reason": "trusted_host_root_unproven",
+            "effective_cpu_capacity_cores": 2.0, "sample_count": 1,
+            "samples": [{"process_cpu_percent": 125.0}],
+            "cgroup_diagnostics": {
+                "status": "complete", "quota_completeness": "unknown",
+                "visible_ancestors": [{
+                    "cpu_stat_completeness": "complete", "cpu_stat_delta": {"nr_throttled": 0},
+                }],
+            },
+        }
+        runner_usage = {
+            "schema": 1, "status": "complete", "reason": "none",
+            "runner_environment": "github-hosted", "sample_count": 3,
+            "window_seconds": 10.0, "effective_cpu_capacity_cores": 2.0,
+            "max_cgroup_cpu_usage_cores": 0.5, "max_visible_throttled_periods_delta": 0,
+            "identity": {
+                "outer_pid_namespace_matches_pid1": True,
+                "outer_mount_namespace_matches_pid1": True,
+                "outer_cgroup_namespace_matches_pid1": True,
+                "target_cgroup_namespace_matches_outer": True,
+                "target_mount_namespace_is_isolated": True,
+                "target_pid_namespace_is_isolated": True,
+                "global_cgroup2_mount": True,
+                "workload_membership_matches_outer": True,
+            },
+        }
+        projected_eligible = _project_capacity_attribution(eligible)
+        self.assertIsNotNone(projected_eligible)
+        projected_runner = _project_runner_cgroup_usage(runner_usage)
+        self.assertEqual(projected_runner["status"], "complete")
+        complete_report = copy.deepcopy(report)
+        for name in (
+            "expected_count", "submitted_count", "started_count", "completed_count",
+            "scheduled_count", "response_completion_count", "user_observed_count",
+        ):
+            complete_report["logical"]["timing"][name] = 100  # type: ignore[index]
+        complete_report["logical"]["timing"]["executor_queue_wait"]["count"] = 100  # type: ignore[index]
+        complete_report["logical"]["timing"]["executor_queue_wait"]["p95_ms"] = 0.5  # type: ignore[index]
+        complete_report["logical"]["timing"]["executor_queue_wait"]["p99_ms"] = 0.8  # type: ignore[index]
+        complete_report["logical"]["timing"]["executor_queue_wait"]["max_ms"] = 0.8  # type: ignore[index]
+        self.assertTrue(_capacity_claim_has_complete_inputs(complete_report, complete_usage, projected_runner, projected_eligible))
+        mismatched_claim = copy.deepcopy(projected_eligible)
+        mismatched_claim["max_process_cpu_percent"] = 126.0
+        self.assertFalse(_capacity_claim_has_complete_inputs(complete_report, complete_usage, projected_runner, mismatched_claim))
+        lagged = copy.deepcopy(complete_report)
+        lagged["logical"]["timing"]["executor_queue_wait"]["p95_ms"] = 2.5  # type: ignore[index]
+        lagged["logical"]["timing"]["executor_queue_wait"]["max_ms"] = 3.0  # type: ignore[index]
+        self.assertFalse(_capacity_claim_has_complete_inputs(lagged, complete_usage, projected_runner, projected_eligible))
+
+        open_loop_forgery = copy.deepcopy(complete_report)
+        open_loop_forgery["arrival_model"] = "open_loop_scheduled_rate"
+        open_loop_forgery["logical"]["timing"]["schedule_delay"] = {"p95_ms": 2.5, "p99_ms": 2.5}  # type: ignore[index]
+        open_loop_claim = copy.deepcopy(eligible)
+        open_loop_claim["load_model"] = "open_loop_scheduled_rate"
+        open_loop_claim["schedule_delay_p95_ms"] = 2.5
+        open_loop_claim["schedule_delay_p99_ms"] = 2.5
+        open_loop_claim["capacity_scope"] = "generator_headroom_only"
+        open_loop_forgery["capacity_attribution"] = open_loop_claim
+        projected_open_loop = project_public_artifact("external_load", open_loop_forgery)
+        self.assertEqual(projected_open_loop["capacity_attribution"]["status"], "unknown")
+        self.assertIsNone(projected_open_loop["capacity_attribution"]["server_capacity_claim"])
+
     def test_external_load_source_identity_is_closed_and_digest_bound(self) -> None:
         binding: dict[str, object] = {
             "schema": 1,
@@ -694,13 +843,66 @@ class EvidencePrivacyTests(unittest.TestCase):
                             "request_ids": ["private-request-id"],
                             "raw_route": "/api/v1/tournaments/private-slug/workspace",
                         },
+                        "ready_vote": {
+                            "requests": 2,
+                            "ready_vote_cpu_pressure_percent": {
+                                "sample_count": 2,
+                                "avg_percent": 70.5,
+                                "p50_percent": 70.5,
+                                "p95_percent": 80.05,
+                                "p99_percent": 80.41,
+                                "max_percent": 80.5,
+                            },
+                            "ready_vote_count_metrics": {
+                                "ready_vote_checkout_count": {
+                                    "sample_count": 2,
+                                    "avg_count": 2.0,
+                                    "p50_count": 2.0,
+                                    "p95_count": 2.9,
+                                    "p99_count": 2.98,
+                                    "max_count": 3.0,
+                                },
+                            },
+                            "legacy_ready_vote_fields_deprecated": True,
+                        },
                     },
+                    "ready_vote_cpu_pressure_percent": {
+                        "sample_count": 2,
+                        "avg_percent": 70.5,
+                        "p50_percent": 70.5,
+                        "p95_percent": 80.05,
+                        "p99_percent": 80.41,
+                        "max_percent": 80.5,
+                    },
+                    "ready_vote_count_metrics": {
+                        "ready_vote_checkout_count": {
+                            "sample_count": 2,
+                            "avg_count": 2.0,
+                            "p50_count": 2.0,
+                            "p95_count": 2.9,
+                            "p99_count": 2.98,
+                            "max_count": 3.0,
+                        },
+                    },
+                    "legacy_ready_vote_fields_deprecated": True,
                 }
             },
         )
 
         request_perf = report["server_request_perf_logs"]
         self.assertEqual(request_perf["scope"], "diagnostic_sample")
+        self.assertEqual(
+            request_perf["ready_vote_cpu_pressure_percent"]["max_percent"], 80.5
+        )
+        self.assertEqual(
+            request_perf["ready_vote_count_metrics"]["ready_vote_checkout_count"]["max_count"],
+            3.0,
+        )
+        self.assertIs(request_perf["legacy_ready_vote_fields_deprecated"], True)
+        self.assertIs(
+            request_perf["by_route"]["ready_vote"]["legacy_ready_vote_fields_deprecated"],
+            True,
+        )
         self.assertEqual(
             request_perf["request_perf_sampling"],
             {

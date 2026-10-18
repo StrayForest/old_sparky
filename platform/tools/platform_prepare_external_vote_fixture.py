@@ -295,10 +295,13 @@ def project_fixture_timing_summary(
     mode = payload.get("mode")
     if not isinstance(mode, str) or mode not in {"scale", "read-mix", "write-burst"}:
         mode = "other"
+    control_account_preserved = payload.get("control_account_preserved")
+    if control_account_preserved is not None and type(control_account_preserved) is not bool:
+        raise ValueError("control account projection value is invalid")
     safe_summary = {
         "schema": 1,
         "mode": mode,
-        "control_account_preserved": payload.get("control_account_preserved") is True,
+        "control_account_preserved": control_account_preserved,
         "planned_tournaments": safe_count("planned_tournaments"),
         "completed_tournaments": safe_count("completed_tournaments"),
         "planned_users": safe_count("planned_users"),

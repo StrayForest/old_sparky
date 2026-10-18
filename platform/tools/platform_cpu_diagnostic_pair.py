@@ -30,8 +30,11 @@ TRACE_HEADER = "x-platform-ssr-trace"
 EXPECTED_USERS = 20_000
 EXPECTED_TOURNAMENTS = 40
 USERS_PER_TOURNAMENT = 500
+CPU_ONLY_TOURNAMENTS = 1
+CPU_ONLY_USERS_PER_TOURNAMENT = 14
 COHORT_USERS = 8
 REQUESTS_PER_LEG = 500
+MEMORY_SAMPLE_COUNT = 5
 LEG_MS = 20_000
 IDLE_MS = 5_000
 PLAN_LEAD_MS = 60_000
@@ -41,7 +44,7 @@ PAIR_PAYLOAD_CAP = 24_576
 WORKER_OUTPUT_CAP = 64_000
 REPORT_CAP = 64_000
 SSH_LIFECYCLE_RECEIPT_CAP = 2_048
-ROOT_USAGE_OUTPUT_CAP = 8_192
+ROOT_USAGE_OUTPUT_CAP = 32_768
 USAGE_ROW_FIELDS = frozenset({
     "service", "phase", "expected_targets", "observed_targets", "event_count",
     "cpu_ns", "window_ms_min", "window_ms_max", "start_lag_ms_min",
@@ -55,6 +58,32 @@ PROFILE_ROW_FIELDS = frozenset({
     "end_lag_ms_max", "categories",
 })
 PROFILE_CATEGORY_FIELDS = frozenset({"category", "cpu_us", "observations"})
+MEMORY_ROW_FIELDS = frozenset({
+    "service", "run_id", "phase", "expected_targets", "observed_targets",
+    "event_count", "duplicate_count", "status", "gc_status", "gc_overflow",
+    "cgroup_memory_status", "cgroup_memory_reason", "sample_count",
+    "rss_min_bytes", "rss_max_bytes", "rss_mean_bytes",
+    "heap_total_min_bytes", "heap_total_max_bytes", "heap_total_mean_bytes",
+    "heap_used_min_bytes", "heap_used_max_bytes", "heap_used_mean_bytes",
+    "heap_limit_min_bytes", "heap_limit_max_bytes", "heap_limit_mean_bytes",
+    "external_min_bytes", "external_max_bytes", "external_mean_bytes",
+    "array_buffers_min_bytes", "array_buffers_max_bytes", "array_buffers_mean_bytes",
+    "sampled_window_start_elapsed_ms", "sampled_window_end_elapsed_ms",
+    "sampled_window_duration_ms", "cgroup_sample_count",
+    "cgroup_memory_current_start_bytes", "cgroup_memory_current_end_bytes",
+    "cgroup_memory_current_sampled_max_bytes", "cgroup_memory_peak_start_bytes",
+    "cgroup_memory_peak_end_bytes", "cgroup_memory_peak_sampled_max_bytes",
+    "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
+    "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
+    "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
+    "gc_count", "gc_duration_ms", "gc_major_count", "gc_minor_count",
+    "gc_incremental_count", "gc_weakcb_count", "gc_other_count",
+})
+MEMORY_METRIC_FIELDS = MEMORY_ROW_FIELDS - {
+    "service", "run_id", "phase", "expected_targets", "observed_targets",
+    "event_count", "duplicate_count", "status", "gc_status", "gc_overflow",
+    "cgroup_memory_status", "cgroup_memory_reason", "gc_duration_ms",
+}
 PROFILE_CATEGORIES = frozenset({
     "repo.get_tournament_workspace", "repo.get_tournament_workspace_by_slug",
     "repo.workspace_conditional_preflight", "repo.get_current_user",
@@ -415,6 +444,388 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
         os.close(fd)
 
 
+def _public_report(value: dict[str, Any]) -> dict[str, Any]:
+    """Return a bounded, identity-free projection for workflow artifacts."""
+
+    def nonnegative_int(item: Any, *, maximum: int = 10**15) -> int | None:
+        if type(item) is not int or not 0 <= item <= maximum:
+            return None
+        return item
+
+    def number(item: Any, *, maximum: float = 10**12) -> float | None:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        if not 0 <= item <= maximum:
+            return None
+        return round(float(item), 6)
+
+    output: dict[str, Any] = {
+        "schema": 1,
+        "workload": WORKLOAD,
+        "fixture_kind": value.get("fixture_kind") if value.get("fixture_kind") in {"external_load", "cpu_diagnostic_only_v1"} else "other",
+        "status": value.get("status") if value.get("status") in {"complete", "incomplete"} else "incomplete",
+        "failure_stage": value.get("failure_stage") if value.get("failure_stage") in {"none", "preflight", "fixture", "off_phase", "on_phase", "cleanup", "supervisor", "unknown"} else "unknown",
+        "failure_code": value.get("failure_code") if value.get("failure_code") in {"none", "invalid_binding", "fixture_invalid", "ssh_preflight_failed", "namespace_not_closed", "worker_failed", "cleanup_failed", "profile_incomplete", "unknown"} else "unknown",
+        "capacity_slo_credit": False,
+        "diagnostic_credit": False,
+        "namespace_closed": value.get("namespace_closed") is True,
+        "plan_cleanup": value.get("plan_cleanup") if value.get("plan_cleanup") in {"complete", "failed", "unknown", "pending"} else "unknown",
+        "source_sha": value.get("source_sha") if isinstance(value.get("source_sha"), str) and SOURCE_SHA_RE.fullmatch(value["source_sha"]) else None,
+        "app_target_sha": value.get("app_target_sha") if isinstance(value.get("app_target_sha"), str) and SOURCE_SHA_RE.fullmatch(value["app_target_sha"]) else None,
+        "external_run_id": value.get("external_run_id") if isinstance(value.get("external_run_id"), str) and value["external_run_id"].isdecimal() else None,
+        "external_run_attempt": value.get("external_run_attempt") if isinstance(value.get("external_run_attempt"), str) and value["external_run_attempt"].isdecimal() else None,
+        "fixture_manifest_sha256": value.get("fixture_manifest_sha256") if isinstance(value.get("fixture_manifest_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", value["fixture_manifest_sha256"]) else None,
+        "input_handoff_sha256": value.get("input_handoff_sha256") if isinstance(value.get("input_handoff_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", value["input_handoff_sha256"]) else None,
+        "source_binding_sha256": value.get("source_binding_sha256") if isinstance(value.get("source_binding_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", value["source_binding_sha256"]) else None,
+        "actor_payload_bytes": nonnegative_int(value.get("actor_payload_bytes"), maximum=ACTOR_PAYLOAD_CAP),
+        "workload_contract": {
+            "actors": COHORT_USERS,
+            "requests_per_phase": REQUESTS_PER_LEG,
+            "phase_window_ms": LEG_MS,
+            "idle_between_phases_ms": IDLE_MS,
+            "max_inflight": 8,
+        },
+        "canonical_fixture": {},
+        "result": None,
+        "service_cpu_usage": None,
+        "cpu_profile_attribution": None,
+        "memory_attribution": None,
+    }
+    fixture = value.get("canonical_fixture")
+    if isinstance(fixture, dict):
+        for key in ("tournaments", "users", "users_per_tournament", "selected_actors"):
+            selected = nonnegative_int(fixture.get(key), maximum=20_000)
+            if selected is not None:
+                output["canonical_fixture"][key] = selected
+        output["canonical_fixture"]["fixture_kind"] = output["fixture_kind"]
+    result = value.get("result")
+    if isinstance(result, dict):
+        clean_result: dict[str, Any] = {
+            "capture_complete": result.get("capture_complete") is True,
+            "all_expected_statuses": result.get("all_expected_statuses") is True,
+        }
+        warmup = result.get("warmup")
+        if isinstance(warmup, dict):
+            clean_result["warmup"] = {
+                key: selected
+                for key in ("expected_actors", "authenticated_200", "page_warm_200", "worker_threads")
+                if (selected := nonnegative_int(warmup.get(key), maximum=COHORT_USERS)) is not None
+            }
+        for phase in ("off", "on"):
+            leg = result.get(phase)
+            if not isinstance(leg, dict):
+                clean_result[phase] = None
+                continue
+            clean_leg: dict[str, Any] = {"complete": leg.get("complete") is True, "all_expected_statuses": leg.get("all_expected_statuses") is True}
+            for key in ("scheduled", "submitted", "completed", "completed_in_window"):
+                selected = nonnegative_int(leg.get(key), maximum=REQUESTS_PER_LEG)
+                if selected is not None:
+                    clean_leg[key] = selected
+            counts = leg.get("status_counts")
+            if isinstance(counts, dict):
+                clean_leg["status_counts"] = {
+                    key: selected
+                    for key, raw in counts.items()
+                    if isinstance(key, str) and re.fullmatch(r"[1-5][0-9]{2}|invalid", key)
+                    and (selected := nonnegative_int(raw, maximum=REQUESTS_PER_LEG)) is not None
+                }
+            latency = leg.get("latency_ms")
+            if isinstance(latency, dict):
+                clean_latency = {
+                    key: selected
+                    for key in ("count", "p50", "p95", "p99")
+                    if (selected := (nonnegative_int(latency.get(key), maximum=REQUESTS_PER_LEG) if key == "count" else number(latency.get(key)))) is not None
+                }
+                clean_leg["latency_ms"] = clean_latency
+            clean_result[phase] = clean_leg
+        quality = result.get("quality_gate")
+        if isinstance(quality, dict):
+            clean_quality: dict[str, Any] = {
+                "status": quality.get("status") if quality.get("status") in {"passed", "failed", "unmeasured"} else "unmeasured",
+                "request_p95_limit_percent": 5.0,
+                "service_cpu_delta_limit_percentage_points": 3.0,
+            }
+            for key in ("request_p95_delta_percent",):
+                clean_quality[key] = number(quality.get(key), maximum=100_000)
+            deltas = quality.get("service_cpu_delta_percentage_points")
+            if isinstance(deltas, dict) and set(deltas) == {"api", "web"}:
+                clean_quality["service_cpu_delta_percentage_points"] = {key: number(deltas.get(key), maximum=100_000) for key in ("api", "web")}
+            clean_result["quality_gate"] = clean_quality
+        output["result"] = clean_result
+    usage = value.get("service_cpu_usage")
+    if isinstance(usage, dict):
+        clean_usage: dict[str, Any] = {
+            "status": usage.get("status") if usage.get("status") in {"complete", "incomplete", "unavailable"} else "unavailable",
+            "reason": usage.get("reason") if usage.get("reason") in {"none", "incomplete", "unavailable", "other"} else "other",
+            "rows": [],
+        }
+        rows = usage.get("rows")
+        if isinstance(rows, list):
+            for row in rows[:4]:
+                if not isinstance(row, dict):
+                    continue
+                service = row.get("service")
+                phase = row.get("phase")
+                if service not in {"api", "web"} or phase not in {"off", "on"}:
+                    continue
+                clean_row: dict[str, Any] = {"service": service, "phase": phase}
+                for key in ("expected_targets", "observed_targets", "event_count", "cpu_ns", "window_ms_min", "window_ms_max"):
+                    selected = nonnegative_int(row.get(key))
+                    if selected is not None:
+                        clean_row[key] = selected
+                clean_usage["rows"].append(clean_row)
+        output["service_cpu_usage"] = clean_usage
+    profile = value.get("cpu_profile_attribution")
+    if isinstance(profile, dict):
+        clean_profile: dict[str, Any] = {
+            "status": profile.get("status") if profile.get("status") in {"complete", "incomplete", "unavailable"} else "unavailable",
+            "reason": profile.get("reason") if profile.get("reason") in {"none", "incomplete", "unavailable", "other"} else "other",
+            "rows": [],
+        }
+        rows = profile.get("rows")
+        if isinstance(rows, list):
+            for row in rows[:2]:
+                if not isinstance(row, dict) or row.get("service") not in {"api", "web"}:
+                    continue
+                item: dict[str, Any] = {"service": row["service"]}
+                for key in ("expected_targets", "observed_targets", "event_count", "total_cpu_us", "sample_count"):
+                    raw = row.get(key)
+                    if raw is None and key == "sample_count":
+                        item[key] = None
+                    elif (selected := nonnegative_int(raw, maximum=10**10)) is not None:
+                        item[key] = selected
+                item["timer"] = row.get("timer") if row.get("timer") in {"thread_cpu", "v8_cpu"} else "other"
+                item["observation_unit"] = row.get("observation_unit") if row.get("observation_unit") in {"calls", "samples"} else "other"
+                categories = row.get("categories")
+                item["categories"] = [
+                    {"category": category["category"], "cpu_us": category["cpu_us"], "observations": category["observations"]}
+                    for category in categories[:16]
+                    if isinstance(category, dict)
+                    and category.get("category") in PROFILE_CATEGORIES
+                    and type(category.get("cpu_us")) is int and 0 <= category["cpu_us"] <= 10**10
+                    and type(category.get("observations")) is int and 0 <= category["observations"] <= 10**10
+                ] if isinstance(categories, list) else []
+                clean_profile["rows"].append(item)
+        output["cpu_profile_attribution"] = clean_profile
+    memory = value.get("memory_attribution")
+    if isinstance(memory, dict):
+        clean_memory: dict[str, Any] = {
+            "status": memory.get("status") if memory.get("status") in {"complete", "incomplete", "unavailable"} else "unavailable",
+            "reason": memory.get("reason") if memory.get("reason") in {"none", "incomplete", "unavailable", "other"} else "other",
+            "cgroup_memory_status": memory.get("cgroup_memory_status") if memory.get("cgroup_memory_status") in {"complete", "unknown", "invalid"} else "unknown",
+            "cgroup_memory_reason": memory.get("cgroup_memory_reason") if memory.get("cgroup_memory_reason") in {"none", "hierarchy_unavailable", "file_unavailable", "invalid_snapshot"} else "invalid_snapshot",
+            "rows": [],
+        }
+        rows = memory.get("rows")
+        if isinstance(rows, list):
+            integer_fields = (
+                "expected_targets", "observed_targets", "event_count", "duplicate_count",
+                "sample_count", "sampled_window_start_elapsed_ms", "sampled_window_end_elapsed_ms",
+                "sampled_window_duration_ms", "rss_min_bytes", "rss_max_bytes", "rss_mean_bytes",
+                "heap_total_min_bytes", "heap_total_max_bytes", "heap_total_mean_bytes",
+                "heap_used_min_bytes", "heap_used_max_bytes", "heap_used_mean_bytes",
+                "heap_limit_min_bytes", "heap_limit_max_bytes", "heap_limit_mean_bytes",
+                "external_min_bytes", "external_max_bytes", "external_mean_bytes",
+                "array_buffers_min_bytes", "array_buffers_max_bytes", "array_buffers_mean_bytes",
+                "cgroup_sample_count", "cgroup_memory_current_start_bytes",
+                "cgroup_memory_current_end_bytes", "cgroup_memory_current_sampled_max_bytes",
+                "cgroup_memory_peak_start_bytes", "cgroup_memory_peak_end_bytes",
+                "cgroup_memory_peak_sampled_max_bytes", "memory_events_low_sampled_delta",
+                "memory_events_high_sampled_delta", "memory_events_max_sampled_delta",
+                "memory_events_oom_sampled_delta", "memory_events_oom_kill_sampled_delta",
+                "memory_events_oom_group_kill_sampled_delta",
+                "gc_count", "gc_major_count", "gc_minor_count", "gc_incremental_count",
+                "gc_weakcb_count", "gc_other_count",
+            )
+            for row in rows[:2]:
+                if not isinstance(row, dict) or row.get("service") != "web" or row.get("phase") not in {"off", "on"}:
+                    continue
+                item: dict[str, Any] = {
+                    "service": "web", "phase": row["phase"],
+                    "status": row.get("status") if row.get("status") in {"complete", "incomplete"} else "incomplete",
+                    "cgroup_memory_status": row.get("cgroup_memory_status") if row.get("cgroup_memory_status") in {"complete", "unknown", "invalid"} else "unknown",
+                    "cgroup_memory_reason": row.get("cgroup_memory_reason") if row.get("cgroup_memory_reason") in {"none", "hierarchy_unavailable", "file_unavailable", "invalid_snapshot"} else "invalid_snapshot",
+                    "gc_status": row.get("gc_status") if row.get("gc_status") in {"complete", "incomplete", "unavailable"} else "unavailable",
+                    "gc_overflow": row.get("gc_overflow") is True,
+                }
+                for key in integer_fields:
+                    raw = row.get(key)
+                    if raw is None and key.startswith(("cgroup_", "memory_events_")):
+                        item[key] = None
+                    elif (selected := nonnegative_int(raw, maximum=10**16)) is not None:
+                        item[key] = selected
+                duration = row.get("gc_duration_ms")
+                if type(duration) in {int, float} and not isinstance(duration, bool) and 0 <= duration <= 20_000:
+                    item["gc_duration_ms"] = round(float(duration), 3)
+                clean_memory["rows"].append(item)
+        output["memory_attribution"] = clean_memory
+    return output
+
+
+def evaluate_cpu_only_report(
+    report: dict[str, Any], *, source_sha: str, app_target_sha: str,
+    run_id: str, attempt: str, manifest_sha256: str,
+) -> str:
+    """Return PASS/FAIL/INVALID for the bounded diagnostic, never matrix credit."""
+    if (
+        report.get("schema") != 1
+        or report.get("workload") != WORKLOAD
+        or report.get("fixture_kind") != "cpu_diagnostic_only_v1"
+        or report.get("capacity_slo_credit") is not False
+        or report.get("diagnostic_credit") is not False
+        or report.get("source_sha") != source_sha
+        or report.get("app_target_sha") != app_target_sha
+        or report.get("external_run_id") != run_id
+        or report.get("external_run_attempt") != attempt
+        or report.get("status") != "complete"
+        or report.get("fixture_manifest_sha256") != manifest_sha256
+        or report.get("namespace_closed") is not True
+        or report.get("plan_cleanup") != "complete"
+        or report.get("failure_stage") != "none"
+        or report.get("failure_code") != "none"
+    ):
+        return "INVALID"
+    fixture = report.get("canonical_fixture")
+    contract = report.get("workload_contract")
+    if (
+        not isinstance(fixture, dict)
+        or fixture != {
+            "fixture_kind": "cpu_diagnostic_only_v1",
+            "tournaments": 1,
+            "users": CPU_ONLY_USERS_PER_TOURNAMENT,
+            "users_per_tournament": CPU_ONLY_USERS_PER_TOURNAMENT,
+            "selected_actors": COHORT_USERS,
+        }
+        or type(report.get("actor_payload_bytes")) is not int
+        or not 1 <= report["actor_payload_bytes"] <= ACTOR_PAYLOAD_CAP
+        or contract != {
+            "actors": COHORT_USERS,
+            "requests_per_phase": REQUESTS_PER_LEG,
+            "phase_window_ms": LEG_MS,
+            "idle_between_phases_ms": IDLE_MS,
+            "max_inflight": 8,
+        }
+    ):
+        return "INVALID"
+    result = report.get("result")
+    if not isinstance(result, dict) or result.get("capture_complete") is not True or result.get("all_expected_statuses") is not True:
+        return "INVALID"
+    warmup = result.get("warmup")
+    if not isinstance(warmup, dict) or any(warmup.get(field) != COHORT_USERS for field in ("expected_actors", "authenticated_200", "page_warm_200")):
+        return "INVALID"
+    for phase in ("off", "on"):
+        leg = result.get(phase)
+        if (
+            not isinstance(leg, dict)
+            or leg.get("complete") is not True
+            or leg.get("all_expected_statuses") is not True
+            or any(leg.get(field) != REQUESTS_PER_LEG for field in ("scheduled", "submitted", "completed", "completed_in_window"))
+            or leg.get("status_counts") != {"200": REQUESTS_PER_LEG}
+            or not isinstance(leg.get("latency_ms"), dict)
+            or leg["latency_ms"].get("count") != REQUESTS_PER_LEG
+        ):
+            return "INVALID"
+    quality = result.get("quality_gate")
+    deltas = quality.get("service_cpu_delta_percentage_points") if isinstance(quality, dict) else None
+    if (
+        not isinstance(quality, dict)
+        or quality.get("status") not in {"passed", "failed"}
+        or type(quality.get("request_p95_delta_percent")) not in {int, float}
+        or isinstance(quality.get("request_p95_delta_percent"), bool)
+        or not isinstance(deltas, dict)
+        or set(deltas) != {"api", "web"}
+        or any(type(deltas[name]) not in {int, float} or isinstance(deltas[name], bool) for name in ("api", "web"))
+    ):
+        return "INVALID"
+    usage = report.get("service_cpu_usage")
+    profile = report.get("cpu_profile_attribution")
+    memory = report.get("memory_attribution")
+    if (
+        not isinstance(usage, dict) or usage.get("status") != "complete"
+        or usage.get("reason") != "none" or not isinstance(usage.get("rows"), list)
+        or len(usage["rows"]) != 4
+        or not isinstance(profile, dict) or profile.get("status") != "complete"
+        or profile.get("reason") != "none" or not isinstance(profile.get("rows"), list)
+        or len(profile["rows"]) != 2
+        or not isinstance(memory, dict) or memory.get("status") != "complete"
+        or memory.get("reason") != "none"
+        or memory.get("cgroup_memory_status") not in {"complete", "unknown"}
+        or memory.get("cgroup_memory_reason") not in {"none", "hierarchy_unavailable", "file_unavailable"}
+        or (memory.get("cgroup_memory_status") == "complete" and memory.get("cgroup_memory_reason") != "none")
+        or (memory.get("cgroup_memory_status") == "unknown" and memory.get("cgroup_memory_reason") == "none")
+        or not isinstance(memory.get("rows"), list) or len(memory["rows"]) != 2
+    ):
+        return "INVALID"
+    expected_service_targets = {"api": 2, "web": 1}
+    for service, timer, unit in (("api", "thread_cpu", "calls"), ("web", "v8_cpu", "samples")):
+        rows = [row for row in profile["rows"] if isinstance(row, dict) and row.get("service") == service]
+        if len(rows) != 1:
+            return "INVALID"
+        row = rows[0]
+        if (
+            row.get("expected_targets") != expected_service_targets[service]
+            or row.get("observed_targets") != expected_service_targets[service]
+            or row.get("event_count") != expected_service_targets[service]
+            or type(row.get("total_cpu_us")) is not int or row["total_cpu_us"] <= 0
+            or row.get("timer") != timer or row.get("observation_unit") != unit
+            or (service == "api" and row.get("sample_count") is not None)
+            or (service == "web" and (type(row.get("sample_count")) is not int or row["sample_count"] <= 0))
+            or not isinstance(row.get("categories"), list) or not row["categories"]
+        ):
+            return "INVALID"
+    for phase in ("off", "on"):
+        rows = [row for row in memory["rows"] if isinstance(row, dict) and row.get("phase") == phase]
+        if len(rows) != 1:
+            return "INVALID"
+        row = rows[0]
+        if (
+            row.get("service") != "web" or row.get("status") != "complete"
+            or row.get("expected_targets") != 1 or row.get("observed_targets") != 1
+            or row.get("event_count") != 1 or row.get("duplicate_count") != 0
+            or row.get("sample_count") != MEMORY_SAMPLE_COUNT
+            or row.get("gc_status") != "complete" or row.get("gc_overflow") is not False
+            or row.get("cgroup_memory_reason") not in {"none", "hierarchy_unavailable", "file_unavailable"}
+            or (row.get("cgroup_memory_status") == "complete" and row.get("cgroup_memory_reason") != "none")
+            or (row.get("cgroup_memory_status") == "unknown" and row.get("cgroup_memory_reason") == "none")
+            or type(row.get("sampled_window_start_elapsed_ms")) is not int
+            or type(row.get("sampled_window_end_elapsed_ms")) is not int
+            or type(row.get("sampled_window_duration_ms")) is not int
+            or not 0 <= row["sampled_window_start_elapsed_ms"] <= 1_000
+            or not 15_000 <= row["sampled_window_duration_ms"] <= 20_000
+            or row["sampled_window_end_elapsed_ms"] > 20_000
+            or row["sampled_window_duration_ms"] != (
+                row["sampled_window_end_elapsed_ms"] - row["sampled_window_start_elapsed_ms"]
+            )
+            or type(row.get("gc_count")) is not int or row["gc_count"] < 0
+            or type(row.get("gc_duration_ms")) not in {int, float}
+            or isinstance(row.get("gc_duration_ms"), bool)
+            or not 0 <= row["gc_duration_ms"] <= 20_000
+            or row.get("cgroup_memory_status") not in {"complete", "unknown"}
+            or any(type(row.get(name)) is not int or row[name] <= 0 for name in (
+                "rss_min_bytes", "rss_max_bytes", "rss_mean_bytes", "heap_total_max_bytes",
+                "heap_used_max_bytes", "heap_limit_max_bytes", "external_max_bytes",
+                "array_buffers_max_bytes",
+            ))
+        ):
+            return "INVALID"
+        if row.get("cgroup_memory_status") == "complete" and (
+            row.get("cgroup_sample_count") != MEMORY_SAMPLE_COUNT
+            or any(type(row.get(name)) is not int or row[name] < 0 for name in (
+                "cgroup_sample_count", "cgroup_memory_current_start_bytes",
+                "cgroup_memory_current_end_bytes", "cgroup_memory_current_sampled_max_bytes",
+                "cgroup_memory_peak_start_bytes", "cgroup_memory_peak_end_bytes",
+                "cgroup_memory_peak_sampled_max_bytes", "memory_events_low_sampled_delta",
+                "memory_events_high_sampled_delta", "memory_events_max_sampled_delta",
+                "memory_events_oom_sampled_delta", "memory_events_oom_kill_sampled_delta",
+                "memory_events_oom_group_kill_sampled_delta",
+            ))
+        ):
+            return "INVALID"
+    request_ok = quality["request_p95_delta_percent"] <= 5.0
+    cpu_ok = all(abs(deltas[name]) <= 3.0 for name in ("api", "web"))
+    return "PASS" if request_ok and cpu_ok else "FAIL"
+
+
 def _quality_gate(
     off: dict[str, Any],
     on: dict[str, Any],
@@ -477,7 +888,8 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
 
     top_fields = {
         "status", "service_count", "usage_status", "usage_reason", "usage_rows",
-        "profile_status", "profile_reason", "profile_rows",
+        "profile_status", "profile_reason", "profile_rows", "memory_status",
+        "memory_reason", "cgroup_memory_status", "cgroup_memory_reason", "memory_rows",
     }
     if (
         not isinstance(value, dict)
@@ -497,6 +909,13 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
             "byte_cap", "line_cap", "timeout", "invalid_profile",
         }
         or not isinstance(value.get("profile_rows"), list)
+        or value.get("memory_status") not in {"complete", "incomplete", "unavailable"}
+        or value.get("memory_reason") not in {"none", "incomplete", "unavailable"}
+        or value.get("cgroup_memory_status") not in {"complete", "unknown", "invalid"}
+        or value.get("cgroup_memory_reason") not in {
+            "none", "hierarchy_unavailable", "file_unavailable", "invalid_snapshot",
+        }
+        or not isinstance(value.get("memory_rows"), list)
     ):
         return None
     rows = value["usage_rows"]
@@ -508,12 +927,20 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
             and value["profile_status"] == "unavailable"
             and value["profile_reason"] == "missing"
             and value["profile_rows"] == []
+            and value["memory_status"] == "unavailable"
+            and value["memory_reason"] == "unavailable"
+            and value["cgroup_memory_status"] == "unknown"
+            and value["cgroup_memory_reason"] == "hierarchy_unavailable"
+            and value["memory_rows"] == []
         ):
             return None
         return {
             "status": value["status"], "service_count": 0,
             "usage_status": "unavailable", "usage_reason": "missing", "usage_rows": [],
             "profile_status": "unavailable", "profile_reason": "missing", "profile_rows": [],
+            "memory_status": "unavailable", "memory_reason": "unavailable",
+            "cgroup_memory_status": "unknown", "cgroup_memory_reason": "hierarchy_unavailable",
+            "memory_rows": [],
         }
     expected = (("api", "off", 2), ("api", "on", 2), ("web", "off", 1), ("web", "on", 1))
     if len(rows) != len(expected) or value["service_count"] != 2:
@@ -646,12 +1073,64 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
         )
     ):
         return None
+    memory_rows = value["memory_rows"]
+    if memory_rows and len(memory_rows) != 2:
+        return None
+    clean_memory: list[dict[str, Any]] = []
+    for row, phase in zip(memory_rows, ("off", "on")):
+        if (
+            not isinstance(row, dict) or set(row) != MEMORY_ROW_FIELDS
+            or row.get("service") != "web" or row.get("phase") != phase
+            or not isinstance(row.get("run_id"), str) or not RUN_ID_RE.fullmatch(row["run_id"])
+            or row.get("expected_targets") != 1
+            or type(row.get("observed_targets")) is not int or row["observed_targets"] not in {0, 1}
+            or type(row.get("event_count")) is not int or not 0 <= row["event_count"] <= 8
+            or type(row.get("duplicate_count")) is not int or not 0 <= row["duplicate_count"] <= 8
+            or row.get("status") not in {"complete", "incomplete"}
+            or row.get("gc_status") not in {"complete", "incomplete", "unavailable"}
+            or type(row.get("gc_overflow")) is not bool
+            or row.get("cgroup_memory_status") not in {"complete", "unknown", "invalid"}
+            or row.get("cgroup_memory_reason") not in {
+                "none", "hierarchy_unavailable", "file_unavailable", "invalid_snapshot",
+            }
+        ):
+            return None
+        clean = {key: row[key] for key in MEMORY_ROW_FIELDS if key not in {"run_id"}}
+        for field in MEMORY_METRIC_FIELDS:
+            raw = clean[field]
+            if raw is not None and (type(raw) is not int or not 0 <= raw <= 10**16):
+                return None
+        duration = clean["gc_duration_ms"]
+        if duration is not None and (
+            type(duration) not in {int, float} or isinstance(duration, bool)
+            or not 0 <= duration <= 20_000
+        ):
+            return None
+        clean_memory.append(clean)
+    if value["memory_status"] == "complete" and (
+        value["memory_reason"] != "none" or len(clean_memory) != 2
+        or any(row["status"] != "complete" or row["sample_count"] != MEMORY_SAMPLE_COUNT
+               or row["gc_status"] != "complete" or row["gc_overflow"]
+               for row in clean_memory)
+    ):
+        return None
+    if value["cgroup_memory_status"] == "complete" and (
+        value["cgroup_memory_reason"] != "none" or len(clean_memory) != 2
+        or any(row["cgroup_memory_status"] != "complete"
+               or row["cgroup_memory_reason"] != "none"
+               or row["cgroup_sample_count"] != MEMORY_SAMPLE_COUNT
+               for row in clean_memory)
+    ):
+        return None
     return {
         "status": value["status"], "service_count": value["service_count"],
         "usage_status": value["usage_status"], "usage_reason": value["usage_reason"],
         "usage_rows": clean_rows,
         "profile_status": value["profile_status"], "profile_reason": value["profile_reason"],
         "profile_rows": clean_profiles,
+        "memory_status": value["memory_status"], "memory_reason": value["memory_reason"],
+        "cgroup_memory_status": value["cgroup_memory_status"],
+        "cgroup_memory_reason": value["cgroup_memory_reason"], "memory_rows": clean_memory,
     }
 
 
@@ -877,10 +1356,16 @@ def _parent(args: argparse.Namespace) -> int:
         "schema", "confirmation", "target_sha", "control_email", "setup_concurrency",
         "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics",
     }
+    fixture_kind = handoff.get("fixture_kind", "external_load")
+    if fixture_kind not in {"external_load", "cpu_diagnostic_only_v1"} or fixture_kind != args.fixture_kind:
+        raise PairError("fixture kind binding rejected")
+    expected_handoff_keys = base_handoff_keys | (
+        {"fixture_kind"} if "fixture_kind" in handoff else set()
+    )
     schema = handoff.get("schema")
     expected_handoff_keys = base_handoff_keys | (
-        {"source_binding"} if schema in (2, "2") else set()
-    )
+        {"fixture_kind"} if "fixture_kind" in handoff else set()
+    ) | ({"source_binding"} if schema in (2, "2") else set())
     source_binding_handoff = handoff.get("source_binding")
     if (
         set(handoff) != expected_handoff_keys
@@ -888,8 +1373,19 @@ def _parent(args: argparse.Namespace) -> int:
         or handoff.get("target_sha") != args.source_sha
         or handoff.get("run_id") != args.external_run_id
         or handoff.get("profile") != "external-vote"
-        or handoff.get("tournament_count") != str(EXPECTED_TOURNAMENTS)
-        or handoff.get("users_per_tournament") != str(USERS_PER_TOURNAMENT)
+        or handoff.get("tournament_count") != str(
+            CPU_ONLY_TOURNAMENTS if fixture_kind == "cpu_diagnostic_only_v1" else EXPECTED_TOURNAMENTS
+        )
+        or handoff.get("users_per_tournament") != str(
+            CPU_ONLY_USERS_PER_TOURNAMENT if fixture_kind == "cpu_diagnostic_only_v1" else USERS_PER_TOURNAMENT
+        )
+        or (
+            fixture_kind == "cpu_diagnostic_only_v1"
+            and (
+                handoff.get("confirmation") != "RUN-PRODUCTION-CPU-DIAGNOSTIC"
+                or handoff.get("timeout_diagnostics") != "false"
+            )
+        )
     ):
         raise PairError("external input handoff binding rejected")
     if schema in (1, "1"):
@@ -976,11 +1472,14 @@ def _parent(args: argparse.Namespace) -> int:
         if hashlib.sha256(binding_raw).hexdigest() != manifest.get("source_binding_sha256"):
             raise PairError("fixture source-binding digest rejected")
     tournaments = manifest.get("tournaments")
+    expected_tournaments = CPU_ONLY_TOURNAMENTS if fixture_kind == "cpu_diagnostic_only_v1" else EXPECTED_TOURNAMENTS
+    expected_users_per_tournament = CPU_ONLY_USERS_PER_TOURNAMENT if fixture_kind == "cpu_diagnostic_only_v1" else USERS_PER_TOURNAMENT
+    expected_users = expected_tournaments * expected_users_per_tournament
     if (
         not isinstance(tournaments, list)
-        or len(tournaments) != EXPECTED_TOURNAMENTS
-        or len(users) != EXPECTED_USERS
-        or any(item.get("user_count") != USERS_PER_TOURNAMENT for item in tournaments)
+        or len(tournaments) != expected_tournaments
+        or len(users) != expected_users
+        or any(item.get("user_count") != expected_users_per_tournament for item in tournaments)
     ):
         raise PairError("canonical fixture dimensions rejected")
     workspace_slug = tournaments[0]["slug"]
@@ -1081,21 +1580,26 @@ def _parent(args: argparse.Namespace) -> int:
     report: dict[str, Any] = {
         "schema": 1,
         "workload": WORKLOAD,
+        "fixture_kind": fixture_kind,
         "source_sha": args.source_sha,
         "app_target_sha": args.app_target_sha,
         "external_run_id": args.external_run_id,
         "external_run_attempt": args.external_run_attempt,
         "status": "incomplete",
+        "failure_stage": "unknown",
+        "failure_code": "unknown",
         "capacity_slo_credit": False,
         "diagnostic_credit": False,
         "canonical_fixture": {
-            "tournaments": EXPECTED_TOURNAMENTS,
-            "users": EXPECTED_USERS,
-            "users_per_tournament": USERS_PER_TOURNAMENT,
+            "fixture_kind": fixture_kind,
+            "tournaments": expected_tournaments,
+            "users": expected_users,
+            "users_per_tournament": expected_users_per_tournament,
             "selected_actors": COHORT_USERS,
         },
         "fixture_manifest_sha256": manifest_sha,
         "input_handoff_sha256": hashlib.sha256(handoff_raw).hexdigest(),
+        "source_binding_sha256": manifest.get("source_binding_sha256"),
         "namespace_closed": False,
         "plan_cleanup": "unknown",
         "ssh_material_safe_to_remove": False,
@@ -1112,6 +1616,8 @@ def _parent(args: argparse.Namespace) -> int:
             args, host, user, ssh_config, ssh_key, plan, ssh_lifecycle
         )
         if not prepared:
+            report["failure_stage"] = "preflight"
+            report["failure_code"] = "ssh_preflight_failed"
             raise PairError("root plan prepare failed")
         if release_slug is None or RELEASE_SLUG_RE.fullmatch(release_slug) is None:
             raise PairError("root release binding rejected")
@@ -1198,23 +1704,36 @@ def _parent(args: argparse.Namespace) -> int:
             and child_report.get("capacity_slo_credit") is False
             and child_report.get("namespace_closed") is False
         )
+        if not closed:
+            report["failure_stage"] = "supervisor"
+            report["failure_code"] = "namespace_not_closed"
+        elif not valid_child:
+            report["failure_stage"] = "supervisor"
+            report["failure_code"] = "worker_failed"
         report: dict[str, Any] = {
             "schema": 1,
             "workload": WORKLOAD,
+            "fixture_kind": fixture_kind,
             "source_sha": args.source_sha,
             "app_target_sha": args.app_target_sha,
             "external_run_id": args.external_run_id,
             "external_run_attempt": args.external_run_attempt,
             "status": "incomplete",
+            "failure_stage": "unknown",
+            "failure_code": "unknown",
             "capacity_slo_credit": False,
             "diagnostic_credit": False,
             "canonical_fixture": {
-                "tournaments": EXPECTED_TOURNAMENTS,
-                "users": EXPECTED_USERS,
-                "users_per_tournament": USERS_PER_TOURNAMENT,
+                "fixture_kind": fixture_kind,
+                "tournaments": expected_tournaments,
+                "users": expected_users,
+                "users_per_tournament": expected_users_per_tournament,
                 "selected_actors": COHORT_USERS,
             },
             "fixture_manifest_sha256": manifest_sha,
+            "input_handoff_sha256": hashlib.sha256(handoff_raw).hexdigest(),
+            "source_binding_sha256": manifest.get("source_binding_sha256"),
+            "actor_payload_bytes": len(actor_bytes),
             "namespace_closed": closed,
             "ssh_material_safe_to_remove": False,
             "worker_exit_code": (
@@ -1283,6 +1802,8 @@ def _parent(args: argparse.Namespace) -> int:
             if not cleaned:
                 status = 2
                 report["status"] = "incomplete"
+                report["failure_stage"] = "cleanup"
+                report["failure_code"] = "cleanup_failed"
             if cleaned and usage_summary is not None:
                 report["service_cpu_usage"] = {
                     "status": usage_summary["usage_status"],
@@ -1293,6 +1814,12 @@ def _parent(args: argparse.Namespace) -> int:
                     "status": usage_summary["profile_status"],
                     "reason": usage_summary["profile_reason"],
                     "rows": usage_summary["profile_rows"],
+                }
+                report["memory_attribution"] = {
+                    "status": usage_summary["memory_status"],
+                    "reason": usage_summary["memory_reason"],
+                    "cgroup_memory_status": usage_summary["cgroup_memory_status"],
+                    "rows": usage_summary["memory_rows"],
                 }
                 pair_result = report.get("result")
                 if isinstance(pair_result, dict):
@@ -1313,6 +1840,12 @@ def _parent(args: argparse.Namespace) -> int:
                         and usage_summary.get("usage_status") == "complete" and quality_ok
                     )
                     report["status"] = "complete" if overall_complete else "incomplete"
+                    if overall_complete:
+                        report["failure_stage"] = "none"
+                        report["failure_code"] = "none"
+                    elif report.get("failure_stage") == "unknown":
+                        report["failure_stage"] = "off_phase" if not off_leg.get("complete") else "on_phase"
+                        report["failure_code"] = "profile_incomplete"
                     status = 0 if overall_complete else 2
         for content in ssh_files.values():
             content[:] = b"\0" * len(content)
@@ -1763,6 +2296,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("worker-entry")
+    sanitize = sub.add_parser("sanitize-report")
+    sanitize.add_argument("--input", required=True)
+    sanitize.add_argument("--output", required=True)
+    sanitize.add_argument("--manifest", required=True)
+    sanitize.add_argument("--source-sha", required=True)
+    sanitize.add_argument("--app-target-sha", required=True)
+    sanitize.add_argument("--external-run-id", required=True)
+    sanitize.add_argument("--external-run-attempt", required=True)
+    sanitize.add_argument("--fixture-kind", required=True, choices=("external_load", "cpu_diagnostic_only_v1"))
     parent = sub.add_parser("parent")
     parent.add_argument("--manifest", required=True)
     parent.add_argument("--input-handoff", required=True)
@@ -1771,12 +2313,41 @@ def main(argv: list[str] | None = None) -> int:
     parent.add_argument("--app-target-sha", required=True)
     parent.add_argument("--external-run-id", required=True)
     parent.add_argument("--external-run-attempt", required=True)
+    parent.add_argument(
+        "--fixture-kind",
+        required=True,
+        choices=("external_load", "cpu_diagnostic_only_v1"),
+    )
     parent.add_argument("--ssh-config", required=True)
     parent.add_argument("--ssh-key", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "worker-entry":
             return _worker_entrypoint()
+        if args.command == "sanitize-report":
+            raw = _read_private_file(Path(args.input), cap=REPORT_CAP)
+            manifest_raw = _read_private_file(Path(args.manifest), cap=24 * 1024 * 1024)
+            try:
+                report = json.loads(raw.decode("ascii"), object_pairs_hook=_pairs)
+            except (UnicodeError, json.JSONDecodeError, PairError) as exc:
+                raise PairError("diagnostic report encoding rejected") from exc
+            if (
+                not isinstance(report, dict)
+                or report.get("source_sha") != args.source_sha
+                or report.get("app_target_sha") != args.app_target_sha
+                or report.get("external_run_id") != args.external_run_id
+                or report.get("external_run_attempt") != args.external_run_attempt
+                or report.get("fixture_kind") != args.fixture_kind
+                or report.get("capacity_slo_credit") is not False
+                or report.get("diagnostic_credit") is not False
+                or report.get("fixture_manifest_sha256") != hashlib.sha256(manifest_raw).hexdigest()
+            ):
+                raise PairError("diagnostic report binding rejected")
+            projected = _public_report(report)
+            if projected.get("source_sha") != args.source_sha or projected.get("app_target_sha") != args.app_target_sha:
+                raise PairError("diagnostic report projection lost source binding")
+            _write_report(Path(args.output), projected)
+            return 0
         if (
             SOURCE_SHA_RE.fullmatch(args.source_sha) is None
             or SOURCE_SHA_RE.fullmatch(args.app_target_sha) is None
@@ -1792,15 +2363,35 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 destination = Path(args.report)
                 if not destination.exists() and not destination.is_symlink():
+                    try:
+                        fallback_manifest_sha = hashlib.sha256(
+                            _read_private_file(Path(args.manifest), cap=24 * 1024 * 1024)
+                        ).hexdigest()
+                    except (OSError, PairError):
+                        fallback_manifest_sha = None
                     _write_report(
                         destination,
                         {
                             "schema": 1,
                             "workload": WORKLOAD,
+                            "fixture_kind": args.fixture_kind,
+                            "source_sha": args.source_sha,
+                            "app_target_sha": args.app_target_sha,
+                            "external_run_id": args.external_run_id,
+                            "external_run_attempt": args.external_run_attempt,
                             "status": "incomplete",
-                            "failure_stage": "parent_preflight_or_cleanup",
+                            "failure_stage": "unknown",
+                            "failure_code": "unknown",
+                            "fixture_manifest_sha256": fallback_manifest_sha,
                             "capacity_slo_credit": False,
                             "diagnostic_credit": False,
+                            "canonical_fixture": {
+                                "fixture_kind": args.fixture_kind,
+                                "tournaments": 1 if args.fixture_kind == "cpu_diagnostic_only_v1" else EXPECTED_TOURNAMENTS,
+                                "users": 14 if args.fixture_kind == "cpu_diagnostic_only_v1" else EXPECTED_USERS,
+                                "users_per_tournament": 14 if args.fixture_kind == "cpu_diagnostic_only_v1" else USERS_PER_TOURNAMENT,
+                                "selected_actors": COHORT_USERS,
+                            },
                             "namespace_closed": False,
                             "plan_cleanup": "unknown",
                             "result": None,

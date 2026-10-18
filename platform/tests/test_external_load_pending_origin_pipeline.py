@@ -1871,7 +1871,10 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             (evidence / "server-observability.json").write_text(observer_path.read_text(encoding="utf-8"), encoding="utf-8")
             (evidence / "timeout-diagnostics.json").write_text('{"schema":1,"enabled":false}\n', encoding="utf-8")
             (evidence / "matrix-summary.json").write_text('{"schema":1,"passed":true}\n', encoding="utf-8")
-            (evidence / "cleanup-summary.json").write_text('{"schema":1,"ok":true}\n', encoding="utf-8")
+            (evidence / "cleanup-summary.json").write_text(
+                '{"schema":1,"ok":true,"control_account_preserved":true}\n',
+                encoding="utf-8",
+            )
             (evidence / "canonical.log").write_text("FINALIZE status=success\n", encoding="utf-8")
             (evidence / "cleanup-canonical.log").write_text("CLEANUP status=success\n", encoding="utf-8")
             github_output = root / "github-output"

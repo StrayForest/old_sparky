@@ -1361,7 +1361,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn('"ref": "dev"', auto)
         self.assertIn('"web_compression": "enabled"', auto)
         self.assertIn('"runtime_profile": "authenticated-read-admission-24x8"', auto)
-        self.assertIn("Refusing stale dispatch", auto)
+        self.assertIn("platform_autodeploy_freshness_guard.py", auto)
+        self.assertIn('--expected-sha "$TARGET_SHA"', auto)
 
     def test_live_qa_runtime_installer_change_is_deployable_and_runtime_sensitive(self) -> None:
         installer = "platform/tools/platform_live_qa_runtime_install.py"

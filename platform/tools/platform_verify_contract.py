@@ -266,10 +266,11 @@ def workflow_level_permission_issues() -> list[str]:
 
 
 def source_bound_backup_dispatch_issues(workflow_text: str) -> list[str]:
-    """Require the exact backup proof to gate the only production child POST."""
+    """Require backup proof, readiness, and source revalidation to gate one child POST."""
 
     issues: list[str] = []
     guard_name = "Verify exact source-bound restore-verified backup"
+    recheck_name = "Revalidate exact successful source-bound backup"
     dispatch_name = "Dispatch production deployment or baseline reconciliation"
     try:
         document = yaml.safe_load(workflow_text)
@@ -292,27 +293,50 @@ def source_bound_backup_dispatch_issues(workflow_text: str) -> list[str]:
             if isinstance(run, str):
                 all_run_text.append(run)
     guards = [(job_name, step) for job_name, name, step in step_rows if name == guard_name]
+    rechecks = [(job_name, step) for job_name, name, step in step_rows if name == recheck_name]
     dispatches = [(job_name, step) for job_name, name, step in step_rows if name == dispatch_name]
     if len(guards) != 1:
         return ["auto-deploy must contain exactly one source-bound backup proof step"]
     if len(dispatches) != 1:
         return ["auto-deploy must contain exactly one production dispatch step"]
+    if len(rechecks) != 1:
+        return ["auto-deploy must revalidate the successful source-bound backup before dispatch"]
     guard_job, guard = guards[0]
+    recheck_job, recheck = rechecks[0]
     dispatch_job, dispatch = dispatches[0]
-    guard_index = next(index for index, (_, _, step) in enumerate(step_rows) if step is guard)
-    dispatch_index = next(index for index, (_, _, step) in enumerate(step_rows) if step is dispatch)
-    if guard_index >= dispatch_index:
-        issues.append("source-bound backup proof must precede the production dispatch")
-    if guard_job != dispatch_job:
-        issues.append("source-bound backup proof and production dispatch must be in the same job")
+    jobs = document["jobs"]
+    dispatch_job_config = jobs.get(guard_job)
+    final_job_config = jobs.get(dispatch_job)
+    if guard_job != "dispatch":
+        issues.append("source-bound backup proof must run in the non-production coordinator job")
+    if dispatch_job != "dispatch-production" or recheck_job != dispatch_job:
+        issues.append("final backup proof and production dispatch must share the source-revalidating child job")
+    if not isinstance(dispatch_job_config, dict) or not isinstance(final_job_config, dict):
+        return issues + ["auto-deploy backup and dispatch jobs must be valid mappings"]
+    if "host-readiness" not in _workflow_job_needs(_workflow_job_block(workflow_text, "dispatch-production")):
+        issues.append("production child dispatch must wait for host generation readiness")
+    if "dispatch" not in _workflow_job_needs(_workflow_job_block(workflow_text, "dispatch-production")):
+        issues.append("production child dispatch must wait for source-bound backup proof")
+    final_if = str(final_job_config.get("if", ""))
+    if (
+        "needs.dispatch.result == 'success'" not in final_if
+        or "needs.dispatch.outputs.deploy == 'true'" not in final_if
+        or "needs.host-readiness.result == 'success'" not in final_if
+    ):
+        issues.append("production dispatch job must require both exact readiness and deploy eligibility")
+    concurrency = document.get("concurrency")
+    if (
+        not isinstance(concurrency, dict)
+        or concurrency.get("cancel-in-progress") is not False
+        or "workflow_run.id" not in str(concurrency.get("group", ""))
+        or "workflow_run.run_attempt" not in str(concurrency.get("group", ""))
+    ):
+        issues.append("auto-deploy coordination must be source-run scoped and non-cancelling")
     guard_keys = {"name", "if", "shell", "env", "run"}
     if set(guard) != guard_keys:
         issues.append("source-bound backup proof step must not add bypass or error-masking keys")
-    if (
-        guard.get("if") != "${{ steps.gate.outputs.deploy == 'true' }}"
-        or dispatch.get("if") != "${{ steps.gate.outputs.deploy == 'true' }}"
-    ):
-        issues.append("backup proof and production dispatch must share the deploy-success condition")
+    if guard.get("if") != "${{ steps.gate.outputs.deploy == 'true' }}":
+        issues.append("initial backup proof must require deploy eligibility")
     expected_env = {
         "GH_TOKEN": "${{ github.token }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
@@ -330,6 +354,27 @@ def source_bound_backup_dispatch_issues(workflow_text: str) -> list[str]:
         or guard.get("run", "").strip() != expected_run
     ):
         issues.append("source-bound backup proof must run only the exact guard with exact Security source inputs")
+    if set(recheck) != {"name", "shell", "env", "run"}:
+        issues.append("final backup recheck must not add bypass or error-masking keys")
+    if (
+        recheck.get("shell") != "bash"
+        or recheck.get("env") != expected_env
+        or not isinstance(recheck.get("run"), str)
+        or recheck.get("run", "").strip() != expected_run
+    ):
+        issues.append("final backup recheck must use exact Security source inputs")
+    final_steps = final_job_config.get("steps")
+    if not isinstance(final_steps, list):
+        issues.append("final production dispatch job must define its ordered steps")
+        final_steps = []
+    names = [step.get("name") for step in final_steps if isinstance(step, dict)]
+    try:
+        if names.index("Revalidate current dev and exact successful Security run") >= names.index(dispatch_name):
+            issues.append("current dev and Security source must be revalidated before child dispatch")
+        if names.index(recheck_name) >= names.index(dispatch_name):
+            issues.append("final backup recheck must precede the production child dispatch")
+    except ValueError:
+        issues.append("source revalidation, final backup recheck, and child dispatch must all be present")
     if set(dispatch) - {"name", "if", "shell", "env", "run"}:
         issues.append("production dispatch step must not use a bypass or error-masking key")
     dispatch_run = dispatch.get("run")
@@ -340,15 +385,24 @@ def source_bound_backup_dispatch_issues(workflow_text: str) -> list[str]:
     total_posts = sum(run.count("--request POST") for run in all_run_text)
     total_endpoints = sum(run.count(endpoint) for run in all_run_text)
     post_index = dispatch_run.find("--request POST")
-    freshness_index = dispatch_run.find('test "$dev_sha" = "$TARGET_SHA"')
+    final_source_recheck = next(
+        (
+            step for step in final_steps
+            if isinstance(step, dict)
+            and step.get("name") == "Revalidate current dev and exact successful Security run"
+        ),
+        {},
+    )
+    freshness_body = final_source_recheck.get("run", "")
     if total_endpoints != 1 or total_posts != 1 or endpoint not in dispatch_run:
         issues.append("auto-deploy must have one post-proof production dispatch POST")
     if (
         dispatch.get("shell") != "bash"
         or "set -euo pipefail" not in dispatch_run
-        or freshness_index < 0
+        or 'platform_autodeploy_freshness_guard.py' not in freshness_body
+        or '--response "$metadata_dir/dev.json"' not in freshness_body
+        or '--expected-sha "$TARGET_SHA"' not in freshness_body
         or post_index < 0
-        or freshness_index > post_index
     ):
         issues.append("production dispatch must fail closed and recheck dev SHA before its only POST")
     return issues
@@ -663,6 +717,10 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
     if host_preflight:
         if "environment: production" not in host_preflight:
             issues.append("host capability preflight must own the production environment")
+        if "needs.validate-dispatch.result == 'success'" not in host_preflight:
+            issues.append("host capability preflight must depend on exact dispatch provenance validation")
+        if "TARGET_SHA: ${{ github.sha }}" not in host_preflight:
+            issues.append("host capability preflight source checkout must bind to the validated workflow SHA")
         if "- build-host-tools" not in host_preflight:
             issues.append("host capability preflight must wait for the exact host-tools artifact")
         if "needs.build-host-tools.result == 'success'" not in host_preflight:
@@ -673,20 +731,40 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host capability preflight must consume the pinned HOST_TOOLS_SHA output")
         if "/opt/oldsparky/platform/shared/host-tools/${{ needs.build-host-tools.outputs.host_tools_sha }}" not in host_preflight:
             issues.append("host capability preflight must address the pinned host-tools generation")
-        if "actions/checkout@" in host_preflight:
-            issues.append("host capability preflight must not checkout repository source")
+        if (
+            "Checkout exact source containing shared host verifier" not in host_preflight
+            or "ref: ${{ env.TARGET_SHA }}" not in host_preflight
+            or "path: target-source" not in host_preflight
+            or "fetch-depth: 1" not in host_preflight
+            or "persist-credentials: false" not in host_preflight
+        ):
+            issues.append("host capability preflight must checkout the exact target only for the shared verifier")
         if "platform_host_tools_bundle.py" in host_preflight:
             issues.append("host capability preflight must not execute the bundle verifier")
         for command in ("/usr/bin/zipinfo", "/usr/bin/unzip", "files.sha256", "files.modes"):
             if command not in host_preflight:
                 issues.append(f"host capability preflight must validate bundle data with {command}")
-        for command in ("/usr/bin/id -u", "/usr/bin/stat", "/usr/bin/sha256sum", "/usr/bin/test"):
-            if command not in host_preflight:
-                issues.append(f"host capability preflight must use fixed {command} checks")
-        if any(marker in host_preflight for marker in ("bash -s", "python -c", "platform_host_tools_install")):
+        shared_verifier_source = (
+            PLATFORM_ROOT / "tools" / "platform_host_tools_installed_check.py"
+        ).read_text(encoding="utf-8")
+        for command in (
+            '_remote(remote, "/usr/bin/id", "-u")',
+            '_remote(remote, "/usr/bin/stat", "-c", "%F:%u:%g:%h:%a"',
+            '_remote(remote, "/usr/bin/sha256sum", "--"',
+            '_remote(remote, "/usr/bin/test", "-d"',
+        ):
+            if command not in shared_verifier_source:
+                issues.append(f"shared host verifier must retain fixed {command} checks")
+        if any(marker in host_preflight for marker in ("bash -s", "python -c", "platform_host_tools_install.py")):
             issues.append("host capability preflight must not execute dynamic or self-installing code")
-        if "platform/tools/platform_workflow_remote_dispatch.py" in host_preflight:
-            issues.append("host capability preflight must not execute repository checkout source")
+        shared_verifier_markers = (
+            '"$GITHUB_WORKSPACE/target-source/platform/tools/platform_host_tools_installed_check.py"',
+            '--source-sha "$HOST_TOOLS_SHA"',
+            '--toolset-version "$HOST_TOOLS_TOOLSET_VERSION"',
+            '--contract-dir "$RUNNER_TEMP/host-tools-download/contract"',
+        )
+        if any(marker not in host_preflight for marker in shared_verifier_markers):
+            issues.append("host capability preflight must invoke the shared verifier with the staged exact-pin contract")
         capability_contract_markers = (
             'source_sha != sys.argv[8] or version != sys.argv[9]',
             'if version == "production-host-tools-v3":',
@@ -758,73 +836,34 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host capability preflight must cover both production dispatch modes")
 
         steps = _workflow_step_blocks(host_preflight)
-        integrity_step_index = next(
-            (
-                index
-                for index, step in enumerate(steps)
-                if "- name: Validate root SSH identity and installed generation" in step
-            ),
-            None,
-        )
-        probe_step_index = next(
-            (
-                index
-                for index, step in enumerate(steps)
-                if "- name: Probe immutable host dispatcher capabilities" in step
-            ),
-            None,
-        )
-        if integrity_step_index is None:
-            issues.append("host capability preflight must inventory the installed generation")
-        if probe_step_index is None:
-            issues.append("host capability preflight must execute an immutable capability probe")
-        if (
-            integrity_step_index is not None
-            and probe_step_index is not None
-            and probe_step_index <= integrity_step_index
-        ):
-            issues.append("host capability probe must follow the complete generation inventory")
-        if probe_step_index is not None:
-            probe_step = steps[probe_step_index]
+        verifier_steps = [
+            step for step in steps
+            if "- name: Validate root SSH identity and installed generation" in step
+        ]
+        if len(verifier_steps) != 1:
+            issues.append("host capability preflight must run exactly one shared generation verifier")
+        elif not all(
+            marker in verifier_steps[0]
             for marker in (
-                '/usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-capabilities',
-                "/usr/bin/timeout --signal=TERM --kill-after=2s 15s",
-                "ulimit -f 1",
-                "remote=(ssh -n -T ",
-                "< /dev/null",
-                ") 2>/dev/null < /dev/null | /usr/bin/head -c 512 > \"$probe_output\"",
-                'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA '
-                'dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 '
-                'retained_load_export_cleanup=1 retained_load_source_binding=1 '
-                'cpu_diagnostic_plan_control=1 '
-                'python_isolated=1 python_bytecode_disabled=1"',
-                'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
-                "command_rc=",
-                "expected_bytes=",
-                "actual_bytes=",
-                "expected_sha256=",
-                "actual_sha256=",
-                "actual_cr_count=",
-                "actual_lf_count=",
-                "exact_one_line=",
-            ):
-                if marker not in probe_step:
-                    issues.append(f"host capability probe is missing fixed contract marker: {marker}")
-            ssh_dir_stat = 'test "$(stat -c \'%F:%a\' -- "$HOST_TOOLS_SSH_DIR")" = "directory:700"'
-            if ssh_dir_stat not in probe_step:
-                issues.append("host capability probe must accept real SSH directory link counts")
-            ssh_dir_owner = 'test "$(stat -c \'%u:%g\' -- "$HOST_TOOLS_SSH_DIR")" = "$(id -u):$(id -g)"'
-            if ssh_dir_owner not in probe_step:
-                issues.append("host capability probe must retain SSH directory ownership checks")
-            if 'stat -c \'%F:%h:%a\' -- "$HOST_TOOLS_SSH_DIR"' in probe_step:
-                issues.append("host capability probe must not require SSH directory nlink 1")
-            if not re.search(
-                r'^\s+"\$\{remote\[@\]\}" /usr/bin/python3\.12 -I -B '
-                r'"\$HOST_TOOLS_DISPATCHER" host-capabilities$',
-                probe_step,
-                re.MULTILINE,
-            ):
-                issues.append("host capability probe must invoke the immutable dispatcher with fixed argv")
+                "platform_host_tools_installed_check.py",
+                "--source-sha \"$HOST_TOOLS_SHA\"",
+                "--toolset-version \"$HOST_TOOLS_TOOLSET_VERSION\"",
+                "--contract-dir \"$RUNNER_TEMP/host-tools-download/contract\"",
+            )
+        ):
+            issues.append("host capability preflight shared verifier must use the staged exact-pin contract")
+        if any("- name: Probe immutable host dispatcher capabilities" in step for step in steps):
+            issues.append("host capability preflight must not retain a duplicate inline dispatcher verifier")
+        if not re.search(r'HOST_KEY_FINGERPRINT = "SHA256:[A-Za-z0-9+/+=]+"', shared_verifier_source):
+            issues.append("shared host verifier must pin the production SSH host key")
+        ssh_setup_markers = (
+            "ssh-keyscan -T 3 -t ed25519",
+            "ssh-keygen -lf",
+            "StrictHostKeyChecking yes",
+            "platform-host-capability-ssh",
+        )
+        if any(marker not in host_preflight for marker in ssh_setup_markers):
+            issues.append("host capability preflight must stage the pinned SSH identity safely")
 
     if preflight:
         preflight_needs = _workflow_job_needs(preflight)

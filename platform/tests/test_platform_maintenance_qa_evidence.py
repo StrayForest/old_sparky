@@ -13,6 +13,7 @@ import tempfile
 import textwrap
 import unittest
 import zipfile
+from types import SimpleNamespace
 from urllib.request import Request
 from unittest.mock import patch
 
@@ -526,6 +527,73 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
         for case, output in invalid_outputs:
             with self.subTest(case=case), self.assertRaises(evidence.EvidenceError):
                 validate(source_bytes, source_bytes, installed_path, output)
+
+    def test_diagnostic_preview_executes_only_argv_derived_from_validated_unit(self) -> None:
+        from tools import platform_storage_maintenance as maintenance
+
+        source_path = REPO_ROOT / "platform/deploy/systemd/deadlock-maintenance.service"
+        source_bytes = source_path.read_bytes()
+        preview_argv = evidence.maintenance_preview_argv()
+        self.assertNotIn("--apply", preview_argv)
+        self.assertIn("--json", preview_argv)
+        self.assertIn("--protected-backup-manifest", preview_argv)
+        self.assertIn("/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json", preview_argv)
+        self.assertIn("--backup-keep", preview_argv)
+        self.assertIn("15", preview_argv)
+        for slug in (
+            "gha-38000614899-1-7e5769ba3f85",
+            "gha-37760797674-1-80e457e57081",
+        ):
+            self.assertIn(slug, preview_argv)
+        properties = _loaded_unit_properties()
+        with patch.object(
+            evidence.subprocess, "run", return_value=SimpleNamespace(returncode=0)
+        ) as run, patch.object(sys, "stdout", SimpleNamespace(buffer=io.BytesIO())), patch.object(
+            evidence,
+            "validate_loaded_maintenance_unit",
+            side_effect=lambda _source, installed, output: evidence._validate_maintenance_unit_bytes(
+                source_bytes, source_bytes, installed, output
+            ),
+        ):
+            self.assertEqual(
+                evidence.run_validated_maintenance_preview(
+                    str(source_path),
+                    "/etc/systemd/system/deadlock-maintenance.service",
+                    properties,
+                ),
+                0,
+            )
+        self.assertEqual(run.call_args.args[0], preview_argv)
+        self.assertEqual(run.call_args.kwargs["timeout"], 180)
+        self.assertNotIn("--apply", run.call_args.args[0])
+        previous_argv = sys.argv
+        try:
+            sys.argv = [preview_argv[0], *preview_argv[2:]]
+            args = maintenance.parse_args()
+        finally:
+            sys.argv = previous_argv
+        self.assertEqual(
+            tuple(args.protected_release),
+            (
+                "gha-38000614899-1-7e5769ba3f85",
+                "gha-37760797674-1-80e457e57081",
+            ),
+        )
+        invalid = properties.replace("NeedDaemonReload=no", "NeedDaemonReload=yes")
+        with patch.object(evidence.subprocess, "run") as run, patch.object(
+            evidence,
+            "validate_loaded_maintenance_unit",
+            side_effect=lambda _source, installed, output: evidence._validate_maintenance_unit_bytes(
+                source_bytes, source_bytes, installed, output
+            ),
+        ):
+            with self.assertRaises(evidence.EvidenceError):
+                evidence.run_validated_maintenance_preview(
+                    str(source_path),
+                    "/etc/systemd/system/deadlock-maintenance.service",
+                    invalid,
+                )
+        run.assert_not_called()
 
     def test_stale_loaded_unit_preflight_exits_before_service_start(self) -> None:
         workflow = (

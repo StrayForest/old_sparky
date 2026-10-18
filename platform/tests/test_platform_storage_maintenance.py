@@ -1792,6 +1792,77 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             ), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 maintenance.parse_args()
 
+    def test_protected_release_args_are_validated_before_maintenance(self) -> None:
+        base = [
+            "--protected-release", "gha-38000614899-1-7e5769ba3f85",
+            "--protected-release", "gha-37760797674-1-80e457e57081",
+        ]
+        with mock.patch.object(maintenance.sys, "argv", ["platform_storage_maintenance.py", *base]):
+            args = maintenance.parse_args()
+        self.assertEqual(
+            args.protected_release,
+            ["gha-38000614899-1-7e5769ba3f85", "gha-37760797674-1-80e457e57081"],
+        )
+        invalid = (
+            ["--protected-release", "gha-38000614899-1-7e5769ba3f85", "--protected-release", "gha-38000614899-1-7e5769ba3f85"],
+            ["--protected-release", "../unsafe"],
+        )
+        for options in invalid:
+            with self.subTest(options=options), mock.patch.object(
+                maintenance.sys,
+                "argv",
+                ["platform_storage_maintenance.py", *options],
+            ), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                maintenance.parse_args()
+
+    def test_cli_protected_releases_are_passed_to_retention_plan(self) -> None:
+        protected = (
+            "gha-38000614899-1-7e5769ba3f85",
+            "gha-37760797674-1-80e457e57081",
+        )
+        args = SimpleNamespace(
+            release_keep=0,
+            protected_release=list(protected),
+            source_release_dir=None,
+            failed_build_max_age_days=1,
+            web_artifact_dir=self.root / "web",
+            test_artifact_max_age_days=7,
+            screenshot_max_age_days=30,
+            report_keep=30,
+            live_qa_runtime_keep=1,
+            backup_keep=15,
+            backup_max_age_hours=24,
+            minimum_free_gib=5,
+            maximum_used_percent=85,
+        )
+        app_dir = self.root / "platform"
+        (app_dir / "releases").mkdir(parents=True)
+        (app_dir / "shared").mkdir()
+        args.apply = False
+        args.skip_backup = True
+        args.web_artifact_dir.mkdir(parents=True)
+        for slug in ("current-release", "previous-release", *protected):
+            self.add_runtime_release(app_dir, slug)
+        (app_dir / "current").symlink_to("releases/current-release")
+        (app_dir / "previous").symlink_to("releases/previous-release")
+        production_plan = maintenance._plan_and_maybe_apply(
+            args,
+            app_dir=app_dir,
+            source_release_dir=None,
+        )[0]
+        self.assertEqual(
+            {entry.path.name for entry in production_plan.retained} & set(protected),
+            set(protected),
+        )
+        self.assertNotIn(
+            "gha-38000614899-1-7e5769ba3f85",
+            {entry.path.name for entry in production_plan.candidates},
+        )
+        self.assertNotIn(
+            "gha-37760797674-1-80e457e57081",
+            {entry.path.name for entry in production_plan.candidates},
+        )
+
     def test_backup_failure_prevents_retention_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
         (app_dir / "shared").mkdir(parents=True)
@@ -2474,6 +2545,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "--protected-backup-manifest "
                 "/opt/oldsparky/platform/shared/backup-retention/"
                 "protected-dump-files.json --backup-keep 15 "
+                "--protected-release gha-38000614899-1-7e5769ba3f85 "
+                "--protected-release gha-37760797674-1-80e457e57081 "
                 "--release-keep 5 --test-artifact-max-age-days 7 "
                 "--screenshot-max-age-days 30 --failed-build-max-age-days 1 "
                 "--minimum-free-gib 5 --maximum-used-percent 85"

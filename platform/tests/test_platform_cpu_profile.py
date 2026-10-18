@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import io
+import subprocess
+import sys
 import tempfile
+import stat
+import threading
+from contextlib import redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from argparse import Namespace
 from pathlib import Path
@@ -14,6 +20,9 @@ from unittest.mock import patch
 from python_packages.platform_infra.cpu_profile import ReadyVoteCpuProfiler
 from tools import platform_cpu_diagnostic_pair as cpu_pair
 from tools import platform_external_load as external_load
+from tools import platform_ssr_capacity_control as capacity_control
+from tools import platform_ssr_capacity_diagnostic as capacity_diagnostic
+from tools import platform_workflow_remote_dispatch as remote_dispatch
 from python_packages.platform_infra.performance_diagnostic import (
     ApiCpuDiagnostic,
     parse_plan_payload,
@@ -53,6 +62,756 @@ def _canonical_payload(payload: dict[str, object]) -> bytes:
 
 
 class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
+    def test_ssr_capacity_control_is_bound_atomic_fresh_and_accepts_complete(self) -> None:
+        expected = {
+            "run_id": "a" * 32,
+            "source_sha": "b" * 40,
+            "app_target_sha": "c" * 40,
+            "profile_digest": "d" * 64,
+            "external_run_id": "12345",
+            "external_run_attempt": "1",
+        }
+
+        def record(sequence: int, decision: str = "continue", reason: str = "none"):
+            return {
+                "schema": 1, **expected, "decision": decision, "reason": reason,
+                "sequence": sequence, "updated_monotonic_ns": 10_000_000_000 + sequence,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capacity-control.json"
+            capacity_control.write_control(
+                path, record(1), expected=expected, now_monotonic_ns=10_000_000_001,
+            )
+            first = capacity_control.read_control(
+                path, expected=expected, now_monotonic_ns=10_000_000_002,
+            )
+            self.assertEqual(first["decision"], "continue")
+            self.assertEqual(
+                capacity_control.stop_reason_from_control(
+                    path, expected=expected, previous_sequence=first["sequence"],
+                    now_monotonic_ns=10_000_000_002,
+                ),
+                (None, first["sequence"]),
+            )
+            capacity_control.write_control(
+                path, record(2, "complete"), expected=expected, now_monotonic_ns=10_000_000_002,
+            )
+            complete = capacity_control.read_control(
+                path, expected=expected, previous_sequence=1,
+                now_monotonic_ns=10_000_000_003,
+            )
+            self.assertEqual(complete["decision"], "complete")
+            self.assertEqual(
+                capacity_control.stop_reason_from_control(
+                    path, expected=expected, previous_sequence=1,
+                    now_monotonic_ns=10_000_000_003,
+                ),
+                ("window_complete", 2),
+            )
+            with self.assertRaises(capacity_control.CapacityControlError):
+                capacity_control.read_control(
+                    path, expected={**expected, "source_sha": "e" * 40},
+                    now_monotonic_ns=10_000_000_003,
+                )
+            with self.assertRaises(capacity_control.CapacityControlError):
+                capacity_control.write_control(
+                    path, record(3, "abort", "memory_floor"), expected=expected,
+                    now_monotonic_ns=12_000_000_000,
+                )
+
+    def test_ssr_capacity_control_rejects_symlink_destination(self) -> None:
+        expected = {
+            "run_id": "a" * 32,
+            "source_sha": "b" * 40,
+            "app_target_sha": "c" * 40,
+            "profile_digest": "d" * 64,
+            "external_run_id": "12345",
+            "external_run_attempt": "1",
+        }
+        record = {
+            "schema": 1, **expected, "decision": "continue", "reason": "none",
+            "sequence": 1, "updated_monotonic_ns": 10_000_000_000,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+            target.write_text("retained", encoding="ascii")
+            link = Path(directory) / "capacity-control.json"
+            link.symlink_to(target)
+            with self.assertRaises(capacity_control.CapacityControlError):
+                capacity_control.write_control(
+                    link, record, expected=expected, now_monotonic_ns=10_000_000_001,
+                )
+            self.assertEqual(target.read_text(encoding="ascii"), "retained")
+
+    def test_ssr_capacity_watch_uses_bound_plan_wall_clock_windows(self) -> None:
+        plan = {
+            "off_start_ms": 2_000, "off_end_ms": 22_000,
+            "on_start_ms": 27_000, "on_end_ms": 47_000,
+        }
+        unit = {
+            "ActiveState": "active", "InvocationID": "f" * 32,
+            "MainPID": "345", "ControlGroup": "/system.slice/deadlock-web.service",
+        }
+        target = {"pid": 345, "start_ticks": 123, "invocation_id": "f" * 32}
+        values = {
+            "memory.current": "1024", "memory.peak": "2048",
+            "memory.max": str(diagnostic_plan_tool.SSR_CAPACITY_MEMORY_MAX_BYTES),
+            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+        }
+        with (
+            patch.object(diagnostic_plan_tool, "_capacity_plan_identity", return_value=(unit, target, plan)),
+            patch.object(diagnostic_plan_tool, "_systemd_memory_max", return_value=diagnostic_plan_tool.SSR_CAPACITY_MEMORY_MAX_BYTES),
+            patch.object(diagnostic_plan_tool, "_systemd_unit", return_value=unit),
+            patch.object(diagnostic_plan_tool, "_service_targets", return_value=[target]),
+            patch.object(diagnostic_plan_tool, "_read_cgroup_pseudo", side_effect=lambda path, maximum: values[path.name]),
+            patch.object(diagnostic_plan_tool.time, "time_ns", side_effect=[1_000_000_000, 22_000_000_000, 47_000_000_000]),
+            patch.object(diagnostic_plan_tool.time, "sleep"),
+        ):
+            rows = list(diagnostic_plan_tool.watch_capacity_memory(Namespace(run_id="a" * 32, source_sha="b" * 40)))
+        self.assertEqual([row["decision"] for row in rows], ["continue", "continue", "complete"])
+        self.assertEqual([row["phase"] for row in rows], ["off", "idle", "complete"])
+        self.assertEqual([row["elapsed_ms"] for row in rows], [0, 20_000, 45_000])
+        self.assertTrue(all(row["plan_on_start_ms"] == 27_000 for row in rows))
+
+    def test_ssr_capacity_remote_observation_maps_only_bound_abort_to_worker_control(self) -> None:
+        binding = {
+            "run_id": "a" * 32, "source_sha": "b" * 40,
+            "app_target_sha": "c" * 40, "profile_digest": "d" * 64,
+            "external_run_id": "12345", "external_run_attempt": "1",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            control_path = Path(directory) / "capacity-control.json"
+            watcher = capacity_diagnostic._RemoteMemoryWatcher(
+                ssh_host="host", ssh_user="user", ssh_config=Path("/tmp/config"),
+                ssh_key=Path("/tmp/key"), control_path=control_path,
+                binding=binding, run_id=binding["run_id"], source_sha=binding["app_target_sha"],
+                expected_plan=(1_000, 26_000, 46_000),
+            )
+            row = {
+                "schema": 1, "run_id": binding["run_id"],
+                "source_sha": binding["app_target_sha"],
+                "workload": capacity_diagnostic.WORKLOAD, "sequence": 1,
+                "elapsed_ms": 0, "phase": "off", "sampled_at_ms": 1_000,
+                "plan_off_start_ms": 1_000, "plan_on_start_ms": 26_000,
+                "plan_on_end_ms": 46_000, "decision": "abort", "reason": "memory_floor",
+                "memory_current_bytes": 805_306_368, "memory_peak_bytes": 810_000_000,
+                "memory_max_bytes": 1_073_741_824,
+                "memory_events_delta": {name: 0 for name in (
+                    "low", "high", "max", "oom", "oom_kill", "oom_group_kill",
+                )},
+                "target_pid": 345, "target_start_ticks": 123,
+                "target_invocation_id": "f" * 32, "identity_status": "complete",
+            }
+            watcher._accept(row)
+            control = capacity_control.read_control(
+                control_path, expected=binding, now_monotonic_ns=time.monotonic_ns(),
+            )
+            self.assertEqual(control["decision"], "abort")
+            self.assertEqual(control["reason"], "memory_floor")
+            self.assertEqual(watcher.stop()["status"], "complete")
+            tampered = {**row, "sequence": 2, "source_sha": "e" * 40}
+            with self.assertRaises(ValueError):
+                watcher._accept(tampered)
+            mismatched_window = {**row, "sequence": 2, "plan_on_start_ms": 27_000, "plan_on_end_ms": 47_000}
+            with self.assertRaises(ValueError):
+                watcher._accept(mismatched_window)
+
+    def test_ssr_capacity_remote_identity_failure_preserves_typed_abort_reason(self) -> None:
+        binding = {
+            "run_id": "a" * 32, "source_sha": "b" * 40,
+            "app_target_sha": "c" * 40, "profile_digest": "d" * 64,
+            "external_run_id": "12345", "external_run_attempt": "1",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            control_path = Path(directory) / "capacity-control.json"
+            watcher = capacity_diagnostic._RemoteMemoryWatcher(
+                ssh_host="host", ssh_user="user", ssh_config=Path("/tmp/config"),
+                ssh_key=Path("/tmp/key"), control_path=control_path,
+                binding=binding, run_id=binding["run_id"], source_sha=binding["app_target_sha"],
+                expected_plan=(1_000, 26_000, 46_000),
+            )
+            row = {
+                "schema": 1, "run_id": binding["run_id"],
+                "source_sha": binding["app_target_sha"], "workload": capacity_diagnostic.WORKLOAD,
+                "sequence": 1, "elapsed_ms": 0, "phase": "off", "sampled_at_ms": 1_000,
+                "plan_off_start_ms": 1_000, "plan_on_start_ms": 26_000,
+                "plan_on_end_ms": 46_000, "decision": "abort", "reason": "identity_changed",
+                "memory_current_bytes": None, "memory_peak_bytes": None,
+                "memory_max_bytes": None, "memory_events_delta": None,
+                "target_pid": 345, "target_start_ticks": 123,
+                "target_invocation_id": "f" * 32, "identity_status": "invalid",
+            }
+            watcher._accept(row)
+            control = capacity_control.read_control(
+                control_path, expected=binding, now_monotonic_ns=time.monotonic_ns(),
+            )
+            self.assertEqual(control["decision"], "abort")
+            self.assertEqual(control["reason"], "identity_changed")
+            self.assertEqual(watcher.stop()["terminal_reason"], "identity_changed")
+
+    def test_ssr_capacity_parent_rejects_worker_report_binding_mutations(self) -> None:
+        binding = {
+            "run_id": "a" * 32, "source_sha": "b" * 40,
+            "app_target_sha": "c" * 40, "profile_digest": "d" * 64,
+            "external_run_id": "12345", "external_run_attempt": "1",
+        }
+        config = {
+            "binding": binding, "manifest_sha256": "e" * 64,
+            "manifest_bytes": 2048,
+            "concurrency": 8, "on_start_ms": 26_000, "on_end_ms": 46_000,
+        }
+        report = {
+            "report_complete": True, "schema": 1,
+            "workload": capacity_diagnostic.WORKLOAD,
+            "fixture_kind": capacity_diagnostic.FIXTURE_KIND,
+            **binding,
+            "fixture_manifest_sha256": "e" * 64,
+            "concurrency": 8, "actors": 8,
+            "fixture_tournaments": 1, "fixture_users": 14,
+            "fixture_manifest_bytes": 2048,
+            "load_model": "closed_loop_best_effort", "window_ms": 20_000,
+            "on_window_start_ms": 26_000, "on_window_end_ms": 46_000,
+            "matrix_credit": False, "slo_credit": False,
+            "diagnostic_credit": False, "namespace_closed": False,
+            "status": "complete", "submitted": 40, "completed": 40,
+            "max_inflight": 8, "response_bytes_total": 8192,
+            "observed_duration_ms": 20_000,
+            "http_status_counts": {"200": 40}, "error_counts": {},
+            "latency_ms": {"sample_count": 40, "p50": 10.0, "p95": 20.0, "p99": 25.0, "max": 30.0},
+            "off_probe": {"submitted": 8, "completed": 8, "http_status": 200},
+            "resource_abort_reason": None, "passed": True,
+            "generator_headroom": {"status": "complete"},
+            "server_capacity_claim": None,
+            "server_capacity_claim_reason": "resource_correlation_not_provided",
+        }
+        self.assertTrue(capacity_diagnostic._worker_report_matches(report, config))
+        one_probe = json.loads(json.dumps(report))
+        one_probe["off_probe"] = {"submitted": 1, "completed": 1, "http_status": 200}
+        self.assertFalse(capacity_diagnostic._worker_report_matches(one_probe, config))
+        for key, value in (
+            ("source_sha", "f" * 40), ("app_target_sha", "f" * 40),
+            ("external_run_id", "54321"), ("external_run_attempt", "2"),
+            ("run_id", "f" * 32), ("profile_digest", "f" * 64),
+            ("fixture_manifest_sha256", "f" * 64), ("concurrency", 16),
+            ("on_window_end_ms", 46_001),
+        ):
+            with self.subTest(field=key):
+                self.assertFalse(capacity_diagnostic._worker_report_matches(
+                    {**report, key: value}, config,
+                ))
+
+    def test_ssr_capacity_remote_complete_cannot_end_local_window_early(self) -> None:
+        self.assertEqual(
+            capacity_diagnostic._guard_reason_for_local_window(
+                "window_complete", local_window_end_monotonic=20.0, now_monotonic=19.999,
+            ),
+            "observer_timing_error",
+        )
+        self.assertEqual(
+            capacity_diagnostic._guard_reason_for_local_window(
+                "window_complete", local_window_end_monotonic=20.0, now_monotonic=20.0,
+            ),
+            "window_complete",
+        )
+        self.assertIsNone(capacity_diagnostic._guard_reason_for_local_window(
+            None, local_window_end_monotonic=20.0, now_monotonic=19.0,
+        ))
+
+    def test_ssr_capacity_evaluator_requires_complete_bound_zero_credit_evidence(self) -> None:
+        report = {
+            "schema": 1, "report_complete": True,
+            "workload": capacity_diagnostic.WORKLOAD,
+            "fixture_kind": capacity_diagnostic.FIXTURE_KIND,
+            "status": "complete", "passed": True,
+            "matrix_credit": False, "slo_credit": False, "diagnostic_credit": False,
+            "source_sha": "b" * 40, "app_target_sha": "c" * 40,
+            "external_run_id": "12345", "external_run_attempt": "1",
+            "run_id": "a" * 32, "profile_digest": capacity_diagnostic.profile_digest(8),
+            "fixture_manifest_sha256": "e" * 64,
+            "fixture_manifest_bytes": 2048,
+            "fixture_tournaments": 1, "fixture_users": 14, "actors": 8,
+            "concurrency": 8, "max_inflight": 8,
+            "load_model": "closed_loop_best_effort", "window_ms": 20_000,
+            "namespace_closed": True,
+            "worker": {
+                "status": "complete", "submitted": 40, "completed": 40,
+                "max_inflight": 8, "fixture_manifest_bytes": 2048,
+                "response_bytes_total": 8192,
+                "http_status_counts": {"200": 40}, "error_counts": {},
+                "latency_ms": {"sample_count": 40, "p50": 10.0, "p95": 20.0, "p99": 25.0, "max": 30.0},
+                "resource_abort_reason": None,
+                "on_window_start_ms": 100_000, "on_window_end_ms": 120_000,
+                "observed_duration_ms": 20_000,
+                "off_probe": {"submitted": 8, "completed": 8, "http_status": 200},
+            },
+            "memory_guard": {
+                "status": "complete", "samples": 250,
+                "current_min_bytes": 300_000_000, "current_max_bytes": 400_000_000,
+                "memory_peak_lifetime_max_bytes": 500_000_000,
+                "memory_events_sampled_max_delta": {key: 0 for key in (
+                    "low", "high", "max", "oom", "oom_kill", "oom_group_kill",
+                )},
+                "target_identity_status": "complete", "terminal_decision": "complete",
+                "terminal_reason": "none", "ssh_material_restored": True,
+            },
+            "runner_headroom": {
+                "schema": 1, "status": "complete", "reason": "none",
+                "runner_environment": "github-hosted",
+                "identity": {key: True for key in (
+                    "outer_pid_namespace_matches_pid1", "outer_mount_namespace_matches_pid1",
+                    "outer_cgroup_namespace_matches_pid1", "target_cgroup_namespace_matches_outer",
+                    "target_mount_namespace_is_isolated", "target_pid_namespace_is_isolated",
+                    "global_cgroup2_mount", "workload_membership_matches_outer",
+                )},
+                "sample_count": 10, "window_seconds": 20.0,
+                "effective_cpu_capacity_cores": 4.0,
+                "max_cgroup_cpu_usage_cores": 1.2,
+                "max_visible_throttled_periods_delta": 0,
+                "window_scope": "on_window",
+                "window_start_offset_ms": 0,
+                "window_end_offset_ms": 20_000,
+            },
+            "server_telemetry": {
+                "schema": 1, "cpu_status": "complete", "cpu_reason": "none",
+                "cpu_rows": [
+                    {
+                        "service": service, "phase": phase,
+                        "expected_targets": targets, "observed_targets": targets,
+                        "event_count": targets, "cpu_ns": 1_000_000,
+                        "window_ms_min": 20_000, "window_ms_max": 20_000,
+                        "start_lag_ms_min": 0, "start_lag_ms_max": 0,
+                        "end_lag_ms_min": 0, "end_lag_ms_max": 0,
+                        "timing_complete": True,
+                    }
+                    for service, phase, targets in (
+                        ("api", "off", 2), ("api", "on", 2),
+                        ("web", "off", 1), ("web", "on", 1),
+                    )
+                ],
+                "node_memory_status": "complete", "node_memory_reason": "none",
+                "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
+                "node_memory_rows": [
+                    {
+                        "service": "web", "phase": phase, "status": "complete",
+                        "sample_count": 5, "rss_min_bytes": 1, "rss_max_bytes": 2,
+                        "rss_mean_bytes": 1, "heap_total_min_bytes": 1,
+                        "heap_total_max_bytes": 2, "heap_total_mean_bytes": 1,
+                        "heap_used_min_bytes": 1, "heap_used_max_bytes": 2,
+                        "heap_used_mean_bytes": 1, "heap_limit_min_bytes": 1,
+                        "heap_limit_max_bytes": 2, "heap_limit_mean_bytes": 1,
+                        "external_min_bytes": 1, "external_max_bytes": 2,
+                        "external_mean_bytes": 1, "array_buffers_min_bytes": 1,
+                        "array_buffers_max_bytes": 2, "array_buffers_mean_bytes": 1,
+                        "sampled_window_start_elapsed_ms": 0,
+                        "sampled_window_end_elapsed_ms": 16_000,
+                        "sampled_window_duration_ms": 16_000,
+                        "cgroup_sample_count": 5,
+                        "cgroup_memory_current_start_bytes": 1,
+                        "cgroup_memory_current_end_bytes": 1,
+                        "cgroup_memory_current_sampled_max_bytes": 1,
+                        "cgroup_memory_peak_start_bytes": 1,
+                        "cgroup_memory_peak_end_bytes": 1,
+                        "cgroup_memory_peak_sampled_max_bytes": 1,
+                        "memory_events_low_sampled_delta": 0,
+                        "memory_events_high_sampled_delta": 0,
+                        "memory_events_max_sampled_delta": 0,
+                        "memory_events_oom_sampled_delta": 0,
+                        "memory_events_oom_kill_sampled_delta": 0,
+                        "memory_events_oom_group_kill_sampled_delta": 0,
+                        "gc_count": 0, "gc_duration_ms": 0, "gc_major_count": 0,
+                        "gc_minor_count": 0, "gc_incremental_count": 0,
+                        "gc_weakcb_count": 0, "gc_other_count": 0,
+                        "gc_status": "complete", "cgroup_memory_status": "complete",
+                        "cgroup_memory_reason": "none", "gc_overflow": False,
+                    }
+                    for phase in ("off", "on")
+                ],
+            },
+            "server_capacity_claim": None,
+            "server_capacity_claim_reason": "resource_correlation_not_provided",
+            "remote_plan_cleanup": "complete",
+        }
+        self.assertIsNotNone(capacity_diagnostic._project_capacity_report(report))
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            report, source_sha="b" * 40, app_target_sha="c" * 40,
+            run_id="12345", attempt="1", manifest_sha256="e" * 64,
+        ), "PASS")
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            {**report, "matrix_credit": True}, source_sha="b" * 40,
+            app_target_sha="c" * 40, run_id="12345", attempt="1",
+            manifest_sha256="e" * 64,
+        ), "INVALID")
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            {**report, "status": "resource_abort", "passed": False},
+            source_sha="b" * 40, app_target_sha="c" * 40,
+            run_id="12345", attempt="1", manifest_sha256="e" * 64,
+        ), "FAIL")
+        missing_api_target = json.loads(json.dumps(report))
+        api_off = next(
+            row for row in missing_api_target["server_telemetry"]["cpu_rows"]
+            if row["service"] == "api" and row["phase"] == "off"
+        )
+        api_off["observed_targets"] = 1
+        api_off["event_count"] = 1
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            missing_api_target, source_sha="b" * 40, app_target_sha="c" * 40,
+            run_id="12345", attempt="1", manifest_sha256="e" * 64,
+        ), "INVALID")
+
+    def test_capacity_closed_loop_reuses_warmed_executor_and_never_zero_waits(self) -> None:
+        local = threading.local()
+        executor = ThreadPoolExecutor(max_workers=1)
+        warmed_thread = executor.submit(
+            lambda: (setattr(local, "http11_client", "warm"), threading.get_ident())[1]
+        ).result(timeout=2)
+        guard_calls = 0
+        wait_timeouts: list[float] = []
+        real_wait = external_load.wait
+
+        def stop_after_submit() -> str | None:
+            nonlocal guard_calls
+            guard_calls += 1
+            return None if guard_calls == 1 else "memory_floor"
+
+        def request_builder(_origin, _actor, _phase, _timeout):
+            self.assertEqual(getattr(local, "http11_client", None), "warm")
+            time.sleep(0.08)
+            return SimpleNamespace(
+                ok=True, status=200, elapsed_ms=80.0, response_bytes=1, error_kind=None,
+            )
+
+        def observed_wait(*args, **kwargs):
+            wait_timeouts.append(float(kwargs.get("timeout", args[1] if len(args) > 1 else 0)))
+            return real_wait(*args, **kwargs)
+
+        actor = external_load.VirtualUser("u", "t", "s" * 32, "c" * 32)
+        now_ms = time.time_ns() // 1_000_000
+        try:
+            with patch.object(external_load, "wait", side_effect=observed_wait):
+                result = external_load.run_authenticated_workspace_capacity_phase(
+                    "http://127.0.0.1:3000", [actor],
+                    phase="test_capacity", duration_seconds=20,
+                    start_at_epoch_ms=now_ms, end_at_epoch_ms=now_ms + 20_000,
+                    concurrency=1, timeout=1.0, request_builder=request_builder,
+                    stop_requested=stop_after_submit, executor=executor,
+                )
+            self.assertTrue(result["aborted"])
+            self.assertEqual(result["completed"], 1)
+            self.assertTrue(wait_timeouts)
+            self.assertTrue(all(timeout > 0 for timeout in wait_timeouts))
+            self.assertEqual(executor.submit(threading.get_ident).result(timeout=2), warmed_thread)
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_ssr_capacity_parent_hides_and_restores_only_exact_ssh_material(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ssh_dir = Path(directory) / "external-ssh"
+            ssh_dir.mkdir(mode=0o700)
+            os.chmod(ssh_dir, 0o700)
+            for name, contents in (
+                ("config", b"Host *\nStrictHostKeyChecking yes\n"),
+                ("id_ed25519", b"safe-test-key-material\n"),
+                ("known_hosts", b"host ssh-ed25519 AAAA\n"),
+            ):
+                path = ssh_dir / name
+                path.write_bytes(contents)
+                os.chmod(path, 0o600)
+            contents, lifecycle = capacity_diagnostic._hide_parent_ssh_material(ssh_dir)
+            self.assertFalse(ssh_dir.exists())
+            capacity_diagnostic._restore_parent_ssh_material(ssh_dir, contents, lifecycle)
+            self.assertEqual(
+                {path.name for path in ssh_dir.iterdir()},
+                {"config", "id_ed25519", "known_hosts"},
+            )
+            for path in ssh_dir.iterdir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_ssr_capacity_parent_rejects_ssh_symlink_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ssh_dir = root / "external-ssh"
+            ssh_dir.mkdir(mode=0o700)
+            target = root / "target"
+            target.write_bytes(b"unchanged")
+            for name, contents in (
+                ("id_ed25519", b"key\n"), ("known_hosts", b"host ssh-ed25519 AAAA\n"),
+            ):
+                path = ssh_dir / name
+                path.write_bytes(contents)
+                os.chmod(path, 0o600)
+            (ssh_dir / "config").symlink_to(target)
+            with self.assertRaises((OSError, ValueError)):
+                capacity_diagnostic._hide_parent_ssh_material(ssh_dir)
+            self.assertEqual(target.read_bytes(), b"unchanged")
+
+    def test_node_memory_event_parser_is_closed_bounded_and_preserves_unknown_cgroup(self) -> None:
+        fields = {
+            "service": "web", "run_id": "a" * 32, "phase": "off", "sample_count": "5",
+            "status": "complete", "cgroup_sample_count": "0",
+            "gc_duration_ms": "1.250", "gc_status": "complete", "gc_overflow": "false",
+        }
+        for prefix in ("rss", "heap_total", "heap_used", "heap_limit", "external", "array_buffers"):
+            for suffix in ("min", "max", "mean"):
+                fields[f"{prefix}_{suffix}_bytes"] = "100"
+        for key in (
+            "cgroup_memory_current_start_bytes", "cgroup_memory_current_end_bytes",
+            "cgroup_memory_current_sampled_max_bytes", "cgroup_memory_peak_start_bytes",
+            "cgroup_memory_peak_end_bytes", "cgroup_memory_peak_sampled_max_bytes",
+            "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
+            "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
+            "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
+        ):
+            fields[key] = "unknown"
+        fields.update({
+            "sampled_window_start_elapsed_ms": "0", "sampled_window_end_elapsed_ms": "16000",
+            "sampled_window_duration_ms": "16000", "cgroup_memory_status": "unavailable",
+            "cgroup_memory_reason": "hierarchy_unavailable",
+        })
+        for key in ("gc_count", "gc_major_count", "gc_minor_count", "gc_incremental_count", "gc_weakcb_count", "gc_other_count"):
+            fields[key] = "0"
+        message = "cpu_diagnostic_memory " + " ".join(f"{key}={value}" for key, value in fields.items())
+        parsed = diagnostic_plan_tool._parse_node_memory_event(message)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertIsNone(parsed["cgroup_memory_peak_end_bytes"])
+        self.assertEqual(parsed["rss_max_bytes"], 100)
+        self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(f"{message} token=private"))
+        self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(message.replace("run_id=" + "a" * 32, "run_id=bad")))
+
+    def test_cpu_only_evaluator_is_typed_zero_credit_and_fails_closed(self) -> None:
+        protocol_fixture = Path(__file__).parent / "fixtures/cpu-diagnostic-memory-complete-v1.protocol"
+        fixture_line = protocol_fixture.read_text(encoding="ascii").strip()
+        node_event = diagnostic_plan_tool._parse_node_memory_event(fixture_line)
+        self.assertIsNotNone(node_event)
+        assert node_event is not None
+        self.assertEqual(node_event["cgroup_memory_status"], "complete")
+        self.assertEqual(node_event["sampled_window_duration_ms"], 16_000)
+        self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(
+            fixture_line.replace("cgroup_memory_current_sampled_max_bytes", "cgroup_memory_current_max_bytes")
+        ))
+        report = {
+            "schema": 1,
+            "workload": cpu_pair.WORKLOAD,
+            "fixture_kind": "cpu_diagnostic_only_v1",
+            "capacity_slo_credit": False,
+            "diagnostic_credit": False,
+            "source_sha": "a" * 40,
+            "app_target_sha": "b" * 40,
+            "external_run_id": "12345",
+            "external_run_attempt": "1",
+            "status": "complete",
+            "fixture_manifest_sha256": "c" * 64,
+            "namespace_closed": True,
+            "plan_cleanup": "complete",
+            "failure_stage": "none",
+            "failure_code": "none",
+            "canonical_fixture": {
+                "fixture_kind": "cpu_diagnostic_only_v1",
+                "tournaments": 1,
+                "users": 14,
+                "users_per_tournament": 14,
+                "selected_actors": 8,
+            },
+            "actor_payload_bytes": 2048,
+            "workload_contract": {
+                "actors": 8,
+                "requests_per_phase": 500,
+                "phase_window_ms": 20_000,
+                "idle_between_phases_ms": 5_000,
+                "max_inflight": 8,
+            },
+            "service_cpu_usage": {"status": "complete", "reason": "none", "rows": [{"service": "api"}] * 2 + [{"service": "web"}] * 2},
+            "cpu_profile_attribution": {
+                "status": "complete",
+                "reason": "none",
+                "rows": [
+                    {
+                        "service": "api", "expected_targets": 2, "observed_targets": 2,
+                        "event_count": 2, "total_cpu_us": 1_000_000, "sample_count": None,
+                        "timer": "thread_cpu", "observation_unit": "calls",
+                        "categories": [{"category": "other", "cpu_us": 1_000_000, "observations": 10}],
+                    },
+                    {
+                        "service": "web", "expected_targets": 1, "observed_targets": 1,
+                        "event_count": 1, "total_cpu_us": 1_000_000, "sample_count": 100,
+                        "timer": "v8_cpu", "observation_unit": "samples",
+                        "categories": [{"category": "other", "cpu_us": 1_000_000, "observations": 100}],
+                    },
+                ],
+            },
+            "memory_attribution": {
+                "status": "complete", "reason": "none", "cgroup_memory_status": "complete",
+                "cgroup_memory_reason": "none",
+                "rows": [
+                    {
+                        **node_event, "phase": phase, "status": "complete",
+                        "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
+                        "expected_targets": 1,
+                        "observed_targets": 1, "event_count": 1, "duplicate_count": 0,
+                        "sample_count": 5, "rss_min_bytes": 100, "rss_max_bytes": 100,
+                        "rss_mean_bytes": 1500, "heap_total_max_bytes": 900,
+                        "heap_used_max_bytes": 700, "heap_limit_max_bytes": 8000,
+                        "external_max_bytes": 100, "array_buffers_max_bytes": 100,
+                        "gc_status": "complete", "gc_overflow": False,
+                        "gc_count": 1, "gc_duration_ms": 0.5,
+                    }
+                    for phase in ("off", "on")
+                ],
+            },
+            "result": {
+                "capture_complete": True,
+                "all_expected_statuses": True,
+                "warmup": {"expected_actors": 8, "authenticated_200": 8, "page_warm_200": 8},
+                **{
+                    phase: {
+                        "complete": True,
+                        "all_expected_statuses": True,
+                        "scheduled": 500,
+                        "submitted": 500,
+                        "completed": 500,
+                        "completed_in_window": 500,
+                        "status_counts": {"200": 500},
+                        "latency_ms": {"count": 500, "p50": 20.0, "p95": 25.0, "p99": 30.0},
+                    }
+                    for phase in ("off", "on")
+                },
+                "quality_gate": {
+                    "status": "passed",
+                    "request_p95_delta_percent": 2.0,
+                    "service_cpu_delta_percentage_points": {"api": 1.0, "web": -2.0},
+                },
+            },
+        }
+        expected = {
+            "source_sha": "a" * 40,
+            "app_target_sha": "b" * 40,
+            "run_id": "12345",
+            "attempt": "1",
+            "manifest_sha256": "c" * 64,
+        }
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "PASS")
+        for row in report["memory_attribution"]["rows"]:
+            row["cgroup_sample_count"] = 4
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "INVALID")
+        for row in report["memory_attribution"]["rows"]:
+            row["cgroup_sample_count"] = 5
+            row["cgroup_memory_reason"] = "file_unavailable"
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "INVALID")
+        report["memory_attribution"]["cgroup_memory_reason"] = "none"
+        for row in report["memory_attribution"]["rows"]:
+            row["cgroup_memory_reason"] = "none"
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "PASS")
+        report["memory_attribution"]["cgroup_memory_status"] = "unknown"
+        report["memory_attribution"]["cgroup_memory_reason"] = "hierarchy_unavailable"
+        for row in report["memory_attribution"]["rows"]:
+            row["cgroup_memory_status"] = "unknown"
+            row["cgroup_memory_reason"] = "hierarchy_unavailable"
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "PASS")
+        report["memory_attribution"]["cgroup_memory_status"] = "complete"
+        report["memory_attribution"]["cgroup_memory_reason"] = "none"
+        for row in report["memory_attribution"]["rows"]:
+            row["cgroup_memory_status"] = "complete"
+            row["cgroup_memory_reason"] = "none"
+        for row in report["memory_attribution"]["rows"]:
+            row["sampled_window_end_elapsed_ms"] = 16_037
+            row["sampled_window_duration_ms"] = 16_037
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "PASS")
+        for row in report["memory_attribution"]["rows"]:
+            row["sampled_window_start_elapsed_ms"] = 1_000
+            row["sampled_window_end_elapsed_ms"] = 999
+            row["sampled_window_duration_ms"] = -1
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "INVALID")
+        for row in report["memory_attribution"]["rows"]:
+            row["sampled_window_start_elapsed_ms"] = 0
+            row["sampled_window_end_elapsed_ms"] = 16_000
+            row["sampled_window_duration_ms"] = 16_000
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "PASS")
+        for row in report["memory_attribution"]["rows"]:
+            row["sampled_window_end_elapsed_ms"] = 20_001
+            row["sampled_window_duration_ms"] = 20_001
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "INVALID")
+        for row in report["memory_attribution"]["rows"]:
+            row["sampled_window_end_elapsed_ms"] = 16_000
+            row["sampled_window_duration_ms"] = 16_000
+        report["result"]["quality_gate"]["request_p95_delta_percent"] = 5.1
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "FAIL")
+        report["canonical_fixture"]["users"] = 20_000
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "INVALID")
+        report["canonical_fixture"]["users"] = 14
+        self.assertEqual(
+            cpu_pair.evaluate_cpu_only_report(report, **{**expected, "source_sha": "d" * 40}),
+            "INVALID",
+        )
+
+    def test_preflight_fallback_report_is_bound_and_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            raw_manifest = b'{"schema":1,"fixture":"private"}\n'
+            manifest.write_bytes(raw_manifest)
+            manifest.chmod(0o600)
+            report = root / "report.json"
+            report_value = {
+                "schema": 1,
+                "workload": cpu_pair.WORKLOAD,
+                "fixture_kind": "cpu_diagnostic_only_v1",
+                "source_sha": "a" * 40,
+                "app_target_sha": "b" * 40,
+                "external_run_id": "12345",
+                "external_run_attempt": "1",
+                "status": "incomplete",
+                "failure_stage": "unknown",
+                "failure_code": "unknown",
+                "capacity_slo_credit": False,
+                "diagnostic_credit": False,
+                "fixture_manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(),
+                "canonical_fixture": {
+                    "fixture_kind": "cpu_diagnostic_only_v1", "tournaments": 1,
+                    "users": 14, "users_per_tournament": 14, "selected_actors": 8,
+                },
+                "namespace_closed": False,
+                "plan_cleanup": "unknown",
+                "memory_attribution": {
+                    "status": "incomplete", "reason": "incomplete",
+                    "cgroup_memory_status": "unknown",
+                    "rows": [{
+                        "service": "web", "phase": "off", "status": "incomplete",
+                        "cgroup_memory_status": "unknown", "gc_status": "unavailable",
+                        "gc_overflow": False, "sample_count": 3, "rss_max_bytes": 12345,
+                        "cgroup_memory_peak_end_bytes": None, "secret": "must not escape",
+                    }],
+                },
+            }
+            cpu_pair._write_report(report, report_value)
+            output = root / "public.json"
+            command = [
+                sys.executable, str(Path(cpu_pair.__file__)), "sanitize-report",
+                "--input", str(report), "--output", str(output), "--manifest", str(manifest),
+                "--source-sha", "a" * 40, "--app-target-sha", "b" * 40,
+                "--external-run-id", "12345", "--external-run-attempt", "1",
+                "--fixture-kind", "cpu_diagnostic_only_v1",
+            ]
+            accepted = subprocess.run(command, capture_output=True, check=False)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            projected = json.loads(output.read_text(encoding="ascii"))
+            self.assertEqual(projected["status"], "incomplete")
+            self.assertFalse(projected["capacity_slo_credit"])
+            self.assertFalse(projected["diagnostic_credit"])
+            self.assertEqual(projected["source_sha"], "a" * 40)
+            self.assertEqual(projected["external_run_id"], "12345")
+            self.assertEqual(projected["memory_attribution"]["rows"][0]["rss_max_bytes"], 12345)
+            self.assertIsNone(projected["memory_attribution"]["rows"][0]["cgroup_memory_peak_end_bytes"])
+            self.assertNotIn("private", output.read_text(encoding="ascii"))
+            self.assertNotIn("must not escape", output.read_text(encoding="ascii"))
+            mismatch = [*command]
+            mismatch[mismatch.index("--manifest") + 1] = str(root / "wrong-manifest.json")
+            wrong = root / "wrong-manifest.json"
+            wrong.write_bytes(b'{"schema":1,"fixture":"different"}\n')
+            wrong.chmod(0o600)
+            rejected = subprocess.run(mismatch, capture_output=True, check=False)
+            self.assertNotEqual(rejected.returncode, 0)
+
     def test_pair_quality_gate_keeps_capture_and_overhead_separate(self) -> None:
         off = {"latency_ms": {"p95": 100.0}}
         on = {"latency_ms": {"p95": 104.0}}
@@ -137,6 +896,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "categories": [{"category": "other", "cpu_us": 1_000_000, "observations": 100}],
                 },
             ],
+            "memory_status": "incomplete",
+            "memory_reason": "incomplete",
+            "cgroup_memory_status": "unknown",
+            "cgroup_memory_reason": "hierarchy_unavailable",
+            "memory_rows": [],
         }
         validated = cpu_pair._validate_usage_summary(summary)
         deltas = cpu_pair._usage_delta_percentage_points(validated)
@@ -716,6 +1480,45 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "_SYSTEMD_CGROUP": cgroup,
                         "__REALTIME_TIMESTAMP": "26000000",
                     })
+                    for phase, timestamp in (("off", "21000000"), ("on", "46000000")):
+                        memory_fields = {
+                            "service": "web", "run_id": "a" * 32, "phase": phase,
+                            "sample_count": "5", "status": "complete",
+                            "cgroup_sample_count": "0",
+                            "gc_duration_ms": "1.250", "gc_status": "complete", "gc_overflow": "false",
+                        }
+                        for prefix in ("rss", "heap_total", "heap_used", "heap_limit", "external", "array_buffers"):
+                            for suffix in ("min", "max", "mean"):
+                                memory_fields[f"{prefix}_{suffix}_bytes"] = "100"
+                        for field in (
+                            "cgroup_memory_current_start_bytes", "cgroup_memory_current_end_bytes",
+                            "cgroup_memory_current_sampled_max_bytes", "cgroup_memory_peak_start_bytes",
+                            "cgroup_memory_peak_end_bytes", "cgroup_memory_peak_sampled_max_bytes",
+                            "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
+                            "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
+                            "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
+                        ):
+                            memory_fields[field] = "unknown"
+                        memory_fields.update({
+                            "sampled_window_start_elapsed_ms": "0",
+                            "sampled_window_end_elapsed_ms": "16000",
+                            "sampled_window_duration_ms": "16000",
+                            "cgroup_memory_status": "unavailable",
+                            "cgroup_memory_reason": "hierarchy_unavailable",
+                        })
+                        for field in ("gc_count", "gc_major_count", "gc_minor_count", "gc_incremental_count", "gc_weakcb_count", "gc_other_count"):
+                            memory_fields[field] = "0"
+                        memory_message = "cpu_diagnostic_memory " + " ".join(
+                            f"{key}={value}" for key, value in memory_fields.items()
+                        )
+                        journal_rows.append({
+                            "MESSAGE": memory_message,
+                            "_PID": str(target["pid"]),
+                            "_SYSTEMD_UNIT": unit,
+                            "_SYSTEMD_INVOCATION_ID": str(target["invocation_id"]),
+                            "_SYSTEMD_CGROUP": cgroup,
+                            "__REALTIME_TIMESTAMP": timestamp,
+                        })
 
         service_rows = {
             service: [{**target} for target in service_targets]
@@ -764,9 +1567,52 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             [row["category"] for row in web_profile["categories"]],
             ["repo.workspace_page", "web_framework"],
         )
+        self.assertEqual(summary["memory_status"], "complete", summary)
+        self.assertEqual(summary["cgroup_memory_status"], "unknown")
+        self.assertEqual([row["phase"] for row in summary["memory_rows"]], ["off", "on"])
+        self.assertEqual(summary["memory_rows"][0]["cgroup_memory_status"], "unknown")
         serialized = json.dumps(summary, sort_keys=True)
         self.assertNotIn('"pid"', serialized)
         self.assertNotIn('"start_ticks"', serialized)
+
+        # Exercise the fixed remote projection and the _ssh_plan validator that
+        # feeds the capacity telemetry projector.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary_path = root / "cleanup-summary.json"
+            summary_path.write_text(json.dumps({
+                "status": "expired_plans_removed", "service_count": 2, **summary,
+            }, sort_keys=True), encoding="ascii")
+            fake_sudo = root / "sudo-fixture"
+            fake_sudo.write_text(
+                "#!/usr/bin/python3\n"
+                "import json,sys\n"
+                "sys.stdin.read()\n"
+                f"value=json.load(open({str(summary_path)!r}, encoding='ascii'))\n"
+                "print('CPU_DIAGNOSTIC_PLAN ' + json.dumps(value, sort_keys=True, separators=(',', ':')))\n",
+                encoding="ascii",
+            )
+            fake_sudo.chmod(0o700)
+            projected_stdout = io.StringIO()
+            with (
+                patch.object(remote_dispatch, "_trusted_helper", return_value=True),
+                patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
+                redirect_stdout(projected_stdout),
+            ):
+                self.assertEqual(remote_dispatch._run_cpu_diagnostic_plan({
+                    "operation": "cleanup", "schema": 1, "run_id": "a" * 32,
+                }), 0)
+            projected_line = projected_stdout.getvalue().strip()
+            self.assertTrue(projected_line.startswith("CPU_DIAGNOSTIC_PLAN {"))
+            projected_value = json.loads(projected_line.removeprefix("CPU_DIAGNOSTIC_PLAN "))
+            validated_cleanup = cpu_pair._validate_usage_summary(projected_value)
+            self.assertIsNotNone(validated_cleanup)
+            self.assertEqual(len(validated_cleanup["memory_rows"]), 2)
+            self.assertEqual(validated_cleanup["memory_rows"][1]["sample_count"], 5)
+            capacity_telemetry = capacity_diagnostic._project_server_telemetry(validated_cleanup)
+            self.assertEqual(capacity_telemetry["node_memory_status"], "complete")
+            self.assertEqual(capacity_telemetry["cgroup_memory_status"], "unknown")
+            self.assertEqual(capacity_telemetry["node_memory_rows"][1]["gc_count"], 0)
 
         with (
             patch.object(diagnostic_plan_tool, "_release_identity", return_value=("b" * 40, "release-bbbbbbbbbbbb")),

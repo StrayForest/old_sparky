@@ -11,6 +11,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from collections.abc import Callable
 from unittest.mock import patch
 
 from tools.platform_load_runtime import (
@@ -798,6 +799,9 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
         *,
         delay_report_read: bool = False,
         delay_report_publish: bool = False,
+        on_namespace_init: Callable[[int, int], None] | None = None,
+        on_namespace_exit: Callable[[int, int], None] | None = None,
+        lifecycle_events: list[str] | None = None,
     ) -> tuple[object, dict[str, object]]:
         """Exercise final report gates without requiring a root-owned namespace."""
 
@@ -861,6 +865,11 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 if delay_report_publish and Path(path).name == "final.json":
                     now[0] = 1002.0
 
+            def reap_namespace(*_args: object, **_kwargs: object) -> bool:
+                if lifecycle_events is not None:
+                    lifecycle_events.append("reap")
+                return True
+
             with (
                 patch("tools.platform_load_runtime.require_pid_namespace_capability"),
                 patch("tools.platform_load_runtime._runner_identity", return_value=(65534, 65534)),
@@ -870,7 +879,7 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 patch("tools.platform_load_runtime._read_process_descendants", return_value=()),
                 patch("tools.platform_load_runtime._await_namespace_ready", return_value=True),
                 patch("tools.platform_load_runtime._namespace_closed", return_value=True),
-                patch("tools.platform_load_runtime._reap_namespace_init", return_value=True),
+                patch("tools.platform_load_runtime._reap_namespace_init", side_effect=reap_namespace),
                 patch("tools.platform_load_runtime._reap_captured_chain", return_value=True),
                 patch("tools.platform_load_runtime._pidfd_is_live", return_value=False),
                 patch("tools.platform_load_runtime.os.pidfd_open", return_value=11),
@@ -899,6 +908,8 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                     },
                     term_grace_seconds=0.05,
                     poll_seconds=0.01,
+                    on_namespace_init=on_namespace_init,
+                    on_namespace_exit=on_namespace_exit,
                 )
             return result, json.loads(final_report.read_text(encoding="utf-8"))
 
@@ -921,6 +932,26 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             payload["runtime_supervisor"]["report_error"],
             "wall_deadline_during_report_publication",
         )
+
+    def test_namespace_init_diagnostic_hook_receives_captured_identity(self) -> None:
+        observed: list[tuple[int, int]] = []
+        closed: list[tuple[int, int]] = []
+        lifecycle_events: list[str] = []
+
+        def on_exit(pid: int, starttime: int) -> None:
+            closed.append((pid, starttime))
+            lifecycle_events.append("snapshot")
+
+        result, payload = self._run_fake_success_with_deadline_hook(
+            on_namespace_init=lambda pid, starttime: observed.append((pid, starttime)),
+            on_namespace_exit=on_exit,
+            lifecycle_events=lifecycle_events,
+        )
+        self.assertEqual(observed, [(1002, 1)])
+        self.assertEqual(closed, [(1002, 1)])
+        self.assertEqual(lifecycle_events, ["snapshot", "reap"])
+        self.assertTrue(payload["namespace_closed"])
+        self.assertTrue(result.namespace_closed)
 
     def test_success_report_publishes_only_after_child_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

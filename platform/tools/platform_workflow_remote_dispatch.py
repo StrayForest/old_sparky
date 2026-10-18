@@ -115,7 +115,9 @@ CLEANUP_HELPER = ACTIVE_TOOLS_DIR / "platform_production_retained_load_cleanup_q
 LIVE_HELPER = ACTIVE_TOOLS_DIR / "platform_live_launch_supervisor.sh"
 LIVE_USER_QA_HELPER = ACTIVE_TOOLS_DIR / "platform_live_user_qa_dispatch.py"
 CPU_DIAGNOSTIC_PLAN_HELPER = ACTIVE_TOOLS_DIR / "platform_cpu_diagnostic_plan.py"
-CPU_DIAGNOSTIC_OUTPUT_CAP = 8192
+CPU_DIAGNOSTIC_OUTPUT_CAP = 32_768
+CAPACITY_MEMORY_WATCH_OUTPUT_CAP = 131_072
+CAPACITY_MEMORY_WATCH_LINE_CAP = 2048
 CPU_USAGE_ROW_FIELDS = {
     "service", "phase", "expected_targets", "observed_targets", "event_count",
     "cpu_ns", "window_ms_min", "window_ms_max", "start_lag_ms_min",
@@ -129,6 +131,32 @@ CPU_PROFILE_ROW_FIELDS = {
     "end_lag_ms_max", "categories",
 }
 CPU_PROFILE_CATEGORY_FIELDS = {"category", "cpu_us", "observations"}
+CPU_MEMORY_ROW_FIELDS = {
+    "service", "run_id", "phase", "expected_targets", "observed_targets",
+    "event_count", "duplicate_count", "status", "gc_status", "gc_overflow",
+    "cgroup_memory_status", "cgroup_memory_reason",
+    "sample_count", "rss_min_bytes", "rss_max_bytes", "rss_mean_bytes",
+    "heap_total_min_bytes", "heap_total_max_bytes", "heap_total_mean_bytes",
+    "heap_used_min_bytes", "heap_used_max_bytes", "heap_used_mean_bytes",
+    "heap_limit_min_bytes", "heap_limit_max_bytes", "heap_limit_mean_bytes",
+    "external_min_bytes", "external_max_bytes", "external_mean_bytes",
+    "array_buffers_min_bytes", "array_buffers_max_bytes", "array_buffers_mean_bytes",
+    "sampled_window_start_elapsed_ms", "sampled_window_end_elapsed_ms",
+    "sampled_window_duration_ms", "cgroup_sample_count",
+    "cgroup_memory_current_start_bytes", "cgroup_memory_current_end_bytes",
+    "cgroup_memory_current_sampled_max_bytes", "cgroup_memory_peak_start_bytes",
+    "cgroup_memory_peak_end_bytes", "cgroup_memory_peak_sampled_max_bytes",
+    "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
+    "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
+    "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
+    "gc_count", "gc_duration_ms", "gc_major_count", "gc_minor_count",
+    "gc_incremental_count", "gc_weakcb_count", "gc_other_count",
+}
+CPU_MEMORY_METRIC_FIELDS = CPU_MEMORY_ROW_FIELDS - {
+    "service", "run_id", "phase", "expected_targets", "observed_targets",
+    "event_count", "duplicate_count", "status", "gc_status", "gc_overflow",
+    "cgroup_memory_status", "cgroup_memory_reason", "gc_duration_ms",
+}
 CPU_PROFILE_CATEGORIES = {
     "repo.get_tournament_workspace", "repo.get_tournament_workspace_by_slug",
     "repo.workspace_conditional_preflight", "repo.get_current_user",
@@ -711,7 +739,8 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
         helper_command = "cleanup-stdin"
         expected_keys = {
             "status", "service_count", "usage_status", "usage_reason", "usage_rows",
-            "profile_status", "profile_reason", "profile_rows",
+            "profile_status", "profile_reason", "profile_rows", "memory_status",
+            "memory_reason", "cgroup_memory_status", "cgroup_memory_reason", "memory_rows",
         }
         helper_payload = {"schema": payload["schema"], "run_id": payload["run_id"]}
     else:
@@ -808,6 +837,14 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 }
                 or not isinstance(result.get("profile_rows"), list)
                 or len(result["profile_rows"]) not in {0, 2}
+                or result.get("memory_status") not in {"complete", "incomplete", "unavailable"}
+                or result.get("memory_reason") not in {"none", "incomplete", "unavailable"}
+                or result.get("cgroup_memory_status") not in {"complete", "unknown", "invalid"}
+                or result.get("cgroup_memory_reason") not in {
+                    "none", "hierarchy_unavailable", "file_unavailable", "invalid_snapshot",
+                }
+                or not isinstance(result.get("memory_rows"), list)
+                or len(result["memory_rows"]) not in {0, 2}
                 or (len(result["usage_rows"]) == 0 and not (
                     result["service_count"] == 0
                     and result["usage_status"] == "unavailable"
@@ -971,6 +1008,63 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 )
             ):
                 return 2
+            projected_memory: list[dict[str, Any]] = []
+            memory_phases = (("off",), ("on",))
+            if result["memory_rows"] and len(result["memory_rows"]) != 2:
+                return 2
+            for row, (phase,) in zip(result["memory_rows"], memory_phases):
+                if (
+                    not isinstance(row, dict)
+                    or set(row) != CPU_MEMORY_ROW_FIELDS
+                    or row.get("service") != "web"
+                    or row.get("phase") != phase
+                    or row.get("expected_targets") != 1
+                    or type(row.get("observed_targets")) is not int
+                    or row["observed_targets"] not in {0, 1}
+                    or type(row.get("event_count")) is not int
+                    or not 0 <= row["event_count"] <= 8
+                    or type(row.get("duplicate_count")) is not int
+                    or not 0 <= row["duplicate_count"] <= 8
+                    or not isinstance(row.get("run_id"), str)
+                    or re.fullmatch(r"[0-9a-f]{32}", row["run_id"]) is None
+                    or row.get("status") not in {"complete", "incomplete"}
+                    or row.get("gc_status") not in {"complete", "incomplete", "unavailable"}
+                    or type(row.get("gc_overflow")) is not bool
+                    or row.get("cgroup_memory_status") not in {"complete", "unknown", "invalid"}
+                    or row.get("cgroup_memory_reason") not in {
+                        "none", "hierarchy_unavailable", "file_unavailable", "invalid_snapshot",
+                    }
+                ):
+                    return 2
+                clean = {key: row[key] for key in CPU_MEMORY_ROW_FIELDS
+                         if key not in {"service", "phase"}}
+                clean.update({"service": "web", "phase": phase})
+                for field in CPU_MEMORY_METRIC_FIELDS:
+                    item = row[field]
+                    if item is not None and (type(item) is not int or not 0 <= item <= 10**16):
+                        return 2
+                duration = row["gc_duration_ms"]
+                if (duration is not None and
+                        (type(duration) not in {int, float} or isinstance(duration, bool)
+                         or not 0 <= duration <= 20_000)):
+                    return 2
+                projected_memory.append(clean)
+            if result["memory_status"] == "complete" and (
+                result["memory_reason"] != "none" or len(projected_memory) != 2
+                or any(row["status"] != "complete" or row["sample_count"] != 5
+                       or row["gc_status"] != "complete" or row["gc_overflow"]
+                       for row in projected_memory)
+            ):
+                return 2
+            if result["cgroup_memory_status"] == "complete" and (
+                result["cgroup_memory_reason"] != "none"
+                or len(projected_memory) != 2
+                or any(row["cgroup_memory_status"] != "complete"
+                       or row["cgroup_memory_reason"] != "none"
+                       or row["cgroup_sample_count"] != 5
+                       for row in projected_memory)
+            ):
+                return 2
             target_count = result["service_count"]
             cleanup_projection = {
                 "status": "expired_plans_removed",
@@ -981,6 +1075,11 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 "profile_status": result["profile_status"],
                 "profile_reason": result["profile_reason"],
                 "profile_rows": projected_profiles,
+                "memory_status": result["memory_status"],
+                "memory_reason": result["memory_reason"],
+                "cgroup_memory_status": result["cgroup_memory_status"],
+                "cgroup_memory_reason": result["cgroup_memory_reason"],
+                "memory_rows": projected_memory,
             }
             marker = "CPU_DIAGNOSTIC_PLAN " + json.dumps(
                 cleanup_projection, ensure_ascii=True, allow_nan=False,
@@ -998,6 +1097,158 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
             process.stdout.close()
         except OSError:
             pass
+
+
+def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
+    """Stream only the fixed, validated SSR cgroup memory-watch projection."""
+
+    if not _trusted_helper(CPU_DIAGNOSTIC_PLAN_HELPER):
+        return 2
+    helper_payload = {
+        "schema": payload["schema"], "run_id": payload["run_id"],
+        "source_sha": payload["source_sha"], "workload": payload["workload"],
+    }
+    child_input = json.dumps(
+        helper_payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("ascii") + b"\n"
+    try:
+        process = subprocess.Popen(  # nosec B603
+            [SUDO, "-n", "--", str(CPU_DIAGNOSTIC_PLAN_HELPER), "memory-watch-stdin"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True, umask=0o077,
+        )
+    except OSError:
+        return 2
+    assert process.stdin is not None and process.stdout is not None
+    selector = selectors.DefaultSelector()
+    pending = bytearray()
+    total = 0
+    expected_sequence = 1
+    terminal_seen = False
+    deadline = time.monotonic() + 55
+    try:
+        process.stdin.write(child_input)
+        process.stdin.flush()
+        process.stdin.close()
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        selector.register(descriptor, selectors.EVENT_READ)
+        eof = False
+        while process.poll() is None or not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process_group(process)
+                return 124
+            for key, _mask in selector.select(min(remaining, 0.1)):
+                try:
+                    chunk = os.read(key.fd, min(4096, CAPACITY_MEMORY_WATCH_OUTPUT_CAP + 1 - total))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    eof = True
+                    continue
+                total += len(chunk)
+                if total > CAPACITY_MEMORY_WATCH_OUTPUT_CAP:
+                    _terminate_process_group(process)
+                    return 2
+                pending.extend(chunk)
+                while b"\n" in pending:
+                    line, _, rest = pending.partition(b"\n")
+                    pending[:] = rest
+                    if not line or len(line) > CAPACITY_MEMORY_WATCH_LINE_CAP:
+                        _terminate_process_group(process)
+                        return 2
+                    sample = _strict_baseline_json(line)
+                    expected_fields = {
+                        "schema", "run_id", "source_sha", "workload", "sequence", "elapsed_ms",
+                        "phase", "sampled_at_ms", "plan_off_start_ms", "plan_on_start_ms", "plan_on_end_ms",
+                        "decision", "reason", "memory_current_bytes", "memory_peak_bytes",
+                        "memory_max_bytes", "memory_events_delta", "target_pid",
+                        "target_start_ticks", "target_invocation_id", "identity_status",
+                    }
+                    if (not isinstance(sample, dict) or set(sample) != expected_fields
+                            or type(sample.get("schema")) is not int or sample["schema"] != 1
+                            or sample.get("run_id") != payload["run_id"]
+                            or sample.get("source_sha") != payload["source_sha"]
+                            or sample.get("workload") != payload["workload"]
+                            or type(sample.get("sequence")) is not int or sample["sequence"] != expected_sequence
+                            or type(sample.get("elapsed_ms")) is not int or sample["elapsed_ms"] < 0
+                            or sample.get("phase") not in {"off", "idle", "on", "complete", "abort"}
+                            or any(type(sample.get(key)) is not int for key in (
+                                "sampled_at_ms", "plan_off_start_ms", "plan_on_start_ms", "plan_on_end_ms"
+                            ))
+                            or sample["plan_off_start_ms"] >= sample["plan_on_start_ms"]
+                            or sample["plan_on_start_ms"] >= sample["plan_on_end_ms"]
+                            or sample["plan_on_start_ms"] - sample["plan_off_start_ms"] != 25_000
+                            or sample["plan_on_end_ms"] - sample["plan_on_start_ms"] != 20_000
+                            or sample["elapsed_ms"] != max(0, sample["sampled_at_ms"] - sample["plan_off_start_ms"])
+                            or sample["phase"] != (
+                                "off" if sample["sampled_at_ms"] < sample["plan_off_start_ms"] + 20_000
+                                else "idle" if sample["sampled_at_ms"] < sample["plan_on_start_ms"]
+                                else "on" if sample["sampled_at_ms"] < sample["plan_on_end_ms"]
+                                else "complete" if sample.get("decision") == "complete"
+                                else "abort"
+                            )
+                            or sample.get("decision") not in {"continue", "abort", "complete"}
+                            or sample.get("reason") not in {
+                                "none", "memory_floor", "memory_event", "identity_changed", "collection_error",
+                            }
+                            or sample.get("identity_status") not in {"complete", "invalid"}
+                            or type(sample.get("target_pid")) is not int or sample["target_pid"] <= 1
+                            or type(sample.get("target_start_ticks")) is not int or sample["target_start_ticks"] <= 0
+                            or not isinstance(sample.get("target_invocation_id"), str)
+                            or re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f-]{36})", sample["target_invocation_id"]) is None):
+                        _terminate_process_group(process)
+                        return 2
+                    for name in ("memory_current_bytes", "memory_peak_bytes", "memory_max_bytes"):
+                        value = sample[name]
+                        if value is not None and (type(value) is not int or value < 0):
+                            _terminate_process_group(process)
+                            return 2
+                    events = sample.get("memory_events_delta")
+                    if events is not None and (
+                        not isinstance(events, dict)
+                        or set(events) != {"low", "high", "max", "oom", "oom_kill", "oom_group_kill"}
+                        or any(type(value) is not int or value < 0 for value in events.values())
+                    ):
+                        _terminate_process_group(process)
+                        return 2
+                    if ((sample["decision"] == "continue" and sample["reason"] != "none")
+                            or (sample["decision"] == "complete" and (
+                                sample["reason"] != "none" or sample["identity_status"] != "complete"
+                            ))
+                            or (sample["decision"] == "abort" and sample["reason"] == "none")
+                            or (sample["identity_status"] != "complete" and sample["decision"] != "abort")
+                            or terminal_seen):
+                        _terminate_process_group(process)
+                        return 2
+                    if sample["decision"] in {"abort", "complete"}:
+                        terminal_seen = True
+                    print(
+                        "CAPACITY_MEMORY_GUARD "
+                        + json.dumps(sample, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+                        flush=True,
+                    )
+                    expected_sequence += 1
+        return 0 if process.wait(timeout=0) == 0 and not pending and terminal_seen else 2
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        if process.poll() is None:
+            _terminate_process_group(process)
+        return 2
+    finally:
+        selector.close()
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            _terminate_process_group(process)
 
 
 def _run_live_user_qa_sudo(
@@ -2876,6 +3127,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if arguments == ["cpu-diagnostic-plan"]:
         mode = "cpu-diagnostic"
+    elif arguments == ["cpu-diagnostic-memory-watch"]:
+        mode = "cpu-memory-watch"
     elif arguments == ["external-fixture"]:
         mode = "external"
     elif arguments == ["external-finalize"]:
@@ -2921,6 +3174,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = load_stdin_payload(mode=mode)
         if arguments == ["cpu-diagnostic-plan"]:
             return _run_cpu_diagnostic_plan(payload)
+        if arguments == ["cpu-diagnostic-memory-watch"]:
+            return _run_cpu_diagnostic_memory_watch(payload)
         if arguments == ["external-fixture"]:
             return _external_fixture(payload)
         if arguments == ["external-finalize"]:

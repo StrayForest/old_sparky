@@ -2,6 +2,81 @@ const SAMPLE_INTERVAL_MS = 5_000;
 const MAXIMUM_SAMPLES = 5_760;
 const MAXIMUM_DURATION_MS = 8 * 60 * 60 * 1_000;
 
+export function isStableBoundedPseudoFileRead({
+  beforeSize,
+  afterSize,
+  beforeDevice,
+  afterDevice,
+  beforeInode,
+  afterInode,
+  beforeRegularFile,
+  afterRegularFile,
+  byteLength,
+  limit,
+}) {
+  if (
+    !Number.isSafeInteger(beforeSize) || beforeSize < 0
+    || !Number.isSafeInteger(afterSize) || afterSize < 0
+    || !Number.isSafeInteger(beforeDevice) || !Number.isSafeInteger(afterDevice)
+    || !Number.isSafeInteger(beforeInode) || !Number.isSafeInteger(afterInode)
+    || beforeRegularFile !== true || afterRegularFile !== true
+    || !Number.isSafeInteger(byteLength) || byteLength <= 0
+    || !Number.isSafeInteger(limit) || limit <= 0
+    || byteLength > limit
+    || beforeDevice !== afterDevice
+    || beforeInode !== afterInode
+    || beforeSize !== afterSize
+  ) {
+    return false;
+  }
+  return beforeSize === 0 || beforeSize === byteLength;
+}
+
+export function appendBoundedSample(samples, value, limit) {
+  if (!Array.isArray(samples) || !Number.isSafeInteger(limit) || limit <= 0) {
+    throw new TypeError("bounded sample input is invalid");
+  }
+  if (samples.length >= limit) return false;
+  samples.push(value);
+  return true;
+}
+
+export function isTimelineEntryWithinWindow(startTime, windowStart, windowEnd) {
+  return Number.isFinite(startTime)
+    && Number.isFinite(windowStart)
+    && Number.isFinite(windowEnd)
+    && windowStart <= startTime
+    && startTime <= windowEnd;
+}
+
+export function timelineEntryDurationWithinWindow(startTime, duration, windowStart, windowEnd) {
+  if (
+    !isTimelineEntryWithinWindow(startTime, windowStart, windowEnd)
+    || !Number.isFinite(duration) || duration < 0
+  ) return null;
+  return Math.max(0, Math.min(startTime + duration, windowEnd) - startTime);
+}
+
+export function classifyCgroupReadFailure(code) {
+  return code === "ENOENT" || code === "ENOTDIR" ? "unavailable" : "invalid";
+}
+
+export function formatCpuDiagnosticMemoryEvent(tokens) {
+  if (!Array.isArray(tokens) || tokens.length < 8) {
+    throw new TypeError("CPU memory event is invalid");
+  }
+  const seen = new Set();
+  for (const token of tokens) {
+    if (typeof token !== "string" || !/^[a-z][a-z0-9_]*=[A-Za-z0-9_.-]+$/u.test(token)) {
+      throw new TypeError("CPU memory event is invalid");
+    }
+    const key = token.slice(0, token.indexOf("="));
+    if (seen.has(key)) throw new TypeError("CPU memory event is invalid");
+    seen.add(key);
+  }
+  return `cpu_diagnostic_memory ${tokens.join(" ")}`;
+}
+
 export function startHeapMetrics(nodeProcess, perfHooks, runtime = {}) {
   const v8 = nodeProcess.getBuiltinModule?.("node:v8");
   if (!v8) {

@@ -39,6 +39,16 @@ on:
         required: false
         default: false
         type: boolean
+      cpu_diagnostic_only:
+        description: "Run the bounded zero-credit CPU diagnostic with one 14-user QA fixture instead of a load profile"
+        required: false
+        default: false
+        type: boolean
+      ssr_capacity_diagnostic_only:
+        description: "Run one guarded zero-credit 20-second authenticated SSR capacity step with one 14-user QA fixture"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -66,6 +76,8 @@ jobs:
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       PROFILE_ID: ${{ inputs.profile_id }}
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
+      CPU_DIAGNOSTIC_ONLY: ${{ inputs.cpu_diagnostic_only }}
+      SSR_CAPACITY_DIAGNOSTIC_ONLY: ${{ inputs.ssr_capacity_diagnostic_only }}
       TARGET_SHA: ${{ github.sha }}
     steps:
       - name: Mask and stage the control identity from the event file
@@ -115,7 +127,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -181,8 +193,11 @@ jobs:
           test "$GITHUB_REF" = refs/heads/dev || { echo "External production load must run from dev." >&2; exit 1; }
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "External load requires an exact target SHA." >&2; exit 1; }
           CPU_DIAGNOSTIC_PAIR='${{ inputs.cpu_diagnostic_pair }}'
-          case "$TIMEOUT_DIAGNOSTICS:$PROFILE_ID:$QA_CONFIRMATION:$CPU_DIAGNOSTIC_PAIR" in
-            true:authenticated-page-load-v1:RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS:false|false:*:RUN-PRODUCTION-EXTERNAL-LOAD:false|false:authenticated-page-load-v1:RUN-PRODUCTION-EXTERNAL-LOAD:true) ;;
+          SSR_CAPACITY_DIAGNOSTIC_ONLY='${{ inputs.ssr_capacity_diagnostic_only }}'
+          case "$TIMEOUT_DIAGNOSTICS:$PROFILE_ID:$QA_CONFIRMATION:$CPU_DIAGNOSTIC_PAIR:$CPU_DIAGNOSTIC_ONLY:$SSR_CAPACITY_DIAGNOSTIC_ONLY" in
+            false:authenticated-page-load-v1:RUN-PRODUCTION-CPU-DIAGNOSTIC:false:true:false) ;;
+            false:authenticated-page-load-v1:RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC:false:false:true) ;;
+            true:authenticated-page-load-v1:RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS:false:false:false|false:*:RUN-PRODUCTION-EXTERNAL-LOAD:false:false:false|false:authenticated-page-load-v1:RUN-PRODUCTION-EXTERNAL-LOAD:true:false:false) ;;
             *) echo "External load confirmation/profile combination is invalid." >&2; exit 1 ;;
           esac
 
@@ -281,7 +296,7 @@ jobs:
             "$RUNNER_TEMP/platform-production-source-binding/source-binding.json" \
             "$QA_CONFIRMATION" "$TARGET_SHA" "$APP_TARGET_SHA" "$SETUP_CONCURRENCY" \
             "$GITHUB_RUN_ID" "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
-            "$TIMEOUT_DIAGNOSTICS" <<'PY'
+            "$TIMEOUT_DIAGNOSTICS" "$CPU_DIAGNOSTIC_ONLY" "$SSR_CAPACITY_DIAGNOSTIC_ONLY" <<'PY'
           import os
           import json
           from pathlib import Path
@@ -294,7 +309,10 @@ jobs:
               validate_external_payload,
           )
 
-          output_path, binding_path_value, confirmation, target_sha, app_target_sha, setup_concurrency, run_id, tournaments, users, timeout_diagnostics = sys.argv[1:]
+          output_path, binding_path_value, confirmation, target_sha, app_target_sha, setup_concurrency, run_id, tournaments, users, timeout_diagnostics, cpu_diagnostic_only, ssr_capacity_diagnostic_only = sys.argv[1:]
+          diagnostic_only = cpu_diagnostic_only == "true" or ssr_capacity_diagnostic_only == "true"
+          if cpu_diagnostic_only == "true" and ssr_capacity_diagnostic_only == "true":
+              raise SystemExit("diagnostic modes are mutually exclusive")
           binding_path = Path(binding_path_value)
           control_email_path = Path(os.environ["RUNNER_TEMP"]) / "platform-production-control-email"
           metadata = control_email_path.lstat()
@@ -336,8 +354,11 @@ jobs:
               "setup_concurrency": setup_concurrency,
               "run_id": run_id,
               "profile": "external-vote",
-              "tournament_count": tournaments,
-              "users_per_tournament": users,
+              "tournament_count": "1" if diagnostic_only else tournaments,
+              "users_per_tournament": "14" if diagnostic_only else users,
+              "fixture_kind": ("cpu_diagnostic_only_v1" if cpu_diagnostic_only == "true" else
+                               "ssr_capacity_diagnostic_v1" if ssr_capacity_diagnostic_only == "true" else
+                               "external_load"),
               "timeout_diagnostics": timeout_diagnostics,
           }
           if binding is not None:
@@ -481,7 +502,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -587,7 +608,7 @@ jobs:
           binding_keys = {"schema", "binding_mode", "runner_sha", "app_target_sha", "baseline_identity", "receipt_document_sha256", "receipt_artifact_id", "receipt_artifact_name", "receipt_artifact_digest", "receipt_archive_sha256", "cumulative_manifest_sha256", "source_security_run_id", "source_security_run_attempt", "autodeploy_run_id", "autodeploy_run_attempt", "production_deploy_run_id", "production_deploy_run_attempt"}
           schema = payload.get("schema")
           binding = payload.get("source_binding")
-          expected = base_keys | ({"source_binding"} if schema in (2, "2") else set())
+          expected = base_keys | ({"fixture_kind"} if "fixture_kind" in payload else set()) | ({"source_binding"} if schema in (2, "2") else set())
           if set(payload) != expected:
               raise SystemExit("external handoff schema is not closed")
           if schema not in (1, "1", 2, "2") or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id:
@@ -605,6 +626,19 @@ jobs:
               raise SystemExit("external source binding is invalid")
           if payload.get("profile") != "external-vote" or payload.get("timeout_diagnostics") not in {"true", "false"}:
               raise SystemExit("external handoff profile is invalid")
+          fixture_kind = payload.get("fixture_kind", "external_load")
+          if fixture_kind not in {"external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1"}:
+              raise SystemExit("external handoff fixture mode is invalid")
+          if fixture_kind in {"cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1"} and (
+              payload.get("confirmation") != (
+                  "RUN-PRODUCTION-CPU-DIAGNOSTIC" if fixture_kind == "cpu_diagnostic_only_v1"
+                  else "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC"
+              )
+              or payload.get("timeout_diagnostics") != "false"
+              or payload.get("tournament_count") != "1"
+              or payload.get("users_per_tournament") != "14"
+          ):
+              raise SystemExit("CPU diagnostic fixture dimensions are invalid")
           if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None or re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None:
               raise SystemExit("external handoff exact target SHA is malformed")
           for key, maximum in (("setup_concurrency", 256), ("tournament_count", 40), ("users_per_tournament", 500)):
@@ -784,7 +818,9 @@ jobs:
       needs.validate-external-inputs.result == 'success' &&
       needs.fixture-setup.result == 'success' &&
       needs.fixture-setup.outputs.setup_status == '0' &&
-      needs.fixture-setup.outputs.manifest_ready == '1'
+      needs.fixture-setup.outputs.manifest_ready == '1' &&
+      inputs.cpu_diagnostic_only != true &&
+      inputs.ssr_capacity_diagnostic_only != true
     runs-on: ubuntu-24.04
     # The largest canonical worker budget is 240 minutes.  Keep a 30-minute
     # runner margin for the mandatory namespace probe, teardown/reap and
@@ -800,6 +836,7 @@ jobs:
       candidate_artifact_id: ${{ steps.publish-candidate.outputs.artifact-id }}
     env:
       TARGET_SHA: ${{ github.sha }}
+      PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}
       APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
       PROFILE_ID: ${{ inputs.profile_id }}
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
@@ -854,7 +891,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -1272,6 +1309,7 @@ jobs:
       - validate-external-inputs
       - fixture-setup
       - load-client
+      - cpu-diagnostic-pair
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -1283,12 +1321,26 @@ jobs:
       manual_required: ${{ steps.namespace-barrier.outputs.manual_required }}
     steps:
       - name: Download candidate report for closure barrier
-        if: ${{ always() && needs.load-client.outputs.candidate_artifact_id != '' }}
+        if: ${{ always() && inputs.cpu_diagnostic_only != true && needs.load-client.outputs.candidate_artifact_id != '' }}
         continue-on-error: true
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: platform-production-external-load-client-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/external-client
+      - name: Download CPU diagnostic report for closure barrier
+        if: ${{ always() && inputs.cpu_diagnostic_only == true && needs['cpu-diagnostic-pair'].outputs.candidate_artifact_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-cpu-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cpu-diagnostic-report
+      - name: Download SSR capacity report for closure barrier
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true && needs['cpu-diagnostic-pair'].outputs.candidate_artifact_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-ssr-capacity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ssr-capacity-report
       - name: Enforce mandatory namespace closure before finalizer
         id: namespace-barrier
         if: ${{ always() }}
@@ -1296,7 +1348,13 @@ jobs:
         run: |
           set -u
           status=1
-          report="$RUNNER_TEMP/external-client/external-load.json"
+          if [[ '${{ inputs.cpu_diagnostic_only }}' == true ]]; then
+            report="$RUNNER_TEMP/cpu-diagnostic-report/cpu-diagnostic.json"
+          elif [[ '${{ inputs.ssr_capacity_diagnostic_only }}' == true ]]; then
+            report="$RUNNER_TEMP/ssr-capacity-report/ssr-capacity.json"
+          else
+            report="$RUNNER_TEMP/external-client/external-load.json"
+          fi
           if /usr/bin/python3 - "$report" <<'PY'
           import json
           from pathlib import Path
@@ -1306,18 +1364,32 @@ jobs:
           if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
               raise SystemExit("candidate report is missing or unsafe")
           payload = json.loads(path.read_text(encoding="utf-8"))
-          supervisor = payload.get("runtime_supervisor")
-          if (
-              not isinstance(payload, dict)
-              or payload.get("worker_report_schema") != 2
-              or payload.get("report_complete") is not True
-              or type(payload.get("namespace_closed")) is not bool
-              or payload.get("namespace_closed") is not True
-              or not isinstance(supervisor, dict)
-              or supervisor.get("isolation") != "pid_namespace"
-              or supervisor.get("namespace_closed") is not True
-          ):
+          if not isinstance(payload, dict) or payload.get("namespace_closed") is not True:
               raise SystemExit("candidate report does not prove namespace closure")
+          if payload.get("fixture_kind") == "cpu_diagnostic_only_v1":
+              if payload.get("capacity_slo_credit") is not False or payload.get("diagnostic_credit") is not False:
+                  raise SystemExit("CPU-only report is not zero-credit")
+          elif payload.get("fixture_kind") == "ssr_capacity_diagnostic_v1":
+              if (
+                  payload.get("schema") != 1
+                  or payload.get("workload") != "authenticated_workspace_read_capacity_v1"
+                  or payload.get("matrix_credit") is not False
+                  or payload.get("slo_credit") is not False
+                  or payload.get("diagnostic_credit") is not False
+                  or payload.get("server_capacity_claim") is not None
+                  or payload.get("report_complete") is not True
+              ):
+                  raise SystemExit("SSR capacity report is not closed and zero-credit")
+          else:
+              supervisor = payload.get("runtime_supervisor")
+              if (
+                  payload.get("worker_report_schema") != 2
+                  or payload.get("report_complete") is not True
+                  or not isinstance(supervisor, dict)
+                  or supervisor.get("isolation") != "pid_namespace"
+                  or supervisor.get("namespace_closed") is not True
+              ):
+                  raise SystemExit("load report does not prove worker closure")
           PY
           then status=0; fi
           echo "namespace_closed_status=$status" >> "$GITHUB_OUTPUT"
@@ -1363,30 +1435,32 @@ jobs:
       - resolve-host-tools-pin
       - fixture-setup
       - load-client
-      - namespace-containment-barrier
-      - namespace-containment-manual-barrier
     if: >-
       always() &&
-      inputs.cpu_diagnostic_pair == true &&
+      (inputs.cpu_diagnostic_pair == true || inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
       needs.validate-external-inputs.result == 'success' &&
       needs.resolve-host-tools-pin.result == 'success' &&
       needs.fixture-setup.result == 'success' &&
       needs.fixture-setup.outputs.setup_status == '0' &&
       needs.fixture-setup.outputs.manifest_ready == '1' &&
-      needs.namespace-containment-barrier.result == 'success' &&
-      needs.namespace-containment-manual-barrier.result == 'success' &&
-      needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' &&
-      (needs.load-client.result == 'success' || needs.load-client.result == 'failure')
+      (
+        ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) && needs.load-client.result == 'skipped') ||
+        (inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true && (needs.load-client.result == 'success' || needs.load-client.result == 'failure'))
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: production
     permissions:
       actions: read
       contents: read
+    outputs:
+      pair_status: ${{ steps.cpu-pair.outputs.pair_status || steps.ssr-capacity.outputs.capacity_status }}
+      candidate_artifact_id: ${{ inputs.ssr_capacity_diagnostic_only && steps.publish-ssr-capacity.outputs.artifact-id || steps.publish-cpu-diagnostic.outputs.artifact-id }}
     env:
       TARGET_SHA: ${{ github.sha }}
       SOURCE_GIT_SHA: ${{ github.sha }}
       APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
+      PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
       MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}
     steps:
@@ -1407,6 +1481,41 @@ jobs:
         with:
           name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cpu-diagnostic-manifest
+
+      - name: Download matrix report before its optional CPU pair
+        if: ${{ inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/matrix-prerequisite
+
+      - name: Require closed matrix worker before the optional CPU pair
+        if: ${{ inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - "$RUNNER_TEMP/matrix-prerequisite/external-load.json" "$TARGET_SHA" "$GITHUB_RUN_ID" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          path, source_sha, run_id = sys.argv[1:]
+          report = json.loads(Path(path).read_text(encoding="utf-8"))
+          supervisor = report.get("runtime_supervisor") if isinstance(report, dict) else None
+          if (
+              not isinstance(report, dict)
+              or report.get("source_git_sha") != source_sha
+              or report.get("report_complete") is not True
+              or report.get("namespace_closed") is not True
+              or not isinstance(supervisor, dict)
+              or supervisor.get("isolation") != "pid_namespace"
+              or supervisor.get("namespace_closed") is not True
+          ):
+              raise SystemExit("matrix client did not prove its closed worker namespace")
+          if report.get("external_run_id") not in (None, run_id):
+              raise SystemExit("matrix client run binding does not match")
+          PY
 
       - name: Check out the bounded handoff files
         shell: bash
@@ -1457,8 +1566,20 @@ jobs:
           } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"
 
+      - name: Prepare SSR capacity report directory
+        if: ${{ inputs.ssr_capacity_diagnostic_only == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/ssr-capacity-report"
+          install -d -m 700 "$report_dir"
+          test "$(stat -c '%u:%g:%a' -- "$report_dir")" = "$(id -u):$(id -g):700"
+          test ! -e "$report_dir/report.json" && test ! -L "$report_dir/report.json"
+          test ! -e "$report_dir/ssr-capacity.json" && test ! -L "$report_dir/ssr-capacity.json"
+
       - name: Run the fixed authenticated workspace CPU pair
         id: cpu-pair
+        if: ${{ inputs.ssr_capacity_diagnostic_only != true }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -1476,12 +1597,34 @@ jobs:
             --app-target-sha "$APP_TARGET_SHA" \
             --external-run-id "$GITHUB_RUN_ID" \
             --external-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --fixture-kind "${{ inputs.cpu_diagnostic_only == true && 'cpu_diagnostic_only_v1' || 'external_load' }}" \
             --ssh-config "$RUNNER_TEMP/external-ssh/config" \
             --ssh-key "$RUNNER_TEMP/external-ssh/id_ed25519"
           pair_status="$?"
           set -e
           echo "pair_status=$pair_status" >> "$GITHUB_OUTPUT"
           exit "$pair_status"
+
+      - name: Run only the guarded SSR capacity diagnostic
+        id: ssr-capacity
+        if: ${{ inputs.ssr_capacity_diagnostic_only == true }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set +e
+          /usr/bin/python3 platform/tools/platform_ssr_capacity_diagnostic.py parent \
+            --manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" \
+            --report "$RUNNER_TEMP/ssr-capacity-report/report.json" \
+            --source-sha "$TARGET_SHA" --app-target-sha "$APP_TARGET_SHA" \
+            --external-run-id "$GITHUB_RUN_ID" --external-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --concurrency 8 \
+            --ssh-config "$RUNNER_TEMP/external-ssh/config" \
+            --ssh-key "$RUNNER_TEMP/external-ssh/id_ed25519"
+          capacity_status="$?"
+          echo "capacity_status=$capacity_status" >> "$GITHUB_OUTPUT"
+          exit "$capacity_status"
 
       - name: Remove diagnostic SSH material
         id: remove-diagnostic-ssh-material
@@ -1490,6 +1633,7 @@ jobs:
         run: |
           set +e
           ssh_dir="$RUNNER_TEMP/external-ssh"
+          if [[ '${{ inputs.ssr_capacity_diagnostic_only }}' == true ]]; then exit 0; fi
           report_path="$RUNNER_TEMP/cpu-diagnostic-report/report.json"
           lifecycle_path="$RUNNER_TEMP/cpu-diagnostic-report/ssh-lifecycle.json"
           /usr/bin/python3 -B -I - "$ssh_dir" "$report_path" "$lifecycle_path" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
@@ -1694,13 +1838,108 @@ jobs:
               raise SystemExit(1)
           PY
 
+      - name: Remove SSR capacity SSH material
+        id: remove-ssr-capacity-ssh
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -B -I - "$RUNNER_TEMP/external-ssh" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          directory = Path(sys.argv[1])
+          try:
+              before = directory.lstat()
+              if (not stat.S_ISDIR(before.st_mode) or before.st_uid != os.geteuid()
+                      or before.st_gid != os.getegid() or stat.S_IMODE(before.st_mode) != 0o700
+                      or before.st_nlink != 2):
+                  raise ValueError
+              fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(fd)
+                  if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                      raise ValueError
+                  names = {"config", "id_ed25519", "known_hosts"}
+                  if set(os.listdir(fd)) != names:
+                      raise ValueError
+                  for name in sorted(names):
+                      member_fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
+                      try:
+                          member = os.fstat(member_fd)
+                          current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                          if (not stat.S_ISREG(member.st_mode) or member.st_uid != os.geteuid()
+                                  or member.st_gid != os.getegid() or stat.S_IMODE(member.st_mode) != 0o600
+                                  or member.st_nlink != 1 or (member.st_dev, member.st_ino) != (current.st_dev, current.st_ino)):
+                              raise ValueError
+                          os.unlink(name, dir_fd=fd)
+                      finally:
+                          os.close(member_fd)
+                  if os.listdir(fd):
+                      raise ValueError
+                  os.fsync(fd)
+              finally:
+                  os.close(fd)
+              current_dir = directory.lstat()
+              if (current_dir.st_dev, current_dir.st_ino) != (before.st_dev, before.st_ino):
+                  raise ValueError
+              directory.rmdir()
+              if os.path.lexists(directory):
+                  raise ValueError
+          except (OSError, ValueError):
+              raise SystemExit("SSR capacity SSH material cleanup failed")
+          PY
+
+      - name: Project the CPU diagnostic report through its closed schema
+        id: sanitize-cpu-report
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only != true && steps.cpu-pair.outputs.pair_status != '' && steps.remove-diagnostic-ssh-material.outcome != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kind='${{ inputs.cpu_diagnostic_only == true && 'cpu_diagnostic_only_v1' || 'external_load' }}'
+          /usr/bin/python3 platform/tools/platform_cpu_diagnostic_pair.py sanitize-report \
+            --input "$RUNNER_TEMP/cpu-diagnostic-report/report.json" \
+            --output "$RUNNER_TEMP/cpu-diagnostic-report/cpu-diagnostic.json" \
+            --manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" \
+            --source-sha "$TARGET_SHA" \
+            --app-target-sha "$APP_TARGET_SHA" \
+            --external-run-id "$GITHUB_RUN_ID" \
+            --external-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --fixture-kind "$kind"
+
       - name: Publish only the bounded diagnostic summary
-        if: ${{ always() && steps.remove-diagnostic-ssh-material.outcome == 'success' }}
+        id: publish-cpu-diagnostic
+        if: ${{ always() && steps.sanitize-cpu-report.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-production-cpu-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/cpu-diagnostic-report/report.json
-          if-no-files-found: warn
+          path: ${{ runner.temp }}/cpu-diagnostic-report/cpu-diagnostic.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Project the SSR capacity report through its closed schema
+        id: sanitize-ssr-capacity
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true && steps.ssr-capacity.outputs.capacity_status != '' && steps.remove-ssr-capacity-ssh.outcome != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_ssr_capacity_diagnostic.py sanitize-report \
+            --input "$RUNNER_TEMP/ssr-capacity-report/report.json" \
+            --output "$RUNNER_TEMP/ssr-capacity-report/ssr-capacity.json" \
+            --manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" \
+            --source-sha "$TARGET_SHA" --app-target-sha "$APP_TARGET_SHA" \
+            --external-run-id "$GITHUB_RUN_ID" --external-run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Publish only the bounded SSR capacity summary
+        id: publish-ssr-capacity
+        if: ${{ always() && steps.sanitize-ssr-capacity.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-ssr-capacity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ssr-capacity-report/ssr-capacity.json
+          if-no-files-found: error
           retention-days: 1
 
   fixture-finalize:
@@ -1745,8 +1984,10 @@ jobs:
       TARGET_SHA: ${{ github.sha }}
       APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
+      CPU_DIAGNOSTIC_ONLY: ${{ inputs.cpu_diagnostic_only }}
+      SSR_CAPACITY_DIAGNOSTIC_ONLY: ${{ inputs.ssr_capacity_diagnostic_only }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
-      CANDIDATE_ARTIFACT_ID: ${{ needs.load-client.outputs.candidate_artifact_id }}
+      CANDIDATE_ARTIFACT_ID: ${{ (inputs.cpu_diagnostic_only || inputs.ssr_capacity_diagnostic_only) && needs['cpu-diagnostic-pair'].outputs.candidate_artifact_id || needs.load-client.outputs.candidate_artifact_id }}
       HOST_TOOLS_SHA: ${{ needs.resolve-host-tools-pin.outputs.host_tools_sha }}
     steps:
       - name: Mask and stage the control identity from the event file
@@ -1796,7 +2037,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -1857,11 +2098,26 @@ jobs:
         with:
           name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/external-input
-      - name: Download candidate diagnostic data
+      - name: Download candidate load data
+        if: ${{ inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true }}
         continue-on-error: true
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: platform-production-external-load-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-client
+      - name: Download CPU-only diagnostic data
+        if: ${{ inputs.cpu_diagnostic_only == true }}
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-cpu-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-client
+      - name: Download SSR capacity diagnostic data
+        if: ${{ inputs.ssr_capacity_diagnostic_only == true }}
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-ssr-capacity-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/external-client
       - name: Revalidate finalizer handoffs
         id: revalidate-finalizer
@@ -1900,7 +2156,7 @@ jobs:
               or handoff.get("schema") not in (1, "1", 2, "2")
               or handoff.get("target_sha") != target_sha
               or handoff.get("run_id") != run_id
-              or set(handoff) != base_handoff_keys | ({"source_binding"} if source_binding is not None else set())
+              or set(handoff) != base_handoff_keys | ({"fixture_kind"} if "fixture_kind" in handoff else set()) | ({"source_binding"} if source_binding is not None else set())
           ):
               raise SystemExit("cleanup source handoff is not bound to this run")
           if source_binding is None:
@@ -2051,8 +2307,14 @@ jobs:
             handoff_status=1
           fi
           install -d -m 700 "$candidate_dir"
+          candidate_artifact_name="platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          if [[ "$CPU_DIAGNOSTIC_ONLY" == true ]]; then
+            candidate_artifact_name="platform-production-cpu-diagnostic-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          elif [[ "$SSR_CAPACITY_DIAGNOSTIC_ONLY" == true ]]; then
+            candidate_artifact_name="platform-production-ssr-capacity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          fi
           if [[ -z "$CANDIDATE_ARTIFACT_ID" ]] \
-            || ! verify_artifact "$CANDIDATE_ARTIFACT_ID" "platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-finalizer-candidate; then
+            || ! verify_artifact "$CANDIDATE_ARTIFACT_ID" "$candidate_artifact_name" external-finalizer-candidate; then
             candidate_artifact_status=1
           fi
           if [[ "$handoff_status" == 0 ]]; then
@@ -2066,7 +2328,7 @@ jobs:
           payload = json.loads(Path(path).read_text(encoding="utf-8"))
           base_keys = {"schema", "confirmation", "target_sha", "control_email", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics"}
           binding = payload.get("source_binding")
-          expected = base_keys | ({"source_binding"} if binding is not None else set())
+          expected = base_keys | ({"fixture_kind"} if "fixture_kind" in payload else set()) | ({"source_binding"} if binding is not None else set())
           if set(payload) != expected or payload.get("schema") not in (1, "1", 2, "2") or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id:
               raise SystemExit("external finalizer handoff schema or exact target SHA mismatch")
           if binding is None:
@@ -2225,7 +2487,7 @@ jobs:
               "markers": 0,
               "users_deleted": 0,
               "tournaments_deleted": 0,
-              "control_account_preserved": False,
+              "control_account_preserved": None,
               "error_class": "cleanup_summary_invalid",
           }
 
@@ -2747,7 +3009,10 @@ jobs:
       SOURCE_GIT_SHA: ${{ github.sha }}
       APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
-      CANDIDATE_ARTIFACT_ID: ${{ needs.load-client.outputs.candidate_artifact_id }}
+      MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}
+      CPU_DIAGNOSTIC_ONLY: ${{ inputs.cpu_diagnostic_only }}
+      SSR_CAPACITY_DIAGNOSTIC_ONLY: ${{ inputs.ssr_capacity_diagnostic_only }}
+      CANDIDATE_ARTIFACT_ID: ${{ (inputs.cpu_diagnostic_only || inputs.ssr_capacity_diagnostic_only) && needs['cpu-diagnostic-pair'].outputs.candidate_artifact_id || needs.load-client.outputs.candidate_artifact_id }}
       ORIGIN_ARTIFACT_ID: ${{ needs.fixture-finalize.outputs.origin_artifact_id }}
     steps:
       - name: Checkout reviewed load evaluator
@@ -2762,10 +3027,25 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_GIT_SHA"
       - name: Download candidate load data
+        if: ${{ inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true }}
         continue-on-error: true
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: platform-production-external-load-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-client
+      - name: Download CPU-only diagnostic data
+        if: ${{ inputs.cpu_diagnostic_only == true }}
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-cpu-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-client
+      - name: Download SSR capacity diagnostic data
+        if: ${{ inputs.ssr_capacity_diagnostic_only == true }}
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-ssr-capacity-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/external-client
       - name: Download exact source-binding handoff
         continue-on-error: true
@@ -2779,6 +3059,13 @@ jobs:
         with:
           name: platform-production-external-load-origin-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/external-evidence
+      - name: Download exact fixture manifest for diagnostic evaluation
+        if: ${{ inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true }}
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-manifest
       - name: Verify evaluator artifact identity and digest
         id: verify-evaluator-artifacts
         if: ${{ always() }}
@@ -2844,15 +3131,173 @@ jobs:
           candidate_status=0
           origin_status=0
           input_status=0
+          manifest_status=0
           verify_artifact "$INPUT_ARTIFACT_ID" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-input || input_status=1
-          verify_artifact "$CANDIDATE_ARTIFACT_ID" "platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-candidate || candidate_status=1
+          if [[ "$CPU_DIAGNOSTIC_ONLY" == true ]]; then
+            verify_artifact "$MANIFEST_ARTIFACT_ID" "platform-production-external-load-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-manifest || manifest_status=1
+          elif [[ "$SSR_CAPACITY_DIAGNOSTIC_ONLY" == true ]]; then
+            verify_artifact "$MANIFEST_ARTIFACT_ID" "platform-production-external-load-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-manifest || manifest_status=1
+          fi
+          candidate_artifact_name="platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          if [[ "$CPU_DIAGNOSTIC_ONLY" == true ]]; then
+            candidate_artifact_name="platform-production-cpu-diagnostic-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          elif [[ "$SSR_CAPACITY_DIAGNOSTIC_ONLY" == true ]]; then
+            candidate_artifact_name="platform-production-ssr-capacity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          fi
+          verify_artifact "$CANDIDATE_ARTIFACT_ID" "$candidate_artifact_name" evaluator-candidate || candidate_status=1
           verify_artifact "$ORIGIN_ARTIFACT_ID" "platform-production-external-load-origin-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-origin || origin_status=1
           echo "candidate_artifact_status=$candidate_status" >> "$GITHUB_OUTPUT"
           echo "origin_artifact_status=$origin_status" >> "$GITHUB_OUTPUT"
           echo "input_artifact_status=$input_status" >> "$GITHUB_OUTPUT"
+          echo "manifest_artifact_status=$manifest_status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Evaluate typed CPU-only diagnostic without matrix credit
+        id: evaluate-cpu-diagnostic
+        if: ${{ always() && inputs.cpu_diagnostic_only == true }}
+        shell: bash
+        run: |
+          set +e
+          outcome=INVALID
+          report="$RUNNER_TEMP/external-client/cpu-diagnostic.json"
+          cleanup="$RUNNER_TEMP/external-evidence/cleanup-summary.json"
+          manifest="$RUNNER_TEMP/external-manifest/manifest.json"
+          handoff="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          if [[ "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.manifest_artifact_status }}" == 0 \
+            && -s "$report" && ! -L "$report" && -s "$cleanup" && ! -L "$cleanup" && -s "$manifest" && ! -L "$manifest" && -s "$handoff" && ! -L "$handoff" ]]; then
+            outcome="$(/usr/bin/python3 - "$report" "$cleanup" "$manifest" "$handoff" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          report_path, cleanup_path, manifest_path, handoff_path, source_sha, app_sha, run_id, attempt = sys.argv[1:]
+          try:
+              report = json.loads(Path(report_path).read_text(encoding="ascii"))
+              cleanup = json.loads(Path(cleanup_path).read_text(encoding="ascii"))
+              manifest_raw = Path(manifest_path).read_bytes()
+              manifest = json.loads(manifest_raw.decode("ascii"))
+              handoff_raw = Path(handoff_path).read_bytes()
+              handoff = json.loads(handoff_raw.decode("ascii"))
+              binding = handoff.get("source_binding")
+              binding_raw = json.dumps(binding, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("ascii") if binding is not None else b""
+              binding_sha = hashlib.sha256(binding_raw).hexdigest() if binding is not None else None
+              if (
+                  not isinstance(cleanup, dict)
+                  or cleanup.get("ok") is not True
+                  or cleanup.get("control_account_preserved") is not True
+                  or cleanup.get("users_deleted") != 14
+                  or cleanup.get("tournaments_deleted") != 1
+                  or not isinstance(manifest, dict)
+                  or len(manifest.get("tournaments", [])) != 1
+                  or len(manifest.get("users", [])) != 14
+                  or handoff.get("target_sha") != source_sha
+                  or handoff.get("run_id") != run_id
+                  or handoff.get("fixture_kind") != "cpu_diagnostic_only_v1"
+                  or handoff.get("tournament_count") != "1"
+                  or handoff.get("users_per_tournament") != "14"
+                  or manifest.get("runner_sha") != source_sha
+                  or manifest.get("app_target_sha") != app_sha
+                  or manifest.get("source_binding_sha256") != binding_sha
+                  or (binding is not None and (binding.get("runner_sha") != source_sha or binding.get("app_target_sha") != app_sha))
+                  or report.get("input_handoff_sha256") != hashlib.sha256(handoff_raw).hexdigest()
+                  or report.get("source_binding_sha256") != binding_sha
+              ):
+                  raise ValueError
+              sys.path.insert(0, str(Path.cwd() / "platform"))
+              from tools.platform_cpu_diagnostic_pair import evaluate_cpu_only_report
+              print(evaluate_cpu_only_report(
+                  report, source_sha=source_sha, app_target_sha=app_sha,
+                  run_id=run_id, attempt=attempt,
+                  manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+              ))
+          except Exception:
+              print("INVALID")
+          PY
+          )"
+          fi
+          case "$outcome" in PASS|FAIL|INVALID) ;; *) outcome=INVALID ;; esac
+          status=0
+          [[ "$outcome" == INVALID ]] && status=1
+          acceptance="diagnostic_$(printf '%s' "$outcome" | tr '[:upper:]' '[:lower:]')"
+          echo "evaluation_status=$status" >> "$GITHUB_OUTPUT"
+          echo "acceptance_status=$acceptance" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Evaluate typed SSR capacity diagnostic without matrix credit
+        id: evaluate-ssr-capacity
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true }}
+        shell: bash
+        run: |
+          set +e
+          outcome=INVALID
+          report="$RUNNER_TEMP/external-client/ssr-capacity.json"
+          cleanup="$RUNNER_TEMP/external-evidence/cleanup-summary.json"
+          manifest="$RUNNER_TEMP/external-manifest/manifest.json"
+          handoff="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          if [[ "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.manifest_artifact_status }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.cleanup_status }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.ssh_cleanup_status }}" == 0 \
+            && -s "$report" && ! -L "$report" && -s "$cleanup" && ! -L "$cleanup" \
+            && -s "$manifest" && ! -L "$manifest" && -s "$handoff" && ! -L "$handoff" ]]; then
+            outcome="$(/usr/bin/python3 - "$report" "$cleanup" "$manifest" "$handoff" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          report_path, cleanup_path, manifest_path, handoff_path, source_sha, app_sha, run_id, attempt = sys.argv[1:]
+          try:
+              report = json.loads(Path(report_path).read_text(encoding="ascii"))
+              cleanup = json.loads(Path(cleanup_path).read_text(encoding="ascii"))
+              manifest_raw = Path(manifest_path).read_bytes()
+              manifest = json.loads(manifest_raw.decode("ascii"))
+              handoff = json.loads(Path(handoff_path).read_text(encoding="ascii"))
+              if (
+                  not isinstance(cleanup, dict)
+                  or cleanup.get("ok") is not True
+                  or cleanup.get("control_account_preserved") is not True
+                  or cleanup.get("users_deleted") != 14
+                  or cleanup.get("tournaments_deleted") != 1
+                  or not isinstance(manifest, dict)
+                  or len(manifest.get("tournaments", [])) != 1
+                  or len(manifest.get("users", [])) != 14
+                  or handoff.get("target_sha") != source_sha
+                  or handoff.get("run_id") != run_id
+                  or handoff.get("fixture_kind") != "ssr_capacity_diagnostic_v1"
+                  or handoff.get("tournament_count") != "1"
+                  or handoff.get("users_per_tournament") != "14"
+                  or manifest.get("runner_sha") != source_sha
+                  or manifest.get("app_target_sha") != app_sha
+                  or report.get("fixture_manifest_sha256") != hashlib.sha256(manifest_raw).hexdigest()
+              ):
+                  raise ValueError
+              sys.path.insert(0, str(Path.cwd() / "platform"))
+              from tools.platform_ssr_capacity_diagnostic import evaluate_capacity_report
+              print(evaluate_capacity_report(
+                  report, source_sha=source_sha, app_target_sha=app_sha,
+                  run_id=run_id, attempt=attempt,
+                  manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+              ))
+          except Exception:
+              print("INVALID")
+          PY
+          )"
+          fi
+          case "$outcome" in PASS|FAIL|INVALID) ;; *) outcome=INVALID ;; esac
+          status=0
+          [[ "$outcome" == INVALID ]] && status=1
+          acceptance="capacity_$(printf '%s' "$outcome" | tr '[:upper:]' '[:lower:]')"
+          echo "evaluation_status=$status" >> "$GITHUB_OUTPUT"
+          echo "acceptance_status=$acceptance" >> "$GITHUB_OUTPUT"
           exit 0
       - name: Evaluate checked-out load report
         id: evaluate-load
+        if: ${{ inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true }}
         shell: bash
         run: |
           set -u
@@ -3161,7 +3606,7 @@ jobs:
           exit 0
       - name: Sanitize external evidence
         id: sanitize
-        if: ${{ always() }}
+        if: ${{ always() && inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true }}
         shell: bash
         run: |
           set +e
@@ -3207,7 +3652,11 @@ jobs:
           cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
           if not isinstance(matrix, dict) or matrix.get("passed") is not True:
               raise SystemExit("matrix summary is not a passing closed record")
-          if not isinstance(cleanup, dict) or cleanup.get("ok") is not True:
+          if (
+              not isinstance(cleanup, dict)
+              or cleanup.get("ok") is not True
+              or cleanup.get("control_account_preserved") is not True
+          ):
               raise SystemExit("cleanup summary is not a passing closed record")
           PY
           if [[ "$?" != 0 ]]; then sanitizer_status=1; fi
@@ -3230,6 +3679,8 @@ jobs:
           exit 0
       - name: Publish external load evidence
         if: >-
+          inputs.cpu_diagnostic_only != true &&
+          inputs.ssr_capacity_diagnostic_only != true &&
           success() &&
           needs.validate-external-inputs.result == 'success' &&
           needs.fixture-setup.result == 'success' &&
@@ -3283,7 +3734,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Enforce external load and exact cleanup gates
-        if: ${{ always() }}
+        if: ${{ always() && inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true }}
         shell: bash
         run: |
           set -euo pipefail
@@ -3328,3 +3779,70 @@ jobs:
             exit 1
           fi
           case "$acceptance_status" in accepted|diagnostic_complete) ;; *) echo "External-load final acceptance state is invalid." >&2; exit 1 ;; esac
+      - name: Enforce CPU-only diagnostic and exact cleanup gates
+        if: ${{ always() && inputs.cpu_diagnostic_only == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ needs.validate-external-inputs.result }}" = success
+          test "${{ needs.fixture-setup.result }}" = success
+          test "${{ needs.fixture-setup.outputs.setup_status }}" = 0
+          test "${{ needs.fixture-setup.outputs.ssh_cleanup_status }}" = 0
+          test "${{ needs.namespace-containment-barrier.result }}" = success
+          test "${{ needs.namespace-containment-barrier.outputs.namespace_closed_status }}" = 0
+          test "${{ needs.namespace-containment-manual-barrier.result }}" = success
+          test "${{ needs.namespace-containment-manual-barrier.outputs.manual_required }}" = 0
+          test "${{ needs['cpu-diagnostic-pair'].result }}" = success
+          test "${{ needs.fixture-finalize.result }}" = success
+          test "${{ needs.fixture-finalize.outputs.remote_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.observer_ready }}" = 1
+          test "${{ needs.fixture-finalize.outputs.finalize_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.cleanup_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_diagnostic_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.cleanup_exports_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.ssh_cleanup_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.cleanup_identity_status }}" = 0
+          test "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" = 0
+          test "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" = 0
+          test "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" = 0
+          test "${{ steps.verify-evaluator-artifacts.outputs.manifest_artifact_status }}" = 0
+          test "${{ steps.evaluate-cpu-diagnostic.outputs.evaluation_status }}" = 0
+          test "${{ steps.evaluate-cpu-diagnostic.outputs.acceptance_status }}" = diagnostic_pass || { echo "CPU diagnostic did not meet its bounded overhead contract." >&2; exit 1; }
+      - name: Enforce SSR capacity-only diagnostic and exact cleanup gates
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ needs.validate-external-inputs.result }}" = success
+          test "${{ needs.fixture-setup.result }}" = success
+          test "${{ needs.fixture-setup.outputs.setup_status }}" = 0
+          test "${{ needs.fixture-setup.outputs.ssh_cleanup_status }}" = 0
+          test "${{ needs.namespace-containment-barrier.result }}" = success
+          test "${{ needs.namespace-containment-barrier.outputs.namespace_closed_status }}" = 0
+          test "${{ needs.namespace-containment-manual-barrier.result }}" = success
+          test "${{ needs.namespace-containment-manual-barrier.outputs.manual_required }}" = 0
+          test "${{ needs['cpu-diagnostic-pair'].result }}" = success
+          test "${{ needs['cpu-diagnostic-pair'].outputs.pair_status }}" = 0
+          test "${{ needs.fixture-finalize.result }}" = success
+          test "${{ needs.fixture-finalize.outputs.remote_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.observer_ready }}" = 1
+          test "${{ needs.fixture-finalize.outputs.finalize_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.cleanup_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_diagnostic_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_dispatch_exit_code }}" = 0
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_stage }}" = complete
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_child_state }}" = exited
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_child_exit }}" = 0
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_stdout_eof }}" = true
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_timed_out }}" = false
+          test "${{ needs.fixture-finalize.outputs.cleanup_exports_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.ssh_cleanup_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.cleanup_identity_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.handoff_status }}" = 0
+          test "${{ needs.fixture-finalize.outputs.candidate_artifact_status }}" = 0
+          test "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" = 0
+          test "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" = 0
+          test "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" = 0
+          test "${{ steps.verify-evaluator-artifacts.outputs.manifest_artifact_status }}" = 0
+          test "${{ steps.evaluate-ssr-capacity.outputs.evaluation_status }}" = 0
+          test "${{ steps.evaluate-ssr-capacity.outputs.acceptance_status }}" = capacity_pass || { echo "SSR capacity diagnostic did not produce complete bounded evidence." >&2; exit 1; }

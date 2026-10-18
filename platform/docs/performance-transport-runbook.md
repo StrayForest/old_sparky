@@ -3,6 +3,79 @@
 - Status: Active operator procedure
 - Owner: Platform maintainers
 
+## CPU and memory diagnostic interpretation
+
+The opt-in paired CPU diagnostic uses an eight-actor authenticated read cohort
+and reports one bounded Node/V8 sample at a nominal four-second interval,
+capped at five per phase. A delayed/incomplete window may contain fewer
+samples; only exactly five accepted samples are complete, and missing samples
+are never filled or promoted to PASS. RSS, V8 heap, external memory and array buffers are byte gauges; Node
+reports `arrayBuffers` as a component of `external`, so do not add them
+together. GC entries belong to a phase by their monotonic start time, and a
+collection extending past the phase end contributes only its in-phase
+duration. `sampled_window_duration_ms` is the interval between the first and
+last accepted samples (normally 16 seconds), not the full 20-second request
+phase. `memory_events_*_sampled_delta` cover only that sampled interval.
+`memory.peak` is the cgroup lifetime high-water mark, while
+`current_sampled_max` is the greatest sampled `memory.current` value; neither
+is a continuous phase maximum. Missing cgroup support is UNKNOWN; malformed
+data where the v2 hierarchy is present is INVALID. These diagnostics explain
+the measured small workload and profiler overhead; they do not alone establish
+the cause of an earlier OOM or the server's total capacity.
+
+Load profiles must also state their arrival model. A closed-loop concurrency
+test produces the rate the system can sustain and is not fixed-RPS evidence;
+an open arrival schedule can reveal under-delivery and dropped work. Preserve
+both scheduled and achieved request counts, generator quota/headroom and queue
+lag before making a server-capacity claim. Capacity attribution treats p99
+executor-queue wait above the protocol's 2 ms diagnostic floor as material;
+open-loop runs also apply that floor to p99 scheduled-to-start delay. This floor
+classifies generator evidence only: it does not change an SLO, latency budget,
+or raw timing series. Any positive timer jitter remains visible, and closed-loop
+schedule delay is not counted as missed offered rate because that model refills
+after completion. See the primary
+[`k6 open and closed models`](https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/),
+[`k6 dropped iterations`](https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/dropped-iterations/),
+and [Locust wait-time documentation](https://docs.locust.io/en/stable/writing-a-locustfile.html#wait-time).
+Node metric semantics are defined by its [`process.memoryUsage()`](https://nodejs.org/api/process.html#processmemoryusage),
+[`v8.getHeapStatistics()`](https://nodejs.org/api/v8.html#v8getheapstatistics),
+and [GC performance entries](https://nodejs.org/api/perf_hooks.html#garbage-collection-gc-details).
+`capacity_attribution_eligible` means only that the measured generator had
+headroom and delivered the scheduled work for SUT-side analysis. It is not a
+server-capacity claim. `server_capacity_claim` remains unknown with reason
+`resource_correlation_not_provided` until production resource saturation is
+independently correlated with the delivered workload; the public sanitizer
+recomputes generator eligibility and does not trust an incoming claim. Older
+reports without this distinction are never promoted to eligible.
+The external-load supervisor may claim only GitHub-hosted VM-visible CPU quota
+and effective cpuset when the exact runner PID/starttime, outer PID/mount/
+cgroup namespaces, global cgroup2 mount, membership, every visible ancestor,
+and sampled counters remain bound and complete. This does not establish
+physical-host capacity or hypervisor scheduling headroom; missing or changed
+evidence stays UNKNOWN. The hosted-runner premise follows the
+[GitHub-hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+and [container-job boundary](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/run-jobs-in-a-container),
+and quota/cpuset semantics follow the [Linux cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html).
+
+The separate `authenticated_workspace_read_capacity_v1` diagnostic is a
+best-effort closed-loop SSR read workload with zero load-matrix credit. Its
+small physical fixture has one tournament and 14 QA-contract users; 14 is an
+existing diagnostic fixture minimum, not an API or business minimum. It uses
+eight actors and a closed preset of 8 or 16 concurrent reads for one 20-second
+ON window. The initial operational run uses 8; 16 requires a clean 8 run and
+independent review of the observed memory margin and generator evidence. The
+untraced warmup and OFF marker burst are separate from ON request counts, use
+the same persistent HTTP/1.1 connection pool as the ON window, and are aligned
+to the bound plan's wall-clock boundaries. The OFF burst must reach both API
+worker processes; partial worker coverage remains incomplete. Server Node/V8,
+GC and cgroup rows must survive the plan cleanup, dispatcher projection,
+validator and capacity evaluator with the same run binding. The concurrent
+read-only memory guard stops new submissions and drains in-flight work at its
+predeclared safety boundary (768 MiB current memory for the bound 1 GiB web
+cgroup, or any positive memory event); an abort is an incomplete diagnostic,
+never a performance pass. These measurements can support workload-specific analysis,
+but do not claim the server's maximum capacity or physical-host headroom.
+
 Use this procedure to separate authenticated HTML latency across direct
 Next.js, local Nginx and public Cloudflare. It is diagnostic evidence only; the
 canonical external load profile remains the authority for production latency,

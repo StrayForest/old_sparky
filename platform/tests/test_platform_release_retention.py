@@ -179,6 +179,25 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         self.assertTrue(current.exists())
         self.assertTrue(previous.exists())
 
+    def test_pinned_qa_provider_release_cannot_become_a_pruning_candidate(self) -> None:
+        current = self.add_release("release-current", age_days=30)
+        previous = self.add_release("release-previous", age_days=29)
+        pinned = self.add_release("gha-38000614899-1-7e5769ba3f85", age_days=90)
+        candidate = self.add_release("release-old", age_days=80)
+        self.link("current", current)
+        self.link("previous", previous)
+
+        plan = build_retention_plan(
+            self.app_dir,
+            keep=0,
+            min_age_days=0,
+            protect_releases=(pinned.name,),
+            now=self.now,
+        )
+        self.assertNotIn(pinned, {entry.path for entry in plan.candidates})
+        self.assertIn(pinned, {entry.path for entry in plan.retained})
+        self.assertIn(candidate, {entry.path for entry in plan.candidates})
+
     def test_apply_deletes_only_candidates(self) -> None:
         current = self.add_release("release-current", age_days=30)
         previous = self.add_release("release-previous", age_days=29)

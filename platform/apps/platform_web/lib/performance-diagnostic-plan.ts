@@ -3,10 +3,19 @@ import "server-only";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { constants as fsConstants, openSync, closeSync, fstatSync, lstatSync, readFileSync, readSync } from "node:fs";
 import { availableParallelism } from "node:os";
+import { constants as performanceConstants, PerformanceObserver } from "node:perf_hooks";
 import { resolve } from "node:path";
 import inspector from "node:inspector";
+import { getHeapStatistics } from "node:v8";
 import { headers } from "next/headers";
 import { hasAuthorizedDiagnosticRunMarker } from "./performance-diagnostic-marker";
+import {
+  appendBoundedSample,
+  classifyCgroupReadFailure,
+  formatCpuDiagnosticMemoryEvent,
+  isStableBoundedPseudoFileRead,
+  timelineEntryDurationWithinWindow,
+} from "./server-ssr-heap-metrics.mjs";
 
 const PLAN_DIRECTORY = "/run/oldsparky-platform";
 const PLAN_PATH = `${PLAN_DIRECTORY}/performance-diagnostic-plan.web.json`;
@@ -19,7 +28,12 @@ const MAX_SAMPLES = 1200;
 const MAX_PROFILE_NODES = 10_000;
 const MAX_PROFILE_CPU_US = 60_000_000;
 const CPU_WINDOW_TOLERANCE_MS = 250;
-const WORKLOAD = "authenticated_workspace_read_pair_v1";
+const MEMORY_SAMPLE_INTERVAL_MS = 4_000;
+const MEMORY_SAMPLE_LIMIT = 5;
+const GC_EVENT_LIMIT = 10_000;
+const CGROUP_MEMORY_EVENT_NAMES = ["low", "high", "max", "oom", "oom_kill", "oom_group_kill"] as const;
+const WORKLOAD_CPU_PAIR = "authenticated_workspace_read_pair_v1";
+const WORKLOAD_SSR_CAPACITY = "authenticated_workspace_read_capacity_v1";
 const DIAGNOSTIC_TRACE_HEADER = "x-platform-ssr-trace";
 
 type PlanTarget = {
@@ -34,7 +48,7 @@ type DiagnosticPlan = {
   readonly run_id: string;
   readonly source_sha: string;
   readonly release_slug: string;
-  readonly workload: typeof WORKLOAD;
+  readonly workload: typeof WORKLOAD_CPU_PAIR | typeof WORKLOAD_SSR_CAPACITY;
   readonly off_start_ms: number;
   readonly off_end_ms: number;
   readonly on_start_ms: number;
@@ -58,6 +72,7 @@ type ActiveDiagnostic = {
 const diagnosticStorage = new AsyncLocalStorage<ActiveDiagnostic>();
 const consumedCpuRunIds = new Set<string>();
 const usageWindowsStarted = new Set<string>();
+const memoryWindowsStarted = new Set<string>();
 let activeCpuRunId: string | null = null;
 let planCache: { checkedAt: number; plan: DiagnosticPlan | null } | null = null;
 const PLAN_CACHE_MS = 100;
@@ -130,7 +145,8 @@ function validatePayload(value: unknown): DiagnosticPlan | null {
     "expires_at_ms", "targets"
   ].sort();
   if (Object.keys(plan).sort().join("|") !== keys.join("|")) return null;
-  if (plan.schema !== 1 || plan.workload !== WORKLOAD
+  if (plan.schema !== 1
+      || (plan.workload !== WORKLOAD_CPU_PAIR && plan.workload !== WORKLOAD_SSR_CAPACITY)
       || typeof plan.run_id !== "string" || !/^[0-9a-f]{32}$/u.test(plan.run_id)
       || typeof plan.source_sha !== "string" || !/^[0-9a-f]{40}$/u.test(plan.source_sha)
       || typeof plan.release_slug !== "string" || !/^[a-z0-9][a-z0-9-]{0,79}$/u.test(plan.release_slug)) {
@@ -265,7 +281,9 @@ export async function run_with_workspace_cpu_diagnostic<T>(
   }
   if (!hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)) return operation();
   startCpuUsageWindow(plan, phase);
-  if (phase === "on" && !consumedCpuRunIds.has(plan.run_id) && activeCpuRunId === null) {
+  startNodeMemoryWindow(plan, phase);
+  if (plan.workload === WORKLOAD_CPU_PAIR && phase === "on"
+      && !consumedCpuRunIds.has(plan.run_id) && activeCpuRunId === null) {
     consumedCpuRunIds.add(plan.run_id);
     await startNodeCpuProfile(plan, Date.now());
   }
@@ -356,6 +374,260 @@ function startCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void
     );
   }, Math.max(0, endTarget - startMs));
   timer.unref();
+}
+
+type CgroupMemorySnapshot = {
+  readonly currentBytes: number;
+  readonly peakBytes: number;
+  readonly events: Readonly<Record<typeof CGROUP_MEMORY_EVENT_NAMES[number], number>>;
+};
+
+type CgroupMemoryRead =
+  | { readonly status: "complete"; readonly reason: "none"; readonly snapshot: CgroupMemorySnapshot }
+  | { readonly status: "unavailable"; readonly reason: "hierarchy_unavailable" | "file_unavailable"; readonly snapshot: null }
+  | { readonly status: "invalid"; readonly reason: "invalid_snapshot"; readonly snapshot: null };
+
+type NodeMemorySample = {
+  readonly elapsedMs: number;
+  readonly rssBytes: number;
+  readonly heapTotalBytes: number;
+  readonly heapUsedBytes: number;
+  readonly heapLimitBytes: number;
+  readonly externalBytes: number;
+  readonly arrayBuffersBytes: number;
+  readonly cgroupMemoryStatus: CgroupMemoryRead["status"];
+  readonly cgroupMemoryReason: CgroupMemoryRead["reason"];
+  readonly cgroup: CgroupMemorySnapshot | null;
+};
+
+type SafeCgroupText =
+  | { readonly status: "complete"; readonly text: string }
+  | { readonly status: "unavailable" | "invalid" };
+
+function readSafeCgroupText(path: string, limit: number): SafeCgroupText {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size < 0 || info.size > limit) return { status: "invalid" };
+    const raw = readBounded(fd, limit);
+    const after = fstatSync(fd);
+    if (!isStableBoundedPseudoFileRead({
+      beforeSize: info.size,
+      afterSize: after.size,
+      beforeDevice: info.dev,
+      afterDevice: after.dev,
+      beforeInode: info.ino,
+      afterInode: after.ino,
+      beforeRegularFile: info.isFile(),
+      afterRegularFile: after.isFile(),
+      byteLength: raw.length,
+      limit,
+    })) return { status: "invalid" };
+    return { status: "complete", text: raw.toString("ascii") };
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : null;
+    return { status: classifyCgroupReadFailure(typeof code === "string" ? code : null) };
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function readCgroupMemorySnapshot(): CgroupMemoryRead {
+  const membership = readSafeCgroupText("/proc/self/cgroup", 8192);
+  if (membership.status === "unavailable") return { status: "unavailable", reason: "hierarchy_unavailable", snapshot: null };
+  if (membership.status === "invalid") return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+  const line = membership.text.split("\n").find((candidate) => candidate.startsWith("0::"));
+  if (!line) return { status: "unavailable", reason: "hierarchy_unavailable", snapshot: null };
+  if (!/^0::\/[A-Za-z0-9._/-]{0,512}$/u.test(line)) return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+  const relative = line.slice(3).split("/").filter(Boolean);
+  if (relative.some((part) => part === "." || part === "..")) return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+  const directory = `/sys/fs/cgroup${relative.length ? `/${relative.join("/")}` : ""}`;
+  const currentRead = readSafeCgroupText(`${directory}/memory.current`, 64);
+  const peakRead = readSafeCgroupText(`${directory}/memory.peak`, 64);
+  const eventsRaw = readSafeCgroupText(`${directory}/memory.events`, 512);
+  if (currentRead.status === "invalid" || peakRead.status === "invalid" || eventsRaw.status === "invalid") {
+    return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+  }
+  if (currentRead.status === "unavailable" || peakRead.status === "unavailable" || eventsRaw.status === "unavailable") {
+    return { status: "unavailable", reason: "file_unavailable", snapshot: null };
+  }
+  if (currentRead.status !== "complete" || peakRead.status !== "complete" || eventsRaw.status !== "complete") {
+    return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+  }
+  const currentRaw = currentRead.text.trim();
+  const peakRaw = peakRead.text.trim();
+  if (!currentRaw || !peakRaw || !/^[0-9]{1,16}$/u.test(currentRaw) || !/^[0-9]{1,16}$/u.test(peakRaw)) {
+    return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+  }
+  const events: Record<typeof CGROUP_MEMORY_EVENT_NAMES[number], number> = {
+    low: -1, high: -1, max: -1, oom: -1, oom_kill: -1, oom_group_kill: -1,
+  };
+  const seen = new Set<string>();
+  for (const row of eventsRaw.text.trim().split("\n")) {
+    const fields = row.split(/\s+/u);
+    if (fields.length !== 2 || !CGROUP_MEMORY_EVENT_NAMES.includes(fields[0] as typeof CGROUP_MEMORY_EVENT_NAMES[number])
+        || !/^[0-9]{1,16}$/u.test(fields[1]) || seen.has(fields[0])) {
+      return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+    }
+    seen.add(fields[0]);
+    events[fields[0] as typeof CGROUP_MEMORY_EVENT_NAMES[number]] = Number(fields[1]);
+  }
+  if (seen.size !== CGROUP_MEMORY_EVENT_NAMES.length
+      || Object.values(events).some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+  }
+  const currentBytes = Number(currentRaw);
+  const peakBytes = Number(peakRaw);
+  if (!Number.isSafeInteger(currentBytes) || !Number.isSafeInteger(peakBytes)) {
+    return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+  }
+  return { status: "complete", reason: "none", snapshot: { currentBytes, peakBytes, events } };
+}
+
+function captureNodeMemorySample(phaseStartMonotonicMs: number): NodeMemorySample | null {
+  try {
+    const memory = process.memoryUsage();
+    const heap = getHeapStatistics();
+    const values = [
+      memory.rss, heap.total_heap_size, heap.used_heap_size, heap.heap_size_limit,
+      memory.external, memory.arrayBuffers,
+    ];
+    if (values.some((value) => !Number.isSafeInteger(value) || value < 0)) return null;
+    const cgroup = readCgroupMemorySnapshot();
+    return {
+      elapsedMs: Math.max(0, Math.round(performance.now() - phaseStartMonotonicMs)),
+      rssBytes: memory.rss,
+      heapTotalBytes: heap.total_heap_size,
+      heapUsedBytes: heap.used_heap_size,
+      heapLimitBytes: heap.heap_size_limit,
+      externalBytes: memory.external,
+      arrayBuffersBytes: memory.arrayBuffers,
+      cgroupMemoryStatus: cgroup.status,
+      cgroupMemoryReason: cgroup.reason,
+      cgroup: cgroup.snapshot,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function startNodeMemoryWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void {
+  const key = `${plan.run_id}:${phase}`;
+  if (memoryWindowsStarted.has(key)) return;
+  memoryWindowsStarted.add(key);
+  const samples: NodeMemorySample[] = [];
+  let gcCount = 0;
+  let gcDurationMs = 0;
+  const gcCounts: Record<string, number> = { major: 0, minor: 0, incremental: 0, weakcb: 0, other: 0 };
+  let gcOverflow = false;
+  let observer: PerformanceObserver | null = null;
+  const phaseStartEpochMs = phase === "off" ? plan.off_start_ms : plan.on_start_ms;
+  const phaseStartMonotonicMs = performance.now() + (phaseStartEpochMs - Date.now());
+  const phaseEndMonotonicMs = phaseStartMonotonicMs + ON_WINDOW_MS;
+  const consumeGcEntries = (entries: readonly PerformanceEntry[]): void => {
+    for (const entry of entries) {
+      const attributedDurationMs = timelineEntryDurationWithinWindow(
+        entry.startTime, entry.duration, phaseStartMonotonicMs, phaseEndMonotonicMs,
+      );
+      if (attributedDurationMs === null) continue;
+      if (gcCount >= GC_EVENT_LIMIT) {
+        gcOverflow = true;
+        continue;
+      }
+      gcCount += 1;
+      gcDurationMs += attributedDurationMs;
+      const kind = entry.detail && typeof entry.detail === "object" && "kind" in entry.detail
+        ? Number(entry.detail.kind) : Number.NaN;
+      const category = kind === performanceConstants.NODE_PERFORMANCE_GC_MAJOR ? "major"
+        : kind === performanceConstants.NODE_PERFORMANCE_GC_MINOR ? "minor"
+          : kind === performanceConstants.NODE_PERFORMANCE_GC_INCREMENTAL ? "incremental"
+            : kind === performanceConstants.NODE_PERFORMANCE_GC_WEAKCB ? "weakcb" : "other";
+      gcCounts[category] += 1;
+    }
+  };
+  try {
+    observer = new PerformanceObserver((list) => consumeGcEntries(list.getEntries()));
+    observer.observe({ entryTypes: ["gc"] });
+  } catch {
+    observer?.disconnect();
+    observer = null;
+  }
+
+  const sample = (): void => {
+    if (samples.length >= MEMORY_SAMPLE_LIMIT) return;
+    const value = captureNodeMemorySample(phaseStartMonotonicMs);
+    if (value !== null) appendBoundedSample(samples, value, MEMORY_SAMPLE_LIMIT);
+  };
+  sample();
+  const interval = setInterval(sample, MEMORY_SAMPLE_INTERVAL_MS);
+  interval.unref();
+  const finish = setTimeout(() => {
+    clearInterval(interval);
+    if (observer !== null) consumeGcEntries(observer.takeRecords());
+    observer?.disconnect();
+    const fields = ["rssBytes", "heapTotalBytes", "heapUsedBytes", "heapLimitBytes", "externalBytes", "arrayBuffersBytes"] as const;
+    const aggregates = fields.map((field) => {
+      const values = samples.map((item) => item[field]);
+      const min = values.length ? Math.min(...values) : null;
+      const max = values.length ? Math.max(...values) : null;
+      const mean = values.length ? Math.round(values.reduce((total, value) => total + value, 0) / values.length) : null;
+      const label = field.replace(/Bytes$/u, "").replace(/[A-Z]/gu, (letter) => `_${letter.toLowerCase()}`);
+      return `${label}_min_bytes=${min ?? "unknown"} ${label}_max_bytes=${max ?? "unknown"} ${label}_mean_bytes=${mean ?? "unknown"}`;
+    });
+    const cgroupRows = samples.map((item) => item.cgroup).filter((item): item is CgroupMemorySnapshot => item !== null);
+    const cgroupInvalid = samples.some((item) => item.cgroupMemoryStatus === "invalid");
+    const cgroupMemoryStatus = cgroupInvalid ? "invalid"
+      : cgroupRows.length === samples.length && samples.length === MEMORY_SAMPLE_LIMIT ? "complete" : "unavailable";
+    const cgroupMemoryReason = cgroupMemoryStatus === "complete" ? "none"
+      : cgroupInvalid ? "invalid_snapshot"
+        : samples.some((item) => item.cgroupMemoryReason === "file_unavailable") ? "file_unavailable"
+          : "hierarchy_unavailable";
+    const first = cgroupRows[0];
+    const last = cgroupRows.at(-1);
+    const sampledWindowStartMs = samples[0]?.elapsedMs ?? null;
+    const sampledWindowEndMs = samples.at(-1)?.elapsedMs ?? null;
+    const sampledWindowDurationMs = sampledWindowStartMs !== null && sampledWindowEndMs !== null
+      ? Math.max(0, sampledWindowEndMs - sampledWindowStartMs) : null;
+    const cgroupMax = (field: "currentBytes" | "peakBytes"): number | null =>
+      cgroupRows.length ? Math.max(...cgroupRows.map((item) => item[field])) : null;
+    const eventDelta = (name: typeof CGROUP_MEMORY_EVENT_NAMES[number]): number | null =>
+      first && last && last.events[name] >= first.events[name] ? last.events[name] - first.events[name] : null;
+    const unknown = (value: number | null): string => value === null ? "unknown" : String(value);
+    try {
+      const tokens = [
+        `service=web`, `run_id=${plan.run_id}`, `phase=${phase}`,
+        `sample_count=${samples.length}`, `status=${samples.length === MEMORY_SAMPLE_LIMIT ? "complete" : "incomplete"}`,
+        ...aggregates.flatMap((entry) => entry.split(" ")),
+        `cgroup_sample_count=${cgroupRows.length}`,
+        `cgroup_memory_status=${cgroupMemoryStatus}`, `cgroup_memory_reason=${cgroupMemoryReason}`,
+        `sampled_window_start_elapsed_ms=${unknown(sampledWindowStartMs)}`,
+        `sampled_window_end_elapsed_ms=${unknown(sampledWindowEndMs)}`,
+        `sampled_window_duration_ms=${unknown(sampledWindowDurationMs)}`,
+        `cgroup_memory_current_start_bytes=${unknown(first?.currentBytes ?? null)}`,
+        `cgroup_memory_current_end_bytes=${unknown(last?.currentBytes ?? null)}`,
+        `cgroup_memory_current_sampled_max_bytes=${unknown(cgroupMax("currentBytes"))}`,
+        `cgroup_memory_peak_start_bytes=${unknown(first?.peakBytes ?? null)}`,
+        `cgroup_memory_peak_end_bytes=${unknown(last?.peakBytes ?? null)}`,
+        `cgroup_memory_peak_sampled_max_bytes=${unknown(cgroupMax("peakBytes"))}`,
+        `memory_events_low_sampled_delta=${unknown(eventDelta("low"))}`,
+        `memory_events_high_sampled_delta=${unknown(eventDelta("high"))}`,
+        `memory_events_max_sampled_delta=${unknown(eventDelta("max"))}`,
+        `memory_events_oom_sampled_delta=${unknown(eventDelta("oom"))}`,
+        `memory_events_oom_kill_sampled_delta=${unknown(eventDelta("oom_kill"))}`,
+        `memory_events_oom_group_kill_sampled_delta=${unknown(eventDelta("oom_group_kill"))}`,
+        `gc_count=${gcCount}`, `gc_duration_ms=${Number.isFinite(gcDurationMs) ? gcDurationMs.toFixed(3) : "unknown"}`,
+        `gc_status=${observer ? (gcOverflow ? "incomplete" : "complete") : "unavailable"}`,
+        `gc_major_count=${gcCounts.major}`, `gc_minor_count=${gcCounts.minor}`,
+        `gc_incremental_count=${gcCounts.incremental}`, `gc_weakcb_count=${gcCounts.weakcb}`,
+        `gc_other_count=${gcCounts.other}`, `gc_overflow=${String(gcOverflow)}`,
+      ];
+      console.info(formatCpuDiagnosticMemoryEvent(tokens));
+    } catch {
+      // Diagnostic output is supplementary and must not affect the request.
+    }
+  }, Math.max(1, phaseEndMonotonicMs - performance.now()));
+  finish.unref();
 }
 
 function categoryForFrame(url: string, functionName: string): string {

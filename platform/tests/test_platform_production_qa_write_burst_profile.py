@@ -536,6 +536,12 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
                 "ready_vote_cpu_monitor_sample_ms=0.12 ready_vote_cpu_monitor_samples=20 "
                 "ready_vote_preflight_ms=6.00 ready_vote_upsert_ms=7.00 "
                 "ready_vote_commit_ms=2.00 ready_vote_response_ms=0.10",
+                "request_perf request_id=two method=POST path=/api/v1/tournaments/other/deadlock/ready-check/vote "
+                "route=/{slug}/deadlock/ready-check/vote status=200 total_ms=60.00 sql_ms=30.00 "
+                "sql_count=4 max_sql_ms=15.00 compute_ms=3.00 compute_blocks=1 response_bytes=190 "
+                "ready_vote_checkout_count=5 ready_vote_admission_inflight=7 ready_vote_admission_limit=8 "
+                "ready_vote_admitted_total=24 ready_vote_shed_total=4 ready_vote_controller_limit_changes=6 "
+                "ready_vote_cpu_pressure=91.50 ready_vote_cpu_monitor_samples=40",
             ],
             tournament_slug="demo",
         )
@@ -543,17 +549,50 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
         ready_vote = summary["by_route"]["ready_vote"]["ready_vote"]
         self.assertEqual(summary["scope"]["kind"], "diagnostic_sample")
         self.assertEqual(ready_vote["ready_vote_auth_ms"]["avg_ms"], 4.0)
-        self.assertEqual(ready_vote["ready_vote_checkout_count"]["avg_ms"], 1.0)
+        self.assertEqual(ready_vote["ready_vote_checkout_count"]["avg_ms"], 3.0)
         self.assertEqual(ready_vote["ready_vote_checkout_ms"]["avg_ms"], 5.0)
-        self.assertEqual(ready_vote["ready_vote_admission_limit"]["avg_ms"], 4.0)
-        self.assertEqual(ready_vote["ready_vote_cpu_pressure"]["avg_ms"], 81.5)
-        self.assertEqual(ready_vote["ready_vote_cpu_monitor_samples"]["avg_ms"], 20.0)
+        self.assertEqual(ready_vote["ready_vote_admission_limit"]["avg_ms"], 6.0)
+        self.assertEqual(ready_vote["ready_vote_cpu_pressure"]["avg_ms"], 86.5)
+        self.assertEqual(ready_vote["ready_vote_cpu_monitor_samples"]["avg_ms"], 30.0)
         self.assertEqual(
             summary["by_route"]["ready_vote"]
             ["ready_vote_controller_state_counts"],
             {"pressure": 1},
         )
         self.assertEqual(ready_vote["ready_vote_commit_ms"]["p95_ms"], 2.0)
+        self.assertEqual(
+            summary["ready_vote_cpu_pressure_percent"],
+            {
+                "sample_count": 2,
+                "avg_percent": 86.5,
+                "p50_percent": 86.5,
+                "p95_percent": 91.0,
+                "p99_percent": 91.4,
+                "max_percent": 91.5,
+            },
+        )
+        self.assertEqual(
+            summary["ready_vote_count_metrics"]["ready_vote_checkout_count"],
+            {
+                "sample_count": 2,
+                "avg_count": 3.0,
+                "p50_count": 3.0,
+                "p95_count": 4.8,
+                "p99_count": 4.96,
+                "max_count": 5.0,
+            },
+        )
+        self.assertEqual(
+            summary["by_route"]["ready_vote"]["ready_vote_cpu_pressure_percent"]["sample_count"],
+            2,
+        )
+        self.assertEqual(
+            summary["by_route"]["ready_vote"]["ready_vote_count_metrics"]
+            ["ready_vote_admission_limit"]["max_count"],
+            8.0,
+        )
+        self.assertIs(summary["legacy_ready_vote_fields_deprecated"], True)
+        self.assertEqual(ready_vote["ready_vote_cpu_pressure"]["avg_ms"], 86.5)
         self.assertNotIn("ready_vote_counter_ms", ready_vote)
         self.assertNotIn("ready_vote_db_checkout_ms", ready_vote)
 

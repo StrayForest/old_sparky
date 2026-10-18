@@ -875,6 +875,14 @@ jobs:
       HOST_TOOLS_ARTIFACT_NAME: platform-host-tools-bundle-${{ github.run_id }}-${{ github.run_attempt }}
       HOST_TOOLS_DISPATCHER: /opt/oldsparky/platform/shared/host-tools/${{ needs.build-host-tools.outputs.host_tools_sha }}/platform_workflow_remote_dispatch.py
     steps:
+      - name: Checkout exact source containing shared host verifier
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 1
+          path: target-source
+          persist-credentials: false
+
       - name: Download and verify exact host-tools artifact
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
@@ -1248,40 +1256,26 @@ jobs:
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
-          capability_check_pass() {
-            printf 'HOST_CAPABILITY_CHECK %s PASS\n' "$1"
-          }
-          capability_check_fail() {
-            printf 'HOST_CAPABILITY_CHECK %s FAIL\n' "$1" >&2
-            exit 1
-          }
-          capability_check_command() {
-            local check_id=$1
-            shift
-            if "$@"; then
-              capability_check_pass "$check_id"
-            else
-              capability_check_fail "$check_id"
-            fi
-          }
-          if [[ -z "${PROD_SSH_HOST:-}" || -z "${PROD_SSH_USER:-}" || -z "${PROD_SSH_KEY:-}" ]]; then
-            echo "Production SSH configuration is incomplete." >&2
-            capability_check_fail ssh_configuration
-          fi
-          capability_check_pass ssh_configuration
+          test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}"
+          [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
           ssh_dir="$RUNNER_TEMP/platform-host-capability-ssh"
-          install -d -m 700 "$ssh_dir"
+          mkdir -m 700 -- "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
-          ssh_scan="$ssh_dir/known_hosts.scan"; rm -f -- "$ssh_scan"; ssh_scan_ok=0
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh_scan_ok=0
           for ssh_attempt in 1 2; do
-            ssh_scan_attempt="$ssh_scan.$ssh_attempt"; rm -f -- "$ssh_scan_attempt"; install -m 600 /dev/null "$ssh_scan_attempt"
+            ssh_scan_attempt="$ssh_scan.$ssh_attempt"
+            install -m 600 /dev/null "$ssh_scan_attempt"
             if timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" >"$ssh_scan_attempt" 2>/dev/null \
               && awk -v host="$PROD_SSH_HOST" 'NR == 1 && NF == 3 && $1 == host && $2 == "ssh-ed25519" { valid=1; next } { invalid=1 } END { exit !(NR == 1 && valid == 1 && !invalid) }' "$ssh_scan_attempt" \
               && test "$(ssh-keygen -lf "$ssh_scan_attempt" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"; then
-              mv -- "$ssh_scan_attempt" "$ssh_scan"; ssh_scan_ok=1; printf 'Production SSH host-key acquisition attempt %s/2 succeeded\n' "$ssh_attempt"; break
+              mv -- "$ssh_scan_attempt" "$ssh_scan"
+              ssh_scan_ok=1
+              break
             fi
-            rm -f -- "$ssh_scan_attempt"; printf 'Production SSH host-key acquisition attempt %s/2 failed\n' "$ssh_attempt" >&2; (( ssh_attempt == 2 )) || sleep 0.5
+            rm -f -- "$ssh_scan_attempt"
+            (( ssh_attempt == 2 )) || sleep 0.5
           done
           test "$ssh_scan_ok" = 1 || { echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2; exit 1; }
           install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
@@ -1291,125 +1285,10 @@ jobs:
             printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
           } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"
-          generation="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA"
-          # Every call through this array is read-only; keep runner-side
-          # sidecars on the runner instead of allowing SSH to consume stdin.
-          remote=(ssh -n -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$ssh_dir/config" -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
-          run_remote_readonly() {
-            /usr/bin/timeout --foreground --signal=TERM --kill-after=5s 60s \
-              "${remote[@]}" "$@"
-          }
-          capability_check_command remote_identity_root test "$(run_remote_readonly /usr/bin/id -u | tr -d '\r\n')" = 0
-          if [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]; then capability_check_pass host_tools_sha_format; else capability_check_fail host_tools_sha_format; fi
-          if [[ "$generation" = "/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA" ]]; then capability_check_pass generation_path_binding; else capability_check_fail generation_path_binding; fi
-          capability_check_command generation_directory_exists run_remote_readonly /usr/bin/test -d "$generation"
-          capability_check_command generation_not_symlink run_remote_readonly /usr/bin/test ! -L "$generation"
-          capability_check_command generation_metadata test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation")" = "directory:0:0:2:555"
-          contract_dir="$RUNNER_TEMP/host-tools-download/contract"
-          if expected_payload_count="$(wc -l < "$contract_dir/files.sha256" | tr -d ' ')"; then
-            capability_check_pass payload_digest_count_read
-          else
-            capability_check_fail payload_digest_count_read
-          fi
-          if expected_mode_payload_count="$(wc -l < "$contract_dir/files.modes" | tr -d ' ')"; then
-            capability_check_pass payload_mode_count_read
-          else
-            capability_check_fail payload_mode_count_read
-          fi
-          capability_check_command payload_digest_count_nonzero test "$expected_payload_count" -gt 0
-          capability_check_command payload_mode_count_matches test "$expected_mode_payload_count" -eq "$expected_payload_count"
-          digest_count=0
-          while read -r expected_hash expected_path; do
-            printf -v row_id '%02d' "$((digest_count + 1))"
-            if [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]; then capability_check_pass "payload_${row_id}_hash_format"; else capability_check_fail "payload_${row_id}_hash_format"; fi
-            if [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^capabilities\.txt$|^manifest\.json$ ]]; then capability_check_pass "payload_${row_id}_path_format"; else capability_check_fail "payload_${row_id}_path_format"; fi
-            remote_path="$generation/$expected_path"
-            capability_check_command "payload_${row_id}_exists" run_remote_readonly /usr/bin/test -f "$remote_path"
-            capability_check_command "payload_${row_id}_not_symlink" run_remote_readonly /usr/bin/test ! -L "$remote_path"
-            case "$expected_path" in
-              capabilities.txt|manifest.json) expected_mode=444 ;;
-              *) expected_mode=555 ;;
-            esac
-            capability_check_command "payload_${row_id}_metadata" test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_path")" = "regular file:0:0:1:$expected_mode"
-          if remote_digest="$(run_remote_readonly /usr/bin/sha256sum -- "$remote_path")"; then
-            capability_check_pass "payload_${row_id}_digest_read"
-          else
-            capability_check_fail "payload_${row_id}_digest_read"
-          fi
-            capability_check_command "payload_${row_id}_digest" test "${remote_digest%% *}" = "$expected_hash"
-            digest_count=$((digest_count + 1))
-          done < "$contract_dir/files.sha256"
-          capability_check_command payload_digest_count_matches test "$digest_count" -eq "$expected_payload_count"
-          if IFS= read -r expected_manifest_hash < "$contract_dir/manifest.sha256"; then
-            capability_check_pass manifest_digest_read
-          else
-            capability_check_fail manifest_digest_read
-          fi
-          if IFS= read -r expected_capabilities_hash < "$contract_dir/capabilities.sha256"; then
-            capability_check_pass capabilities_digest_read
-          else
-            capability_check_fail capabilities_digest_read
-          fi
-          capability_check_command manifest_digest test "$(run_remote_readonly /usr/bin/sha256sum -- "$generation/manifest.json")" = "$expected_manifest_hash  $generation/manifest.json"
-          capability_check_command manifest_metadata test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/manifest.json")" = "regular file:0:0:1:444"
-          capability_check_command capabilities_digest test "$(run_remote_readonly /usr/bin/sha256sum -- "$generation/capabilities.txt")" = "$expected_capabilities_hash  $generation/capabilities.txt"
-          capability_check_command capabilities_metadata test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/capabilities.txt")" = "regular file:0:0:1:444"
-          declare -A expected_entries=([capabilities.txt]=1 [manifest.json]=1)
-          mode_count=0
-          while read -r expected_mode expected_path; do
-            remote_path="$generation/$expected_path"
-            printf -v row_id '%02d' "$((mode_count + 1))"
-            if remote_mode="$(run_remote_readonly /usr/bin/stat -c '%a' -- "$remote_path")"; then
-              capability_check_pass "mode_${row_id}_read"
-            else
-              capability_check_fail "mode_${row_id}_read"
-            fi
-            capability_check_command "mode_${row_id}_matches" test "$remote_mode" = "$expected_mode"
-            expected_entries["$expected_path"]=1
-            mode_count=$((mode_count + 1))
-          done < "$contract_dir/files.modes"
-          capability_check_command mode_count_matches test "$mode_count" -eq "$expected_payload_count"
-          printf '%s\n' "Verified host-tools remote digest entries: $digest_count"
-          printf '%s\n' "Verified host-tools remote mode entries: $mode_count"
-          expected_entry_count="${#expected_entries[@]}"
-          inventory_encoded="$RUNNER_TEMP/host-tools-remote-entries.b64"
-          inventory_file="$RUNNER_TEMP/host-tools-remote-entries"
-          # NUL-delimited find output is base64-wrapped before it crosses the
-          # SSH boundary.  This preserves dotfiles and makes newline/control
-          # names observable instead of allowing line-oriented ambiguity.
-          if run_remote_readonly /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -print0 \
-            | /usr/bin/base64 -w 0 > "$inventory_encoded"; then
-            capability_check_pass inventory_fetch
-          else
-            capability_check_fail inventory_fetch
-          fi
-          capability_check_command inventory_encoded_metadata test "$(stat -c '%F:%h' -- "$inventory_encoded")" = "regular file:1"
-          capability_check_command inventory_encoded_size_bound test "$(stat -c '%s' -- "$inventory_encoded")" -le 16384
-          if /usr/bin/base64 --decode "$inventory_encoded" > "$inventory_file"; then
-            capability_check_pass inventory_decode
-          else
-            capability_check_fail inventory_decode
-          fi
-          capability_check_command inventory_file_metadata test "$(stat -c '%F:%h' -- "$inventory_file")" = "regular file:1"
-          mapfile -d '' -t remote_names < "$inventory_file"
-          capability_check_command inventory_entry_count test "${#remote_names[@]}" -eq "$expected_entry_count"
-          declare -A seen_entries=()
-          inventory_name_count=0
-          for remote_path in "${remote_names[@]}"; do
-            inventory_name_count=$((inventory_name_count + 1))
-            printf -v row_id '%02d' "$inventory_name_count"
-            if [[ "$remote_path" == "$generation/"* ]]; then capability_check_pass "inventory_${row_id}_generation_prefix"; else capability_check_fail "inventory_${row_id}_generation_prefix"; fi
-            relative_path="${remote_path#"$generation/"}"
-            if [[ "$relative_path" =~ ^[A-Za-z0-9_.-]+$ ]]; then capability_check_pass "inventory_${row_id}_name_format"; else capability_check_fail "inventory_${row_id}_name_format"; fi
-            if [[ -n "${expected_entries[$relative_path]+present}" ]]; then capability_check_pass "inventory_${row_id}_expected_member"; else capability_check_fail "inventory_${row_id}_expected_member"; fi
-            if [[ -z "${seen_entries[$relative_path]+present}" ]]; then capability_check_pass "inventory_${row_id}_unique_member"; else capability_check_fail "inventory_${row_id}_unique_member"; fi
-            seen_entries["$relative_path"]=1
-            unset "expected_entries[$relative_path]"
-          done
-          capability_check_command inventory_no_missing_members test "${#expected_entries[@]}" -eq 0
-          printf '%s\n' "HOST_TOOLS_GENERATION=$generation" >> "$GITHUB_ENV"
-          printf '%s\n' "HOST_TOOLS_SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
-
+          /usr/bin/python3 -I -B "$GITHUB_WORKSPACE/target-source/platform/tools/platform_host_tools_installed_check.py" \
+            --source-sha "$HOST_TOOLS_SHA" \
+            --toolset-version "$HOST_TOOLS_TOOLSET_VERSION" \
+            --contract-dir "$RUNNER_TEMP/host-tools-download/contract"
       - name: Create closed host-tools handoff after final verification
         id: host-tools-handoff
         shell: bash
@@ -1563,89 +1442,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Probe immutable host dispatcher capabilities
-        shell: bash
-        env:
-          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
-        run: |
-          set -euo pipefail
-          umask 077
-          test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}"
-          [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
-          expected_generation="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA"
-          expected_dispatcher="$expected_generation/platform_workflow_remote_dispatch.py"
-          test "$HOST_TOOLS_GENERATION" = "$expected_generation"
-          test "$HOST_TOOLS_DISPATCHER" = "$expected_dispatcher"
-          test -d "$HOST_TOOLS_SSH_DIR" && test ! -L "$HOST_TOOLS_SSH_DIR"
-          test "$(stat -c '%F:%a' -- "$HOST_TOOLS_SSH_DIR")" = "directory:700"
-          test "$(stat -c '%u:%g' -- "$HOST_TOOLS_SSH_DIR")" = "$(id -u):$(id -g)"
-          test -f "$HOST_TOOLS_SSH_DIR/config" && test ! -L "$HOST_TOOLS_SSH_DIR/config"
-          test -f "$HOST_TOOLS_SSH_DIR/known_hosts" && test ! -L "$HOST_TOOLS_SSH_DIR/known_hosts"
-          test -f "$HOST_TOOLS_SSH_DIR/id_ed25519" && test ! -L "$HOST_TOOLS_SSH_DIR/id_ed25519"
-          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/config")" = "regular file:1:600"
-          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/known_hosts")" = "regular file:1:600"
-          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
-          remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
-          probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
-          case "$HOST_TOOLS_TOOLSET_VERSION" in
-            production-host-tools-v3)
-              expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 python_isolated=1 python_bytecode_disabled=1"
-              ;;
-            production-host-tools-v4)
-              expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1"
-              ;;
-            *) echo "host-tools pin selected an unsupported capability layout" >&2; exit 1 ;;
-          esac
-          expected_bytes="$(printf '%s\n' "$expected_output" | wc -c | tr -d '[:space:]')"
-          expected_sha256="$(printf '%s\n' "$expected_output" | sha256sum | cut -d' ' -f1)"
-          # The file-size limit bounds the remote process, while ``head`` caps
-          # retained stdout at 512 bytes. The dispatcher emits one short, fixed
-          # line; anything larger fails closed instead of being retained or
-          # projected to logs.
-          probe_rc=0
-          if (
-            ulimit -f 1
-            exec /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
-              "${remote[@]}" /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-capabilities
-          ) 2>/dev/null < /dev/null | /usr/bin/head -c 512 > "$probe_output"; then
-            :
-          else
-            probe_rc="$?"
-          fi
-          probe_file_ok=0
-          if [[ -f "$probe_output" && ! -L "$probe_output" ]] \
-            && [[ "$(stat -c '%F:%h' -- "$probe_output")" == "regular file:1" ]]; then
-            probe_file_ok=1
-          fi
-          if [[ "$probe_file_ok" -eq 1 ]]; then
-            actual_bytes="$(LC_ALL=C wc -c < "$probe_output" | tr -d '[:space:]')"
-            actual_sha256="$(sha256sum -- "$probe_output" | cut -d' ' -f1)"
-            actual_cr_count="$(LC_ALL=C tr -cd '\r' < "$probe_output" | wc -c | tr -d '[:space:]')"
-            actual_lf_count="$(LC_ALL=C tr -cd '\n' < "$probe_output" | wc -c | tr -d '[:space:]')"
-          else
-            actual_bytes=0
-            actual_sha256="$(printf '' | sha256sum | cut -d' ' -f1)"
-            actual_cr_count=0
-            actual_lf_count=0
-          fi
-          exact_one_line=0
-          if [[ "$actual_cr_count" -eq 0 && "$actual_lf_count" -eq 1 ]]; then
-            exact_one_line=1
-          fi
-          probe_match=0
-          if [[ "$probe_file_ok" -eq 1 && "$actual_bytes" -le 512 ]] \
-            && printf '%s\n' "$expected_output" | cmp -s - "$probe_output"; then
-            probe_match=1
-          fi
-          if [[ "$probe_rc" -ne 0 || "$probe_file_ok" -ne 1 || "$actual_bytes" -gt 512 || "$probe_match" -ne 1 ]]; then
-            printf 'immutable host capability probe diagnostics: command_rc=%s expected_bytes=%s actual_bytes=%s expected_sha256=%s actual_sha256=%s expected_cr_count=0 actual_cr_count=%s expected_lf_count=1 actual_lf_count=%s exact_one_line=%s\n' \
-              "$probe_rc" "$expected_bytes" "$actual_bytes" "$expected_sha256" \
-              "$actual_sha256" "$actual_cr_count" "$actual_lf_count" "$exact_one_line" >&2
-            exit 1
-          fi
-
       - name: Read active production baseline for reconciliation
         id: active-baseline
         if: ${{ inputs.mode == 'baseline-reconcile' || inputs.mode == 'recovery-deploy' }}
@@ -1738,7 +1534,7 @@ jobs:
             "$RUNNER_TEMP/platform-host-capabilities-output"
           rm -f -- "$RUNNER_TEMP/host-tools-remote-entries.b64" "$RUNNER_TEMP/host-tools-remote-entries" \
             "$RUNNER_TEMP/platform-host-tools-expected-members" "$RUNNER_TEMP/platform-host-tools-actual-members"
-          rm -rf -- "$RUNNER_TEMP/host-tools-download" "$RUNNER_TEMP/platform-host-tools-inner"
+          rm -rf -- "$RUNNER_TEMP/host-tools-download" "$RUNNER_TEMP/platform-host-tools-inner" "$GITHUB_WORKSPACE/target-source"
           ssh_dir="$RUNNER_TEMP/platform-host-capability-ssh"
           if [[ -d "$ssh_dir" && ! -L "$ssh_dir" ]]; then
             rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/known_hosts.scan.1" "$ssh_dir/known_hosts.scan.2" "$ssh_dir/config" "$ssh_dir/control.sock" "$ssh_dir/control-master" "$ssh_dir/control-master.sock"

@@ -378,6 +378,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--backup-keep", type=int, default=14)
     parser.add_argument(
+        "--protected-release",
+        action="append",
+        default=None,
+        metavar="SLUG",
+        help="Retain this provider release during production pruning; repeat for each exact slug.",
+    )
+    parser.add_argument(
         "--protected-backup-manifest",
         type=Path,
         default=None,
@@ -490,6 +497,11 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must not be negative")
     if args.backup_keep < 1:
         parser.error("--backup-keep must be at least 1")
+    protected_releases = args.protected_release or []
+    if len(protected_releases) != len(set(protected_releases)):
+        parser.error("--protected-release values must be unique")
+    if any(SAFE_RELEASE_ID_RE.fullmatch(slug) is None for slug in protected_releases):
+        parser.error("--protected-release must be a valid release slug")
     if (
         not math.isfinite(args.backup_max_age_hours)
         or args.backup_max_age_hours <= 0
@@ -2425,6 +2437,7 @@ def _plan_and_maybe_apply(
         app_dir,
         keep=args.release_keep,
         min_age_days=0,
+        protect_releases=tuple(getattr(args, "protected_release", None) or ()),
     )
     if source_release_dir is None:
         source_plan = ArtifactRetentionPlan((), (), ())

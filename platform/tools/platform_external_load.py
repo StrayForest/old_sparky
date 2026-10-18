@@ -119,6 +119,7 @@ PROFILE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 CLIENT_CPU_SAMPLE_INTERVAL_SECONDS = 1.0
 CLIENT_CPU_SAMPLE_LIMIT = 4096
 CLIENT_CPU_SAMPLE_JOIN_SECONDS = 2.0
+CAPACITY_ATTRIBUTION_LAG_FLOOR_MS = 2.0
 CLIENT_CGROUP_LINE_LIMIT = 256
 CLIENT_CGROUP_ANCESTOR_LIMIT = 32
 CLIENT_CGROUP_MOUNTINFO_LIMIT = 64 * 1024
@@ -163,6 +164,26 @@ CLIENT_CGROUP_DIAGNOSTIC_REASONS = frozenset(
         "cpu_max_changed",
         "cpu_stat_reset",
         "trusted_host_root_unproven",
+        "trusted_runner_context_unavailable",
+        "workload_cgroup_mismatch",
+        "runner_namespace_binding_invalid",
+        "runner_cgroup_snapshot_incomplete",
+        "workload_identity_changed",
+        "runner_cgroup_identity_changed",
+        "runner_sample_limit",
+        "runner_sampler_join_timeout",
+        "runner_membership_changed",
+        "runner_final_snapshot_invalid",
+        "runner_samples_incomplete",
+        "runner_hierarchy_changed",
+        "runner_cpuset_incomplete",
+        "runner_cpu_quota_changed",
+        "runner_cpu_quota_incomplete",
+        "runner_sample_clock_invalid",
+        "runner_cpu_stat_incomplete",
+        "runner_cpu_counter_reset",
+        "runner_snapshot_unavailable",
+        "runner_snapshot_invalid",
         "diagnostics_invalid",
     }
 )
@@ -212,6 +233,33 @@ def _effective_cpu_capacity_details(
     # when mountinfo reports `/`. Hidden ancestors may impose tighter quotas,
     # so visible cpu.max values cannot establish effective host capacity.
     return None, "trusted_host_root_unproven"
+
+
+def _parse_effective_cpu_set(value: str) -> int | None:
+    """Count a bounded canonical Linux CPU-list value; never expand huge ranges."""
+
+    if not isinstance(value, str) or len(value) > CLIENT_CGROUP_LINE_LIMIT:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    count = 0
+    previous_end = -1
+    for item in text.split(","):
+        if not item:
+            return None
+        bounds = item.split("-")
+        if len(bounds) not in {1, 2} or any(not part.isdigit() for part in bounds):
+            return None
+        start = int(bounds[0])
+        end = int(bounds[-1])
+        if start < 0 or end < start or start <= previous_end or end > 1_000_000:
+            return None
+        count += end - start + 1
+        if count > 4096:
+            return None
+        previous_end = end
+    return count
 
 
 def _effective_cpu_capacity_cores(
@@ -375,6 +423,7 @@ def _read_cgroup_diagnostic_snapshot(
     mountinfo_text: str | None = None,
     namespace_identity: tuple[int, int] | None = None,
     file_reader: Callable[[Path], str] | None = None,
+    process_pid: int | None = None,
 ) -> dict[str, Any]:
     """Read a bounded, private in-memory view of this process's cgroup tree.
 
@@ -384,7 +433,11 @@ def _read_cgroup_diagnostic_snapshot(
 
     if cgroup_text is None:
         try:
-            cgroup_text = _read_bounded_ascii(Path("/proc/self/cgroup"))
+            if process_pid is not None and (type(process_pid) is not int or process_pid <= 0):
+                raise ValueError("invalid process PID")
+            cgroup_text = _read_bounded_ascii(
+                Path(f"/proc/{process_pid}/cgroup") if process_pid is not None else Path("/proc/self/cgroup")
+            )
         except (OSError, UnicodeError, ValueError) as exc:
             raise _CgroupDiagnosticError("cgroup_record_unavailable") from exc
     if mountinfo_text is None:
@@ -402,7 +455,9 @@ def _read_cgroup_diagnostic_snapshot(
 
     if namespace_identity is None:
         try:
-            namespace_stat = os.stat("/proc/self/ns/cgroup")
+            namespace_stat = os.stat(
+                f"/proc/{process_pid}/ns/cgroup" if process_pid is not None else "/proc/self/ns/cgroup"
+            )
         except (OSError, ValueError) as exc:
             raise _CgroupDiagnosticError("namespace_identity_unavailable") from exc
         namespace_identity = (namespace_stat.st_dev, namespace_stat.st_ino)
@@ -428,6 +483,14 @@ def _read_cgroup_diagnostic_snapshot(
                 if file_reader is not None
                 else _read_bounded_ascii(current / "cpu.max")
             )
+        except FileNotFoundError:
+            if current == mountpoint and mapping["root"] == Path("/"):
+                # cgroup v2 defines cpu.max for non-root cgroups only. At the
+                # proven hierarchy root, absence means no parent quota in the
+                # mounted hierarchy; non-root absence remains incomplete.
+                quota_period = (None, 100_000)
+            else:
+                reasons.add("cpu_max_unavailable")
         except (OSError, UnicodeError, ValueError):
             reasons.add("cpu_max_unavailable")
         else:
@@ -454,6 +517,7 @@ def _read_cgroup_diagnostic_snapshot(
             )
         except (OSError, UnicodeError, ValueError):
             reasons.add("cpu_stat_unavailable")
+            optional_status = "unavailable"
         else:
             if len(stat_text) > CLIENT_CGROUP_STAT_LIMIT:
                 reasons.add("cpu_stat_invalid")
@@ -475,22 +539,36 @@ def _read_cgroup_diagnostic_snapshot(
                             break
                         parsed_stat[parts[0]] = value
                 optional_present = set(parsed_stat) & CLIENT_CGROUP_STAT_OPTIONAL_KEYS
+                global_root = current == mountpoint and mapping["root"] == Path("/")
                 if (
                     valid_stat
                     and CLIENT_CGROUP_STAT_REQUIRED_KEYS.issubset(parsed_stat)
-                    and optional_present
-                    in (frozenset(), CLIENT_CGROUP_STAT_OPTIONAL_KEYS)
+                    and optional_present in (frozenset(), CLIENT_CGROUP_STAT_OPTIONAL_KEYS)
                 ):
                     stat_values = parsed_stat
-                    if set(parsed_stat) != set(CLIENT_CGROUP_STAT_KEYS):
+                    if optional_present == frozenset() and not global_root:
                         reasons.add("cpu_stat_partial")
+                    optional_status = "available" if optional_present else "not_applicable" if global_root else "missing"
                 else:
                     reasons.add("cpu_stat_invalid")
+                    optional_status = "invalid"
+        try:
+            cpuset_text = (
+                file_reader(current / "cpuset.cpus.effective")
+                if file_reader is not None
+                else _read_bounded_ascii(current / "cpuset.cpus.effective")
+            )
+        except (OSError, UnicodeError, ValueError):
+            cpuset_count = None
+        else:
+            cpuset_count = _parse_effective_cpu_set(cpuset_text)
         ancestors.append(
             {
                 "path": current,
                 "cpu_max": quota_period,
                 "cpu_stat": stat_values,
+                "cpu_stat_optional_status": optional_status,
+                "cpuset_count": cpuset_count,
             }
         )
         if current == mountpoint:
@@ -617,6 +695,9 @@ def _cgroup_diagnostic_report(
         row["cpu_stat_completeness"] = counter_completeness
         if deltas:
             row["cpu_stat_delta"] = deltas
+        cpuset_count = right.get("cpuset_count")
+        if type(cpuset_count) is int and cpuset_count > 0:
+            row["cpuset_cpu_count"] = cpuset_count
         public_rows.append(row)
     complete_rows = len(public_rows) == len(before_rows) and all(
         row.get("cpu_max_kind") in {"max", "quota"}
@@ -773,6 +854,592 @@ class _ProcessCpuSampler:
                 after_error=cgroup_snapshot_after_error,
             ),
         }
+
+
+class RunnerCgroupSampler:
+    """Observe the exact supervised load process from the trusted outer runner."""
+
+    SAMPLE_INTERVAL_SECONDS = 5.0
+    SAMPLE_LIMIT = 4096
+
+    def __init__(self, *, runner_environment: str | None) -> None:
+        self._runner_environment = runner_environment
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._samples: list[tuple[float, dict[str, Any]]] = []
+        self._failure: str | None = None
+        self._pid: int | None = None
+        self._starttime: int | None = None
+        self._membership: str | None = None
+        self._mountinfo: str | None = None
+        self._cgroup_namespace: tuple[int, int] | None = None
+        self._target_namespaces: dict[str, tuple[int, int]] = {}
+        self._initial: dict[str, Any] | None = None
+        self._outer_identity: dict[str, tuple[int, int]] = {}
+        self._identity: dict[str, bool] = {}
+
+    @staticmethod
+    def _namespace_identity(path: str) -> tuple[int, int]:
+        stat_result = os.stat(path)
+        return stat_result.st_dev, stat_result.st_ino
+
+    def _target_is_stable(self) -> bool:
+        if self._pid is None or self._starttime is None or self._membership is None:
+            return False
+        try:
+            from tools.platform_load_runtime import _read_process_starttime
+        except ModuleNotFoundError:
+            from platform_load_runtime import _read_process_starttime  # type: ignore[no-redef]
+        try:
+            if _read_process_starttime(self._pid) != self._starttime:
+                return False
+            current_membership = _read_bounded_ascii(Path(f"/proc/{self._pid}/cgroup"))
+            return current_membership == self._membership
+        except (OSError, UnicodeError, ValueError, RuntimeError):
+            return False
+
+    def start(self, pid: int, starttime: int) -> None:
+        """Start only after the supervisor has captured PID and starttime."""
+
+        try:
+            if (
+                self._runner_environment != "github-hosted"
+                or type(pid) is not int or pid <= 1
+                or type(starttime) is not int or starttime <= 0
+            ):
+                raise _CgroupDiagnosticError("trusted_runner_context_unavailable")
+            self._pid, self._starttime = pid, starttime
+            try:
+                from tools.platform_load_runtime import _read_process_starttime
+            except ModuleNotFoundError:
+                from platform_load_runtime import _read_process_starttime  # type: ignore[no-redef]
+            if _read_process_starttime(pid) != starttime:
+                raise _CgroupDiagnosticError("workload_identity_changed")
+            self._membership = _read_bounded_ascii(Path(f"/proc/{pid}/cgroup"))
+            parent_membership = _read_bounded_ascii(Path("/proc/self/cgroup"))
+            if self._membership != parent_membership:
+                raise _CgroupDiagnosticError("workload_cgroup_mismatch")
+            self._mountinfo = _bounded_proc_text(
+                Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
+            )
+            mapping = _cgroup2_membership_mapping(self._membership, self._mountinfo)
+            pid1 = {
+                "pid": self._namespace_identity("/proc/1/ns/pid"),
+                "mount": self._namespace_identity("/proc/1/ns/mnt"),
+                "cgroup": self._namespace_identity("/proc/1/ns/cgroup"),
+            }
+            outer = {
+                "pid": self._namespace_identity("/proc/self/ns/pid"),
+                "mount": self._namespace_identity("/proc/self/ns/mnt"),
+                "cgroup": self._namespace_identity("/proc/self/ns/cgroup"),
+            }
+            self._outer_identity = outer
+            target_cgroup_ns = self._namespace_identity(f"/proc/{pid}/ns/cgroup")
+            target_mount_ns = self._namespace_identity(f"/proc/{pid}/ns/mnt")
+            target_pid_ns = self._namespace_identity(f"/proc/{pid}/ns/pid")
+            self._target_namespaces = {
+                "pid": target_pid_ns, "mount": target_mount_ns, "cgroup": target_cgroup_ns,
+            }
+            self._identity = {
+                "outer_pid_namespace_matches_pid1": outer["pid"] == pid1["pid"],
+                "outer_mount_namespace_matches_pid1": outer["mount"] == pid1["mount"],
+                "outer_cgroup_namespace_matches_pid1": outer["cgroup"] == pid1["cgroup"],
+                "target_cgroup_namespace_matches_outer": target_cgroup_ns == outer["cgroup"],
+                "target_mount_namespace_is_isolated": target_mount_ns != outer["mount"],
+                "target_pid_namespace_is_isolated": target_pid_ns != outer["pid"],
+                "global_cgroup2_mount": mapping["root"] == Path("/")
+                and mapping["mountpoint"] == Path("/sys/fs/cgroup"),
+                "workload_membership_matches_outer": self._membership == parent_membership,
+            }
+            self._cgroup_namespace = target_cgroup_ns
+            if not all(self._identity.values()):
+                raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
+            self._initial = _read_cgroup_diagnostic_snapshot(
+                cgroup_text=self._membership,
+                mountinfo_text=self._mountinfo,
+                namespace_identity=target_cgroup_ns,
+                process_pid=pid,
+            )
+            if not self._initial.get("mount_root_is_global") or self._initial.get("reasons"):
+                raise _CgroupDiagnosticError("runner_cgroup_snapshot_incomplete")
+            self._samples = [(time.monotonic(), self._initial)]
+            self._thread = threading.Thread(
+                target=self._sample_loop, name="runner-cgroup-sampler", daemon=True
+            )
+            self._thread.start()
+        except (OSError, UnicodeError, ValueError, _CgroupDiagnosticError) as exc:
+            self._failure = getattr(exc, "reason", "runner_snapshot_unavailable")
+
+    def _sample_loop(self) -> None:
+        while not self._stop.wait(self.SAMPLE_INTERVAL_SECONDS):
+            if not Path(f"/proc/{self._pid}").exists():
+                return
+            if not self._target_is_stable():
+                self._failure = "workload_identity_changed"
+                return
+            try:
+                for name, path in (
+                    ("pid", "/proc/self/ns/pid"),
+                    ("mount", "/proc/self/ns/mnt"),
+                    ("cgroup", "/proc/self/ns/cgroup"),
+                ):
+                    if self._namespace_identity(path) != self._outer_identity.get(name):
+                        raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
+                    if self._namespace_identity(path.replace("self", "1")) != self._outer_identity.get(name):
+                        raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
+                    target_namespace_name = "mnt" if name == "mount" else name
+                    target_namespace = self._namespace_identity(
+                        f"/proc/{self._pid}/ns/{target_namespace_name}"
+                    )
+                    if target_namespace != self._target_namespaces.get(name):
+                        raise _CgroupDiagnosticError("workload_identity_changed")
+                mountinfo = _bounded_proc_text(
+                    Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
+                )
+                mapping = _cgroup2_membership_mapping(self._membership, mountinfo)
+                if (
+                    mapping["mount_identity"] != self._initial["mount_identity"]
+                    or mapping["root"] != Path("/")
+                    or mapping["mountpoint"] != Path("/sys/fs/cgroup")
+                ):
+                    raise _CgroupDiagnosticError("runner_cgroup_identity_changed")
+                snapshot = _read_cgroup_diagnostic_snapshot(
+                    cgroup_text=self._membership,
+                    mountinfo_text=mountinfo,
+                    namespace_identity=self._cgroup_namespace,
+                    process_pid=self._pid,
+                )
+                if (
+                    snapshot.get("membership") != self._initial.get("membership")
+                    or snapshot.get("mount_identity") != self._initial.get("mount_identity")
+                    or snapshot.get("reasons")
+                    or not snapshot.get("mount_root_is_global")
+                ):
+                    self._failure = "runner_cgroup_identity_changed"
+                    return
+                with self._lock:
+                    if len(self._samples) >= self.SAMPLE_LIMIT:
+                        self._failure = "runner_sample_limit"
+                        return
+                    self._samples.append((time.monotonic(), snapshot))
+            except (OSError, UnicodeError, ValueError, _CgroupDiagnosticError):
+                self._failure = "runner_snapshot_invalid"
+                return
+
+    def stop(
+        self,
+        *,
+        namespace_pid: int | None = None,
+        namespace_starttime: int | None = None,
+        phase_window_monotonic: tuple[float, float] | None = None,
+    ) -> dict[str, Any]:
+        """Return only bounded aggregates; incomplete identity stays UNKNOWN."""
+
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(2.0)
+            if self._thread.is_alive():
+                self._failure = "runner_sampler_join_timeout"
+        if namespace_pid is not None or namespace_starttime is not None:
+            if (
+                namespace_pid != self._pid
+                or namespace_starttime != self._starttime
+            ):
+                self._failure = "workload_identity_changed"
+        if self._initial is None or self._failure is not None:
+            return {
+                "schema": 1, "status": "unknown",
+                "reason": self._failure or "runner_context_unavailable",
+                "runner_environment": "github-hosted" if self._runner_environment == "github-hosted" else "unknown",
+                "identity": self._identity,
+                "sample_count": len(self._samples),
+            }
+        try:
+            if not self._target_is_stable():
+                raise _CgroupDiagnosticError("workload_identity_changed")
+            if _read_bounded_ascii(Path("/proc/self/cgroup")) != self._membership:
+                raise _CgroupDiagnosticError("runner_membership_changed")
+            for name, path in (
+                ("pid", "/proc/self/ns/pid"),
+                ("mount", "/proc/self/ns/mnt"),
+                ("cgroup", "/proc/self/ns/cgroup"),
+            ):
+                if self._namespace_identity(path) != self._outer_identity.get(name):
+                    raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
+                if self._namespace_identity(path.replace("self", "1")) != self._outer_identity.get(name):
+                    raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
+                target_namespace_name = "mnt" if name == "mount" else name
+                if self._namespace_identity(
+                    f"/proc/{self._pid}/ns/{target_namespace_name}"
+                ) != self._target_namespaces.get(name):
+                    raise _CgroupDiagnosticError("workload_identity_changed")
+            final_mountinfo = _bounded_proc_text(
+                Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
+            )
+            final_mapping = _cgroup2_membership_mapping(self._membership, final_mountinfo)
+            if (
+                final_mapping["mount_identity"] != self._initial["mount_identity"]
+                or final_mapping["root"] != Path("/")
+                or final_mapping["mountpoint"] != Path("/sys/fs/cgroup")
+            ):
+                raise _CgroupDiagnosticError("runner_cgroup_identity_changed")
+            final = _read_cgroup_diagnostic_snapshot(
+                cgroup_text=self._membership,
+                mountinfo_text=final_mountinfo,
+                namespace_identity=self._cgroup_namespace,
+            )
+        except (OSError, UnicodeError, ValueError, _CgroupDiagnosticError):
+            return {
+                "schema": 1, "status": "unknown", "reason": "runner_final_snapshot_invalid",
+                "runner_environment": "github-hosted", "identity": self._identity,
+                "sample_count": len(self._samples),
+            }
+        samples = [*self._samples, (time.monotonic(), final)]
+        if len(samples) < 3 or final.get("reasons"):
+            return {
+                "schema": 1, "status": "unknown", "reason": "runner_samples_incomplete",
+                "runner_environment": "github-hosted", "identity": self._identity,
+                "sample_count": len(samples),
+            }
+        base = samples[0][1]
+        all_rows = [sample[1]["ancestors"] for sample in samples]
+        if any(len(rows) != len(base["ancestors"]) for rows in all_rows):
+            return {
+                "schema": 1, "status": "unknown", "reason": "runner_hierarchy_changed",
+                "runner_environment": "github-hosted", "identity": self._identity,
+                "sample_count": len(samples),
+            }
+        capacities: list[float] = []
+        for index, initial_row in enumerate(base["ancestors"]):
+            cpus = [rows[index].get("cpuset_count") for rows in all_rows]
+            quotas = [rows[index].get("cpu_max") for rows in all_rows]
+            if any(type(value) is not int or value <= 0 for value in cpus) or len(set(cpus)) != 1:
+                return {
+                    "schema": 1, "status": "unknown", "reason": "runner_cpuset_incomplete",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples),
+                }
+            if any(value != initial_row.get("cpu_max") for value in quotas):
+                return {
+                    "schema": 1, "status": "unknown", "reason": "runner_cpu_quota_changed",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples),
+                }
+            capacities.append(float(cpus[0]))
+            quota_period = initial_row.get("cpu_max")
+            if not isinstance(quota_period, tuple) or len(quota_period) != 2:
+                return {
+                    "schema": 1, "status": "unknown", "reason": "runner_cpu_quota_incomplete",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples),
+                }
+            quota, period = quota_period
+            if quota is not None:
+                capacities.append(quota / period)
+        capacity = min(capacities)
+        intervals: list[tuple[float, float, float, int]] = []
+        max_throttled = 0
+        for (start_time, left), (end_time, right) in zip(samples, samples[1:]):
+            elapsed = end_time - start_time
+            if elapsed <= 0:
+                return {
+                    "schema": 1, "status": "unknown", "reason": "runner_sample_clock_invalid",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples),
+                }
+            left_leaf, right_leaf = left["ancestors"][0], right["ancestors"][0]
+            left_stat, right_stat = left_leaf.get("cpu_stat"), right_leaf.get("cpu_stat")
+            if not isinstance(left_stat, dict) or not isinstance(right_stat, dict):
+                return {
+                    "schema": 1, "status": "unknown", "reason": "runner_cpu_stat_incomplete",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples),
+                }
+            usage_delta = right_stat.get("usage_usec", -1) - left_stat.get("usage_usec", 0)
+            throttle_deltas = []
+            root_index = len(left["ancestors"]) - 1
+            for row_index, (old, new) in enumerate(zip(left["ancestors"], right["ancestors"])):
+                old_stat, new_stat = old.get("cpu_stat"), new.get("cpu_stat")
+                if not isinstance(old_stat, dict) or not isinstance(new_stat, dict):
+                    return {
+                        "schema": 1, "status": "unknown", "reason": "runner_cpu_stat_incomplete",
+                        "runner_environment": "github-hosted", "identity": self._identity,
+                        "sample_count": len(samples),
+                    }
+                if set(old_stat) != set(new_stat) or old.get("cpu_stat_optional_status") != new.get("cpu_stat_optional_status"):
+                    return {
+                        "schema": 1, "status": "unknown", "reason": "runner_cpu_stat_incomplete",
+                        "runner_environment": "github-hosted", "identity": self._identity,
+                        "sample_count": len(samples),
+                    }
+                optional_status = old.get("cpu_stat_optional_status")
+                root_optional_na = (
+                    row_index == root_index and left.get("mount_root_is_global") is True
+                    and optional_status == "not_applicable"
+                )
+                if root_optional_na:
+                    if not CLIENT_CGROUP_STAT_REQUIRED_KEYS.issubset(old_stat):
+                        return {
+                            "schema": 1, "status": "unknown", "reason": "runner_cpu_stat_incomplete",
+                            "runner_environment": "github-hosted", "identity": self._identity,
+                            "sample_count": len(samples),
+                        }
+                    continue
+                if not set(CLIENT_CGROUP_STAT_KEYS).issubset(old_stat):
+                    return {
+                        "schema": 1, "status": "unknown", "reason": "runner_cpu_stat_incomplete",
+                        "runner_environment": "github-hosted", "identity": self._identity,
+                        "sample_count": len(samples),
+                    }
+                delta = new_stat["nr_throttled"] - old_stat["nr_throttled"]
+                if delta < 0:
+                    return {
+                        "schema": 1, "status": "unknown", "reason": "runner_cpu_counter_reset",
+                        "runner_environment": "github-hosted", "identity": self._identity,
+                        "sample_count": len(samples),
+                    }
+                throttle_deltas.append(delta)
+            if not throttle_deltas:
+                return {
+                    "schema": 1, "status": "unknown", "reason": "runner_throttle_evidence_unavailable",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples),
+                }
+            if usage_delta < 0:
+                return {
+                    "schema": 1, "status": "unknown", "reason": "runner_cpu_counter_reset",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples),
+                }
+            intervals.append((start_time, end_time, usage_delta / 1_000_000 / elapsed,
+                              max(throttle_deltas)))
+            max_throttled = max(max_throttled, *throttle_deltas)
+        selected_intervals = intervals
+        phase_fields: dict[str, Any] = {}
+        if phase_window_monotonic is not None:
+            phase_start, phase_end = phase_window_monotonic
+            if (type(phase_start) not in (int, float) or type(phase_end) not in (int, float)
+                    or not math.isfinite(phase_start) or not math.isfinite(phase_end)
+                    or phase_start < 0 or phase_end <= phase_start):
+                return {
+                    "schema": 1, "status": "unknown", "reason": "runner_phase_window_invalid",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples), "window_scope": "on_window",
+                    "window_seconds": None, "effective_cpu_capacity_cores": None,
+                    "max_cgroup_cpu_usage_cores": None,
+                    "max_visible_throttled_periods_delta": None,
+                }
+            selected_intervals = [
+                row for row in intervals if row[0] >= phase_start and row[1] <= phase_end
+            ]
+            if len(selected_intervals) < 2:
+                return {
+                    "schema": 1, "status": "unknown", "reason": "runner_phase_samples_incomplete",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(selected_intervals) + 1,
+                    "window_scope": "on_window", "window_seconds": None,
+                    "window_start_offset_ms": None, "window_end_offset_ms": None,
+                    "effective_cpu_capacity_cores": None,
+                    "max_cgroup_cpu_usage_cores": None,
+                    "max_visible_throttled_periods_delta": None,
+                }
+            phase_start_observed = selected_intervals[0][0]
+            phase_end_observed = selected_intervals[-1][1]
+            phase_fields = {
+                "window_scope": "on_window",
+                "window_seconds": round(phase_end_observed - phase_start_observed, 3),
+                "window_start_offset_ms": round((phase_start_observed - phase_start) * 1000),
+                "window_end_offset_ms": round((phase_end_observed - phase_start) * 1000),
+            }
+            max_throttled = max(row[3] for row in selected_intervals)
+        return {
+            "schema": 1, "status": "complete", "reason": "none",
+            "runner_environment": "github-hosted", "identity": self._identity,
+            "sample_count": len(selected_intervals) + 1 if phase_window_monotonic is not None else len(samples),
+            "window_seconds": (
+                phase_fields["window_seconds"] if phase_window_monotonic is not None
+                else round(samples[-1][0] - samples[0][0], 3)
+            ),
+            "effective_cpu_capacity_cores": round(capacity, 6),
+            "max_cgroup_cpu_usage_cores": round(max(row[2] for row in selected_intervals), 6),
+            "max_visible_throttled_periods_delta": max_throttled,
+            **phase_fields,
+        }
+
+
+def _capacity_attribution(
+    report: Mapping[str, Any],
+    usage: Mapping[str, Any],
+    runner_usage: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assess capacity only from delivered work and source-bound outer-runner evidence."""
+
+    mode = report.get("mode")
+    scenario_kind = report.get("scenario_kind")
+    load_model = report.get("arrival_model")
+    has_ramp = (
+        mode == "read-mix" and isinstance(report.get("concurrency_stages"), list)
+    ) or (scenario_kind == "capacity" and load_model == "open_loop_scheduled_rate")
+    base = {
+        "schema": 1, "load_model": load_model,
+        "capacity_scope": "generator_headroom_only",
+        "capacity_attribution_eligible": None,
+        "server_capacity_claim": None,
+        "server_capacity_claim_status": "unknown",
+        "server_capacity_claim_reason": "resource_correlation_not_provided",
+    }
+    if load_model not in {
+        "open_loop_scheduled_rate", "closed_loop_concurrency_ramp", "closed_loop_staggered_cohort"
+    }:
+        return {**base, "status": "unknown", "reason": "invalid_load_model", "server_capacity_claim": None}
+    if not has_ramp:
+        return {**base, "status": "not_applicable", "reason": "not_capacity_profile", "server_capacity_claim": None}
+
+    logical = report.get("logical")
+    timing = logical.get("timing") if isinstance(logical, Mapping) else None
+    if not isinstance(timing, Mapping):
+        return {**base, "status": "unknown", "reason": "delivery_evidence_missing", "server_capacity_claim": None}
+    count_names = (
+        "expected_count", "submitted_count", "started_count", "completed_count",
+        "scheduled_count", "response_completion_count", "user_observed_count", "dropped_work",
+    )
+    counts = {name: timing.get(name) for name in count_names}
+    if any(type(value) is not int or value < 0 for value in counts.values()):
+        return {**base, "status": "unknown", "reason": "delivery_evidence_invalid", "server_capacity_claim": None}
+    if (
+        timing.get("partial") is not False
+        or len({counts[name] for name in count_names[:4]}) != 1
+        or len({counts[name] for name in count_names[:4] + count_names[4:7]}) != 1
+        or counts["dropped_work"] != 0
+    ):
+        return {**base, "status": "ineligible", "capacity_attribution_eligible": False, "reason": "work_under_delivered"}
+
+    late_start_count = timing.get("late_start_count")
+    queue_wait = timing.get("executor_queue_wait")
+    if type(late_start_count) is not int or late_start_count < 0 or not isinstance(queue_wait, Mapping):
+        return {**base, "status": "unknown", "reason": "queue_evidence_missing", "server_capacity_claim": None}
+    queue_count = queue_wait.get("count")
+    queue_max = queue_wait.get("max_ms")
+    queue_p95 = queue_wait.get("p95_ms")
+    queue_p99 = queue_wait.get("p99_ms")
+    schedule = timing.get("schedule_delay")
+    schedule_p95 = schedule.get("p95_ms") if isinstance(schedule, Mapping) else None
+    schedule_p99 = schedule.get("p99_ms") if isinstance(schedule, Mapping) else None
+    if (
+        type(queue_count) is not int or queue_count != counts["completed_count"]
+        or isinstance(queue_max, bool) or not isinstance(queue_max, (int, float))
+        or not math.isfinite(queue_max) or queue_max < 0
+        or isinstance(queue_p95, bool) or not isinstance(queue_p95, (int, float))
+        or not math.isfinite(queue_p95) or not 0 <= queue_p95 <= queue_max
+        or isinstance(queue_p99, bool) or not isinstance(queue_p99, (int, float))
+        or not math.isfinite(queue_p99) or not queue_p95 <= queue_p99 <= queue_max
+    ):
+        return {**base, "status": "unknown", "reason": "queue_evidence_invalid", "server_capacity_claim": None}
+    if load_model == "open_loop_scheduled_rate" and (
+        isinstance(schedule_p95, bool) or not isinstance(schedule_p95, (int, float))
+        or not math.isfinite(schedule_p95) or schedule_p95 < 0
+        or isinstance(schedule_p99, bool) or not isinstance(schedule_p99, (int, float))
+        or not math.isfinite(schedule_p99) or schedule_p99 < schedule_p95
+    ):
+        return {**base, "status": "unknown", "reason": "queue_evidence_invalid", "server_capacity_claim": None}
+    schedule_lag_ms = (
+        float(schedule_p95) if load_model == "open_loop_scheduled_rate" else None
+    )
+    schedule_tail_lag_ms = (
+        float(schedule_p99) if load_model == "open_loop_scheduled_rate" else None
+    )
+    if (
+        float(queue_p99) > CAPACITY_ATTRIBUTION_LAG_FLOOR_MS
+        or (schedule_tail_lag_ms is not None and schedule_tail_lag_ms > CAPACITY_ATTRIBUTION_LAG_FLOOR_MS)
+    ):
+        return {**base, "status": "ineligible", "capacity_attribution_eligible": False, "reason": "client_queue_lag"}
+
+    child_diagnostics = usage.get("cgroup_diagnostics")
+    child_rows = child_diagnostics.get("visible_ancestors") if isinstance(child_diagnostics, Mapping) else None
+    if isinstance(child_rows, list) and child_rows:
+        for row in child_rows:
+            delta = row.get("cpu_stat_delta") if isinstance(row, Mapping) else None
+            throttled = delta.get("nr_throttled") if isinstance(delta, Mapping) else None
+            if (
+                isinstance(row, Mapping) and row.get("cpu_stat_completeness") == "complete"
+                and type(throttled) is int and throttled > 0
+            ):
+                return {**base, "status": "ineligible", "capacity_attribution_eligible": False, "reason": "generator_quota_throttled"}
+
+    if not isinstance(runner_usage, Mapping):
+        return {**base, "status": "unknown", "reason": "trusted_runner_evidence_missing", "server_capacity_claim": None}
+    capacity = runner_usage.get("effective_cpu_capacity_cores")
+    runner_cpu_max = runner_usage.get("max_cgroup_cpu_usage_cores")
+    identity = runner_usage.get("identity")
+    if (
+        runner_usage.get("status") != "complete"
+        or runner_usage.get("reason") != "none"
+        or runner_usage.get("runner_environment") != "github-hosted"
+        or not isinstance(identity, Mapping) or any(value is not True for value in identity.values())
+        or isinstance(capacity, bool) or not isinstance(capacity, (int, float))
+        or not math.isfinite(capacity) or capacity <= 0
+        or isinstance(runner_cpu_max, bool) or not isinstance(runner_cpu_max, (int, float))
+        or not math.isfinite(runner_cpu_max) or runner_cpu_max < 0
+        or type(runner_usage.get("max_visible_throttled_periods_delta")) is not int
+        or runner_usage["max_visible_throttled_periods_delta"] < 0
+    ):
+        return {**base, "status": "unknown", "reason": "trusted_runner_evidence_incomplete", "server_capacity_claim": None}
+    load_window = report.get("wall_seconds")
+    runner_window = runner_usage.get("window_seconds")
+    if (
+        isinstance(load_window, bool) or not isinstance(load_window, (int, float))
+        or not math.isfinite(load_window) or load_window <= 0
+        or isinstance(runner_window, bool) or not isinstance(runner_window, (int, float))
+        or not math.isfinite(runner_window) or runner_window < load_window
+    ):
+        return {**base, "status": "unknown", "reason": "runner_window_incomplete", "server_capacity_claim": None}
+
+    samples = usage.get("samples")
+    if (
+        usage.get("status") != "complete"
+        or usage.get("cpu_capacity_status") not in {"known", "unknown"}
+        or not isinstance(samples, list) or not samples
+    ):
+        return {**base, "status": "unknown", "reason": "generator_cpu_evidence_invalid", "server_capacity_claim": None}
+    cpu_values = [sample.get("process_cpu_percent") for sample in samples if isinstance(sample, Mapping)]
+    if len(cpu_values) != len(samples) or any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        or not math.isfinite(value) or value < 0 for value in cpu_values
+    ):
+        return {**base, "status": "unknown", "reason": "generator_cpu_evidence_invalid", "server_capacity_claim": None}
+    max_cpu = max(cpu_values)
+    reason = (
+        "generator_quota_throttled" if runner_usage["max_visible_throttled_periods_delta"] > 0
+        else "generator_cpu_saturated" if runner_cpu_max >= float(capacity) or max_cpu >= float(capacity) * 100.0
+        else "headroom_observed"
+    )
+    eligible = reason == "headroom_observed"
+    return {
+        **base,
+        "status": "eligible" if eligible else "ineligible",
+        "reason": reason,
+        "capacity_scope": "generator_headroom_only",
+        "capacity_attribution_eligible": eligible,
+        "server_capacity_claim": None,
+        "server_capacity_claim_status": "unknown",
+        "server_capacity_claim_reason": "resource_correlation_not_provided",
+        "effective_cpu_capacity_cores": round(float(capacity), 6),
+        "max_process_cpu_percent": round(max_cpu, 4),
+        "max_visible_throttled_periods_delta": runner_usage["max_visible_throttled_periods_delta"],
+        "max_cgroup_cpu_usage_cores": round(float(runner_cpu_max), 6),
+        "offered_actions": counts["expected_count"],
+        "started_actions": counts["started_count"],
+        "client_queue_lag_floor_ms": CAPACITY_ATTRIBUTION_LAG_FLOOR_MS,
+        "executor_queue_p95_ms": round(float(queue_p95), 3),
+        "executor_queue_p99_ms": round(float(queue_p99), 3),
+        "schedule_delay_p95_ms": (
+            round(float(schedule_p95), 3) if schedule_lag_ms is not None else None
+        ),
+        "schedule_delay_p99_ms": (
+            round(float(schedule_p99), 3) if schedule_tail_lag_ms is not None else None
+        ),
+    }
 
 
 def _default_https_context() -> ssl.SSLContext:
@@ -2826,6 +3493,138 @@ def run_phase(
     return results
 
 
+def run_authenticated_workspace_capacity_phase(
+    origin: str,
+    actors: list[VirtualUser],
+    *,
+    phase: str,
+    duration_seconds: float,
+    start_at_epoch_ms: int,
+    end_at_epoch_ms: int,
+    concurrency: int,
+    timeout: float,
+    request_builder: Callable[[str, VirtualUser, str, float], Any],
+    stop_requested: Callable[[], str | None],
+    progress_callback: Callable[[str, Any | None], None] | None = None,
+    executor: ThreadPoolExecutor | None = None,
+) -> dict[str, Any]:
+    """Run a bounded closed-loop workspace read with a fail-closed stop guard.
+
+    This deliberately has no offered-rate schedule: each actor starts another
+    authenticated read only when one of its bounded in-flight requests drains.
+    On a guard decision it stops refilling and waits for the existing futures
+    to finish under their request timeout.
+    """
+
+    if (not actors or type(concurrency) is not int or not 1 <= concurrency <= 16
+            or type(duration_seconds) not in (int, float)
+            or isinstance(duration_seconds, bool) or duration_seconds != 20
+            or type(start_at_epoch_ms) is not int or type(end_at_epoch_ms) is not int
+            or end_at_epoch_ms - start_at_epoch_ms != 20_000
+            or type(timeout) not in (int, float) or isinstance(timeout, bool)
+            or not 0 < timeout <= 30):
+        raise ExternalLoadError("capacity diagnostic bounds rejected")
+    started = time.monotonic()
+    wall_now_ms = time.time_ns() // 1_000_000
+    deadline = started + max(0.0, (end_at_epoch_ms - wall_now_ms) / 1000)
+    owns_executor = executor is None
+    if executor is None:
+        executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="ssr-capacity")
+    elif getattr(executor, "_max_workers", None) != concurrency:
+        raise ExternalLoadError("capacity executor size rejected")
+    in_flight: dict[Future[Any], int] = {}
+    results: list[Any] = []
+    submitted = 0
+    next_actor = 0
+    abort_reason: str | None = None
+
+    def guard_reason() -> str | None:
+        try:
+            reason = stop_requested()
+        except Exception:
+            return "guard_unavailable"
+        if reason is not None and reason not in {
+            "memory_floor", "memory_event", "identity_changed", "collection_error",
+            "control_file_invalid", "observer_failed", "window_complete",
+            "observer_timing_error",
+        }:
+            return "guard_unavailable"
+        return reason
+
+    def submit_one() -> bool:
+        nonlocal submitted, next_actor, abort_reason
+        if time.monotonic() >= deadline:
+            return False
+        if time.time_ns() // 1_000_000 < start_at_epoch_ms:
+            return False
+        reason = guard_reason()
+        if reason is not None:
+            abort_reason = reason
+            return False
+        actor = actors[next_actor % len(actors)]
+        next_actor += 1
+        index = submitted
+        submitted += 1
+        future = executor.submit(request_builder, origin, actor, phase, float(timeout))
+        in_flight[future] = index
+        return True
+
+    try:
+        while len(in_flight) < concurrency and submit_one():
+            pass
+        while in_flight or (abort_reason is None and time.monotonic() < deadline):
+            reason = guard_reason() if abort_reason is None else abort_reason
+            if reason is not None:
+                abort_reason = reason
+            while abort_reason is None and len(in_flight) < concurrency and submit_one():
+                pass
+            if not in_flight:
+                if abort_reason is not None or time.monotonic() >= deadline:
+                    break
+                time.sleep(min(0.025, max(0.0, deadline - time.monotonic())))
+                submit_one()
+                continue
+            done, _pending = wait(
+                in_flight,
+                timeout=(
+                    max(0.01, min(0.05, max(0.0, deadline - time.monotonic())))
+                    if abort_reason is None and time.monotonic() < deadline else 0.05
+                ),
+                return_when=FIRST_COMPLETED,
+            )
+            for future in sorted(done, key=in_flight.__getitem__):
+                in_flight.pop(future, None)
+                result = future.result()
+                results.append(result)
+                if progress_callback is not None:
+                    try:
+                        progress_callback("http", result)
+                    except Exception:
+                        pass
+                _release_result_payload(result)
+                if abort_reason is None and time.monotonic() < deadline:
+                    submit_one()
+    except BaseException:
+        for future in in_flight:
+            future.cancel()
+        if owns_executor:
+            executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        if owns_executor:
+            executor.shutdown(wait=True)
+    return {
+        "submitted": submitted,
+        "completed": len(results),
+        "aborted": abort_reason not in {None, "window_complete"},
+        "abort_reason": abort_reason,
+        "window_start_at_ms": start_at_epoch_ms,
+        "window_end_at_ms": end_at_epoch_ms,
+        "duration_ms": max(0, round((time.monotonic() - started) * 1000)),
+        "results": results,
+    }
+
+
 def run_rate_phase(
     origin: str,
     users: list[VirtualUser],
@@ -4476,6 +5275,11 @@ def _run_load_impl(
         "wall_seconds": round(wall_seconds, 6),
         "opening_spread_seconds": spread_seconds,
         "scenario_kind": scenario_kind,
+        "arrival_model": (
+            "open_loop_scheduled_rate" if phase_plan
+            else "closed_loop_concurrency_ramp" if concurrency_stages
+            else "closed_loop_staggered_cohort"
+        ),
         "client_transport": (
             READY_VOTE_TRANSPORT_PAIR_LABEL
             if transport_pair_plan is not None
@@ -4589,6 +5393,7 @@ def run_load(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 usage["samples"] = []
                 usage["sample_count"] = 0
             report["client_resource_usage"] = usage
+            report["capacity_attribution"] = _capacity_attribution(report, usage)
 
 
 def _safe_load_timestamp(value: Any) -> datetime | None:

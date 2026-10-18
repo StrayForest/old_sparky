@@ -13,14 +13,30 @@ permissions:
   contents: read
 
 concurrency:
-  group: platform-production-auto-deploy
-  cancel-in-progress: true
+  # A readiness wait belongs to one exact Security source run.  A newer
+  # commit must not cancel an older run while it is proving its own backup;
+  # the final pre-dispatch source check rejects stale runs instead.
+  group: platform-production-auto-deploy-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: false
 
 jobs:
   dispatch:
+    outputs:
+      deploy: ${{ steps.gate.outputs.deploy }}
+      mode: ${{ steps.gate.outputs.mode }}
+      route_class: ${{ steps.route.outputs.route_class }}
+      route_deployable: ${{ steps.route.outputs.route_deployable }}
+      route_recovery_bootstrap_only: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
+      route_candidate_packaging_only: ${{ steps.route.outputs.route_candidate_packaging_only }}
+      host_tools_sha: ${{ steps.host-tools-pin.outputs.host_tools_sha }}
+      host_tools_toolset_version: ${{ steps.host-tools-build.outputs.toolset_version }}
+      host_tools_artifact_id: ${{ steps.publish-host-tools.outputs.artifact-id }}
+      host_tools_artifact_digest: ${{ steps.publish-host-tools.outputs.artifact-digest }}
     permissions:
       actions: write
+      attestations: write
       contents: read
+      id-token: write
       statuses: read
     if: >-
       github.event.workflow_run.event == 'push' &&
@@ -910,21 +926,292 @@ jobs:
           set -euo pipefail
           /usr/bin/python3 -I "$BACKUP_GUARD_TOOL"
 
-      - name: Dispatch production deployment or baseline reconciliation
+      - name: Resolve host-tools pin for exact tested source
+        id: host-tools-pin
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          pin_output="$RUNNER_TEMP/platform-host-tools-pin"
+          /usr/bin/python3 "$GITHUB_WORKSPACE/platform/tools/platform_host_tools_pin.py" resolve \
+            --source-root "$GITHUB_WORKSPACE" \
+            --target-sha "$TARGET_SHA" \
+            --expected-repository "$GITHUB_REPOSITORY" > "$pin_output"
+          test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
+          test "$(wc -l < "$pin_output" | tr -d ' ')" = 1
+          IFS= read -r host_tools_sha < "$pin_output"
+          [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
+          rm -f -- "$pin_output"
+
+      - name: Checkout exact pinned host-tools source
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.host-tools-pin.outputs.host_tools_sha }}
+          fetch-depth: 1
+          path: host-tools-source
+          persist-credentials: false
+
+      - name: Build exact host-tools bundle for root provisioning
+        id: host-tools-build
         if: ${{ steps.gate.outputs.deploy == 'true' }}
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          DISPATCH_MODE: ${{ steps.gate.outputs.mode }}
-          ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
-          ROUTE_DEPLOYABLE: ${{ steps.route.outputs.route_deployable }}
-          ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
-          ROUTE_CANDIDATE_PACKAGING_ONLY: ${{ steps.route.outputs.route_candidate_packaging_only }}
-          AUTODEPLOY_RUN_ID: ${{ github.run_id }}
-          AUTODEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          HOST_TOOLS_SHA: ${{ steps.host-tools-pin.outputs.host_tools_sha }}
         run: |
           set -euo pipefail
+          umask 077
+          host_tools_source="$GITHUB_WORKSPACE/host-tools-source"
+          test "$(git -C "$host_tools_source" rev-parse HEAD)" = "$HOST_TOOLS_SHA"
+          test -z "$(git -C "$host_tools_source" status --porcelain=v1 --untracked-files=all -- platform/tools)"
+          mkdir -m 700 "$RUNNER_TEMP/platform-host-tools-artifact"
+          /usr/bin/python3 "$host_tools_source/platform/tools/platform_host_tools_bundle.py" build \
+            --source-root "$host_tools_source" \
+            --source-sha "$HOST_TOOLS_SHA" \
+            --output "$RUNNER_TEMP/platform-host-tools-artifact/platform-host-tools-bundle.zip"
+          /usr/bin/python3 "$host_tools_source/platform/tools/platform_host_tools_bundle.py" verify \
+            --bundle "$RUNNER_TEMP/platform-host-tools-artifact/platform-host-tools-bundle.zip" \
+            --expected-source-sha "$HOST_TOOLS_SHA" \
+            --contract-dir "$RUNNER_TEMP/platform-host-tools-artifact/contract"
+          IFS= read -r toolset_version < "$RUNNER_TEMP/platform-host-tools-artifact/contract/toolset_version"
+          case "$toolset_version" in
+            production-host-tools-v3|production-host-tools-v4) ;;
+            *) echo "host-tools source produced unsupported generation metadata" >&2; exit 1 ;;
+          esac
+          printf 'toolset_version=%s\n' "$toolset_version" >> "$GITHUB_OUTPUT"
 
+      - name: Publish exact root-provisioning host-tools artifact
+        id: publish-host-tools
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-host-tools-bootstrap-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: ${{ runner.temp }}/platform-host-tools-artifact
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest exact root-provisioning host-tools bundle
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ runner.temp }}/platform-host-tools-artifact/platform-host-tools-bundle.zip
+
+      - name: Remove host-tools build source and local artifact
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -rf -- "$GITHUB_WORKSPACE/host-tools-source" "$RUNNER_TEMP/platform-host-tools-artifact"
+          rm -f -- "$RUNNER_TEMP/platform-host-tools-pin"
+
+      - name: Auto-deploy preflight summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          SHOULD_DEPLOY: ${{ steps.gate.outputs.deploy }}
+          SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
+          ROUTE_REASON: ${{ steps.route.outputs.route_reason }}
+        run: |
+          {
+            echo "### Platform production auto-deploy preflight"
+            echo
+            echo "- Tested commit: \`$TARGET_SHA\`"
+            echo "- Security/build run: $SOURCE_RUN_URL"
+            echo "- Classifier route: \`$ROUTE_CLASS\` ($ROUTE_REASON)"
+            if [[ "$SHOULD_DEPLOY" == "true" ]]; then
+              echo "- Result: exact host-tools artifact built; backup proof passed; waiting for host readiness."
+            else
+              echo "- Result: no deployment required."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  host-readiness:
+    name: Wait for exact host-tools generation readiness
+    needs:
+      - dispatch
+    if: >-
+      needs.dispatch.result == 'success' &&
+      needs.dispatch.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+    env:
+      TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+      HOST_TOOLS_SHA: ${{ needs.dispatch.outputs.host_tools_sha }}
+      HOST_TOOLS_TOOLSET_VERSION: ${{ needs.dispatch.outputs.host_tools_toolset_version }}
+    steps:
+      - name: Checkout exact tested source containing shared verifier
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download exact uploaded host-tools bundle and contract
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-host-tools-bootstrap-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: ${{ runner.temp }}/host-tools-bootstrap
+
+      - name: Revalidate bundle bytes against exact host-tools pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -B "$GITHUB_WORKSPACE/platform/tools/platform_host_tools_bundle.py" verify \
+            --bundle "$RUNNER_TEMP/host-tools-bootstrap/platform-host-tools-bundle.zip" \
+            --expected-source-sha "$HOST_TOOLS_SHA" \
+            --contract-dir "$RUNNER_TEMP/host-tools-bootstrap/contract"
+
+      - name: Verify exact installed generation with shared read-only verifier
+        id: host-ready
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ && "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HOST_TOOLS_TOOLSET_VERSION" =~ ^production-host-tools-v[34]$ ]]
+          IFS= read -r bundle_source < "$RUNNER_TEMP/host-tools-bootstrap/contract/source_sha"
+          IFS= read -r bundle_version < "$RUNNER_TEMP/host-tools-bootstrap/contract/toolset_version"
+          test "$bundle_source" = "$HOST_TOOLS_SHA"
+          test "$bundle_version" = "$HOST_TOOLS_TOOLSET_VERSION"
+          /usr/bin/timeout --signal=TERM --kill-after=5s 35m \
+            /usr/bin/python3 -I -B "$GITHUB_WORKSPACE/platform/tools/platform_host_tools_installed_check.py" \
+              --source-sha "$HOST_TOOLS_SHA" \
+              --toolset-version "$HOST_TOOLS_TOOLSET_VERSION" \
+              --contract-dir "$RUNNER_TEMP/host-tools-bootstrap/contract" \
+              --wait-for-generation-seconds 1800
+
+      - name: Remove host-readiness verifier material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- "$RUNNER_TEMP/host-tools-bootstrap" "$RUNNER_TEMP/platform-host-capability-ssh"
+          rm -f -- "$RUNNER_TEMP/platform-host-tools-pin"
+
+  dispatch-production:
+    name: Revalidate exact source and dispatch normal production child
+    needs:
+      - dispatch
+      - host-readiness
+    if: >-
+      needs.dispatch.result == 'success' &&
+      needs.dispatch.outputs.deploy == 'true' &&
+      needs.host-readiness.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      statuses: read
+    env:
+      TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+      PROVENANCE_TOOL: ${{ github.workspace }}/platform/tools/platform_workflow_provenance.py
+    steps:
+      - name: Checkout exact source for final provenance revalidation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Revalidate requested host-tools pin before child dispatch
+        shell: bash
+        env:
+          HOST_TOOLS_SHA: ${{ needs.dispatch.outputs.host_tools_sha }}
+        run: |
+          set -euo pipefail
+          pin_output="$RUNNER_TEMP/platform-final-host-tools-pin"
+          /usr/bin/python3 "$GITHUB_WORKSPACE/platform/tools/platform_host_tools_pin.py" resolve \
+            --source-root "$GITHUB_WORKSPACE" \
+            --target-sha "$TARGET_SHA" \
+            --expected-repository "$GITHUB_REPOSITORY" > "$pin_output"
+          test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
+          test "$(wc -l < "$pin_output" | tr -d ' ')" = 1
+          IFS= read -r requested_host_tools_sha < "$pin_output"
+          rm -f -- "$pin_output"
+          test "$requested_host_tools_sha" = "$HOST_TOOLS_SHA"
+
+      - name: Revalidate current dev and exact successful Security run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          metadata_dir="$(mktemp -d "$RUNNER_TEMP/platform-final-security.XXXXXX")"
+          trap 'rm -rf -- "$metadata_dir"' EXIT
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev" > "$metadata_dir/dev.json"
+          /usr/bin/python3 "$GITHUB_WORKSPACE/platform/tools/platform_autodeploy_freshness_guard.py" \
+            --response "$metadata_dir/dev.json" \
+            --expected-sha "$TARGET_SHA"
+          for endpoint in \
+            "workflows/platform-security.yml" \
+            "runs/$SOURCE_RUN_ID" \
+            "commits/$TARGET_SHA/statuses?per_page=100&page=1"; do
+            name="${endpoint%%/*}"
+            name="${name%%\?*}"
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/${endpoint}" \
+              --output "$metadata_dir/$name.json"
+          done
+          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 "$PROVENANCE_TOOL" security \
+            --workflow "$metadata_dir/workflows.json" \
+            --run "$metadata_dir/runs.json" \
+            --status "$metadata_dir/commits.json" \
+            --expected-run-id "$SOURCE_RUN_ID" \
+            --expected-attempt "$SOURCE_RUN_ATTEMPT" \
+            --expected-target-sha "$TARGET_SHA" \
+            --expected-run-url "$SOURCE_RUN_URL"
+
+      - name: Revalidate exact successful source-bound backup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          SOURCE_SECURITY_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_SECURITY_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+          BACKUP_GUARD_TOOL: ${{ github.workspace }}/platform/tools/platform_backup_success_guard.py
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I "$BACKUP_GUARD_TOOL"
+
+      - name: Dispatch production deployment or baseline reconciliation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_MODE: ${{ needs.dispatch.outputs.mode }}
+          ROUTE_CLASS: ${{ needs.dispatch.outputs.route_class }}
+          ROUTE_DEPLOYABLE: ${{ needs.dispatch.outputs.route_deployable }}
+          ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ needs.dispatch.outputs.route_recovery_bootstrap_only }}
+          ROUTE_CANDIDATE_PACKAGING_ONLY: ${{ needs.dispatch.outputs.route_candidate_packaging_only }}
+          AUTODEPLOY_RUN_ID: ${{ github.run_id }}
+          AUTODEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          HOST_TOOLS_SHA: ${{ needs.dispatch.outputs.host_tools_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
           case "$DISPATCH_MODE" in
             deploy)
               [[ "$ROUTE_DEPLOYABLE" == "true" \
@@ -938,36 +1225,12 @@ jobs:
                   || ( "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ) ) ]] \
                 || { echo "Refusing an invalid baseline-reconcile route." >&2; exit 1; }
               ;;
-            *)
-              echo "Refusing an unknown production dispatch mode." >&2
-              exit 1
-              ;;
+            *) echo "Refusing an unknown production dispatch mode." >&2; exit 1 ;;
           esac
-
-          branch_json="$(
-            curl --fail-with-body --silent --show-error \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev"
-          )"
-          dev_sha="$(
-            printf '%s' "$branch_json" | /usr/bin/python3 -c '
-          import json
-          import sys
-          print(json.load(sys.stdin)["commit"]["sha"])
-          '
-          )"
-          test "$dev_sha" = "$TARGET_SHA" || {
-            echo "Refusing stale dispatch: dev moved from $TARGET_SHA to $dev_sha." >&2
-            exit 1
-          }
           [[ "$AUTODEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
             && "$AUTODEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || {
-            echo "Refusing malformed auto-deploy run identity." >&2
-            exit 1
+            echo "Refusing malformed auto-deploy run identity." >&2; exit 1;
           }
-
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
@@ -977,8 +1240,6 @@ jobs:
             --data "$(/usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$DISPATCH_MODE" "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" <<'PY'
           import json
           import sys
-          # Keep the reviewed profile and compression contract explicit:
-          # "runtime_profile":"authenticated-read-admission-24x8" and "web_compression":"enabled".
           print(json.dumps({
               "ref": "dev",
               "inputs": {
@@ -994,29 +1255,21 @@ jobs:
           PY
             )"
 
-      - name: Auto-deploy summary
+      - name: Auto-deploy dispatch summary
         if: ${{ always() }}
         shell: bash
         env:
-          SHOULD_DEPLOY: ${{ steps.gate.outputs.deploy }}
           SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
-          ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
-          ROUTE_REASON: ${{ steps.route.outputs.route_reason }}
-          DISPATCH_MODE: ${{ steps.gate.outputs.mode }}
+          DISPATCH_MODE: ${{ needs.dispatch.outputs.mode }}
         run: |
           {
-            echo "### Platform production auto-deploy"
+            echo "### Platform production auto-deploy dispatch"
             echo
-            echo "- Tested commit: \`$TARGET_SHA\`"
             echo "- Security/build run: $SOURCE_RUN_URL"
-            echo "- Classifier route: \`$ROUTE_CLASS\` ($ROUTE_REASON)"
-            if [[ "$SHOULD_DEPLOY" == "true" ]]; then
-              if [[ "$DISPATCH_MODE" == "baseline-reconcile" ]]; then
-                echo "- Result: authenticated baseline reconciliation dispatched"
-              else
-                echo "- Result: production deployment dispatched"
-              fi
+            echo "- Mode: \`$DISPATCH_MODE\`"
+            if [[ "${{ job.status }}" == "success" ]]; then
+              echo "- Result: normal production child dispatched after source, backup, and host readiness proofs."
             else
-              echo "- Result: no deployment required"
+              echo "- Result: deployment child was not dispatched."
             fi
           } >> "$GITHUB_STEP_SUMMARY"

@@ -6666,17 +6666,21 @@ cleanup
         dispatcher = (
             TOOLS_DIR / "platform_workflow_remote_dispatch.py"
         ).read_text(encoding="utf-8")
-        probe = self._workflow_step_run(
-            workflow, "Probe immutable host dispatcher capabilities"
-        )
-        expected_match = re.search(r'expected_output="([^"]+)"', probe)
         dispatcher_match = re.search(r'"dispatcher=[^"]+"', dispatcher)
-        self.assertIsNotNone(expected_match)
         self.assertIsNotNone(dispatcher_match)
-        assert expected_match is not None
         assert dispatcher_match is not None
-        self.assertIn(dispatcher_match.group(0)[1:-1], expected_match.group(1))
-        self.assertIn("release_baseline=1", expected_match.group(1))
+        helper = (TOOLS_DIR / "platform_host_tools_installed_check.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"/usr/bin/python3.12", "-I", "-B", dispatcher, "host-capabilities"', helper)
+        for capability_field in dispatcher_match.group(0)[1:-1].split():
+            self.assertIn(capability_field, helper)
+        self.assertIn("release_baseline=1", helper)
+        preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
+            "  build-release:", 1
+        )[0]
+        self.assertIn("platform_host_tools_installed_check.py", preflight)
+        self.assertIn("--contract-dir", preflight)
 
     def test_host_tools_handoff_digest_matches_action_and_api_formats(self) -> None:
         workflow = (
