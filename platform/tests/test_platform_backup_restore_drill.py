@@ -1940,7 +1940,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             required = (
                 backup_drill._required_disk_floor(total_bytes)
                 + backup_drill.RESTORE_DISK_LEAD_BYTES
-                + 4096
+                + 8192
             )
             snapshot = types.SimpleNamespace(
                 valid=True,
@@ -1949,6 +1949,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             )
             real_fstat = os.fstat
             real_lstat = pathlib.Path.lstat
+            real_posix_fallocate = os.posix_fallocate
+            allocation_calls: list[tuple[int, int, int, int]] = []
+            formatter_events: list[str] = []
 
             def root_owned_lstat(path: pathlib.Path) -> os.stat_result:
                 if path in {temporary_root, image_root}:
@@ -1985,9 +1988,29 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     st_blocks=actual.st_blocks,
                 )
 
+            def simulated_lazy_inode_zeroout(
+                argv: list[str], **_kwargs: object
+            ) -> subprocess.CompletedProcess[bytes]:
+                # Model a formatter zeroout path that punches the second
+                # filesystem block while preserving an already written block.
+                formatter_events.append("mkfs")
+                with pathlib.Path(argv[-1]).open("r+b") as image_file:
+                    image_file.truncate(0)
+                    image_file.truncate(8192)
+                    image_file.write(b"mkfs-sentinel")
+                return subprocess.CompletedProcess(argv, 0)
+
+            def record_exact_inode_allocation(
+                descriptor: int, offset: int, length: int
+            ) -> None:
+                info = os.fstat(descriptor)
+                allocation_calls.append((info.st_dev, info.st_ino, offset, length))
+                formatter_events.append("fallocate")
+                real_posix_fallocate(descriptor, offset, length)
+
             with (
                 mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
-                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_BYTES", 4096),
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_BYTES", 8192),
                 mock.patch.object(backup_drill.os, "geteuid", return_value=0),
                 mock.patch.object(
                     backup_drill,
@@ -1995,7 +2018,16 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
                 ),
                 mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
-                mock.patch.object(backup_drill.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as mkfs,
+                mock.patch.object(
+                    backup_drill.subprocess,
+                    "run",
+                    side_effect=simulated_lazy_inode_zeroout,
+                ) as mkfs,
+                mock.patch.object(
+                    backup_drill.os,
+                    "posix_fallocate",
+                    side_effect=record_exact_inode_allocation,
+                ),
                 mock.patch.object(pathlib.Path, "lstat", root_owned_lstat),
                 mock.patch.object(backup_drill.os, "fstat", side_effect=root_owned_fstat),
             ):
@@ -2003,13 +2035,22 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "0123456789abcdef01234567"
                 )
             self.assertEqual(image_path.parent, image_root)
-            self.assertEqual(identity[2], 4096)
-            self.assertEqual(image_path.stat().st_blocks * 512, 4096)
+            self.assertEqual(identity[2], 8192)
+            self.assertEqual(image_path.stat().st_blocks * 512, 8192)
+            self.assertEqual(image_path.read_bytes()[:13], b"mkfs-sentinel")
+            self.assertEqual(
+                allocation_calls,
+                [
+                    (image_path.stat().st_dev, image_path.stat().st_ino, 0, 8192),
+                    (image_path.stat().st_dev, image_path.stat().st_ino, 0, 8192),
+                ],
+            )
+            self.assertEqual(formatter_events, ["fallocate", "mkfs", "fallocate"])
             self.assertEqual(
                 mkfs.call_args.args[0],
                 [
                     "/usr/sbin/mkfs.ext4", "-F", "-q", "-m", "0",
-                    "-E", "nodiscard", str(image_path),
+                    "-E", "nodiscard,lazy_itable_init=0", str(image_path),
                 ],
             )
             self.assertTrue(mkfs.call_args.kwargs["check"])
@@ -2017,16 +2058,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
             image_path.unlink()
 
-            def simulated_formatter_discard(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
-                # Model mke2fs discard punching holes in the regular-file image.
-                with pathlib.Path(argv[-1]).open("r+b") as image_file:
-                    image_file.truncate(0)
-                    image_file.truncate(4096)
-                return subprocess.CompletedProcess(argv, 0)
-
             with (
                 mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
-                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_BYTES", 4096),
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_BYTES", 8192),
                 mock.patch.object(backup_drill.os, "geteuid", return_value=0),
                 mock.patch.object(
                     backup_drill,
@@ -2034,12 +2068,22 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
                 ),
                 mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
-                mock.patch.object(backup_drill.subprocess, "run", side_effect=simulated_formatter_discard),
+                mock.patch.object(
+                    backup_drill.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0),
+                ),
+                mock.patch.object(
+                    backup_drill.os,
+                    "posix_fallocate",
+                    side_effect=OSError(28, "synthetic allocation failure"),
+                ),
                 mock.patch.object(pathlib.Path, "lstat", root_owned_lstat),
                 mock.patch.object(backup_drill.os, "fstat", side_effect=root_owned_fstat),
-                self.assertRaisesRegex(RuntimeError, "fixed allocation contract"),
+                self.assertRaises(OSError),
             ):
                 backup_drill._scratch_prepare_disk_image("0123456789abcdef01234567")
+            self.assertFalse(image_path.exists())
             self.assertFalse(image_path.exists())
 
     def test_disk_image_setup_collision_is_reported_as_not_created(self) -> None:

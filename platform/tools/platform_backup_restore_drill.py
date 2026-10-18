@@ -3322,7 +3322,10 @@ def _scratch_prepare_disk_image(token: str) -> tuple[pathlib.Path, tuple[int, in
         ):
             raise RuntimeError("Scratch image formatter identity is unsafe.")
         subprocess.run(
-            [str(mkfs_path), "-F", "-q", "-m", "0", "-E", "nodiscard", str(path)],
+            [
+                str(mkfs_path), "-F", "-q", "-m", "0", "-E",
+                "nodiscard,lazy_itable_init=0", str(path),
+            ],
             check=True,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -3330,6 +3333,10 @@ def _scratch_prepare_disk_image(token: str) -> tuple[pathlib.Path, tuple[int, in
             timeout=30,
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
         )
+        # e2fsprogs may use hole-punch fallback for zero-range on regular
+        # files even with discard disabled. Reassert allocation on the exact
+        # held inode before the unchanged full-allocation identity check.
+        os.posix_fallocate(descriptor, 0, SCRATCH_DISK_IMAGE_BYTES)
         os.fsync(descriptor)
         _scratch_fsync_directory(parent)
         identity = _scratch_image_path_identity(path)
