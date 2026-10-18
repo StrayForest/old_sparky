@@ -9,7 +9,6 @@ provide only the verified generation SHA and local bundle contract directory.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 from pathlib import Path
 import re
@@ -334,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
             stream.write(f"HOST_TOOLS_GENERATION={generation}\n")
         print("Verified installed host-tools generation and dispatcher capabilities.")
         return 0
-    except GenerationAbsent as exc:
+    except GenerationAbsent:
         print("Exact host-tools generation is not installed yet.", file=sys.stderr)
         return 10
     except (KeyError, OSError, UnicodeError, VerificationError) as exc:

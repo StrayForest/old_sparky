@@ -289,27 +289,8 @@ The `platform-host-tools-candidate.yml` workflow is a separate trusted `workflow
 a production gate. Its validator and bundle tests belong to `backend-tool-contract` through
 `test_platform_host_tools_bundle`, except the active-baseline reader test, which exercises
 root-owned release metadata and belongs to `backend-privileged`; catalog snapshots track both.
-The `verification-contract` gate invokes a pinned actionlint 1.7.12 binary against every
-`.github/workflows/*.yml` and `*.yaml` file with shellcheck and pyflakes integrations explicitly
-disabled. Canonical Security CI downloads the official Linux archive into private `RUNNER_TEMP`,
-checks its fixed SHA-256, verifies its GitHub artifact attestation before extraction or execution,
-and binds the attestation to the upstream
-[v1.7.12 release workflow](https://github.com/rhysd/actionlint/blob/v1.7.12/.github/workflows/release.yaml)
-and exact release tag. It exposes only that exact binary to the gate. The gate also runs positive and negative
-`runner.environment` context fixtures, guarding step-level availability and rejecting job-level
-use. The upstream [v1.7.12 installation guide](https://github.com/rhysd/actionlint/blob/v1.7.12/docs/install.md)
-recommends verifying release-archive attestations with the
-[GitHub CLI attestation command](https://cli.github.com/manual/gh_attestation_verify). A local
-machine without the exact pinned binary reports `LOCAL GATE BLOCKED`; it does not skip workflow
-validation. The verification-contract gate also invokes
-`host_tools_candidate_workflow_issues()` so default-branch guards, narrow permissions, pinned
-actions, data-only candidate handling, isolated-Python use, TOCTOU rechecks and production
-artifact isolation fail closed. The workflow returns a successful no-op for a base-reachable
-pin; only a novel eligible pin reaches build, attestation and upload.
-`test_platform_noop_source_binding` belongs to `backend-tool-contract`: its hermetic cases
-validate the closed no-op receipt, distinct runner/application SHA binding, authenticated
-artifact metadata, bounded archive extraction, and redirect credential handling without
-production access.
+The `verification-contract` gate runs pinned actionlint 1.7.12 on every workflow YAML file with shellcheck and pyflakes disabled; owner tests exercise positive and negative `runner.environment` context fixtures. Security CI downloads the official archive into private `RUNNER_TEMP`, checks its fixed SHA-256, and verifies its GitHub attestation against the exact release tag and [upstream release workflow](https://github.com/rhysd/actionlint/blob/v1.7.12/.github/workflows/release.yaml) before extraction or execution. The [installation guide](https://github.com/rhysd/actionlint/blob/v1.7.12/docs/install.md) and [GitHub CLI attestation command](https://cli.github.com/manual/gh_attestation_verify) document this verification; a missing exact local binary is `LOCAL GATE BLOCKED`, never a skipped workflow check.
+The same gate invokes `host_tools_candidate_workflow_issues()` so default-branch guards, narrow permissions, pinned actions, data-only candidate handling, isolated-Python use, TOCTOU rechecks and production artifact isolation fail closed. A base-reachable pin is a successful no-op; only a novel eligible pin reaches build, attestation and upload. `test_platform_noop_source_binding` belongs to `backend-tool-contract` and covers the closed no-op receipt, distinct runner/application SHA binding, authenticated artifact metadata, bounded archive extraction and redirect handling without production access. Its output is review evidence only, not production authority.
 That output is review evidence only: it grants no deploy/provision authority, and production
 workflows must not consume its artifact prefixes.
 

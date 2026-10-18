@@ -435,8 +435,12 @@ function readSafeCgroupText(path: string, limit: number): SafeCgroupText {
 
 function readCgroupMemorySnapshot(): CgroupMemoryRead {
   const membership = readSafeCgroupText("/proc/self/cgroup", 8192);
-  if (membership.status === "unavailable") return { status: "unavailable", reason: "hierarchy_unavailable", snapshot: null };
-  if (membership.status === "invalid") return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+  if (membership.status !== "complete") {
+    if (membership.status === "unavailable") {
+      return { status: "unavailable", reason: "hierarchy_unavailable", snapshot: null };
+    }
+    return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
+  }
   const line = membership.text.split("\n").find((candidate) => candidate.startsWith("0::"));
   if (!line) return { status: "unavailable", reason: "hierarchy_unavailable", snapshot: null };
   if (!/^0::\/[A-Za-z0-9._/-]{0,512}$/u.test(line)) return { status: "invalid", reason: "invalid_snapshot", snapshot: null };
@@ -537,8 +541,9 @@ function startNodeMemoryWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): vo
       }
       gcCount += 1;
       gcDurationMs += attributedDurationMs;
-      const kind = entry.detail && typeof entry.detail === "object" && "kind" in entry.detail
-        ? Number(entry.detail.kind) : Number.NaN;
+      const detail = (entry as PerformanceEntry & { readonly detail?: unknown }).detail;
+      const kind = detail && typeof detail === "object" && "kind" in detail
+        ? Number(detail.kind) : Number.NaN;
       const category = kind === performanceConstants.NODE_PERFORMANCE_GC_MAJOR ? "major"
         : kind === performanceConstants.NODE_PERFORMANCE_GC_MINOR ? "minor"
           : kind === performanceConstants.NODE_PERFORMANCE_GC_INCREMENTAL ? "incremental"

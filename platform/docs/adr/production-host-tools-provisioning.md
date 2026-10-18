@@ -12,9 +12,8 @@ generation.  The immutable path is:
 The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
-is the only source for `HOST_TOOLS_SHA` and selects
-`bdc5adfe1d2be5e08fbf169040bd735910092aa0`. This differs from installed host
-generation **C1** and application source **G** (`TARGET_SHA`); pin selection is not installation evidence.
+is the only source for `HOST_TOOLS_SHA` and selects `fcbfe3dc41c999ae298a8b1f958a07f9c1fd0ff1`; pin-only commit `43783b31699d498776a70b2a644b081d828cd41b` records source A's exact 15-member closure, but does not prove installation.
+The active installed generation remains recorded in [`CURRENT.md`](../CURRENT.md); this differs from installed host generation **C1** and application source **G** (`TARGET_SHA`).
 S11 source A is `138128c99025069143f5c234f6cb58545ed8ab1c` and is
 installed with provisioning receipt SHA-256
 `2f182be1aaf90ee56ed83f7c755e4f38ec860d6f7f20e2ae003084c1a0a7c3f7`. Its
