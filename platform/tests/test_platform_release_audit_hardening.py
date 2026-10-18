@@ -1843,22 +1843,62 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                         )
                         self.assertNotIn("secrets.PROD_SSH_", step, location)
                     if uses and ssh_material_cleanup_seen:
-                        cleanup_step_id = (
-                            "remove-diagnostic-ssh-material"
-                            if path.name == "platform-production-external-load.yml"
+                        bounded_cpu_summary = (
+                            path.name == "platform-production-external-load.yml"
                             and job_name == "cpu-diagnostic-pair"
-                            else "cleanup_ssh"
+                            and (
+                                "name: Publish only the bounded diagnostic summary" in step
+                                or "name: Publish only the bounded SSR capacity summary" in step
+                            )
                         )
-                        self.assertRegex(
-                            step,
-                            rf"steps\.{re.escape(cleanup_step_id)}\.outcome\s*==\s*['\"]success['\"]",
-                            f"{location} must not run after an unsuccessful SSH cleanup",
-                        )
-                        self.assertNotRegex(
-                            step,
-                            r"(?:PROD_SSH_(?:HOST|USER|KEY)|SSH_DIR|id_ed25519|known_hosts|old_sparky_prod)",
-                            f"{location} must not inherit cleaned production SSH material",
-                        )
+                        if bounded_cpu_summary:
+                            sanitizer_step_id = (
+                                "sanitize-cpu-report"
+                                if "name: Publish only the bounded diagnostic summary" in step
+                                else "sanitize-ssr-capacity"
+                            )
+                            condition = re.search(
+                                r"(?m)^\s+if:\s*(.+)$", step
+                            )
+                            self.assertIsNotNone(condition, location)
+                            self.assertEqual(
+                                condition.group(1).strip(),
+                                "${{ always() && steps."
+                                f"{sanitizer_step_id}.outcome == 'success' " + "}}",
+                                f"{location} must upload only a successfully sanitized report",
+                            )
+                            report_path = (
+                                "${{ runner.temp }}/cpu-diagnostic-report/cpu-diagnostic.json"
+                                if sanitizer_step_id == "sanitize-cpu-report"
+                                else "${{ runner.temp }}/ssr-capacity-report/ssr-capacity.json"
+                            )
+                            self.assertIn(
+                                report_path,
+                                step,
+                                location,
+                            )
+                            self.assertNotRegex(
+                                step,
+                                r"(?:PROD_SSH_(?:HOST|USER|KEY)|SSH_DIR|id_ed25519|known_hosts|old_sparky_prod|report\.json|ssh-lifecycle)",
+                                f"{location} must not publish raw diagnostics or SSH material",
+                            )
+                        else:
+                            cleanup_step_id = (
+                                "remove-diagnostic-ssh-material"
+                                if path.name == "platform-production-external-load.yml"
+                                and job_name == "cpu-diagnostic-pair"
+                                else "cleanup_ssh"
+                            )
+                            self.assertRegex(
+                                step,
+                                rf"steps\.{re.escape(cleanup_step_id)}\.outcome\s*==\s*['\"]success['\"]",
+                                f"{location} must not run after an unsuccessful SSH cleanup",
+                            )
+                            self.assertNotRegex(
+                                step,
+                                r"(?:PROD_SSH_(?:HOST|USER|KEY)|SSH_DIR|id_ed25519|known_hosts|old_sparky_prod)",
+                                f"{location} must not inherit cleaned production SSH material",
+                            )
                     if "run_checked_out_client" in run:
                         self.assertFalse(
                             secret_names.intersection(step_secrets), location
@@ -2414,6 +2454,43 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             producer = active_tools / "platform_storage_maintenance.py"
             release_helper = active_tools / "platform_release_retention.py"
             liveqa_helper = active_tools / "platform_live_qa_guard.py"
+            maintenance_validator = active_tools / "platform_maintenance_qa_evidence.py"
+            source_unit = active_release / "deploy/systemd/deadlock-maintenance.service"
+            source_unit.parent.mkdir(parents=True)
+            source_unit_bytes = (
+                PLATFORM_ROOT / "deploy/systemd/deadlock-maintenance.service"
+            ).read_bytes()
+            source_unit.write_bytes(source_unit_bytes)
+            installed_unit_fixture = root / "installed-deadlock-maintenance.service"
+            installed_unit_fixture.write_bytes(source_unit_bytes)
+            systemctl_bin = root / "bin"
+            systemctl_bin.mkdir()
+            expected_argv = platform_maintenance_qa_evidence.EXPECTED_MAINTENANCE_ARGV
+            exec_start = (
+                "{ path=" + expected_argv[0]
+                + " ; argv[]=" + " ".join(expected_argv)
+                + " ; ignore_errors=no ; start_time= ; stop_time= ; pid=0"
+                + " ; code=(null) ; status=0/0 }"
+            )
+            loaded_properties = (
+                "FragmentPath=/etc/systemd/system/deadlock-maintenance.service\n"
+                "DropInPaths=\nNeedDaemonReload=no\nActiveState=inactive\n"
+                "SubState=dead\n"
+                f"ExecStart={exec_start}\n"
+                "CPUQuotaPerSecUSec=500ms\nMemoryMax=536870912\n"
+                "TimeoutStartUSec=30min\n"
+            )
+            fake_systemctl = systemctl_bin / "systemctl"
+            fake_systemctl.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                f"value = {loaded_properties!r}\n"
+                "if os.environ.get('TEST_UNIT_VARIANT') == 'loaded-mismatch':\n"
+                "    value = value.replace('gha-38000614899-1-7e5769ba3f85', 'gha-00000000000-1-000000000000')\n"
+                "print(value, end='')\n",
+                encoding="utf-8",
+            )
+            fake_systemctl.chmod(0o755)
             cache_candidate = root / "private-cache-candidate"
             cache_candidate.mkdir()
             (cache_candidate / "payload.bin").write_bytes(b"safe test fixture")
@@ -2479,15 +2556,61 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     )
                 """
             )
+            maintenance_validator.write_text(
+                textwrap.dedent(
+                    f"""
+                    import importlib.util
+                    import subprocess
+                    import sys
+                    from pathlib import Path
+
+                    sys.path.insert(0, {str(TOOLS_DIR)!r})
+                    module_path = Path({str(TOOLS_DIR / 'platform_maintenance_qa_evidence.py')!r})
+                    spec = importlib.util.spec_from_file_location("maintenance_evidence", module_path)
+                    evidence = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(evidence)
+                    _, source_path, installed_path = sys.argv[1:]
+                    properties = sys.stdin.read(evidence.MAX_UNIT_BYTES + 1)
+                    if len(properties.encode("utf-8")) > evidence.MAX_UNIT_BYTES:
+                        raise SystemExit(1)
+                    source_bytes = Path(source_path).read_bytes()
+                    installed_bytes = Path({str(installed_unit_fixture)!r}).read_bytes()
+                    evidence._validate_maintenance_unit_bytes(
+                        source_bytes, installed_bytes, installed_path, properties
+                    )
+                    argv = list(evidence.maintenance_preview_argv())
+                    if ("--apply" in argv or "--json" not in argv
+                        or "--protected-release" not in argv
+                        or "--protected-backup-manifest" not in argv
+                        or argv[argv.index("--backup-keep") + 1] != "15"):
+                        raise SystemExit(1)
+                    argv[0] = sys.executable
+                    argv[1] = {str(producer)!r}
+                    completed = subprocess.run(argv, capture_output=True, check=False)
+                    sys.stdout.buffer.write(completed.stdout)
+                    raise SystemExit(completed.returncode)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            maintenance_validator.chmod(0o600)
 
             def run_caller(
                 output: str,
                 *,
                 release_source: str = release_module,
                 liveqa_source: str = liveqa_module,
+                unit_variant: str = "valid",
+                source_mismatch: bool = False,
             ) -> subprocess.CompletedProcess[str]:
+                installed_bytes = source_unit_bytes
+                if source_mismatch:
+                    installed_bytes = source_unit_bytes.replace(b"CPUQuota=50%", b"CPUQuota=51%")
+                installed_unit_fixture.write_bytes(installed_bytes)
                 producer.write_text(
-                    "import sys\n"
+                    "import json, os, sys\n"
+                    "from pathlib import Path\n"
+                    "Path(os.environ['TEST_ARGV_CAPTURE']).write_text(json.dumps(sys.argv[1:]))\n"
                     f"print({output!r})\n"
                     "sys.exit(1)\n",
                     encoding="utf-8",
@@ -2515,6 +2638,12 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     text=True,
                     capture_output=True,
                     check=False,
+                    env={
+                        **os.environ,
+                        "PATH": f"{systemctl_bin}:{os.environ['PATH']}",
+                        "TEST_UNIT_VARIANT": unit_variant,
+                        "TEST_ARGV_CAPTURE": str(root / "maintenance-argv.json"),
+                    },
                 )
 
             pointer_snapshot = (
@@ -2529,6 +2658,20 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             )
             unhealthy = run_caller(json.dumps(unhealthy_report))
             self.assertEqual(unhealthy.returncode, 1, unhealthy.stderr)
+            preview_argv = json.loads((root / "maintenance-argv.json").read_text())
+            self.assertIn("--json", preview_argv)
+            self.assertNotIn("--apply", preview_argv)
+            self.assertIn("--protected-backup-manifest", preview_argv)
+            self.assertIn("/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json", preview_argv)
+            self.assertIn("--backup-keep", preview_argv)
+            self.assertEqual(preview_argv[preview_argv.index("--backup-keep") + 1], "15")
+            self.assertEqual(
+                [preview_argv[index + 1] for index, value in enumerate(preview_argv[:-1]) if value == "--protected-release"],
+                [
+                    "gha-38000614899-1-7e5769ba3f85",
+                    "gha-37760797674-1-80e457e57081",
+                ],
+            )
             self.assertEqual(
                 pointer_snapshot,
                 (
@@ -2563,6 +2706,19 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             self.assertEqual(result["status"], "unhealthy")
             self.assertEqual(result["error_class"], "disk_threshold")
             self.assertEqual(failure["stage"], "retention_threshold")
+            argv_capture = root / "maintenance-argv.json"
+            argv_capture.unlink(missing_ok=True)
+            loaded_mismatch = run_caller(
+                json.dumps(unhealthy_report), unit_variant="loaded-mismatch"
+            )
+            self.assertNotEqual(loaded_mismatch.returncode, 0)
+            self.assertFalse(argv_capture.exists())
+            source_mismatch = run_caller(
+                json.dumps(unhealthy_report), source_mismatch=True
+            )
+            self.assertNotEqual(source_mismatch.returncode, 0)
+            self.assertFalse(argv_capture.exists())
+            installed_unit_fixture.write_bytes(source_unit_bytes)
             self.assertEqual(failure["exit_code"], 1)
             self.assertNotIn("must-not-appear-in-evidence", unhealthy.stdout)
             previews = {

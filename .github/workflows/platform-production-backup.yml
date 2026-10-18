@@ -388,29 +388,83 @@ jobs:
           expected_runner = f"https://github.com/StrayForest/old_sparky/actions/runs/{run_id}/attempts/{attempt}"
           if not isinstance(values, list) or not values:
               raise SystemExit("attestation output is empty")
-          for item in values:
+          policy_checks = (
+              "issuer",
+              "source_repository",
+              "source_ref",
+              "source_digest",
+              "build_config",
+              "build_signer",
+              "run_invocation",
+              "subject_count",
+              "subject_digest",
+          )
+          best_diagnostic = None
+          for item in values[:256]:
               result = item.get("verificationResult") if isinstance(item, dict) else None
               signature = result.get("signature") if isinstance(result, dict) else None
               certificate = signature.get("certificate") if isinstance(signature, dict) else None
               statement = result.get("statement") if isinstance(result, dict) else None
               subjects = statement.get("subject") if isinstance(statement, dict) else None
-              if (
-                  isinstance(certificate, dict)
-                  and certificate.get("issuer") == "https://token.actions.githubusercontent.com"
-                  and certificate.get("sourceRepositoryURI") == expected_repo
-                  and certificate.get("sourceRepositoryRef") == "refs/heads/dev"
-                  and certificate.get("sourceRepositoryDigest") == source_sha
-                  and certificate.get("buildConfigURI") == expected_build
-                  and certificate.get("buildSignerURI") == expected_build
-                  and certificate.get("runInvocationURI") == expected_runner
-                  and isinstance(subjects, list)
+              checks = {
+                  "issuer": isinstance(certificate, dict)
+                  and certificate.get("issuer") == "https://token.actions.githubusercontent.com",
+                  "source_repository": isinstance(certificate, dict)
+                  and certificate.get("sourceRepositoryURI") == expected_repo,
+                  "source_ref": isinstance(certificate, dict)
+                  and certificate.get("sourceRepositoryRef") == "refs/heads/dev",
+                  "source_digest": isinstance(certificate, dict)
+                  and certificate.get("sourceRepositoryDigest") == source_sha,
+                  "build_config": isinstance(certificate, dict)
+                  and certificate.get("buildConfigURI") == expected_build,
+                  "build_signer": isinstance(certificate, dict)
+                  and certificate.get("buildSignerURI") == expected_build,
+                  "run_invocation": isinstance(certificate, dict)
+                  and certificate.get("runInvocationURI") == expected_runner,
+                  "subject_count": isinstance(subjects, list) and len(subjects) == 1,
+                  "subject_digest": isinstance(subjects, list)
                   and len(subjects) == 1
                   and isinstance(subjects[0], dict)
                   and isinstance(subjects[0].get("digest"), dict)
-                  and subjects[0]["digest"].get("sha256") == digest
-              ):
+                  and subjects[0]["digest"].get("sha256") == digest,
+              }
+              if all(checks.values()):
                   break
+              certificate_shape = (
+                  "invalid"
+                  if not isinstance(certificate, dict)
+                  else "extensions"
+                  if isinstance(certificate.get("extensions"), dict)
+                  else "flat"
+              )
+              candidate = {
+                  "shape": certificate_shape,
+                  "checks": checks,
+                  "score": sum(bool(value) for value in checks.values()),
+              }
+              if best_diagnostic is None or candidate["score"] > best_diagnostic["score"]:
+                  best_diagnostic = candidate
           else:
+              diagnostic = {
+                  "schema": 1,
+                  "kind": "backup_attestation_policy_diagnostic",
+                  "status": "mismatch",
+                  "source_sha": source_sha,
+                  "run_id": run_id,
+                  "run_attempt": attempt,
+                  "bundle_sha256": digest,
+                  "candidate_count": min(len(values), 256),
+                  "candidate_count_capped": len(values) > 256,
+                  "certificate_shape": (
+                      "invalid" if best_diagnostic is None else best_diagnostic["shape"]
+                  ),
+                  "checks": (
+                      {name: False for name in policy_checks}
+                      if best_diagnostic is None
+                      else best_diagnostic["checks"]
+                  ),
+              }
+              print(json.dumps(diagnostic, sort_keys=True, separators=(",", ":")), file=sys.stderr)
               raise SystemExit("backup verifier attestation policy failed")
           PY
           /usr/bin/python3 -I -B - "$bundle_path" "$SOURCE_SHA" "$GITHUB_OUTPUT" <<'PY'

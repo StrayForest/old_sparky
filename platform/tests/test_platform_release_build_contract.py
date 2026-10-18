@@ -72,6 +72,39 @@ def workflow_job(source: str, name: str) -> str:
 
 class PlatformReleaseBuildContractTests(unittest.TestCase):
     @staticmethod
+    def _autodeploy_dispatch_payload(mode: str = "deploy") -> dict[str, object]:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
+        ).read_text(encoding="utf-8")
+        marker = '--data "$(/usr/bin/python3 - "$SOURCE_RUN_ID"'
+        start = workflow.index(marker)
+        heredoc_start = workflow.index("<<'PY'\n", start) + len("<<'PY'\n")
+        heredoc_end = workflow.index("\n          PY", heredoc_start)
+        generator = textwrap.dedent(workflow[heredoc_start:heredoc_end])
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                generator,
+                "12345678901",
+                "2",
+                mode,
+                "12345678902",
+                "3",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AssertionError("auto-deploy dispatch payload generator failed")
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, dict):
+            raise AssertionError("auto-deploy dispatch payload is not an object")
+        return payload
+
+    @staticmethod
     def _candidate_diagnostic_runner_source(supervisor: str) -> str:
         """Return the production runner heredoc for isolated subprocess tests."""
 
@@ -2125,10 +2158,12 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         )
 
     def test_auto_deploy_keeps_compression_enabled(self) -> None:
-        workflow = (
-            REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
-        ).read_text()
-        self.assertIn('"web_compression":"enabled"', workflow)
+        payload = self._autodeploy_dispatch_payload()
+        self.assertEqual(payload.get("ref"), "dev")
+        inputs = payload.get("inputs")
+        self.assertIsInstance(inputs, dict)
+        self.assertEqual(inputs.get("web_compression"), "enabled")
+        self.assertEqual(inputs.get("mode"), "deploy")
 
     def test_backup_helper_bundle_is_source_bound_attested_and_staged_without_current_fallback(self) -> None:
         security = (
@@ -2194,6 +2229,102 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('"bundle_sha256={digest}\\n"', verify_step)
         self.assertIn('stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"', stage_start_body)
 
+        attestation_checker_start = backup.index(
+            '/usr/bin/python3 -I -B - "$artifact_dir/attestation.json"'
+        )
+        attestation_checker_start = backup.index("<<'PY'\n", attestation_checker_start) + len("<<'PY'\n")
+        attestation_checker_end = backup.index("\n          PY", attestation_checker_start)
+        attestation_checker = textwrap.dedent(
+            backup[attestation_checker_start:attestation_checker_end]
+        )
+        diagnostic_input = {
+            "verificationResult": {
+                "signature": {
+                    "certificate": {
+                        "issuer": "private-issuer-marker",
+                        "sourceRepositoryURI": "private-repository-marker",
+                        "sourceRepositoryRef": "refs/heads/dev",
+                        "sourceRepositoryDigest": "private-source-marker",
+                        "buildConfigURI": "private-build-marker",
+                        "buildSignerURI": "private-signer-marker",
+                        "runInvocationURI": "private-run-marker",
+                    }
+                },
+                "statement": {
+                    "subject": [{"digest": {"sha256": "private-subject-marker"}}]
+                },
+            }
+        }
+        passing_diagnostic_input = {
+            "verificationResult": {
+                "signature": {
+                    "certificate": {
+                        "issuer": "https://token.actions.githubusercontent.com",
+                        "sourceRepositoryURI": "https://github.com/StrayForest/old_sparky",
+                        "sourceRepositoryRef": "refs/heads/dev",
+                        "sourceRepositoryDigest": "b" * 40,
+                        "buildConfigURI": "https://github.com/StrayForest/old_sparky/.github/workflows/platform-security.yml@refs/heads/dev",
+                        "buildSignerURI": "https://github.com/StrayForest/old_sparky/.github/workflows/platform-security.yml@refs/heads/dev",
+                        "runInvocationURI": "https://github.com/StrayForest/old_sparky/actions/runs/12345678901/attempts/2",
+                    }
+                },
+                "statement": {
+                    "subject": [{"digest": {"sha256": "a" * 64}}]
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            attestation_json = Path(temporary) / "attestation.json"
+            attestation_json.write_text(
+                json.dumps([passing_diagnostic_input]), encoding="utf-8"
+            )
+            args = [
+                sys.executable, "-I", "-B", "-", str(attestation_json),
+                "a" * 64, "12345678901", "2", "b" * 40,
+            ]
+            accepted = subprocess.run(
+                args,
+                input=attestation_checker,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(accepted.stderr, "")
+
+            attestation_json.write_text(
+                json.dumps([diagnostic_input] * 299 + [passing_diagnostic_input]),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                args,
+                input=attestation_checker,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            diagnostic_line = next(
+                line for line in rejected.stderr.splitlines()
+                if line.startswith("{") and "backup_attestation_policy_diagnostic" in line
+            )
+            diagnostic = json.loads(diagnostic_line)
+            self.assertEqual(diagnostic["kind"], "backup_attestation_policy_diagnostic")
+            self.assertEqual(diagnostic["source_sha"], "b" * 40)
+            self.assertEqual(diagnostic["run_id"], "12345678901")
+            self.assertEqual(diagnostic["run_attempt"], "2")
+            self.assertEqual(diagnostic["bundle_sha256"], "a" * 64)
+            self.assertEqual(diagnostic["certificate_shape"], "flat")
+            self.assertEqual(diagnostic["candidate_count"], 256)
+            self.assertTrue(diagnostic["candidate_count_capped"])
+            self.assertTrue(all(type(value) is bool for value in diagnostic["checks"].values()))
+            self.assertFalse(any(marker in rejected.stderr for marker in (
+                "private-issuer-marker", "private-repository-marker",
+                "private-source-marker", "private-build-marker",
+                "private-signer-marker", "private-run-marker",
+                "private-subject-marker",
+            )))
+
         extract_start = backup.index('            helper_dir="$helper_stage/tools"', stage_start)
         extract_end = backup.index('          else\n            failure_stage=preflight', extract_start)
         extraction = backup[extract_start:extract_end]
@@ -2206,6 +2337,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         proof_step = autodeploy.index("      - name: Verify exact source-bound restore-verified backup")
         dispatch_step = autodeploy.index("      - name: Dispatch production deployment or baseline reconciliation", proof_step)
         self.assertLess(proof_step, dispatch_step)
+        proof_end = autodeploy.index("\n      - name:", proof_step + 1)
+        proof_region = autodeploy[proof_step:proof_end]
+        dispatch_region = autodeploy[dispatch_step:]
         guarded_region = autodeploy[proof_step:dispatch_step]
         self.assertIn("steps.gate.outputs.deploy == 'true'", guarded_region)
         self.assertIn("github.event.workflow_run.id", guarded_region)
@@ -2214,7 +2348,26 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn("SOURCE_RUN_COMPLETED_AT", autodeploy)
         self.assertIn("github.event.workflow_run.head_sha", guarded_region)
         self.assertIn("platform_backup_success_guard.py", guarded_region)
-        self.assertNotIn("curl ", guarded_region)
+        self.assertNotIn("curl ", proof_region)
+        freshness_start = autodeploy.index(
+            "      - name: Revalidate current dev and exact successful Security run"
+        )
+        freshness_end = autodeploy.index("\n      - name:", freshness_start + 1)
+        freshness_step = autodeploy[freshness_start:freshness_end]
+        self.assertIn('--header "Authorization: Bearer $GH_TOKEN"', freshness_step)
+        self.assertIn(
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev"',
+            freshness_step,
+        )
+        self.assertIn(
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/${endpoint}"',
+            freshness_step,
+        )
+        self.assertNotIn("curl https://", freshness_step)
+        self.assertNotIn("--location", freshness_step)
+        self.assertIn('"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches"', dispatch_region)
+        self.assertIn('--header "Authorization: Bearer $GH_TOKEN"', dispatch_region)
+        self.assertNotIn("curl https://", guarded_region)
 
     def test_baseline_runtime_profile_restores_ready_vote_admission_limits(self) -> None:
         workflow = DEPLOY_SUPERVISOR.read_text()
@@ -2420,12 +2573,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertEqual(restored_values[key], expected, key)
 
     def test_auto_deploy_preserves_static_eight_runtime_profile(self) -> None:
-        workflow = (
-            REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
-        ).read_text()
-        self.assertIn(
-            '"runtime_profile":"authenticated-read-admission-24x8"',
-            workflow,
+        payload = self._autodeploy_dispatch_payload()
+        inputs = payload.get("inputs")
+        self.assertIsInstance(inputs, dict)
+        self.assertEqual(
+            inputs.get("runtime_profile"), "authenticated-read-admission-24x8"
         )
         self.assertEqual(
             platform_configure_shared_env.RUNTIME_PROFILES[
