@@ -589,6 +589,11 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
     (
         "test_platform_backup_restore_drill",
         "PlatformBackupRestoreDrillTests",
+        "test_disk_image_fixture_directory_validator_checks_identity_and_mode",
+    ): "backend-privileged",
+    (
+        "test_platform_backup_restore_drill",
+        "PlatformBackupRestoreDrillTests",
         "test_synthetic_pg16_restore_diagnostic_under_root",
     ): "backend-privileged",
     (
@@ -636,8 +641,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 52,
         "module_digest": "88caec1d7501a955a7d663309dcffb8ed6b0c178445690524f3597b9a892f2c4",
-        "test_count": 555,
-        "test_id_digest": "edb339775657f3adcd82cb3682ca1ef41ab0c71949196e9c6246e5cc354b0bde",
+        "test_count": 554,
+        "test_id_digest": "0dc23599aadcb42b677823410095c98590bd5395132fd18948403a888378c1fe",
     },
     "backend-integration": {
         "module_count": 41,
@@ -648,8 +653,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 26,
         "module_digest": "210efce670a082b8360377da86457b71db79310b02abffc0d3849445b073748a",
-        "test_count": 639,
-        "test_id_digest": "bb48917bc4c9cd5683ab32348b863c4b68c6be22ec070ead338a0ae48e8492f4",
+        "test_count": 640,
+        "test_id_digest": "f81e6fd088c0097008dbfa9d7c4db8e828dc27ae4b58a260d67b244da76395ac",
     },
     "performance-contract": {
         "module_count": 11,
