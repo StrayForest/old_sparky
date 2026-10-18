@@ -4,7 +4,7 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
 import re
@@ -1046,6 +1046,128 @@ class HostToolsBundleTests(unittest.TestCase):
                 REPO_ROOT,
                 target_sha=PIN_SHA,
                 expected_repository="attacker/old_sparky",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            full = root / "full"
+            full.mkdir()
+            subprocess.run(["git", "-C", str(full), "init", "-q"], check=True)
+            subprocess.run(
+                ["git", "-C", str(full), "config", "user.name", "Fixture"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(full), "config", "user.email", "fixture@example.invalid"],
+                check=True,
+            )
+            closure_payload = json.loads(
+                (REPO_ROOT / pin.PIN_RELATIVE_PATH).read_text(encoding="utf-8")
+            )
+            for record in closure_payload["closure"]:
+                relative = str(record["path"])
+                destination = full / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(REPO_ROOT / relative, destination)
+                destination.chmod(int(record["mode"]))
+            declaration = full / "platform/tools/platform_host_tools_bundle.py"
+            declaration.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(
+                REPO_ROOT / "platform/tools/platform_host_tools_bundle.py",
+                declaration,
+            )
+
+            def fixture_git(repository: Path, *arguments: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(repository), *arguments],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                return completed.stdout.strip()
+
+            fixture_git(full, "add", "platform/tools")
+            fixture_git(full, "commit", "-q", "-m", "host-tools generation")
+            generation_sha = fixture_git(full, "rev-parse", "HEAD")
+            contract = full / pin.PIN_RELATIVE_PATH
+            contract.parent.mkdir(parents=True, exist_ok=True)
+            closure_payload["host_tools_sha"] = generation_sha
+            contract.write_text(
+                json.dumps(closure_payload, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            fixture_git(full, "add", str(pin.PIN_RELATIVE_PATH))
+            fixture_git(full, "commit", "-q", "-m", "pin host-tools generation")
+            target_sha = fixture_git(full, "rev-parse", "HEAD")
+            fixture_git(
+                full,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/StrayForest/old_sparky.git",
+            )
+            self.assertEqual(
+                pin.resolve_pin(full, target_sha=target_sha), generation_sha
+            )
+            closure_payload["host_tools_sha"] = "0" * 40
+            contract.write_text(
+                json.dumps(closure_payload, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(pin.HostToolsPinError) as missing_failure:
+                pin.resolve_pin(full, target_sha=target_sha)
+            self.assertEqual(
+                missing_failure.exception.diagnostic_code,
+                "missing_pinned_commit",
+            )
+
+            bare = root / "origin.git"
+            shallow = root / "shallow"
+            subprocess.run(
+                ["git", "clone", "--bare", str(full), str(bare)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "clone", "--depth", "1", f"file://{bare}", str(shallow)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            fixture_git(
+                shallow,
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/StrayForest/old_sparky.git",
+            )
+            self.assertEqual(fixture_git(shallow, "rev-parse", "HEAD"), target_sha)
+            self.assertEqual(
+                fixture_git(shallow, "rev-parse", "--is-shallow-repository"),
+                "true",
+            )
+            with self.assertRaises(pin.HostToolsPinError) as shallow_failure:
+                pin.resolve_pin(shallow, target_sha=target_sha)
+            self.assertEqual(
+                shallow_failure.exception.diagnostic_code, "shallow_history"
+            )
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                result = pin.main(
+                    [
+                        "resolve",
+                        "--source-root",
+                        str(shallow),
+                        "--target-sha",
+                        target_sha,
+                        "--expected-repository",
+                        pin.EXPECTED_REPOSITORY,
+                    ]
+                )
+            self.assertEqual(result, 2)
+            self.assertEqual(
+                stderr.getvalue(), "host-tools pin is invalid: shallow_history\n"
             )
 
     def test_repository_pin_rejects_closure_type_path_and_digest_tampering(self) -> None:

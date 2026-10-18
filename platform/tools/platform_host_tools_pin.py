@@ -59,6 +59,10 @@ SUPPORTED_HOST_TOOL_LAYOUTS = (
 class HostToolsPinError(ValueError):
     """Bounded validation failure for the host-tools pin contract."""
 
+    def __init__(self, message: str, *, diagnostic_code: str | None = None) -> None:
+        super().__init__(message)
+        self.diagnostic_code = diagnostic_code
+
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
@@ -141,7 +145,21 @@ def _validate_commit(source_root: Path, host_tools_sha: str, target_sha: str) ->
         raise HostToolsPinError("host-tools SHA is not a full lowercase commit")
     if _git(source_root, "rev-parse", "--verify", "HEAD^{commit}") != target_sha:
         raise HostToolsPinError("target source checkout is not the requested commit")
-    if _git(source_root, "rev-parse", "--verify", f"{host_tools_sha}^{{commit}}") != host_tools_sha:
+    pinned_commit_ref = f"{host_tools_sha}^{{commit}}"
+    if _git(source_root, "rev-parse", "--verify", pinned_commit_ref, check=False) != "0":
+        shallow_state = _git(
+            source_root, "rev-parse", "--is-shallow-repository"
+        )
+        if shallow_state == "true":
+            raise HostToolsPinError(
+                "host-tools commit is unavailable in shallow history",
+                diagnostic_code="shallow_history",
+            )
+        raise HostToolsPinError(
+            "pinned host-tools commit is unavailable",
+            diagnostic_code="missing_pinned_commit",
+        )
+    if _git(source_root, "rev-parse", "--verify", pinned_commit_ref) != host_tools_sha:
         raise HostToolsPinError("host-tools SHA is not a reachable commit")
     if _git(source_root, "cat-file", "-t", host_tools_sha) != "commit":
         raise HostToolsPinError("host-tools SHA is not a commit object")
@@ -407,7 +425,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(host_tools_sha)
             return 0
-    except (HostToolsPinError, OSError, ValueError):
+    except HostToolsPinError as exc:
+        if exc.diagnostic_code in {"shallow_history", "missing_pinned_commit"}:
+            print(f"host-tools pin is invalid: {exc.diagnostic_code}", file=sys.stderr)
+        else:
+            print("host-tools pin is invalid", file=sys.stderr)
+        return 2
+    except (OSError, ValueError):
         print("host-tools pin is invalid", file=sys.stderr)
         return 2
     return 2

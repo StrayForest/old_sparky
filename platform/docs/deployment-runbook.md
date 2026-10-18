@@ -90,7 +90,7 @@ to `dev`. The chain is:
    repository-owned `platform/contracts/host_tools_pin.json` from the exact
    target source, validates its repository/commit ancestry and closure
    baseline, then checks out and runs the pinned `HOST_TOOLS_SHA` helper to
-   create and attest the deterministic release-independent host-tools handoff.
+   create and attest the deterministic release-independent host-tools handoff. Auto-deploy keeps full history in its exact-source checkout for ancestry validation, disables persisted checkout credentials, and reports missing pinned ancestors as a shallow-history failure without weakening validation.
    The environment-approved `host-capability-preflight` verifies that exact
    artifact and the already provisioned
    `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>` generation. It

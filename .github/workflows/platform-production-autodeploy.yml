@@ -59,7 +59,9 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
-          fetch-depth: 1
+          # The exact-source host-tools pin must be present so the resolver can
+          # verify commit type and ancestry without weakening the pin contract.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify exact completed security workflow run

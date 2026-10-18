@@ -2133,6 +2133,19 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         auto = (
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
         ).read_text(encoding="utf-8")
+        exact_source_checkout_start = auto.index(
+            "      - name: Checkout exact source for shared provenance validation"
+        )
+        exact_source_checkout_end = auto.index(
+            "      - name:", exact_source_checkout_start + 1
+        )
+        exact_source_checkout = auto[exact_source_checkout_start:exact_source_checkout_end]
+        pin_resolution = auto.index(
+            "      - name: Resolve host-tools pin for exact tested source"
+        )
+        self.assertIn("fetch-depth: 0", exact_source_checkout)
+        self.assertIn("persist-credentials: false", exact_source_checkout)
+        self.assertLess(exact_source_checkout_start, pin_resolution)
         dispatch = workflow_job(auto, "dispatch")
         self.assertIn("candidate_packaging_reason =", dispatch)
         self.assertIn("candidate_packaging_only = bool(", dispatch)
