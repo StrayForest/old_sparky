@@ -160,6 +160,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
         }
         with (
+            patch.object(diagnostic_plan_tool.os, "geteuid", return_value=0),
             patch.object(diagnostic_plan_tool, "_capacity_plan_identity", return_value=(unit, target, plan)),
             patch.object(diagnostic_plan_tool, "_systemd_memory_max", return_value=diagnostic_plan_tool.SSR_CAPACITY_MEMORY_MAX_BYTES),
             patch.object(diagnostic_plan_tool, "_systemd_unit", return_value=unit),
@@ -173,6 +174,17 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual([row["phase"] for row in rows], ["off", "idle", "complete"])
         self.assertEqual([row["elapsed_ms"] for row in rows], [0, 20_000, 45_000])
         self.assertTrue(all(row["plan_on_start_ms"] == 27_000 for row in rows))
+
+    def test_ssr_capacity_watch_rejects_non_root_before_reading_plan(self) -> None:
+        with (
+            patch.object(diagnostic_plan_tool.os, "geteuid", return_value=1000),
+            patch.object(diagnostic_plan_tool, "_capacity_plan_identity") as plan_identity,
+        ):
+            with self.assertRaisesRegex(PlanError, "root identity required"):
+                list(diagnostic_plan_tool.watch_capacity_memory(
+                    Namespace(run_id="a" * 32, source_sha="b" * 40),
+                ))
+        plan_identity.assert_not_called()
 
     def test_ssr_capacity_remote_observation_maps_only_bound_abort_to_worker_control(self) -> None:
         binding = {

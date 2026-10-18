@@ -352,18 +352,19 @@ test("workspace CPU diagnostics require an exact private run marker", () => {
 
 test("CPU memory and GC sampling is bounded to the exact diagnostic phase", () => {
   const planModule = source("lib/performance-diagnostic-plan.ts");
+  const metricsModule = source("lib/server-ssr-heap-metrics.mjs");
   expect(planModule).toContain("const MEMORY_SAMPLE_LIMIT = 5;");
   expect(planModule).toContain("const MEMORY_SAMPLE_INTERVAL_MS = 4_000;");
   expect(planModule).toContain("timelineEntryDurationWithinWindow(");
   expect(planModule).toContain("new PerformanceObserver(");
-  expect(planModule).toContain("cpu_diagnostic_memory service=web run_id=");
+  expect(planModule).toContain("formatCpuDiagnosticMemoryEvent(tokens)");
   for (const metric of [
     "memory.rss", "heap.total_heap_size", "heap.used_heap_size", "heap.heap_size_limit",
     "memory.external", "memory.arrayBuffers", "memory.current", "memory.peak", "memory.events",
   ]) {
     expect(planModule).toContain(metric);
   }
-  expect(planModule).not.toMatch(/heapdump|writeHeapSnapshot/u);
+  expect(`${planModule}\n${metricsModule}`).not.toMatch(/heapdump|writeHeapSnapshot/u);
 });
 
 test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
