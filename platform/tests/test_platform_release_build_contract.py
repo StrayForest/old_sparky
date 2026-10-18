@@ -6462,7 +6462,9 @@ cleanup
             supervisor,
         )
         self.assertIn('EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"', supervisor)
-        self.assertIn("External-load fixture requires the dedicated external-load confirmation.", supervisor)
+        self.assertIn(
+            "External-load fixture requires an approved confirmation.", supervisor
+        )
         self.assertIn("supports only the external-vote profile.", supervisor)
         self.assertNotIn('--mode read-mix', supervisor)
         self.assertNotIn('--mode write-burst', supervisor)

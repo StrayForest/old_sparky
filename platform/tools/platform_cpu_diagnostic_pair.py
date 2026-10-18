@@ -719,7 +719,12 @@ def evaluate_cpu_only_report(
             not isinstance(leg, dict)
             or leg.get("complete") is not True
             or leg.get("all_expected_statuses") is not True
-            or any(leg.get(field) != REQUESTS_PER_LEG for field in ("scheduled", "submitted", "completed", "completed_in_window"))
+            or any(
+                leg.get(field) != REQUESTS_PER_LEG
+                for field in ("scheduled", "submitted", "completed")
+            )
+            or type(leg.get("completed_in_window")) is not int
+            or not 0 <= leg["completed_in_window"] <= leg["completed"]
             or leg.get("status_counts") != {"200": REQUESTS_PER_LEG}
             or not isinstance(leg.get("latency_ms"), dict)
             or leg["latency_ms"].get("count") != REQUESTS_PER_LEG

@@ -2056,7 +2056,14 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("CURRENT_STAGE=retention_dry_run", workflow)
         self.assertIn('run-retention-preview "$maintenance_unit_source"', workflow)
         self.assertIn('systemctl show deadlock-maintenance.service', workflow)
-        self.assertIn('maintenance_unit_source="$current/deploy/systemd/deadlock-maintenance.service"', workflow)
+        self.assertIn(
+            'maintenance_unit_source="$runtime/releases/$current_id/deploy/systemd/deadlock-maintenance.service"',
+            workflow,
+        )
+        self.assertNotIn(
+            'maintenance_unit_source="$current/deploy/systemd/deadlock-maintenance.service"',
+            workflow,
+        )
         self.assertNotIn('"$python_bin" "$current/tools/platform_storage_maintenance.py" --json', workflow)
         release_preview = workflow.index("CURRENT_STAGE=release_retention_preview")
         liveqa_preview = workflow.index("CURRENT_STAGE=liveqa_cache_preview")
@@ -2670,6 +2677,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 [
                     "gha-38000614899-1-7e5769ba3f85",
                     "gha-37760797674-1-80e457e57081",
+                    "gha-38182702358-1-f1154c7dba4f",
                 ],
             )
             self.assertEqual(

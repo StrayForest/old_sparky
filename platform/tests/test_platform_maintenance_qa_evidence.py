@@ -563,10 +563,45 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                     str(current_path / "deploy/systemd/deadlock-maintenance.service"),
                     installed=False,
                 )
-            self.assertEqual(
-                evidence._safe_unit_bytes(str(immutable_unit), installed=False),
-                source_bytes,
-            )
+            real_lstat = Path.lstat
+
+            def lstat_with_source_owner(path: Path, owner_uid: int):
+                snapshot = real_lstat(path)
+                if path != immutable_unit:
+                    return snapshot
+                fields = (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_uid",
+                    "st_gid",
+                    "st_nlink",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                )
+                values = {field: getattr(snapshot, field) for field in fields}
+                values["st_uid"] = owner_uid
+                return SimpleNamespace(**values)
+
+            with patch.object(
+                Path,
+                "lstat",
+                new=lambda path: lstat_with_source_owner(path, 0),
+            ):
+                self.assertEqual(
+                    evidence._safe_unit_bytes(str(immutable_unit), installed=False),
+                    source_bytes,
+                )
+            with (
+                patch.object(
+                    Path,
+                    "lstat",
+                    new=lambda path: lstat_with_source_owner(path, 1),
+                ),
+                self.assertRaises(evidence.EvidenceError),
+            ):
+                evidence._safe_unit_bytes(str(immutable_unit), installed=False)
         preview_argv = evidence.maintenance_preview_argv()
         self.assertNotIn("--apply", preview_argv)
         self.assertEqual(

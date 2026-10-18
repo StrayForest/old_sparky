@@ -10,7 +10,7 @@ import tempfile
 import stat
 import threading
 from contextlib import redirect_stdout
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from argparse import Namespace
 from pathlib import Path
 import time
@@ -703,6 +703,24 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "manifest_sha256": "c" * 64,
         }
         self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "PASS")
+        # Request 500 is scheduled at 19.96s; a 90ms response finishes at
+        # 20.05s, inside the existing bounded drain. Keep the nominal-window
+        # count truthful while still requiring all 500 successful responses.
+        for phase in ("off", "on"):
+            report["result"][phase]["completed_in_window"] = 499
+        self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "PASS")
+        report["result"]["off"]["completed"] = 499
+        self.assertEqual(
+            cpu_pair.evaluate_cpu_only_report(report, **expected), "INVALID"
+        )
+        report["result"]["off"]["completed"] = 500
+        report["result"]["on"]["status_counts"] = {"200": 499, "500": 1}
+        report["result"]["on"]["all_expected_statuses"] = False
+        self.assertEqual(
+            cpu_pair.evaluate_cpu_only_report(report, **expected), "INVALID"
+        )
+        report["result"]["on"]["status_counts"] = {"200": 500}
+        report["result"]["on"]["all_expected_statuses"] = True
         for row in report["memory_attribution"]["rows"]:
             row["cgroup_sample_count"] = 4
         self.assertEqual(cpu_pair.evaluate_cpu_only_report(report, **expected), "INVALID")
@@ -998,6 +1016,92 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(request.call_count, 4)
         transport_tripwire.assert_not_called()
         urllib_tripwire.assert_not_called()
+
+        def run_synthetic_leg(last_response_seconds: float) -> dict[str, object]:
+            clock = [100.0]
+            index = [0]
+            synthetic_plan = {
+                "run_id": "d" * 32,
+                "off_start_ms": 100_000,
+                "off_end_ms": 120_000,
+                "on_start_ms": 125_000,
+                "on_end_ms": 145_000,
+            }
+
+            def successful_request(
+                *_args: object, **_kwargs: object
+            ) -> SimpleNamespace:
+                current_index = index[0]
+                index[0] += 1
+                latency = last_response_seconds if current_index == 499 else 0.01
+                return SimpleNamespace(
+                    status=200,
+                    error_kind=None,
+                    elapsed_ms=latency * 1000,
+                    finished_at_monotonic=clock[0] + latency,
+                    ok=True,
+                )
+
+            class ImmediateExecutor:
+                def submit(self, callback):
+                    future = Future()
+                    future.set_result(callback())
+                    return future
+
+            def advance_wait(futures, *, timeout, return_when):
+                del return_when
+                end = clock[0] + max(timeout, 0.0)
+                finished = {
+                    future
+                    for future in futures
+                    if future.result().finished_at_monotonic <= end
+                }
+                if finished:
+                    clock[0] = max(
+                        clock[0],
+                        max(
+                            future.result().finished_at_monotonic
+                            for future in finished
+                        ),
+                    )
+                    return finished, set(futures) - finished
+                clock[0] = end
+                return set(), set(futures)
+
+            with (
+                patch.object(cpu_pair, "_wait_until", return_value=100.0),
+                patch.object(cpu_pair.time, "monotonic", side_effect=lambda: clock[0]),
+                patch.object(
+                    cpu_pair.time,
+                    "sleep",
+                    side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay),
+                ),
+                patch.object(cpu_pair, "wait", side_effect=advance_wait),
+                patch.object(
+                    cpu_pair.external_load,
+                    "_page_request",
+                    side_effect=successful_request,
+                ),
+            ):
+                return cpu_pair._leg(
+                    "https://old-sparky.com",
+                    actors,
+                    ("session", "csrf"),
+                    synthetic_plan,
+                    "off",
+                    ImmediateExecutor(),
+                )
+
+        in_drain = run_synthetic_leg(0.09)
+        self.assertTrue(in_drain["complete"])
+        self.assertTrue(in_drain["all_expected_statuses"])
+        self.assertEqual(in_drain["submitted"], 500)
+        self.assertEqual(in_drain["completed"], 500)
+        self.assertEqual(in_drain["completed_in_window"], 499)
+        self.assertEqual(in_drain["drain_deadline_ms"], 125_000)
+        self.assertAlmostEqual(in_drain["elapsed_seconds"], 20.05, places=6)
+        with self.assertRaises(cpu_pair.PairError):
+            run_synthetic_leg(5.05)
 
         # Exercise the complete worker callback without HTTP. In particular,
         # capture completion must be published before the parent-only CPU
