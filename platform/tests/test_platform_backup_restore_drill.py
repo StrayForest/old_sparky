@@ -160,6 +160,7 @@ _SYNTHETIC_RESTORE_STDERR_REASONS = frozenset(
         "unknown_unit_property",
         "systemd_bus_unavailable",
         "synthetic_backend_exit_observer_failed",
+        "synthetic_invalid_index_plan",
         "synthetic_unknown_restore_phase",
     }
 )
@@ -168,6 +169,8 @@ _SYNTHETIC_RESTORE_STDERR_REASONS = frozenset(
 def _synthetic_restore_stderr_reason(line: str) -> str | None:
     if line == "[FAIL] Synthetic restore reported an unknown phase.":
         return "synthetic_unknown_restore_phase"
+    if line == "[FAIL] Synthetic restore returned an invalid index plan.":
+        return "synthetic_invalid_index_plan"
     if line == "[FAIL] Synthetic restore backend-exit observer failed.":
         return "synthetic_backend_exit_observer_failed"
     if re.fullmatch(
@@ -1045,6 +1048,93 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             len({row[2] for row in expected_rows}),
             backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
         )
+        snapshot_target = backup_drill.DatabaseTarget(
+            host=str(socket_dir),
+            port=backup_drill.SCRATCH_PG_PORT,
+            username="postgres",
+            password=None,
+            database="platform_restore_drill_20261018t230000z_arm1_12345",
+        )
+        logical_snapshot = {
+            "tables": ["synthetic_restore_probe"],
+            "columns": [
+                ["id", "integer", "NO"],
+                ["label", "text", "NO"],
+                ["search_text", "text", "NO"],
+            ],
+            "primary_key_columns": ["id"],
+            "rows": expected_rows,
+            "row_count": backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+            "payload_bytes": backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_BYTES,
+            "min_payload_bytes": backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_BYTES_PER_ROW,
+            "max_payload_bytes": backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_BYTES_PER_ROW,
+            "unique_prefix_count": backup_drill.SCRATCH_SYNTHETIC_PAYLOAD_ROWS,
+            "prefixes_match_ids": True,
+            "like_match_ids": [1],
+            "alembic_versions": [backup_drill.SCRATCH_SYNTHETIC_ALEMBIC_REVISION],
+            "pg_trgm_installed": True,
+            "pg_trgm_functional": True,
+            "gin_trgm_index_valid": True,
+        }
+        logical_stdout = json.dumps(logical_snapshot)
+        gin_plan_stdout = json.dumps(
+            [
+                {
+                    "Plan": {
+                        "Node Type": "Bitmap Heap Scan",
+                        "Plans": [
+                            {
+                                "Node Type": "Bitmap Index Scan",
+                                "Index Name": backup_drill.SCRATCH_SYNTHETIC_TRGM_INDEX,
+                            }
+                        ],
+                    }
+                }
+            ]
+        )
+
+        def snapshot_with_plan(plan_stdout: str) -> tuple[dict[str, Any], list[Any]]:
+            outputs = [
+                subprocess.CompletedProcess([], 0, stdout=logical_stdout, stderr=""),
+                subprocess.CompletedProcess([], 0, stdout=plan_stdout, stderr=""),
+            ]
+            with mock.patch.object(
+                backup_drill, "run_command", side_effect=outputs
+            ) as psql_calls:
+                result = backup_drill._scratch_synthetic_restore_snapshot(
+                    snapshot_target,
+                    expected_rows=expected_rows,
+                    psql_binary="/usr/lib/postgresql/16/bin/psql",
+                )
+            return result, psql_calls.call_args_list
+
+        snapshot_result, snapshot_calls = snapshot_with_plan(gin_plan_stdout)
+        self.assertEqual(
+            snapshot_result,
+            {
+                "logical_sha256": hashlib.sha256(
+                    json.dumps(
+                        logical_snapshot, separators=(",", ":"), sort_keys=True
+                    ).encode("ascii")
+                ).hexdigest()
+            },
+        )
+        logical_query_args = snapshot_calls[0].args[0]
+        plan_query_args = snapshot_calls[1].args[0]
+        self.assertNotIn("--quiet", logical_query_args)
+        self.assertIn("--quiet", plan_query_args)
+        self.assertEqual(
+            plan_query_args[-1],
+            "SET enable_seqscan = off; EXPLAIN (FORMAT JSON) "
+            "SELECT id FROM platform.synthetic_restore_probe "
+            "WHERE search_text LIKE '00000001%';",
+        )
+        with self.assertRaisesRegex(RuntimeError, "invalid index plan"):
+            snapshot_with_plan(f"SET\n{gin_plan_stdout}")
+        sequential_scan_plan = json.dumps([{"Plan": {"Node Type": "Seq Scan"}}])
+        with self.assertRaisesRegex(RuntimeError, "did not use its fixed GIN index"):
+            snapshot_with_plan(sequential_scan_plan)
+
         self.assertEqual(
             backup_drill.SCRATCH_SYNTHETIC_RESTORE_PHASES,
             ("restore_platform", "restore_public"),
@@ -1170,6 +1260,14 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ["synthetic_backend_exit_observer_failed"],
         )
         self.assertEqual(observer_failure["unknown_lines"], 0)
+        invalid_plan_failure = _classify_synthetic_restore_stderr(
+            b"[FAIL] Synthetic restore returned an invalid index plan.\n",
+            complete=True,
+        )
+        self.assertEqual(invalid_plan_failure["classification"], "known")
+        self.assertEqual(
+            invalid_plan_failure["reasons"], ["synthetic_invalid_index_plan"]
+        )
         unknown_phase_failure = _classify_synthetic_restore_stderr(
             b"[FAIL] Synthetic restore reported an unknown phase.\n",
             complete=True,

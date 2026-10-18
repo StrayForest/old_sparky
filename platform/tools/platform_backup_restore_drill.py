@@ -4793,6 +4793,7 @@ def _scratch_synthetic_restore_snapshot(
         [
             psql_binary,
             "--no-psqlrc",
+            "--quiet",
             "--tuples-only",
             "--no-align",
             *connection_args(target),
