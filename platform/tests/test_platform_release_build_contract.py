@@ -2245,6 +2245,218 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "      - name: Revalidate exact successful source-bound backup",
             final_security_start,
         )
+        final_security_step = auto[final_security_start:final_backup_start]
+        self.assertIn(
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${SECURITY_WORKFLOW_FILE}"',
+            final_security_step,
+        )
+        self.assertIn(
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"',
+            final_security_step,
+        )
+        self.assertIn(
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=1"',
+            final_security_step,
+        )
+        self.assertNotIn(
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/workflows/',
+            final_security_step,
+        )
+        for metadata_name in ("workflows", "runs", "commits"):
+            self.assertIn(f'--output "$metadata_dir/{metadata_name}.json"', final_security_step)
+        run_marker = "        run: |\n"
+        self.assertIn(run_marker, final_security_step)
+        final_security_script = textwrap.dedent(
+            final_security_step.split(run_marker, 1)[1]
+        )
+        target_sha = "a" * 40
+        source_run_id = "12345678901"
+        source_attempt = "2"
+        workflow_id = 777
+        api_root = "https://api.github.invalid/repos/StrayForest/old_sparky"
+        source_run_url = (
+            f"https://github.com/StrayForest/old_sparky/actions/runs/{source_run_id}"
+        )
+        workflow_metadata = {
+            "id": workflow_id,
+            "path": ".github/workflows/platform-security.yml",
+            "name": "Platform security and build",
+        }
+        security_run = {
+            "id": int(source_run_id),
+            "run_attempt": int(source_attempt),
+            "workflow_id": workflow_id,
+            "path": ".github/workflows/platform-security.yml",
+            "name": "Platform security and build",
+            "repository": {
+                "full_name": "StrayForest/old_sparky",
+                "name": "old_sparky",
+                "owner": {"login": "StrayForest"},
+            },
+            "html_url": source_run_url,
+            "event": "push",
+            "head_branch": "dev",
+            "head_sha": target_sha,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        status_timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        security_statuses = [
+            {
+                "id": 123,
+                "context": "platform-security-build",
+                "state": "success",
+                "description": "Platform security and build passed",
+                "target_url": f"{source_run_url}/attempts/{source_attempt}",
+                "created_at": status_timestamp,
+                "updated_at": status_timestamp,
+                "creator": {
+                    "login": "github-actions[bot]",
+                    "type": "Bot",
+                    "id": 41898282,
+                },
+            }
+        ]
+        expected_api = {
+            f"{api_root}/branches/dev": {"commit": {"sha": target_sha}},
+            f"{api_root}/actions/workflows/platform-security.yml": workflow_metadata,
+            f"{api_root}/actions/runs/{source_run_id}": security_run,
+            f"{api_root}/commits/{target_sha}/statuses?per_page=100&page=1": security_statuses,
+        }
+        expected_requests = [
+            (url, "-") if url.endswith("/branches/dev") else (url, filename)
+            for url, filename in (
+                (f"{api_root}/branches/dev", ""),
+                (f"{api_root}/actions/workflows/platform-security.yml", "workflows.json"),
+                (f"{api_root}/actions/runs/{source_run_id}", "runs.json"),
+                (
+                    f"{api_root}/commits/{target_sha}/statuses?per_page=100&page=1",
+                    "commits.json",
+                ),
+            )
+        ]
+        with tempfile.TemporaryDirectory(prefix="autodeploy-final-security-contract-") as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            runner_temp = root / "runner"
+            workspace = root / "workspace"
+            workspace_tools = workspace / "platform" / "tools"
+            fake_bin.mkdir()
+            runner_temp.mkdir()
+            workspace_tools.mkdir(parents=True)
+            for tool_name in (
+                "platform_autodeploy_freshness_guard.py",
+                "platform_workflow_provenance.py",
+            ):
+                source_tool = TOOLS_DIR / tool_name
+                copied_tool = workspace_tools / tool_name
+                shutil.copyfile(source_tool, copied_tool)
+                self.assertEqual(copied_tool.read_bytes(), source_tool.read_bytes())
+            fixture_path = root / "api-fixtures.json"
+            fixture_path.write_text(json.dumps(expected_api), encoding="utf-8")
+            request_log = root / "curl-requests.jsonl"
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/python3
+                    import json
+                    import os
+                    from pathlib import Path
+                    import sys
+
+                    args = sys.argv[1:]
+                    url = next((value for value in args if value.startswith("https://")), None)
+                    if "--request" in args or "--data" in args:
+                        raise SystemExit("unexpected write request")
+                    headers = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "--header"]
+                    required_headers = {
+                        "Authorization: Bearer synthetic-contract-token",
+                        "Accept: application/vnd.github+json",
+                        "X-GitHub-Api-Version: 2022-11-28",
+                    }
+                    if url is None or not required_headers.issubset(headers):
+                        raise SystemExit("unexpected request shape")
+                    fixtures = json.loads(Path(os.environ["API_FIXTURES"]).read_text(encoding="utf-8"))
+                    output = Path(args[args.index("--output") + 1]) if "--output" in args else None
+                    with Path(os.environ["REQUEST_LOG"]).open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps({"method": "GET", "url": url, "output": output.name if output else "-"}) + "\\n")
+                    if url not in fixtures:
+                        raise SystemExit(22)
+                    payload = json.dumps(fixtures[url], separators=(",", ":")) + "\\n"
+                    if output is None:
+                        sys.stdout.write(payload)
+                    else:
+                        output.write_text(payload, encoding="utf-8")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_WORKSPACE": str(workspace),
+                "GITHUB_API_URL": "https://api.github.invalid",
+                "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                "GH_TOKEN": "synthetic-contract-token",
+                "TARGET_SHA": target_sha,
+                "SOURCE_RUN_ID": source_run_id,
+                "SOURCE_RUN_ATTEMPT": source_attempt,
+                "SOURCE_RUN_URL": source_run_url,
+                "SECURITY_WORKFLOW_FILE": "platform-security.yml",
+                "PROVENANCE_TOOL": str(workspace_tools / "platform_workflow_provenance.py"),
+                "API_FIXTURES": str(fixture_path),
+                "REQUEST_LOG": str(request_log),
+            }
+            passed = subprocess.run(
+                ["/bin/bash", "-c", final_security_script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(passed.returncode, 0, passed.stderr)
+            observed_requests = [
+                (row["method"], row["url"], row["output"])
+                for row in map(json.loads, request_log.read_text(encoding="utf-8").splitlines())
+            ]
+            self.assertEqual(
+                observed_requests,
+                [("GET", url, output) for url, output in expected_requests],
+            )
+            self.assertNotIn("synthetic-contract-token", passed.stdout + passed.stderr)
+            self.assertNotIn("synthetic-contract-token", request_log.read_text(encoding="utf-8"))
+
+            legacy_script = final_security_script.replace(
+                "actions/workflows/${SECURITY_WORKFLOW_FILE}",
+                "workflows/platform-security.yml",
+            )
+            self.assertNotEqual(legacy_script, final_security_script)
+            request_log.unlink()
+            legacy = subprocess.run(
+                ["/bin/bash", "-c", legacy_script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertNotEqual(legacy.returncode, 0)
+            legacy_requests = [
+                (row["method"], row["url"], row["output"])
+                for row in map(json.loads, request_log.read_text(encoding="utf-8").splitlines())
+            ]
+            self.assertEqual(
+                legacy_requests[-1],
+                (
+                    "GET",
+                    f"{api_root}/workflows/platform-security.yml",
+                    "workflows.json",
+                ),
+            )
         final_dispatch_start = auto.index(
             "      - name: Dispatch production deployment or baseline reconciliation",
             final_backup_start,
@@ -2254,10 +2466,19 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertLess(final_backup_start, final_dispatch_start)
         dispatch_step_end = auto.index("      - name:", final_dispatch_start + 1)
         final_dispatch_step = auto[final_dispatch_start:dispatch_step_end]
+        final_backup_step = auto[final_backup_start:final_dispatch_start]
+        self.assertIn('BACKUP_GUARD_TOOL: ${{ github.workspace }}/platform/tools/platform_backup_success_guard.py', final_backup_step)
+        self.assertIn('/usr/bin/python3 -I "$BACKUP_GUARD_TOOL"', final_backup_step)
+        self.assertNotIn("curl ", final_backup_step)
         self.assertIn('[[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]', final_dispatch_step)
         self.assertIn('"$ROUTE_DEPLOYABLE" == "true"', final_dispatch_step)
         self.assertIn('"$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false"', final_dispatch_step)
         self.assertIn('"$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false"', final_dispatch_step)
+        self.assertEqual(final_dispatch_step.count("--request POST"), 1)
+        self.assertIn('"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches"', final_dispatch_step)
+        self.assertIn('"mode": sys.argv[3]', final_dispatch_step)
+        self.assertIn('"classifier_run_id": sys.argv[1]', final_dispatch_step)
+        self.assertIn('"autodeploy_run_id": sys.argv[4]', final_dispatch_step)
         dispatch = workflow_job(auto, "dispatch")
         self.assertIn("candidate_packaging_reason =", dispatch)
         self.assertIn("candidate_packaging_only = bool(", dispatch)
@@ -2495,7 +2716,19 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             freshness_step,
         )
         self.assertIn(
-            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/${endpoint}"',
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${SECURITY_WORKFLOW_FILE}"',
+            freshness_step,
+        )
+        self.assertIn(
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"',
+            freshness_step,
+        )
+        self.assertIn(
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=1"',
+            freshness_step,
+        )
+        self.assertNotIn(
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/workflows/',
             freshness_step,
         )
         self.assertNotIn("curl https://", freshness_step)
