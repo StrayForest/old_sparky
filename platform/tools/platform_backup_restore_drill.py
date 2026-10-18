@@ -309,6 +309,11 @@ _SCRATCH_VERIFICATION_SITES = frozenset(
         "controller_process_state",
         "controller_completion_unit_state",
         "controller_completion_identity",
+        "active_poll_host_guard",
+        "active_poll_selector_wait",
+        "active_poll_stream_read",
+        "active_poll_stream_unregister",
+        "active_poll_output_bound",
         "worker_root_path_identity",
         "worker_root_mode_identity",
         "worker_mount_identity",
@@ -317,6 +322,45 @@ _SCRATCH_VERIFICATION_SITES = frozenset(
         "other",
     }
 )
+_SCRATCH_ACTIVE_POLL_VERIFICATION_SITES = frozenset(
+    {
+        "active_poll_host_guard",
+        "active_poll_selector_wait",
+        "active_poll_stream_read",
+        "active_poll_stream_unregister",
+        "active_poll_output_bound",
+    }
+)
+_SCRATCH_WORKER_IDENTITY_VERIFICATION_SITES = frozenset(
+    {
+        "worker_root_path_identity",
+        "worker_root_mode_identity",
+        "worker_mount_identity",
+        "worker_cgroup_identity",
+        "worker_postgres_account_identity",
+    }
+)
+
+
+def _scratch_fault_verification_binding_is_valid(
+    origin: str, site: str, verification_site: str
+) -> bool:
+    if verification_site not in _SCRATCH_VERIFICATION_SITES - {"none"}:
+        return False
+    if origin == "controller" and site == "controller_active_poll":
+        return verification_site in _SCRATCH_ACTIVE_POLL_VERIFICATION_SITES
+    if origin == "controller" and site in {
+        "controller_identity", "controller_completion_snapshot", "controller_final_snapshot",
+    }:
+        return (
+            verification_site not in _SCRATCH_ACTIVE_POLL_VERIFICATION_SITES
+            and verification_site not in _SCRATCH_WORKER_IDENTITY_VERIFICATION_SITES
+        )
+    if origin == "worker" and site in {
+        "worker_root_identity", "worker_mount_snapshot", "worker_cgroup_snapshot",
+    }:
+        return verification_site not in _SCRATCH_ACTIVE_POLL_VERIFICATION_SITES
+    return False
 
 
 def valid_scratch_synthetic_path_fixture_rejection(value: Any) -> bool:
@@ -545,18 +589,8 @@ def valid_scratch_first_fault(value: Any) -> bool:
         return False
     if "verification_site" in value and (
         type(value["verification_site"]) is not str
-        or value["verification_site"] not in _SCRATCH_VERIFICATION_SITES - {"none"}
-        or (
-            value["origin"] == "controller"
-            and value["site"] not in {
-                "controller_identity", "controller_completion_snapshot", "controller_final_snapshot"
-            }
-        )
-        or (
-            value["origin"] == "worker"
-            and value["site"] not in {
-                "worker_root_identity", "worker_mount_snapshot", "worker_cgroup_snapshot"
-            }
+        or not _scratch_fault_verification_binding_is_valid(
+            value["origin"], value["site"], value["verification_site"]
         )
     ):
         return False
@@ -702,15 +736,8 @@ def _scratch_first_fault(error: BaseException, *, origin: str, site: str) -> dic
     verification_site = getattr(error, "scratch_verification_site", None)
     if verification_site is not None:
         if (
-            (origin == "controller" and site not in {
-                "controller_identity", "controller_completion_snapshot", "controller_final_snapshot"
-            })
-            or (origin == "worker" and site not in {
-                "worker_root_identity", "worker_mount_snapshot", "worker_cgroup_snapshot"
-            })
-            or origin not in {"controller", "worker"}
-            or type(verification_site) is not str
-            or verification_site not in _SCRATCH_VERIFICATION_SITES - {"none"}
+            type(verification_site) is not str
+            or not _scratch_fault_verification_binding_is_valid(origin, site, verification_site)
         ):
             return None
         value["verification_site"] = verification_site
@@ -1840,16 +1867,20 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
     expected_keys = base_keys if schema == 1 else base_keys | {"terminal_snapshot"}
     if schema == 3:
         expected_keys = base_keys | {"verification_site"}
+    if schema == 4:
+        expected_keys = base_keys | {"verification_site", "worker_frame_status"}
+    if schema == 5:
+        expected_keys = base_keys | {"verification_site", "worker_frame_status", "terminal_snapshot"}
     phases = {
         "unit_exited_before_confinement",
         "confinement_verification_failed",
         "unit_exited_after_confinement",
     }
-    if schema in {2, 3}:
+    if schema in {2, 3, 4, 5}:
         phases.add("authorization_failed")
     if schema == 3 and "terminal_snapshot" in value:
         expected_keys.add("terminal_snapshot")
-    if schema not in {1, 2, 3} or set(value) != expected_keys:
+    if schema not in {1, 2, 3, 4, 5} or set(value) != expected_keys:
         return False
     if (
         type(value.get("schema")) is not int
@@ -1882,10 +1913,27 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         or type(value.get("verification_error")) is not str
         or value.get("verification_error") not in {"none", "os_error", "policy_error", "other"}
         or (
-            schema == 3
+            schema in {3, 4, 5}
             and (
                 type(value.get("verification_site")) is not str
-                or value.get("verification_site") not in _SCRATCH_VERIFICATION_SITES - {"none"}
+                or value.get("verification_site") not in (
+                    _SCRATCH_VERIFICATION_SITES
+                    if schema in {4, 5}
+                    else _SCRATCH_VERIFICATION_SITES - {"none"}
+                )
+            )
+        )
+        or (
+            schema == 3
+            and value.get("verification_site") in _SCRATCH_ACTIVE_POLL_VERIFICATION_SITES
+        )
+        or (
+            schema in {4, 5}
+            and (
+                type(value.get("worker_frame_status")) is not str
+                or value.get("worker_frame_status") not in {
+                    "not_started", "missing", "valid", "invalid", "worker_failure_report"
+                }
             )
         )
         or (
@@ -1915,7 +1963,21 @@ def valid_scratch_unit_diagnostic(value: Any) -> bool:
         return False
     if value["verification_error"] != "os_error" and value["verification_errno"] is not None:
         return False
-    if schema in {2, 3} and "terminal_snapshot" in value and not valid_scratch_terminal_snapshot(
+    if schema in {4, 5}:
+        frame_status = value["worker_frame_status"]
+        terminal = value.get("terminal_snapshot")
+        if frame_status == "not_started" and terminal is not None and terminal["start_token_sent"]:
+            return False
+        if frame_status == "missing" and (
+            value["stdout_bytes"] != 0
+            or (terminal is not None and not terminal["start_token_sent"])
+        ):
+            return False
+        if frame_status in {"valid", "invalid"} and value["stdout_bytes"] == 0:
+            return False
+        if frame_status == "worker_failure_report" and value["stderr_bytes"] == 0:
+            return False
+    if schema in {2, 3, 5} and "terminal_snapshot" in value and not valid_scratch_terminal_snapshot(
         value.get("terminal_snapshot")
     ):
         return False
@@ -2454,6 +2516,7 @@ def _scratch_unit_diagnostic(
     verification_error: str = "none",
     verification_errno: int | None = None,
     verification_site: str = "none",
+    worker_frame_status: str | None = None,
     terminal_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     properties = snapshot.get("properties", {})
@@ -2468,7 +2531,9 @@ def _scratch_unit_diagnostic(
     stdout_prefix = stdout_prefix[:SCRATCH_PRIVATE_STDOUT_BYTES]
     stderr_prefix = stderr_prefix[:SCRATCH_PRIVATE_STDERR_BYTES]
     schema = (
-        3 if verification_site != "none"
+        5 if worker_frame_status is not None and valid_scratch_terminal_snapshot(terminal_snapshot)
+        else 4 if worker_frame_status is not None
+        else 3 if verification_site != "none"
         else 2 if valid_scratch_terminal_snapshot(terminal_snapshot)
         else 1
     )
@@ -2491,6 +2556,9 @@ def _scratch_unit_diagnostic(
     }
     if schema == 3:
         diagnostic["verification_site"] = verification_site
+    if schema in {4, 5}:
+        diagnostic["verification_site"] = verification_site
+        diagnostic["worker_frame_status"] = worker_frame_status
     if valid_scratch_terminal_snapshot(terminal_snapshot):
         diagnostic["terminal_snapshot"] = terminal_snapshot
     return diagnostic if valid_scratch_unit_diagnostic(diagnostic) else None
@@ -10637,9 +10705,12 @@ def _run_isolated_restore_drill(
                 if now >= deadline or now - last_tick > SCRATCH_RUNTIME_SAMPLE_SECONDS * 8:
                     raise RuntimeError("Scratch restore monitor exceeded its bounded runtime or sample interval.")
                 fault_site = "controller_active_poll"
+                verification_operation = "active_poll_host_guard"
                 try:
                     _scratch_host_guard("parent_active_poll")
                 except BaseException as guard_error:
+                    if _scratch_verification_site(guard_error) == "none":
+                        setattr(guard_error, "scratch_verification_site", verification_operation)
                     guard_diagnostic = getattr(
                         guard_error, "scratch_host_guard_diagnostic", None
                     )
@@ -10728,6 +10799,7 @@ def _run_isolated_restore_drill(
                             # remains best effort and cannot replace the guard.
                             pass
                     raise
+                verification_operation = None
                 fault_site = "controller_unit_snapshot"
                 snapshot = _scratch_service_snapshot(unit_name)
                 properties = snapshot.get("properties", {})
@@ -10912,21 +10984,32 @@ def _run_isolated_restore_drill(
                 fault_site = "controller_active_poll"
                 verification_operation = None
                 last_tick = now
-                for key, _ in selector.select(timeout=SCRATCH_RUNTIME_SAMPLE_SECONDS):
+                verification_operation = "active_poll_selector_wait"
+                ready_events = selector.select(timeout=SCRATCH_RUNTIME_SAMPLE_SECONDS)
+                verification_operation = None
+                for key, _ in ready_events:
+                    verification_operation = "active_poll_stream_read"
                     try:
                         data = os.read(key.fileobj.fileno(), 65536)
                     except BlockingIOError:
+                        verification_operation = None
                         continue
+                    verification_operation = None
                     if not data:
+                        verification_operation = "active_poll_stream_unregister"
                         selector.unregister(key.fileobj)
+                        verification_operation = None
                         if key.data == "stderr":
                             stderr_eof = True
                     elif key.data == "stdout":
+                        verification_operation = "active_poll_output_bound"
                         stdout_observed += len(data)
                         stdout_buffer.extend(data)
                         if len(stdout_buffer) > stdout_limit:
                             raise RuntimeError("Scratch restore worker output exceeded its closed bound.")
+                        verification_operation = None
                     else:
+                        verification_operation = "active_poll_output_bound"
                         stderr_size += len(data)
                         if stderr_tail_buffer is not None:
                             _scratch_append_bounded_tail(
@@ -10938,6 +11021,7 @@ def _run_isolated_restore_drill(
                             stderr_buffer.extend(data[: SCRATCH_PRIVATE_STDERR_BYTES - len(stderr_buffer)])
                         if stderr_size > 65536:
                             raise RuntimeError("Scratch restore worker error output exceeded its closed bound.")
+                        verification_operation = None
                 if start_token_sent and not completion_token_sent and stdout_buffer:
                     fault_site = "controller_worker_frame"
                     candidate = (
@@ -11284,6 +11368,16 @@ def _run_isolated_restore_drill(
                     )
                     if first_fault is not None:
                         setattr(operation_error, "scratch_first_fault", first_fault)
+                    if not start_token_sent:
+                        worker_frame_status = "not_started"
+                    elif candidate_output is not None:
+                        worker_frame_status = "valid"
+                    elif first_fault is not None and first_fault.get("origin") == "worker":
+                        worker_frame_status = "worker_failure_report"
+                    elif not stdout_buffer:
+                        worker_frame_status = "missing"
+                    else:
+                        worker_frame_status = "invalid"
                     diagnostic = _scratch_unit_diagnostic(
                         early_exit_snapshot,
                         launcher_exit_status=process.returncode if process is not None else None,
@@ -11297,6 +11391,7 @@ def _run_isolated_restore_drill(
                         verification_error=verification_error,
                         verification_errno=verification_errno,
                         verification_site=verification_site,
+                        worker_frame_status=worker_frame_status,
                         terminal_snapshot=terminal_snapshot,
                     )
                     if diagnostic is not None:

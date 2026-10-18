@@ -281,6 +281,38 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         cls.backup_first_fault_sites = _literal_set_assignment(legacy_tree, "first_fault_sites")
         cls.backup_first_fault_kinds = _literal_set_assignment(legacy_tree, "first_fault_kinds")
         cls.backup_verification_sites = _literal_set_assignment(legacy_tree, "verification_sites")
+        cls.backup_active_poll_verification_sites = _literal_set_assignment(
+            legacy_tree, "active_poll_verification_sites"
+        )
+        cls.backup_worker_identity_verification_sites = _literal_set_assignment(
+            legacy_tree, "worker_identity_verification_sites"
+        )
+        authorization_probe = _heredoc_after(
+            cls.source,
+            'if probe_marker="$(/usr/bin/python3 -I - "$backup_report_file" "$backup_capture_file"',
+        )
+        authorization_tree = ast.parse(authorization_probe)
+        authorization_validator = next(
+            (
+                node
+                for node in ast.walk(authorization_tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "valid_first_fault"
+            ),
+            None,
+        )
+        if authorization_validator is None:
+            raise AssertionError("could not isolate the authorization-probe first-fault validator")
+        cls.authorization_fault_validator = compile(
+            ast.fix_missing_locations(ast.Module(body=[authorization_validator], type_ignores=[])),
+            str(WORKFLOW),
+            "exec",
+        )
+        cls.authorization_first_fault_sites = _literal_set_assignment(
+            authorization_tree, "sites"
+        )
+        cls.authorization_verification_sites = _literal_set_assignment(
+            authorization_tree, "verification_sites"
+        )
         cls.workflow_unit_verification_sites = _literal_set_assignment(
             legacy_tree, "scratch_verification_sites"
         )
@@ -378,20 +410,72 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
             str(WORKFLOW),
             "exec",
         )
+        worker_frame_binding = next(
+            (
+                node
+                for node in ast.walk(legacy_tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "valid_worker_failure_frame_binding"
+            ),
+            None,
+        )
+        if worker_frame_binding is None:
+            raise AssertionError("could not isolate the worker failure-frame binder")
+        cls.worker_frame_binding_validator = compile(
+            ast.fix_missing_locations(ast.Module(body=[worker_frame_binding], type_ignores=[])),
+            str(WORKFLOW),
+            "exec",
+        )
+        worker_status_validator = next(
+            (
+                node
+                for node in ast.walk(legacy_tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "valid_worker_frame_status"
+            ),
+            None,
+        )
+        if worker_status_validator is None:
+            raise AssertionError("could not isolate the worker-frame observation validator")
+        cls.worker_status_validator = compile(
+            ast.fix_missing_locations(ast.Module(body=[worker_status_validator], type_ignores=[])),
+            str(WORKFLOW),
+            "exec",
+        )
 
     def _legacy_first_fault_valid(self, value) -> bool:
         namespace = {
             "first_fault_sites": self.backup_first_fault_sites,
             "first_fault_kinds": self.backup_first_fault_kinds,
             "verification_sites": self.backup_verification_sites,
+            "active_poll_verification_sites": self.backup_active_poll_verification_sites,
+            "worker_identity_verification_sites": self.backup_worker_identity_verification_sites,
         }
         exec(self.legacy_fault_validator, namespace)
         return namespace["valid_first_fault"](value)
 
-    def _controller_identity_binding_valid(self, first_fault, scratch_unit) -> bool:
+    def _authorization_first_fault_valid(self, value) -> bool:
         namespace = {}
+        exec(self.authorization_fault_validator, namespace)
+        return namespace["valid_first_fault"](value)
+
+    def _controller_identity_binding_valid(self, first_fault, scratch_unit) -> bool:
+        namespace = {
+            "active_poll_verification_sites": self.backup_active_poll_verification_sites,
+        }
         exec(self.identity_binding_validator, namespace)
         return namespace["valid_controller_identity_failure_binding"](first_fault, scratch_unit)
+
+    def _worker_failure_frame_binding_valid(self, first_fault, scratch_unit) -> bool:
+        namespace = {}
+        exec(self.worker_frame_binding_validator, namespace)
+        return namespace["valid_worker_failure_frame_binding"](first_fault, scratch_unit)
+
+    def _workflow_worker_frame_status_valid(self, scratch_unit, scratch_terminal, scratch_first_fault) -> bool:
+        namespace = {}
+        exec(self.worker_status_validator, namespace)
+        return namespace["valid_worker_frame_status"](
+            scratch_unit, scratch_terminal, scratch_first_fault
+        )
 
     def _workflow_resource_attribution_valid(self, value) -> bool:
         namespace = {}
@@ -1287,6 +1371,165 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                 unit = {"schema": 3, "verification_site": site}
                 self.assertTrue(self._legacy_first_fault_valid(fault))
                 self.assertTrue(self._controller_identity_binding_valid(fault, unit))
+        poll_sites = (
+            "active_poll_host_guard", "active_poll_selector_wait", "active_poll_stream_read",
+            "active_poll_stream_unregister", "active_poll_output_bound",
+        )
+        for site in poll_sites:
+            with self.subTest(workflow_active_poll_site=site):
+                fault = {
+                    **operation_fault,
+                    "site": "controller_active_poll",
+                    "verification_site": site,
+                }
+                for schema in (4, 5):
+                    unit = {
+                        "schema": schema,
+                        "verification_site": site,
+                        "worker_frame_status": "missing",
+                    }
+                    self.assertTrue(self._legacy_first_fault_valid(fault))
+                    self.assertTrue(self._controller_identity_binding_valid(fault, unit))
+                self.assertFalse(
+                    self._controller_identity_binding_valid(
+                        fault,
+                        {"schema": 3, "verification_site": site},
+                    )
+                )
+                self.assertFalse(
+                    self._controller_identity_binding_valid(
+                        fault,
+                        {
+                            "schema": 4,
+                            "verification_site": next(candidate for candidate in poll_sites if candidate != site),
+                            "worker_frame_status": "missing",
+                        },
+                    )
+                )
+        poll_fault_with_identity_site = {
+            **operation_fault,
+            "site": "controller_active_poll",
+            "verification_site": "proc_exe_stat",
+        }
+        self.assertFalse(self._legacy_first_fault_valid(poll_fault_with_identity_site))
+        identity_fault_with_poll_site = {
+            **operation_fault,
+            "verification_site": "active_poll_stream_read",
+        }
+        self.assertFalse(self._legacy_first_fault_valid(identity_fault_with_poll_site))
+        source = platform_backup_restore_drill
+        self.assertEqual(self.backup_first_fault_sites, source._SCRATCH_FIRST_FAULT_SITES)
+        self.assertEqual(self.authorization_first_fault_sites, source._SCRATCH_FIRST_FAULT_SITES)
+        self.assertEqual(
+            self.backup_verification_sites,
+            source._SCRATCH_VERIFICATION_SITES - {"none"},
+        )
+        self.assertEqual(
+            self.authorization_verification_sites,
+            source._SCRATCH_VERIFICATION_SITES - {"none"},
+        )
+        # Exercise every finite origin/top-site/subsite tuple through the
+        # producer validator and both independently embedded workflow
+        # validators. This catches consumer drift in closed site ownership.
+        verification_sites = sorted(source._SCRATCH_VERIFICATION_SITES - {"none"})
+        for origin in sorted(source._SCRATCH_FIRST_FAULT_ORIGINS):
+            for top_site in sorted(source._SCRATCH_FIRST_FAULT_SITES):
+                for verification_site in [None, *verification_sites]:
+                    fault = {
+                        "schema": 1,
+                        "origin": origin,
+                        "site": top_site,
+                        "exception_kind": "runtime",
+                        "errno": None,
+                    }
+                    if verification_site is not None:
+                        fault["verification_site"] = verification_site
+                    expected = source.valid_scratch_first_fault(fault)
+                    with self.subTest(
+                        fault_origin=origin,
+                        top_site=top_site,
+                        verification_site=verification_site,
+                    ):
+                        self.assertIs(self._legacy_first_fault_valid(fault), expected)
+                        self.assertIs(self._authorization_first_fault_valid(fault), expected)
+        prestart_with_output = {"worker_frame_status": "not_started", "stdout_bytes": 25, "stderr_bytes": 0}
+        prestart_terminal = {"start_token_sent": False}
+        self.assertTrue(
+            self._workflow_worker_frame_status_valid(
+                prestart_with_output, prestart_terminal, None
+            )
+        )
+        self.assertFalse(
+            self._workflow_worker_frame_status_valid(
+                prestart_with_output, {"start_token_sent": True}, None
+            )
+        )
+        self.assertTrue(
+            self._workflow_worker_frame_status_valid(
+                {"worker_frame_status": "missing", "stdout_bytes": 0, "stderr_bytes": 0},
+                {"start_token_sent": True},
+                None,
+            )
+        )
+        self.assertFalse(
+            self._workflow_worker_frame_status_valid(
+                {"worker_frame_status": "missing", "stdout_bytes": 25, "stderr_bytes": 0},
+                {"start_token_sent": True},
+                None,
+            )
+        )
+        for schema in (3, 4, 5):
+            with self.subTest(identity_schema=schema):
+                self.assertTrue(
+                    self._controller_identity_binding_valid(
+                        operation_fault,
+                        {
+                            "schema": schema,
+                            "verification_site": "process_cgroup_read",
+                            **({"worker_frame_status": "not_started"} if schema in {4, 5} else {}),
+                        },
+                    )
+                )
+        self.assertFalse(
+            self._controller_identity_binding_valid(
+                operation_fault,
+                {"schema": 4, "verification_site": "process_cgroup_parse", "worker_frame_status": "missing"},
+            )
+        )
+        worker_fault = {
+            "schema": 1,
+            "origin": "worker",
+            "site": "worker_mount_snapshot",
+            "exception_kind": "runtime",
+            "errno": None,
+        }
+        worker_frame_unit = {
+            "schema": 4,
+            "verification_site": "worker_mount_identity",
+            "worker_frame_status": "worker_failure_report",
+        }
+        self.assertTrue(self._worker_failure_frame_binding_valid(worker_fault, worker_frame_unit))
+        self.assertFalse(
+            self._worker_failure_frame_binding_valid(operation_fault, worker_frame_unit)
+        )
+        self.assertFalse(self._worker_failure_frame_binding_valid(None, worker_frame_unit))
+        self.assertFalse(
+            self._worker_failure_frame_binding_valid(
+                worker_fault,
+                {**worker_frame_unit, "worker_frame_status": "missing"},
+            )
+        )
+        active_poll_secondary = {
+            "schema": 4,
+            "verification_site": "active_poll_stream_read",
+            "worker_frame_status": "worker_failure_report",
+        }
+        self.assertTrue(
+            self._controller_identity_binding_valid(worker_fault, active_poll_secondary)
+        )
+        self.assertFalse(
+            self._controller_identity_binding_valid(None, {**active_poll_secondary, "worker_frame_status": "missing"})
+        )
         worker_operation = {**operation_fault, "origin": "worker", "site": "worker_mount_snapshot"}
         self.assertTrue(self._controller_identity_binding_valid(worker_operation, operation_unit))
         phase_names = (
@@ -1350,6 +1593,7 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         })
         controller_sites = frozenset({
             "controller_entry", "controller_archive_identity", "controller_unit_setup",
+            "controller_synthetic_path_fixture",
             "controller_host_guard", "controller_launch", "controller_unit_snapshot",
             "controller_identity", "controller_start_token", "controller_active_poll",
             "controller_worker_frame", "controller_completion_snapshot", "controller_done_token",

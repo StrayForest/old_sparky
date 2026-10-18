@@ -1738,6 +1738,125 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         )
         self.assertEqual(parsed, first_fault)
 
+        poll_error = OSError(5, "synthetic active poll read failure")
+        poll_error.scratch_verification_site = "active_poll_stream_read"
+        poll_fault = backup_drill._scratch_first_fault(
+            poll_error,
+            origin="controller",
+            site="controller_active_poll",
+        )
+        self.assertEqual(
+            poll_fault,
+            {
+                "schema": 1,
+                "origin": "controller",
+                "site": "controller_active_poll",
+                "exception_kind": "os_error",
+                "errno": 5,
+                "verification_site": "active_poll_stream_read",
+            },
+        )
+        assert poll_fault is not None
+        poll_error.scratch_authorization_probe = True
+        poll_error.scratch_first_fault = poll_fault
+        poll_error.scratch_unit_diagnostic = backup_drill._scratch_unit_diagnostic(
+            {"properties": {"ActiveState": "active", "SubState": "running", "Result": "success"}},
+            launcher_exit_status=1,
+            stdout_prefix=b"",
+            stdout_observed=0,
+            stdout_complete=True,
+            stderr_prefix=b"",
+            stderr_observed=0,
+            stderr_complete=True,
+            phase="authorization_failed",
+            verification_error="os_error",
+            verification_errno=5,
+            verification_site="active_poll_stream_read",
+            worker_frame_status="missing",
+            terminal_snapshot={
+                "load_state": "loaded",
+                "active_state": "inactive",
+                "sub_state": "dead",
+                "result": "exit-code",
+                "exec_main_status": 1,
+                "start_token_sent": True,
+                "completion_token_sent": False,
+            },
+        )
+        self.assertTrue(
+            backup_drill.valid_scratch_unit_diagnostic(poll_error.scratch_unit_diagnostic)
+        )
+        poll_error.scratch_cleanup_status = "confirmed"
+        poll_report = backup_drill.failure_report_for_exception(
+            poll_error,
+            private_scratch_diagnostics=True,
+        )
+        self.assertEqual(poll_report["scratch_first_fault"], poll_fault)
+        self.assertEqual(
+            poll_report["scratch_unit_diagnostic"]["worker_frame_status"], "missing"
+        )
+        poll_frame = backup_drill.private_failure_frame_for_exception(
+            poll_error,
+            enabled=True,
+        )
+        self.assertIsNotNone(poll_frame)
+        assert poll_frame is not None
+        poll_parsed = backup_drill._parse_bound_scratch_first_fault(
+            (json.dumps(poll_report, sort_keys=True) + "\n").encode("ascii"),
+            poll_frame.encode("ascii"),
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
+        self.assertEqual(poll_parsed, poll_fault)
+        self.assertIsNone(
+            backup_drill._scratch_first_fault(
+                type("Err", (RuntimeError,), {"scratch_verification_site": "active_poll_stream_read"})(),
+                origin="controller",
+                site="controller_identity",
+            )
+        )
+        malformed_poll_unit = dict(poll_error.scratch_unit_diagnostic)
+        malformed_poll_unit["worker_frame_status"] = "not_started"
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(malformed_poll_unit))
+        prestart_output = backup_drill._scratch_unit_diagnostic(
+            {
+                "properties": {
+                    "ActiveState": "failed",
+                    "SubState": "failed",
+                    "Result": "exit-code",
+                    "ExecMainStatus": "203",
+                }
+            },
+            launcher_exit_status=1,
+            stdout_prefix=b"pre-start launcher output",
+            stdout_observed=len(b"pre-start launcher output"),
+            stdout_complete=True,
+            stderr_prefix=b"",
+            stderr_observed=0,
+            stderr_complete=True,
+            phase="unit_exited_before_confinement",
+            worker_frame_status="not_started",
+            terminal_snapshot={
+                "load_state": "loaded",
+                "active_state": "failed",
+                "sub_state": "failed",
+                "result": "exit-code",
+                "exec_main_status": 203,
+                "start_token_sent": False,
+                "completion_token_sent": False,
+            },
+        )
+        self.assertIsNotNone(prestart_output)
+        self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(prestart_output))
+        assert prestart_output is not None
+        self.assertEqual(prestart_output["stdout_bytes"], len(b"pre-start launcher output"))
+        started_without_frame = dict(prestart_output)
+        started_without_frame["terminal_snapshot"] = {
+            **prestart_output["terminal_snapshot"],
+            "start_token_sent": True,
+        }
+        self.assertFalse(backup_drill.valid_scratch_unit_diagnostic(started_without_frame))
+
     def test_scratch_disk_image_admission_reserves_floor_lead_and_full_image(self) -> None:
         total_bytes = 100 * 1024**3
         required = backup_drill._scratch_disk_image_required_free_bytes(total_bytes)
@@ -7557,7 +7676,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def _assert_scratch_final_identity_loss_blocks_done(self) -> None:
         for replacement in (
             "pid", "invocation", "starttime", "cgroup", "missing", "late_start", "late_done",
-            "poll_error",
+            "poll_error", "read_error", "unregister_error", "host_guard_error", "output_bound_error",
         ):
             with self.subTest(final_identity=replacement), tempfile.TemporaryDirectory() as temporary_dir:
                 archive_path = pathlib.Path(temporary_dir) / "platformdb.dump"
@@ -7623,6 +7742,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     return snapshot["properties"]["ControlGroup"]
 
                 start_tokens: list[bytes] = []
+                host_guard_injected: list[bool] = []
+                selector_instances = []
                 send_token = backup_drill._scratch_send_worker_token
 
                 def capture_token(process: subprocess.Popen[bytes], *, token: bytes, deadline: float, close_after: bool) -> None:
@@ -7646,6 +7767,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     def __init__(self) -> None:
                         self.registered: dict[int, object] = {}
                         self.read_failure_sent = False
+                        self.unregister_failure_sent = False
+                        selector_instances.append(self)
 
                     def __enter__(self):
                         return self
@@ -7664,21 +7787,33 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                             if key.events & selectors.EVENT_WRITE
                         ]
                         if write_events:
-                            return write_events
+                            return [(key, selectors.EVENT_WRITE) for key in write_events]
                         if (
                             backup_drill.SCRATCH_START_TOKEN in start_tokens
                             and not self.read_failure_sent
+                            and replacement == "poll_error"
                         ):
                             self.read_failure_sent = True
                             raise OSError(5, "synthetic poll failure")
+                        if (
+                            backup_drill.SCRATCH_START_TOKEN in start_tokens
+                            and replacement == "host_guard_error"
+                        ):
+                            # Keep the worker result unread so the next outer
+                            # iteration reaches the injected host guard before
+                            # any completion candidate can authorize DONE.
+                            return []
                         if backup_drill.SCRATCH_START_TOKEN in start_tokens:
                             return [
-                                key for key in self.registered.values()
+                                (key, selectors.EVENT_READ) for key in self.registered.values()
                                 if key.events & selectors.EVENT_READ
                             ]
                         return []
 
                     def unregister(self, *_args: Any) -> None:
+                        if replacement == "unregister_error" and not self.unregister_failure_sent:
+                            self.unregister_failure_sent = True
+                            raise OSError(5, "synthetic unregister failure")
                         return None
 
                     def get_key(self, fileobj: object) -> object:
@@ -7692,14 +7827,50 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
                 selector_factory = (
                     PollFailureSelector
-                    if replacement == "poll_error"
+                    if replacement in {
+                        "poll_error", "read_error", "unregister_error", "host_guard_error",
+                        "output_bound_error",
+                    }
                     else backup_drill.selectors.DefaultSelector
                 )
+
+                original_os_read = os.read
+                injected_read = False
+                injected_read_streams: list[str] = []
+
+                def read_with_injected_failure(fd: int, size: int) -> bytes:
+                    nonlocal injected_read
+                    if launched and fd in {
+                        launched[0].stdout.fileno(), launched[0].stderr.fileno(),
+                    } and not injected_read:
+                        if replacement == "read_error":
+                            injected_read = True
+                            raise OSError(5, "synthetic stream read failure")
+                        if replacement == "unregister_error":
+                            injected_read = True
+                            return b""
+                        if (
+                            replacement == "output_bound_error"
+                            and fd == launched[0].stdout.fileno()
+                        ):
+                            injected_read = True
+                            injected_read_streams.append("stdout")
+                            return b"x" * 4097  # Normal restore stdout limit is 4096 bytes.
+                    return original_os_read(fd, size)
+
+                def host_guard(site: str) -> None:
+                    if (
+                        replacement == "host_guard_error"
+                        and site == "parent_active_poll"
+                        and backup_drill.SCRATCH_START_TOKEN in start_tokens
+                    ):
+                        host_guard_injected.append(True)
+                        raise OSError(5, "synthetic host guard failure")
 
                 unit_command = mock.Mock(return_value=command)
                 with (
                     mock.patch.object(backup_drill, "require_commands"),
-                    mock.patch.object(backup_drill, "_scratch_host_guard"),
+                    mock.patch.object(backup_drill, "_scratch_host_guard", side_effect=host_guard),
                     mock.patch.object(backup_drill, "_scratch_unit_command", unit_command),
                     mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", return_value=False),
                     mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=service_snapshot),
@@ -7711,6 +7882,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
                     mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
                     mock.patch.object(backup_drill.selectors, "DefaultSelector", new=selector_factory),
+                    mock.patch.object(backup_drill.os, "read", side_effect=read_with_injected_failure),
                 ):
                     with self.assertRaises(Exception) as failure:
                         backup_drill._run_isolated_restore_drill(
@@ -7736,12 +7908,57 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     ),
                     replacement == "late_done",
                 )
-                if replacement == "poll_error":
+                if replacement in {
+                    "poll_error", "read_error", "unregister_error", "host_guard_error", "output_bound_error",
+                }:
                     first_fault = getattr(failure.exception, "scratch_first_fault", None)
                     self.assertIsInstance(first_fault, dict)
                     assert isinstance(first_fault, dict)
                     self.assertEqual(first_fault.get("site"), "controller_active_poll")
-                    self.assertNotIn("verification_site", first_fault)
+                    expected_site = {
+                        "poll_error": "active_poll_selector_wait",
+                        "read_error": "active_poll_stream_read",
+                        "unregister_error": "active_poll_stream_unregister",
+                        "host_guard_error": "active_poll_host_guard",
+                        "output_bound_error": "active_poll_output_bound",
+                    }[replacement]
+                    if replacement == "output_bound_error":
+                        self.assertTrue(injected_read, "oversized stdout injection was not reached")
+                        self.assertEqual(injected_read_streams, ["stdout"])
+                    self.assertEqual(
+                        first_fault.get("verification_site"),
+                        expected_site,
+                        msg=f"{replacement}: {first_fault!r}",
+                    )
+                    expected_kind, expected_errno = (
+                        ("runtime", None)
+                        if replacement == "output_bound_error"
+                        else ("os_error", 5)
+                    )
+                    self.assertEqual(first_fault.get("exception_kind"), expected_kind)
+                    self.assertEqual(first_fault.get("errno"), expected_errno)
+                    self.assertIn(backup_drill.SCRATCH_START_TOKEN, start_tokens)
+                    if replacement == "poll_error":
+                        self.assertTrue(selector_instances[0].read_failure_sent)
+                    elif replacement == "unregister_error":
+                        self.assertTrue(selector_instances[0].unregister_failure_sent)
+                    elif replacement in {"read_error", "output_bound_error"}:
+                        self.assertTrue(injected_read)
+                    elif replacement == "host_guard_error":
+                        self.assertEqual(host_guard_injected, [True])
+                    unit_diagnostic = getattr(failure.exception, "scratch_unit_diagnostic", None)
+                    self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(unit_diagnostic))
+                    assert isinstance(unit_diagnostic, dict)
+                    self.assertIn(unit_diagnostic["schema"], {4, 5})
+                    if unit_diagnostic["schema"] == 5:
+                        self.assertTrue(unit_diagnostic["terminal_snapshot"]["start_token_sent"])
+                    self.assertEqual(unit_diagnostic["verification_site"], expected_site)
+                    self.assertEqual(
+                        unit_diagnostic["worker_frame_status"],
+                        "missing" if unit_diagnostic["stdout_bytes"] == 0 else "invalid",
+                    )
+                    if replacement == "output_bound_error":
+                        self.assertGreater(unit_diagnostic["stdout_bytes"], 0)
                 self.assertFalse(pathlib.Path(unit_command.call_args.kwargs["mountpoint"]).exists())
 
     def _assert_worker_token_deadline_delivery_is_truthful(self) -> None:
