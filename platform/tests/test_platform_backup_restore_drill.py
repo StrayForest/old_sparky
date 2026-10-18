@@ -327,9 +327,58 @@ def _write_synthetic_restore_failure_artifact(
     first_fault = getattr(failure, "scratch_first_fault", None)
     if first_fault is not None and not backup_drill.valid_scratch_first_fault(first_fault):
         raise RuntimeError("Synthetic restore failure site failed validation.")
+    image_identity_diagnostic = getattr(
+        failure, "scratch_image_identity_diagnostic", None
+    )
+    if image_identity_diagnostic is not None and (
+        scratch_backend != backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+        or not backup_drill.valid_scratch_image_identity_diagnostic(
+            image_identity_diagnostic
+        )
+        or first_fault is None
+        or first_fault.get("origin") != "controller"
+        or first_fault.get("site") != "controller_identity"
+        or first_fault.get("verification_site") != "controller_image_mount_identity"
+        or unit_diagnostic is None
+        or unit_diagnostic.get("verification_site") != "controller_image_mount_identity"
+    ):
+        raise RuntimeError("Synthetic restore image identity projection failed validation.")
     cleanup_status = getattr(failure, "scratch_cleanup_status", "unknown")
     if not backup_drill.valid_scratch_cleanup_status(cleanup_status):
         raise RuntimeError("Synthetic restore cleanup status failed validation.")
+    cleanup_diagnostic = getattr(failure, "scratch_cleanup_diagnostic", None)
+    if cleanup_diagnostic is None:
+        cleanup_diagnostic = {
+            "schema": 1,
+            "service_stopped": None,
+            "mount_absent": None,
+            "mountpoint_removed": None,
+            "loop_released": None,
+            "image_created_by_invocation": None,
+            "image_unlinked": None,
+            "retention_receipt_written": None,
+            "protected_paths_cleaned": None,
+            "cleanup_status": cleanup_status,
+        }
+    if (
+        not backup_drill.valid_scratch_cleanup_diagnostic(cleanup_diagnostic)
+        or cleanup_diagnostic["cleanup_status"] != cleanup_status
+        or (
+            scratch_backend == backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+            and cleanup_status == "confirmed"
+            and (
+                cleanup_diagnostic["image_created_by_invocation"] is None
+                or (
+                    cleanup_diagnostic["image_created_by_invocation"] is True
+                    and (
+                        cleanup_diagnostic["loop_released"] is not True
+                        or cleanup_diagnostic["image_unlinked"] is not True
+                    )
+                )
+            )
+        )
+    ):
+        raise RuntimeError("Synthetic restore cleanup projection failed validation.")
 
     private_output = getattr(failure, "scratch_unit_private_output", None)
     if private_output is None:
@@ -393,6 +442,12 @@ def _write_synthetic_restore_failure_artifact(
         "scratch_unit_diagnostic": unit_diagnostic,
         "scratch_unit_journal_diagnostic": journal_diagnostic,
         "scratch_cleanup_status": cleanup_status,
+        "scratch_cleanup_diagnostic": cleanup_diagnostic,
+        **(
+            {"scratch_image_identity_diagnostic": image_identity_diagnostic}
+            if image_identity_diagnostic is not None
+            else {}
+        ),
         "stderr_diagnostic": _classify_synthetic_restore_stderr(
             stderr_suffix, complete=stderr_suffix_complete
         ),
@@ -1779,6 +1834,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "sub_state": "dead",
                 "result": "exit-code",
                 "exec_main_status": 1,
+                "exec_main_code": "exited",
                 "start_token_sent": True,
                 "completion_token_sent": False,
             },
@@ -1802,7 +1858,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertIsNotNone(poll_frame)
         assert poll_frame is not None
         poll_parsed = backup_drill._parse_bound_scratch_first_fault(
-            (json.dumps(poll_report, sort_keys=True) + "\n").encode("ascii"),
+            (json.dumps(poll_report, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
             poll_frame.encode("ascii"),
             stdout_truncated=False,
             stderr_truncated=False,
@@ -1842,6 +1898,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "sub_state": "failed",
                 "result": "exit-code",
                 "exec_main_status": 203,
+                "exec_main_code": "exited",
                 "start_token_sent": False,
                 "completion_token_sent": False,
             },
@@ -1984,6 +2041,192 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ):
                 backup_drill._scratch_prepare_disk_image("0123456789abcdef01234567")
             self.assertFalse(image_path.exists())
+
+    def test_disk_image_setup_collision_is_reported_as_not_created(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            temporary_root = pathlib.Path(temporary_dir)
+            (temporary_root / "platform").mkdir()
+            image_root = temporary_root / "images"
+            token = "0123456789abcdef01234567"
+            image_path = image_root / f"restore-{token}.ext4"
+            image_root.mkdir(mode=0o700)
+            image_path.write_bytes(b"preexisting protected inode")
+            image_path.chmod(0o600)
+            original_bytes = image_path.read_bytes()
+            total_bytes = 100 * 1024**3
+            snapshot = types.SimpleNamespace(
+                valid=True,
+                total_bytes=total_bytes,
+                free_bytes=(
+                    backup_drill._required_disk_floor(total_bytes)
+                    + backup_drill.RESTORE_DISK_LEAD_BYTES
+                    + backup_drill.SCRATCH_DISK_IMAGE_BYTES
+                    + 1024**3
+                ),
+            )
+            first_fault = {
+                "schema": 1,
+                "origin": "controller",
+                "site": "controller_unit_setup",
+                "exception_kind": "runtime",
+                "errno": None,
+            }
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
+                mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
+                ),
+                mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
+            ):
+                with self.assertRaises(FileExistsError) as raised:
+                    backup_drill._scratch_prepare_disk_image(token)
+            failure = raised.exception
+            self.assertFalse(failure.scratch_image_created_by_invocation)
+            self.assertIsNone(failure.scratch_image_unlinked)
+            self.assertIsNone(failure.scratch_loop_released)
+            self.assertIsNone(failure.scratch_retention_receipt_written)
+            self.assertEqual(image_path.read_bytes(), original_bytes)
+
+            failure.scratch_first_fault = first_fault
+            backup_drill._scratch_cleanup_failure(
+                failure,
+                [],
+                authorization_probe=False,
+                service_stopped=True,
+                mount_absent=True,
+                mountpoint_removed=True,
+                image_created_by_invocation=failure.scratch_image_created_by_invocation,
+                image_removed=failure.scratch_image_unlinked,
+                loop_released=failure.scratch_loop_released,
+                retention_receipt_written=failure.scratch_retention_receipt_written,
+                protected_paths_cleaned=True,
+            )
+            self.assertEqual(failure.scratch_cleanup_status, "confirmed")
+            self.assertEqual(
+                failure.scratch_cleanup_diagnostic,
+                {
+                    "schema": 1,
+                    "service_stopped": True,
+                    "mount_absent": True,
+                    "mountpoint_removed": True,
+                    "loop_released": None,
+                    "image_created_by_invocation": False,
+                    "image_unlinked": None,
+                    "retention_receipt_written": None,
+                    "protected_paths_cleaned": True,
+                    "cleanup_status": "confirmed",
+                },
+            )
+            self.assertTrue(
+                backup_drill.valid_scratch_cleanup_diagnostic(
+                    failure.scratch_cleanup_diagnostic
+                )
+            )
+            with mock.patch.object(sys.modules[__name__], "REPO_ROOT", temporary_root):
+                artifact_path = _write_synthetic_restore_failure_artifact(
+                    failure,
+                    source_sha="f" * 40,
+                    scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                )
+            artifact = json.loads(artifact_path.read_text(encoding="ascii"))
+            self.assertEqual(artifact["scratch_cleanup_status"], "confirmed")
+            self.assertEqual(
+                artifact["scratch_cleanup_diagnostic"]["image_created_by_invocation"],
+                False,
+            )
+            self.assertEqual(image_path.read_bytes(), original_bytes)
+            image_path.unlink()
+            artifact_path.unlink()
+
+            real_lstat = pathlib.Path.lstat
+
+            def root_owned_lstat(path: pathlib.Path) -> os.stat_result:
+                actual = real_lstat(path)
+                if path in {temporary_root, image_root} or path == image_path:
+                    return types.SimpleNamespace(
+                        st_mode=(stat.S_IFREG if path == image_path else stat.S_IFDIR)
+                        | (0o600 if path == image_path else 0o700),
+                        st_uid=0,
+                        st_gid=0,
+                        st_dev=actual.st_dev,
+                        st_ino=actual.st_ino,
+                        st_size=actual.st_size,
+                        st_nlink=1,
+                    )  # type: ignore[return-value]
+                return actual
+
+            receipt_writer = mock.patch.object(
+                backup_drill, "_scratch_write_image_cleanup_receipt"
+            )
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_BYTES", 4096),
+                mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
+                ),
+                mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
+                mock.patch.object(pathlib.Path, "lstat", root_owned_lstat),
+                mock.patch.object(backup_drill.os, "fstat", side_effect=OSError("private")),
+                receipt_writer as write_receipt,
+            ):
+                with self.assertRaises(OSError) as raised_identity:
+                    backup_drill._scratch_prepare_disk_image(token)
+            identity_failure = raised_identity.exception
+            self.assertTrue(identity_failure.scratch_image_created_by_invocation)
+            self.assertIsNone(identity_failure.scratch_image_unlinked)
+            self.assertTrue(identity_failure.scratch_loop_released)
+            write_receipt.assert_called_once()
+            self.assertTrue(identity_failure.scratch_retention_receipt_written)
+            self.assertTrue(image_path.is_file())
+            self.assertEqual(image_path.stat().st_size, 0)
+
+            identity_failure.scratch_first_fault = first_fault
+            backup_drill._scratch_cleanup_failure(
+                identity_failure,
+                [],
+                authorization_probe=False,
+                service_stopped=True,
+                mount_absent=True,
+                mountpoint_removed=True,
+                image_created_by_invocation=True,
+                image_removed=None,
+                loop_released=True,
+                retention_receipt_written=True,
+                protected_paths_cleaned=True,
+            )
+            self.assertEqual(identity_failure.scratch_cleanup_status, "unknown")
+            self.assertTrue(
+                backup_drill.valid_scratch_cleanup_diagnostic(
+                    identity_failure.scratch_cleanup_diagnostic
+                )
+            )
+            with mock.patch.object(sys.modules[__name__], "REPO_ROOT", temporary_root):
+                identity_artifact_path = _write_synthetic_restore_failure_artifact(
+                    identity_failure,
+                    source_sha="a" * 40,
+                    scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                )
+            identity_artifact = json.loads(
+                identity_artifact_path.read_text(encoding="ascii")
+            )
+            self.assertEqual(identity_artifact["scratch_cleanup_status"], "unknown")
+            self.assertTrue(
+                identity_artifact["scratch_cleanup_diagnostic"][
+                    "image_created_by_invocation"
+                ]
+            )
+            self.assertIsNone(
+                identity_artifact["scratch_cleanup_diagnostic"]["image_unlinked"]
+            )
+            self.assertTrue(image_path.is_file())
+            identity_artifact_path.unlink()
+            image_path.unlink()
 
     def test_scratch_disk_image_identity_rejects_sparse_or_replaced_inode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -2845,6 +3088,72 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_dir:
             temporary_root = pathlib.Path(temporary_dir)
             (temporary_root / "platform").mkdir()
+            image_root = temporary_root / "image-root"
+            image_root.mkdir(mode=0o700)
+            image_path = image_root / "image.ext4"
+            with image_path.open("wb") as image_file:
+                image_file.truncate(backup_drill.SCRATCH_DISK_IMAGE_BYTES)
+            real_fstat = os.fstat
+            real_lstat = pathlib.Path.lstat
+
+            def image_identity_fstat(descriptor: int) -> types.SimpleNamespace:
+                actual = real_fstat(descriptor)
+                return types.SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o600,
+                    st_dev=123,
+                    st_ino=456,
+                    st_size=backup_drill.SCRATCH_DISK_IMAGE_BYTES,
+                    st_uid=0,
+                    st_gid=0,
+                    st_nlink=1,
+                    st_blocks=0,
+                ) if actual.st_ino == image_path.stat().st_ino else actual
+
+            def image_identity_lstat(path: pathlib.Path) -> os.stat_result:
+                if path == image_root:
+                    return types.SimpleNamespace(
+                        st_mode=stat.S_IFDIR | 0o700,
+                        st_dev=123,
+                        st_ino=321,
+                        st_uid=0,
+                        st_gid=0,
+                    )  # type: ignore[return-value]
+                if path == image_path:
+                    return types.SimpleNamespace(
+                        st_mode=stat.S_IFREG | 0o600,
+                        st_dev=123,
+                        st_ino=456,
+                        st_size=backup_drill.SCRATCH_DISK_IMAGE_BYTES,
+                        st_uid=0,
+                        st_gid=0,
+                        st_nlink=1,
+                    )  # type: ignore[return-value]
+                return real_lstat(path)
+
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
+                mock.patch.object(backup_drill.os, "fstat", side_effect=image_identity_fstat),
+                mock.patch.object(pathlib.Path, "lstat", image_identity_lstat),
+                self.assertRaisesRegex(RuntimeError, "fixed allocation contract") as image_error,
+            ):
+                backup_drill._scratch_image_path_identity(image_path)
+            source_image_diagnostic = image_error.exception.scratch_image_identity_diagnostic
+            self.assertTrue(
+                backup_drill.valid_scratch_image_identity_diagnostic(source_image_diagnostic)
+            )
+            self.assertEqual(source_image_diagnostic["failed_predicate"], "fully_allocated")
+            self.assertEqual(
+                source_image_diagnostic["predicates"],
+                {
+                    "regular_file": True,
+                    "exact_size": True,
+                    "owner_mode_nlink": True,
+                    "path_inode_match": True,
+                    "parent_identity_stable": True,
+                    "same_filesystem": True,
+                    "fully_allocated": False,
+                },
+            )
             with mock.patch.object(sys.modules[__name__], "REPO_ROOT", temporary_root):
                 artifact_path = _write_synthetic_restore_diagnostic_artifact(
                     schema3_tmpfs, source_sha="c" * 40
@@ -2886,11 +3195,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 )
             )
             unit_diagnostic = {
-                "schema": 1,
-                "phase": "unit_exited_before_confinement",
-                "active_state": "failed",
-                "sub_state": "failed",
-                "result": "exit-code",
+                "schema": 3,
+                "phase": "authorization_failed",
+                "active_state": "active",
+                "sub_state": "running",
+                "result": "success",
                 "exec_main_status": 127,
                 "launcher_exit_status": 1,
                 "stdout_bytes": len(synthetic_stdout),
@@ -2899,17 +3208,20 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "stderr_bytes": len(synthetic_stderr),
                 "stderr_sha256": hashlib.sha256(synthetic_stderr).hexdigest(),
                 "stderr_truncated": False,
-                "verification_error": "none",
+                "verification_error": "policy_error",
                 "verification_errno": None,
+                "verification_site": "controller_image_mount_identity",
             }
             failure = RuntimeError("private exception text must not be exported")
             failure.scratch_first_fault = {
                 "schema": 1,
                 "origin": "controller",
-                "site": "controller_unit_snapshot",
+                "site": "controller_identity",
                 "exception_kind": "runtime",
                 "errno": None,
+                "verification_site": "controller_image_mount_identity",
             }
+            failure.scratch_image_identity_diagnostic = source_image_diagnostic
             failure.scratch_unit_diagnostic = unit_diagnostic
             failure.scratch_unit_journal_diagnostic = {
                 "schema": 1,
@@ -2924,11 +3236,29 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "target": "scratch_tmpfs",
             }
             failure.scratch_cleanup_status = "confirmed"
+            failure.scratch_cleanup_diagnostic = {
+                "schema": 1,
+                "service_stopped": True,
+                "mount_absent": True,
+                "mountpoint_removed": True,
+                "loop_released": True,
+                "image_created_by_invocation": True,
+                "image_unlinked": True,
+                "retention_receipt_written": None,
+                "protected_paths_cleaned": True,
+                "cleanup_status": "confirmed",
+            }
             failure.scratch_unit_private_output = (synthetic_stdout, synthetic_stderr)
             failure.scratch_synthetic_stderr_tail = synthetic_stderr[
                 -backup_drill.SCRATCH_SYNTHETIC_STDERR_TAIL_BYTES :
             ]
             failure.scratch_synthetic_stderr_tail_complete = True
+            with mock.patch.object(sys.modules[__name__], "REPO_ROOT", temporary_root):
+                _write_synthetic_restore_failure_artifact(
+                    failure,
+                    source_sha="e" * 40,
+                    scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                )
             with (
                 mock.patch.object(sys.modules[__name__], "REPO_ROOT", temporary_root),
                 mock.patch.object(
@@ -2940,7 +3270,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as raised:
                     _run_synthetic_restore_diagnostic_for_ci(
                         source_sha="e" * 40,
-                        scratch_backend=backup_drill.SCRATCH_BACKEND_TMPFS_V1,
+                        scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
                     )
             self.assertIs(raised.exception, failure)
             failure_artifact_path = (
@@ -2966,6 +3296,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "scratch_unit_diagnostic",
                     "scratch_unit_journal_diagnostic",
                     "scratch_cleanup_status",
+                    "scratch_cleanup_diagnostic",
+                    "scratch_image_identity_diagnostic",
                     "stderr_diagnostic",
                 },
             )
@@ -2975,7 +3307,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             )
             self.assertEqual(failure_artifact["source_sha"], "e" * 40)
             self.assertEqual(
-                failure_artifact["scratch_backend"], backup_drill.SCRATCH_BACKEND_TMPFS_V1
+                failure_artifact["scratch_backend"],
+                backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
             )
             self.assertEqual(failure_artifact["test_id"], _SYNTHETIC_RESTORE_TEST_ID)
             self.assertEqual(failure_artifact["failure_stage"], "run_synthetic_restore_diagnostic")
@@ -2990,6 +3323,113 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 failure_artifact["scratch_first_fault"], failure.scratch_first_fault
             )
             self.assertEqual(failure_artifact["scratch_cleanup_status"], "confirmed")
+            self.assertEqual(
+                failure_artifact["scratch_cleanup_diagnostic"],
+                failure.scratch_cleanup_diagnostic,
+            )
+            self.assertTrue(
+                backup_drill.valid_scratch_cleanup_diagnostic(
+                    failure_artifact["scratch_cleanup_diagnostic"]
+                )
+            )
+            unproven_cleanup = json.loads(
+                json.dumps(failure_artifact["scratch_cleanup_diagnostic"])
+            )
+            unproven_cleanup["loop_released"] = False
+            self.assertFalse(backup_drill.valid_scratch_cleanup_diagnostic(unproven_cleanup))
+            unknown_cleanup = json.loads(
+                json.dumps(failure_artifact["scratch_cleanup_diagnostic"])
+            )
+            unknown_cleanup["mount_absent"] = None
+            unknown_cleanup["loop_released"] = None
+            unknown_cleanup["image_unlinked"] = None
+            unknown_cleanup["retention_receipt_written"] = None
+            unknown_cleanup["cleanup_status"] = "failed"
+            self.assertTrue(backup_drill.valid_scratch_cleanup_diagnostic(unknown_cleanup))
+            malformed_cleanup = json.loads(
+                json.dumps(failure_artifact["scratch_cleanup_diagnostic"])
+            )
+            malformed_cleanup["unit_name"] = "private"
+            self.assertFalse(backup_drill.valid_scratch_cleanup_diagnostic(malformed_cleanup))
+            self.assertEqual(
+                failure_artifact["scratch_image_identity_diagnostic"],
+                source_image_diagnostic,
+            )
+            self.assertTrue(
+                backup_drill.valid_scratch_image_identity_diagnostic(
+                    failure_artifact["scratch_image_identity_diagnostic"]
+                )
+            )
+            original_image_diagnostic = failure.scratch_image_identity_diagnostic
+            invalid_image_diagnostics = []
+            all_true = json.loads(json.dumps(original_image_diagnostic))
+            all_true["predicates"] = dict.fromkeys(
+                backup_drill.SCRATCH_IMAGE_IDENTITY_PREDICATES, True
+            )
+            invalid_image_diagnostics.append(all_true)
+            unknown_key = json.loads(json.dumps(original_image_diagnostic))
+            unknown_key["private_path"] = "/not-exportable"
+            invalid_image_diagnostics.append(unknown_key)
+            missing_key = json.loads(json.dumps(original_image_diagnostic))
+            missing_key.pop("observed_size")
+            invalid_image_diagnostics.append(missing_key)
+            wrong_type = json.loads(json.dumps(original_image_diagnostic))
+            wrong_type["observed_size"] = True
+            invalid_image_diagnostics.append(wrong_type)
+            out_of_range = json.loads(json.dumps(original_image_diagnostic))
+            out_of_range["allocated_bytes"] = 2**63
+            invalid_image_diagnostics.append(out_of_range)
+            wrong_failed_predicate = json.loads(json.dumps(original_image_diagnostic))
+            wrong_failed_predicate["predicates"]["exact_size"] = False
+            invalid_image_diagnostics.append(wrong_failed_predicate)
+            contradictory_size = json.loads(json.dumps(original_image_diagnostic))
+            contradictory_size["predicates"]["exact_size"] = False
+            contradictory_size["failed_predicate"] = "exact_size"
+            invalid_image_diagnostics.append(contradictory_size)
+            contradictory_allocation = json.loads(json.dumps(original_image_diagnostic))
+            contradictory_allocation["allocated_bytes"] = contradictory_allocation[
+                "observed_size"
+            ]
+            invalid_image_diagnostics.append(contradictory_allocation)
+            contradictory_mode = json.loads(json.dumps(original_image_diagnostic))
+            contradictory_mode["predicates"]["owner_mode_nlink"] = True
+            contradictory_mode["failed_predicate"] = "fully_allocated"
+            contradictory_mode["observed_mode"] = 0o640
+            invalid_image_diagnostics.append(contradictory_mode)
+            for invalid_projection in invalid_image_diagnostics:
+                self.assertFalse(
+                    backup_drill.valid_scratch_image_identity_diagnostic(invalid_projection)
+                )
+                failure.scratch_image_identity_diagnostic = invalid_projection
+                with self.assertRaisesRegex(RuntimeError, "image identity projection"):
+                    _write_synthetic_restore_failure_artifact(
+                        failure,
+                        source_sha="e" * 40,
+                        scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                    )
+            failure.scratch_image_identity_diagnostic = original_image_diagnostic
+            with self.assertRaisesRegex(RuntimeError, "image identity projection"):
+                _write_synthetic_restore_failure_artifact(
+                    failure,
+                    source_sha="e" * 40,
+                    scratch_backend=backup_drill.SCRATCH_BACKEND_TMPFS_V1,
+                )
+            wrong_origin = dict(failure.scratch_first_fault)
+            wrong_origin["origin"] = "worker"
+            failure.scratch_first_fault = wrong_origin
+            with self.assertRaisesRegex(RuntimeError, "site failed validation"):
+                _write_synthetic_restore_failure_artifact(
+                    failure,
+                    source_sha="e" * 40,
+                    scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                )
+            failure.scratch_first_fault["origin"] = "controller"
+            with self.assertRaisesRegex(RuntimeError, "source failed validation"):
+                _write_synthetic_restore_failure_artifact(
+                    failure,
+                    source_sha="not-a-source-sha",
+                    scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                )
             stderr_diagnostic = failure_artifact["stderr_diagnostic"]
             self.assertEqual(
                 set(stderr_diagnostic),
@@ -4578,6 +5018,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             }
         )
         forbidden_stderr = io.StringIO()
+        forbidden_stdout = io.TextIOWrapper(io.BytesIO())
         with (
             mock.patch.object(backup_drill, "parse_args", return_value=forbidden_archive_args),
             mock.patch.object(
@@ -4591,11 +5032,22 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             mock.patch.object(backup_drill.pathlib.Path, "is_dir", return_value=True),
             mock.patch.object(backup_drill.os, "geteuid", return_value=0),
             mock.patch.object(backup_drill.sys, "stdin", io.BytesIO()),
+            mock.patch.object(backup_drill.sys, "stdout", forbidden_stdout),
             mock.patch.object(backup_drill.sys, "stderr", forbidden_stderr),
         ):
             self.assertEqual(backup_drill.main(), 1)
         forbidden_run.assert_not_called()
-        self.assertIn("must not receive archive inputs", forbidden_stderr.getvalue())
+        forbidden_stdout.flush()
+        rejected_input_fault = backup_drill._parse_bound_scratch_first_fault(
+            forbidden_stdout.buffer.getvalue(),
+            forbidden_stderr.getvalue().encode("ascii"),
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
+        self.assertIsNotNone(rejected_input_fault)
+        assert rejected_input_fault is not None
+        self.assertEqual(rejected_input_fault["origin"], "worker")
+        self.assertEqual(rejected_input_fault["site"], "worker_entry")
 
         normal_worker_args = argparse.Namespace(**{
             **vars(synthetic_args),
@@ -5295,10 +5747,29 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 service_stopped=True,
                 mount_absent=True,
                 mountpoint_removed=False,
+                loop_released=None,
+                image_removed=None,
+                retention_receipt_written=None,
+                protected_paths_cleaned=False,
             )
         )
         self.assertEqual(first.scratch_first_fault, expected)
         self.assertEqual(first.scratch_cleanup_status, "failed")
+        self.assertEqual(
+            first.scratch_cleanup_diagnostic,
+            {
+                "schema": 1,
+                "service_stopped": True,
+                "mount_absent": True,
+                "mountpoint_removed": False,
+                "loop_released": None,
+                "image_created_by_invocation": None,
+                "image_unlinked": None,
+                "retention_receipt_written": None,
+                "protected_paths_cleaned": False,
+                "cleanup_status": "failed",
+            },
+        )
         self.assertNotIn(
             "secondary private cleanup detail",
             " ".join(getattr(first, "__notes__", [])),
@@ -5311,8 +5782,14 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             service_stopped=True,
             mount_absent=True,
             mountpoint_removed=True,
+            protected_paths_cleaned=True,
         )
         self.assertEqual(confirmed.scratch_cleanup_status, "confirmed")
+        self.assertTrue(
+            backup_drill.valid_scratch_cleanup_diagnostic(
+                confirmed.scratch_cleanup_diagnostic
+            )
+        )
         cleanup_report = backup_drill.failure_report_for_exception(
             confirmed, private_scratch_diagnostics=True
         )

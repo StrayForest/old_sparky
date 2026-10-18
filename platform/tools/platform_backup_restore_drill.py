@@ -75,6 +75,15 @@ SCRATCH_SYS_BLOCK_ROOT = pathlib.Path("/sys/block")
 SCRATCH_SYS_DEV_BLOCK_ROOT = pathlib.Path("/sys/dev/block")
 SCRATCH_SYS_DEVICES_ROOT = pathlib.Path("/sys/devices")
 SCRATCH_DISK_IMAGE_BYTES = 576 * 1024**2
+SCRATCH_IMAGE_IDENTITY_PREDICATES = (
+    "regular_file",
+    "exact_size",
+    "owner_mode_nlink",
+    "path_inode_match",
+    "parent_identity_stable",
+    "same_filesystem",
+    "fully_allocated",
+)
 SCRATCH_DISK_USABLE_MIN_BYTES = 512 * 1024**2
 SCRATCH_DISK_LOOP_TEARDOWN_SECONDS = 5.0
 SCRATCH_MEMORY_MAX_BYTES = 640 * 1024**2
@@ -779,12 +788,15 @@ def _scratch_cleanup_failure(
     service_stopped: bool | None = None,
     mount_absent: bool | None = None,
     mountpoint_removed: bool | None = None,
+    loop_released: bool | None = None,
+    image_created_by_invocation: bool | None = None,
     image_removed: bool | None = None,
+    retention_receipt_written: bool | None = None,
     protected_paths_cleaned: bool | None = None,
 ) -> BaseException | None:
     """Keep cleanup status separate and never replace an existing first fault."""
     observed_cleanup = (service_stopped, mount_absent, mountpoint_removed)
-    if image_removed is not None:
+    if image_created_by_invocation is True or image_removed is not None:
         observed_cleanup += (image_removed,)
     if protected_paths_cleaned is not None:
         observed_cleanup += (protected_paths_cleaned,)
@@ -798,12 +810,30 @@ def _scratch_cleanup_failure(
         cleanup_status = "failed"
     else:
         cleanup_status = "unknown"
+    cleanup_diagnostic = {
+        "schema": 1,
+        "service_stopped": service_stopped,
+        "mount_absent": mount_absent,
+        "mountpoint_removed": mountpoint_removed,
+        "loop_released": loop_released,
+        "image_created_by_invocation": image_created_by_invocation,
+        "image_unlinked": image_removed,
+        "retention_receipt_written": retention_receipt_written,
+        "protected_paths_cleaned": protected_paths_cleaned,
+        "cleanup_status": cleanup_status,
+    }
+    if not valid_scratch_cleanup_diagnostic(cleanup_diagnostic):
+        cleanup_diagnostic = None
     if not cleanup_errors:
         if primary_error is not None:
             setattr(primary_error, "scratch_cleanup_status", cleanup_status)
+            if cleanup_diagnostic is not None:
+                setattr(primary_error, "scratch_cleanup_diagnostic", cleanup_diagnostic)
         return None
     if primary_error is not None:
         setattr(primary_error, "scratch_cleanup_status", cleanup_status)
+        if cleanup_diagnostic is not None:
+            setattr(primary_error, "scratch_cleanup_diagnostic", cleanup_diagnostic)
         if hasattr(primary_error, "add_note"):
             primary_error.add_note("Scratch restore final cleanup also failed.")
         return None
@@ -811,6 +841,8 @@ def _scratch_cleanup_failure(
         "Scratch restore unit or mount cleanup could not be confirmed."
     )
     setattr(cleanup_error, "scratch_cleanup_status", cleanup_status)
+    if cleanup_diagnostic is not None:
+        setattr(cleanup_error, "scratch_cleanup_diagnostic", cleanup_diagnostic)
     if authorization_probe:
         setattr(cleanup_error, "scratch_authorization_probe", True)
     _retain_first_scratch_fault(
@@ -1639,6 +1671,100 @@ def valid_scratch_allocation_attribution(value: Any) -> bool:
 def valid_scratch_cleanup_status(value: Any) -> bool:
     """Validate the closed, private cleanup outcome enum."""
     return type(value) is str and value in {"confirmed", "failed", "unknown"}
+
+
+def valid_scratch_cleanup_diagnostic(value: Any) -> bool:
+    """Validate the post-finalizer observations without treating unknown as success."""
+    keys = {
+        "schema",
+        "service_stopped",
+        "mount_absent",
+        "mountpoint_removed",
+        "loop_released",
+        "image_created_by_invocation",
+        "image_unlinked",
+        "retention_receipt_written",
+        "protected_paths_cleaned",
+        "cleanup_status",
+    }
+    if (
+        type(value) is not dict
+        or set(value) != keys
+        or type(value.get("schema")) is not int
+        or value["schema"] != 1
+    ):
+        return False
+    for field in keys - {"schema", "cleanup_status"}:
+        if value[field] is not None and type(value[field]) is not bool:
+            return False
+    if not valid_scratch_cleanup_status(value["cleanup_status"]):
+        return False
+    if value["image_created_by_invocation"] is False and any(
+        value[field] is not None
+        for field in (
+            "loop_released",
+            "image_unlinked",
+            "retention_receipt_written",
+        )
+    ):
+        return False
+    if value["image_created_by_invocation"] is True and (
+        value["image_unlinked"] is True
+        and value["loop_released"] is not True
+    ):
+        return False
+    if value["image_created_by_invocation"] is True and (
+        value["image_unlinked"] is False
+        and value["retention_receipt_written"] is None
+    ):
+        return False
+    if value["image_created_by_invocation"] is True and (
+        value["image_unlinked"] is True
+        and value["retention_receipt_written"] is not None
+    ):
+        return False
+    if value["image_created_by_invocation"] is None and any(
+        value[field] is not None
+        for field in ("loop_released", "image_unlinked", "retention_receipt_written")
+    ):
+        return False
+    if value["image_unlinked"] is True and (
+        value["service_stopped"] is not True
+        or value["mount_absent"] is not True
+        or value["mountpoint_removed"] is not True
+        or value["loop_released"] is not True
+        or value["retention_receipt_written"] is not None
+    ):
+        return False
+    if value["image_unlinked"] is False and (
+        value["service_stopped"] is not True
+        or value["mount_absent"] is not True
+        or value["mountpoint_removed"] is not True
+        or value["loop_released"] is not True
+        or value["retention_receipt_written"] is None
+    ):
+        return False
+    if value["loop_released"] is False and value["image_unlinked"] is not None:
+        return False
+    if value["retention_receipt_written"] is True and value["image_unlinked"] is True:
+        return False
+    if value["cleanup_status"] == "confirmed" and any(
+        value[field] is not True
+        for field in (
+            "service_stopped",
+            "mount_absent",
+            "mountpoint_removed",
+            "protected_paths_cleaned",
+        )
+    ):
+        return False
+    if value["cleanup_status"] == "confirmed" and value[
+        "image_created_by_invocation"
+    ] is True and (
+        value["loop_released"] is not True or value["image_unlinked"] is not True
+    ):
+        return False
+    return True
 
 
 def parse_scratch_host_guard_frame(
@@ -2956,6 +3082,77 @@ def _scratch_validate_image_directory(path: pathlib.Path) -> os.stat_result:
     return info
 
 
+def valid_scratch_image_identity_diagnostic(value: Any) -> bool:
+    """Validate the closed projection for a failed synthetic image identity check."""
+    expected_keys = {
+        "schema",
+        "predicates",
+        "failed_predicate",
+        "observed_size",
+        "expected_size",
+        "allocated_bytes",
+        "observed_mode",
+        "expected_mode",
+        "observed_nlink",
+        "expected_nlink",
+    }
+    if (
+        type(value) is not dict
+        or set(value) != expected_keys
+        or type(value.get("schema")) is not int
+        or value["schema"] != 1
+    ):
+        return False
+    predicates = value.get("predicates")
+    if (
+        type(predicates) is not dict
+        or set(predicates) != set(SCRATCH_IMAGE_IDENTITY_PREDICATES)
+        or any(type(result) is not bool for result in predicates.values())
+    ):
+        return False
+    first_failed = next(
+        (name for name in SCRATCH_IMAGE_IDENTITY_PREDICATES if not predicates[name]), None
+    )
+    if (
+        first_failed is None
+        or type(value.get("failed_predicate")) is not str
+        or value["failed_predicate"] != first_failed
+    ):
+        return False
+    exact_int_ranges = {
+        "observed_size": (0, 2**63 - 1),
+        "expected_size": (1, 2**63 - 1),
+        "allocated_bytes": (0, 2**63 - 1),
+        "observed_mode": (0, 0o7777),
+        "expected_mode": (0, 0o7777),
+        "observed_nlink": (0, 2**31 - 1),
+        "expected_nlink": (1, 2**31 - 1),
+    }
+    for name, (minimum, maximum) in exact_int_ranges.items():
+        observed = value.get(name)
+        if type(observed) is not int or not minimum <= observed <= maximum:
+            return False
+    predicates = value["predicates"]
+    if predicates["exact_size"] is not (
+        value["observed_size"] == value["expected_size"]
+    ):
+        return False
+    if predicates["fully_allocated"] is not (
+        value["allocated_bytes"] >= value["observed_size"]
+    ):
+        return False
+    if predicates["owner_mode_nlink"] and (
+        value["observed_mode"] != value["expected_mode"]
+        or value["observed_nlink"] != value["expected_nlink"]
+    ):
+        return False
+    return (
+        value["expected_size"] == SCRATCH_DISK_IMAGE_BYTES
+        and value["expected_mode"] == 0o600
+        and value["expected_nlink"] == 1
+    )
+
+
 def _scratch_image_path_identity(path: pathlib.Path) -> tuple[int, int, int, int, int, int, int]:
     """Validate the exact root-owned, fixed-size, fully allocated image inode."""
     parent_before = _scratch_validate_image_directory(path.parent)
@@ -2977,18 +3174,35 @@ def _scratch_image_path_identity(path: pathlib.Path) -> tuple[int, int, int, int
             stat.S_IMODE(opened.st_mode),
             opened.st_nlink,
         )
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or identity[2] != SCRATCH_DISK_IMAGE_BYTES
-            or identity[3:] != (0, 0, 0o600, 1)
-            or (opened.st_dev, opened.st_ino, opened.st_size)
-            != (current.st_dev, current.st_ino, current.st_size)
-            or (parent_before.st_dev, parent_before.st_ino)
-            != (parent_after.st_dev, parent_after.st_ino)
-            or opened.st_dev != parent_after.st_dev
-            or opened.st_blocks * 512 < opened.st_size
-        ):
-            raise RuntimeError("Scratch disk image inode failed its fixed allocation contract.")
+        predicates = {
+            "regular_file": stat.S_ISREG(opened.st_mode),
+            "exact_size": identity[2] == SCRATCH_DISK_IMAGE_BYTES,
+            "owner_mode_nlink": identity[3:] == (0, 0, 0o600, 1),
+            "path_inode_match": (opened.st_dev, opened.st_ino, opened.st_size)
+            == (current.st_dev, current.st_ino, current.st_size),
+            "parent_identity_stable": (parent_before.st_dev, parent_before.st_ino)
+            == (parent_after.st_dev, parent_after.st_ino),
+            "same_filesystem": opened.st_dev == parent_after.st_dev,
+            "fully_allocated": opened.st_blocks * 512 >= opened.st_size,
+        }
+        if not all(predicates.values()):
+            diagnostic = {
+                "schema": 1,
+                "predicates": predicates,
+                "failed_predicate": next(
+                    name for name in SCRATCH_IMAGE_IDENTITY_PREDICATES if not predicates[name]
+                ),
+                "observed_size": opened.st_size,
+                "expected_size": SCRATCH_DISK_IMAGE_BYTES,
+                "allocated_bytes": opened.st_blocks * 512,
+                "observed_mode": stat.S_IMODE(opened.st_mode),
+                "expected_mode": 0o600,
+                "observed_nlink": opened.st_nlink,
+                "expected_nlink": 1,
+            }
+            error = RuntimeError("Scratch disk image inode failed its fixed allocation contract.")
+            setattr(error, "scratch_image_identity_diagnostic", diagnostic)
+            raise error
         return identity
     finally:
         os.close(descriptor)
@@ -3066,8 +3280,12 @@ def _scratch_prepare_disk_image(token: str) -> tuple[pathlib.Path, tuple[int, in
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor: int | None = None
     created_identity: tuple[int, int] | None = None
+    image_created_by_invocation = False
+    image_unlinked: bool | None = None
+    retention_receipt_written: bool | None = None
     try:
         descriptor = os.open(path, flags, 0o600)
+        image_created_by_invocation = True
         info = os.fstat(descriptor)
         created_identity = (info.st_dev, info.st_ino)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1:
@@ -3125,65 +3343,88 @@ def _scratch_prepare_disk_image(token: str) -> tuple[pathlib.Path, tuple[int, in
                 phase="scratch_image_postallocation",
             )
         return path, identity
-    except BaseException:
+    except BaseException as setup_error:
         # This image has not been offered to systemd yet. Remove only the inode
         # this call created; if identity changed, preserve it for investigation.
         try:
+            path_info = path.lstat() if image_created_by_invocation else None
+            descriptor_identity_matches = False
             if descriptor is not None and created_identity is not None:
                 current = os.fstat(descriptor)
-                path_info = path.lstat()
-                if (current.st_dev, current.st_ino) == created_identity == (
+                assert path_info is not None
+                descriptor_identity_matches = (
+                    (current.st_dev, current.st_ino) == created_identity == (
                     path_info.st_dev, path_info.st_ino
-                ):
+                    )
+                )
+            if descriptor_identity_matches:
+                try:
+                    path.unlink()
+                    _scratch_fsync_directory(parent)
+                    image_unlinked = True
+                except BaseException:
+                    image_unlinked = False
                     try:
-                        path.unlink()
-                        _scratch_fsync_directory(parent)
+                        retained = path.lstat()
+                        if (retained.st_dev, retained.st_ino) == created_identity:
+                            retained_identity = (
+                                retained.st_dev,
+                                retained.st_ino,
+                                retained.st_size,
+                                retained.st_uid,
+                                retained.st_gid,
+                                stat.S_IMODE(retained.st_mode),
+                                retained.st_nlink,
+                            )
+                            _scratch_write_image_cleanup_receipt(
+                                path,
+                                retained_identity,
+                                unit_name=f"oldsparky-backup-restore-{token}.service",
+                                reason="cleanup_observer_failed",
+                            )
+                            retention_receipt_written = True
+                    except FileNotFoundError:
+                        image_unlinked = True
                     except BaseException:
-                        try:
-                            retained = path.lstat()
-                            if (retained.st_dev, retained.st_ino) == created_identity:
-                                retained_identity = (
-                                    retained.st_dev,
-                                    retained.st_ino,
-                                    retained.st_size,
-                                    retained.st_uid,
-                                    retained.st_gid,
-                                    stat.S_IMODE(retained.st_mode),
-                                    retained.st_nlink,
-                                )
-                                _scratch_write_image_cleanup_receipt(
-                                    path,
-                                    retained_identity,
-                                    unit_name=f"oldsparky-backup-restore-{token}.service",
-                                    reason="cleanup_observer_failed",
-                                )
-                        except FileNotFoundError:
-                            pass
-                elif (
+                        retention_receipt_written = False
+            elif image_created_by_invocation and path_info is not None and (
                     stat.S_ISREG(path_info.st_mode)
                     and path_info.st_uid == 0
                     and path_info.st_gid == 0
                     and path_info.st_nlink == 1
-                ):
-                    retained_identity = (
-                        path_info.st_dev,
-                        path_info.st_ino,
-                        path_info.st_size,
-                        path_info.st_uid,
-                        path_info.st_gid,
-                        stat.S_IMODE(path_info.st_mode),
-                        path_info.st_nlink,
-                    )
-                    _scratch_write_image_cleanup_receipt(
-                        path,
-                        retained_identity,
-                        unit_name=f"oldsparky-backup-restore-{token}.service",
-                        reason="image_identity_changed",
-                    )
+            ):
+                retained_identity = (
+                    path_info.st_dev,
+                    path_info.st_ino,
+                    path_info.st_size,
+                    path_info.st_uid,
+                    path_info.st_gid,
+                    stat.S_IMODE(path_info.st_mode),
+                    path_info.st_nlink,
+                )
+                _scratch_write_image_cleanup_receipt(
+                    path,
+                    retained_identity,
+                    unit_name=f"oldsparky-backup-restore-{token}.service",
+                    reason="image_identity_changed",
+                )
+                retention_receipt_written = True
         except BaseException:
             # Preserve the first setup fault. The exact pathname and inode are
             # left untouched whenever ownership cannot be proven.
             pass
+        setattr(
+            setup_error,
+            "scratch_image_created_by_invocation",
+            image_created_by_invocation,
+        )
+        setattr(setup_error, "scratch_image_unlinked", image_unlinked)
+        setattr(
+            setup_error,
+            "scratch_loop_released",
+            True if image_created_by_invocation else None,
+        )
+        setattr(setup_error, "scratch_retention_receipt_written", retention_receipt_written)
         raise
     finally:
         if descriptor is not None:
@@ -8477,6 +8718,7 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         args._scratch_verification_site = "worker_postgres_account_identity"
         postgres = pwd.getpwnam("postgres")
     if getattr(args, "_scratch_synthetic_restore_diagnostic", False):
+        args._scratch_fault_site = "worker_entry"
         if getattr(args, "_scratch_authorization_probe", False) or any(
             getattr(args, name, None) is not None
             for name in (
@@ -8485,7 +8727,6 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
             )
         ):
             raise RuntimeError("Synthetic restore diagnostic must not receive archive inputs.")
-        args._scratch_fault_site = "worker_synthetic_restore_diagnostic"
         report = _scratch_synthetic_restore_diagnostic_worker(args, root)
         result_stream = getattr(sys.stdout, "buffer", None)
         if result_stream is None:
@@ -10508,6 +10749,13 @@ def _run_isolated_restore_drill(
             else None
         )
         image_identity: tuple[int, int, int, int, int, int, int] | None = None
+        image_created_by_invocation: bool | None = (
+            False
+            if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+            else None
+        )
+        mountpoint_identity: tuple[int, int] | None = None
+        mountpoint_created = False
         fault_site = "controller_unit_setup"
         command = _scratch_unit_command(
             mountpoint=mountpoint,
@@ -10598,6 +10846,7 @@ def _run_isolated_restore_drill(
                         synthetic_opt_parent_adjustment = adjustment
                     raise
             os.mkdir(mountpoint, 0o700)
+            mountpoint_created = True
             mountpoint_stat = mountpoint.lstat()
             mountpoint_identity = (mountpoint_stat.st_dev, mountpoint_stat.st_ino)
             if (
@@ -10611,33 +10860,66 @@ def _run_isolated_restore_drill(
                 raise RuntimeError("Scratch restore mountpoint identity is unsafe.")
             if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
                 assert image_path is not None
-                image_path, image_identity = _scratch_prepare_disk_image(token)
+                try:
+                    image_path, image_identity = _scratch_prepare_disk_image(token)
+                    image_created_by_invocation = True
+                except BaseException as image_error:
+                    image_created_by_invocation = getattr(
+                        image_error,
+                        "scratch_image_created_by_invocation",
+                        image_created_by_invocation,
+                    )
+                    raise
         except BaseException as setup_error:
             fixture_cleanup_failed = False
+            setup_cleanup_errors: list[BaseException] = []
+            image_unlinked: bool | None = getattr(
+                setup_error, "scratch_image_unlinked", None
+            )
+            retention_receipt_written: bool | None = getattr(
+                setup_error, "scratch_retention_receipt_written", None
+            )
             if image_path is not None and image_identity is not None:
                 try:
                     current_image = _scratch_image_path_identity(image_path)
                     if current_image == image_identity:
                         image_path.unlink()
                         _scratch_fsync_directory(image_path.parent)
+                        image_created_by_invocation = True
+                        image_unlinked = True
+                        retention_receipt_written = None
+                    else:
+                        image_unlinked = False
                 except BaseException:
                     # Before systemd receives the source, uncertainty retains
                     # the exact root-owned inode rather than risking a wrong delete.
-                    pass
-            try:
-                current_mountpoint = mountpoint.lstat()
-                if (
-                    (current_mountpoint.st_dev, current_mountpoint.st_ino)
-                    == mountpoint_identity
-                    and stat.S_ISDIR(current_mountpoint.st_mode)
-                    and current_mountpoint.st_uid == 0
-                    and current_mountpoint.st_gid == 0
-                    and stat.S_IMODE(current_mountpoint.st_mode) == 0o700
-                    and not any(mountpoint.iterdir())
-                ):
-                    mountpoint.rmdir()
-            except BaseException:
-                pass
+                    image_unlinked = None
+                    setup_cleanup_errors.append(RuntimeError("Scratch image cleanup was not confirmed."))
+            mountpoint_removed = not mountpoint_created
+            if mountpoint_created:
+                try:
+                    current_mountpoint = mountpoint.lstat()
+                    if (
+                        mountpoint_identity is not None
+                        and (current_mountpoint.st_dev, current_mountpoint.st_ino)
+                        == mountpoint_identity
+                        and stat.S_ISDIR(current_mountpoint.st_mode)
+                        and current_mountpoint.st_uid == 0
+                        and current_mountpoint.st_gid == 0
+                        and stat.S_IMODE(current_mountpoint.st_mode) == 0o700
+                        and not any(mountpoint.iterdir())
+                    ):
+                        mountpoint.rmdir()
+                        mountpoint_removed = True
+                    else:
+                        mountpoint_removed = False
+                except FileNotFoundError:
+                    mountpoint_removed = True
+                except BaseException:
+                    mountpoint_removed = None
+                    setup_cleanup_errors.append(
+                        RuntimeError("Scratch mountpoint cleanup was not confirmed.")
+                    )
             if synthetic_restore_diagnostic:
                 try:
                     _scratch_remove_created_protected_path_directories(
@@ -10657,11 +10939,43 @@ def _run_isolated_restore_drill(
                         synthetic_opt_parent_adjustment = None
                     except BaseException:
                         fixture_cleanup_failed = True
+            loop_released = (
+                True
+                if image_created_by_invocation is True and not launch_started
+                else getattr(setup_error, "scratch_loop_released", None)
+            )
+            _scratch_cleanup_failure(
+                setup_error,
+                setup_cleanup_errors,
+                authorization_probe=authorization_probe,
+                service_stopped=not launch_started,
+                mount_absent=True if not launch_started else None,
+                mountpoint_removed=mountpoint_removed,
+                loop_released=loop_released,
+                image_created_by_invocation=image_created_by_invocation,
+                image_removed=image_unlinked,
+                retention_receipt_written=retention_receipt_written,
+                protected_paths_cleaned=not fixture_cleanup_failed,
+            )
             signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
             if fixture_cleanup_failed:
-                raise RuntimeError(
+                cleanup_error = RuntimeError(
                     "Synthetic protected path fixture setup failed and cleanup could not be confirmed."
-                ) from setup_error
+                )
+                for name in (
+                    "scratch_cleanup_status",
+                    "scratch_cleanup_diagnostic",
+                    "scratch_first_fault",
+                    "scratch_image_identity_diagnostic",
+                    "scratch_unit_diagnostic",
+                    "scratch_unit_journal_diagnostic",
+                    "scratch_unit_private_output",
+                    "scratch_synthetic_stderr_tail",
+                    "scratch_synthetic_stderr_tail_complete",
+                ):
+                    if hasattr(setup_error, name):
+                        setattr(cleanup_error, name, getattr(setup_error, name))
+                raise cleanup_error from setup_error
             raise
         try:
             # A pending TERM/INT is delivered only after the exact host
@@ -11483,7 +11797,7 @@ def _run_isolated_restore_drill(
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             final_cleanup_errors: list[BaseException] = []
-            service_stopped = not launch_started
+            service_stopped: bool | None = True if not launch_started else None
             if launch_started:
                 try:
                     final_snapshot = _scratch_service_snapshot(unit_name)
@@ -11508,11 +11822,12 @@ def _run_isolated_restore_drill(
                             )
                         )
                 except BaseException as cleanup_error:
+                    service_stopped = None
                     final_cleanup_errors.append(cleanup_error)
             try:
                 mount_absent = not _scratch_mountpoint_is_mounted(mountpoint)
             except BaseException as cleanup_error:
-                mount_absent = False
+                mount_absent = None
                 final_cleanup_errors.append(cleanup_error)
             try:
                 current_mountpoint = mountpoint.lstat()
@@ -11531,11 +11846,13 @@ def _run_isolated_restore_drill(
             except FileNotFoundError:
                 mountpoint_removed = False
             except BaseException as cleanup_error:
-                mountpoint_removed = False
+                mountpoint_removed = None
                 final_cleanup_errors.append(cleanup_error)
+            loop_released: bool | None = None
             image_removed: bool | None = None
+            retention_receipt_written: bool | None = None
             if image_path is not None and image_identity is not None:
-                image_removed = False
+                image_created_by_invocation = True
                 retain_reason = "cleanup_observer_failed"
                 try:
                     if not service_stopped:
@@ -11545,8 +11862,11 @@ def _run_isolated_restore_drill(
                     elif not mountpoint_removed:
                         retain_reason = "mountpoint_not_removed"
                     elif not _scratch_wait_for_image_loop_release(image_path, image_identity):
+                        loop_released = False
                         retain_reason = "loop_association_persists"
                     else:
+                        loop_released = True
+                        image_removed = False
                         _scratch_unlink_image_exact(image_path, image_identity)
                         image_removed = True
                 except BaseException as cleanup_error:
@@ -11559,6 +11879,7 @@ def _run_isolated_restore_drill(
                         retain_reason = "image_identity_changed"
                     final_cleanup_errors.append(cleanup_error)
                 if not image_removed:
+                    retention_receipt_written = False
                     try:
                         _scratch_write_image_cleanup_receipt(
                             image_path,
@@ -11566,6 +11887,7 @@ def _run_isolated_restore_drill(
                             unit_name=unit_name,
                             reason=retain_reason,
                         )
+                        retention_receipt_written = True
                     except BaseException as cleanup_error:
                         final_cleanup_errors.append(cleanup_error)
                     final_cleanup_errors.append(
@@ -11646,7 +11968,10 @@ def _run_isolated_restore_drill(
                 service_stopped=service_stopped,
                 mount_absent=mount_absent,
                 mountpoint_removed=mountpoint_removed,
+                loop_released=loop_released,
+                image_created_by_invocation=image_created_by_invocation,
                 image_removed=image_removed,
+                retention_receipt_written=retention_receipt_written,
                 protected_paths_cleaned=protected_paths_cleaned,
             )
             if cleanup_failure is not None:
