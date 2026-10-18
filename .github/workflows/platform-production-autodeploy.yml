@@ -1178,6 +1178,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          SECURITY_WORKFLOW_FILE: platform-security.yml
         run: |
           set -euo pipefail
           metadata_dir="$(mktemp -d "$RUNNER_TEMP/platform-final-security.XXXXXX")"

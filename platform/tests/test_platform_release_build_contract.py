@@ -2133,6 +2133,89 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         auto = (
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
         ).read_text(encoding="utf-8")
+        import yaml
+
+        auto_document = yaml.safe_load(auto)
+        dispatch_production = auto_document["jobs"]["dispatch-production"]
+        dispatch_production_env = dispatch_production.get("env", {})
+        final_security_step_object = next(
+            step
+            for step in dispatch_production["steps"]
+            if step.get("name") == "Revalidate current dev and exact successful Security run"
+        )
+        final_security_step_env = final_security_step_object.get("env", {})
+        self.assertEqual(
+            final_security_step_env.get("SECURITY_WORKFLOW_FILE"),
+            "platform-security.yml",
+        )
+        self.assertEqual(
+            final_security_step_env.get("GH_TOKEN"), "${{ github.token }}"
+        )
+        final_backup_step_object = next(
+            step
+            for step in dispatch_production["steps"]
+            if step.get("name") == "Revalidate exact successful source-bound backup"
+        )
+        final_dispatch_step_object = next(
+            step
+            for step in dispatch_production["steps"]
+            if step.get("name")
+            == "Dispatch production deployment or baseline reconciliation"
+        )
+        github_runtime_env = {
+            "GITHUB_API_URL",
+            "GITHUB_REPOSITORY",
+            "GITHUB_WORKSPACE",
+            "RUNNER_TEMP",
+        }
+        for step_object, required_env in (
+            (
+                final_security_step_object,
+                {
+                    "GH_TOKEN",
+                    "SECURITY_WORKFLOW_FILE",
+                    "TARGET_SHA",
+                    "SOURCE_RUN_ID",
+                    "SOURCE_RUN_ATTEMPT",
+                    "SOURCE_RUN_URL",
+                    "PROVENANCE_TOOL",
+                    *github_runtime_env,
+                },
+            ),
+            (
+                final_backup_step_object,
+                {
+                    "GH_TOKEN",
+                    "GITHUB_REPOSITORY",
+                    "GITHUB_API_URL",
+                    "SOURCE_SECURITY_RUN_ID",
+                    "SOURCE_SECURITY_RUN_ATTEMPT",
+                    "TARGET_SHA",
+                    "BACKUP_GUARD_TOOL",
+                },
+            ),
+            (
+                final_dispatch_step_object,
+                {
+                    "GH_TOKEN",
+                    "DISPATCH_MODE",
+                    "ROUTE_CLASS",
+                    "ROUTE_DEPLOYABLE",
+                    "ROUTE_RECOVERY_BOOTSTRAP_ONLY",
+                    "ROUTE_CANDIDATE_PACKAGING_ONLY",
+                    "AUTODEPLOY_RUN_ID",
+                    "AUTODEPLOY_RUN_ATTEMPT",
+                    "HOST_TOOLS_SHA",
+                    "SOURCE_RUN_ID",
+                    "SOURCE_RUN_ATTEMPT",
+                    *github_runtime_env,
+                },
+            ),
+        ):
+            declared_env = set(dispatch_production_env) | set(
+                step_object.get("env", {})
+            )
+            self.assertLessEqual(required_env, declared_env | github_runtime_env)
         exact_source_checkout_start = auto.index(
             "      - name: Checkout exact source for shared provenance validation"
         )
@@ -2394,22 +2477,39 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             )
             fake_curl.chmod(0o755)
             environment = {
-                **os.environ,
                 "PATH": f"{fake_bin}:/usr/bin:/bin",
                 "RUNNER_TEMP": str(runner_temp),
                 "GITHUB_WORKSPACE": str(workspace),
                 "GITHUB_API_URL": "https://api.github.invalid",
                 "GITHUB_REPOSITORY": "StrayForest/old_sparky",
-                "GH_TOKEN": "synthetic-contract-token",
+                "API_FIXTURES": str(fixture_path),
+                "REQUEST_LOG": str(request_log),
+            }
+            resolved_job_env = {
                 "TARGET_SHA": target_sha,
                 "SOURCE_RUN_ID": source_run_id,
                 "SOURCE_RUN_ATTEMPT": source_attempt,
                 "SOURCE_RUN_URL": source_run_url,
-                "SECURITY_WORKFLOW_FILE": "platform-security.yml",
                 "PROVENANCE_TOOL": str(workspace_tools / "platform_workflow_provenance.py"),
-                "API_FIXTURES": str(fixture_path),
-                "REQUEST_LOG": str(request_log),
             }
+            expected_job_env = {
+                "TARGET_SHA": "${{ github.event.workflow_run.head_sha }}",
+                "SOURCE_RUN_ID": "${{ github.event.workflow_run.id }}",
+                "SOURCE_RUN_ATTEMPT": "${{ github.event.workflow_run.run_attempt }}",
+                "SOURCE_RUN_URL": "${{ github.event.workflow_run.html_url }}",
+                "PROVENANCE_TOOL": "${{ github.workspace }}/platform/tools/platform_workflow_provenance.py",
+            }
+            for name, expected in expected_job_env.items():
+                self.assertEqual(dispatch_production_env.get(name), expected)
+            environment.update(resolved_job_env)
+            environment.update(
+                {
+                    "GH_TOKEN": "synthetic-contract-token",
+                    "SECURITY_WORKFLOW_FILE": final_security_step_env[
+                        "SECURITY_WORKFLOW_FILE"
+                    ],
+                }
+            )
             passed = subprocess.run(
                 ["/bin/bash", "-c", final_security_script],
                 env=environment,
@@ -2429,6 +2529,33 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             )
             self.assertNotIn("synthetic-contract-token", passed.stdout + passed.stderr)
             self.assertNotIn("synthetic-contract-token", request_log.read_text(encoding="utf-8"))
+
+            request_log.unlink()
+            missing_workflow_file_env = dict(environment)
+            del missing_workflow_file_env["SECURITY_WORKFLOW_FILE"]
+            missing_workflow_file = subprocess.run(
+                ["/bin/bash", "-c", final_security_script],
+                env=missing_workflow_file_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertNotEqual(missing_workflow_file.returncode, 0)
+            self.assertIn(
+                "SECURITY_WORKFLOW_FILE: unbound variable",
+                missing_workflow_file.stderr,
+            )
+            missing_env_requests = [
+                (row["method"], row["url"], row["output"])
+                for row in map(
+                    json.loads, request_log.read_text(encoding="utf-8").splitlines()
+                )
+            ]
+            self.assertEqual(
+                missing_env_requests,
+                [("GET", f"{api_root}/branches/dev", "-")],
+            )
 
             legacy_script = final_security_script.replace(
                 "actions/workflows/${SECURITY_WORKFLOW_FILE}",
