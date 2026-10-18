@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import re
+import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import textwrap
 import unittest
 
 
@@ -70,6 +75,130 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertIn("steps.cleanup.outputs.cleanup_status", jobs["fixture-finalize"])
         self.assertIn("Remove fixture-setup SSH material", jobs["fixture-setup"])
         self.assertIn("Remove finalizer SSH material", jobs["fixture-finalize"])
+
+        fixture_setup = jobs["fixture-setup"]
+        finalizer = jobs["fixture-finalize"]
+        self.assertIn("supervisor_exit_status:", fixture_setup)
+        self.assertIn("pre_candidate_cleanup_allowed:", fixture_setup)
+        self.assertIn("rb\"(?:0|[1-9][0-9]{0,2})\\n\"", fixture_setup)
+        self.assertIn("if value > 255", fixture_setup)
+        self.assertIn("needs.load-client.result == 'skipped'", finalizer)
+        self.assertIn("needs['cpu-diagnostic-pair'].result == 'skipped'", finalizer)
+        self.assertIn("needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1'", finalizer)
+        self.assertIn("needs.fixture-setup.outputs.manifest_ready != '1'", finalizer)
+        self.assertIn("needs.fixture-setup.outputs.manifest_ready == '1'", finalizer)
+        self.assertIn("needs.namespace-containment-barrier.outputs.namespace_closed_status == '0'", finalizer)
+        self.assertIn("manual_required=1", jobs["namespace-containment-manual-barrier"])
+        self.assertIn("external-cleanup-exports < \"$input_path\"", finalizer)
+        self.assertIn("supervisor_status", fixture_setup)
+
+        cleanup_conditions: list[str] = []
+        finalizer_lines = finalizer.splitlines()
+        for index, line in enumerate(finalizer_lines):
+            if line.strip() != "if: >-":
+                continue
+            condition_lines: list[str] = []
+            for following in finalizer_lines[index + 1:]:
+                if not following.startswith("          "):
+                    break
+                condition_lines.append(following.strip())
+            if condition_lines and condition_lines[0].startswith("always() &&"):
+                cleanup_conditions.append(" ".join(condition_lines))
+        self.assertEqual(len(cleanup_conditions), 3)
+        self.assertEqual(len(set(cleanup_conditions)), 1)
+        condition = cleanup_conditions[0]
+        substitutions = {
+            "needs['cpu-diagnostic-pair'].result == 'skipped'": "pair_skipped",
+            "needs.namespace-containment-barrier.outputs.namespace_closed_status == '0'": "namespace_closed",
+            "needs.namespace-containment-manual-barrier.outputs.manual_required == '0'": "manual_clear",
+            "needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1'": "cleanup_flag",
+            "needs.fixture-setup.outputs.manifest_ready != '1'": "manifest_missing",
+            "needs.load-client.result == 'skipped'": "load_skipped",
+            "inputs.cpu_diagnostic_only == true": "cpu_only",
+            "inputs.ssr_capacity_diagnostic_only == true": "ssr_only",
+            "always()": "always_true",
+        }
+        for original, replacement in substitutions.items():
+            condition = condition.replace(original, replacement)
+        condition = condition.replace("&&", " and ").replace("||", " or ")
+
+        def allows_cleanup(**overrides: bool) -> bool:
+            values = {
+                "always_true": True,
+                "namespace_closed": False,
+                "manual_clear": False,
+                "cpu_only": True,
+                "ssr_only": False,
+                "cleanup_flag": True,
+                "manifest_missing": True,
+                "load_skipped": True,
+                "pair_skipped": True,
+                **overrides,
+            }
+            return bool(eval(condition, {"__builtins__": {}}, values))
+
+        self.assertTrue(allows_cleanup())
+        self.assertTrue(allows_cleanup(namespace_closed=True, manual_clear=True, cleanup_flag=False))
+        for denied in (
+            {"cleanup_flag": False},
+            {"manifest_missing": False},
+            {"load_skipped": False},
+            {"pair_skipped": False},
+            {"cpu_only": False, "ssr_only": False},
+        ):
+            with self.subTest(denied=denied):
+                self.assertFalse(allows_cleanup(**denied))
+        self.assertIn(
+            "needs.fixture-setup.outputs.manifest_ready == '1'",
+            finalizer[finalizer.index("id: external-finalize"):],
+        )
+        self.assertIn("namespace_closed_status == '0'", finalizer[finalizer.index("id: cleanup"):])
+
+        parser_match = re.search(
+            r'(?ms)^\s*supervisor_status="\$\(/usr/bin/python3 - "\$artifact_dir/supervisor\.exit\.download" <<\'PY\'\n(.*?)^\s*PY\n\s*\)"',
+            fixture_setup,
+        )
+        self.assertIsNotNone(parser_match)
+        parser_source = textwrap.dedent(parser_match.group(1))
+
+        def parse_status(raw: bytes) -> subprocess.CompletedProcess[bytes]:
+            with tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                marker = directory / "supervisor.exit"
+                marker.write_bytes(raw)
+                marker.chmod(0o600)
+                return subprocess.run(
+                    [sys.executable, "-c", parser_source, str(marker)],
+                    capture_output=True,
+                    check=False,
+                )
+
+        for valid in (b"0\n", b"1\n", b"137\n", b"255\n"):
+            with self.subTest(valid_status=valid):
+                parsed = parse_status(valid)
+                self.assertEqual(parsed.returncode, 0)
+                self.assertEqual(parsed.stdout, valid)
+                self.assertEqual(parsed.stderr, b"")
+        for malformed in (b"00\n", b"+1\n", b"256\n", b"1", b"1\n\n", b"\xff\n"):
+            with self.subTest(invalid_status=malformed):
+                parsed = parse_status(malformed)
+                self.assertEqual(parsed.returncode, 2)
+                self.assertEqual(parsed.stdout, b"")
+                self.assertEqual(parsed.stderr, b"")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            marker = directory / "supervisor.exit"
+            marker.write_bytes(b"1\n")
+            marker.chmod(0o600)
+            hardlink = directory / "linked"
+            os.link(marker, hardlink)
+            linked = subprocess.run(
+                [sys.executable, "-c", parser_source, str(marker)],
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(linked.returncode, 2)
+            self.assertEqual(linked.stdout, b"")
 
     def test_live_launch_sanitizer_is_a_fresh_secret_free_failure_barrier(self) -> None:
         source = _workflow("platform-live-launch.yml")

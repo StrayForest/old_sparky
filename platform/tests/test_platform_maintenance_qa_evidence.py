@@ -533,6 +533,40 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
 
         source_path = REPO_ROOT / "platform/deploy/systemd/deadlock-maintenance.service"
         source_bytes = source_path.read_bytes()
+        diagnostics_workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'maintenance_unit_source="$runtime/releases/$current_id/deploy/systemd/deadlock-maintenance.service"',
+            diagnostics_workflow,
+        )
+        self.assertIn(
+            'run-retention-preview "$maintenance_unit_source"',
+            diagnostics_workflow,
+        )
+        self.assertNotIn(
+            'maintenance_unit_source="$current/deploy/systemd/deadlock-maintenance.service"',
+            diagnostics_workflow,
+        )
+        with tempfile.TemporaryDirectory(prefix="retention-source-path-") as temporary:
+            root = Path(temporary)
+            release_path = root / "releases" / "verified-release"
+            immutable_unit = release_path / "deploy/systemd/deadlock-maintenance.service"
+            immutable_unit.parent.mkdir(parents=True)
+            immutable_unit.write_bytes(source_bytes)
+            immutable_unit.chmod(0o600)
+            current_path = root / "current"
+            current_path.symlink_to(release_path, target_is_directory=True)
+            with self.assertRaises(evidence.EvidenceError):
+                evidence._safe_unit_bytes(
+                    str(current_path / "deploy/systemd/deadlock-maintenance.service"),
+                    installed=False,
+                )
+            self.assertEqual(
+                evidence._safe_unit_bytes(str(immutable_unit), installed=False),
+                source_bytes,
+            )
         preview_argv = evidence.maintenance_preview_argv()
         self.assertNotIn("--apply", preview_argv)
         self.assertEqual(
@@ -547,6 +581,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
         for slug in (
             "gha-38000614899-1-7e5769ba3f85",
             "gha-37760797674-1-80e457e57081",
+            "gha-38182702358-1-f1154c7dba4f",
         ):
             self.assertIn(slug, preview_argv)
         properties = _loaded_unit_properties()
@@ -581,6 +616,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             (
                 "gha-38000614899-1-7e5769ba3f85",
                 "gha-37760797674-1-80e457e57081",
+                "gha-38182702358-1-f1154c7dba4f",
             ),
         )
         invalid = properties.replace("NeedDaemonReload=no", "NeedDaemonReload=yes")

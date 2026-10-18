@@ -94,6 +94,8 @@ EXPECTED_MAINTENANCE_ARGV = (
     "gha-38000614899-1-7e5769ba3f85",
     "--protected-release",
     "gha-37760797674-1-80e457e57081",
+    "--protected-release",
+    "gha-38182702358-1-f1154c7dba4f",
     "--release-keep",
     "5",
     "--test-artifact-max-age-days",

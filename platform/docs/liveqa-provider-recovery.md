@@ -2,7 +2,7 @@
 
 - Status: Exceptional operator procedure
 - Owner: Production operator
-- Last reviewed: 2026-10-15
+- Last reviewed: 2026-10-19
 
 Use this procedure only when protected LiveQA consumers reference an exact
 immutable engine provider whose payload root is missing. It does not authorize
@@ -32,6 +32,20 @@ reconciler, switch active pointers, alter users or secrets, replace an existing
 provider, or remove other artifacts. On any mismatch, preserve protected state
 and stop. Provider recovery does not replace the required verified backup,
 browser QA or normal GitHub Actions release gates.
+
+The fixed recovery source `19603dfff122386726313c86b0350812ebbe8cca`
+publishes a provider payload with exactly one top-level `runtime` directory;
+that recovery writer does not create the regular provider `source-sha`
+sidecar. The trusted runtime guard allows that exact runtime-only shape only
+when the provider SHA is this fixed recovery source. Every ordinary provider
+still requires the root-owned, immutable `source-sha` marker. If the marker is
+present for the recovery SHA, it must be valid and match; a malformed marker,
+extra top-level entry or any other provider without a marker fails closed.
+This exception does not skip the active pointer, provider metadata, runtime
+manifest, file-map, size, mode, ownership, link-count or content-hash checks.
+The runtime's Node and browser files remain bound to the attested
+version-specific Playwright package lock and engine manifest; see the
+[Playwright browser installation guidance](https://playwright.dev/docs/browsers).
 
 The snapshot requires all three logical roles (`current`, `previous`, and the
 active LiveQA pointer), but validates provider manifests once per distinct

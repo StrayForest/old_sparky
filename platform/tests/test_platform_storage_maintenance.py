@@ -2761,6 +2761,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "protected-dump-files.json --backup-keep 15 "
                 "--protected-release gha-38000614899-1-7e5769ba3f85 "
                 "--protected-release gha-37760797674-1-80e457e57081 "
+                "--protected-release gha-38182702358-1-f1154c7dba4f "
                 "--release-keep 5 --test-artifact-max-age-days 7 "
                 "--screenshot-max-age-days 30 --failed-build-max-age-days 1 "
                 "--minimum-free-gib 5 --maximum-used-percent 85"
@@ -2779,12 +2780,28 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             REPO_ROOT
             / ".github/workflows/platform-production-storage-maintenance.yml"
         ).read_text()
+        storage_diagnostics_workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-storage-diagnostics.yml"
+        ).read_text()
         self.assertIn("exclusive_retained_load_lock", retention)
         self.assertIn("with release_operation_lock(app_dir)", maintenance_source)
         self.assertIn("with exclusive_retained_load_lock()", maintenance_source)
         self.assertIn("reverse load -> release edge", maintenance_workflow)
         self.assertNotIn(
             'exec 9>"$retained_load_lock"', maintenance_workflow
+        )
+        self.assertIn(
+            'maintenance_unit_source="$runtime/releases/$current_id/deploy/systemd/deadlock-maintenance.service"',
+            storage_diagnostics_workflow,
+        )
+        self.assertIn(
+            'run-retention-preview "$maintenance_unit_source"',
+            storage_diagnostics_workflow,
+        )
+        self.assertNotIn(
+            'maintenance_unit_source="$current/deploy/systemd/deadlock-maintenance.service"',
+            storage_diagnostics_workflow,
         )
         self.assertIn("CPUQuota=50%", service)
         self.assertIn("MemoryMax=512M", service)

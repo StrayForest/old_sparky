@@ -2,7 +2,7 @@
 
 - Status: Active reference and operator how-to
 - Owner: Performance and web verification owners
-- Last reviewed: 2026-10-10
+- Last reviewed: 2026-10-19
 
 This document owns the detailed retained-load cleanup, hermetic web verification,
 external-load workflow barrier and evidence-projection contracts. The
@@ -58,6 +58,21 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 | cleanup/export cleanup | `cleanup_status=0`, `cleanup_exports_status=0` |
 | handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
 | evaluation/projection | observer-bound accepted result, structurally complete profile-budget miss, or closed known-status failure; `sanitizer_status=0` |
+
+CPU-only and SSR-capacity fixture confirmations are accepted by the trusted
+origin supervisor only for the fixed one-tournament, fourteen-user fixture
+with timeout diagnostics disabled. The confirmation check runs after the
+run-bound export directory and its private `supervisor.exit` trap are created,
+but before fixture preparation. The runner polls the existing `ready` and
+manifest handoff first, then accepts only a bounded canonical exit status
+(`0`–`255`) from the exact run export. A nonzero status can authorize the
+separate exact cleanup attempt only when the manifest is absent and both the
+load-client and CPU/SSR candidate jobs are actually skipped. It never marks
+namespace closure or the manual barrier successful; the overall run remains
+failed, and the three-hour origin finalization poll is skipped without a
+manifest. Cleanup still uses the ordinary run-bound identity and control
+account-preservation checks. A missing, malformed or zero status without a
+manifest remains a manual-barrier failure.
 
 A structurally complete budget miss may pass through origin attachment and
 sanitization so its evidence is retained, but final workflow enforcement still

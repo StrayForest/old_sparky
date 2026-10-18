@@ -139,6 +139,7 @@ DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 UUID_PATTERN = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 MAX_JSON_BYTES = 64 * 1024
 MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES = 256 * 1024
+PROVIDER_RECOVERY_SOURCE_SHA = "19603dfff122386726313c86b0350812ebbe8cca"
 MAX_ACTIVE_MANIFEST_BYTES = 256 * 1024
 MAX_ZIP_ENTRIES = 20_000
 MAX_ZIP_MEMBER_BYTES = 768 * 1024 * 1024
@@ -2798,11 +2799,11 @@ def _trusted_runtime_root() -> Path:
     provider_sha = provider["provider_sha"]
     provider_payload = TRUSTED_PAYLOAD_ROOT / provider_sha
     provider_root = provider_payload / "runtime"
+    source_marker = provider_payload / "source-sha"
+    recovered_provider = False
     try:
         payload_meta = provider_payload.lstat()
         root_meta = provider_root.lstat()
-        source_meta = (provider_payload / "source-sha").lstat()
-        recorded_source = (provider_payload / "source-sha").read_text(encoding="ascii")
     except OSError as exc:
         raise GuardError("referenced live-QA engine provider is unavailable") from exc
     if (
@@ -2814,11 +2815,42 @@ def _trusted_runtime_root() -> Path:
         or not stat.S_ISDIR(root_meta.st_mode)
         or root_meta.st_uid != 0 or root_meta.st_gid != 0
         or root_meta.st_nlink < 2 or stat.S_IMODE(root_meta.st_mode) != 0o555
-        or stat.S_ISLNK(source_meta.st_mode)
-        or not stat.S_ISREG(source_meta.st_mode)
-        or source_meta.st_uid != 0 or source_meta.st_gid != 0
-        or source_meta.st_nlink != 1 or stat.S_IMODE(source_meta.st_mode) != 0o444
-        or recorded_source != provider_sha + "\n"
+    ):
+        raise GuardError("referenced live-QA engine provider metadata is unsafe")
+    try:
+        source_meta = source_marker.lstat()
+    except FileNotFoundError as exc:
+        try:
+            provider_entries = {entry.name for entry in provider_payload.iterdir()}
+        except OSError as entry_exc:
+            raise GuardError("referenced live-QA engine provider is unavailable") from entry_exc
+        if provider_sha != PROVIDER_RECOVERY_SOURCE_SHA or provider_entries != {"runtime"}:
+            raise GuardError("referenced live-QA engine provider is unavailable") from exc
+        recorded_source = None
+        recovered_provider = True
+    except OSError as exc:
+        raise GuardError("referenced live-QA engine provider is unavailable") from exc
+    else:
+        try:
+            recorded_source = source_marker.read_text(encoding="ascii")
+        except (OSError, UnicodeError) as exc:
+            raise GuardError("referenced live-QA engine provider is unavailable") from exc
+    if (
+        stat.S_ISLNK(payload_meta.st_mode)
+        or not stat.S_ISDIR(payload_meta.st_mode)
+        or payload_meta.st_uid != 0 or payload_meta.st_gid != 0
+        or payload_meta.st_nlink < 2 or stat.S_IMODE(payload_meta.st_mode) != 0o555
+        or stat.S_ISLNK(root_meta.st_mode)
+        or not stat.S_ISDIR(root_meta.st_mode)
+        or root_meta.st_uid != 0 or root_meta.st_gid != 0
+        or root_meta.st_nlink < 2 or stat.S_IMODE(root_meta.st_mode) != 0o555
+        or not recovered_provider and (
+            stat.S_ISLNK(source_meta.st_mode)
+            or not stat.S_ISREG(source_meta.st_mode)
+            or source_meta.st_uid != 0 or source_meta.st_gid != 0
+            or source_meta.st_nlink != 1 or stat.S_IMODE(source_meta.st_mode) != 0o444
+            or recorded_source != provider_sha + "\n"
+        )
     ):
         raise GuardError("referenced live-QA engine provider metadata is unsafe")
     expected_files = provider["engine_files"]

@@ -15,6 +15,8 @@ OUTPUT_ROOT_BASE="$RUNTIME_ROOT/shared/production-retained-matrix"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"
 TIMEOUT_DIAGNOSTICS_CONFIRMATION="RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS"
+CPU_DIAGNOSTIC_CONFIRMATION="RUN-PRODUCTION-CPU-DIAGNOSTIC"
+SSR_CAPACITY_CONFIRMATION="RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC"
 EXPECTED_ORIGIN="https://old-sparky.com"
 MAX_RUNTIME="180m"
 # Explicit ``-B`` flags below are the primary contract.  Keep this defense
@@ -158,18 +160,6 @@ fi
   echo "Timeout diagnostics mode must be true or false." >&2
   exit 1
 }
-if [[ "$timeout_diagnostics" == "true" ]]; then
-  [[ "$confirmation" == "$TIMEOUT_DIAGNOSTICS_CONFIRMATION" ]] || {
-    echo "Timeout diagnostics require the dedicated timeout-diagnostics confirmation." >&2
-    exit 1
-  }
-else
-  [[ "$confirmation" == "$EXTERNAL_CONFIRMATION" ]] || {
-    echo "External-load fixture requires the dedicated external-load confirmation." >&2
-    exit 1
-  }
-fi
-
 test -x "$QA_PYTHON" || {
   echo "Production QA Python runtime is missing." >&2
   exit 1
@@ -249,6 +239,33 @@ write_supervisor_exit() {
   exit "$supervisor_status"
 }
 trap write_supervisor_exit EXIT
+validate_fixture_confirmation() {
+  if [[ "$timeout_diagnostics" == "true" ]]; then
+    [[ "$confirmation" == "$TIMEOUT_DIAGNOSTICS_CONFIRMATION" ]] || {
+      echo "Timeout diagnostics require the dedicated timeout-diagnostics confirmation." >&2
+      return 1
+    }
+    return 0
+  fi
+  if [[ "$confirmation" == "$EXTERNAL_CONFIRMATION" ]]; then
+    return 0
+  fi
+  if [[ "$confirmation" == "$CPU_DIAGNOSTIC_CONFIRMATION" \
+    || "$confirmation" == "$SSR_CAPACITY_CONFIRMATION" ]]; then
+    [[ "$external_vote_tournament_count" == "1" \
+      && "$external_vote_users_per_tournament" == "14" ]] || {
+      echo "Diagnostic fixture confirmation requires the exact one-by-fourteen fixture." >&2
+      return 1
+    }
+    [[ "$timeout_diagnostics" == "false" ]] || {
+      echo "Diagnostic fixture confirmation cannot enable timeout diagnostics." >&2
+      return 1
+    }
+    return 0
+  fi
+  echo "External-load fixture requires an approved confirmation." >&2
+  return 1
+}
 artifact_owner_json="$("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_retained_load_export_executor.py" owner)" || {
   echo "Dedicated retained-load artifact owner is not available." >&2
   exit 1
@@ -292,6 +309,7 @@ install -d -o root -g root -m 0700 "$run_root"
 /usr/bin/chmod 0700 -- "$export_dir"
 export_dir_identity="$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h' -- "$export_dir")"
 export_created=1
+validate_fixture_confirmation || exit 1
 log_path="$run_root/canonical.log"
 server_observability_log="$run_root/server-observability.json"
 external_vote_root="$run_root/external-vote"

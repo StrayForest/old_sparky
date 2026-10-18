@@ -985,7 +985,7 @@ jobs:
           CURRENT_STAGE=retention_tempfile
           retention_file="$(mktemp)"
           CURRENT_STAGE=retention_dry_run
-          maintenance_unit_source="$current/deploy/systemd/deadlock-maintenance.service"
+          maintenance_unit_source="$runtime/releases/$current_id/deploy/systemd/deadlock-maintenance.service"
           maintenance_unit_validator="$current/tools/platform_maintenance_qa_evidence.py"
           loaded_maintenance_unit="$(systemctl show deadlock-maintenance.service \
             --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \

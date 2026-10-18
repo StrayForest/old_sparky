@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-10-16
+- Last reviewed: 2026-10-19
 
 ## Runtime checks
 
@@ -57,6 +57,10 @@ Maintenance keeps:
 | failed-login `btmp` | rotate at 16 MiB, keep 2 uncompressed files |
 
 It never deletes shared env/runtimes, upload staging, current/previous releases, active/source-protected live-QA generations or caches, business rows or canonical reports; backup failure stops pruning. The canonical unit in this source tree uses the fixed protected-pair manifest while running other retention. Backup-only preserves complete pairs but skips other retention; generic callers retain their existing rotation (see the [backup and restore runbook](backup-restore-runbook.md)). The currently deployed unit remains unchanged until the reviewed source is released; see the [named backup retention policy](backup-retention-protection.md).
+The source-owned maintenance unit also provisionally protects release
+`gha-38182702358-1-f1154c7dba4f` pending a bounded dependency review. Its
+transitive LiveQA or pending-recovery role is unknown; do not call it a
+provider or remove this protection based on the current retention preview.
 Live-QA cache pruning holds the machine-wide lock, requires an idle browser cgroup and user, accepts only root-owned non-symlink `runtime-<40 lowercase hex>` trees, retains the newest valid unprotected fallback, and treats keep as a hard cap rather than an age window.
 Health monitoring and storage maintenance share one conservative hard gate: available free space must be at least 5 GiB and conservative use (`total - available`, including filesystem-reserved headroom) must be at most 85%; exact 5 GiB and 85% boundaries pass, and 80% is not a failure threshold.
 The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it.

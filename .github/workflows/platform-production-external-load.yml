@@ -447,6 +447,8 @@ jobs:
     outputs:
       setup_status: ${{ steps.fixture-setup.outputs.setup_status }}
       manifest_ready: ${{ steps.fixture-setup.outputs.manifest_ready }}
+      supervisor_exit_status: ${{ steps.fixture-setup.outputs.supervisor_exit_status }}
+      pre_candidate_cleanup_allowed: ${{ steps.fixture-setup.outputs.pre_candidate_cleanup_allowed }}
       manifest_artifact_id: ${{ steps.publish-manifest.outputs.artifact-id }}
       ssh_cleanup_status: ${{ steps.cleanup-setup-ssh.outputs.ssh_cleanup_status }}
     env:
@@ -697,22 +699,108 @@ jobs:
           export_dir="/tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID"
           manifest_path="$artifact_dir/manifest.json"
           mkdir -p "$artifact_dir"; chmod 700 "$artifact_dir"
-          manifest_ready=0; setup_status=1
+          manifest_ready=0; setup_status=1; supervisor_exit_status=""; pre_candidate_cleanup_allowed=0
           set +e
           ssh -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" /usr/bin/python3.12 -I -B /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py external-fixture < "$input_path" >/dev/null 2>&1
           launch_status="$?"
           if [[ "$launch_status" == 0 ]]; then
             for _ in $(seq 1 900); do
+              rm -f -- "$artifact_dir/ready" "$manifest_path"
               if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/ready" "$artifact_dir/ready" >/dev/null 2>&1 \
                 && scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/manifest.json" "$manifest_path" >/dev/null 2>&1; then
                 chmod 600 "$manifest_path"; manifest_ready=1; setup_status=0; break
+              fi
+              rm -f -- "$artifact_dir/supervisor.exit.download"
+              if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/supervisor.exit" \
+                "$artifact_dir/supervisor.exit.download" >/dev/null 2>&1; then
+                supervisor_status="$(/usr/bin/python3 - "$artifact_dir/supervisor.exit.download" <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          path = Path(sys.argv[1])
+          try:
+              parent = path.parent.lstat()
+              before = path.lstat()
+              if (
+                  not stat.S_ISDIR(parent.st_mode)
+                  or stat.S_ISLNK(parent.st_mode)
+                  or parent.st_uid != os.geteuid()
+                  or stat.S_IMODE(parent.st_mode) != 0o700
+                  or stat.S_ISLNK(before.st_mode)
+                  or not stat.S_ISREG(before.st_mode)
+                  or before.st_uid != os.geteuid()
+                  or before.st_nlink != 1
+                  or not 1 <= before.st_size <= 4
+              ):
+                  raise ValueError
+              os.chmod(path, 0o600, follow_symlinks=False)
+              before = path.lstat()
+              if (
+                  stat.S_ISLNK(before.st_mode)
+                  or not stat.S_ISREG(before.st_mode)
+                  or before.st_uid != os.geteuid()
+                  or before.st_nlink != 1
+                  or stat.S_IMODE(before.st_mode) != 0o600
+              ):
+                  raise ValueError
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or stat.S_IMODE(metadata.st_mode) != 0o600
+                      or not 1 <= metadata.st_size <= 4
+                  ):
+                      raise ValueError
+                  raw = os.read(descriptor, 5)
+              finally:
+                  os.close(descriptor)
+              if len(raw) != before.st_size or re.fullmatch(rb"(?:0|[1-9][0-9]{0,2})\n", raw) is None:
+                  raise ValueError
+              value = int(raw[:-1])
+              if value > 255:
+                  raise ValueError
+          except (OSError, ValueError):
+              raise SystemExit(2)
+          print(value)
+          PY
+          )"
+                marker_status="$?"
+                rm -f -- "$artifact_dir/supervisor.exit.download"
+                if [[ "$marker_status" != 0 ]]; then
+                  supervisor_exit_status="invalid"
+                  break
+                fi
+                supervisor_exit_status="$supervisor_status"
+                if [[ "$supervisor_status" != 0 ]]; then
+                  if [[ '${{ inputs.cpu_diagnostic_only }}' == true || '${{ inputs.ssr_capacity_diagnostic_only }}' == true ]]; then
+                    pre_candidate_cleanup_allowed=1
+                  fi
+                  break
+                fi
+                # A zero exit races publication of ready/manifest only; check
+                # the pair once more, then fail closed if it is still absent.
+                rm -f -- "$artifact_dir/ready" "$manifest_path"
+                if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/ready" "$artifact_dir/ready" >/dev/null 2>&1 \
+                  && scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/manifest.json" "$manifest_path" >/dev/null 2>&1; then
+                  chmod 600 "$manifest_path"; manifest_ready=1; setup_status=0
+                fi
+                break
               fi
               sleep 2
             done
           fi
           echo "manifest_ready=$manifest_ready" >> "$GITHUB_OUTPUT"
           echo "setup_status=$setup_status" >> "$GITHUB_OUTPUT"
+          echo "supervisor_exit_status=$supervisor_exit_status" >> "$GITHUB_OUTPUT"
+          echo "pre_candidate_cleanup_allowed=$pre_candidate_cleanup_allowed" >> "$GITHUB_OUTPUT"
           exit "$setup_status"
 
       - name: Validate closed fixture manifest
@@ -2122,7 +2210,15 @@ jobs:
           path: ${{ runner.temp }}/external-client
       - name: Revalidate finalizer handoffs
         id: revalidate-finalizer
-        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' }}
+        if: >-
+          always() && (
+            (needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0') ||
+            ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
+              needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1' &&
+              needs.fixture-setup.outputs.manifest_ready != '1' &&
+              needs.load-client.result == 'skipped' &&
+              needs['cpu-diagnostic-pair'].result == 'skipped')
+          )
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2362,7 +2458,15 @@ jobs:
           exit 0
 
       - name: Configure finalizer SSH
-        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' }}
+        if: >-
+          always() && (
+            (needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0') ||
+            ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
+              needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1' &&
+              needs.fixture-setup.outputs.manifest_ready != '1' &&
+              needs.load-client.result == 'skipped' &&
+              needs['cpu-diagnostic-pair'].result == 'skipped')
+          )
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -2389,7 +2493,7 @@ jobs:
 
       - name: Signal fixture completion and collect origin evidence
         id: external-finalize
-        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' }}
+        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' && needs.fixture-setup.outputs.manifest_ready == '1' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -2436,7 +2540,15 @@ jobs:
 
       - name: Exact cleanup of external fixture
         id: cleanup
-        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' }}
+        if: >-
+          always() && (
+            (needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0') ||
+            ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
+              needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1' &&
+              needs.fixture-setup.outputs.manifest_ready != '1' &&
+              needs.load-client.result == 'skipped' &&
+              needs['cpu-diagnostic-pair'].result == 'skipped')
+          )
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}

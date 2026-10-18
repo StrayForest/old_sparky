@@ -1696,10 +1696,17 @@ class LiveQaGuardTests(unittest.TestCase):
             expected_node_digest: str | None = None,
             node_mode: int = 0o444,
             node_symlink: bool = False,
+            recovery_provider: bool = False,
+            omit_source_marker: bool = False,
+            source_marker_value: str | None = None,
+            extra_provider_entry: bool = False,
         ) -> tuple[Path, Path]:
             payloads = base / "trusted" / "releases"
             active_payload = payloads / source_sha
-            provider_payload = payloads / provider_sha
+            actual_provider_sha = (
+                guard.PROVIDER_RECOVERY_SOURCE_SHA if recovery_provider else provider_sha
+            )
+            provider_payload = payloads / actual_provider_sha
             active_payload.mkdir(mode=0o755, parents=True)
             (active_payload / "runtime").mkdir(mode=0o555)
             (active_payload / "runtime" / "runtime-manifest.json").write_text(
@@ -1775,7 +1782,7 @@ class LiveQaGuardTests(unittest.TestCase):
             provider = {
                 "version": 1,
                 "source_sha": source_sha,
-                "provider_sha": provider_sha,
+                "provider_sha": actual_provider_sha,
                 "engine_tree_sha256": engine_digest.hexdigest(),
                 "node_version": guard.NODE_VERSION,
                 "package_lock_sha256": package_lock_sha,
@@ -1787,9 +1794,19 @@ class LiveQaGuardTests(unittest.TestCase):
                 encoding="ascii",
             )
             os.chmod(provider_path, 0o444)
-            source_file = provider_payload / "source-sha"
-            source_file.write_text(provider_sha + "\n", encoding="ascii")
-            os.chmod(source_file, 0o444)
+            if not omit_source_marker:
+                source_file = provider_payload / "source-sha"
+                source_file.write_text(
+                    source_marker_value
+                    if source_marker_value is not None
+                    else actual_provider_sha + "\n",
+                    encoding="ascii",
+                )
+                os.chmod(source_file, 0o444)
+            if extra_provider_entry:
+                unexpected = provider_payload / "unexpected"
+                unexpected.write_text("x\n", encoding="ascii")
+                os.chmod(unexpected, 0o444)
 
             for directory in sorted(
                 (path for path in payloads.rglob("*") if path.is_dir()),
@@ -1822,6 +1839,60 @@ class LiveQaGuardTests(unittest.TestCase):
                 guard.GuardError, "helper file metadata is unsafe"
             ):
                 guard._sha256_regular(node, expected_uid=0)
+
+        self.assertEqual(
+            guard.PROVIDER_RECOVERY_SOURCE_SHA,
+            "19603dfff122386726313c86b0350812ebbe8cca",
+        )
+        installer_source = SCRIPT_PATH.with_name(
+            "platform_live_qa_runtime_install.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            f'PROVIDER_RECOVERY_SOURCE_SHA = "{guard.PROVIDER_RECOVERY_SOURCE_SHA}"',
+            installer_source,
+        )
+        with self.subTest("recovered provider exact runtime-only shape"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(
+                    base, recovery_provider=True, omit_source_marker=True
+                )
+                self.assertEqual(
+                    resolve(pointer, base / "trusted" / "releases"),
+                    base / "trusted" / "releases" / guard.PROVIDER_RECOVERY_SOURCE_SHA / "runtime",
+                )
+
+        with self.subTest("ordinary provider still requires source marker"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(base, omit_source_marker=True)
+                with self.assertRaisesRegex(
+                    guard.GuardError, "referenced live-QA engine provider is unavailable"
+                ):
+                    resolve(pointer, base / "trusted" / "releases")
+
+        with self.subTest("recovered provider rejects malformed present marker"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(
+                    base, recovery_provider=True, source_marker_value="other\n"
+                )
+                with self.assertRaisesRegex(
+                    guard.GuardError, "referenced live-QA engine provider metadata is unsafe"
+                ):
+                    resolve(pointer, base / "trusted" / "releases")
+
+        with self.subTest("recovered provider rejects extra outer entry"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(
+                    base, recovery_provider=True, omit_source_marker=True,
+                    extra_provider_entry=True,
+                )
+                with self.assertRaisesRegex(
+                    guard.GuardError, "referenced live-QA engine provider is unavailable"
+                ):
+                    resolve(pointer, base / "trusted" / "releases")
 
         with self.subTest("hash mismatch"):
             with tempfile.TemporaryDirectory(dir="/root") as temporary:

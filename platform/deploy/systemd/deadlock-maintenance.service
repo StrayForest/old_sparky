@@ -10,7 +10,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/oldsparky/platform/current
 Environment=PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python
-ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_storage_maintenance.py --apply --scratch-backend disk_ext4_image_v1 --protected-backup-manifest /opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json --backup-keep 15 --protected-release gha-38000614899-1-7e5769ba3f85 --protected-release gha-37760797674-1-80e457e57081 --release-keep 5 --test-artifact-max-age-days 7 --screenshot-max-age-days 30 --failed-build-max-age-days 1 --minimum-free-gib 5 --maximum-used-percent 85
+ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_storage_maintenance.py --apply --scratch-backend disk_ext4_image_v1 --protected-backup-manifest /opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json --backup-keep 15 --protected-release gha-38000614899-1-7e5769ba3f85 --protected-release gha-37760797674-1-80e457e57081 --protected-release gha-38182702358-1-f1154c7dba4f --release-keep 5 --test-artifact-max-age-days 7 --screenshot-max-age-days 30 --failed-build-max-age-days 1 --minimum-free-gib 5 --maximum-used-percent 85
 Nice=10
 IOSchedulingClass=idle
 CPUQuota=50%

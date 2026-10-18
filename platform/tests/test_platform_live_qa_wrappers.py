@@ -15,6 +15,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import stat
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -724,6 +725,126 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertTrue(failed_child.stdin.closed)
             failed_command = failed_popen.call_args.args[0]
             self.assertNotIn(payload["control_email"], failed_command)
+
+            helper_source = (
+                PLATFORM_ROOT / "tools" / "platform_production_external_fixture_qa.sh"
+            ).read_text(encoding="utf-8")
+            confirmation_function = re.search(
+                r"(?ms)^validate_fixture_confirmation\(\) \{\n.*?^\}\n",
+                helper_source,
+            )
+            self.assertIsNotNone(confirmation_function)
+            function_source = confirmation_function.group(0)
+            supervisor_function = re.search(
+                r"(?ms)^write_supervisor_exit\(\) \{\n.*?^\}\n",
+                helper_source,
+            )
+            self.assertIsNotNone(supervisor_function)
+            self.assertLess(
+                helper_source.index("export_created=1"),
+                helper_source.index("validate_fixture_confirmation || exit 1"),
+            )
+            self.assertLess(
+                helper_source.index("validate_fixture_confirmation || exit 1"),
+                helper_source.index("platform_prepare_external_vote_fixture.py"),
+            )
+
+            with tempfile.TemporaryDirectory() as temporary:
+                export_dir = Path(temporary) / "exports" / "run"
+                rejected_script = "\n".join(
+                    (
+                        "platform_retained_load_lock_close() { :; }",
+                        supervisor_function.group(0),
+                        function_source,
+                        'export_dir="$TEST_EXPORT_DIR"',
+                        'supervisor_exit_path="$export_dir/supervisor.exit"',
+                        'mkdir -p "$export_dir"',
+                        'chmod 700 "$export_dir"',
+                        'export_dir_identity="$(/usr/bin/stat -c \'%d:%i:%u:%g:%a:%h\' -- "$export_dir")"',
+                        "export_created=1",
+                        'export_uid="$(id -u)"; export_gid="$(id -g)"',
+                        "progress_enabled=0",
+                        "trap write_supervisor_exit EXIT",
+                        'confirmation="$CPU_DIAGNOSTIC_CONFIRMATION"',
+                        'timeout_diagnostics=false',
+                        'external_vote_tournament_count=2',
+                        'external_vote_users_per_tournament=14',
+                        "validate_fixture_confirmation || exit 1",
+                        'printf called > "$TEST_DB_PREPARED"',
+                    )
+                )
+                rejected_environment = {
+                    **os.environ,
+                    "CPU_DIAGNOSTIC_CONFIRMATION": "RUN-PRODUCTION-CPU-DIAGNOSTIC",
+                    "TEST_EXPORT_DIR": str(export_dir),
+                    "TEST_DB_PREPARED": str(Path(temporary) / "db-prepared"),
+                }
+                rejected = subprocess.run(
+                    ["bash", "-c", rejected_script],
+                    env=rejected_environment,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(rejected.returncode, 1)
+                self.assertEqual((export_dir / "supervisor.exit").read_bytes(), b"1\n")
+                marker = (export_dir / "supervisor.exit").lstat()
+                self.assertEqual(stat.S_IMODE(marker.st_mode), 0o600)
+                self.assertEqual(marker.st_nlink, 1)
+                self.assertFalse((export_dir / "ready").exists())
+                self.assertFalse((export_dir / "manifest.json").exists())
+                self.assertFalse(Path(rejected_environment["TEST_DB_PREPARED"]).exists())
+
+            def run_confirmation(
+                confirmation: str, timeout: str, tournaments: str, users: str
+            ) -> int:
+                environment = {
+                    **os.environ,
+                    "EXTERNAL_CONFIRMATION": "RUN-PRODUCTION-EXTERNAL-LOAD",
+                    "TIMEOUT_DIAGNOSTICS_CONFIRMATION": "RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS",
+                    "CPU_DIAGNOSTIC_CONFIRMATION": "RUN-PRODUCTION-CPU-DIAGNOSTIC",
+                    "SSR_CAPACITY_CONFIRMATION": "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC",
+                    "confirmation": confirmation,
+                    "timeout_diagnostics": timeout,
+                    "external_vote_tournament_count": tournaments,
+                    "external_vote_users_per_tournament": users,
+                }
+                completed = subprocess.run(
+                    ["bash", "-c", function_source + "validate_fixture_confirmation\n"],
+                    env=environment,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotIn(b"control@example.invalid", completed.stderr)
+                return completed.returncode
+
+            self.assertEqual(
+                run_confirmation("RUN-PRODUCTION-EXTERNAL-LOAD", "false", "1", "14"),
+                0,
+            )
+            self.assertEqual(
+                run_confirmation("RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS", "true", "1", "14"),
+                0,
+            )
+            self.assertEqual(
+                run_confirmation("RUN-PRODUCTION-CPU-DIAGNOSTIC", "false", "1", "14"),
+                0,
+            )
+            self.assertEqual(
+                run_confirmation("RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC", "false", "1", "14"),
+                0,
+            )
+            self.assertNotEqual(
+                run_confirmation("RUN-PRODUCTION-CPU-DIAGNOSTIC", "false", "2", "14"),
+                0,
+            )
+            self.assertNotEqual(
+                run_confirmation("RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC", "true", "1", "14"),
+                0,
+            )
+            self.assertNotEqual(
+                run_confirmation("RUN-PRODUCTION-CPU-DIAGNOSTIC", "false", "1", "15"),
+                0,
+            )
 
     def test_release_baseline_input_requires_an_exact_integer_schema(self) -> None:
         valid = {
