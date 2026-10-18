@@ -11082,20 +11082,22 @@ def _run_isolated_restore_drill(
                 if image_created_by_invocation is True and not launch_started
                 else getattr(setup_error, "scratch_loop_released", None)
             )
-            _scratch_cleanup_failure(
-                setup_error,
-                setup_cleanup_errors,
-                authorization_probe=authorization_probe,
-                service_stopped=not launch_started,
-                mount_absent=True if not launch_started else None,
-                mountpoint_removed=mountpoint_removed,
-                loop_released=loop_released,
-                image_created_by_invocation=image_created_by_invocation,
-                image_removed=image_unlinked,
-                retention_receipt_written=retention_receipt_written,
-                protected_paths_cleaned=not fixture_cleanup_failed,
-            )
-            signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
+            try:
+                _scratch_cleanup_failure(
+                    setup_error,
+                    setup_cleanup_errors,
+                    authorization_probe=authorization_probe,
+                    service_stopped=not launch_started,
+                    mount_absent=True if not launch_started else None,
+                    mountpoint_removed=mountpoint_removed,
+                    loop_released=loop_released,
+                    image_created_by_invocation=image_created_by_invocation,
+                    image_removed=image_unlinked,
+                    retention_receipt_written=retention_receipt_written,
+                    protected_paths_cleaned=not fixture_cleanup_failed,
+                )
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
             if fixture_cleanup_failed:
                 cleanup_error = RuntimeError(
                     "Synthetic protected path fixture setup failed and cleanup could not be confirmed."
@@ -12173,8 +12175,15 @@ def _run_isolated_restore_drill(
         _retain_first_scratch_fault(exc, origin="controller", site=fault_site)
         raise
     finally:
-        if archive_descriptor is not None:
-            os.close(archive_descriptor)
+        try:
+            if archive_descriptor is not None:
+                os.close(archive_descriptor)
+        finally:
+            if synthetic_restore_diagnostic:
+                # Keep termination signals blocked through the complete unit,
+                # image, mount, and fixture cleanup above, then restore the
+                # exact caller mask even when cleanup or archive close failed.
+                signal.pthread_sigmask(signal.SIG_SETMASK, setup_signal_mask)
 
 
 def run_synthetic_restore_diagnostic(

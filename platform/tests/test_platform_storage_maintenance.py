@@ -4962,6 +4962,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                                 "sub_state": "running",
                                 "result": "success",
                                 "exec_main_status": 0,
+                                "exec_main_code": "none",
                                 "start_token_sent": False,
                                 "completion_token_sent": False,
                             },
@@ -5064,6 +5065,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         "sub_state": "running",
                         "result": "success",
                         "exec_main_status": 0,
+                        "exec_main_code": "none",
                         "start_token_sent": False,
                         "completion_token_sent": False,
                     },
@@ -5816,6 +5818,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "schema": 1,
                 "origin": "controller",
                 "site": "controller_active_poll",
+                "verification_site": "active_poll_host_guard",
                 "exception_kind": "runtime",
                 "errno": None,
             }
@@ -5873,15 +5876,53 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 diagnostic: dict[str, object] | None = None,
                 report_resource: dict[str, object] | None = None,
                 report_bytes: bytes | None = None,
+                unit_schema: int = 5,
+                unit_verification_site: str = "active_poll_host_guard",
             ) -> subprocess.CompletedProcess[str]:
                 report_file = test_root / f"host-guard-report-{run_id}.json"
                 capture_file = test_root / f"host-guard-stderr-{run_id}.log"
                 if report_bytes is None:
+                    snapshot = {
+                        "properties": {
+                            "LoadState": "loaded",
+                            "ActiveState": "active",
+                            "SubState": "running",
+                            "Result": "success",
+                            "ExecMainCode": "0",
+                            "ExecMainStatus": "0",
+                        }
+                    }
+                    terminal_snapshot = (
+                        maintenance.backup_restore_drill._scratch_terminal_snapshot(
+                            snapshot,
+                            start_token_sent=True,
+                            completion_token_sent=False,
+                        )
+                        if unit_schema == 5
+                        else None
+                    )
+                    unit_diagnostic = maintenance.backup_restore_drill._scratch_unit_diagnostic(
+                        snapshot,
+                        launcher_exit_status=0,
+                        stdout_prefix=b"",
+                        stdout_observed=0,
+                        stdout_complete=True,
+                        stderr_prefix=capture,
+                        stderr_observed=len(capture),
+                        stderr_complete=True,
+                        phase="authorization_failed",
+                        verification_error="other",
+                        verification_site=unit_verification_site,
+                        worker_frame_status="missing",
+                        terminal_snapshot=terminal_snapshot,
+                    )
+                    self.assertIsNotNone(unit_diagnostic)
                     report = {
                         "ok": False,
                         "status": "failed",
                         "error_class": "backup",
                         "scratch_first_fault": report_fault,
+                        "scratch_unit_diagnostic": unit_diagnostic,
                         "scratch_host_guard_diagnostic": diagnostic,
                     }
                     if report_resource is not None:
@@ -5931,9 +5972,53 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(host_guard_receipt["report_state"], "typed_failure")
             self.assertEqual(host_guard_receipt["scratch_first_fault"], host_guard_fault)
             self.assertEqual(host_guard_receipt["scratch_host_guard_diagnostic"], host_guard)
+            self.assertEqual(host_guard_receipt["scratch_unit_diagnostic"]["schema"], 5)
+            self.assertEqual(
+                host_guard_receipt["scratch_unit_diagnostic"]["verification_site"],
+                "active_poll_host_guard",
+            )
             self.assertEqual(host_guard_receipt["scratch_resource_attribution"], resource_attribution)
             self.assertNotIn("OLDS_PG_SCRATCH_HOST_GUARD_V1", host_guard_receipt_path.read_text(encoding="ascii"))
             self.assertNotIn("900000000", host_guard_result.stdout)
+
+            schema_four_result = run_host_guard_trap(
+                "123474",
+                host_guard_capture(host_guard_fault, host_guard),
+                report_fault=host_guard_fault,
+                diagnostic=host_guard,
+                unit_schema=4,
+            )
+            self.assertEqual(schema_four_result.returncode, 0, schema_four_result.stderr)
+            schema_four_receipt = json.loads(
+                (host_guard_shared / "backup-failure-123474-1.json").read_text(
+                    encoding="ascii"
+                )
+            )
+            self.assertEqual(schema_four_receipt["report_state"], "typed_failure")
+            self.assertEqual(schema_four_receipt["scratch_unit_diagnostic"]["schema"], 4)
+            self.assertEqual(
+                schema_four_receipt["scratch_first_fault"]["verification_site"],
+                "active_poll_host_guard",
+            )
+
+            mismatched_subsite_fault = dict(
+                host_guard_fault,
+                verification_site="active_poll_selector_wait",
+            )
+            mismatched_subsite_result = run_host_guard_trap(
+                "123475",
+                host_guard_capture(mismatched_subsite_fault, host_guard),
+                report_fault=mismatched_subsite_fault,
+                diagnostic=host_guard,
+            )
+            self.assertEqual(mismatched_subsite_result.returncode, 0)
+            mismatched_subsite_receipt = json.loads(
+                (host_guard_shared / "backup-failure-123475-1.json").read_text(
+                    encoding="ascii"
+                )
+            )
+            self.assertEqual(mismatched_subsite_receipt["report_state"], "unclassified_json")
+            self.assertIsNone(mismatched_subsite_receipt["scratch_first_fault"])
 
             bad_guard_cases = (
                 (
@@ -6056,6 +6141,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 )
 
             forwarded_stderr = io.StringIO()
+            original_signal_handlers = {
+                signum: signal.getsignal(signum)
+                for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+            }
             with (
                 mock.patch.object(drill.os, "geteuid", return_value=0),
                 mock.patch.object(drill, "require_commands"),
@@ -6069,7 +6158,6 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     side_effect=AssertionError("host guard must stop before unit launch"),
                 ) as unit_launch,
                 mock.patch.object(drill, "create_backup", side_effect=fail_at_controller_host_guard),
-                mock.patch.object(drill, "_termination_signal_scope", return_value=mock.MagicMock()),
                 mock.patch.object(maintenance.sys, "stderr", forwarded_stderr),
             ):
                 with self.assertRaises(maintenance.BackupCommandFailure) as forwarded_error:
@@ -6078,6 +6166,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         keep=14,
                         private_failure_diagnostics=True,
                     )
+            self.assertEqual(
+                {signum: signal.getsignal(signum) for signum in original_signal_handlers},
+                original_signal_handlers,
+            )
             disk_guard.assert_called_once()
             memory_read.assert_called_once()
             unit_launch.assert_not_called()

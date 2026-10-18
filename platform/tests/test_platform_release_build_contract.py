@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import shlex
 import subprocess
@@ -147,12 +148,18 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         isolated = runner.replace(
             '"/var/tmp"', json.dumps(str(diagnostic_parent)), 1
         )
-        return subprocess.run(
+        inherited_sigterm = signal.getsignal(signal.SIGTERM)
+        reset_then_exec = (
+            "import os, signal, sys; "
+            "signal.signal(signal.SIGTERM, signal.SIG_DFL); "
+            "signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM}); "
+            "os.execv(sys.executable, [sys.executable, '-I', '-B', '-', *sys.argv[1:]])"
+        )
+        completed = subprocess.run(
             [
                 sys.executable,
-                "-I",
-                "-B",
-                "-",
+                "-c",
+                reset_then_exec,
                 str(candidate),
                 "/fixture/release.tar.gz",
                 "/fixture/runtime",
@@ -170,6 +177,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             timeout=15,
             check=False,
         )
+        if signal.getsignal(signal.SIGTERM) != inherited_sigterm:
+            raise AssertionError("candidate runner changed the parent SIGTERM disposition")
+        return completed
 
     @staticmethod
     def _candidate_diagnostic_marker_harness(
@@ -4605,15 +4615,24 @@ fail 'private lock detail must not cross the public channel'
             self.assertNotIn("RELEASE_INSTALL_DIAG", truncated_public.stdout)
 
             signal_candidate = root / "signal-candidate"
+            signal_candidate_state = root / "signal-candidate-term-disposition"
             signal_candidate.write_text(
                 "#!/usr/bin/python3\n"
                 "import os, signal\n"
+                f"mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())\n"
+                f"with open({str(signal_candidate_state)!r}, 'w', encoding='ascii') as state_file:\n"
+                "    state_file.write(f'{signal.getsignal(signal.SIGTERM)},{int(signal.SIGTERM in mask)}')\n"
                 "os.kill(os.getpid(), signal.SIGTERM)\n",
                 encoding="ascii",
             )
             signal_candidate.chmod(0o700)
             signal_result, signal_slug, signal_dir = invoke(
                 signal_candidate, int(run_id) + 7
+            )
+            self.assertEqual(
+                signal_candidate_state.read_text(encoding="ascii"),
+                f"{signal.SIG_DFL},0",
+                "candidate child must observe default, unblocked SIGTERM under test harness",
             )
             self.assertEqual(
                 signal_result.stdout,
@@ -4623,6 +4642,19 @@ fail 'private lock detail must not cross the public channel'
             )
             signal_metadata = json.loads((signal_dir / "candidate.json").read_text())
             self.assertEqual(signal_metadata["candidate_exit_status"], 143)
+            inherited_sigterm = signal.getsignal(signal.SIGTERM)
+            try:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                default_parent_result, _default_parent_slug, _default_parent_dir = invoke(
+                    signal_candidate, int(run_id) + 8
+                )
+                self.assertEqual(
+                    default_parent_result.stdout,
+                    signal_result.stdout,
+                )
+            finally:
+                signal.signal(signal.SIGTERM, inherited_sigterm)
+            self.assertEqual(signal.getsignal(signal.SIGTERM), inherited_sigterm)
             signal_marker_harness = self._candidate_diagnostic_marker_harness(
                 supervisor,
                 result=signal_result.stdout.rstrip("\n"),

@@ -2097,6 +2097,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             image_path.write_bytes(b"preexisting protected inode")
             image_path.chmod(0o600)
             original_bytes = image_path.read_bytes()
+            original_identity = image_path.stat().st_dev, image_path.stat().st_ino
             total_bytes = 100 * 1024**3
             snapshot = types.SimpleNamespace(
                 valid=True,
@@ -2115,6 +2116,34 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "exception_kind": "runtime",
                 "errno": None,
             }
+            real_lstat = pathlib.Path.lstat
+            root_lstat_paths: list[pathlib.Path] = []
+
+            def root_owned_parent_lstat(path: pathlib.Path) -> os.stat_result:
+                actual = real_lstat(path)
+                if path in {temporary_root, image_root}:
+                    root_lstat_paths.append(path)
+                    return types.SimpleNamespace(
+                        st_mode=stat.S_IFDIR | 0o700,
+                        st_uid=0,
+                        st_gid=0,
+                        st_dev=actual.st_dev,
+                        st_ino=actual.st_ino,
+                    )  # type: ignore[return-value]
+                return actual
+
+            def unsafe_parent_lstat(path: pathlib.Path) -> os.stat_result:
+                actual = real_lstat(path)
+                if path == temporary_root:
+                    return types.SimpleNamespace(
+                        st_mode=stat.S_IFDIR | 0o700,
+                        st_uid=1234,
+                        st_gid=1234,
+                        st_dev=actual.st_dev,
+                        st_ino=actual.st_ino,
+                    )  # type: ignore[return-value]
+                return actual
+
             with (
                 mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
                 mock.patch.object(backup_drill.os, "geteuid", return_value=0),
@@ -2124,15 +2153,40 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
                 ),
                 mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
+                mock.patch.object(pathlib.Path, "lstat", root_owned_parent_lstat),
+                mock.patch.object(backup_drill.os, "open", wraps=os.open) as open_spy,
             ):
                 with self.assertRaises(FileExistsError) as raised:
                     backup_drill._scratch_prepare_disk_image(token)
+            open_spy.assert_called_once()
+            self.assertEqual(open_spy.call_args.args[0], image_path)
+            self.assertTrue(open_spy.call_args.args[1] & os.O_EXCL)
+            self.assertEqual(set(root_lstat_paths), {temporary_root, image_root})
             failure = raised.exception
             self.assertFalse(failure.scratch_image_created_by_invocation)
             self.assertIsNone(failure.scratch_image_unlinked)
             self.assertIsNone(failure.scratch_loop_released)
             self.assertIsNone(failure.scratch_retention_receipt_written)
             self.assertEqual(image_path.read_bytes(), original_bytes)
+            self.assertEqual((image_path.stat().st_dev, image_path.stat().st_ino), original_identity)
+
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
+                mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
+                ),
+                mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
+                mock.patch.object(pathlib.Path, "lstat", unsafe_parent_lstat),
+                mock.patch.object(backup_drill.os, "open", wraps=os.open) as unsafe_open_spy,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "parent directory identity is unsafe"):
+                    backup_drill._scratch_prepare_disk_image(token)
+            unsafe_open_spy.assert_not_called()
+            self.assertEqual(image_path.read_bytes(), original_bytes)
+            self.assertEqual((image_path.stat().st_dev, image_path.stat().st_ino), original_identity)
 
             failure.scratch_first_fault = first_fault
             backup_drill._scratch_cleanup_failure(
@@ -4216,12 +4270,18 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertEqual(os.geteuid(), 0)
         source_sha = os.environ.get("GITHUB_SHA", "")
         self.assertRegex(source_sha, r"^[0-9a-f]{40}$")
+        original_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
         scratch_backend = os.environ.get(
             "PLATFORM_SCRATCH_BACKEND", backup_drill.SCRATCH_BACKEND_TMPFS_V1
         )
         self.assertIn(scratch_backend, backup_drill.SCRATCH_BACKENDS)
         report = _run_synthetic_restore_diagnostic_for_ci(
             source_sha=source_sha, scratch_backend=scratch_backend
+        )
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            original_signal_mask,
+            "successful synthetic restore must restore the caller signal mask after cleanup",
         )
         self.assertTrue(backup_drill.valid_scratch_synthetic_restore_diagnostic(report))
         self.assertEqual(
@@ -8517,7 +8577,7 @@ raise SystemExit(status)
             ),
             mock.patch.object(
                 backup_drill, "_scratch_remove_created_protected_path_directories"
-            ),
+            ) as cleanup_fixture_paths,
             mock.patch.object(backup_drill, "_scratch_unit_command", side_effect=unit_command),
             mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", side_effect=no_mount),
             mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=service_snapshot),
@@ -8541,6 +8601,22 @@ raise SystemExit(status)
             mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
         ):
             failure = run_parent()
+            signal_mask_before_cleanup_failure = signal.pthread_sigmask(
+                signal.SIG_BLOCK, set()
+            )
+            launched.clear()
+            stop_requested = False
+            cleanup_fixture_paths.side_effect = RuntimeError(
+                "injected synthetic fixture cleanup failure"
+            )
+            cleanup_failure = run_parent()
+            self.assertEqual(
+                signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                signal_mask_before_cleanup_failure,
+            )
+            self.assertIsNotNone(
+                getattr(cleanup_failure, "scratch_cleanup_status", None)
+            )
 
         self.assertEqual(len(launched), 1)
         self.assertIsNotNone(launched[0].returncode)
@@ -9204,25 +9280,50 @@ raise SystemExit(status)
                 "--auth-host=reject",
             ],
         )
-        self._assert_parent_active_poll_sampler_failure_preserves_guard_and_cleanup()
-        self._assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db()
-        self._assert_scratch_sigterm_stops_and_reaps_launched_unit()
-        self._assert_scratch_worker_uses_pinned_archive_fd()
-        self._assert_scratch_unit_diagnostic_caps_and_private_envelope()
-        self._assert_scratch_early_exit_output_is_drained()
-        self._assert_scratch_live_identity_failure_preserves_output()
-        self._assert_scratch_identity_replacement_cannot_receive_authorization()
-        self._assert_scratch_startup_inactive_race_is_handled()
-        self._assert_synthetic_worker_failure_pair_reaches_parent()
-        self._assert_scratch_final_identity_loss_blocks_done()
-        self._assert_worker_token_deadline_delivery_is_truthful()
-        self._assert_scratch_fast_launcher_cannot_skip_active_confinement()
-        self._assert_scratch_absent_unit_has_bounded_startup_deadline()
-        self._assert_scratch_after_confinement_failure_preserves_output()
+        original_handlers = {
+            signum: signal.getsignal(signum)
+            for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+        }
+        original_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        def current_signal_mask() -> set[signal.Signals]:
+            return signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        def run_cleanup_assertion(assertion) -> None:
+            # Production wraps this entrypoint in the signal scope. These
+            # helpers call it directly, so each must model that scope and
+            # prove cleanup did not leak SIG_IGN into later child processes.
+            with backup_drill._termination_signal_scope():
+                assertion()
+            self.assertEqual(
+                {signum: signal.getsignal(signum) for signum in original_handlers},
+                original_handlers,
+            )
+            self.assertEqual(current_signal_mask(), original_signal_mask)
+
+        for assertion in (
+            self._assert_parent_active_poll_sampler_failure_preserves_guard_and_cleanup,
+            self._assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db,
+            self._assert_scratch_sigterm_stops_and_reaps_launched_unit,
+            self._assert_scratch_worker_uses_pinned_archive_fd,
+            self._assert_scratch_unit_diagnostic_caps_and_private_envelope,
+            self._assert_scratch_early_exit_output_is_drained,
+            self._assert_scratch_live_identity_failure_preserves_output,
+            self._assert_scratch_identity_replacement_cannot_receive_authorization,
+            self._assert_scratch_startup_inactive_race_is_handled,
+            self._assert_synthetic_worker_failure_pair_reaches_parent,
+            self._assert_scratch_final_identity_loss_blocks_done,
+            self._assert_worker_token_deadline_delivery_is_truthful,
+            self._assert_scratch_fast_launcher_cannot_skip_active_confinement,
+            self._assert_scratch_absent_unit_has_bounded_startup_deadline,
+            self._assert_scratch_after_confinement_failure_preserves_output,
+        ):
+            run_cleanup_assertion(assertion)
         self._assert_collected_unit_without_properties_preserves_output()
         self._assert_scratch_worker_forwards_output_only_when_private()
         self._assert_worker_authorization_barrier()
         self._assert_worker_token_raw_pipe_framing()
+        self.assertEqual(current_signal_mask(), original_signal_mask)
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             scratch_root = pathlib.Path(temporary_dir) / "scratch"
@@ -9262,6 +9363,39 @@ raise SystemExit(status)
         ))
         self.assertFalse(any("ReadWritePaths=" in item for item in command))
         self.assertFalse(any("PGPASSWORD" in item or "PLATFORM_DATABASE_URL" in item for item in command))
+
+        setup_failure_mask = current_signal_mask()
+        with (
+            mock.patch.object(backup_drill, "require_commands"),
+            mock.patch.object(backup_drill, "_scratch_host_guard"),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_prepare_synthetic_protected_paths",
+                return_value=((), None),
+            ),
+            mock.patch.object(
+                backup_drill.os,
+                "mkdir",
+                side_effect=OSError("injected mountpoint setup failure"),
+            ),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_remove_created_protected_path_directories",
+            ),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_cleanup_failure",
+                side_effect=RuntimeError("injected cleanup report failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "injected cleanup report failure"),
+        ):
+            backup_drill._run_isolated_restore_drill(
+                None,
+                timestamp_slug="20261018T120000Z",
+                synthetic_restore_diagnostic=True,
+                scratch_backend=backup_drill.SCRATCH_BACKEND_TMPFS_V1,
+            )
+        self.assertEqual(current_signal_mask(), setup_failure_mask)
 
     def _assert_scratch_worker_uses_pinned_archive_fd(self) -> None:
         self.assertEqual(backup_drill.os.geteuid(), 0)
@@ -9404,9 +9538,17 @@ raise SystemExit(status)
         class LauncherProcess:
             def __init__(self) -> None:
                 self.returncode: int | None = None
-                self.stdout = io.BytesIO()
-                self.stderr = io.BytesIO()
+                stdout_fd, stdout_write_fd = os.pipe()
+                stderr_fd, stderr_write_fd = os.pipe()
+                os.close(stdout_write_fd)
+                os.close(stderr_write_fd)
+                self.stdout = os.fdopen(stdout_fd, "rb", buffering=0)
+                self.stderr = os.fdopen(stderr_fd, "rb", buffering=0)
                 self.wait_calls = 0
+
+            def close_streams(self) -> None:
+                self.stdout.close()
+                self.stderr.close()
 
             def poll(self) -> int | None:
                 return self.returncode
@@ -9461,12 +9603,15 @@ raise SystemExit(status)
                 mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit) as stop,
                 mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch) as popen,
             ):
-                with backup_drill._termination_signal_scope():
-                    with self.assertRaisesRegex(backup_drill.BackupOperationInterrupted, "SIGTERM"):
-                        backup_drill._run_isolated_restore_drill(
-                            archive_path,
-                            timestamp_slug="20261012T010203Z",
-                        )
+                try:
+                    with backup_drill._termination_signal_scope():
+                        with self.assertRaisesRegex(backup_drill.BackupOperationInterrupted, "SIGTERM"):
+                            backup_drill._run_isolated_restore_drill(
+                                archive_path,
+                                timestamp_slug="20261012T010203Z",
+                            )
+                finally:
+                    launcher.close_streams()
 
             self.assertEqual(popen.call_count, 1)
             self.assertEqual(stop.call_count, 1)
@@ -9510,14 +9655,17 @@ raise SystemExit(status)
                 ),
                 mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch_then_term),
             ):
-                with backup_drill._termination_signal_scope():
-                    with self.assertRaisesRegex(
-                        backup_drill.BackupOperationInterrupted, "SIGHUP"
-                    ) as interrupted:
-                        backup_drill._run_isolated_restore_drill(
-                            archive_path,
-                            timestamp_slug="20261012T010204Z",
-                        )
+                try:
+                    with backup_drill._termination_signal_scope():
+                        with self.assertRaisesRegex(
+                            backup_drill.BackupOperationInterrupted, "SIGHUP"
+                        ) as interrupted:
+                            backup_drill._run_isolated_restore_drill(
+                                archive_path,
+                                timestamp_slug="20261012T010204Z",
+                            )
+                finally:
+                    failed_stop_launcher.close_streams()
             self.assertEqual(failed_stop_launcher.wait_calls, 2)
             self.assertIsNotNone(failed_stop_launcher.returncode)
             self.assertTrue(

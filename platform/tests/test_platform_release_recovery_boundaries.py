@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import signal
 import shlex
 import shutil
 import stat
@@ -6342,6 +6343,10 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         test_env["PLATFORM_CANDIDATE_DEADLINE_MONOTONIC_NS"] = str(
             time.monotonic_ns() + 630 * 1_000_000_000
         )
+        inherited_signal_handlers = {
+            signum: signal.getsignal(signum)
+            for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+        }
         result = self.run_script(
             deploy,
             "--resume",
@@ -6349,6 +6354,11 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             str(self.app_dir),
             env=test_env,
             check=False,
+            reset_child_sigterm=True,
+        )
+        self.assertEqual(
+            {signum: signal.getsignal(signum) for signum in inherited_signal_handlers},
+            inherited_signal_handlers,
         )
         elapsed = time.monotonic() - started
 
@@ -6385,6 +6395,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             str(self.app_dir),
             env=self.runtime_env(label="first-install-liveqa-reconcile-retry"),
             check=False,
+            reset_child_sigterm=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.shared / STATE_NAME).exists())
@@ -8308,13 +8319,24 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         *args: str,
         env: dict[str, str] | None = None,
         check: bool = True,
+        reset_child_sigterm: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         command_env = os.environ.copy()
         command_env["PLATFORM_ENVIRONMENT"] = "test"
         command_env["PLATFORM_TESTING"] = "1"
         command_env.update(env or {})
+        inherited_sigterm = signal.getsignal(signal.SIGTERM)
+        command = [str(script), *args]
+        if reset_child_sigterm:
+            reset_then_exec = (
+                "import os, signal, sys; "
+                "signal.signal(signal.SIGTERM, signal.SIG_DFL); "
+                "signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM}); "
+                "os.execv(sys.argv[1], sys.argv[1:])"
+            )
+            command = [sys.executable, "-c", reset_then_exec, *command]
         result = subprocess.run(
-            [str(script), *args],
+            command,
             cwd=REPO_ROOT,
             env=command_env,
             text=True,
@@ -8323,6 +8345,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             check=False,
             timeout=120,
         )
+        if signal.getsignal(signal.SIGTERM) != inherited_sigterm:
+            raise AssertionError("release test child changed the parent SIGTERM disposition")
         if check and result.returncode != 0:
             self.fail(f"{script} failed: {result.returncode}\n{result.stderr}")
         return result
