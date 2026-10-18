@@ -2159,6 +2159,105 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("fetch-depth: 0", final_source_checkout)
         self.assertIn("persist-credentials: false", final_source_checkout)
         self.assertLess(final_source_checkout_start, final_pin_resolution)
+
+        initial_pin_start = auto.index(
+            "      - name: Resolve host-tools pin for exact tested source"
+        )
+        initial_pin_end = auto.index("      - name:", initial_pin_start + 1)
+        initial_pin_step = auto[initial_pin_start:initial_pin_end]
+        initial_pin_script = initial_pin_step.split("        run: |\n", 1)[1]
+        self.assertIn("          set -euo pipefail\n          umask 077\n", initial_pin_script)
+        self.assertIn('pin_output="$RUNNER_TEMP/platform-host-tools-pin"', initial_pin_script)
+        self.assertIn(
+            "--private-output \"$pin_output\"",
+            initial_pin_script,
+        )
+        self.assertNotIn('> "$pin_output"', initial_pin_script)
+        initial_private_output_call = initial_pin_script.index(
+            '--private-output "$pin_output"'
+        )
+        initial_cleanup_trap = initial_pin_script.index("trap cleanup_pin_output EXIT")
+        self.assertLess(initial_private_output_call, initial_cleanup_trap)
+        self.assertIn('[[ -z "$pin_output_identity" || -L "$pin_output" ]]', initial_pin_script)
+        self.assertIn(
+            '[[ "$current_identity" == "$pin_output_identity" ]]', initial_pin_script
+        )
+        self.assertIn('rm -f -- "$pin_output" || true', initial_pin_script)
+        self.assertIn(
+            'test "$(stat -c \'%F:%h:%a\' -- "$pin_output")" = "regular file:1:600"',
+            initial_pin_script,
+        )
+        self.assertIn("[[ \"$host_tools_sha\" =~ ^[0-9a-f]{40}$ ]]", initial_pin_script)
+        self.assertIn("printf 'host_tools_sha=%s\\n' \"$host_tools_sha\" >> \"$GITHUB_OUTPUT\"", initial_pin_script)
+        host_cleanup_start = auto.index(
+            "      - name: Remove host-readiness verifier material"
+        )
+        host_cleanup_end = auto.index("      - name:", host_cleanup_start + 1)
+        host_cleanup_step = auto[host_cleanup_start:host_cleanup_end]
+        self.assertIn('"$RUNNER_TEMP/host-tools-bootstrap"', host_cleanup_step)
+        self.assertNotIn('"$RUNNER_TEMP/platform-host-tools-pin"', host_cleanup_step)
+
+        final_pin_step_end = auto.index("      - name:", final_pin_resolution + 1)
+        final_pin_step = auto[final_pin_resolution:final_pin_step_end]
+        self.assertIn(
+            "TARGET_SHA: ${{ github.event.workflow_run.head_sha }}",
+            auto[auto.index("  dispatch-production:"):final_source_checkout_start],
+        )
+        self.assertIn(
+            "HOST_TOOLS_SHA: ${{ needs.dispatch.outputs.host_tools_sha }}",
+            final_pin_step,
+        )
+        final_pin_script = final_pin_step.split("        run: |\n", 1)[1]
+        self.assertIn("          set -euo pipefail\n          umask 077\n", final_pin_script)
+        self.assertIn(
+            'pin_output="$RUNNER_TEMP/platform-final-host-tools-pin"', final_pin_script
+        )
+        self.assertIn(
+            '/usr/bin/python3 "$GITHUB_WORKSPACE/platform/tools/platform_host_tools_pin.py" resolve',
+            final_pin_script,
+        )
+        self.assertIn('--source-root "$GITHUB_WORKSPACE"', final_pin_script)
+        self.assertIn('--target-sha "$TARGET_SHA"', final_pin_script)
+        self.assertIn('--expected-repository "$GITHUB_REPOSITORY"', final_pin_script)
+        self.assertIn('--private-output "$pin_output"', final_pin_script)
+        self.assertNotIn('> "$pin_output"', final_pin_script)
+        final_private_output_call = final_pin_script.index('--private-output "$pin_output"')
+        final_cleanup_trap = final_pin_script.index("trap cleanup_pin_output EXIT")
+        self.assertLess(final_private_output_call, final_cleanup_trap)
+        self.assertIn('[[ -z "$pin_output_identity" || -L "$pin_output" ]]', final_pin_script)
+        self.assertIn(
+            '[[ "$current_identity" == "$pin_output_identity" ]]', final_pin_script
+        )
+        self.assertIn('rm -f -- "$pin_output" || true', final_pin_script)
+        self.assertIn(
+            'test "$(stat -c \'%F:%h:%a\' -- "$pin_output")" = "regular file:1:600"',
+            final_pin_script,
+        )
+        self.assertIn("[[ \"$requested_host_tools_sha\" =~ ^[0-9a-f]{40}$ ]]", final_pin_script)
+        self.assertIn(
+            'test "$requested_host_tools_sha" = "$HOST_TOOLS_SHA"', final_pin_script
+        )
+        final_security_start = auto.index(
+            "      - name: Revalidate current dev and exact successful Security run",
+            final_pin_step_end,
+        )
+        final_backup_start = auto.index(
+            "      - name: Revalidate exact successful source-bound backup",
+            final_security_start,
+        )
+        final_dispatch_start = auto.index(
+            "      - name: Dispatch production deployment or baseline reconciliation",
+            final_backup_start,
+        )
+        self.assertLess(final_pin_resolution, final_security_start)
+        self.assertLess(final_security_start, final_backup_start)
+        self.assertLess(final_backup_start, final_dispatch_start)
+        dispatch_step_end = auto.index("      - name:", final_dispatch_start + 1)
+        final_dispatch_step = auto[final_dispatch_start:dispatch_step_end]
+        self.assertIn('[[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]', final_dispatch_step)
+        self.assertIn('"$ROUTE_DEPLOYABLE" == "true"', final_dispatch_step)
+        self.assertIn('"$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false"', final_dispatch_step)
+        self.assertIn('"$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false"', final_dispatch_step)
         dispatch = workflow_job(auto, "dispatch")
         self.assertIn("candidate_packaging_reason =", dispatch)
         self.assertIn("candidate_packaging_only = bool(", dispatch)

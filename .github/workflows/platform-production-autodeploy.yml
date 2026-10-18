@@ -939,13 +939,26 @@ jobs:
           /usr/bin/python3 "$GITHUB_WORKSPACE/platform/tools/platform_host_tools_pin.py" resolve \
             --source-root "$GITHUB_WORKSPACE" \
             --target-sha "$TARGET_SHA" \
-            --expected-repository "$GITHUB_REPOSITORY" > "$pin_output"
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --private-output "$pin_output"
+          pin_output_identity=""
+          cleanup_pin_output() {
+            if [[ -z "$pin_output_identity" || -L "$pin_output" ]]; then
+              return 0
+            fi
+            local current_identity
+            current_identity="$(stat -c '%F:%h:%a:%u:%d:%i' -- "$pin_output" 2>/dev/null)" || return 0
+            if [[ "$current_identity" == "$pin_output_identity" ]]; then
+              rm -f -- "$pin_output" || true
+            fi
+          }
+          trap cleanup_pin_output EXIT
+          pin_output_identity="$(stat -c '%F:%h:%a:%u:%d:%i' -- "$pin_output")"
           test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
           test "$(wc -l < "$pin_output" | tr -d ' ')" = 1
           IFS= read -r host_tools_sha < "$pin_output"
           [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
           printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
-          rm -f -- "$pin_output"
 
       - name: Checkout exact pinned host-tools source
         if: ${{ steps.gate.outputs.deploy == 'true' }}
@@ -1099,7 +1112,6 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf -- "$RUNNER_TEMP/host-tools-bootstrap" "$RUNNER_TEMP/platform-host-capability-ssh"
-          rm -f -- "$RUNNER_TEMP/platform-host-tools-pin"
 
   dispatch-production:
     name: Revalidate exact source and dispatch normal production child
@@ -1136,15 +1148,30 @@ jobs:
           HOST_TOOLS_SHA: ${{ needs.dispatch.outputs.host_tools_sha }}
         run: |
           set -euo pipefail
+          umask 077
           pin_output="$RUNNER_TEMP/platform-final-host-tools-pin"
           /usr/bin/python3 "$GITHUB_WORKSPACE/platform/tools/platform_host_tools_pin.py" resolve \
             --source-root "$GITHUB_WORKSPACE" \
             --target-sha "$TARGET_SHA" \
-            --expected-repository "$GITHUB_REPOSITORY" > "$pin_output"
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --private-output "$pin_output"
+          pin_output_identity=""
+          cleanup_pin_output() {
+            if [[ -z "$pin_output_identity" || -L "$pin_output" ]]; then
+              return 0
+            fi
+            local current_identity
+            current_identity="$(stat -c '%F:%h:%a:%u:%d:%i' -- "$pin_output" 2>/dev/null)" || return 0
+            if [[ "$current_identity" == "$pin_output_identity" ]]; then
+              rm -f -- "$pin_output" || true
+            fi
+          }
+          trap cleanup_pin_output EXIT
+          pin_output_identity="$(stat -c '%F:%h:%a:%u:%d:%i' -- "$pin_output")"
           test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
           test "$(wc -l < "$pin_output" | tr -d ' ')" = 1
           IFS= read -r requested_host_tools_sha < "$pin_output"
-          rm -f -- "$pin_output"
+          [[ "$requested_host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
           test "$requested_host_tools_sha" = "$HOST_TOOLS_SHA"
 
       - name: Revalidate current dev and exact successful Security run

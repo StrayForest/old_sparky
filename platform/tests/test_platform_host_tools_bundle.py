@@ -11,6 +11,7 @@ import re
 import resource
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1336,6 +1337,81 @@ class HostToolsBundleTests(unittest.TestCase):
             pin_path.symlink_to(REPO_ROOT / pin.PIN_RELATIVE_PATH)
             with self.assertRaises(pin.HostToolsPinError):
                 pin._read_pin(root)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stdout = StringIO()
+            stderr = StringIO()
+            arguments = [
+                "resolve",
+                "--source-root",
+                str(REPO_ROOT),
+                "--target-sha",
+                self._current_target_sha(),
+                "--expected-repository",
+                pin.EXPECTED_REPOSITORY,
+            ]
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                result = pin.main(arguments)
+            self.assertEqual(result, 0)
+            self.assertEqual(stdout.getvalue(), f"{PIN_SHA}\n")
+            self.assertEqual(stderr.getvalue(), "")
+
+            private_output = root / "pin-output"
+            old_umask = os.umask(0o022)
+            try:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    stdout.seek(0)
+                    stdout.truncate(0)
+                    stderr.seek(0)
+                    stderr.truncate(0)
+                    result = pin.main([*arguments, "--private-output", str(private_output)])
+            finally:
+                os.umask(old_umask)
+            self.assertEqual(result, 0)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "")
+            metadata = private_output.stat()
+            self.assertEqual(private_output.read_bytes(), f"{PIN_SHA}\n".encode("ascii"))
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_nlink, 1)
+            self.assertEqual(metadata.st_uid, os.geteuid())
+
+            sentinel = root / "sentinel"
+            sentinel.write_bytes(b"preserve me")
+            sentinel_metadata = sentinel.stat()
+            for output_path, create_alias in (
+                (root / "existing-output", lambda path: path.write_bytes(b"keep")),
+                (root / "symlink-output", lambda path: path.symlink_to(sentinel)),
+                (root / "hardlink-output", lambda path: os.link(sentinel, path)),
+            ):
+                with self.subTest(output=output_path.name):
+                    create_alias(output_path)
+                    with self.assertRaises(pin.HostToolsPinError):
+                        pin._write_private_pin_output(output_path, PIN_SHA)
+                    self.assertTrue(output_path.exists() or output_path.is_symlink())
+                    self.assertEqual(sentinel.read_bytes(), b"preserve me")
+                    self.assertEqual(
+                        (sentinel.stat().st_dev, sentinel.stat().st_ino),
+                        (sentinel_metadata.st_dev, sentinel_metadata.st_ino),
+                    )
+
+            partial_output = root / "partial-output"
+            real_write = os.write
+            calls = 0
+
+            def fail_after_partial_write(descriptor: int, data: bytes) -> int:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return real_write(descriptor, data[:5])
+                raise OSError("synthetic write failure")
+
+            with patch.object(pin.os, "write", side_effect=fail_after_partial_write):
+                with self.assertRaises(pin.HostToolsPinError):
+                    pin._write_private_pin_output(partial_output, PIN_SHA)
+            self.assertFalse(partial_output.exists())
 
     def test_pin_bump_uses_prior_generation_and_rejects_unpinned_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -404,6 +404,126 @@ def resolve_pin(
     return host_tools_sha
 
 
+def _remove_private_output_if_owned(
+    parent_descriptor: int, name: str, identity: tuple[int, int] | None
+) -> None:
+    if identity is None:
+        return
+    try:
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            (current.st_dev, current.st_ino) == identity
+            and stat.S_ISREG(current.st_mode)
+            and current.st_nlink == 1
+            and current.st_uid == os.geteuid()
+        ):
+            os.unlink(name, dir_fd=parent_descriptor)
+    except OSError:
+        # Cleanup is best effort and never follows or removes a replacement.
+        return
+
+
+def _write_private_pin_output(output_path: Path, host_tools_sha: str) -> None:
+    """Create a canonical pin line at a new private path without clobbering it."""
+    if (
+        not isinstance(output_path, Path)
+        or not output_path.is_absolute()
+        or output_path.name in {"", ".", ".."}
+        or any(part in {".", ".."} for part in output_path.parts[1:])
+        or SHA_RE.fullmatch(host_tools_sha) is None
+    ):
+        raise HostToolsPinError("host-tools pin private output is invalid")
+
+    parent_descriptor = -1
+    descriptor = -1
+    created_identity: tuple[int, int] | None = None
+    name = output_path.name
+    try:
+        parent_before = output_path.parent.lstat()
+        if (
+            stat.S_ISLNK(parent_before.st_mode)
+            or not stat.S_ISDIR(parent_before.st_mode)
+            or parent_before.st_uid != os.geteuid()
+            or parent_before.st_mode & 0o022
+        ):
+            raise HostToolsPinError("host-tools pin private output parent is unsafe")
+        parent_descriptor = os.open(
+            output_path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        parent_opened = os.fstat(parent_descriptor)
+        if (
+            (parent_before.st_dev, parent_before.st_ino)
+            != (parent_opened.st_dev, parent_opened.st_ino)
+            or not stat.S_ISDIR(parent_opened.st_mode)
+            or parent_opened.st_uid != os.geteuid()
+            or parent_opened.st_mode & 0o022
+        ):
+            raise HostToolsPinError("host-tools pin private output parent changed")
+
+        descriptor = os.open(
+            name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        created = os.fstat(descriptor)
+        created_identity = (created.st_dev, created.st_ino)
+        os.fchmod(descriptor, 0o600)
+        payload = (host_tools_sha + "\n").encode("ascii")
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("private output write made no progress")
+            written += count
+        os.fsync(descriptor)
+        finished = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            (finished.st_dev, finished.st_ino) != created_identity
+            or (named.st_dev, named.st_ino) != created_identity
+            or not stat.S_ISREG(finished.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or finished.st_uid != os.geteuid()
+            or named.st_uid != os.geteuid()
+            or stat.S_IMODE(finished.st_mode) != 0o600
+            or stat.S_IMODE(named.st_mode) != 0o600
+            or finished.st_nlink != 1
+            or named.st_nlink != 1
+            or finished.st_size != len(payload)
+            or named.st_size != len(payload)
+        ):
+            raise HostToolsPinError("host-tools pin private output metadata is unsafe")
+        closing_descriptor = descriptor
+        descriptor = -1
+        os.close(closing_descriptor)
+    except HostToolsPinError:
+        _remove_private_output_if_owned(parent_descriptor, name, created_identity)
+        raise
+    except OSError as exc:
+        _remove_private_output_if_owned(parent_descriptor, name, created_identity)
+        raise HostToolsPinError("host-tools pin private output is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if parent_descriptor >= 0:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -411,6 +531,7 @@ def _parser() -> argparse.ArgumentParser:
     resolve.add_argument("--source-root", required=True)
     resolve.add_argument("--target-sha", required=True)
     resolve.add_argument("--expected-repository", required=True)
+    resolve.add_argument("--private-output")
     return parser
 
 
@@ -423,7 +544,12 @@ def main(argv: list[str] | None = None) -> int:
                 target_sha=arguments.target_sha,
                 expected_repository=arguments.expected_repository,
             )
-            print(host_tools_sha)
+            if arguments.private_output is None:
+                print(host_tools_sha)
+            else:
+                _write_private_pin_output(
+                    Path(arguments.private_output), host_tools_sha
+                )
             return 0
     except HostToolsPinError as exc:
         if exc.diagnostic_code in {"shallow_history", "missing_pinned_commit"}:
