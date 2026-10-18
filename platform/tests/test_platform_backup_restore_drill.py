@@ -5714,6 +5714,72 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 "worker_after_restore_before_postgres_stop",
             ],
         )
+        for owner in (
+            backup_drill._scratch_worker_main,
+            backup_drill._scratch_synthetic_restore_diagnostic_worker,
+        ):
+            tree = ast.parse(inspect.getsource(owner))
+            backend_guard_calls = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_scratch_resource_guard"
+            ]
+            self.assertTrue(backend_guard_calls)
+            self.assertTrue(
+                all(
+                    any(
+                        keyword.arg == "scratch_backend"
+                        and isinstance(keyword.value, ast.Name)
+                        and keyword.value.id == "scratch_backend"
+                        for keyword in node.keywords
+                    )
+                    for node in backend_guard_calls
+                )
+            )
+            self.assertTrue(
+                all(
+                    any(keyword.arg == "expected_owner" for keyword in node.keywords)
+                    for node in backend_guard_calls
+                )
+            )
+        guard_root = pathlib.Path("/synthetic-guard-root")
+        with (
+            mock.patch.object(backup_drill, "require_restore_headroom"),
+            mock.patch.object(backup_drill, "_raise_scratch_host_memory_reserve"),
+            mock.patch.object(backup_drill, "_scratch_cgroup_snapshot"),
+            mock.patch.object(backup_drill, "_scratch_mount_snapshot") as mount_snapshot,
+            mock.patch.object(
+                backup_drill.pwd,
+                "getpwnam",
+                return_value=types.SimpleNamespace(pw_uid=26, pw_gid=26),
+            ) as get_postgres,
+        ):
+            backup_drill._scratch_resource_guard(guard_root)
+            mount_snapshot.assert_called_once_with(
+                guard_root, backend=backup_drill.SCRATCH_BACKEND_TMPFS_V1
+            )
+            get_postgres.assert_not_called()
+            mount_snapshot.reset_mock()
+            backup_drill._scratch_resource_guard(
+                guard_root,
+                scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                expected_owner=(26, 26),
+            )
+            mount_snapshot.assert_called_once_with(
+                guard_root,
+                backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                expected_owner=(26, 26),
+            )
+            get_postgres.assert_not_called()
+            mount_snapshot.reset_mock()
+            with self.assertRaisesRegex(RuntimeError, "exact postgres owner"):
+                backup_drill._scratch_resource_guard(
+                    guard_root,
+                    scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
+                )
+            mount_snapshot.assert_not_called()
         self.assertEqual(
             backup_drill._scratch_host_guard_frame({**valid_host_guard, "guard_site": "unknown"}),
             None,
@@ -6244,6 +6310,30 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 stdout_truncated=False,
                 stderr_truncated=False,
             )
+        )
+        self.assertEqual(
+            backup_drill._scratch_synthetic_worker_failure_candidate(
+                emitted_stdout, b"", stderr_eof=False
+            ),
+            ("pending", None),
+        )
+        self.assertEqual(
+            backup_drill._scratch_synthetic_worker_failure_candidate(
+                emitted_stdout, emitted_stderr[:12], stderr_eof=False
+            ),
+            ("pending", None),
+        )
+        self.assertEqual(
+            backup_drill._scratch_synthetic_worker_failure_candidate(
+                emitted_stdout, emitted_stderr, stderr_eof=True
+            ),
+            ("valid", child_failure.scratch_first_fault),
+        )
+        self.assertEqual(
+            backup_drill._scratch_synthetic_worker_failure_candidate(
+                emitted_stdout, mismatch_frame, stderr_eof=True
+            ),
+            ("invalid", None),
         )
 
         # The same worker flag without the typed synthetic mode keeps the
@@ -8293,6 +8383,145 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             mountpoint = pathlib.Path(unit_command.call_args.kwargs["mountpoint"])
             self.assertFalse(mountpoint.exists())
 
+    def _assert_synthetic_worker_failure_pair_reaches_parent(self) -> None:
+        """Exercise child main(), pipe ordering, parent binding, and cleanup."""
+        self.assertEqual(os.geteuid(), 0)
+        real_builder = backup_drill._scratch_unit_command
+        launched: list[subprocess.Popen[bytes]] = []
+        stop_requested = False
+        invocation_id = "0123456789abcdef0123456789abcdef"
+        control_group = "/system.slice/scratch-synthetic-failure.service"
+
+        child_source = f"""\
+import importlib.util
+import pathlib
+import sys
+import time
+
+path = pathlib.Path({str(SCRIPT_PATH)!r})
+spec = importlib.util.spec_from_file_location("scratch_child", path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+def fail_mount(*args, **kwargs):
+    raise RuntimeError("private child detail")
+
+module._scratch_mount_snapshot = fail_mount
+module._scratch_emit_allocation_sample = lambda *args, **kwargs: None
+sys.argv = [str(path), *sys.argv[1:]]
+status = module.main()
+time.sleep(2)
+raise SystemExit(status)
+"""
+
+        def unit_command(**kwargs: Any) -> list[str]:
+            built = real_builder(**kwargs)
+            worker_args = built[built.index(backup_drill.SCRATCH_WORKER_MODE):]
+            return [sys.executable, "-c", child_source, *worker_args]
+
+        real_popen = subprocess.Popen
+
+        def launch(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            launched.append(process)
+            return process
+
+        def service_snapshot(_unit_name: str) -> dict[str, Any]:
+            process = launched[0] if launched else None
+            active = process is not None and process.poll() is None and not stop_requested
+            properties = {
+                "LoadState": "loaded" if active else "not-found",
+                "ActiveState": "active" if active else "inactive",
+                "SubState": "running" if active else "dead",
+                "Result": "success" if active else "exit-code",
+                "ExecMainPID": str(process.pid) if active and process is not None else "0",
+                "InvocationID": invocation_id,
+                "ExecMainCode": "1" if not active else "0",
+                "ExecMainStatus": "1" if not active else "0",
+                "ControlGroup": control_group if active else "",
+            }
+            return {"properties": properties, "load_state": properties["LoadState"]}
+
+        def stop_unit(_unit_name: str) -> None:
+            nonlocal stop_requested
+            stop_requested = True
+            if launched and launched[0].poll() is None:
+                launched[0].terminate()
+                launched[0].wait(timeout=3)
+
+        def no_mount(_mountpoint: pathlib.Path) -> bool:
+            return False
+
+        def run_parent() -> BaseException:
+            with self.assertRaises(RuntimeError) as failure:
+                backup_drill._run_isolated_restore_drill(
+                    None,
+                    timestamp_slug="20261018T120000Z",
+                    synthetic_restore_diagnostic=True,
+                    scratch_backend=backup_drill.SCRATCH_BACKEND_TMPFS_V1,
+                )
+            return failure.exception
+
+        with (
+            mock.patch.object(backup_drill, "require_commands"),
+            mock.patch.object(backup_drill, "_scratch_host_guard"),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_prepare_synthetic_protected_paths",
+                return_value=((), None),
+            ),
+            mock.patch.object(
+                backup_drill, "_scratch_remove_created_protected_path_directories"
+            ),
+            mock.patch.object(backup_drill, "_scratch_unit_command", side_effect=unit_command),
+            mock.patch.object(backup_drill, "_scratch_mountpoint_is_mounted", side_effect=no_mount),
+            mock.patch.object(backup_drill, "_scratch_service_snapshot", side_effect=service_snapshot),
+            mock.patch.object(
+                backup_drill, "_scratch_expected_properties", return_value=control_group
+            ),
+            mock.patch.object(backup_drill, "_scratch_control_group_snapshot", return_value={}),
+            mock.patch.object(backup_drill, "_scratch_stop_unit", side_effect=stop_unit),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_unit_journal_diagnostic",
+                return_value=backup_drill._scratch_empty_journal_diagnostic("unavailable"),
+            ),
+            mock.patch.object(backup_drill, "_scratch_reset_failed_unit"),
+            mock.patch.object(
+                backup_drill,
+                "_scratch_wait_unit_not_found",
+                return_value={"properties": {"LoadState": "not-found"}, "load_state": "not-found"},
+            ),
+            mock.patch.object(backup_drill.subprocess, "Popen", side_effect=launch),
+            mock.patch.object(backup_drill.secrets, "token_hex", return_value=uuid.uuid4().hex[:24]),
+        ):
+            failure = run_parent()
+
+        self.assertEqual(len(launched), 1)
+        self.assertIsNotNone(launched[0].returncode)
+        self.assertTrue(stop_requested)
+        self.assertEqual(
+            getattr(failure, "scratch_first_fault", None),
+            {
+                "schema": 1,
+                "origin": "worker",
+                "site": "worker_mount_snapshot",
+                "exception_kind": "runtime",
+                "errno": None,
+                "verification_site": "worker_mount_identity",
+            },
+            msg=f"parent failure={failure!r}; unit={getattr(failure, 'scratch_unit_diagnostic', None)!r}",
+        )
+        unit = getattr(failure, "scratch_unit_diagnostic", None)
+        self.assertTrue(backup_drill.valid_scratch_unit_diagnostic(unit))
+        assert isinstance(unit, dict)
+        self.assertEqual(unit["worker_frame_status"], "worker_failure_report")
+        self.assertEqual(unit["phase"], "authorization_failed")
+        self.assertTrue(unit["terminal_snapshot"]["start_token_sent"])
+        self.assertFalse(unit["terminal_snapshot"]["completion_token_sent"])
+        self.assertEqual(getattr(failure, "scratch_cleanup_status", None), "confirmed")
+
     def _assert_scratch_final_identity_loss_blocks_done(self) -> None:
         for replacement in (
             "pid", "invocation", "starttime", "cgroup", "missing", "late_start", "late_done",
@@ -8940,6 +9169,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self._assert_scratch_live_identity_failure_preserves_output()
         self._assert_scratch_identity_replacement_cannot_receive_authorization()
         self._assert_scratch_startup_inactive_race_is_handled()
+        self._assert_synthetic_worker_failure_pair_reaches_parent()
         self._assert_scratch_final_identity_loss_blocks_done()
         self._assert_worker_token_deadline_delivery_is_truthful()
         self._assert_scratch_fast_launcher_cannot_skip_active_confinement()

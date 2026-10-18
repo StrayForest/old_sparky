@@ -6243,10 +6243,13 @@ def require_commands(*commands: str) -> None:
 
 
 def _scratch_mount_snapshot(
-    path: pathlib.Path, *, backend: str = SCRATCH_BACKEND_TMPFS_V1
+    path: pathlib.Path,
+    *,
+    backend: str = SCRATCH_BACKEND_TMPFS_V1,
+    expected_owner: tuple[int, int] = (0, 0),
 ) -> dict[str, int | str]:
     if backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
-        return _scratch_disk_mount_snapshot(path)
+        return _scratch_disk_mount_snapshot(path, expected_owner=expected_owner)
     if backend != SCRATCH_BACKEND_TMPFS_V1:
         raise RuntimeError("Scratch restore backend is not supported.")
     target = str(path)
@@ -7900,6 +7903,8 @@ def _scratch_resource_guard(
     root: pathlib.Path,
     *,
     guard_site: str = "worker_pg_restore_resource_guard",
+    scratch_backend: str = SCRATCH_BACKEND_TMPFS_V1,
+    expected_owner: tuple[int, int] | None = None,
 ) -> None:
     require_restore_headroom(pathlib.Path("/"))
     _raise_scratch_host_memory_reserve(
@@ -7907,7 +7912,25 @@ def _scratch_resource_guard(
         message="Scratch restore stopped by the host-memory reserve guard.",
     )
     _scratch_cgroup_snapshot()
-    _scratch_mount_snapshot(root)
+    if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
+        if (
+            not isinstance(expected_owner, tuple)
+            or len(expected_owner) != 2
+            or type(expected_owner[0]) is not int
+            or type(expected_owner[1]) is not int
+            or expected_owner[0] <= 0
+            or expected_owner[1] < 0
+        ):
+            raise RuntimeError("Scratch disk resource guard requires the exact postgres owner.")
+        _scratch_mount_snapshot(
+            root,
+            backend=scratch_backend,
+            expected_owner=expected_owner,
+        )
+    else:
+        if scratch_backend != SCRATCH_BACKEND_TMPFS_V1 or expected_owner is not None:
+            raise RuntimeError("Scratch restore backend or owner is not supported.")
+        _scratch_mount_snapshot(root, backend=scratch_backend)
 
 
 def _open_verified_scratch_archive(args: argparse.Namespace) -> BinaryIO:
@@ -8110,6 +8133,7 @@ def _scratch_synthetic_restore_diagnostic_worker(
     if scratch_backend not in SCRATCH_BACKENDS:
         raise RuntimeError("Synthetic restore diagnostic backend is unsupported.")
     postgres_user = pwd.getpwnam("postgres")
+    scratch_expected_owner = (postgres_user.pw_uid, postgres_user.pw_gid)
     if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1:
         _scratch_disk_mount_snapshot(root)
         _scratch_prepare_disk_root_for_postgres(
@@ -8196,7 +8220,16 @@ def _scratch_synthetic_restore_diagnostic_worker(
         _scratch_prepare_postgres_directory(
             socket_dir, uid=postgres_user.pw_uid, gid=postgres_user.pw_gid
         )
-        _scratch_resource_guard(root, guard_site="worker_synthetic_before_initdb")
+        _scratch_resource_guard(
+            root,
+            guard_site="worker_synthetic_before_initdb",
+            scratch_backend=scratch_backend,
+            expected_owner=(
+                scratch_expected_owner
+                if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+                else None
+            ),
+        )
         as_postgres(_scratch_initdb_command(str(initdb), data), capture_output=True)
 
     def start_cluster(
@@ -8205,7 +8238,16 @@ def _scratch_synthetic_restore_diagnostic_worker(
         log: pathlib.Path,
         options: list[str],
     ) -> None:
-        _scratch_resource_guard(root, guard_site="worker_synthetic_before_postgres_start")
+        _scratch_resource_guard(
+            root,
+            guard_site="worker_synthetic_before_postgres_start",
+            scratch_backend=scratch_backend,
+            expected_owner=(
+                scratch_expected_owner
+                if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+                else None
+            ),
+        )
         as_postgres(
             [
                 str(pgctl), "--pgdata", str(data), "--log", str(log),
@@ -8213,7 +8255,16 @@ def _scratch_synthetic_restore_diagnostic_worker(
             ],
             capture_output=True,
         )
-        _scratch_resource_guard(root, guard_site="worker_synthetic_after_postgres_start")
+        _scratch_resource_guard(
+            root,
+            guard_site="worker_synthetic_after_postgres_start",
+            scratch_backend=scratch_backend,
+            expected_owner=(
+                scratch_expected_owner
+                if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+                else None
+            ),
+        )
 
     def stop_cluster(data: pathlib.Path) -> None:
         pid_file = data / "postmaster.pid"
@@ -8488,7 +8539,16 @@ def _scratch_synthetic_restore_diagnostic_worker(
                         phase_state["phase_ended_ns"] = time.monotonic_ns()
 
                 def resource_guard() -> None:
-                    _scratch_resource_guard(root, guard_site="worker_synthetic_restore_resource_guard")
+                    _scratch_resource_guard(
+                        root,
+                        guard_site="worker_synthetic_restore_resource_guard",
+                        scratch_backend=scratch_backend,
+                        expected_owner=(
+                            scratch_expected_owner
+                            if scratch_backend == SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1
+                            else None
+                        ),
+                    )
 
                 table_count = perform_restore_drill(
                     archive_path,
@@ -8717,6 +8777,9 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         args._scratch_fault_site = "worker_postgres_tools"
         args._scratch_verification_site = "worker_postgres_account_identity"
         postgres = pwd.getpwnam("postgres")
+    scratch_expected_owner = (
+        (postgres.pw_uid, postgres.pw_gid) if postgres is not None else None
+    )
     if getattr(args, "_scratch_synthetic_restore_diagnostic", False):
         args._scratch_fault_site = "worker_entry"
         if getattr(args, "_scratch_authorization_probe", False) or any(
@@ -8854,7 +8917,10 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
     try:
         args._scratch_fault_site = "worker_after_initdb_guard"
         _scratch_resource_guard(
-            root, guard_site="worker_after_initdb_before_postgres_start"
+            root,
+            guard_site="worker_after_initdb_before_postgres_start",
+            scratch_backend=scratch_backend,
+            expected_owner=scratch_expected_owner,
         )
         _scratch_emit_allocation_sample(args, root, "initdb_end")
         server_options = shlex.join(_scratch_postgres_start_options(socket_dir))
@@ -8870,7 +8936,12 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         )
         started = True
         args._scratch_fault_site = "worker_after_postgres_start_guard"
-        _scratch_resource_guard(root, guard_site="worker_after_postgres_start")
+        _scratch_resource_guard(
+            root,
+            guard_site="worker_after_postgres_start",
+            scratch_backend=scratch_backend,
+            expected_owner=scratch_expected_owner,
+        )
         _scratch_emit_allocation_sample(args, root, "postgres_start_end")
         args._scratch_fault_site = "worker_role_setup"
         admin_target = DatabaseTarget(
@@ -8892,7 +8963,12 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
 
         def pg_restore_resource_guard() -> None:
             args._scratch_fault_site = "worker_pg_restore_resource_guard"
-            _scratch_resource_guard(root, guard_site="worker_pg_restore_resource_guard")
+            _scratch_resource_guard(
+                root,
+                guard_site="worker_pg_restore_resource_guard",
+                scratch_backend=scratch_backend,
+                expected_owner=scratch_expected_owner,
+            )
 
         table_count = perform_restore_drill(
             root / "archive.dump",
@@ -8908,7 +8984,10 @@ def _scratch_worker_main(args: argparse.Namespace) -> int:
         )
         args._scratch_fault_site = "worker_after_restore_guard"
         _scratch_resource_guard(
-            root, guard_site="worker_after_restore_before_postgres_stop"
+            root,
+            guard_site="worker_after_restore_before_postgres_stop",
+            scratch_backend=scratch_backend,
+            expected_owner=scratch_expected_owner,
         )
     except BaseException as exc:
         if getattr(args, "private_scratch_diagnostics", False):
@@ -9965,6 +10044,58 @@ def _scratch_synthetic_worker_candidate(stdout: bytes) -> dict[str, Any] | None:
     if not valid_scratch_synthetic_restore_diagnostic(decoded):
         raise RuntimeError("Scratch synthetic diagnostic result failed validation.")
     return decoded
+
+
+def _scratch_synthetic_worker_failure_candidate(
+    stdout: bytes,
+    stderr: bytes,
+    *,
+    stderr_eof: bool,
+) -> tuple[str, dict[str, Any] | None]:
+    """Recognize only the child's fixed, canonical failure report/frame pair.
+
+    The report is emitted before its stderr frame. A valid report with an
+    incomplete frame stays pending so the success parser never sees it and no
+    completion token can be sent prematurely.
+    """
+    if (
+        not stdout
+        or len(stdout) > SCRATCH_SYNTHETIC_RESULT_MAX_BYTES
+        or not stdout.endswith(b"\n")
+    ):
+        return "not_failure", None
+    try:
+        decoded = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "not_failure", None
+    if not isinstance(decoded, dict) or set(decoded) != {
+        "ok", "error", "scratch_first_fault"
+    }:
+        return "not_failure", None
+    fault = decoded.get("scratch_first_fault")
+    if (
+        decoded.get("ok") is not False
+        or decoded.get("error") != "Synthetic restore worker failed."
+        or not valid_scratch_first_fault(fault)
+        or fault.get("origin") != "worker"
+        or stdout
+        != json.dumps(decoded, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    ):
+        return "invalid", None
+    expected_frame = _scratch_first_fault_frame(fault)
+    if expected_frame is None:
+        return "invalid", None
+    if stderr == expected_frame:
+        bound = _parse_bound_scratch_first_fault(
+            stdout,
+            stderr,
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
+        return ("valid", fault) if bound == fault else ("invalid", None)
+    if not stderr_eof and expected_frame.startswith(stderr):
+        return "pending", None
+    return "invalid", None
 
 
 def _scratch_authorization_probe_candidate(stdout: bytes) -> dict[str, Any] | None:
@@ -11338,6 +11469,27 @@ def _run_isolated_restore_drill(
                         verification_operation = None
                 if start_token_sent and not completion_token_sent and stdout_buffer:
                     fault_site = "controller_worker_frame"
+                    if synthetic_restore_diagnostic:
+                        failure_state, worker_failure = (
+                            _scratch_synthetic_worker_failure_candidate(
+                                bytes(stdout_buffer),
+                                bytes(stderr_buffer),
+                                stderr_eof=stderr_eof,
+                            )
+                        )
+                        if failure_state == "pending":
+                            continue
+                        if failure_state == "valid":
+                            failure_error = RuntimeError(
+                                "Synthetic restore worker reported a bounded failure."
+                            )
+                            assert worker_failure is not None
+                            setattr(failure_error, "scratch_first_fault", worker_failure)
+                            raise failure_error
+                        if failure_state == "invalid":
+                            raise RuntimeError(
+                                "Scratch synthetic worker failure frame did not match its report."
+                            )
                     candidate = (
                         _scratch_authorization_probe_candidate(bytes(stdout_buffer))
                         if authorization_probe
