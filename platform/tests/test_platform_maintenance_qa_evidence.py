@@ -622,6 +622,12 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                 _loaded_unit_properties().replace("status=0/0", "status=", 1),
             ),
             (
+                "cleared-exec-with-success-label",
+                _loaded_unit_properties().replace(
+                    "status=0/0", "status=0/SUCCESS", 1
+                ),
+            ),
+            (
                 "malformed-exec-fields",
                 _loaded_unit_properties().replace(" ; pid=0 ;", " ; pid= ;", 1),
             ),

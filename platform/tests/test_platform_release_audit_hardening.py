@@ -3512,7 +3512,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     f"ExecStart={{ path={expected_maintenance_argv[0]} ; "
                     f"argv[]={' '.join(expected_maintenance_argv)} ; "
                     "ignore_errors=no ; start_time= ; stop_time= ; pid=0 ; "
-                    "code=(null) ; status=0/SUCCESS }"
+                    "code=(null) ; status=0/0 }"
                 )
                 unit_properties = "\n".join(
                     (
