@@ -3004,6 +3004,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
     def test_spoofed_status_cannot_authorize_mutation(self) -> None:
         workflow, run, jobs, statuses = self._payload()
         spoof = copy.deepcopy(statuses[0])
+        spoof["id"] = 5678
         spoof["creator"] = {"login": "attacker", "type": "User", "id": 1}
         statuses.append(spoof)
         statuses[0]["updated_at"] = "2026-09-19T09:00:00Z"
@@ -3031,8 +3032,13 @@ class WorkflowProvenanceTests(unittest.TestCase):
             else:
                 candidate_statuses[0]["creator"] = creator
             with self.subTest(creator=label):
+                expected_error = (
+                    "status creator is missing"
+                    if label in {"missing", "null"}
+                    else "status creator is not the GitHub Actions bot"
+                )
                 with self.assertRaisesRegex(
-                    ProvenanceError, "status creator is not the GitHub Actions bot"
+                    ProvenanceError, expected_error
                 ):
                     validate_deployment_marker(
                         workflow,
@@ -3194,7 +3200,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
             candidate_statuses[0][field] = value
             with self.subTest(field=field):
                 expected_error = (
-                    "status context is not canonical"
+                    "status is missing"
                     if field == "context"
                     else "status state is not canonical"
                 )
