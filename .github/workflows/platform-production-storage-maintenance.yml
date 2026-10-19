@@ -342,14 +342,167 @@ jobs:
           fi
           invocation_completed_at="$(date -u '+%Y-%m-%dT%H:%M:%S.%NZ')" \
             || fail "Maintenance invocation completion time producer failed."
-          if ! service_invocation_after="$(systemctl show deadlock-maintenance.service \
-            --property=InvocationID --value --no-pager 2>/dev/null)"; then
+          # Type=oneshot with CollectMode=inactive may garbage-collect this
+          # completed unit before `systemctl start` returns, clearing its
+          # InvocationID property. Bind the start to the exact unit/job journal
+          # records in this call's timestamp window instead of depending on a
+          # post-completion unit property surviving collection.
+          if ! service_invocation_after="$(/usr/bin/python3 -I - \
+            "$invocation_started_at" "$invocation_completed_at" \
+            "$service_invocation_before" "$service_status" <<'PY'
+          from datetime import datetime, timezone
+          import json
+          import re
+          import subprocess
+          import sys
+
+          unit = "deadlock-maintenance.service"
+          start_job_message_id = "7d4958e842da4a758f6c1cdc7b36dcc5"
+          success_job_message_id = "39f53479d3a045ac8e11786248231fbf"
+          failed_job_message_id = "be02cf6855d2428ba40df7e9d022f03d"
+          failed_job_results = {
+              "assert",
+              "canceled",
+              "collected",
+              "concurrency",
+              "dependency",
+              "failed",
+              "frozen",
+              "invalid",
+              "once",
+              "resources",
+              "skipped",
+              "timeout",
+              "unsupported",
+          }
+          invocation_pattern = re.compile(r"[0-9a-f]{32}")
+
+          def timestamp_ns(value: str) -> int:
+              match = re.fullmatch(
+                  r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})\.([0-9]{9})Z",
+                  value,
+              )
+              if match is None:
+                  raise ValueError
+              moment = datetime.fromisoformat(match.group(1)).replace(tzinfo=timezone.utc)
+              epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+              delta = moment - epoch
+              return (
+                  (delta.days * 86400 + delta.seconds) * 1_000_000_000
+                  + int(match.group(2))
+              )
+
+          try:
+              started_ns = timestamp_ns(sys.argv[1])
+              completed_ns = timestamp_ns(sys.argv[2])
+              before_id = sys.argv[3]
+              service_status = int(sys.argv[4])
+              if (
+                  completed_ns < started_ns
+                  or (before_id and not invocation_pattern.fullmatch(before_id))
+                  or not 0 <= service_status <= 255
+              ):
+                  raise ValueError
+              result = subprocess.run(
+                  [
+                      "/usr/bin/journalctl",
+                      "--quiet",
+                      "--no-pager",
+                      "--output=json",
+                      f"--since={sys.argv[1]}",
+                      f"--until={sys.argv[2]}",
+                      f"--unit={unit}",
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+                  timeout=15,
+                  check=False,
+              )
+              if result.returncode != 0 or len(result.stdout) > 512 * 1024:
+                  raise ValueError
+              invocation_ids = set()
+              start_ids = set()
+              success_ids = set()
+              failed_ids = set()
+              service_success_ids = set()
+              for line in result.stdout.splitlines():
+                  if not line or len(line) > 64 * 1024:
+                      raise ValueError
+                  row = json.loads(line)
+                  if not isinstance(row, dict):
+                      raise ValueError
+                  try:
+                      record_ns = int(row["__REALTIME_TIMESTAMP"]) * 1_000
+                  except (KeyError, TypeError, ValueError):
+                      raise ValueError from None
+                  if not started_ns <= record_ns <= completed_ns:
+                      continue
+                  manager_id = row.get("INVOCATION_ID")
+                  service_id = row.get("_SYSTEMD_INVOCATION_ID")
+                  manager_record = row.get("UNIT") == unit
+                  start_record = row.get("MESSAGE_ID") == start_job_message_id
+                  success_record = row.get("MESSAGE_ID") == success_job_message_id
+                  failed_record = row.get("MESSAGE_ID") == failed_job_message_id
+                  if manager_record and (start_record or success_record or failed_record):
+                      if not isinstance(manager_id, str) or not invocation_pattern.fullmatch(manager_id):
+                          raise ValueError
+                      invocation_ids.add(manager_id)
+                      if row.get("JOB_TYPE") != "start":
+                          raise ValueError
+                      if start_record:
+                          start_ids.add(manager_id)
+                      if success_record and row.get("JOB_RESULT") == "done":
+                          success_ids.add(manager_id)
+                      if failed_record:
+                          job_result = row.get("JOB_RESULT")
+                          if job_result not in failed_job_results:
+                              raise ValueError
+                          failed_ids.add(manager_id)
+                  elif manager_record and isinstance(manager_id, str):
+                      if not invocation_pattern.fullmatch(manager_id):
+                          raise ValueError
+                      invocation_ids.add(manager_id)
+                  service_record = row.get("_SYSTEMD_UNIT") == unit
+                  service_success_record = (
+                      service_record
+                      and row.get("MESSAGE") == "[OK] Platform storage maintenance (apply)"
+                  )
+                  if service_record and isinstance(service_id, str):
+                      if not invocation_pattern.fullmatch(service_id):
+                          raise ValueError
+                      invocation_ids.add(service_id)
+                      if service_success_record:
+                          service_success_ids.add(service_id)
+                  elif service_success_record:
+                      raise ValueError
+              if len(invocation_ids) != 1 or len(start_ids) != 1:
+                  raise ValueError
+              invocation_id = next(iter(invocation_ids))
+              if start_ids != {invocation_id} or invocation_id == before_id:
+                  raise ValueError
+              if service_status == 0:
+                  if (
+                      success_ids != {invocation_id}
+                      or failed_ids
+                      or service_success_ids != {invocation_id}
+                  ):
+                      raise ValueError
+              elif (
+                  failed_ids != {invocation_id}
+                  or success_ids
+                  or service_success_ids
+              ):
+                  raise ValueError
+              print(invocation_id)
+          except Exception:
+              raise SystemExit(1)
+          PY
+          )"; then
             fail_for_service_status invocation_unavailable 2
           fi
-          if [[ ! "$service_invocation_after" =~ ^[0-9a-f]{32}$ \
-            || "$service_invocation_after" == "$service_invocation_before" ]]; then
-            fail_for_service_status invocation_unavailable 2
-          fi
+          [[ "$service_invocation_after" =~ ^[0-9a-f]{32}$ \
+            && "$service_invocation_after" != "$service_invocation_before" ]] \
+            || fail_for_service_status invocation_unavailable 2
           service_output="$(systemctl show deadlock-maintenance.service \
             --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec \
             --no-pager 2>/dev/null)" \
