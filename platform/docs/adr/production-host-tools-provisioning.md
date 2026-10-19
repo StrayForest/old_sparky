@@ -591,8 +591,7 @@ app-side capability before accepting runner/application mismatch.
 
 ## Consequences
 
-Source **C** `ac49b9c57c9f61734e5f85ed9a475411f03e4df9` updates the 15-member v4 pin (dispatcher/input-guard only; SSR stays app-side).
-This is provenance, not installation proof; production requires exact-target CI, signed preflight/provenance, approved provisioning and installed self-test.
+Source **C** `5849001b78aed824527f474c4c3586108019c402` updates the 15-member v4 pin with the dispatcher’s bounded Python-helper launch and export-removal status protocol. Application workflow and CPU-pair changes remain app-side. This is provenance, not installation proof; production requires exact-target CI, signed preflight/provenance, approved provisioning and installed self-test.
 
 The host-control trust boundary is independent of application releases and cannot be repaired by candidate code in a secret-bearing job.
 A host image or operator must provision each reviewed generation before deployment; this is the rollback/supply-chain trade-off for preventing candidate source from becoming production authority.
