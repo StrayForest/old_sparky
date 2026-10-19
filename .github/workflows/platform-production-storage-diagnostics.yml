@@ -380,8 +380,8 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$EXPECTED_SHA" "$BACKUP_FAILURE_RUN_ID" \
-              "$BACKUP_FAILURE_RUN_ATTEMPT" "$BACKUP_FAILURE_SOURCE_SHA" > "$remote_report" 2> "$ssh_error" <<'REMOTE'
+            bash -s -- "$EXPECTED_SHA" "${BACKUP_FAILURE_RUN_ID:--}" \
+              "${BACKUP_FAILURE_RUN_ATTEMPT:--}" "${BACKUP_FAILURE_SOURCE_SHA:--}" > "$remote_report" 2> "$ssh_error" <<'REMOTE'
           set -Eeuo pipefail
           CURRENT_STAGE=identity
           trap 'diagnostic_rc=$?; trap - ERR; printf "{\"schema\":1,\"kind\":\"collection_failure\",\"status\":\"failed\",\"stage\":\"%s\",\"outcome\":\"producer_failed\",\"exit_code\":%d}\n" "$CURRENT_STAGE" "$diagnostic_rc"; exit "$diagnostic_rc"' ERR
@@ -398,6 +398,15 @@ jobs:
           backup_failure_run_id="$2"
           backup_failure_run_attempt="$3"
           backup_failure_source_sha="$4"
+          if [[ "$backup_failure_run_id" == - && "$backup_failure_run_attempt" == - \
+              && "$backup_failure_source_sha" == - ]]; then
+            backup_failure_run_id=""
+            backup_failure_run_attempt=""
+            backup_failure_source_sha=""
+          elif [[ "$backup_failure_run_id" == - || "$backup_failure_run_attempt" == - \
+              || "$backup_failure_source_sha" == - ]]; then
+            report_failure identity invalid_backup_failure_binding 1
+          fi
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           python_bin="$runtime/shared/venv/bin/python"

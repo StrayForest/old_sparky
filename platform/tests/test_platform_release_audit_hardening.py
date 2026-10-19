@@ -2341,6 +2341,156 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             self.assertEqual(changed_summary["dropin_identity"], "unexpected_present")
             self.assertNotIn("override.conf", changed_timer.stdout)
 
+            # OpenSSH sends a shell command string, not an argv vector: joining
+            # empty local arguments drops their positional boundaries remotely.
+            # Run this workflow step with a stub that models that serialization,
+            # then execute the exact extracted remote argument/bootstrap prefix.
+            ssh_bin = Path(temporary) / "bin"
+            ssh_bin.mkdir()
+            fake_ssh = ssh_bin / "ssh"
+            fake_ssh.write_text(
+                textwrap.dedent(
+                    r"""
+                    #!/usr/bin/python3
+                    import os
+                    import shlex
+                    import subprocess
+                    import sys
+
+                    argv = sys.argv[1:]
+                    destination = os.environ["FAKE_SSH_DESTINATION"]
+                    index = argv.index(destination)
+                    # OpenSSH constructs a single remote command string from argv.
+                    remote_command = " ".join(argv[index + 1 :])
+                    remote_argv = shlex.split(remote_command)
+                    script = sys.stdin.read()
+                    marker = "runtime=/opt/oldsparky/platform\n"
+                    args = remote_argv[3:]
+                    if len(args) == 4 and args[1:] == ["-", "-", "-"]:
+                        state = "empty"
+                    else:
+                        state = "bound" if len(args) == 4 else "missing"
+                    command_ok = remote_argv[:3] == ["bash", "-s", "--"]
+                    marker_ok = marker in script
+                    with open(os.environ["FAKE_SSH_TRACE"], "w", encoding="ascii") as stream:
+                        stream.write(
+                            f"argument_count={len(args)}\nstate={state}\n"
+                            f"command_ok={command_ok}\nmarker_ok={marker_ok}\n"
+                        )
+                    if not marker_ok or not command_ok:
+                        raise SystemExit(96)
+                    prefix = script.split(marker, 1)[0]
+                    harness = r'''if [[ -z "$backup_failure_run_id" \
+                      && -z "$backup_failure_run_attempt" \
+                      && -z "$backup_failure_source_sha" ]]; then
+                      status_json=$(printf '{"schema":1,"kind":"collection_status","status":"ok","stage":"%s","exit_code":0}' empty_tuple)
+                      printf '%s\n' "$status_json"
+                    elif [[ "$backup_failure_run_id" == 39248154270 \
+                      && "$backup_failure_run_attempt" == 2 \
+                      && "$backup_failure_source_sha" == \
+                        bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ]]; then
+                      receipt_json=$(printf '{"schema":1,"kind":"backup_failure_receipt_payload","state":"missing"}')
+                      status_json=$(printf '{"schema":1,"kind":"collection_status","status":"ok","stage":"%s","exit_code":0}' bound_tuple)
+                      printf '%s\n' "$receipt_json"
+                      printf '%s\n' "$status_json"
+                    else
+                      report_failure identity invalid_test_binding 1
+                    fi
+                    '''
+                    completed = subprocess.run(
+                        ["/bin/bash", "-s", "--", *args],
+                        input=(prefix + harness).encode(),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    sys.stdout.buffer.write(completed.stdout)
+                    sys.exit(completed.returncode)
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+
+            def run_ssh_transport_case(
+                case_name: str,
+                run_id: str,
+                run_attempt: str,
+                source_sha: str,
+                expected_stage: str,
+                expected_state: str,
+            ) -> None:
+                case_dir = Path(temporary) / case_name
+                case_dir.mkdir()
+                case_temp = case_dir / "runner-temp"
+                case_temp.mkdir(mode=0o700)
+                case_ssh = case_dir / "ssh"
+                case_ssh.mkdir(mode=0o700)
+                (case_ssh / "config").write_text("Host *\\n", encoding="ascii")
+                (case_ssh / "id_ed25519").write_text("test-only\\n", encoding="ascii")
+                github_env = case_dir / "github-env"
+                github_output = case_dir / "github-output"
+                trace = case_dir / "ssh-trace"
+                child_env = {
+                    **os.environ,
+                    "PATH": f"{ssh_bin}:{os.environ['PATH']}",
+                    "RUNNER_TEMP": str(case_temp),
+                    "GITHUB_ENV": str(github_env),
+                    "GITHUB_OUTPUT": str(github_output),
+                    "GITHUB_RUN_ID": "39300000000",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "EXPECTED_SHA": "d" * 40,
+                    "BACKUP_FAILURE_RUN_ID": run_id,
+                    "BACKUP_FAILURE_RUN_ATTEMPT": run_attempt,
+                    "BACKUP_FAILURE_SOURCE_SHA": source_sha,
+                    "SSH_DIR": str(case_ssh),
+                    "PROD_SSH_HOST": "synthetic.invalid",
+                    "PROD_SSH_USER": "runner",
+                    "FAKE_SSH_DESTINATION": "runner@synthetic.invalid",
+                    "FAKE_SSH_TRACE": str(trace),
+                }
+                completed = subprocess.run(
+                    ["bash", "-c", collection_step["run"]],
+                    cwd=case_dir,
+                    env=child_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertTrue(trace.exists(), completed.stderr)
+                self.assertEqual(
+                    trace.read_text(encoding="ascii"),
+                    f"argument_count=4\nstate={expected_state}\ncommand_ok=True\nmarker_ok=True\n",
+                )
+                report = case_temp / "platform-production-storage-diagnostics-artifact.txt"
+                rows = [
+                    json.loads(line)
+                    for line in report.read_text(encoding="ascii").splitlines()
+                ]
+                self.assertTrue(
+                    any(
+                        row.get("kind") == "collection_status"
+                        and row.get("stage") == expected_stage
+                        for row in rows
+                    ),
+                    rows,
+                )
+                self.assertTrue(
+                    any(
+                        row.get("kind") == "collection_transport"
+                        and row.get("exit_code") == 0
+                        for row in rows
+                    ),
+                    rows,
+                )
+
+            run_ssh_transport_case("empty-tuple", "", "", "", "empty_tuple", "empty")
+            run_ssh_transport_case(
+                "populated-tuple", "39248154270", "2", "b" * 40, "bound_tuple", "bound"
+            )
+
     @unittest.skipUnless(os.geteuid() == 0, "lock probe fixture requires root")
     def test_storage_diagnostics_backup_receipt_reader_is_bound_and_private(self) -> None:
         workflow = yaml.safe_load(
@@ -3471,6 +3621,11 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 current_release_tools.mkdir(parents=True)
                 current_release_systemd.mkdir(parents=True)
                 previous_release.mkdir(parents=True)
+                fixture_active_sha = "0123456789abcdef0123456789abcdef01234567"
+                (current_release / "RELEASE.json").write_text(
+                    json.dumps({"source_git_commit": fixture_active_sha}),
+                    encoding="utf-8",
+                )
                 shared = runtime / "shared"
                 report_dir = shared / "maintenance"
                 report_dir.mkdir(parents=True)
@@ -3504,7 +3659,11 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 mock_bin.mkdir()
                 calls = root / "invocation-count"
                 started = root / "service-started"
+                date_calls = root / "date-count"
+                journal_json = root / "journal-records.jsonl"
                 systemctl = mock_bin / "systemctl"
+                journalctl = mock_bin / "journalctl"
+                fake_date = mock_bin / "date"
                 expected_maintenance_argv = (
                     platform_maintenance_qa_evidence.EXPECTED_MAINTENANCE_ARGV
                 )
@@ -3530,12 +3689,12 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 )
                 systemctl.write_text(
                     "#!/usr/bin/python3\n"
-                    "import pathlib, sys\n"
+                    "import os, pathlib, sys\n"
                     "args = sys.argv[1:]\n"
                     "prop = next((item.split('=', 1)[1] for item in args if item.startswith('--property=')), '')\n"
                     "if args[:1] == ['start']:\n"
                     f"    pathlib.Path({str(started)!r}).write_text('called')\n"
-                    "    raise SystemExit(1)\n"
+                    "    raise SystemExit(int(os.environ.get('FAKE_START_STATUS', '1')))\n"
                     "if prop == 'FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec':\n"
                     f"    print({unit_properties!r})\n"
                     "elif prop == 'ActiveState':\n"
@@ -3544,14 +3703,39 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     f"    counter = pathlib.Path({str(calls)!r})\n"
                     "    value = int(counter.read_text()) if counter.exists() else 0\n"
                     "    counter.write_text(str(value + 1))\n"
-                    "    print(('1' if value == 0 else '2') * 32)\n"
+                    "    print(os.environ.get('FAKE_PREVIOUS_INVOCATION_ID', '1' * 32))\n"
                     "elif prop == 'ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec':\n"
-                    "    print('ActiveState=failed\\nSubState=dead\\nResult=exit-code\\nExecMainCode=exited\\nExecMainStatus=1\\nNRestarts=0\\nMemoryCurrent=0\\nMemoryPeak=0\\nMemoryMax=536870912\\nTasksCurrent=0\\nTasksMax=0\\nCPUUsageNSec=0')\n"
+                    "    print(os.environ['FAKE_SERVICE_PROPERTIES'])\n"
                     "else:\n"
                     "    raise SystemExit(2)\n",
                     encoding="utf-8",
                 )
                 systemctl.chmod(0o755)
+                journalctl.write_text(
+                    "#!/usr/bin/python3\n"
+                    "import os, pathlib, sys\n"
+                    "sys.stdout.buffer.write(\n"
+                    "    pathlib.Path(os.environ['FAKE_JOURNAL_RECORDS']).read_bytes()\n"
+                    ")\n",
+                    encoding="utf-8",
+                )
+                journalctl.chmod(0o755)
+                fake_date.write_text(
+                    "#!/usr/bin/python3\n"
+                    "import pathlib, sys\n"
+                    f"counter = pathlib.Path({str(date_calls)!r})\n"
+                    "value = int(counter.read_text()) if counter.exists() else 0\n"
+                    "counter.write_text(str(value + 1))\n"
+                    "print(\n"
+                    "    '2026-10-19T10:00:00.000000000Z' if value == 0\n"
+                    "    else '2026-10-19T10:00:10.000000000Z'\n"
+                    ")\n",
+                    encoding="utf-8",
+                )
+                fake_date.chmod(0o755)
+                service_caller = service_caller.replace(
+                    '"/usr/bin/journalctl"', repr(str(journalctl))
+                )
                 current_before = str(current_release)
                 previous_before = str(previous_release)
                 prefix = "\n".join(
@@ -3568,7 +3752,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                         f"previous_before={shlex.quote(previous_before)}",
                         "current_id=current-fixture",
                         "previous_id=previous-fixture",
-                        "active_sha=0123456789abcdef0123456789abcdef01234567",
+                        f"active_sha={fixture_active_sha}",
                         f"summary_tool={shlex.quote(str(installed_summary_tool))}",
                         "service_status=0",
                         "",
@@ -3579,9 +3763,49 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     "report_binding_status=2\n"
                     f"{report_failure}\n"
                 )
+                from datetime import datetime
+
+                invocation_start = datetime.fromisoformat(
+                    "2026-10-19T10:00:00+00:00"
+                )
+                invocation_epoch_us = int(invocation_start.timestamp() * 1_000_000)
+                failed_invocation_id = "2" * 32
+                failed_rows = (
+                    {
+                        "__REALTIME_TIMESTAMP": str(invocation_epoch_us + 1_000_000),
+                        "UNIT": "deadlock-maintenance.service",
+                        "JOB_TYPE": "start",
+                        "MESSAGE_ID": "7d4958e842da4a758f6c1cdc7b36dcc5",
+                        "INVOCATION_ID": failed_invocation_id,
+                    },
+                    {
+                        "__REALTIME_TIMESTAMP": str(invocation_epoch_us + 5_000_000),
+                        "UNIT": "deadlock-maintenance.service",
+                        "JOB_TYPE": "start",
+                        "MESSAGE_ID": "be02cf6855d2428ba40df7e9d022f03d",
+                        "JOB_RESULT": "failed",
+                        "INVOCATION_ID": failed_invocation_id,
+                    },
+                )
+                journal_json.write_text(
+                    "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in failed_rows),
+                    encoding="ascii",
+                )
                 completed = subprocess.run(
                     ["bash", "-c", prefix + service_caller + trailer],
-                    env={**os.environ, "PATH": f"{mock_bin}:/usr/bin:/bin"},
+                    env={
+                        **os.environ,
+                        "PATH": f"{mock_bin}:/usr/bin:/bin",
+                        "FAKE_START_STATUS": "1",
+                        "FAKE_PREVIOUS_INVOCATION_ID": "1" * 32,
+                        "FAKE_SERVICE_PROPERTIES": (
+                            "ActiveState=failed\nSubState=dead\nResult=exit-code\n"
+                            "ExecMainCode=exited\nExecMainStatus=1\nNRestarts=0\n"
+                            "MemoryCurrent=0\nMemoryPeak=0\nMemoryMax=536870912\n"
+                            "TasksCurrent=0\nTasksMax=0\nCPUUsageNSec=0"
+                        ),
+                        "FAKE_JOURNAL_RECORDS": str(journal_json),
+                    },
                     text=True,
                     capture_output=True,
                     check=False,
@@ -3602,6 +3826,313 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 self.assertEqual(failure["stage"], "report_binding")
                 self.assertEqual(failure["outcome"], "report_unavailable")
                 self.assertEqual(failure["exit_code"], 1)
+
+                invocation_start_text = "2026-10-19T10:00:00.000000000Z"
+                invocation_finish_text = "2026-10-19T10:00:10.000000000Z"
+                invocation_start_us = int(invocation_start.timestamp() * 1_000_000)
+                parser_match = re.search(
+                    r"service_invocation_after=.*?<<'PY'\n(?P<script>.*?)\nPY\n\s*\)\"; then",
+                    service_caller,
+                    re.DOTALL,
+                )
+                self.assertIsNotNone(parser_match)
+                journal_parser = parser_match.group("script")
+
+                def manager_row(
+                    at_seconds: int,
+                    invocation_id: str,
+                    message_id: str,
+                    *,
+                    job_result: str | None = None,
+                ) -> dict[str, str]:
+                    row = {
+                        "__REALTIME_TIMESTAMP": str(
+                            invocation_start_us + at_seconds * 1_000_000
+                        ),
+                        "UNIT": "deadlock-maintenance.service",
+                        "JOB_TYPE": "start",
+                        "MESSAGE_ID": message_id,
+                        "INVOCATION_ID": invocation_id,
+                    }
+                    if job_result is not None:
+                        row["JOB_RESULT"] = job_result
+                    return row
+
+                def success_journal(invocation_id: str) -> list[dict[str, str]]:
+                    return [
+                        manager_row(
+                            1,
+                            invocation_id,
+                            "7d4958e842da4a758f6c1cdc7b36dcc5",
+                        ),
+                        {
+                            "__REALTIME_TIMESTAMP": str(
+                                invocation_start_us + 5_000_000
+                            ),
+                            "_SYSTEMD_UNIT": "deadlock-maintenance.service",
+                            "_SYSTEMD_INVOCATION_ID": invocation_id,
+                            "MESSAGE": "[OK] Platform storage maintenance (apply)",
+                        },
+                        manager_row(
+                            8,
+                            invocation_id,
+                            "39f53479d3a045ac8e11786248231fbf",
+                            job_result="done",
+                        ),
+                    ]
+
+                def run_journal_parser(
+                    rows: list[dict[str, str]],
+                    *,
+                    before_id: str = "",
+                    service_status: str = "0",
+                ) -> subprocess.CompletedProcess[str]:
+                    journal_json.write_text(
+                        "".join(
+                            json.dumps(row, separators=(",", ":")) + "\n"
+                            for row in rows
+                        ),
+                        encoding="ascii",
+                    )
+                    return subprocess.run(
+                        [
+                            "/usr/bin/python3",
+                            "-I",
+                            "-",
+                            invocation_start_text,
+                            invocation_finish_text,
+                            before_id,
+                            service_status,
+                        ],
+                        input=journal_parser,
+                        text=True,
+                        capture_output=True,
+                        env={
+                            **os.environ,
+                            "PATH": f"{mock_bin}:/usr/bin:/bin",
+                            "FAKE_JOURNAL_RECORDS": str(journal_json),
+                        },
+                        check=False,
+                    )
+
+                successful_id = "a" * 32
+                valid_success_rows = success_journal(successful_id)
+                parsed_success = run_journal_parser(valid_success_rows)
+                self.assertEqual(parsed_success.returncode, 0, parsed_success.stderr)
+                self.assertEqual(parsed_success.stdout.strip(), successful_id)
+
+                failed_id = "c" * 32
+                valid_failed_rows = [
+                    manager_row(
+                        1,
+                        failed_id,
+                        "7d4958e842da4a758f6c1cdc7b36dcc5",
+                    ),
+                    manager_row(
+                        8,
+                        failed_id,
+                        "be02cf6855d2428ba40df7e9d022f03d",
+                        job_result="failed",
+                    ),
+                ]
+                parsed_failed = run_journal_parser(
+                    valid_failed_rows, before_id="b" * 32, service_status="1"
+                )
+                self.assertEqual(parsed_failed.returncode, 0, parsed_failed.stderr)
+                self.assertEqual(parsed_failed.stdout.strip(), failed_id)
+
+                rejected_journals: dict[str, list[dict[str, str]]] = {
+                    "missing_rows": [],
+                    "missing_success_job": valid_success_rows[:-1],
+                    "malformed_id": [
+                        {**row, "INVOCATION_ID": "not-an-invocation"}
+                        if row.get("UNIT") == "deadlock-maintenance.service"
+                        else row
+                        for row in valid_success_rows
+                    ],
+                    "ambiguous_ids": valid_success_rows
+                    + [
+                        manager_row(
+                            6,
+                            "d" * 32,
+                            "7d4958e842da4a758f6c1cdc7b36dcc5",
+                        )
+                    ],
+                    "service_id_mismatch": [
+                        {
+                            **row,
+                            "_SYSTEMD_INVOCATION_ID": "e" * 32,
+                        }
+                        if row.get("_SYSTEMD_UNIT") == "deadlock-maintenance.service"
+                        else row
+                        for row in valid_success_rows
+                    ],
+                    "out_of_window": [
+                        {
+                            **row,
+                            "__REALTIME_TIMESTAMP": str(
+                                invocation_start_us + 20_000_000
+                            ),
+                        }
+                        for row in valid_success_rows
+                    ],
+                    "failed_marker_on_success": valid_failed_rows,
+                    "unknown_failure_result": [
+                        valid_failed_rows[0],
+                        {
+                            **valid_failed_rows[1],
+                            "JOB_RESULT": "unrecognized",
+                        },
+                    ],
+                }
+                for scenario, rows in rejected_journals.items():
+                    with self.subTest(journal_scenario=scenario):
+                        result = run_journal_parser(rows)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+                stale = run_journal_parser(
+                    success_journal("f" * 32), before_id="f" * 32
+                )
+                self.assertNotEqual(stale.returncode, 0)
+                self.assertEqual(stale.stdout, "")
+                failed_marker_on_success_status = run_journal_parser(
+                    valid_failed_rows, service_status="0"
+                )
+                self.assertNotEqual(failed_marker_on_success_status.returncode, 0)
+                self.assertEqual(failed_marker_on_success_status.stdout, "")
+                success_marker_on_failure = run_journal_parser(
+                    valid_success_rows, service_status="1"
+                )
+                self.assertNotEqual(success_marker_on_failure.returncode, 0)
+                self.assertEqual(success_marker_on_failure.stdout, "")
+                missing_failed_terminal = run_journal_parser(
+                    valid_failed_rows[:1], service_status="1"
+                )
+                self.assertNotEqual(missing_failed_terminal.returncode, 0)
+                self.assertEqual(missing_failed_terminal.stdout, "")
+
+                success_properties = (
+                    "ActiveState=inactive\nSubState=dead\nResult=success\n"
+                    "ExecMainCode=exited\nExecMainStatus=0\nNRestarts=0\n"
+                    "MemoryCurrent=0\nMemoryPeak=0\nMemoryMax=536870912\n"
+                    "TasksCurrent=0\nTasksMax=0\nCPUUsageNSec=0"
+                )
+                date_calls.write_text("0", encoding="ascii")
+                calls.write_text("0", encoding="ascii")
+                journal_json.write_text(
+                    "".join(
+                        json.dumps(row, separators=(",", ":")) + "\n"
+                        for row in valid_success_rows
+                    ),
+                    encoding="ascii",
+                )
+                success = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        prefix
+                        + service_caller
+                        + '\nprintf "CALLER_STATUS=%s INVOCATION=%s\\n" '
+                        + '"$service_status" "$service_invocation_after"\n',
+                    ],
+                    env={
+                        **os.environ,
+                        "PATH": f"{mock_bin}:/usr/bin:/bin",
+                        "FAKE_START_STATUS": "0",
+                        "FAKE_PREVIOUS_INVOCATION_ID": "",
+                        "FAKE_SERVICE_PROPERTIES": success_properties,
+                        "FAKE_JOURNAL_RECORDS": str(journal_json),
+                    },
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(success.returncode, 0, success.stderr)
+                self.assertIn(
+                    f"CALLER_STATUS=0 INVOCATION={successful_id}", success.stdout
+                )
+                self.assertEqual(calls.read_text(encoding="ascii"), "1")
+
+                report_reader_start = workflow.index(
+                    '          if report_name="$(/usr/bin/python3 -I - "$report_dir"'
+                )
+                report_reader_end = workflow.index(
+                    "\n          if (( report_binding_status != 0 )); then",
+                    report_reader_start,
+                )
+                report_binding = textwrap.dedent(
+                    workflow[report_reader_start:report_reader_end]
+                )
+                report_payload = {
+                    "mode": "apply",
+                    "ok": True,
+                    "started_at_utc": "2026-10-19T10:00:02Z",
+                    "completed_at_utc": "2026-10-19T10:00:08Z",
+                    "production_releases": {
+                        "protected": ["current-fixture", "previous-fixture"]
+                    },
+                    "backup": {
+                        "status": "completed",
+                        "created": True,
+                        "restore_verified": True,
+                        "alembic_revision_verified": True,
+                        "rotation_mode": "rotate-existing",
+                        "protected_retention_proof": {"status": "pass"},
+                        "removed_count": 0,
+                    },
+                }
+                report_name = "platform-maintenance-20261019T100005Z.json"
+                report_path = report_dir / report_name
+                report_path.write_text(json.dumps(report_payload), encoding="ascii")
+                report_path.chmod(0o600)
+                report_epoch = datetime.fromisoformat(
+                    "2026-10-19T10:00:05+00:00"
+                ).timestamp()
+                os.utime(report_path, (report_epoch, report_epoch))
+                report_prefix = (
+                    prefix
+                    + "\ninvocation_started_at="
+                    + shlex.quote(invocation_start_text)
+                    + "\ninvocation_completed_at="
+                    + shlex.quote(invocation_finish_text)
+                    + "\nservice_invocation_before=''\n"
+                    + f"service_invocation_after={successful_id}\nservice_status=0\n"
+                    + "CURRENT_STAGE=report_binding\n"
+                )
+                report_script = (
+                    report_prefix
+                    + report_binding
+                    + "\n"
+                    + report_failure
+                    + "\nprintf 'BOUND_REPORT=%s\\n' \"$report_name\"\n"
+                )
+                report_check = subprocess.run(
+                    ["bash", "-c", report_script],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(report_check.returncode, 0, report_check.stderr)
+                self.assertIn(f"BOUND_REPORT={report_name}", report_check.stdout)
+
+                duplicate_report = report_dir / "platform-maintenance-20261019T100006Z.json"
+                duplicate_report.write_text(json.dumps(report_payload), encoding="ascii")
+                duplicate_report.chmod(0o600)
+                os.utime(duplicate_report, (report_epoch, report_epoch))
+                ambiguous_report = subprocess.run(
+                    ["bash", "-c", report_script],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(ambiguous_report.returncode, 3)
+                report_failure_record = next(
+                    json.loads(line)
+                    for line in ambiguous_report.stdout.splitlines()
+                    if line.startswith("{")
+                )
+                self.assertEqual(report_failure_record["stage"], "report_binding")
+                self.assertEqual(report_failure_record["outcome"], "report_unavailable")
         finally:
             if created_unit_opened and created_unit_identity is None:
                 cleanup_error = "created canonical unit identity could not be captured"
