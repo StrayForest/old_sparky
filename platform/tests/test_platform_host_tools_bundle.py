@@ -2770,12 +2770,41 @@ raise SystemExit(module.main(["host-capabilities"]))
             returncode = 0
 
             def __init__(self) -> None:
-                self.input_bytes: bytes | None = None
-                self.timeout: float | None = None
+                class InputStream:
+                    def __init__(self) -> None:
+                        self.buffer = bytearray()
+
+                    def write(self, payload: bytes) -> int:
+                        self.buffer.extend(payload)
+                        return len(payload)
+
+                    def flush(self) -> None:
+                        return None
+
+                    def close(self) -> None:
+                        return None
+
+                self.stdin = InputStream()
+                read_fd, write_fd = os.pipe()
+                os.write(
+                    write_fd,
+                    b"ARTIFACT_EXPORT_REMOVE schema=1 status=passed removed_roots=0\n",
+                )
+                os.close(write_fd)
+                self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+
+            @property
+            def input_bytes(self) -> bytes:
+                return bytes(self.stdin.buffer)
+
+            def poll(self) -> int:
+                return self.returncode
+
+            def wait(self, *, timeout: float) -> int:
+                return self.returncode
 
             def communicate(self, *, input: bytes, timeout: float) -> tuple[bytes, bytes]:
-                self.input_bytes = input
-                self.timeout = timeout
+                self.stdin.write(input)
                 return b"", b""
 
         child = CompletedChild()
