@@ -24,6 +24,7 @@ jobs:
     outputs:
       deploy: ${{ steps.gate.outputs.deploy }}
       mode: ${{ steps.gate.outputs.mode }}
+      backup_required: ${{ steps.gate.outputs.backup_required }}
       route_class: ${{ steps.route.outputs.route_class }}
       route_deployable: ${{ steps.route.outputs.route_deployable }}
       route_recovery_bootstrap_only: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
@@ -730,9 +731,22 @@ jobs:
 
           echo "mode=$dispatch_mode" >> "$GITHUB_OUTPUT"
           echo "deploy=true" >> "$GITHUB_OUTPUT"
+          backup_required=true
+          if [[ "$dispatch_mode" == "baseline-reconcile" \
+            && "$ROUTE_CLASS" == "docs-only" \
+            && "$ROUTE_DEPLOYABLE" == "false" \
+            && "$ROUTE_DOCS_ONLY" == "true" \
+            && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
+            && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ]]; then
+            # The child independently proves the complete active-release-to-
+            # target range is exactly docs-only and emits a no-op receipt;
+            # this incremental docs-only source cannot activate an app build.
+            backup_required=false
+          fi
+          echo "backup_required=$backup_required" >> "$GITHUB_OUTPUT"
 
       - name: Verify exact source-bound restore-verified backup
-        if: ${{ steps.gate.outputs.deploy == 'true' }}
+        if: ${{ steps.gate.outputs.deploy == 'true' && steps.gate.outputs.backup_required != 'false' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -843,6 +857,7 @@ jobs:
         shell: bash
         env:
           SHOULD_DEPLOY: ${{ steps.gate.outputs.deploy }}
+          BACKUP_REQUIRED: ${{ steps.gate.outputs.backup_required }}
           SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
           ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
           ROUTE_REASON: ${{ steps.route.outputs.route_reason }}
@@ -854,7 +869,14 @@ jobs:
             echo "- Security/build run: $SOURCE_RUN_URL"
             echo "- Classifier route: \`$ROUTE_CLASS\` ($ROUTE_REASON)"
             if [[ "$SHOULD_DEPLOY" == "true" ]]; then
-              echo "- Result: exact host-tools artifact built; backup proof passed; waiting for host readiness."
+              if [[ "$BACKUP_REQUIRED" == "true" ]]; then
+                echo "- Result: exact host-tools artifact built; source-bound backup proof passed; waiting for host readiness."
+              elif [[ "$BACKUP_REQUIRED" == "false" && "$ROUTE_CLASS" == "docs-only" ]]; then
+                echo "- Result: exact docs-only baseline route selected; the child must authenticate cumulative no-op before issuing its source receipt."
+              else
+                echo "- Result: source-bound backup requirement is unresolved." >&2
+                exit 1
+              fi
             else
               echo "- Result: no deployment required."
             fi
@@ -1037,6 +1059,7 @@ jobs:
             --expected-run-url "$SOURCE_RUN_URL"
 
       - name: Revalidate exact successful source-bound backup
+        if: ${{ needs.dispatch.outputs.backup_required != 'false' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1060,6 +1083,7 @@ jobs:
           ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ needs.dispatch.outputs.route_recovery_bootstrap_only }}
           ROUTE_CANDIDATE_PACKAGING_ONLY: ${{ needs.dispatch.outputs.route_candidate_packaging_only }}
           ROUTE_DOCS_ONLY: ${{ needs.dispatch.outputs.route_docs_only }}
+          BACKUP_REQUIRED: ${{ needs.dispatch.outputs.backup_required }}
           AUTODEPLOY_RUN_ID: ${{ github.run_id }}
           AUTODEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
           HOST_TOOLS_SHA: ${{ needs.dispatch.outputs.host_tools_sha }}
@@ -1068,6 +1092,9 @@ jobs:
           [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
           case "$DISPATCH_MODE" in
             deploy)
+              [[ "$BACKUP_REQUIRED" == "true" ]] || {
+                echo "Ordinary deployment requires an exact source-bound backup." >&2; exit 1;
+              }
               [[ "$ROUTE_DEPLOYABLE" == "true" \
                 && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
                 && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ]] \
@@ -1082,9 +1109,23 @@ jobs:
                     && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
                     && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ) ) ]] \
                 || { echo "Refusing an invalid baseline-reconcile route." >&2; exit 1; }
+              if [[ "$ROUTE_CLASS" == "docs-only" && "$ROUTE_DOCS_ONLY" == "true" \
+                && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
+                && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ]]; then
+                [[ "$BACKUP_REQUIRED" == "false" ]] || {
+                  echo "Exact docs-only baseline reconciliation must not require an application backup." >&2; exit 1;
+                }
+              else
+                [[ "$BACKUP_REQUIRED" == "true" ]] || {
+                  echo "Non-docs baseline reconciliation requires an exact source-bound backup." >&2; exit 1;
+                }
+              fi
               ;;
             *) echo "Refusing an unknown production dispatch mode." >&2; exit 1 ;;
           esac
+          [[ "$BACKUP_REQUIRED" == "true" || "$BACKUP_REQUIRED" == "false" ]] || {
+            echo "Source-bound backup requirement is missing or malformed." >&2; exit 1;
+          }
           [[ "$AUTODEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
             && "$AUTODEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || {
             echo "Refusing malformed auto-deploy run identity." >&2; exit 1;
@@ -1119,6 +1160,8 @@ jobs:
         env:
           SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
           DISPATCH_MODE: ${{ needs.dispatch.outputs.mode }}
+          BACKUP_REQUIRED: ${{ needs.dispatch.outputs.backup_required }}
+          ROUTE_CLASS: ${{ needs.dispatch.outputs.route_class }}
         run: |
           {
             echo "### Platform production auto-deploy dispatch"
@@ -1126,7 +1169,14 @@ jobs:
             echo "- Security/build run: $SOURCE_RUN_URL"
             echo "- Mode: \`$DISPATCH_MODE\`"
             if [[ "${{ job.status }}" == "success" ]]; then
-              echo "- Result: normal production child dispatched after source, backup, and host readiness proofs."
+              if [[ "$BACKUP_REQUIRED" == "true" ]]; then
+                echo "- Result: normal production child dispatched after source, backup, and host readiness proofs."
+              elif [[ "$BACKUP_REQUIRED" == "false" && "$DISPATCH_MODE" == "baseline-reconcile" && "$ROUTE_CLASS" == "docs-only" ]]; then
+                echo "- Result: exact docs-only baseline reconciliation child dispatched after source and host readiness proofs; it must prove cumulative no-op before receipt publication."
+              else
+                echo "- Result: backup requirement is unresolved." >&2
+                exit 1
+              fi
             else
               echo "- Result: deployment child was not dispatched."
             fi

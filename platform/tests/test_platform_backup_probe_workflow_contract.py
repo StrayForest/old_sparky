@@ -1156,9 +1156,61 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         backup_guard = autodeploy.index("- name: Verify exact source-bound restore-verified backup")
         child_dispatch = autodeploy.index("- name: Dispatch production deployment or baseline reconciliation")
         self.assertLess(backup_guard, child_dispatch)
+        self.assertIn("backup_required: ${{ steps.gate.outputs.backup_required }}", autodeploy)
+        backup_guard_end = autodeploy.find("\n      - name:", backup_guard + 1)
+        if backup_guard_end < 0:
+            backup_guard_end = len(autodeploy)
+        backup_guard_step = autodeploy[backup_guard:backup_guard_end]
+        self.assertIn(
+            "if: ${{ steps.gate.outputs.deploy == 'true' && steps.gate.outputs.backup_required != 'false' }}",
+            backup_guard_step,
+        )
         self.assertIn("SOURCE_SECURITY_RUN_ID: ${{ github.event.workflow_run.id }}", autodeploy)
         self.assertIn("SOURCE_SECURITY_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}", autodeploy)
         self.assertIn("BACKUP_GUARD_TOOL: ${{ github.workspace }}/platform/tools/platform_backup_success_guard.py", autodeploy)
+        gate_script = _workflow_run_scalar(autodeploy, "Verify tested SHA is current dev head")
+        policy_start = gate_script.index("backup_required=true\n")
+        policy_end = gate_script.index('echo "backup_required=$backup_required" >> "$GITHUB_OUTPUT"', policy_start) + len(
+            'echo "backup_required=$backup_required" >> "$GITHUB_OUTPUT"'
+        )
+        backup_policy = 'dispatch_mode="$DISPATCH_MODE"\n' + gate_script[policy_start:policy_end]
+        route_cases = (
+            ("deploy", "full", "true", "false", "false", "false", "true"),
+            ("baseline-reconcile", "full", "false", "false", "true", "false", "true"),
+            ("baseline-reconcile", "full", "false", "false", "false", "true", "true"),
+            ("baseline-reconcile", "docs-only", "false", "true", "false", "false", "false"),
+            # Inconsistent docs/recovery flags cannot produce the exemption.
+            ("baseline-reconcile", "docs-only", "false", "true", "true", "false", "true"),
+        )
+        for mode, route_class, deployable, docs_only, recovery_only, candidate_only, expected in route_cases:
+            with self.subTest(backup_policy_route=route_class, mode=mode, expected=expected):
+                with tempfile.TemporaryDirectory() as temporary:
+                    output_path = Path(temporary) / "github-output"
+                    environment = os.environ.copy()
+                    environment.update(
+                        {
+                            "DISPATCH_MODE": mode,
+                            "ROUTE_CLASS": route_class,
+                            "ROUTE_DEPLOYABLE": deployable,
+                            "ROUTE_DOCS_ONLY": docs_only,
+                            "ROUTE_RECOVERY_BOOTSTRAP_ONLY": recovery_only,
+                            "ROUTE_CANDIDATE_PACKAGING_ONLY": candidate_only,
+                            "GITHUB_OUTPUT": str(output_path),
+                        }
+                    )
+                    result = subprocess.run(
+                        ["/bin/bash", "-c", backup_policy],
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        output_path.read_text(encoding="utf-8"),
+                        f"backup_required={expected}\n",
+                    )
         self.assertIn("github.event.workflow_run.status == 'completed'", autodeploy)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", autodeploy)
         self.assertIn("host-readiness:\n    name: Wait for exact host-tools generation readiness", autodeploy)
@@ -1175,8 +1227,90 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertIn("needs.host-readiness.result == 'success'", final_dispatch)
         self.assertIn("Revalidate current dev and exact successful Security run", final_dispatch)
         self.assertIn("Revalidate exact successful source-bound backup", final_dispatch)
+        self.assertIn("needs.dispatch.outputs.backup_required != 'false'", final_dispatch)
+        self.assertIn('"$BACKUP_REQUIRED" == "true"', final_dispatch)
+        self.assertIn('"$BACKUP_REQUIRED" == "false"', final_dispatch)
+        self.assertIn('"$DISPATCH_MODE" == "baseline-reconcile"', final_dispatch)
+        self.assertIn("Exact docs-only baseline reconciliation must not require an application backup", final_dispatch)
+        self.assertIn("Non-docs baseline reconciliation requires an exact source-bound backup", final_dispatch)
+        self.assertIn("backup requirement is unresolved", final_dispatch)
         self.assertIn("platform-production-deploy.yml/dispatches", final_dispatch)
         self.assertNotIn("workflow_run:\n    workflows:\n      - Platform production auto-deploy", autodeploy)
+
+        dispatch_script = _workflow_run_scalar(
+            autodeploy, "Dispatch production deployment or baseline reconciliation"
+        )
+        validation_script = dispatch_script.split(
+            'curl --fail-with-body --silent --show-error', 1
+        )[0]
+        self.assertNotIn("curl", validation_script)
+        dispatch_cases = (
+            ("ordinary deploy", "deploy", "full", "true", "false", "false", "false", "true", True),
+            ("recovery reconcile", "baseline-reconcile", "full", "false", "false", "true", "false", "true", True),
+            ("candidate reconcile", "baseline-reconcile", "full", "false", "false", "false", "true", "true", True),
+            ("exact docs no-op", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "false", True),
+            ("docs needs backup rejected", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "true", False),
+            ("mixed docs recovery rejected", "baseline-reconcile", "docs-only", "false", "true", "true", "false", "false", False),
+            ("ordinary without backup rejected", "deploy", "full", "true", "false", "false", "false", "false", False),
+            ("ordinary missing backup rejected", "deploy", "full", "true", "false", "false", "false", "missing", False),
+            ("recovery missing backup rejected", "baseline-reconcile", "full", "false", "false", "true", "false", "missing", False),
+            ("candidate missing backup rejected", "baseline-reconcile", "full", "false", "false", "false", "true", "missing", False),
+            ("malformed backup requirement rejected", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "unknown", False),
+            ("storage route cannot dispatch", "baseline-reconcile", "full", "false", "false", "false", "false", "true", False),
+        )
+        for label, mode, route_class, deployable, docs_only, recovery_only, candidate_only, backup_required, accepted in dispatch_cases:
+            with self.subTest(dispatch_policy=label):
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "HOST_TOOLS_SHA": "a" * 40,
+                        "DISPATCH_MODE": mode,
+                        "ROUTE_CLASS": route_class,
+                        "ROUTE_DEPLOYABLE": deployable,
+                        "ROUTE_DOCS_ONLY": docs_only,
+                        "ROUTE_RECOVERY_BOOTSTRAP_ONLY": recovery_only,
+                        "ROUTE_CANDIDATE_PACKAGING_ONLY": candidate_only,
+                        "AUTODEPLOY_RUN_ID": "12345",
+                        "AUTODEPLOY_RUN_ATTEMPT": "1",
+                    }
+                )
+                environment.pop("BACKUP_REQUIRED", None)
+                if backup_required != "missing":
+                    environment["BACKUP_REQUIRED"] = backup_required
+                result = subprocess.run(
+                    ["/bin/bash", "-c", validation_script],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+        missing_backup_environment = os.environ.copy()
+        missing_backup_environment.update(
+            {
+                "HOST_TOOLS_SHA": "a" * 40,
+                "DISPATCH_MODE": "baseline-reconcile",
+                "ROUTE_CLASS": "docs-only",
+                "ROUTE_DEPLOYABLE": "false",
+                "ROUTE_DOCS_ONLY": "true",
+                "ROUTE_RECOVERY_BOOTSTRAP_ONLY": "false",
+                "ROUTE_CANDIDATE_PACKAGING_ONLY": "false",
+                "AUTODEPLOY_RUN_ID": "12345",
+                "AUTODEPLOY_RUN_ATTEMPT": "1",
+            }
+        )
+        missing_backup_environment.pop("BACKUP_REQUIRED", None)
+        missing_backup = subprocess.run(
+            ["/bin/bash", "-c", validation_script],
+            env=missing_backup_environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(missing_backup.returncode, 0)
 
     def test_probe_skips_database_env_and_backup_summary_paths(self) -> None:
         self.assertIn('if [[ "$operation" != authorization-probe ]]; then\n            test -f "$runtime/shared/.env.platform"', self.source)

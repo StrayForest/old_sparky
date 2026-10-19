@@ -137,16 +137,11 @@ boundary. Release/install and systemd modules remain privileged even with tempor
 enforce root ownership, fixed release paths or systemd state. Tests mock subprocess contracts instead of requiring a real mount
 namespace or `CAP_SYS_ADMIN` on the CI runner. `test_profile_access_cache_purge_is_fixed_bounded_and_verified` is
 `backend-integration`; it verifies fixed rollback/restore namespaces, bounded scans and fail-closed handling.
-`test_restore_profile_access_cache_purge_requires_stopped_services_and_skips_retention` is `backend-privileged`; it verifies
-restore purge requires stopped API/worker and skips backup/retention.
+`test_restore_profile_access_cache_purge_requires_stopped_services_and_skips_retention` is `backend-privileged`; it verifies restore purge requires stopped API/worker and skips backup/retention.
 
-The 11 catalogued `test_platform_load_runtime` cases that create real PID
-namespaces require a non-root Linux process with PID-namespace capability.
-The canonical verifier and direct runner check this exact ID set before test
-execution; a local miss is `LOCAL GATE BLOCKED`, not an exclusion or skip. The
-negative test for explicit namespace-probe refusal remains runnable on root.
-The complete `performance-contract` contour still runs on the hosted Security
-runner.
+The four root-only supervisor fixture IDs in the catalog (`test_supervisor_cleanup_covers_upload_failures_and_closes_locks`, `test_host_tools_contract_failure_emits_marker_before_locks`, `test_deploy_only_artifact_preparation_errors_emit_markers_without_app_writes`, `test_retained_lock_supervisor_preserves_callback_failure_marker`) require the hosted Linux root environment. Their helper checks exact ID, runner environment and UID before `/opt` or `/run/lock` writes; local execution fails with `LOCAL GATE BLOCKED`, and positive fixtures remain in the hosted privileged contour.
+
+The 11 catalogued `test_platform_load_runtime` cases that create real PID namespaces require a non-root Linux process with PID-namespace capability. The canonical verifier and direct runner check this exact ID set before execution; a local miss is `LOCAL GATE BLOCKED`, not an exclusion or skip. The explicit namespace-probe refusal test remains runnable on root; the complete contour runs on the hosted Security runner.
 `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` is a root-only `backend-privileged` and
 `release-runtime` fixture exercising the production runner, marker, dispatcher and isolated fake candidates for bounded capture,
 status, no-follow setup, cleanup and descendant termination. Successful captures are removed after reap and durable metadata;

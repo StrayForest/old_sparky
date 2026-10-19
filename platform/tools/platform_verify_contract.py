@@ -335,8 +335,12 @@ def source_bound_backup_dispatch_issues(workflow_text: str) -> list[str]:
     guard_keys = {"name", "if", "shell", "env", "run"}
     if set(guard) != guard_keys:
         issues.append("source-bound backup proof step must not add bypass or error-masking keys")
-    if guard.get("if") != "${{ steps.gate.outputs.deploy == 'true' }}":
-        issues.append("initial backup proof must require deploy eligibility")
+    expected_guard_if = "${{ steps.gate.outputs.deploy == 'true' && steps.gate.outputs.backup_required != 'false' }}"
+    if guard.get("if") != expected_guard_if:
+        issues.append("initial backup proof must run for every route except the exact validated backup exemption")
+    dispatch_outputs = dispatch_job_config.get("outputs", {})
+    if not isinstance(dispatch_outputs, dict) or dispatch_outputs.get("backup_required") != "${{ steps.gate.outputs.backup_required }}":
+        issues.append("dispatch job must expose the validated closed backup requirement")
     expected_env = {
         "GH_TOKEN": "${{ github.token }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
@@ -354,15 +358,32 @@ def source_bound_backup_dispatch_issues(workflow_text: str) -> list[str]:
         or guard.get("run", "").strip() != expected_run
     ):
         issues.append("source-bound backup proof must run only the exact guard with exact Security source inputs")
-    if set(recheck) != {"name", "shell", "env", "run"}:
+    if set(recheck) != {"name", "if", "shell", "env", "run"}:
         issues.append("final backup recheck must not add bypass or error-masking keys")
     if (
+        recheck.get("if") != "${{ needs.dispatch.outputs.backup_required != 'false' }}"
+        or
         recheck.get("shell") != "bash"
         or recheck.get("env") != expected_env
         or not isinstance(recheck.get("run"), str)
         or recheck.get("run", "").strip() != expected_run
     ):
-        issues.append("final backup recheck must use exact Security source inputs")
+        issues.append("final backup recheck must conditionally use exact Security source inputs")
+    dispatch_env = dispatch.get("env", {})
+    dispatch_run = dispatch.get("run", "")
+    if (
+        not isinstance(dispatch_env, dict)
+        or dispatch_env.get("BACKUP_REQUIRED") != "${{ needs.dispatch.outputs.backup_required }}"
+        or not isinstance(dispatch_run, str)
+        or '"$BACKUP_REQUIRED" == "true"' not in dispatch_run
+        or '"$BACKUP_REQUIRED" == "false"' not in dispatch_run
+        or '[[ "$BACKUP_REQUIRED" == "true" || "$BACKUP_REQUIRED" == "false" ]]' not in dispatch_run
+        or "baseline-reconcile)" not in dispatch_run
+        or "Exact docs-only baseline reconciliation must not require an application backup" not in dispatch_run
+        or "Non-docs baseline reconciliation requires an exact source-bound backup" not in dispatch_run
+        or "backup requirement is missing or malformed" not in dispatch_run
+    ):
+        issues.append("child dispatch must fail closed on backup requirement and exempt only exact docs-only baseline reconciliation")
     final_steps = final_job_config.get("steps")
     if not isinstance(final_steps, list):
         issues.append("final production dispatch job must define its ordered steps")
