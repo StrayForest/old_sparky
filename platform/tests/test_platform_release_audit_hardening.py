@@ -1756,6 +1756,17 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             (*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml"))
         )
         self.assertTrue(workflow_paths)
+        cpu_pair_source = (TOOLS_DIR / "platform_cpu_diagnostic_pair.py").read_text(
+            encoding="utf-8"
+        )
+        for required_cpu_cleanup_contract in (
+            'if ssh_lifecycle.get("closed") is not True:',
+            'ssh_lifecycle.get("mux_off_enforced") is True',
+            'ssh_lifecycle.get("last_command_returned") is True',
+            'report["ssh_material_safe_to_remove"] = True',
+            '"material_hidden": ssh_hidden.get("value") is True',
+        ):
+            self.assertIn(required_cpu_cleanup_contract, cpu_pair_source)
         expression_count = 0
         standard_cleanup_dirs = {
             "platform-cloudflare-range-alert.yml": "platform-cloudflare-range-alert-ssh",
@@ -1935,7 +1946,22 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                             "read_private_json(lifecycle_path, 2_048)",
                             "read_private_json(report_path, 64_000)",
                             'report.get("ssh_material_safe_to_remove") is not True',
-                            'lifecycle.get("material_hidden") is not True',
+                            "if not isinstance(lifecycle, dict) or set(lifecycle) != {",
+                            '"schema", "event", "source_sha", "run_id", "attempt",',
+                            '"config_dir_dev", "config_dir_ino", "material_hidden",',
+                            'type(lifecycle.get("material_hidden")) is not bool',
+                            'lifecycle.get("source_sha") != source_sha',
+                            'lifecycle.get("run_id") != run_id',
+                            'lifecycle.get("attempt") != attempt',
+                            'binding.get("source_sha") != source_sha',
+                            'binding.get("run_id") != run_id',
+                            'binding.get("attempt") != attempt',
+                            'set(os.listdir(directory_fd)) != {',
+                            '"config", "id_ed25519", "known_hosts"}',
+                            'member.st_uid != os.geteuid()',
+                            'member.st_gid != os.getegid()',
+                            "member.st_nlink != 1",
+                            "stat.S_IMODE(member.st_mode) != 0o600",
                             "os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW",
                             "os.unlink(name, dir_fd=directory_fd)",
                             "os.rmdir(ssh_dir)",

@@ -2258,6 +2258,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             binding: dict[str, object],
             *,
             safe: object = True,
+            material_hidden: object = True,
             report_binding: dict[str, object] | None = None,
         ) -> Path:
             report_dir = runner_temp / "cpu-diagnostic-report"
@@ -2286,7 +2287,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 "attempt": attempt,
                 "config_dir_dev": binding["config_dir_dev"],
                 "config_dir_ino": binding["config_dir_ino"],
-                "material_hidden": True,
+                "material_hidden": material_hidden,
             }
             lifecycle_path.write_text(
                 json.dumps(
@@ -2305,21 +2306,30 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             write_cpu_report(runner_temp, binding)
             unrelated_socket = runner_temp / "old-sparky-external-load-ssh-cpudiag-other"
             unrelated_socket.write_text("unrelated run marker", encoding="ascii")
-            # The early lifecycle receipt proves the directory was hidden
-            # before the namespace child. The helper restores it afterward
-            # for final SSH cleanup, so this finalizer must bind and remove
-            # the restored directory rather than require it to stay absent.
+            # The exact report proves the SSH lifecycle is safe to clean up.
+            # The helper may restore the directory after its child is reaped,
+            # so this finalizer binds and removes that exact directory.
             self.assertTrue(ssh_dir.is_dir())
             completed = run_cpu_cleanup(runner_temp)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertFalse(ssh_dir.exists())
             self.assertEqual(unrelated_socket.read_text(encoding="ascii"), "unrelated run marker")
 
-        # Missing, false, string-true, stale, replaced, or symlink reports
+        # A typed false hidden-state marker is valid when the report separately
+        # proves safe removal and the exact run/source/directory inventory binds.
+        with tempfile.TemporaryDirectory(prefix="external-load-cpudiag-cleanup-unhidden-") as temp:
+            runner_temp = Path(temp)
+            ssh_dir, binding = make_cpu_ssh_dir(runner_temp)
+            write_cpu_report(runner_temp, binding, material_hidden=False)
+            completed = run_cpu_cleanup(runner_temp)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(ssh_dir.exists())
+
+        # Missing, incorrectly typed, unsafe, stale, replaced, or symlink reports
         # fail closed and leave the exact SSH material available for diagnosis.
         for report_case in (
             "missing", "false", "string_true", "stale", "replaced", "symlink", "duplicate",
-            "early_missing", "early_stale", "early_false", "early_symlink",
+            "early_missing", "early_stale", "early_string", "early_false_unsafe", "early_symlink",
         ):
             with self.subTest(report_case=report_case), tempfile.TemporaryDirectory(
                 prefix="external-load-cpudiag-cleanup-reject-"
@@ -2343,7 +2353,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 if report_case != "early_missing":
                     if report_case == "early_stale":
                         lifecycle_payload["run_id"] = "123456788"
-                    if report_case == "early_false":
+                    if report_case == "early_string":
+                        lifecycle_payload["material_hidden"] = "true"
+                    if report_case == "early_false_unsafe":
                         lifecycle_payload["material_hidden"] = False
                     lifecycle_bytes = json.dumps(
                         lifecycle_payload,
@@ -2368,7 +2380,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         stale_binding["config_dir_ino"] = int(binding["config_dir_ino"]) + 1
                     payload = {
                         "schema": 1,
-                        "ssh_material_safe_to_remove": "true" if report_case == "string_true" else False if report_case == "false" else True,
+                        "ssh_material_safe_to_remove": (
+                            "true"
+                            if report_case == "string_true"
+                            else False
+                            if report_case in {"false", "early_false_unsafe"}
+                            else True
+                        ),
                         "ssh_material_binding": stale_binding,
                     }
                     if report_case == "symlink":
