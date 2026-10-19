@@ -2036,8 +2036,20 @@ class EvidencePrivacyTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            original_fstat = os.fstat
+
+            def fstat_as_uid(descriptor: int, uid: int):
+                result = original_fstat(descriptor)
+                values = list(result)
+                values[4] = uid
+                return os.stat_result(values)
+
             with mock.patch("tools.platform_abort_retained_load.RUN_ROOT_BASE", root / "runs"), \
                 mock.patch("tools.platform_abort_retained_load.ABORT_EXPORT_BASE", export_root), \
+                mock.patch(
+                    "tools.platform_abort_retained_load.os.fstat",
+                    side_effect=lambda descriptor: fstat_as_uid(descriptor, 0),
+                ), \
                 mock.patch.dict(
                     os.environ,
                     {
@@ -2086,6 +2098,36 @@ class EvidencePrivacyTests(unittest.TestCase):
                 json.loads((exported / "abort-only.json").read_text(encoding="ascii")),
                 abort_only,
             )
+
+            with mock.patch("tools.platform_abort_retained_load.RUN_ROOT_BASE", root / "runs"), \
+                mock.patch("tools.platform_abort_retained_load.ABORT_EXPORT_BASE", export_root), \
+                mock.patch(
+                    "tools.platform_abort_retained_load.os.fstat",
+                    side_effect=lambda descriptor: fstat_as_uid(descriptor, 1001),
+                ), \
+                self.assertRaisesRegex(RuntimeError, "abort-only evidence file is unsafe"):
+                export_abort_evidence("124", '{"schema":1,"process_count":0}\n', abort_only=abort_only)
+
+            symlink_target = root / "symlink-target.json"
+            symlink_target.write_text("preserve", encoding="ascii")
+            original_open = os.open
+
+            def open_with_abort_symlink(path, flags, *args, **kwargs):
+                candidate = Path(path)
+                if candidate.name == "abort-only.json":
+                    candidate.symlink_to(symlink_target)
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch("tools.platform_abort_retained_load.RUN_ROOT_BASE", root / "runs"), \
+                mock.patch("tools.platform_abort_retained_load.ABORT_EXPORT_BASE", export_root), \
+                mock.patch(
+                    "tools.platform_abort_retained_load.os.open",
+                    side_effect=open_with_abort_symlink,
+                ), \
+                self.assertRaises(FileExistsError):
+                export_abort_evidence("125", '{"schema":1,"process_count":0}\n', abort_only=abort_only)
+            self.assertEqual(symlink_target.read_text(encoding="ascii"), "preserve")
+
             marker = root / "non-object-marker.json"
             marker.write_bytes(b"7\n")
             os.chmod(marker, 0o600)
