@@ -94,6 +94,13 @@ gh workflow run platform-production-storage-maintenance.yml --repo StrayForest/o
 gh run watch <maintenance-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
+Keep the workflow ref at `dev`; `expected_sha` is the active deployed app
+source. The maintenance workflow run and QA artifacts bind to that exact
+`dev` runner SHA; both reports must name `expected_sha` as their app target. If
+runner and app SHAs differ, each report must carry the authenticated
+`verified-noop` source-binding digest. Do not dispatch from an arbitrary SHA
+ref.
+
 Storage diagnostics/maintenance workflow or exact storage-retention skill changes use the closed storage-operations route: full, runtime-sensitive verification but no application or baseline action. AUTO takes its no-deploy branch. The recovery producer uploads a bound skip receipt with a provenance attestation; the publisher checks its fields against exact producer and parent CI/classifier evidence, but does not verify the attestation cryptographically or publish a host bundle/production marker. When an activation reports a full filesystem or unusable temporary directory, collect bounded read-only evidence before cleanup:
 `gh workflow run platform-production-storage-diagnostics.yml --repo StrayForest/old_sparky --ref dev -f expected_sha=<exact-source-sha-currently-deployed>`
 It reports filesystem/journal/service usage, retention candidates, current/previous release identities, latest restore-verified backup age/checksum, and timer state/times; it compares the installed and release-owned timer units, emitting only drop-in presence. Backup checksum reads are timeout-bounded. Diagnostics never create/delete backups or files or apply runtime settings; failure artifacts contain bounded partial evidence and closed outcomes, never raw host output. Maintenance evidence binds to one invocation; a verified backup and nonzero exit can follow deletions when thresholds still fail, so failure proves neither no deletion nor successful cleanup.
