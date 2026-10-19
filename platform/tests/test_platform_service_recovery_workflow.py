@@ -52,13 +52,14 @@ class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
     def test_secret_job_embeds_exact_reviewed_controller_without_checkout(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(_embedded_controller(), TOOL.read_bytes())
-        self.assertIn("      - name: Recover deadlock-api and deadlock-worker", workflow)
-        self.assertIn("if: ${{ inputs.mode == 'api-worker' }}", workflow)
+        self.assertIn("      - name: Recover deadlock-api, deadlock-worker, and optional nginx", workflow)
+        self.assertIn("inputs.mode == 'api-worker' || inputs.mode == 'api-worker-nginx'", workflow)
         self.assertIn("RECOVER-DEADLOCK-API-WORKER", workflow)
+        self.assertIn("RECOVER-DEADLOCK-API-WORKER-NGINX", workflow)
         self.assertIn("RECOVER-DEADLOCK-WEB", workflow)
         self.assertNotIn("actions/checkout@", workflow)
         self.assertIn("platform_release_lock.sh", workflow)
-        api_mode = workflow.split("- name: Recover deadlock-api and deadlock-worker", 1)[1]
+        api_mode = workflow.split("- name: Recover deadlock-api, deadlock-worker, and optional nginx", 1)[1]
         self.assertNotIn("curl ", api_mode)
         self.assertIn("/usr/bin/python3 -I -", api_mode)
         self.assertIn("stat.S_IMODE(metadata.st_mode) != 0o600", api_mode)
@@ -94,6 +95,104 @@ class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
         self.assertTrue(any(item.startswith("PLATFORM_EXPECTED_CELERY_NODE=celery@") for item in argv))
         self.assertLessEqual(kwargs["timeout"], 7.0)
         self.assertNotIn("secret", " ".join(argv).lower())
+
+    def test_proxy_readiness_uses_loopback_tls_and_bounds_health_body(self) -> None:
+        namespace = {"__name__": "service_recovery_test"}
+        exec(compile(_embedded_controller(), "embedded-service-recovery.py", "exec"), namespace)
+        events: list[tuple[object, ...]] = []
+
+        class FakeSocket:
+            def settimeout(self, timeout: float) -> None:
+                events.append(("timeout", timeout))
+
+            def sendall(self, request: bytes) -> None:
+                events.append(("request", request))
+
+            def getpeercert(self, *, binary_form: bool) -> bytes:
+                self.assert_binary_form = binary_form
+                return b"origin-cert"
+
+            def close(self) -> None:
+                events.append(("close",))
+
+        tls_socket = FakeSocket()
+
+        class FakeContext:
+            def wrap_socket(self, _sock: object, *, server_hostname: str) -> FakeSocket:
+                events.append(("sni", server_hostname))
+                return tls_socket
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, _sock: object) -> None:
+                pass
+
+            def begin(self) -> None:
+                pass
+
+            def read(self, limit: int) -> bytes:
+                events.append(("read", limit))
+                return b'{"status":"ok","service":"deadlock-platform-api"}'
+
+        fake_ssl = SimpleNamespace(PROTOCOL_TLS_CLIENT=1, SSLContext=lambda _protocol: FakeContext(), CERT_NONE=0)
+        fake_http = SimpleNamespace(HTTPResponse=FakeResponse, HTTPException=Exception)
+        fake_socket = SimpleNamespace(
+            create_connection=lambda address, timeout: events.append(("connect", address, timeout)) or FakeSocket()
+        )
+        with patch.dict(namespace, {
+            "ssl": fake_ssl,
+            "socket": fake_socket,
+            "http": SimpleNamespace(client=fake_http),
+            "_nginx_certificate_der": lambda: b"origin-cert",
+        }):
+            self.assertTrue(namespace["_proxy_api_ready"]())
+        self.assertIn(("connect", ("127.0.0.1", 443), 2.0), events)
+        self.assertIn(("sni", "old-sparky.com"), events)
+        self.assertIn(("read", 4097), events)
+        request = next(item[1] for item in events if item[0] == "request")
+        self.assertIn(b"Host: old-sparky.com", request)
+        self.assertIn(b"/api/v1/health/ready", request)
+
+    def test_nginx_configuration_checks_origin_certificate_and_private_key_identity(self) -> None:
+        namespace = {"__name__": "service_recovery_test"}
+        exec(compile(_embedded_controller(), "embedded-service-recovery.py", "exec"), namespace)
+        calls: list[list[str]] = []
+
+        def command(argv: list[str], **_kwargs: object) -> SimpleNamespace:
+            calls.append(argv)
+            return SimpleNamespace(returncode=0, stdout="nginx config\n")
+
+        with patch.dict(namespace, {
+            "_command": command,
+            "_nginx_certificate_der": lambda: b"origin-cert",
+            "_owned_file_identity": lambda path, **kwargs: (7, 11, 0, 0, 1, 0o600, 128, 13, 17),
+        }):
+            namespace["_nginx_configuration_identity"]()
+
+        openssl_calls = [argv for argv in calls if argv[0] == "/usr/bin/openssl"]
+        self.assertEqual(len(openssl_calls), 2)
+        self.assertIn(["-checkhost", "old-sparky.com"], [argv[-2:] for argv in openssl_calls])
+        self.assertIn(["-checkend", "2592000"], [argv[-2:] for argv in openssl_calls])
+        self.assertEqual(namespace["NGINX_KEY_PATH"].name, "old-sparky.com-origin.key")
+        self.assertEqual(namespace["NGINX_CERT_MIN_REMAINING_SECONDS"], 30 * 86_400)
+
+        calls.clear()
+        def expired_certificate(argv: list[str], **_kwargs: object) -> SimpleNamespace:
+            calls.append(argv)
+            return SimpleNamespace(
+                returncode=1 if "-checkend" in argv else 0,
+                stdout="nginx config\n" if argv[:2] == ["/usr/sbin/nginx", "-T"] else "",
+            )
+
+        with patch.dict(namespace, {
+            "_command": expired_certificate,
+            "_nginx_certificate_der": lambda: b"origin-cert",
+            "_owned_file_identity": lambda _path, **_kwargs: (7, 11, 0, 0, 1, 0o600, 128, 13, 17),
+        }):
+            with self.assertRaises(namespace["RecoveryRefusal"]) as error:
+                namespace["_nginx_configuration_identity"]()
+        self.assertEqual(error.exception.stage, "nginx_certificate_validity")
 
     def test_embedded_ping_rejects_a_different_worker_node(self) -> None:
         namespace = {"__name__": "service_recovery_test"}
@@ -203,6 +302,7 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
         self.releases = self.app / "releases"
         self.shared = self.app / "shared"
         self.systemd = self.root / "systemd"
+        self.nginx_unit = self.root / "usr" / "lib" / "systemd" / "system" / "nginx.service"
         for directory in (self.app, self.releases, self.shared, self.systemd):
             directory.mkdir(parents=True, mode=0o755)
             directory.chmod(0o755)
@@ -226,6 +326,17 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
             target = self.systemd / f"{service}.service"
             target.parent.mkdir(parents=True, exist_ok=True)
             self._file(target, unit.encode(), 0o644)
+        self.timer_names = (
+            "deadlock-maintenance.timer",
+            "deadlock-logrotate.timer",
+            "deadlock-cloudflare-ips.timer",
+            "deadlock-health-monitor.timer",
+        )
+        for unit in self.timer_names:
+            unit_bytes = f"[Unit]\nDescription={unit}\n[Timer]\nOnCalendar=daily\n".encode()
+            self._file(self.release / "deploy" / "systemd" / unit, unit_bytes, 0o644)
+            self._file(self.systemd / unit, unit_bytes, 0o644)
+        self._file(self.nginx_unit, b"[Unit]\nDescription=nginx\n[Service]\nExecStart=/usr/sbin/nginx\n", 0o644)
         self.preflight = self.release / "tools" / "platform_release_preflight.sh"
         self._file(self.preflight, b"#!/bin/bash\nexit 0\n", 0o755)
         self.namespace = {"__name__": "service_recovery_test"}
@@ -243,8 +354,8 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
         metadata = {"artifact_format_version": 1, "release_slug": slug, "source_git_commit": sha}
         self._file(path / "RELEASE.json", json.dumps(metadata, separators=(",", ":")).encode(), 0o444)
 
-    def _states(self) -> dict[str, dict[str, str]]:
-        return {
+    def _states(self, *, nginx_active: bool = False) -> dict[str, dict[str, str]]:
+        states = {
             service: {
                 "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
                 "Result": "success", "ExecMainStatus": "0", "MainPID": "0",
@@ -255,13 +366,79 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
             for service in ("deadlock-api", "deadlock-worker")
         }
 
-    def _run(self, *, worker_ping: bool = True, bad_prestate: bool = False) -> tuple[int, list[tuple[str, str]], dict[str, dict[str, str]]]:
-        states = self._states()
+        states["nginx"] = {
+            "LoadState": "loaded",
+            "ActiveState": "active" if nginx_active else "inactive",
+            "SubState": "running" if nginx_active else "dead",
+            "Result": "success",
+            "ExecMainStatus": "0",
+            "MainPID": "234" if nginx_active else "0",
+            "FragmentPath": str(self.nginx_unit),
+            "DropInPaths": "",
+            "UnitFileState": "enabled",
+            "User": "",
+            "Group": "",
+        }
+        for unit in self.timer_names:
+            states[unit] = {
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainStatus": "0",
+                "MainPID": "0",
+                "FragmentPath": str(self.systemd / unit),
+                "DropInPaths": "",
+                "UnitFileState": "disabled",
+                "User": "",
+                "Group": "",
+            }
+        return states
+
+    def _run(
+        self,
+        *,
+        worker_ping: bool = True,
+        bad_prestate: bool = False,
+        mode: str = "api-worker",
+        nginx_active: bool = False,
+        proxy_ready: bool = True,
+        nginx_start_ok: bool = True,
+        nginx_partial_start: bool = False,
+        nginx_config_ok: bool = True,
+        nginx_config_drift: bool = False,
+        timer_drift: bool = False,
+        timer_bad_prestate: bool = False,
+        timer_identity_mismatch: bool = False,
+        nginx_bad_identity: bool = False,
+        nginx_bad_prestate: bool = False,
+    ) -> tuple[int, list[tuple[str, str]], dict[str, dict[str, str]]]:
+        states = self._states(nginx_active=nginx_active)
+        if nginx_bad_identity:
+            states["nginx"]["DropInPaths"] = "/run/systemd/system/nginx.service.d/50-extra.conf"
+        if nginx_bad_prestate:
+            states["nginx"].update(ActiveState="failed", SubState="failed", Result="exit-code", MainPID="0")
+        if timer_bad_prestate:
+            states[self.timer_names[0]].update(ActiveState="failed", SubState="failed", Result="exit-code")
+        if timer_identity_mismatch:
+            self._file(self.systemd / self.timer_names[0], b"[Unit]\nDescription=unexpected timer\n", 0o644)
         if bad_prestate:
             states["deadlock-api"]["ActiveState"] = "failed"
             states["deadlock-api"]["SubState"] = "failed"
             states["deadlock-api"]["Result"] = "exit-code"
         actions: list[tuple[str, str]] = []
+        nginx_config_calls = 0
+
+        def nginx_config_identity() -> str:
+            nonlocal nginx_config_calls
+            nginx_config_calls += 1
+            if not nginx_config_ok:
+                raise self.namespace["RecoveryRefusal"]("nginx_config_test")
+            if nginx_config_drift and nginx_config_calls > 1:
+                return "changed-nginx-config-digest"
+            return "nginx-config-digest"
+
+        receipt = io.StringIO()
 
         def systemctl(_binary: str, *args: str, **_kwargs: object) -> SimpleNamespace:
             action, unit, *rest = args
@@ -270,12 +447,19 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
                 output = "".join(f"{key}={value}\n" for key, value in states[service].items())
                 return SimpleNamespace(returncode=0, stdout=output)
             if action == "is-enabled":
-                return SimpleNamespace(returncode=1, stdout="disabled\n")
+                enabled = states[service]["UnitFileState"] == "enabled"
+                return SimpleNamespace(returncode=0 if enabled else 1, stdout="enabled\n" if enabled else "disabled\n")
             if action == "is-active":
                 return SimpleNamespace(returncode=0 if service not in states or states[service]["ActiveState"] == "active" else 3, stdout="")
             if action == "start":
                 actions.append((action, service))
+                if service == "nginx" and not nginx_start_ok:
+                    if nginx_partial_start:
+                        states[service].update(ActiveState="active", SubState="running", MainPID="123")
+                    return SimpleNamespace(returncode=1, stdout="")
                 states[service].update(ActiveState="active", SubState="running", MainPID="123", Result="success", ExecMainStatus="0")
+                if service == "deadlock-worker" and timer_drift:
+                    states[self.timer_names[0]].update(ActiveState="active", SubState="waiting")
                 return SimpleNamespace(returncode=0, stdout="")
             if action == "stop":
                 actions.append((action, service))
@@ -295,10 +479,15 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
                 "_assert_active": lambda *_args: None,
                 "_wait_api_ready": lambda: True,
                 "_worker_ready": lambda *_args: worker_ping,
+                "_wait_proxy_api_ready": lambda: proxy_ready,
+                "_nginx_configuration_identity": nginx_config_identity,
+                "NGINX_UNIT_PATH": self.nginx_unit,
             }),
             patch.object(self.namespace["pwd"], "getpwnam", return_value=SimpleNamespace(pw_gid=os.getgid())),
+            contextlib.redirect_stdout(receipt),
         ):
-            result = self.namespace["recover"](self.app, self.sha, self.slug, self.systemd)
+            result = self.namespace["recover"](self.app, self.sha, self.slug, self.systemd, mode=mode)
+        self.last_receipt = receipt.getvalue()
         return result, actions, states
 
     def test_starts_only_api_then_worker_and_requires_ping(self) -> None:
@@ -326,6 +515,91 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
         result, actions, _states = self._run(bad_prestate=True)
         self.assertEqual(result, 1)
         self.assertFalse(any(action == "start" for action, _service in actions))
+
+    def test_nginx_mode_starts_api_worker_then_nginx_and_checks_proxy(self) -> None:
+        result, actions, states = self._run(mode="api-worker-nginx")
+        self.assertEqual(result, 0)
+        self.assertEqual([service for action, service in actions if action == "start"], [
+            "deadlock-api", "deadlock-worker", "nginx"
+        ])
+        self.assertEqual(states["nginx"]["ActiveState"], "active")
+        self.assertIn("proxy_readiness=loopback_pinned_tls_api_health timers=preserved", self.last_receipt)
+
+    def test_nginx_mode_preserves_preexisting_active_nginx(self) -> None:
+        result, actions, states = self._run(mode="api-worker-nginx", nginx_active=True)
+        self.assertEqual(result, 0)
+        self.assertNotIn(("start", "nginx"), actions)
+        self.assertNotIn(("stop", "nginx"), actions)
+        self.assertEqual(states["nginx"]["ActiveState"], "active")
+
+    def test_nginx_readiness_failure_rolls_back_started_units_in_reverse_order(self) -> None:
+        result, actions, states = self._run(mode="api-worker-nginx", proxy_ready=False)
+        self.assertEqual(result, 1)
+        self.assertEqual([service for action, service in actions if action == "stop"], [
+            "nginx", "deadlock-worker", "deadlock-api"
+        ])
+        self.assertEqual(states["nginx"]["ActiveState"], "inactive")
+
+    def test_nginx_start_failure_without_activation_rolls_back_only_app_units(self) -> None:
+        result, actions, states = self._run(mode="api-worker-nginx", nginx_start_ok=False)
+        self.assertEqual(result, 1)
+        self.assertEqual([service for action, service in actions if action == "stop"], [
+            "deadlock-worker", "deadlock-api"
+        ])
+        self.assertEqual(states["nginx"]["ActiveState"], "inactive")
+
+    def test_nginx_partial_start_failure_is_unwound_in_reverse_order(self) -> None:
+        result, actions, states = self._run(
+            mode="api-worker-nginx", nginx_start_ok=False, nginx_partial_start=True
+        )
+        self.assertEqual(result, 1)
+        self.assertEqual([service for action, service in actions if action == "stop"], [
+            "nginx", "deadlock-worker", "deadlock-api"
+        ])
+        self.assertEqual(states["nginx"]["ActiveState"], "inactive")
+
+    def test_invalid_nginx_config_refuses_before_starting_services(self) -> None:
+        result, actions, _states = self._run(mode="api-worker-nginx", nginx_config_ok=False)
+        self.assertEqual(result, 1)
+        self.assertFalse(any(action == "start" for action, _service in actions))
+
+    def test_nginx_unit_dropin_or_unknown_prestate_refuses_before_start(self) -> None:
+        for options in ({"nginx_bad_identity": True}, {"nginx_bad_prestate": True}):
+            with self.subTest(options=options):
+                result, actions, _states = self._run(mode="api-worker-nginx", **options)
+                self.assertEqual(result, 1)
+                self.assertFalse(any(action == "start" for action, _service in actions))
+
+    def test_timer_state_change_is_detected_without_timer_mutation(self) -> None:
+        result, actions, states = self._run(timer_drift=True)
+        self.assertEqual(result, 1)
+        self.assertFalse(any(action in {"start", "stop"} and service.endswith(".timer") for action, service in actions))
+        self.assertEqual(states[self.timer_names[0]]["ActiveState"], "active")
+        self.assertEqual([service for action, service in actions if action == "stop"], [
+            "deadlock-worker", "deadlock-api"
+        ])
+
+    def test_unknown_timer_prestate_refuses_before_start(self) -> None:
+        result, actions, _states = self._run(timer_bad_prestate=True)
+        self.assertEqual(result, 1)
+        self.assertFalse(any(action == "start" for action, _service in actions))
+        self.assertIn("stage=timer_state", self.last_receipt)
+        self.assertIn("timers=not_checked", self.last_receipt)
+
+    def test_timer_unit_identity_mismatch_refuses_before_start(self) -> None:
+        result, actions, _states = self._run(timer_identity_mismatch=True)
+        self.assertEqual(result, 1)
+        self.assertFalse(any(action == "start" for action, _service in actions))
+        self.assertIn("stage=timer_unit_identity", self.last_receipt)
+
+    def test_nginx_config_drift_refuses_before_starting_proxy(self) -> None:
+        result, actions, states = self._run(mode="api-worker-nginx", nginx_config_drift=True)
+        self.assertEqual(result, 1)
+        self.assertNotIn(("start", "nginx"), actions)
+        self.assertEqual([service for action, service in actions if action == "stop"], [
+            "deadlock-worker", "deadlock-api"
+        ])
+        self.assertEqual(states["nginx"]["ActiveState"], "inactive")
 
     def test_service_unit_identity_uses_the_pinned_release_if_current_moves(self) -> None:
         service = "deadlock-api"
