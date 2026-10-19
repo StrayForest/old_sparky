@@ -80,6 +80,9 @@ TIMER_SHOW_PROPERTIES = (
 MAX_CONFIG_BYTES = 1024 * 1024
 MIN_FREE_BYTES = 5 * 1024**3
 MAX_USED_PERCENT = 85.0
+# The stopped-worker read-only probe took up to 8.27s, including a 5.10s
+# Celery ping timeout; keep this bounded child cap above that measured cold path.
+WORKER_PROBE_TIMEOUT = 10.0
 API_READY_URL = "http://127.0.0.1:8010/api/v1/health/ready"
 NGINX_UNIT_PATH = Path("/usr/lib/systemd/system/nginx.service")
 NGINX_READY_HOST = "old-sparky.com"
@@ -88,6 +91,39 @@ NGINX_KEY_PATH = Path("/opt/oldsparky/platform/shared/tls/old-sparky.com-origin.
 NGINX_CONFIG_MAX_BYTES = 1024 * 1024
 NGINX_CERT_MAX_BYTES = 64 * 1024
 NGINX_CERT_MIN_REMAINING_SECONDS = 30 * 86_400
+WORKER_READINESS_BOOTSTRAP = """\
+set -euo pipefail
+TOOLS_DIR="$PLATFORM_ROOT_DIR/tools"
+source "$TOOLS_DIR/platform_runtime_common.sh"
+platform_require_isolated_service_env worker
+platform_load_env_file
+platform_require_python
+cd "$PLATFORM_ROOT_DIR"
+export PYTHONPATH="$PLATFORM_ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+export PLATFORM_EXPECTED_CELERY_NODE="$2"
+exec "$PLATFORM_PYTHON_BIN" -c "$1"
+"""
+WORKER_READINESS_CODE = """\
+import os
+try:
+    from apps.platform_worker.worker import celery_app
+    expected = os.environ["PLATFORM_EXPECTED_CELERY_NODE"]
+except Exception:
+    print("WORKER_PING status=failed reason=exception")
+    raise SystemExit(1)
+try:
+    replies = celery_app.control.ping(timeout=5.0, limit=1, destination=[expected])
+except Exception:
+    print("WORKER_PING status=failed reason=exception")
+    raise SystemExit(1)
+# Celery 5.6.3 wraps the worker's pong with its `ok()` result envelope.
+if replies == [{expected: {"ok": "pong"}}]:
+    print("WORKER_PING status=passed")
+    raise SystemExit(0)
+reason = "no_reply" if replies == [] else "unexpected_reply"
+print(f"WORKER_PING status=failed reason={reason}")
+raise SystemExit(1)
+"""
 
 
 class RecoveryRefusal(RuntimeError):
@@ -264,7 +300,9 @@ def _command(
             cwd=cwd,
             env=env or {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        raise RecoveryRefusal("command_timeout") from exc
+    except OSError as exc:
         raise RecoveryRefusal("command_unavailable") from exc
 
 
@@ -671,16 +709,8 @@ def _wait_api_ready(*, timeout: float = 30.0) -> bool:
     return False
 
 
-def _worker_ready(app_dir: Path, release: Path, systemd_dir: Path) -> bool:
+def _worker_ready(app_dir: Path, release: Path, systemd_dir: Path) -> str:
     shared = app_dir / "shared"
-    code = (
-        "import os; from apps.platform_worker.worker import celery_app; "
-        "expected=os.environ['PLATFORM_EXPECTED_CELERY_NODE']; "
-        "replies=celery_app.control.ping(timeout=5.0, limit=1, destination=[expected]); "
-        "ok=replies==[{expected:'pong'}]; "
-        "print('WORKER_PING status=passed' if ok else 'WORKER_PING status=failed'); "
-        "raise SystemExit(0 if ok else 1)"
-    )
     command = [
         "/usr/sbin/runuser", "-u", SERVICE_USERS["deadlock-worker"], "--",
         "/usr/bin/env",
@@ -691,11 +721,11 @@ def _worker_ready(app_dir: Path, release: Path, systemd_dir: Path) -> bool:
         f"PLATFORM_ENV_FILE={shared / 'env/worker.env'}",
         f"PLATFORM_PYTHON_BIN={shared / 'venv/bin/python'}",
         "PLATFORM_WORKER_CONCURRENCY=2",
-        f"PLATFORM_EXPECTED_CELERY_NODE=celery@{socket.gethostname()}",
-        f"PYTHONPATH={release}",
-        str(shared / "venv/bin/python"), "-c", code,
+        "/bin/bash", "-c", WORKER_READINESS_BOOTSTRAP,
+        "worker-readiness", WORKER_READINESS_CODE, f"celery@{socket.gethostname()}",
     ]
     deadline = time.monotonic() + 30.0
+    last_reason = "timeout"
     while time.monotonic() < deadline:
         try:
             _assert_service_unit(
@@ -706,24 +736,39 @@ def _worker_ready(app_dir: Path, release: Path, systemd_dir: Path) -> bool:
                 before=False,
             )
         except RecoveryRefusal:
-            return False
+            return "unit_changed"
         remaining = deadline - time.monotonic()
+        command_completed = True
         try:
             result = _command(
                 command,
-                timeout=min(7.0, remaining),
+                timeout=min(WORKER_PROBE_TIMEOUT, remaining),
                 cwd=release,
                 env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
             )
         except RecoveryRefusal as exc:
-            if exc.stage != "command_unavailable":
-                return False
+            if exc.stage == "command_timeout":
+                last_reason = "timeout"
+            elif exc.stage == "command_unavailable":
+                last_reason = "command_unavailable"
+            else:
+                return "invalid_output"
+            command_completed = False
             result = subprocess.CompletedProcess(command, 1, stdout="", stderr="")
-        if result.returncode == 0 and result.stdout.splitlines() == ["WORKER_PING status=passed"]:
-            return True
+        else:
+            last_reason = "invalid_output"
+        output = result.stdout.splitlines()
+        if command_completed and result.returncode != 0 and not output:
+            return "bootstrap_failure"
+        if result.returncode == 0 and output == ["WORKER_PING status=passed"]:
+            return "passed"
+        for reason in ("exception", "no_reply", "unexpected_reply"):
+            if output == [f"WORKER_PING status=failed reason={reason}"]:
+                last_reason = reason
+                break
         if time.monotonic() < deadline:
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
-    return False
+    return last_reason
 
 
 def _receipt(
@@ -868,8 +913,9 @@ def recover(
                     raise RecoveryRefusal(stage)
 
         stage = "worker_readiness"
-        if not _worker_ready(app_dir, release, systemd_dir):
-            raise RecoveryRefusal(stage)
+        worker_result = _worker_ready(app_dir, release, systemd_dir)
+        if worker_result != "passed":
+            raise RecoveryRefusal(f"{stage}_{worker_result}")
 
         if mode == "api-worker-nginx":
             stage = "nginx_prestart_config"
