@@ -535,8 +535,7 @@ jobs:
             || fail "A release transaction remains after maintenance."
 
           CURRENT_STAGE=report_binding
-          set +e
-          report_name="$(/usr/bin/python3 -I - "$report_dir" \
+          if report_name="$(/usr/bin/python3 -I - "$report_dir" \
             "$invocation_started_at" "$invocation_completed_at" \
             "$service_invocation_before" "$service_invocation_after" \
             "$current_id" "$previous_id" 2>/dev/null <<'PY'
@@ -658,9 +657,11 @@ jobs:
           except Exception:
               raise SystemExit(2)
           PY
-          )"
-          report_binding_status=$?
-          set -e
+          )"; then
+            report_binding_status=0
+          else
+            report_binding_status=$?
+          fi
           if (( report_binding_status != 0 )); then
             if (( service_status != 0 )); then
               fail_with_status report_unavailable "$service_status"

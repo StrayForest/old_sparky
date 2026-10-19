@@ -4054,12 +4054,13 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 self.assertEqual(calls.read_text(encoding="ascii"), "1")
 
                 report_reader_start = workflow.index(
-                    '          report_name="$(/usr/bin/python3 -I - "$report_dir"'
+                    '          if report_name="$(/usr/bin/python3 -I - "$report_dir"'
                 )
                 report_reader_end = workflow.index(
-                    "\n          report_binding_status=$?", report_reader_start
+                    "\n          if (( report_binding_status != 0 )); then",
+                    report_reader_start,
                 )
-                report_reader = textwrap.dedent(
+                report_binding = textwrap.dedent(
                     workflow[report_reader_start:report_reader_end]
                 )
                 report_payload = {
@@ -4100,8 +4101,8 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 )
                 report_script = (
                     report_prefix
-                    + report_reader
-                    + "\nreport_binding_status=$?\nset -e\n"
+                    + report_binding
+                    + "\n"
                     + report_failure
                     + "\nprintf 'BOUND_REPORT=%s\\n' \"$report_name\"\n"
                 )
