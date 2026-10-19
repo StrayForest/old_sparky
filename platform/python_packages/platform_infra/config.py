@@ -13,11 +13,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PLATFORM_SCHEMA = "platform"
 PLATFORM_ROOT = Path(__file__).resolve().parents[2]
 DEVELOPMENT_SECRET_KEY = "development-only-secret-key-change-before-production"
+_PLATFORM_ENV_FILE = os.environ.get("PLATFORM_ENV_FILE", "").strip()
+_SETTINGS_ENV_FILE = Path(_PLATFORM_ENV_FILE) if _PLATFORM_ENV_FILE else None
+if _SETTINGS_ENV_FILE is None:
+    _SETTINGS_ENV_FILE = PLATFORM_ROOT / ".env.platform"
+elif not _SETTINGS_ENV_FILE.is_absolute():
+    _SETTINGS_ENV_FILE = PLATFORM_ROOT / _SETTINGS_ENV_FILE
 
 
 class PlatformSettings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=PLATFORM_ROOT / ".env.platform",
+        env_file=_SETTINGS_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )

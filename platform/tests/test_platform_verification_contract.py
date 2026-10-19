@@ -120,10 +120,10 @@ from tools.platform_verify_contract import (
 )
 
 EXPECTED_LOCAL_CI_EXECUTION_ORDER = (
-    "verification-contract",
     "docs",
     "python-quality",
     "security",
+    "verification-contract",
     "migration",
     "backend",
     "web-quality",
@@ -3030,10 +3030,10 @@ except lock.VerificationLockError as exc:
         self.assertEqual(
             aggregate_order,
             [
-                "verification-contract",
                 "docs",
                 "python-quality",
                 "security",
+                "verification-contract",
                 "migration",
                 "schema-upgrade",
                 "backend",
@@ -3051,7 +3051,7 @@ except lock.VerificationLockError as exc:
             patch("tools.platform_verify._prepare_ci_backend_database") as prepare_database,
         ):
             self.assertEqual(dispatch_ci(), 19)
-        self.assertEqual(early_failure_order, ["verification-contract"])
+        self.assertEqual(early_failure_order, ["docs"])
         prepare_database.assert_not_called()
 
         failed_order: list[str] = []
@@ -3073,7 +3073,7 @@ except lock.VerificationLockError as exc:
             self.assertEqual(dispatch_ci(), 17)
         self.assertEqual(
             failed_order,
-            ["verification-contract", "docs", "python-quality", "security", "migration"],
+            ["docs", "python-quality", "security", "verification-contract", "migration"],
         )
         failed_upgrade.assert_called_once()
 
@@ -3096,7 +3096,7 @@ except lock.VerificationLockError as exc:
             dispatch_ci()
         self.assertEqual(
             unsafe_order,
-            ["verification-contract", "docs", "python-quality", "security", "migration"],
+            ["docs", "python-quality", "security", "verification-contract", "migration"],
         )
         unsafe_upgrade.assert_not_called()
         missing_seed = _integration_preflight_error(

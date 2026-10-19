@@ -214,7 +214,46 @@ five-contour aggregate and needs its DB, Redis and privileged prerequisites.
 Raw underlying commands are reserved for debugging the canonical runner or
 isolating a CI failure. The local deterministic aggregate is
 `tools/platform_verify.py ci`; it does not run production smoke, live QA or
-load testing.
+load testing. Its order is `docs`, `python-quality`, `security`,
+`verification-contract`, `migration`, backend database preparation, `backend`,
+`web-quality` and `web-hermetic`. The first four gates need no test database;
+each gate runs once and stops the aggregate on its first failure.
+
+The DB-free backend contours need test-only settings but do not connect to
+PostgreSQL or Redis. To run one after bootstrap without loading the ignored
+runtime dotenv, use a private test environment file with the same loopback
+resource names as CI:
+
+```bash
+cd /root/old_sparky/platform
+set -euo pipefail
+umask 077
+test_env_dir="$(mktemp -d)"
+test_env_file="$test_env_dir/test.env"
+trap 'rm -f -- "$test_env_file"; rmdir -- "$test_env_dir"' EXIT
+cat > "$test_env_file" <<'EOF'
+PLATFORM_ENVIRONMENT=test
+PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+PLATFORM_DB_SCHEMA=platform
+PLATFORM_SECRET_KEY=example-local-test-secret-no-production-credentials
+PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
+PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
+PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+PLATFORM_OBJECT_STORAGE_BACKEND=local
+EOF
+chmod 600 "$test_env_file"
+PLATFORM_ENV_FILE="$test_env_file" \
+  .venv_platform/bin/python tools/platform_verify.py backend-unit
+```
+
+Replace `backend-unit` with `backend-tool-contract` or
+`performance-contract` for those DB-free contours. The file contains only
+local test values and is removed when the shell exits. `PLATFORM_ENV_FILE`
+selects the same dotenv for the wrapper and application settings; an explicit
+missing path disables dotenv loading, and an unset value keeps the default
+`platform/.env.platform`. Use `platform_prepare_test_runtime.py --apply` and
+the migration gate only when preparing the disposable database for
+`backend-integration` or the full `backend` aggregate.
 
 For a production-bound `dev` change, final verification is the GitHub chain for the same tested execution SHA:
 

@@ -1544,10 +1544,10 @@ def dispatch_ci() -> int:
     # the registry as the membership authority and require this order to name
     # every required gate exactly once when a new gate is added.
     ordered_gate_ids = (
-        "verification-contract",
         "docs",
         "python-quality",
         "security",
+        "verification-contract",
         "migration",
         "backend",
         "web-quality",

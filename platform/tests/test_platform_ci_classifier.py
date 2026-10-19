@@ -524,14 +524,18 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_release_runtime_sensitivity_is_exact_and_digest_bound(self) -> None:
         runtime_path = "platform/tools/platform_build_live_qa_runtime.py"
+        settings_path = "platform/python_packages/platform_infra/config.py"
         self.assertIn(runtime_path, RUNTIME_SENSITIVE_FILES)
-        runtime = classify(
-            [runtime_path],
-            event="pull_request",
-            target_sha=self.TARGET_SHA,
-        )
-        self.assertTrue(runtime["runtime_sensitive"])
-        validate_manifest(runtime, expected_target_sha=self.TARGET_SHA)
+        self.assertIn(settings_path, RUNTIME_SENSITIVE_FILES)
+        for path in (runtime_path, settings_path):
+            with self.subTest(path=path):
+                runtime = classify(
+                    [path],
+                    event="pull_request",
+                    target_sha=self.TARGET_SHA,
+                )
+                self.assertTrue(runtime["runtime_sensitive"])
+                validate_manifest(runtime, expected_target_sha=self.TARGET_SHA)
 
         for files in (
             ["platform/docs/test-suite-governance.md"],
