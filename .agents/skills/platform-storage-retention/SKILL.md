@@ -82,6 +82,13 @@ calling the task complete.
    gh run watch <maintenance-run-id> --repo StrayForest/old_sparky --exit-status
    ```
 
+   Keep the workflow ref at `dev`; `expected_sha` is the active deployed app
+   SHA. The verifier and both QA artifacts bind to the exact `dev` runner SHA,
+   while both reports must name `expected_sha` as their app target. If runner
+   and app SHAs differ, each report must carry the authenticated
+   `verified-noop` source-binding digest. Never dispatch from an arbitrary SHA
+   ref or treat `expected_sha` as the workflow source.
+
    The workflow verifies the active release and starts
    `deadlock-maintenance.service`; the installed service holds the canonical
    release then retained-load locks while applying the sweep and publishing
