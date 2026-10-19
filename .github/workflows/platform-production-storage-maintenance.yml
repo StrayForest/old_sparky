@@ -76,9 +76,10 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/dev"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$EXPECTED_SHA" = "$GITHUB_SHA"
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
           timeout --foreground 180s /usr/bin/python3 -I -B \
             platform/tools/platform_maintenance_qa_evidence.py \
+            --runner-sha "$GITHUB_SHA" \
             --target-sha "$EXPECTED_SHA" \
             --live-launch-run-id "$LIVE_LAUNCH_RUN_ID" \
             --live-launch-attempt "$LIVE_LAUNCH_RUN_ATTEMPT" \
