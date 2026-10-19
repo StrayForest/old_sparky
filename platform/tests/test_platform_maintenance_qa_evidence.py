@@ -23,7 +23,10 @@ from tools import platform_maintenance_qa_evidence as evidence
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _canonical_workflow_report(workflow_name: str, target_sha: str) -> dict[str, object]:
+def _canonical_workflow_report(
+    workflow_name: str, runner_sha: str, app_target_sha: str | None = None
+) -> dict[str, object]:
+    app_target_sha = app_target_sha or runner_sha
     workflow_path = REPO_ROOT / ".github" / "workflows" / workflow_name
     source = workflow_path.read_text(encoding="utf-8")
     if workflow_name == "platform-live-launch.yml":
@@ -39,14 +42,15 @@ def _canonical_workflow_report(workflow_name: str, target_sha: str) -> dict[str,
             "LIVE_BROWSER_COUNTS schema=1 run_status=passed logical_total=54 logical_pass=47 "
             "logical_fail=0 logical_expected_fail=0 logical_flaky=0 logical_skip=7 "
             f"logical_interrupted=0 attempt_total=54 attempt_pass=47 attempt_fail=0 "
-            f"attempt_skip=7 attempt_interrupted=0 attempt_timedout=0 source_sha={target_sha} "
-            f"app_sha={target_sha} marker_sha256={marker_digest}\n"
+            f"attempt_skip=7 attempt_interrupted=0 attempt_timedout=0 source_sha={runner_sha} "
+            f"app_sha={app_target_sha} marker_sha256={marker_digest}\n"
         )
         status_line = (
             "LIVE_LAUNCH_STATUS schema=2 status=passed stage=complete check=none "
-            f"child_exit=0 source_sha={target_sha}\n"
+            f"child_exit=0 source_sha={runner_sha}\n"
         )
-        arguments = ("0", target_sha, target_sha, "", marker)
+        binding_digest = "" if app_target_sha == runner_sha else "c" * 64
+        arguments = ("0", runner_sha, app_target_sha, binding_digest, marker)
         raw = (count_line + status_line).encode("ascii")
         output_name = "safe.json"
     else:
@@ -60,15 +64,16 @@ def _canonical_workflow_report(workflow_name: str, target_sha: str) -> dict[str,
             "LIVE_BROWSER_COUNTS schema=1 run_status=passed logical_total=1 logical_pass=1 "
             "logical_fail=0 logical_expected_fail=0 logical_flaky=0 logical_skip=0 "
             f"logical_interrupted=0 attempt_total=1 attempt_pass=1 attempt_fail=0 "
-            f"attempt_skip=0 attempt_interrupted=0 attempt_timedout=0 source_sha={target_sha} "
-            f"app_sha={target_sha} marker_sha256={marker_digest}\n"
+            f"attempt_skip=0 attempt_interrupted=0 attempt_timedout=0 source_sha={runner_sha} "
+            f"app_sha={app_target_sha} marker_sha256={marker_digest}\n"
         )
         diagnostic = (
             "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none stdout_bytes=0 stderr_bytes=0 "
             "truncated=false child_exit=0\n"
         )
         raw = (count_line + "LIVE_USER_QA_SUCCESS\n" + diagnostic).encode("ascii")
-        arguments = ("0", target_sha, target_sha, "")
+        binding_digest = "" if app_target_sha == runner_sha else "c" * 64
+        arguments = ("0", runner_sha, app_target_sha, binding_digest)
         output_name = "report.json"
     match = re.search(pattern, source, flags=re.DOTALL)
     if match is None:
@@ -205,12 +210,23 @@ def _legacy_preserve_maintenance_argv() -> tuple[str, ...]:
 
 class MaintenanceQaEvidenceTests(unittest.TestCase):
     def test_closed_qa_reports_reject_inconsistent_counts_and_bindings(self) -> None:
-        target_sha = "a" * 40
-        launch = _canonical_workflow_report("platform-live-launch.yml", target_sha)
-        evidence.validate_live_launch_report(launch, target_sha)
-        user = _canonical_workflow_report("platform-live-user-qa.yml", target_sha)
-        evidence.validate_live_user_qa_report(user, target_sha)
+        runner_sha = "a" * 40
+        app_target_sha = "a" * 40
+        launch = _canonical_workflow_report("platform-live-launch.yml", runner_sha)
+        evidence.validate_live_launch_report(launch, runner_sha, app_target_sha)
+        user = _canonical_workflow_report("platform-live-user-qa.yml", runner_sha)
+        evidence.validate_live_user_qa_report(user, runner_sha, app_target_sha)
         self.assertIsNone(user["failure_origin"])
+
+        app_target_sha = "b" * 40
+        bound_launch = _canonical_workflow_report(
+            "platform-live-launch.yml", runner_sha, app_target_sha
+        )
+        bound_user = _canonical_workflow_report(
+            "platform-live-user-qa.yml", runner_sha, app_target_sha
+        )
+        evidence.validate_live_launch_report(bound_launch, runner_sha, app_target_sha)
+        evidence.validate_live_user_qa_report(bound_user, runner_sha, app_target_sha)
 
         invalid = (
             ("launch-skip-count", {**launch, "logical_counts": {**launch["logical_counts"], "logical_skip": 5}}, "launch"),
@@ -222,18 +238,30 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             ("user-failure-origin-missing", {key: value for key, value in user.items() if key != "failure_origin"}, "user"),
             ("user-skipped", {**user, "browser_counts": {**user["browser_counts"], "logical_skip": 1}}, "user"),
             ("user-binding", {**user, "source_binding_sha256": ""}, "user"),
+            ("launch-wrong-app-target", {**bound_launch, "app_target_sha": "d" * 40}, "launch-bound"),
+            ("launch-wrong-runner", {**bound_launch, "source_git_sha": "e" * 40}, "launch-bound"),
+            ("launch-missing-noop-binding", {**bound_launch, "source_binding_sha256": None}, "launch-bound"),
+            ("launch-malformed-noop-binding", {**bound_launch, "source_binding_sha256": "not-a-digest"}, "launch-bound"),
+            ("user-wrong-app-target", {**bound_user, "app_target_sha": "d" * 40}, "user-bound"),
+            ("user-wrong-runner", {**bound_user, "source_git_sha": "e" * 40}, "user-bound"),
+            ("user-missing-noop-binding", {**bound_user, "source_binding_sha256": None}, "user-bound"),
+            ("user-malformed-noop-binding", {**bound_user, "source_binding_sha256": "not-a-digest"}, "user-bound"),
+            ("equal-target-with-noop-binding", {**launch, "source_binding_sha256": "c" * 64}, "launch-equal"),
         )
         for case, candidate, report_type in invalid:
             with self.subTest(case=case), self.assertRaises(evidence.EvidenceError):
-                if report_type == "launch":
-                    evidence.validate_live_launch_report(candidate, target_sha)
+                if report_type.startswith("launch"):
+                    expected_target = app_target_sha if report_type == "launch-bound" else runner_sha
+                    evidence.validate_live_launch_report(candidate, runner_sha, expected_target)
                 else:
-                    evidence.validate_live_user_qa_report(candidate, target_sha)
+                    expected_target = app_target_sha if report_type == "user-bound" else runner_sha
+                    evidence.validate_live_user_qa_report(candidate, runner_sha, expected_target)
 
     def test_artifact_proof_binds_latest_attempt_digest_window_and_report(self) -> None:
-        target_sha = "a" * 40
+        runner_sha = "a" * 40
+        app_target_sha = "b" * 40
         member = "live-launch-sanitized.json"
-        report = _canonical_workflow_report("platform-live-launch.yml", target_sha)
+        report = _canonical_workflow_report("platform-live-launch.yml", runner_sha, app_target_sha)
         archive_bytes = _zip_report(member, report)
         run_id, attempt, artifact_id = 12345, 2, 67890
         workflow = {
@@ -250,7 +278,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             "run_attempt": attempt,
             "status": "completed",
             "conclusion": "success",
-            "head_sha": target_sha,
+            "head_sha": runner_sha,
             "head_branch": "dev",
             "event": "workflow_dispatch",
             "html_url": f"https://github.com/{evidence.REPOSITORY}/actions/runs/{run_id}",
@@ -277,7 +305,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             "expires_at": "2026-10-14T10:08:00Z",
             "workflow_run": {
                 "id": run_id,
-                "head_sha": target_sha,
+                "head_sha": runner_sha,
                 "head_branch": "dev",
             },
         }
@@ -290,7 +318,8 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             "archive_bytes": archive_bytes,
             "run_id_text": str(run_id),
             "attempt_text": str(attempt),
-            "expected_sha": target_sha,
+            "expected_runner_sha": runner_sha,
+            "expected_app_target_sha": app_target_sha,
             "workflow_path": evidence.LIVE_LAUNCH_PATH,
             "workflow_name": evidence.LIVE_LAUNCH_NAME,
             "artifact_prefix": "platform-live-launch-sanitized",
@@ -370,6 +399,17 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
 
         invalid = (
             ("wrong-attempt", {"run": {**run, "run_attempt": 1}}),
+            ("wrong-runner-sha", {"expected_runner_sha": "f" * 40}),
+            ("wrong-app-target-sha", {"expected_app_target_sha": "d" * 40}),
+            ("wrong-run-head-sha", {"run": {**run, "head_sha": "f" * 40}}),
+            (
+                "wrong-artifact-head-sha",
+                {"metadata": {**metadata, "workflow_run": {**metadata["workflow_run"], "head_sha": "f" * 40}}},
+            ),
+            (
+                "wrong-app-report-target",
+                {"archive_bytes": _zip_report(member, {**report, "app_target_sha": "d" * 40})},
+            ),
             ("duplicate-artifact", {"listing": {"total_count": 2, "artifacts": [*listing["artifacts"], dict(listing["artifacts"][0])]}}),
             ("expired", {"metadata": {**metadata, "expired": True}}),
             ("digest", {"archive_bytes": archive_bytes + b"x"}),
@@ -527,7 +567,8 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                     with self.assertRaises(evidence.EvidenceError):
                         evidence._verify_one_qa(
                             token="synthetic",
-                            target_sha="a" * 40,
+                            runner_sha="a" * 40,
+                            app_target_sha="b" * 40,
                             run_id=run_id,
                             attempt=attempt,
                             workflow_path=evidence.LIVE_LAUNCH_PATH,
@@ -537,6 +578,42 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                             report_validator=evidence.validate_live_launch_report,
                         )
                     build_opener.assert_not_called()
+
+        runner_sha = "a" * 40
+        app_target_sha = "b" * 40
+        with (
+            patch.object(evidence, "verify_qa_evidence") as verify,
+            patch.dict(os.environ, {"GH_TOKEN": "synthetic"}),
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            self.assertEqual(
+                evidence.main(
+                    [
+                        "--runner-sha",
+                        runner_sha,
+                        "--target-sha",
+                        app_target_sha,
+                        "--live-launch-run-id",
+                        "123",
+                        "--live-launch-attempt",
+                        "1",
+                        "--live-user-qa-run-id",
+                        "456",
+                        "--live-user-qa-attempt",
+                        "1",
+                    ]
+                ),
+                0,
+            )
+        verify.assert_called_once_with(
+            runner_sha=runner_sha,
+            app_target_sha=app_target_sha,
+            live_launch_run_id="123",
+            live_launch_attempt="1",
+            live_user_qa_run_id="456",
+            live_user_qa_attempt="1",
+            token="synthetic",
+        )
 
     def test_loaded_maintenance_unit_requires_exact_protected_rotation_argv_and_limits(self) -> None:
         source_bytes = (

@@ -606,17 +606,29 @@ def _closed_ints(value: object, fields: tuple[str, ...]) -> dict[str, int]:
     return result
 
 
-def _check_source_binding(report: dict[str, Any], expected_sha: str) -> None:
+def _check_source_binding(
+    report: dict[str, Any], expected_runner_sha: str, expected_app_target_sha: str
+) -> None:
+    """Bind report claims to the exact runner and deployed app target.
+
+    For runner/target mismatches, the exact successful QA workflow run has
+    already authenticated its verified-noop handoff before it emits this
+    report; require that workflow's canonical binding digest to be carried
+    through alongside the explicitly expected app target.
+    """
     app_sha = report.get("app_target_sha")
     binding = report.get("source_binding_sha256")
     if (
-        not isinstance(expected_sha, str)
-        or SHA_RE.fullmatch(expected_sha) is None
+        not isinstance(expected_runner_sha, str)
+        or SHA_RE.fullmatch(expected_runner_sha) is None
+        or not isinstance(expected_app_target_sha, str)
+        or SHA_RE.fullmatch(expected_app_target_sha) is None
         or not isinstance(app_sha, str)
         or SHA_RE.fullmatch(app_sha) is None
-        or (app_sha == expected_sha and binding is not None)
+        or app_sha != expected_app_target_sha
+        or (expected_app_target_sha == expected_runner_sha and binding is not None)
         or (
-            app_sha != expected_sha
+            expected_app_target_sha != expected_runner_sha
             and (not isinstance(binding, str) or DIGEST_RE.fullmatch(binding) is None)
         )
     ):
@@ -642,13 +654,15 @@ def _check_success_child_diagnostic(value: object) -> None:
         _fail()
 
 
-def validate_live_launch_report(report: dict[str, Any], expected_sha: str) -> None:
+def validate_live_launch_report(
+    report: dict[str, Any], expected_runner_sha: str, expected_app_target_sha: str
+) -> None:
     if (
         set(report) != LAUNCH_REPORT_KEYS
         or type(report.get("schema")) is not int
         or report.get("schema") != 1
-        or report.get("source_git_sha") != expected_sha
-        or report.get("source_sha") != expected_sha
+        or report.get("source_git_sha") != expected_runner_sha
+        or report.get("source_sha") != expected_runner_sha
         or report.get("status") != "passed"
         or report.get("success") is not True
         or report.get("failure_reason") != "none"
@@ -668,7 +682,7 @@ def validate_live_launch_report(report: dict[str, Any], expected_sha: str) -> No
     ):
         if type(report.get(field)) is not int or report[field] < 0:
             _fail()
-    _check_source_binding(report, expected_sha)
+    _check_source_binding(report, expected_runner_sha, expected_app_target_sha)
     _check_success_child_diagnostic(report.get("child_diagnostic"))
     logical = _closed_ints(report.get("logical_counts"), LAUNCH_LOGICAL_FIELDS)
     attempts = _closed_ints(report.get("attempt_counts"), LAUNCH_ATTEMPT_FIELDS)
@@ -717,12 +731,14 @@ def validate_live_launch_report(report: dict[str, Any], expected_sha: str) -> No
         "interrupted": 0,
     }:
         _fail()
-def validate_live_user_qa_report(report: dict[str, Any], expected_sha: str) -> None:
+def validate_live_user_qa_report(
+    report: dict[str, Any], expected_runner_sha: str, expected_app_target_sha: str
+) -> None:
     if (
         set(report) != USER_REPORT_KEYS
         or type(report.get("schema")) is not int
         or report.get("schema") != 1
-        or report.get("source_git_sha") != expected_sha
+        or report.get("source_git_sha") != expected_runner_sha
         or report.get("status") != "passed"
         or report.get("failure_origin") is not None
         or report.get("success") is not True
@@ -749,14 +765,14 @@ def validate_live_user_qa_report(report: dict[str, Any], expected_sha: str) -> N
     ):
         if type(report.get(field)) is not int or report[field] < 0:
             _fail()
-    _check_source_binding(report, expected_sha)
+    _check_source_binding(report, expected_runner_sha, expected_app_target_sha)
     _check_success_child_diagnostic(report.get("child_diagnostic"))
     counts = report.get("browser_counts")
     if not isinstance(counts, dict) or set(counts) != USER_BROWSER_COUNT_KEYS:
         _fail()
     if (
         counts.get("run_status") != "passed"
-        or counts.get("source_sha") != expected_sha
+        or counts.get("source_sha") != expected_runner_sha
         or counts.get("app_sha") != report.get("app_target_sha")
         or not isinstance(counts.get("marker_sha256"), str)
         or DIGEST_RE.fullmatch(counts["marker_sha256"]) is None
@@ -844,7 +860,8 @@ def _validate_artifact_binding(
     archive_bytes: bytes,
     run_id_text: str,
     attempt_text: str,
-    expected_sha: str,
+    expected_runner_sha: str,
+    expected_app_target_sha: str,
     workflow_path: str,
     workflow_name: str,
     artifact_prefix: str,
@@ -856,8 +873,10 @@ def _validate_artifact_binding(
     attempt = _input_id(attempt_text)
     if (
         not isinstance(metadata, dict)
-        or not isinstance(expected_sha, str)
-        or SHA_RE.fullmatch(expected_sha) is None
+        or not isinstance(expected_runner_sha, str)
+        or SHA_RE.fullmatch(expected_runner_sha) is None
+        or not isinstance(expected_app_target_sha, str)
+        or SHA_RE.fullmatch(expected_app_target_sha) is None
     ):
         _fail()
     expected_name = f"{artifact_prefix}-{run_id_text}-{attempt_text}"
@@ -867,7 +886,7 @@ def _validate_artifact_binding(
             run,
             expected_run_id=run_id,
             expected_attempt=attempt,
-            expected_target_sha=expected_sha,
+            expected_target_sha=expected_runner_sha,
             expected_event="workflow_dispatch",
             expected_branch="dev",
             expected_path=workflow_path,
@@ -916,7 +935,7 @@ def _validate_artifact_binding(
         not isinstance(artifact_run, dict)
         or type(artifact_run.get("id")) is not int
         or artifact_run["id"] != run_id
-        or artifact_run.get("head_sha") != expected_sha
+        or artifact_run.get("head_sha") != expected_runner_sha
         or artifact_run.get("head_branch") != "dev"
         or ("run_attempt" in artifact_run and
             (type(artifact_run.get("run_attempt")) is not int or artifact_run["run_attempt"] != attempt))
@@ -936,7 +955,7 @@ def _validate_artifact_binding(
     if len(archive_bytes) != size or hashlib.sha256(archive_bytes).hexdigest() != digest.removeprefix("sha256:"):
         _fail()
     report = _parse_report_member(archive_bytes, member_name)
-    report_validator(report, expected_sha)
+    report_validator(report, expected_runner_sha, expected_app_target_sha)
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -1017,7 +1036,8 @@ def _api_json(opener: Any, url: str, headers: dict[str, str]) -> dict[str, Any]:
 def _verify_one_qa(
     *,
     token: str,
-    target_sha: str,
+    runner_sha: str,
+    app_target_sha: str,
     run_id: str,
     attempt: str,
     workflow_path: str,
@@ -1028,7 +1048,13 @@ def _verify_one_qa(
 ) -> None:
     run_id_value = _input_id(run_id)
     attempt_value = _input_id(attempt)
-    if not token or "\n" in token or "\r" in token or SHA_RE.fullmatch(target_sha) is None:
+    if (
+        not token
+        or "\n" in token
+        or "\r" in token
+        or SHA_RE.fullmatch(runner_sha) is None
+        or SHA_RE.fullmatch(app_target_sha) is None
+    ):
         _fail()
     api_opener = build_opener(_NoRedirect())
     artifact_opener = build_opener(_SafeArtifactRedirect())
@@ -1073,7 +1099,8 @@ def _verify_one_qa(
         archive_bytes=archive_bytes,
         run_id_text=run_id,
         attempt_text=attempt,
-        expected_sha=target_sha,
+        expected_runner_sha=runner_sha,
+        expected_app_target_sha=app_target_sha,
         workflow_path=workflow_path,
         workflow_name=workflow_name,
         artifact_prefix=artifact_prefix,
@@ -1084,7 +1111,8 @@ def _verify_one_qa(
 
 def verify_qa_evidence(
     *,
-    target_sha: str,
+    runner_sha: str,
+    app_target_sha: str,
     live_launch_run_id: str,
     live_launch_attempt: str,
     live_user_qa_run_id: str,
@@ -1095,7 +1123,8 @@ def verify_qa_evidence(
         _fail()
     _verify_one_qa(
         token=token,
-        target_sha=target_sha,
+        runner_sha=runner_sha,
+        app_target_sha=app_target_sha,
         run_id=live_launch_run_id,
         attempt=live_launch_attempt,
         workflow_path=LIVE_LAUNCH_PATH,
@@ -1106,7 +1135,8 @@ def verify_qa_evidence(
     )
     _verify_one_qa(
         token=token,
-        target_sha=target_sha,
+        runner_sha=runner_sha,
+        app_target_sha=app_target_sha,
         run_id=live_user_qa_run_id,
         attempt=live_user_qa_attempt,
         workflow_path=LIVE_USER_QA_PATH,
@@ -1174,6 +1204,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             return 1
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runner-sha", required=True)
     parser.add_argument("--target-sha", required=True)
     parser.add_argument("--live-launch-run-id", required=True)
     parser.add_argument("--live-launch-attempt", required=True)
@@ -1182,7 +1213,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(actual_argv)
     try:
         verify_qa_evidence(
-            target_sha=args.target_sha,
+            runner_sha=args.runner_sha,
+            app_target_sha=args.target_sha,
             live_launch_run_id=args.live_launch_run_id,
             live_launch_attempt=args.live_launch_attempt,
             live_user_qa_run_id=args.live_user_qa_run_id,
