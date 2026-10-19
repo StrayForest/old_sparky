@@ -968,7 +968,6 @@ class NoopSourceBindingTests(unittest.TestCase):
         self.assertIn("APP_TARGET_SHA", app_sha_consumer["env"])
 
         archive = _zip_receipt(_receipt_document())
-        metadata = _artifact_metadata(archive)
         deploy_run = {
             "id": int(DEPLOY_RUN_ID),
             "run_attempt": int(DEPLOY_ATTEMPT),

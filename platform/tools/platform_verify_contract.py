@@ -2455,7 +2455,6 @@ def collect_issues() -> list[str]:
     ):
         for marker in (
             "platform-ci-route-",
-            "classifier-manifest.json",
             "target_sha",
             "digest",
         ):
@@ -2467,16 +2466,42 @@ def collect_issues() -> list[str]:
     if "platform_production_classifier_artifact.py" not in production_text:
         issues.append("production deploy must independently invoke the canonical classifier parser")
     if (
+        "platform_production_classifier_artifact.py manifest" not in auto_text
+        or "--allow-docs-only" not in auto_text
+        or "--allow-candidate-packaging" not in auto_text
+        or "--emit-manifest-base64" not in auto_text
+    ):
+        issues.append("auto-deploy must validate the exact classifier ZIP through the shared parser")
+    artifact_parser = PLATFORM_ROOT / "tools" / "platform_production_classifier_artifact.py"
+    safe_zip_parser = PLATFORM_ROOT / "tools" / "platform_safe_zip.py"
+    try:
+        artifact_parser_text = artifact_parser.read_text(encoding="utf-8")
+        safe_zip_parser_text = safe_zip_parser.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        issues.append("canonical classifier artifact ZIP parser is missing or unreadable")
+    else:
+        if "extract_single_manifest" not in artifact_parser_text:
+            issues.append("canonical classifier parser must extract the single bounded manifest")
+        if '"classifier-manifest.json"' not in safe_zip_parser_text:
+            issues.append("safe ZIP parser must bind the exact classifier manifest member")
+    if (
         'manifest_args=(--target-sha "$TARGET_SHA"' not in production_text
         or 'manifest "$route_dir/artifact.zip" "${manifest_args[@]}"' not in production_text
         or production_text.count(
             'manifest_args+=(--require-reconcile-source)'
-        ) != 2
+        ) != 1
+        or production_text.count(
+            'manifest_args+=(--require-reconcile-source --allow-docs-only)'
+        ) != 1
+        or production_text.count('manifest_args+=(--allow-docs-only)') != 1
         or production_text.count(
             'if [[ "$RECONCILE_MODE" == "true" ]]; then'
         ) != 2
         or "RECONCILE_MODE: ${{ inputs.mode == 'baseline-reconcile' && 'true' || 'false' }}"
         not in production_text
+        or "BASELINE_RECONCILE_MODE: ${{ inputs.mode == 'baseline-reconcile' && 'true' || 'false' }}"
+        not in production_text
+        or 'if [[ "$BASELINE_RECONCILE_MODE" == "true" ]]; then' not in production_text
         or "DEPLOY_MODE: deploy" not in production_text
     ):
         issues.append("production deploy must revalidate the exact classifier manifest before writes")

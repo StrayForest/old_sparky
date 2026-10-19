@@ -3441,6 +3441,7 @@ jobs:
       ACTIVE_BASELINE_JSON: ${{ needs.host-capability-preflight.outputs.baseline_identity }}
       ACTIVE_BASELINE_SHA: ${{ inputs.mode == 'recovery-deploy' && needs.validate-recovery-baseline.outputs.active_baseline_sha || needs.validate-active-baseline.outputs.active_baseline_sha }}
       RECONCILE_MODE: ${{ (inputs.mode == 'baseline-reconcile' || inputs.mode == 'recovery-deploy') && 'true' || 'false' }}
+      BASELINE_RECONCILE_MODE: ${{ inputs.mode == 'baseline-reconcile' && 'true' || 'false' }}
       BASELINE_RUNTIME_REQUIRED: ${{ inputs.mode == 'recovery-deploy' && needs.validate-recovery-baseline.outputs.runtime_required || needs.validate-active-baseline.outputs.runtime_required }}
       CUMULATIVE_MANIFEST_SHA256: ${{ inputs.mode == 'recovery-deploy' && needs.validate-recovery-baseline.outputs.cumulative_manifest_sha256 || needs.validate-active-baseline.outputs.cumulative_manifest_sha256 }}
       BASELINE_RUNTIME_PROOF_RUN_ID: ${{ needs.validate-baseline-runtime-proof.outputs.proof_run_id }}
@@ -3674,6 +3675,9 @@ jobs:
           manifest_args=(--target-sha "$TARGET_SHA")
           if [[ "$RECONCILE_MODE" == "true" ]]; then
             manifest_args+=(--require-reconcile-source)
+          fi
+          if [[ "$BASELINE_RECONCILE_MODE" == "true" ]]; then
+            manifest_args+=(--allow-docs-only)
           fi
           /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" "${manifest_args[@]}"
 
