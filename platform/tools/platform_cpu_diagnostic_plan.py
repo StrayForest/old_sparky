@@ -298,28 +298,41 @@ def _process_start_ticks(pid: int) -> int:
 
 
 def _read_process_environ(pid: int, *, maximum: int = 131_072) -> dict[str, bytes]:
-    # Values are inspected in-memory only for two fixed identity keys; the raw
-    # environment and all unrelated entries are never printed or persisted.
+    # Values are inspected in-memory only for two fixed identity keys. Parse
+    # offsets in the mutable buffer so unrelated bytearray entries are never
+    # copied into temporary objects before the buffer is wiped.
     fd = os.open(f"/proc/{pid}/environ", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    raw = bytearray()
     try:
-        raw = bytearray()
-        while len(raw) <= maximum:
-            chunk = os.read(fd, min(8192, maximum + 1 - len(raw)))
-            if not chunk:
-                break
-            raw.extend(chunk)
+        try:
+            while len(raw) <= maximum:
+                chunk = os.read(fd, min(8192, maximum + 1 - len(raw)))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+        finally:
+            os.close(fd)
+        if len(raw) > maximum:
+            raise PlanError("service process environment exceeds bound")
+        wanted = {b"INVOCATION_ID", b"PLATFORM_RUNTIME_SERVICE"}
+        selected: dict[str, bytes] = {}
+        start = 0
+        while start < len(raw):
+            end = raw.find(b"\0", start)
+            if end < 0:
+                end = len(raw)
+            separator = raw.find(b"=", start, end)
+            if separator >= 0:
+                key_bytes = bytes(raw[start:separator])
+                if key_bytes in wanted:
+                    name = key_bytes.decode("ascii")
+                    if name in selected:
+                        raise PlanError("service process identity marker is duplicated")
+                    selected[name] = bytes(raw[separator + 1:end])
+            start = end + 1
+        return selected
     finally:
-        os.close(fd)
-    if len(raw) > maximum:
-        raise PlanError("service process environment exceeds bound")
-    wanted = {b"INVOCATION_ID", b"PLATFORM_RUNTIME_SERVICE"}
-    selected: dict[str, bytes] = {}
-    for item in raw.split(b"\0"):
-        key, separator, value = item.partition(b"=")
-        if separator and key in wanted:
-            selected[key.decode("ascii")] = value
-    raw[:] = b"\0" * len(raw)
-    return selected
+        raw[:] = b"\0" * len(raw)
 
 
 def _service_targets(service: str, fields: dict[str, str]) -> list[dict[str, object]]:
@@ -1771,7 +1784,9 @@ def main(argv: list[str] | None = None) -> int:
             if known_class in {"PlanError", "OSError", "ValueError", "KeyError"}
             else "unexpected"
         )
-        print(f"CPU_DIAGNOSTIC_PLAN status=refused class={safe_class}", file=sys.stderr)
+        # This single closed token is the cross-boundary refusal protocol.
+        # Never include the exception text or any request/process identity.
+        print(f"CPU_DIAGNOSTIC_PLAN status=refused class={safe_class}")
         return 2
     print(
         "CPU_DIAGNOSTIC_PLAN "

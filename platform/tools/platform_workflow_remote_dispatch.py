@@ -794,7 +794,18 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     _terminate_process_group(process)
                     return 2
         child_status = process.wait(timeout=0)
-        if child_status != 0 or not output.endswith(b"\n") or output.count(b"\n") != 1:
+        if not output.endswith(b"\n") or output.count(b"\n") != 1:
+            return 2
+        if child_status == 2:
+            refusal = re.fullmatch(
+                rb"CPU_DIAGNOSTIC_PLAN status=refused class=(PlanError|OSError|ValueError|KeyError|unexpected)\n",
+                bytes(output),
+            )
+            if refusal is None:
+                return 2
+            print(bytes(output[:-1]).decode("ascii"))
+            return 2
+        if child_status != 0:
             return 2
         helper_prefix = b"CPU_DIAGNOSTIC_PLAN "
         if not output.startswith(helper_prefix):
@@ -2688,8 +2699,15 @@ def _trusted_live_launch_helper() -> bool:
 def _external_fixture(payload: dict[str, object]) -> int:
     try:
         source_arguments = _source_binding_arguments(payload)
+        canonical_payload = json.dumps(
+            payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+        ).encode("ascii") + b"\n"
     except (TypeError, ValueError, UnicodeEncodeError):
         return 2
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    if not re.fullmatch(r"[1-9][0-9]{0,8}", attempt):
+        return 2
+    input_handoff_sha256 = hashlib.sha256(canonical_payload).hexdigest()
     arguments = [
         payload["confirmation"],
         payload["target_sha"],
@@ -2700,6 +2718,8 @@ def _external_fixture(payload: dict[str, object]) -> int:
         payload["users_per_tournament"],
         payload["timeout_diagnostics"],
         *source_arguments,
+        "--run-attempt", attempt,
+        "--input-handoff-sha256", input_handoff_sha256,
     ]
     if (
         EXTERNAL_HELPER.parent != ACTIVE_TOOLS_DIR

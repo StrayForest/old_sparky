@@ -11,6 +11,10 @@ on:
         description: "GitHub run ID of the canceled production retained-load workflow"
         required: true
         type: string
+      load_run_attempt:
+        description: "Exact attempt number of the selected retained-load run"
+        required: true
+        type: string
       target_sha:
         description: "Exact source SHA currently deployed on the production VPS"
         required: true
@@ -32,6 +36,7 @@ jobs:
     env:
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       LOAD_RUN_ID: ${{ inputs.load_run_id }}
+      LOAD_RUN_ATTEMPT: ${{ inputs.load_run_attempt }}
       TARGET_SHA: ${{ inputs.target_sha }}
 
     steps:
@@ -45,6 +50,8 @@ jobs:
             || { echo "Refusing abort without exact confirmation." >&2; exit 1; }
           [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] \
             || { echo "load_run_id must be a positive decimal identifier." >&2; exit 1; }
+          [[ "$LOAD_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,8}$ ]] \
+            || { echo "load_run_attempt must be a positive decimal attempt." >&2; exit 1; }
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "target_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
 
@@ -105,7 +112,7 @@ jobs:
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             sudo -n -- /opt/oldsparky/platform/current/tools/platform_abort_retained_load.py \
-              "$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" \
+              "$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" \
             > "$ssh_output_file" 2>&1
           remote_status=$?
           set -e
@@ -128,6 +135,7 @@ jobs:
               fi
             }
             copy_if_present abort-process-tree.txt
+            copy_if_present abort-only.json
             copy_if_present canonical.log
             copy_if_present server-observability.json
             copy_if_present matrix-summary.json
@@ -201,6 +209,7 @@ jobs:
               "ssh_cleanup": classify("ABORT_SSH_CLEANUP_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
               "raw_log": present("abort-raw.log"),
               "process_tree": present("abort-process-tree.txt"),
+              "abort_only": present("abort-only.json"),
               "canonical": present("canonical.log"),
               "matrix": present("matrix-summary.json"),
               "observer": present("server-observability.json"),
@@ -217,6 +226,10 @@ jobs:
         id: normalize_abort_evidence
         if: ${{ always() }}
         shell: bash
+        env:
+          ABORT_REMOTE_STEP: ${{ steps.abort_remote.outcome }}
+          ABORT_REMOTE_STATUS: ${{ steps.abort_remote.outputs.remote_status }}
+          ABORT_SSH_CLEANUP_STEP: ${{ steps.cleanup_ssh.outcome }}
         run: |
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/production-retained-abort-artifacts"
@@ -276,6 +289,9 @@ jobs:
           if [[ ! -s "$artifact_dir/matrix-summary.json" ]]; then
             printf '%s\n' '{"schema":1,"passed":false,"control_account_preserved":false,"rows":[]}' > "$artifact_dir/matrix-summary.json"
           fi
+          if [[ ! -s "$artifact_dir/abort-only.json" ]]; then
+            printf '%s\n' '{"schema":1,"status":"not_applicable"}' > "$artifact_dir/abort-only.json"
+          fi
           if [[ ! -s "$artifact_dir/server-observability.json" ]]; then
             printf '%s\n' '{"schema":1,"available":false,"error_class":"observer_unavailable","binding":{"complete":false}}' > "$artifact_dir/server-observability.json"
           fi
@@ -317,20 +333,126 @@ jobs:
           test ! -e "$artifact_dir/abort-raw.log"
           test ! -e "$artifact_dir/abort.log"
 
-          /usr/bin/python3 - "$artifact_dir/canonical.log" <<'PY'
+          /usr/bin/python3 - "$artifact_dir/canonical.log" "$artifact_dir/abort-only.json" \
+            "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
           import json
+          import os
+          import re
+          import stat
           from pathlib import Path
           import sys
 
+          canonical_path, abort_path = Path(sys.argv[1]), Path(sys.argv[2])
+          run_id, attempt, target_sha = sys.argv[3:]
           try:
-              payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+              payload = json.loads(canonical_path.read_text(encoding="utf-8"))
           except (OSError, UnicodeError, json.JSONDecodeError):
               raise SystemExit("required abort log evidence is not valid JSON")
-          if (
-              not isinstance(payload, dict)
-              or payload.get("truncated") is not False
-              or payload.get("status") in {"truncated", "error", "unavailable"}
-          ):
+          if not isinstance(payload, dict) or payload.get("truncated") is not False:
+              raise SystemExit("required abort log evidence is incomplete")
+          if payload.get("status") == "unavailable":
+              proof_raw = b""
+              descriptor = -1
+              try:
+                  before = abort_path.lstat()
+                  if (
+                      not stat.S_ISREG(before.st_mode)
+                      or stat.S_ISLNK(before.st_mode)
+                      or before.st_nlink != 1
+                      or before.st_size > 4096
+                  ):
+                      raise ValueError
+                  descriptor = os.open(abort_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                  opened = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(opened.st_mode)
+                      or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                      or opened.st_nlink != 1
+                      or opened.st_size != before.st_size
+                  ):
+                      raise ValueError
+                  chunks = bytearray()
+                  while len(chunks) <= 4096:
+                      block = os.read(descriptor, min(1024, 4097 - len(chunks)))
+                      if not block:
+                          break
+                      chunks.extend(block)
+                  after = os.fstat(descriptor)
+                  if (
+                      len(chunks) != before.st_size
+                      or len(chunks) > 4096
+                      or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                      != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                  ):
+                      raise ValueError
+                  proof_raw = bytes(chunks)
+              except (OSError, UnicodeError, ValueError):
+                  raise SystemExit("CPU abort proof is unavailable")
+              finally:
+                  if descriptor >= 0:
+                      os.close(descriptor)
+              if not proof_raw.endswith(b"\n"):
+                  raise SystemExit("CPU abort proof is not canonical")
+
+              def reject_duplicate_keys(pairs):
+                  result = {}
+                  for key, value in pairs:
+                      if key in result:
+                          raise ValueError
+                      result[key] = value
+                  return result
+
+              try:
+                  proof = json.loads(
+                      proof_raw.decode("ascii"), object_pairs_hook=reject_duplicate_keys
+                  )
+                  canonical_proof = json.dumps(
+                      proof, ensure_ascii=True, allow_nan=False, sort_keys=True,
+                      separators=(",", ":"),
+                  ).encode("ascii") + b"\n"
+              except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+                  raise SystemExit("CPU abort proof is invalid")
+              if canonical_proof != proof_raw:
+                  raise SystemExit("CPU abort proof is not canonical")
+              expected = {
+                  "schema", "status", "fixture_kind", "external_run_id",
+                  "external_run_attempt", "source_sha", "app_target_sha",
+                  "input_handoff_sha256", "fixture_manifest_sha256", "remote_stage",
+                  "supervisor_selector", "supervisor_roots_before", "supervisor_tree_before",
+                  "supervisor_roots_after", "supervisor_descendants_after", "proc_read_errors",
+                  "supervisor_exit_code", "shared_lock_clear", "namespace_closed",
+              }
+              if (
+                  not isinstance(proof, dict)
+                  or set(proof) != expected
+                  or type(proof.get("schema")) is not int or proof["schema"] != 1
+                  or proof.get("status") != "safe_for_exact_fixture_cleanup"
+                  or proof.get("fixture_kind") != "cpu_diagnostic_only_v1"
+                  or proof.get("external_run_id") != run_id
+                  or proof.get("external_run_attempt") != attempt
+                  or proof.get("source_sha") != target_sha
+                  or proof.get("app_target_sha") != target_sha
+                  or not isinstance(proof.get("input_handoff_sha256"), str)
+                  or re.fullmatch(r"[0-9a-f]{64}", proof["input_handoff_sha256"]) is None
+                  or not isinstance(proof.get("fixture_manifest_sha256"), str)
+                  or re.fullmatch(r"[0-9a-f]{64}", proof["fixture_manifest_sha256"]) is None
+                  or proof.get("remote_stage") != "supervisor_terminated"
+                  or proof.get("supervisor_selector") != "fixed_script_path_and_run_id"
+                  or type(proof.get("supervisor_roots_before")) is not int or proof["supervisor_roots_before"] < 1
+                  or type(proof.get("supervisor_tree_before")) is not int or proof["supervisor_tree_before"] < 1
+                  or type(proof.get("supervisor_roots_after")) is not int or proof["supervisor_roots_after"] != 0
+                  or type(proof.get("supervisor_descendants_after")) is not int or proof["supervisor_descendants_after"] != 0
+                  or type(proof.get("proc_read_errors")) is not int or proof["proc_read_errors"] != 0
+                  or type(proof.get("supervisor_exit_code")) is not int
+                  or not 0 <= proof["supervisor_exit_code"] <= 255
+                  or proof.get("shared_lock_clear") is not True
+                  or proof.get("namespace_closed") is not False
+                  or os.environ.get("ABORT_REMOTE_STEP") != "success"
+                  or os.environ.get("ABORT_REMOTE_STATUS") != "0"
+                  or os.environ.get("ABORT_SSH_CLEANUP_STEP") != "success"
+              ):
+                  raise SystemExit("CPU abort proof binding or termination checks failed")
+          elif payload.get("status") not in {"passed", "failed", "unknown"}:
               raise SystemExit("required abort log evidence is incomplete")
           PY
 
@@ -389,6 +511,7 @@ jobs:
               "normalize": classify("ABORT_NORMALIZE_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
               "canonical": present("canonical.log"),
               "process_tree": present("abort-process-tree.txt"),
+              "abort_only": present("abort-only.json"),
               "matrix": present("matrix-summary.json"),
               "observer": present("server-observability.json"),
               "evidence_status": evidence_status,
@@ -409,6 +532,7 @@ jobs:
           name: platform-production-retained-abort-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/production-retained-abort-artifacts/canonical.log
+            ${{ runner.temp }}/production-retained-abort-artifacts/abort-only.json
             ${{ runner.temp }}/production-retained-abort-artifacts/abort-process-tree.txt
             ${{ runner.temp }}/production-retained-abort-artifacts/server-observability.json
             ${{ runner.temp }}/production-retained-abort-artifacts/matrix-summary.json

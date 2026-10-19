@@ -56,7 +56,8 @@ platform_retained_load_lock_open || {
 trap platform_retained_load_lock_close EXIT
 source_binding_b64=""
 run_attempt=""
-if (( $# < 7 || $# > 12 )); then
+input_handoff_sha256=""
+if (( $# < 7 || $# > 14 )); then
   echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path]" >&2
   exit 2
 fi
@@ -78,29 +79,37 @@ if (( $# >= 9 )) && [[ "${9}" == "--source-binding-base64" ]]; then
   source_binding_b64="${10}"
   next_extra_arg=11
 fi
-if (( $# >= next_extra_arg )); then
-  if (( next_extra_arg == 9 )); then
-    extra_option="${9}"
-    extra_value="${10:-}"
-  else
-    extra_option="${11}"
-    extra_value="${12:-}"
-  fi
-  [[ "$extra_option" == "--run-attempt" && -n "$extra_value" ]] || {
-    echo "Run-attempt option is invalid." >&2
+while (( $# >= next_extra_arg )); do
+  option_index="$next_extra_arg"
+  value_index=$((next_extra_arg + 1))
+  option="${!option_index}"
+  value="${!value_index:-}"
+  case "$option" in
+    --run-attempt)
+      [[ -z "$run_attempt" && -n "$value" ]] || {
+        echo "Run-attempt option is invalid." >&2
+        exit 2
+      }
+      run_attempt="$value"
+      ;;
+    --input-handoff-sha256)
+      [[ -z "$input_handoff_sha256" && -n "$value" ]] || {
+        echo "Input handoff digest option is invalid." >&2
+        exit 2
+      }
+      input_handoff_sha256="$value"
+      ;;
+    *)
+      echo "Unexpected external-load fixture option." >&2
+      exit 2
+      ;;
+  esac
+  (( $# >= value_index )) || {
+    echo "External-load fixture option is incomplete." >&2
     exit 2
   }
-  run_attempt="$extra_value"
-  (( $# == next_extra_arg + 1 )) || {
-    echo "Unexpected external-load fixture arguments." >&2
-    exit 2
-  }
-fi
-if (( $# != 7 && $# != 8 && $# != 9 && $# != 10 && $# != 11 && $# != 12 )); then
-  echo "Unexpected external-load fixture arguments." >&2
-  exit 2
-fi
-
+  next_extra_arg=$((next_extra_arg + 2))
+done
 [[ "$profile" == "external-vote" ]] || {
   echo "External-load fixture supports only the external-vote profile." >&2
   exit 1
@@ -144,6 +153,10 @@ fi
 }
 if [[ -n "$run_attempt" && ! "$run_attempt" =~ ^[1-9][0-9]{0,8}$ ]]; then
   echo "Run attempt must be a positive decimal integer." >&2
+  exit 1
+fi
+if [[ -n "$input_handoff_sha256" && ! "$input_handoff_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Input handoff digest is invalid." >&2
   exit 1
 fi
 if [[ ! "$external_vote_tournament_count" =~ ^[1-9][0-9]?$ ]] \
@@ -310,6 +323,11 @@ install -d -o root -g root -m 0700 "$run_root"
 export_dir_identity="$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h' -- "$export_dir")"
 export_created=1
 validate_fixture_confirmation || exit 1
+if [[ "$confirmation" == "$CPU_DIAGNOSTIC_CONFIRMATION" ]] \
+  && [[ -z "$run_attempt" || -z "$input_handoff_sha256" ]]; then
+  echo "CPU diagnostic fixture binding is incomplete." >&2
+  exit 1
+fi
 log_path="$run_root/canonical.log"
 server_observability_log="$run_root/server-observability.json"
 external_vote_root="$run_root/external-vote"
@@ -450,6 +468,74 @@ if [[ "$qa_status" == "0" && -s "$external_vote_manifest" ]]; then
   # Actions artifact.
   install -o "$export_uid" -g "$export_gid" -m 0600 \
     "$external_vote_manifest" "$export_dir/manifest.json"
+  if [[ "$confirmation" == "$CPU_DIAGNOSTIC_CONFIRMATION" ]]; then
+    /usr/bin/python3.12 -I -B - \
+      "$run_root" "$external_vote_manifest" "$run_id" "$run_attempt" \
+      "$target_sha" "$app_target_sha" "$input_handoff_sha256" <<'PY' || {
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+run_root, manifest_path = (Path(value) for value in sys.argv[1:3])
+run_id, attempt, source_sha, app_sha, input_sha = sys.argv[3:]
+if (
+    re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None
+    or re.fullmatch(r"[1-9][0-9]{0,8}", attempt) is None
+    or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+    or re.fullmatch(r"[0-9a-f]{40}", app_sha) is None
+    or re.fullmatch(r"[0-9a-f]{64}", input_sha) is None
+):
+    raise SystemExit(1)
+root_meta = run_root.lstat()
+if not stat.S_ISDIR(root_meta.st_mode) or root_meta.st_uid != 0 or root_meta.st_gid != 0 or stat.S_IMODE(root_meta.st_mode) != 0o700:
+    raise SystemExit(1)
+vote_meta = (run_root / "external-vote").lstat()
+if not stat.S_ISDIR(vote_meta.st_mode) or vote_meta.st_uid != 0 or vote_meta.st_gid != 0 or stat.S_IMODE(vote_meta.st_mode) != 0o700:
+    raise SystemExit(1)
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+fd = os.open(manifest_path, flags)
+try:
+    meta = os.fstat(fd)
+    if not stat.S_ISREG(meta.st_mode) or meta.st_uid != 0 or meta.st_gid != 0 or meta.st_nlink != 1 or stat.S_IMODE(meta.st_mode) != 0o600 or meta.st_size <= 0 or meta.st_size > 1_048_576:
+        raise SystemExit(1)
+    digest = hashlib.sha256()
+    while chunk := os.read(fd, 65536):
+        digest.update(chunk)
+finally:
+    os.close(fd)
+record = {
+    "schema": 1,
+    "fixture_kind": "cpu_diagnostic_only_v1",
+    "external_run_id": run_id,
+    "external_run_attempt": attempt,
+    "source_sha": source_sha,
+    "app_target_sha": app_sha,
+    "input_handoff_sha256": input_sha,
+    "fixture_manifest_sha256": digest.hexdigest(),
+}
+destination = run_root / "cpu-abort-binding.json"
+data = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+out = os.open(destination, create_flags, 0o600)
+try:
+    metadata = os.fstat(out)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise SystemExit(1)
+    with os.fdopen(out, "wb", closefd=False) as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+finally:
+    os.close(out)
+PY
+    echo "CPU diagnostic abort binding could not be published safely." >&2
+    qa_status=1
+  }
+  fi
   rm -f -- "$external_vote_complete" "$external_vote_ready"
 
   # Bind the observer to the exact fixture created by this run.  The prepare

@@ -117,6 +117,10 @@ class PairError(ValueError):
     """A fixed diagnostic input or execution contract failed."""
 
 
+class _PlanPrepareRejected(Exception):
+    """Keep the in-scope bounded report when remote plan prepare refuses."""
+
+
 def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -470,6 +474,11 @@ def _public_report(value: dict[str, Any]) -> dict[str, Any]:
         "diagnostic_credit": False,
         "namespace_closed": value.get("namespace_closed") is True,
         "plan_cleanup": value.get("plan_cleanup") if value.get("plan_cleanup") in {"complete", "failed", "unknown", "pending"} else "unknown",
+        "plan_prepare_status": value.get("plan_prepare_status") if value.get("plan_prepare_status") in {"not_attempted", "prepared", "refused", "transport_failed", "bad_protocol"} else "not_attempted",
+        "plan_prepare_refusal_class": value.get("plan_prepare_refusal_class") if value.get("plan_prepare_refusal_class") in {"PlanError", "OSError", "ValueError", "KeyError", "unexpected"} else "none",
+        "plan_cleanup_status": value.get("plan_cleanup_status") if value.get("plan_cleanup_status") in {"not_attempted", "pending", "complete", "refused", "transport_failed", "bad_protocol", "failed"} else "not_attempted",
+        "plan_cleanup_refusal_class": value.get("plan_cleanup_refusal_class") if value.get("plan_cleanup_refusal_class") in {"PlanError", "OSError", "ValueError", "KeyError", "unexpected"} else "none",
+        "plan_cleanup_failure_code": value.get("plan_cleanup_failure_code") if value.get("plan_cleanup_failure_code") in {"none", "plan_refused", "transport_failed", "bad_protocol", "cleanup_failed"} else "bad_protocol",
         "source_sha": value.get("source_sha") if isinstance(value.get("source_sha"), str) and SOURCE_SHA_RE.fullmatch(value["source_sha"]) else None,
         "app_target_sha": value.get("app_target_sha") if isinstance(value.get("app_target_sha"), str) and SOURCE_SHA_RE.fullmatch(value["app_target_sha"]) else None,
         "external_run_id": value.get("external_run_id") if isinstance(value.get("external_run_id"), str) and value["external_run_id"].isdecimal() else None,
@@ -660,6 +669,76 @@ def _public_report(value: dict[str, Any]) -> dict[str, Any]:
                 clean_memory["rows"].append(item)
         output["memory_attribution"] = clean_memory
     return output
+
+
+def _record_plan_cleanup_failure(report: dict[str, Any]) -> None:
+    """Record cleanup failure without replacing an earlier primary cause."""
+
+    report["status"] = "incomplete"
+    status = report.get("plan_cleanup_status")
+    report["plan_cleanup_failure_code"] = {
+        "refused": "plan_refused",
+        "transport_failed": "transport_failed",
+        "bad_protocol": "bad_protocol",
+        "failed": "cleanup_failed",
+    }.get(status, "cleanup_failed")
+    if report.get("failure_stage") in {"unknown", "none"}:
+        report["failure_stage"] = "cleanup"
+        report["failure_code"] = "cleanup_failed"
+
+
+def _merge_supervisor_report(
+    report: dict[str, Any], *, closed: bool, valid_child: bool,
+    worker_result: Any, child_report: dict[str, Any] | None,
+    fixture_kind: str, expected_tournaments: int, expected_users: int,
+    expected_users_per_tournament: int, actor_payload_bytes: int,
+) -> None:
+    """Merge supervisor results into the original report without losing cause."""
+
+    if not closed and report.get("failure_stage") in {"unknown", "none"}:
+        report["failure_stage"] = "supervisor"
+        report["failure_code"] = "namespace_not_closed"
+    elif not valid_child and report.get("failure_stage") in {"unknown", "none"}:
+        report["failure_stage"] = "supervisor"
+        report["failure_code"] = "worker_failed"
+    report.update({
+        "status": "incomplete",
+        "canonical_fixture": {
+            "fixture_kind": fixture_kind,
+            "tournaments": expected_tournaments,
+            "users": expected_users,
+            "users_per_tournament": expected_users_per_tournament,
+            "selected_actors": COHORT_USERS,
+        },
+        "actor_payload_bytes": actor_payload_bytes,
+        "namespace_closed": closed,
+        "ssh_material_safe_to_remove": False,
+        "worker_exit_code": (
+            worker_result.returncode
+            if worker_result.returncode in {0, 1, 2}
+            else None
+        ),
+        "supervisor_reason": (
+            worker_result.reason
+            if worker_result.reason in {
+                "none", "max_duration_seconds", "max_runner_minutes",
+                "external_signal", "namespace_start_failed", "namespace_not_closed",
+                "worker_report_invalid", "worker_exit_nonzero",
+            }
+            else "other"
+        ),
+        "plan_cleanup": "pending",
+        "plan_cleanup_status": "pending",
+        "plan_cleanup_refusal_class": "none",
+        "plan_cleanup_failure_code": "none",
+        "result": {
+            key: child_report.get(key)
+            for key in (
+                "status", "warmup", "off", "on", "capture_complete",
+                "all_expected_statuses", "quality_gate",
+            )
+        } if valid_child and child_report is not None else None,
+    })
 
 
 def evaluate_cpu_only_report(
@@ -1607,6 +1686,11 @@ def _parent(args: argparse.Namespace) -> int:
         "source_binding_sha256": manifest.get("source_binding_sha256"),
         "namespace_closed": False,
         "plan_cleanup": "unknown",
+        "plan_prepare_status": "not_attempted",
+        "plan_prepare_refusal_class": "none",
+        "plan_cleanup_status": "not_attempted",
+        "plan_cleanup_refusal_class": "none",
+        "plan_cleanup_failure_code": "none",
         "ssh_material_safe_to_remove": False,
         "ssh_material_binding": None,
         "result": None,
@@ -1620,10 +1704,12 @@ def _parent(args: argparse.Namespace) -> int:
         prepared, release_slug, _unused_usage = _ssh_plan(
             args, host, user, ssh_config, ssh_key, plan, ssh_lifecycle
         )
+        report["plan_prepare_status"] = ssh_lifecycle.get("plan_prepare_status", "bad_protocol")
+        report["plan_prepare_refusal_class"] = ssh_lifecycle.get("plan_prepare_refusal_class", "none")
         if not prepared:
             report["failure_stage"] = "preflight"
             report["failure_code"] = "ssh_preflight_failed"
-            raise PairError("root plan prepare failed")
+            raise _PlanPrepareRejected
         if release_slug is None or RELEASE_SLUG_RE.fullmatch(release_slug) is None:
             raise PairError("root release binding rejected")
         plan["release_slug"] = release_slug
@@ -1709,61 +1795,24 @@ def _parent(args: argparse.Namespace) -> int:
             and child_report.get("capacity_slo_credit") is False
             and child_report.get("namespace_closed") is False
         )
-        if not closed:
-            report["failure_stage"] = "supervisor"
-            report["failure_code"] = "namespace_not_closed"
-        elif not valid_child:
-            report["failure_stage"] = "supervisor"
-            report["failure_code"] = "worker_failed"
-        report: dict[str, Any] = {
-            "schema": 1,
-            "workload": WORKLOAD,
-            "fixture_kind": fixture_kind,
-            "source_sha": args.source_sha,
-            "app_target_sha": args.app_target_sha,
-            "external_run_id": args.external_run_id,
-            "external_run_attempt": args.external_run_attempt,
-            "status": "incomplete",
-            "failure_stage": "unknown",
-            "failure_code": "unknown",
-            "capacity_slo_credit": False,
-            "diagnostic_credit": False,
-            "canonical_fixture": {
-                "fixture_kind": fixture_kind,
-                "tournaments": expected_tournaments,
-                "users": expected_users,
-                "users_per_tournament": expected_users_per_tournament,
-                "selected_actors": COHORT_USERS,
-            },
-            "fixture_manifest_sha256": manifest_sha,
-            "input_handoff_sha256": hashlib.sha256(handoff_raw).hexdigest(),
-            "source_binding_sha256": manifest.get("source_binding_sha256"),
-            "actor_payload_bytes": len(actor_bytes),
-            "namespace_closed": closed,
-            "ssh_material_safe_to_remove": False,
-            "worker_exit_code": (
-                result.returncode if result.returncode in {0, 1, 2} else None
-            ),
-            "supervisor_reason": (
-                result.reason
-                if result.reason in {
-                    "none", "max_duration_seconds", "max_runner_minutes",
-                    "external_signal", "namespace_start_failed", "namespace_not_closed",
-                    "worker_report_invalid", "worker_exit_nonzero",
-                }
-                else "other"
-            ),
-            "plan_cleanup": "pending",
-            "ssh_material_binding": None,
-            "result": {
-                key: child_report.get(key)
-                for key in (
-                    "status", "warmup", "off", "on", "capture_complete",
-                    "all_expected_statuses", "quality_gate",
-                )
-            } if valid_child and child_report is not None else None,
-        }
+        _merge_supervisor_report(
+            report,
+            closed=closed,
+            valid_child=valid_child,
+            worker_result=result,
+            child_report=child_report,
+            fixture_kind=fixture_kind,
+            expected_tournaments=expected_tournaments,
+            expected_users=expected_users,
+            expected_users_per_tournament=expected_users_per_tournament,
+            actor_payload_bytes=len(actor_bytes),
+        )
         status = 0 if report["status"] == "complete" else 2
+    except _PlanPrepareRejected:
+        # The refusal is already captured in the closed report fields. Keep it
+        # inside this scope so cleanup failures cannot send main() to its
+        # generic fallback report and erase the primary cause.
+        status = 2
     finally:
         if prepare_attempted:
             cleaned = False
@@ -1771,6 +1820,7 @@ def _parent(args: argparse.Namespace) -> int:
             try:
                 if ssh_lifecycle.get("closed") is not True:
                     report["plan_cleanup"] = "failed"
+                    report["plan_cleanup_status"] = "transport_failed"
                 else:
                     _wait_past(plan["on_end_ms"] + 1_000)
                     _restore_hidden_ssh_material(
@@ -1783,8 +1833,15 @@ def _parent(args: argparse.Namespace) -> int:
                         allow_noop_cleanup=not prepared,
                     )
                     report["plan_cleanup"] = "complete" if cleaned else "failed"
+                    report["plan_cleanup_status"] = ssh_lifecycle.get(
+                        "plan_cleanup_status", "bad_protocol"
+                    )
+                    report["plan_cleanup_refusal_class"] = ssh_lifecycle.get(
+                        "plan_cleanup_refusal_class", "none"
+                    )
             except (OSError, PairError, subprocess.SubprocessError):
                 report["plan_cleanup"] = "failed"
+                report["plan_cleanup_status"] = "transport_failed"
             finally:
                 if ssh_lifecycle.get("closed") is True:
                     try:
@@ -1806,9 +1863,7 @@ def _parent(args: argparse.Namespace) -> int:
                         cleaned = False
             if not cleaned:
                 status = 2
-                report["status"] = "incomplete"
-                report["failure_stage"] = "cleanup"
-                report["failure_code"] = "cleanup_failed"
+                _record_plan_cleanup_failure(report)
             if cleaned and usage_summary is not None:
                 report["service_cpu_usage"] = {
                     "status": usage_summary["usage_status"],
@@ -1872,6 +1927,14 @@ def _ssh_plan(
     *,
     allow_noop_cleanup: bool = False,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
+    operation = payload.get("operation")
+    status_key = "plan_prepare_status" if operation == "prepare" else "plan_cleanup_status"
+    refusal_key = (
+        "plan_prepare_refusal_class" if operation == "prepare"
+        else "plan_cleanup_refusal_class"
+    )
+    lifecycle[status_key] = "transport_failed"
+    lifecycle[refusal_key] = "none"
     lifecycle["last_command_returned"] = False
     data = json.dumps(
         payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
@@ -1936,6 +1999,18 @@ def _ssh_plan(
         lifecycle["closed"] = True
         lifecycle["last_command_returned"] = True
         if process.returncode != 0 or not output.endswith(b"\n") or output.count(b"\n") != 1:
+            if process.returncode == 2:
+                refusal = re.fullmatch(
+                    rb"CPU_DIAGNOSTIC_PLAN status=refused class=(PlanError|OSError|ValueError|KeyError|unexpected)\n",
+                    bytes(output),
+                )
+                if refusal is not None:
+                    lifecycle[status_key] = "refused"
+                    lifecycle[refusal_key] = refusal.group(1).decode("ascii")
+                else:
+                    lifecycle[status_key] = "bad_protocol"
+            elif process.returncode == 0:
+                lifecycle[status_key] = "bad_protocol"
             return False, None, None
         if payload.get("operation") == "prepare":
             try:
@@ -1946,6 +2021,7 @@ def _ssh_plan(
                 r"CPU_DIAGNOSTIC_PLAN status=prepared targets=3 release_slug=([a-z0-9][a-z0-9-]{0,79})\n",
                 text,
             )
+            lifecycle[status_key] = "prepared" if match else "bad_protocol"
             return (True, match.group(1), None) if match else (False, None, None)
         prefix = b"CPU_DIAGNOSTIC_PLAN "
         if not bytes(output).startswith(prefix):
@@ -1953,12 +2029,16 @@ def _ssh_plan(
         try:
             usage_value = _decode_canonical(bytes(output)[len(prefix):-1], cap=ROOT_USAGE_OUTPUT_CAP)
         except PairError:
+            lifecycle[status_key] = "bad_protocol"
             return False, None, None
         usage = _validate_usage_summary(usage_value)
         if usage is None or (usage["service_count"] == 0 and not allow_noop_cleanup):
+            lifecycle[status_key] = "bad_protocol"
             return False, None, None
+        lifecycle[status_key] = "complete"
         return True, None, usage
     except (OSError, subprocess.SubprocessError):
+        lifecycle[status_key] = "transport_failed"
         _terminate_worker(process)
         lifecycle["closed"] = True
         return False, None, None

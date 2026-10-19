@@ -6,6 +6,7 @@ import base64
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -260,6 +261,7 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 patch.object(dispatcher, "ACTIVE_TOOLS_DIR", root),
                 patch.object(dispatcher, "EXTERNAL_HELPER", helper),
                 patch.object(dispatcher, "SUDO", "/usr/bin/sudo"),
+                patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "3"}),
                 patch.object(dispatcher.subprocess, "Popen", return_value=process) as popen,
             ):
                 self.assertEqual(dispatcher._external_fixture(payload), 0)
@@ -281,6 +283,9 @@ class SourceBindingDispatchTests(unittest.TestCase):
         self.assertEqual(command[12], "--source-binding-base64")
         decoded = json.loads(base64.b64decode(command[13], validate=True))
         self.assertEqual(decoded, _binding())
+        self.assertEqual(command[14:16], ["--run-attempt", "3"])
+        self.assertEqual(command[16], "--input-handoff-sha256")
+        self.assertRegex(command[17], r"^[0-9a-f]{64}$")
         self.assertNotIn("shell", popen.call_args.kwargs)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
 

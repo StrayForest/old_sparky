@@ -30,7 +30,11 @@ from tools.platform_external_load_observer import (
     postgres_statement_delta,
     summarize_ssr_observability,
 )
-from tools.platform_abort_retained_load import export_abort_evidence
+from tools.platform_abort_retained_load import (
+    _closed_root_json,
+    _cpu_abort_binding,
+    export_abort_evidence,
+)
 from tools.platform_live_launch_report import sanitize_live_launch_lines
 from tools.platform_production_qa import (
     _safe_qa_scenario_detail,
@@ -2041,7 +2045,30 @@ class EvidencePrivacyTests(unittest.TestCase):
                         "SUDO_GID": str(os.getegid()),
                     },
                 ):
-                exported = export_abort_evidence("123", '{"schema":1,"process_count":1}\n')
+                abort_only = {
+                    "schema": 1,
+                    "status": "safe_for_exact_fixture_cleanup",
+                    "fixture_kind": "cpu_diagnostic_only_v1",
+                    "external_run_id": "123",
+                    "external_run_attempt": "1",
+                    "source_sha": "a" * 40,
+                    "app_target_sha": "a" * 40,
+                    "input_handoff_sha256": "b" * 64,
+                    "fixture_manifest_sha256": "c" * 64,
+                    "remote_stage": "supervisor_terminated",
+                    "supervisor_selector": "fixed_script_path_and_run_id",
+                    "supervisor_roots_before": 1,
+                    "supervisor_tree_before": 1,
+                    "supervisor_roots_after": 0,
+                    "supervisor_descendants_after": 0,
+                    "proc_read_errors": 0,
+                    "supervisor_exit_code": 0,
+                    "shared_lock_clear": True,
+                    "namespace_closed": False,
+                }
+                exported = export_abort_evidence(
+                    "123", '{"schema":1,"process_count":1}\n', abort_only=abort_only
+                )
             payload = json.loads((exported / "server-observability.json").read_text(encoding="utf-8"))
             output = serialized(payload)
             self.assertNotIn("preprod26082900000000ab", output)
@@ -2055,6 +2082,81 @@ class EvidencePrivacyTests(unittest.TestCase):
                 payload["system"]["processes"]["deadlock-api"]["rss_bytes"],
                 123456.0,
             )
+            self.assertEqual(
+                json.loads((exported / "abort-only.json").read_text(encoding="ascii")),
+                abort_only,
+            )
+            marker = root / "non-object-marker.json"
+            marker.write_bytes(b"7\n")
+            os.chmod(marker, 0o600)
+
+            cpu_root = root / "runs" / "gha-456"
+            external_vote = cpu_root / "external-vote"
+            external_vote.mkdir(parents=True, mode=0o700)
+            os.chmod(cpu_root, 0o700)
+            os.chmod(external_vote, 0o700)
+            source_sha = "a" * 40
+            manifest = json.dumps({
+                "runner_sha": source_sha,
+                "app_target_sha": source_sha,
+            }, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+            manifest_path = external_vote / "manifest.json"
+            manifest_path.write_bytes(manifest)
+            os.chmod(manifest_path, 0o600)
+            binding = {
+                "schema": 1,
+                "fixture_kind": "cpu_diagnostic_only_v1",
+                "external_run_id": "456",
+                "external_run_attempt": "2",
+                "source_sha": source_sha,
+                "app_target_sha": source_sha,
+                "input_handoff_sha256": "b" * 64,
+                "fixture_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+            }
+            binding_path = cpu_root / "cpu-abort-binding.json"
+            binding_path.write_bytes(
+                json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+            )
+            os.chmod(binding_path, 0o600)
+            abort_module = __import__("tools.platform_abort_retained_load", fromlist=["unused"])
+            original_lstat = Path.lstat
+            original_open = os.open
+            original_fstat = os.fstat
+            opened_descriptors: set[int] = set()
+
+            def root_owned(record):
+                values = list(record)
+                values[4] = 0
+                values[5] = 0
+                return os.stat_result(values)
+
+            def lstat_with_root_identity(path: Path):
+                record = original_lstat(path)
+                if path == marker or cpu_root in path.parents or path == cpu_root:
+                    return root_owned(record)
+                return record
+
+            def tracked_open(path, flags, *args, **kwargs):
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if Path(path) in {marker, binding_path, manifest_path}:
+                    opened_descriptors.add(descriptor)
+                return descriptor
+
+            def fstat_with_root_identity(descriptor: int):
+                record = original_fstat(descriptor)
+                return root_owned(record) if descriptor in opened_descriptors else record
+
+            with (
+                mock.patch.object(abort_module, "RUN_ROOT_BASE", root / "runs"),
+                mock.patch.object(Path, "lstat", lstat_with_root_identity),
+                mock.patch.object(os, "open", tracked_open),
+                mock.patch.object(os, "fstat", fstat_with_root_identity),
+            ):
+                self.assertIsNone(_closed_root_json(marker, maximum=64))
+                self.assertEqual(_cpu_abort_binding("456", "2", source_sha), binding)
+                self.assertIsNone(_cpu_abort_binding("456", "1", source_sha))
+                binding_path.write_bytes(b"7\n")
+                self.assertIsNone(_cpu_abort_binding("456", "2", source_sha))
 
 
 if __name__ == "__main__":

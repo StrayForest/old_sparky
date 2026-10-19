@@ -9,7 +9,7 @@ import sys
 import tempfile
 import stat
 import threading
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import Future, ThreadPoolExecutor
 from argparse import Namespace
 from pathlib import Path
@@ -1348,6 +1348,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "last_command_returned": True,
                 "directory_dev": secret_dir_stat.st_dev,
                 "directory_ino": secret_dir_stat.st_ino,
+                "plan_prepare_status": "prepared",
+                "plan_prepare_refusal_class": "none",
             })
             command = captured["command"]
             self.assertIsInstance(command, list)
@@ -1355,6 +1357,64 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.assertIn(option, command)
             cpu_pair._remove_ssh_files(secret_dir, secrets, lifecycle)
             self.assertFalse(secret_dir.exists())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secret_dir = Path(temp_dir) / "external-ssh"
+            secret_dir.mkdir(mode=0o700)
+            config_path = secret_dir / "config"
+            key_path = secret_dir / "id_ed25519"
+            config_path.write_text("ssh config", encoding="ascii")
+            key_path.write_text("private key", encoding="ascii")
+            os.chmod(config_path, 0o600)
+            os.chmod(key_path, 0o600)
+            lifecycle = {"closed": True}
+            real_popen = cpu_pair.subprocess.Popen
+
+            def refusal_ssh(_command: list[str], **kwargs: object):
+                script = (
+                    "import sys; sys.stdin.buffer.read(); "
+                    "sys.stdout.write('CPU_DIAGNOSTIC_PLAN status=refused class=PlanError\\n'); "
+                    "sys.exit(2)"
+                )
+                return real_popen([cpu_pair.sys.executable, "-c", script], **kwargs)
+
+            with patch.object(cpu_pair.subprocess, "Popen", side_effect=refusal_ssh):
+                prepared, release_slug, usage = cpu_pair._ssh_plan(
+                    SimpleNamespace(), "example.org", "deploy", config_path,
+                    key_path, {"operation": "prepare"}, lifecycle,
+                )
+            self.assertFalse(prepared)
+            self.assertIsNone(release_slug)
+            self.assertIsNone(usage)
+            self.assertEqual(lifecycle["plan_prepare_status"], "refused")
+            self.assertEqual(lifecycle["plan_prepare_refusal_class"], "PlanError")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secret_dir = Path(temp_dir) / "external-ssh"
+            secret_dir.mkdir(mode=0o700)
+            config_path = secret_dir / "config"
+            key_path = secret_dir / "id_ed25519"
+            config_path.write_text("ssh config", encoding="ascii")
+            key_path.write_text("private key", encoding="ascii")
+            os.chmod(config_path, 0o600)
+            os.chmod(key_path, 0o600)
+            lifecycle = {"closed": True}
+            real_popen = cpu_pair.subprocess.Popen
+
+            def false_success_ssh(_command: list[str], **kwargs: object):
+                script = (
+                    "import sys; sys.stdin.buffer.read(); "
+                    "sys.stdout.write('CPU_DIAGNOSTIC_PLAN status=refused class=PlanError\\n')"
+                )
+                return real_popen([cpu_pair.sys.executable, "-c", script], **kwargs)
+
+            with patch.object(cpu_pair.subprocess, "Popen", side_effect=false_success_ssh):
+                prepared, _release_slug, _usage = cpu_pair._ssh_plan(
+                    SimpleNamespace(), "example.org", "deploy", config_path,
+                    key_path, {"operation": "prepare"}, lifecycle,
+                )
+            self.assertFalse(prepared)
+            self.assertEqual(lifecycle["plan_prepare_status"], "bad_protocol")
 
         # If child death is not yet proven, cleanup refuses to unlink secrets.
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1782,6 +1842,269 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(plan.phase_at(26_000), "on")
         self.assertEqual(plan.phase_at(45_999), "on")
         self.assertIsNone(plan.phase_at(46_000))
+
+    def test_cpu_plan_process_environment_is_allowlisted_and_identity_checked(self) -> None:
+        marker = b"SENTINEL_PRIVATE_ENV_MUST_NOT_ESCAPE"
+        valid_env = (
+            b"INVOCATION_ID=" + b"f" * 32 + b"\0"
+            b"PLATFORM_RUNTIME_SERVICE=api\0UNRELATED_SECRET=" + marker + b"\0"
+        )
+
+        def read_environment(raw: bytes) -> dict[str, bytes]:
+            with (
+                patch.object(diagnostic_plan_tool.os, "open", return_value=71),
+                patch.object(
+                    diagnostic_plan_tool.os, "read", side_effect=(raw, b""),
+                ),
+                patch.object(diagnostic_plan_tool.os, "close"),
+            ):
+                return diagnostic_plan_tool._read_process_environ(101)
+
+        projected = read_environment(valid_env)
+        self.assertEqual(
+            projected,
+            {
+                "INVOCATION_ID": b"f" * 32,
+                "PLATFORM_RUNTIME_SERVICE": b"api",
+            },
+        )
+        self.assertNotIn(marker, b"\0".join(projected.values()))
+
+        with self.subTest(identity="duplicate-allowlisted-marker"):
+            with self.assertRaisesRegex(PlanError, "identity marker is duplicated"):
+                read_environment(
+                    b"INVOCATION_ID=" + b"f" * 32 + b"\0"
+                    b"INVOCATION_ID=" + b"e" * 32 + b"\0"
+                )
+
+        with self.subTest(identity="missing-runtime-marker"):
+            self.assertEqual(
+                read_environment(b"INVOCATION_ID=" + b"f" * 32 + b"\0"),
+                {"INVOCATION_ID": b"f" * 32},
+            )
+
+        with patch.object(diagnostic_plan_tool.os, "open", return_value=71), patch.object(
+            diagnostic_plan_tool.os, "read", side_effect=OSError("private read detail")
+        ), patch.object(diagnostic_plan_tool.os, "close") as close_fd:
+            with self.assertRaises(OSError):
+                diagnostic_plan_tool._read_process_environ(101)
+            close_fd.assert_called_once_with(71)
+
+        with patch.object(diagnostic_plan_tool.os, "open", return_value=71), patch.object(
+            diagnostic_plan_tool.os, "read", side_effect=(b"x" * 6, b"")
+        ), patch.object(diagnostic_plan_tool.os, "close") as close_fd:
+            with self.assertRaisesRegex(PlanError, "environment exceeds bound"):
+                diagnostic_plan_tool._read_process_environ(101, maximum=5)
+            close_fd.assert_called_once_with(71)
+
+        wrong_role_env = valid_env.replace(
+            b"PLATFORM_RUNTIME_SERVICE=api", b"PLATFORM_RUNTIME_SERVICE=web"
+        )
+        missing_role_env = b"INVOCATION_ID=" + b"f" * 32 + b"\0"
+        unit = {
+            "ActiveState": "active",
+            "InvocationID": "f" * 32,
+            "MainPID": "999",
+            "ControlGroup": "/system.slice/deadlock-api.service",
+        }
+        fake_stat = SimpleNamespace(st_uid=os.getuid(), st_dev=1, st_ino=2)
+        for environment, refusal in (
+            (wrong_role_env, "service process role mismatch"),
+            (missing_role_env, "service process role mismatch"),
+        ):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch.object(diagnostic_plan_tool.Path, "read_text", return_value="101\n"),
+                patch.object(diagnostic_plan_tool.Path, "stat", return_value=fake_stat),
+                patch.object(diagnostic_plan_tool.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.getuid())),
+                patch.object(diagnostic_plan_tool.os, "readlink", return_value="/usr/bin/python3"),
+                patch.object(diagnostic_plan_tool, "_process_start_ticks", side_effect=(10, 10)),
+                patch.object(diagnostic_plan_tool.os, "open", return_value=71),
+                patch.object(diagnostic_plan_tool.os, "read", side_effect=(environment, b"")),
+                patch.object(diagnostic_plan_tool.os, "close"),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                with self.assertRaisesRegex(PlanError, refusal) as caught:
+                    diagnostic_plan_tool._service_targets("api", unit)
+            self.assertNotIn(marker.decode("ascii"), str(caught.exception))
+            self.assertNotIn(marker.decode("ascii"), stdout.getvalue() + stderr.getvalue())
+
+    def test_cpu_plan_refusal_is_closed_and_cleanup_failure_preserves_primary(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(diagnostic_plan_tool, "_read_request", side_effect=PlanError("private detail")),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(diagnostic_plan_tool.main(["prepare-stdin"]), 2)
+        self.assertEqual(stdout.getvalue(), "CPU_DIAGNOSTIC_PLAN status=refused class=PlanError\n")
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertNotIn("private detail", stdout.getvalue() + stderr.getvalue())
+
+        report = {
+            "status": "incomplete",
+            "failure_stage": "preflight",
+            "failure_code": "ssh_preflight_failed",
+            "plan_cleanup_status": "refused",
+        }
+        cpu_pair._record_plan_cleanup_failure(report)
+        self.assertEqual(report["failure_stage"], "preflight")
+        self.assertEqual(report["failure_code"], "ssh_preflight_failed")
+        self.assertEqual(report["plan_cleanup_failure_code"], "plan_refused")
+        public = cpu_pair._public_report(report)
+        self.assertEqual(public["plan_cleanup_status"], "refused")
+        self.assertEqual(public["plan_cleanup_failure_code"], "plan_refused")
+        self.assertEqual(public["failure_code"], "ssh_preflight_failed")
+
+        initial = {
+            "schema": 1, "workload": cpu_pair.WORKLOAD,
+            "fixture_kind": "cpu_diagnostic_only_v1", "source_sha": "a" * 40,
+            "app_target_sha": "a" * 40, "external_run_id": "123", "external_run_attempt": "1",
+            "status": "incomplete", "failure_stage": "unknown", "failure_code": "unknown",
+            "capacity_slo_credit": False, "diagnostic_credit": False,
+            "fixture_manifest_sha256": "b" * 64, "input_handoff_sha256": "c" * 64,
+            "source_binding_sha256": None, "plan_cleanup": "unknown",
+            "plan_prepare_status": "prepared", "plan_prepare_refusal_class": "none",
+            "plan_cleanup_status": "not_attempted", "plan_cleanup_refusal_class": "none",
+            "plan_cleanup_failure_code": "none", "namespace_closed": False,
+            "ssh_material_safe_to_remove": False, "ssh_material_binding": None,
+            "result": None,
+        }
+        child = {
+            "status": "complete", "warmup": {}, "off": {}, "on": {},
+            "capture_complete": True, "all_expected_statuses": True,
+            "quality_gate": {"status": "passed"},
+        }
+        cpu_pair._merge_supervisor_report(
+            initial, closed=True, valid_child=True,
+            worker_result=SimpleNamespace(returncode=0, reason="none"),
+            child_report=child, fixture_kind="cpu_diagnostic_only_v1",
+            expected_tournaments=1, expected_users=14,
+            expected_users_per_tournament=14, actor_payload_bytes=512,
+        )
+        initial["plan_cleanup"] = "complete"
+        initial["plan_cleanup_status"] = "complete"
+        sanitized = cpu_pair._public_report(initial)
+        self.assertEqual(sanitized["plan_prepare_status"], "prepared")
+        self.assertEqual(sanitized["plan_cleanup_status"], "complete")
+
+        failed_worker = {
+            **initial,
+            "failure_stage": "unknown", "failure_code": "unknown",
+            "plan_cleanup_status": "not_attempted",
+        }
+        cpu_pair._merge_supervisor_report(
+            failed_worker, closed=True, valid_child=False,
+            worker_result=SimpleNamespace(returncode=1, reason="worker_report_invalid"),
+            child_report=None, fixture_kind="cpu_diagnostic_only_v1",
+            expected_tournaments=1, expected_users=14,
+            expected_users_per_tournament=14, actor_payload_bytes=512,
+        )
+        failed_worker["plan_cleanup_status"] = "refused"
+        cpu_pair._record_plan_cleanup_failure(failed_worker)
+        failed_public = cpu_pair._public_report(failed_worker)
+        self.assertEqual(failed_public["failure_stage"], "supervisor")
+        self.assertEqual(failed_public["failure_code"], "worker_failed")
+        self.assertEqual(failed_public["plan_cleanup_failure_code"], "plan_refused")
+        self.assertEqual(failed_public["plan_prepare_status"], "prepared")
+
+        # Drive the real CLI parent path: a typed prepare refusal followed by
+        # a cleanup refusal must retain the original preflight classification
+        # in the final sanitized JSON, without leaking either remote detail.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            os.chmod(root, 0o700)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_bytes(b"fixture manifest bytes\n")
+            os.chmod(manifest_path, 0o600)
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text(json.dumps({
+                "schema": 1,
+                "confirmation": "RUN-PRODUCTION-CPU-DIAGNOSTIC",
+                "target_sha": "a" * 40,
+                "control_email": "operator@example.test",
+                "setup_concurrency": "8",
+                "run_id": "123",
+                "profile": "external-vote",
+                "tournament_count": "1",
+                "users_per_tournament": "14",
+                "timeout_diagnostics": "false",
+                "fixture_kind": "cpu_diagnostic_only_v1",
+            }, sort_keys=True, separators=(",", ":")), encoding="ascii")
+            os.chmod(handoff_path, 0o600)
+            ssh_dir = root / "external-ssh"
+            ssh_dir.mkdir(mode=0o700)
+            for name, content in (
+                ("config", b"ssh config"),
+                ("id_ed25519", b"private key"),
+                ("known_hosts", b"host key"),
+            ):
+                path = ssh_dir / name
+                path.write_bytes(content)
+                os.chmod(path, 0o600)
+            report_path = root / "report.json"
+            manifest = {
+                "runner_sha": "a" * 40,
+                "app_target_sha": "a" * 40,
+                "source_binding": None,
+                "source_binding_sha256": None,
+                "origin": "https://old-sparky.com",
+                "session_cookie_name": "session",
+                "csrf_cookie_name": "csrf",
+                "tournaments": [{"slug": "cpu-fixture", "user_count": 14}],
+            }
+            users = [SimpleNamespace(
+                tournament_slug="cpu-fixture",
+                session_token=f"s{index:031d}",
+                csrf_token=f"c{index:042d}.{'a' * 64}",
+            ) for index in range(14)]
+            def fake_plan(_args, _host, _user, _config, _key, payload, lifecycle, **_kwargs):
+                lifecycle["closed"] = True
+                lifecycle["last_command_returned"] = True
+                if payload["operation"] == "prepare":
+                    lifecycle["plan_prepare_status"] = "refused"
+                    lifecycle["plan_prepare_refusal_class"] = "PlanError"
+                else:
+                    lifecycle["plan_cleanup_status"] = "refused"
+                    lifecycle["plan_cleanup_refusal_class"] = "OSError"
+                return False, None, None
+
+            argv = [
+                "parent", "--manifest", str(manifest_path),
+                "--input-handoff", str(handoff_path), "--report", str(report_path),
+                "--source-sha", "a" * 40, "--app-target-sha", "a" * 40,
+                "--external-run-id", "123", "--external-run-attempt", "1",
+                "--fixture-kind", "cpu_diagnostic_only_v1",
+                "--ssh-config", str(ssh_dir / "config"),
+                "--ssh-key", str(ssh_dir / "id_ed25519"),
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch.object(cpu_pair.external_load, "load_manifest_bytes", return_value=(manifest, users)),
+                patch.object(cpu_pair, "_ssh_plan", side_effect=fake_plan),
+                patch.object(cpu_pair, "_wait_past"),
+                patch.object(cpu_pair, "_restore_hidden_ssh_material"),
+                patch.dict(os.environ, {"PROD_SSH_HOST": "example.test", "PROD_SSH_USER": "deploy"}),
+                redirect_stdout(stdout), redirect_stderr(stderr),
+            ):
+                self.assertEqual(cpu_pair.main(argv), 2)
+            public = json.loads(report_path.read_text(encoding="ascii"))
+            self.assertEqual(public["failure_stage"], "preflight")
+            self.assertEqual(public["failure_code"], "ssh_preflight_failed")
+            self.assertEqual(public["plan_prepare_status"], "refused")
+            self.assertEqual(public["plan_prepare_refusal_class"], "PlanError")
+            self.assertEqual(public["plan_cleanup_status"], "refused")
+            self.assertEqual(public["plan_cleanup_refusal_class"], "OSError")
+            self.assertEqual(public["plan_cleanup_failure_code"], "plan_refused")
+            self.assertFalse(public["capacity_slo_credit"])
+            self.assertFalse(public["diagnostic_credit"])
+            self.assertNotIn("operator@example.test", report_path.read_text(encoding="ascii"))
+            self.assertNotIn("private key", report_path.read_text(encoding="ascii"))
+            self.assertNotIn("root plan prepare failed", stdout.getvalue() + stderr.getvalue())
 
     def test_api_release_identity_uses_real_released_platform_layout(self) -> None:
         import python_packages.platform_infra.performance_diagnostic as diagnostic_module

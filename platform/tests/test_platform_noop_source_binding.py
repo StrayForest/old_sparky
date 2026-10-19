@@ -669,16 +669,20 @@ class NoopSourceBindingTests(unittest.TestCase):
             child.stdin.write.side_effect = written.append
             with patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_root), \
                 patch.object(platform_workflow_remote_dispatch, "EXTERNAL_HELPER", helper), \
+                patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "4"}), \
                 patch.object(platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child) as popen:
                 self.assertEqual(platform_workflow_remote_dispatch._external_fixture(payload), 0)
 
         command = popen.call_args.args[0]
         self.assertEqual(command[5], RUNNER_SHA)
-        self.assertEqual(command[-2], "--source-binding-base64")
+        self.assertEqual(command[-6], "--source-binding-base64")
         self.assertEqual(
-            json.loads(base64.b64decode(command[-1], validate=True)),
+            json.loads(base64.b64decode(command[-5], validate=True)),
             binding,
         )
+        self.assertEqual(command[-4:-2], ["--run-attempt", "4"])
+        self.assertEqual(command[-2], "--input-handoff-sha256")
+        self.assertRegex(command[-1], r"^[0-9a-f]{64}$")
         self.assertNotIn("control@example.invalid", command)
         self.assertEqual(
             written,

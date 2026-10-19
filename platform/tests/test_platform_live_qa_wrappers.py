@@ -624,6 +624,45 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertTrue(dispatch_output.startswith("CPU_DIAGNOSTIC_PLAN "))
         projected = json.loads(dispatch_output.removeprefix("CPU_DIAGNOSTIC_PLAN "))
         self.assertEqual(projected["usage_rows"], rows)
+
+        real_popen = subprocess.Popen
+
+        def invoke_refusal(line: bytes) -> tuple[int, str]:
+            def fake_popen(_command, **kwargs):
+                script = (
+                    "import sys; sys.stdin.buffer.read(); "
+                    f"sys.stdout.buffer.write({line!r}); "
+                    "sys.stderr.write('PRIVATE_SENTINEL'); sys.exit(2)"
+                )
+                return real_popen([sys.executable, "-c", script], **kwargs)
+
+            stdout = StringIO()
+            stderr = StringIO()
+            with (
+                patch.object(platform_workflow_remote_dispatch, "_trusted_helper", return_value=True),
+                patch.object(platform_workflow_remote_dispatch.subprocess, "Popen", side_effect=fake_popen),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = platform_workflow_remote_dispatch._run_cpu_diagnostic_plan(prepare)
+            self.assertNotIn("PRIVATE_SENTINEL", stdout.getvalue() + stderr.getvalue())
+            self.assertEqual(stderr.getvalue(), "")
+            return status, stdout.getvalue()
+
+        refusal_status, refusal_output = invoke_refusal(
+            b"CPU_DIAGNOSTIC_PLAN status=refused class=PlanError\n"
+        )
+        self.assertEqual(refusal_status, 2)
+        self.assertEqual(
+            refusal_output,
+            "CPU_DIAGNOSTIC_PLAN status=refused class=PlanError\n",
+        )
+        bad_refusal_status, bad_refusal_output = invoke_refusal(
+            b"CPU_DIAGNOSTIC_PLAN status=refused class=PrivateError\n"
+        )
+        self.assertEqual(bad_refusal_status, 2)
+        self.assertEqual(bad_refusal_output, "")
+
         duplicate_result = dict(helper_result)
         duplicate_rows = [dict(row) for row in rows]
         duplicate_rows[0]["duplicate_count"] = 1
@@ -670,6 +709,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             child.stdin = CapturedInput()
             payload = {
                 "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
+                "schema": "1",
                 "target_sha": "a" * 40,
                 "control_email": "control@example.invalid",
                 "setup_concurrency": "8",
@@ -679,9 +719,13 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 "users_per_tournament": "14",
                 "timeout_diagnostics": "false",
             }
+            payload_sha = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+            ).hexdigest()
             with patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", root), \
                 patch.object(platform_workflow_remote_dispatch, "EXTERNAL_HELPER", helper), \
                 patch.object(platform_workflow_remote_dispatch, "SUDO", "/usr/bin/sudo"), \
+                patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2"}), \
                 patch.object(
                     platform_workflow_remote_dispatch.subprocess,
                     "Popen",
@@ -699,6 +743,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     payload["setup_concurrency"], payload["run_id"],
                     payload["profile"], payload["tournament_count"],
                     payload["users_per_tournament"], payload["timeout_diagnostics"],
+                    "--run-attempt", "2", "--input-handoff-sha256", payload_sha,
                 ],
             )
             self.assertNotIn(payload["control_email"], command)
@@ -717,7 +762,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             ) as failed_popen, patch.object(
                 platform_workflow_remote_dispatch,
                 "_terminate_process_group",
-            ) as terminate:
+            ) as terminate, patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2"}):
                 self.assertEqual(
                     platform_workflow_remote_dispatch._external_fixture(payload), 2
                 )
@@ -2833,6 +2878,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         abort = (
             REPO_ROOT / ".github/workflows/platform-production-retained-load-abort.yml"
         ).read_text(encoding="utf-8")
+        self.assertIn("      load_run_attempt:", abort)
+        self.assertIn("LOAD_RUN_ATTEMPT: ${{ inputs.load_run_attempt }}", abort)
+        self.assertIn('"$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT"', abort)
         for source, marker, next_step, fields in (
             (
                 external,
@@ -4289,6 +4337,104 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 with self.subTest(wrapper=wrapper.name):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(b"root", result.stderr.lower())
+
+
+    def test_retained_abort_normalizer_accepts_only_bound_cpu_abort_proof(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-abort.yml"
+        ).read_text(encoding="utf-8")
+        marker = '/usr/bin/python3 - "$artifact_dir/canonical.log" "$artifact_dir/abort-only.json"'
+        start = workflow.index(marker)
+        heredoc = workflow.index("<<'PY'\n", start) + len("<<'PY'\n")
+        end = workflow.index("\n          PY", heredoc)
+        script = textwrap.dedent(workflow[heredoc:end])
+        run_id, attempt, target_sha = "39178530966", "1", "a" * 40
+        proof = {
+            "schema": 1,
+            "status": "safe_for_exact_fixture_cleanup",
+            "fixture_kind": "cpu_diagnostic_only_v1",
+            "external_run_id": run_id,
+            "external_run_attempt": attempt,
+            "source_sha": target_sha,
+            "app_target_sha": target_sha,
+            "input_handoff_sha256": "b" * 64,
+            "fixture_manifest_sha256": "c" * 64,
+            "remote_stage": "supervisor_terminated",
+            "supervisor_selector": "fixed_script_path_and_run_id",
+            "supervisor_roots_before": 1,
+            "supervisor_tree_before": 7,
+            "supervisor_roots_after": 0,
+            "supervisor_descendants_after": 0,
+            "proc_read_errors": 0,
+            "supervisor_exit_code": 0,
+            "shared_lock_clear": True,
+            "namespace_closed": False,
+        }
+
+        def execute(
+            canonical: object,
+            abort_proof: object | None,
+            *,
+            selected_attempt: str = attempt,
+            remote_step: str = "success",
+            remote_status: str = "0",
+            ssh_cleanup: str = "success",
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                canonical_path = Path(directory) / "canonical.log"
+                proof_path = Path(directory) / "abort-only.json"
+                canonical_path.write_text(json.dumps(canonical), encoding="utf-8")
+                if abort_proof is not None:
+                    if isinstance(abort_proof, bytes):
+                        proof_path.write_bytes(abort_proof)
+                    else:
+                        proof_path.write_bytes(
+                            json.dumps(
+                                abort_proof, ensure_ascii=True, sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("ascii") + b"\n"
+                        )
+                return subprocess.run(
+                    [sys.executable, "-", str(canonical_path), str(proof_path), run_id,
+                     selected_attempt, target_sha],
+                    input=script,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={
+                        **os.environ,
+                        "ABORT_REMOTE_STEP": remote_step,
+                        "ABORT_REMOTE_STATUS": remote_status,
+                        "ABORT_SSH_CLEANUP_STEP": ssh_cleanup,
+                    },
+                    check=False,
+                    timeout=5,
+                )
+
+        unavailable = {"schema": 1, "status": "unavailable", "truncated": False}
+        passed = {"schema": 1, "status": "passed", "truncated": False}
+        self.assertEqual(execute(unavailable, proof).returncode, 0)
+        self.assertEqual(execute(passed, {"schema": 1, "status": "not_applicable"}).returncode, 0)
+        self.assertNotEqual(execute(unavailable, None).returncode, 0)
+        self.assertNotEqual(execute(unavailable, proof, selected_attempt="2").returncode, 0)
+        self.assertNotEqual(execute(unavailable, proof, remote_status="1").returncode, 0)
+        self.assertNotEqual(execute(unavailable, proof, ssh_cleanup="failure").returncode, 0)
+        self.assertNotEqual(execute(unavailable, 7).returncode, 0)
+        malformed = {**proof, "supervisor_exit_code": True}
+        self.assertNotEqual(execute(unavailable, malformed).returncode, 0)
+        for field in (
+            "supervisor_roots_after", "supervisor_descendants_after", "proc_read_errors"
+        ):
+            malformed_zero = {**proof, field: False}
+            with self.subTest(field=field):
+                self.assertNotEqual(execute(unavailable, malformed_zero).returncode, 0)
+        duplicate_key_proof = (
+            b'{"schema":1,"status":"safe_for_exact_fixture_cleanup",'
+            b'"status":"safe_for_exact_fixture_cleanup"}\n'
+        )
+        self.assertNotEqual(execute(unavailable, duplicate_key_proof).returncode, 0)
+        oversized_proof = b" " * 4097
+        self.assertNotEqual(execute(unavailable, oversized_proof).returncode, 0)
 
 
 if __name__ == "__main__":
