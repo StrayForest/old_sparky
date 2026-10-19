@@ -15,6 +15,10 @@ from tools.platform_storage_evidence_summary import (
     summarize_retention,
     summarize_service,
 )
+from tools.platform_backup_failure_receipt import (
+    ReceiptError,
+    project_receipt,
+)
 
 
 FORBIDDEN_VALUES = (
@@ -116,6 +120,157 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertNotIn("/opt/oldsparky/platform/shared/backup-retention", serialized(backup))
         self.assertNotIn("b" * 64, serialized(backup))
         self.assertNotIn("c" * 64, serialized(backup))
+
+    def test_backup_failure_receipt_projects_only_exact_bound_closed_fields(self) -> None:
+        run_id = "39248154270"
+        attempt = "1"
+        source_sha = "a" * 40
+        receipt = {
+            "schema": 1,
+            "event": "platform_backup_failure",
+            "run_id": run_id,
+            "attempt": attempt,
+            "operation": "create",
+            "source_sha": source_sha,
+            "bundle_sha256": "b" * 64,
+            "stage": "backup_create",
+            "public_summary_error": "none",
+            "public_summary_normalizer_diagnostic": {
+                "schema": 1,
+                "status": "not_run",
+                "normalizer_exit_code": None,
+                "stdout_bytes": None,
+                "stdout_sha256": None,
+                "stdout_class": "not_run",
+                "stderr_bytes": None,
+                "stderr_sha256": None,
+                "stderr_class": "not_run",
+                "exception_class": "none",
+                "collector_error_class": "none",
+            },
+            "exit_code": 1,
+            "report_state": "typed_failure",
+            "report_error_class": "storage",
+            "restore_diagnostic": None,
+            "scratch_unit_diagnostic": None,
+            "scratch_admission_diagnostic": {
+                "schema": 1,
+                "phase": "pre_create_admission",
+                "guard_reason": "memory_reserve",
+                "available_bytes": 1024,
+                "required_bytes": 1073741824,
+                "helper_rss_bytes": 400,
+                "direct_parent_rss_bytes": 600,
+                "observed_pair_rss_bytes": 1000,
+                "observed_process_count": 2,
+            },
+            "backup_disk_diagnostic": None,
+            "scratch_host_guard_diagnostic": None,
+            "scratch_first_fault": None,
+            "scratch_resource_attribution": None,
+            "scratch_phase_attribution": None,
+            "scratch_cleanup_status": None,
+            "report_bytes": 31,
+            "report_sha256": "c" * 64,
+            "stderr_state": "read",
+            "stderr_exception_class": "none",
+            "stderr_bytes": 17,
+            "stderr_sha256": "d" * 64,
+        }
+        result = project_receipt(json.dumps(receipt).encode("ascii"), run_id, attempt, source_sha)
+        self.assertEqual(result["stage"], "backup_create")
+        self.assertEqual(result["report_error_class"], "storage")
+        self.assertIsNone(result["backup_disk_diagnostic"])
+        self.assertEqual(
+            result["scratch_admission_diagnostic"],
+            {
+                "phase": "pre_create_admission",
+                "guard_reason": "memory_reserve",
+                "available_bytes": 1024,
+                "required_bytes": 1073741824,
+                "observed_process_count": 2,
+            },
+        )
+        self.assertNotIn("helper_rss_bytes", result["scratch_admission_diagnostic"])
+        self.assert_no_forbidden_values(result)
+        self.assertNotIn("bundle_sha256", result)
+
+        receipt["backup_disk_diagnostic"] = {
+            "schema": 1,
+            "phase": "backup_admission",
+            "guard_reason": "disk_floor",
+            "free_bytes": 1,
+            "required_free_bytes": 2,
+        }
+        disk_result = project_receipt(json.dumps(receipt).encode("ascii"), run_id, attempt, source_sha)
+        self.assertEqual(
+            disk_result["backup_disk_diagnostic"],
+            {
+                "phase": "backup_admission",
+                "guard_reason": "disk_floor",
+                "free_bytes": 1,
+                "required_free_bytes": 2,
+            },
+        )
+
+    def test_backup_failure_receipt_rejects_wrong_binding_and_open_schema(self) -> None:
+        receipt = {
+            "schema": 1,
+            "event": "platform_backup_failure",
+            "run_id": "12",
+            "attempt": "2",
+            "operation": "create",
+            "source_sha": "a" * 40,
+            "bundle_sha256": "b" * 64,
+            "stage": "backup_create",
+            "public_summary_error": "none",
+            "public_summary_normalizer_diagnostic": {
+                "schema": 1,
+                "status": "not_run",
+                "normalizer_exit_code": None,
+                "stdout_bytes": None,
+                "stdout_sha256": None,
+                "stdout_class": "not_run",
+                "stderr_bytes": None,
+                "stderr_sha256": None,
+                "stderr_class": "not_run",
+                "exception_class": "none",
+                "collector_error_class": "none",
+            },
+            "exit_code": 1,
+            "report_state": "typed_failure",
+            "report_error_class": "storage",
+            "restore_diagnostic": None,
+            "scratch_unit_diagnostic": None,
+            "scratch_admission_diagnostic": None,
+            "backup_disk_diagnostic": None,
+            "scratch_host_guard_diagnostic": None,
+            "scratch_first_fault": None,
+            "scratch_resource_attribution": None,
+            "scratch_phase_attribution": None,
+            "scratch_cleanup_status": None,
+            "report_bytes": 0,
+            "report_sha256": None,
+            "stderr_state": "absent",
+            "stderr_exception_class": "none",
+            "stderr_bytes": 0,
+            "stderr_sha256": None,
+        }
+        binding = ("12", "2", "a" * 40)
+        for field, wrong_binding in zip(
+            ("run_id", "attempt", "source_sha"),
+            (("13", "2", "a" * 40), ("12", "1", "a" * 40), ("12", "2", "e" * 40)),
+            strict=True,
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(ReceiptError):
+                    project_receipt(json.dumps(receipt).encode("ascii"), *wrong_binding)
+        receipt["private_message"] = "Authorization: Bearer secret-token /root/private-report"
+        with self.assertRaises(ReceiptError):
+            project_receipt(json.dumps(receipt).encode("ascii"), *binding)
+        duplicate_key_json = json.dumps(receipt).replace('"schema": 1,', '"schema": 1, "schema": 1,', 1)
+        with self.assertRaises(ReceiptError):
+            project_receipt(duplicate_key_json.encode("ascii"), *binding)
 
     def test_retention_summary_keeps_numeric_recovery_audit_only(self) -> None:
         report = summarize_retention(

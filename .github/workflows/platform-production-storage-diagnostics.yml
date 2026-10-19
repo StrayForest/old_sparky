@@ -7,6 +7,21 @@ on:
         description: "Exact source SHA currently deployed on the production VPS"
         required: true
         type: string
+      backup_failure_run_id:
+        description: "Optional exact failed backup workflow run ID for a closed receipt projection"
+        required: false
+        type: string
+        default: ""
+      backup_failure_run_attempt:
+        description: "Exact attempt of the failed backup workflow run"
+        required: false
+        type: string
+        default: ""
+      backup_failure_source_sha:
+        description: "Exact source SHA bound to the failed backup receipt"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -23,6 +38,9 @@ jobs:
     environment: production
     env:
       EXPECTED_SHA: ${{ inputs.expected_sha }}
+      BACKUP_FAILURE_RUN_ID: ${{ inputs.backup_failure_run_id }}
+      BACKUP_FAILURE_RUN_ATTEMPT: ${{ inputs.backup_failure_run_attempt }}
+      BACKUP_FAILURE_SOURCE_SHA: ${{ inputs.backup_failure_source_sha }}
     steps:
       - name: Validate diagnostic inputs
         shell: bash
@@ -33,6 +51,16 @@ jobs:
 
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "expected_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
+          if [[ -z "$BACKUP_FAILURE_RUN_ID" && -z "$BACKUP_FAILURE_RUN_ATTEMPT" && -z "$BACKUP_FAILURE_SOURCE_SHA" ]]; then
+            :
+          elif [[ "$BACKUP_FAILURE_RUN_ID" =~ ^[1-9][0-9]{0,19}$ \
+              && "$BACKUP_FAILURE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ \
+              && "$BACKUP_FAILURE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            :
+          else
+            echo "Backup failure receipt binding must be supplied as one exact run/attempt/source tuple." >&2
+            exit 1
+          fi
 
       - name: Validate production SSH inputs
         shell: bash
@@ -83,15 +111,265 @@ jobs:
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          BACKUP_FAILURE_RUN_ID: ${{ inputs.backup_failure_run_id }}
+          BACKUP_FAILURE_RUN_ATTEMPT: ${{ inputs.backup_failure_run_attempt }}
+          BACKUP_FAILURE_SOURCE_SHA: ${{ inputs.backup_failure_source_sha }}
         run: |
           set -euo pipefail
           umask 077
           remote_report="$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
           ssh_error="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
           artifact_report="$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+          backup_failure_helper="$RUNNER_TEMP/platform-production-backup-failure-helper-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.py"
+          backup_failure_receipt="$RUNNER_TEMP/platform-production-backup-failure-receipt-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          printf 'BACKUP_FAILURE_HELPER_PATH=%s\n' "$backup_failure_helper" >> "$GITHUB_ENV"
+          printf 'BACKUP_FAILURE_RECEIPT_PATH=%s\n' "$backup_failure_receipt" >> "$GITHUB_ENV"
           : >"$remote_report"
           : >"$ssh_error"
           chmod 600 "$remote_report" "$ssh_error"
+          ulimit -f 2048
+          if [[ -n "$BACKUP_FAILURE_RUN_ID" ]]; then
+            install -m 600 /dev/null "$backup_failure_helper"
+            cat > "$backup_failure_helper" <<'BACKUP_FAILURE_HELPER'
+          #!/usr/bin/env python3
+          """Project one bounded backup-failure receipt into closed diagnostic values.
+
+          This dependency-free source is embedded verbatim in the production storage
+          diagnostics workflow. Tests check that copy and exercise this implementation
+          with synthetic receipts; it is not installed on production hosts.
+          """
+
+          from __future__ import annotations
+
+          import json
+          import re
+          import sys
+
+          MAX_BYTES = 64 * 1024
+          MAX_MEMORY_BYTES = 1 << 30
+          MAX_RSS_BYTES = 1 << 40
+
+
+          class ReceiptError(ValueError):
+              pass
+
+
+          def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ReceiptError
+                  result[key] = value
+              return result
+
+
+          def _integer(value: object, *, maximum: int = 10**18, nullable: bool = False) -> bool:
+              return (nullable and value is None) or (type(value) is int and 0 <= value <= maximum)
+
+
+          def project_receipt(raw: bytes, run_id: str, attempt: str, source_sha: str) -> dict[str, object]:
+              if (
+                  re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None
+                  or re.fullmatch(r"[1-9][0-9]{0,5}", attempt) is None
+                  or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+                  or not 1 <= len(raw) <= MAX_BYTES
+              ):
+                  raise ReceiptError
+              try:
+                  payload = json.loads(raw.decode("ascii"), object_pairs_hook=_no_duplicate_keys)
+              except (UnicodeDecodeError, json.JSONDecodeError, ReceiptError) as exc:
+                  raise ReceiptError from exc
+              if not isinstance(payload, dict):
+                  raise ReceiptError
+              required = {
+                  "schema", "event", "run_id", "attempt", "operation", "source_sha",
+                  "bundle_sha256", "stage", "public_summary_error",
+                  "public_summary_normalizer_diagnostic", "exit_code", "report_state",
+                  "report_error_class", "restore_diagnostic", "scratch_unit_diagnostic",
+                  "scratch_admission_diagnostic", "backup_disk_diagnostic",
+                  "scratch_host_guard_diagnostic", "scratch_first_fault",
+                  "scratch_resource_attribution", "scratch_phase_attribution",
+                  "scratch_cleanup_status", "report_bytes", "report_sha256", "stderr_state",
+                  "stderr_exception_class", "stderr_bytes", "stderr_sha256",
+              }
+              if set(payload) not in (required, required | {"scratch_allocation_attribution"}):
+                  raise ReceiptError
+              if (
+                  type(payload.get("schema")) is not int or payload["schema"] != 1
+                  or payload.get("event") != "platform_backup_failure"
+                  or payload.get("run_id") != run_id
+                  or payload.get("attempt") != attempt
+                  or payload.get("source_sha") != source_sha
+                  or payload.get("operation") != "create"
+              ):
+                  raise ReceiptError
+
+              def enum(value: object, choices: set[str]) -> str:
+                  if not isinstance(value, str) or value not in choices:
+                      raise ReceiptError
+                  return value
+
+              stage = enum(payload["stage"], {
+                  "preflight", "helper_bundle_validation", "backup_create",
+                  "backup_verify_existing", "summary_validation", "public_summary",
+                  "private_capture_cleanup", "helper_cleanup", "report_cleanup", "complete",
+              })
+              report_state = enum(payload["report_state"], {
+                  "absent", "unsafe", "changed", "read", "invalid_json", "typed_failure",
+                  "success_payload", "unclassified_json",
+              })
+              report_error = enum(payload["report_error_class"], {
+                  "none", "backup", "lock", "integrity", "configuration", "storage",
+              })
+              if type(payload["exit_code"]) is not int or not 1 <= payload["exit_code"] <= 999:
+                  raise ReceiptError
+
+              projected: dict[str, object] = {
+                  "schema": 1,
+                  "kind": "backup_failure_diagnostic",
+                  "status": "available",
+                  "run_id": run_id,
+                  "attempt": attempt,
+                  "source_sha": source_sha,
+                  "operation": "create",
+                  "stage": stage,
+                  "report_state": report_state,
+                  "report_error_class": report_error,
+                  "exit_code": payload["exit_code"],
+                  "backup_disk_diagnostic": None, "restore_diagnostic": None,
+                  "scratch_admission_diagnostic": None,
+              }
+              # The remaining writer-owned diagnostic values are bounded by the 64 KiB
+              # receipt and discarded. Never copy or serialize those private structures.
+              for field in (
+                  "restore_diagnostic", "scratch_unit_diagnostic", "scratch_admission_diagnostic",
+                  "backup_disk_diagnostic", "scratch_host_guard_diagnostic", "scratch_first_fault",
+                  "scratch_resource_attribution", "scratch_phase_attribution", "scratch_cleanup_status",
+              ):
+                  value = payload[field]
+                  if value is not None and not isinstance(value, dict):
+                      raise ReceiptError
+
+              disk = payload["backup_disk_diagnostic"]
+              if disk is not None:
+                  if set(disk) != {"schema", "phase", "guard_reason", "free_bytes", "required_free_bytes"}:
+                      raise ReceiptError
+                  if (
+                      type(disk["schema"]) is not int or disk["schema"] != 1
+                      or disk["phase"] not in {"backup_admission", "pg_dump_pre_spawn", "pg_dump_post_start", "pg_dump_monitor", "pg_dump_post_exit"}
+                      or disk["guard_reason"] not in {"disk_floor", "disk_unavailable", "child_unstopped", "command_start_failed", "command_failed"}
+                      or not _integer(disk["free_bytes"], nullable=True)
+                      or not _integer(disk["required_free_bytes"], nullable=True)
+                  ):
+                      raise ReceiptError
+                  if disk["guard_reason"] == "disk_floor" and (
+                      type(disk["free_bytes"]) is not int or type(disk["required_free_bytes"]) is not int
+                      or disk["free_bytes"] >= disk["required_free_bytes"]
+                  ):
+                      raise ReceiptError
+                  projected["backup_disk_diagnostic"] = {
+                      "phase": disk["phase"], "guard_reason": disk["guard_reason"],
+                      "free_bytes": disk["free_bytes"], "required_free_bytes": disk["required_free_bytes"],
+                  }
+
+              admission = payload["scratch_admission_diagnostic"]
+              if admission is not None:
+                  keys = {
+                      "schema", "phase", "guard_reason", "available_bytes", "required_bytes",
+                      "helper_rss_bytes", "direct_parent_rss_bytes", "observed_pair_rss_bytes",
+                      "observed_process_count",
+                  }
+                  if set(admission) != keys:
+                      raise ReceiptError
+                  helper_rss = admission["helper_rss_bytes"]
+                  parent_rss = admission["direct_parent_rss_bytes"]
+                  count = admission["observed_process_count"]
+                  pair = admission["observed_pair_rss_bytes"]
+                  if (
+                      type(admission["schema"]) is not int or admission["schema"] != 1
+                      or admission["phase"] != "pre_create_admission"
+                      or admission["guard_reason"] != "memory_reserve"
+                      or not _integer(admission["available_bytes"], maximum=MAX_MEMORY_BYTES - 1)
+                      or type(admission["required_bytes"]) is not int or admission["required_bytes"] != MAX_MEMORY_BYTES
+                      or any(not _integer(value, maximum=MAX_RSS_BYTES, nullable=True) for value in (helper_rss, parent_rss))
+                      or type(count) is not int or count != sum(value is not None for value in (helper_rss, parent_rss))
+                      or count not in {0, 1, 2}
+                      or (count == 2 and (type(pair) is not int or pair != helper_rss + parent_rss or pair > 2 * MAX_RSS_BYTES))
+                      or (count < 2 and pair is not None)
+                  ):
+                      raise ReceiptError
+                  projected["scratch_admission_diagnostic"] = {
+                      "phase": admission["phase"], "guard_reason": admission["guard_reason"],
+                      "available_bytes": admission["available_bytes"], "required_bytes": admission["required_bytes"],
+                      "observed_process_count": count,
+                  }
+
+              restore = payload["restore_diagnostic"]
+              if restore is not None:
+                  keys = {
+                      "schema", "restore_stage", "guard_reason", "free_bytes", "required_free_bytes",
+                      "temporary_database_created", "drop_outcome", "temporary_database_absent",
+                      "archive_sha256", "archive_size_bytes",
+                  }
+                  stages = {
+                      "pre_create_admission", "create_database", "extension_setup", "schema_setup",
+                      "restore_platform", "restore_public", "validate_table_count", "validate_connectivity",
+                      "validate_revision", "validate_extensions", "drop_database",
+                  }
+                  drops = {"not_required", "drop_failed", "database_present", "absence_unconfirmed", "confirmed_absent"}
+                  if set(restore) != keys or (
+                      type(restore["schema"]) is not int or restore["schema"] != 1
+                      or restore["restore_stage"] not in stages
+                      or restore["guard_reason"] not in {"none", "disk_floor", "disk_unavailable", "child_unstopped", "command_start_failed", "command_failed"}
+                      or restore["drop_outcome"] not in drops
+                      or any(value is not None and type(value) is not bool for value in (restore["temporary_database_created"], restore["temporary_database_absent"]))
+                      or not _integer(restore["free_bytes"], nullable=True)
+                      or not _integer(restore["required_free_bytes"], nullable=True)
+                      or not isinstance(restore["archive_sha256"], str)
+                      or re.fullmatch(r"[0-9a-f]{64}", restore["archive_sha256"]) is None
+                      or not _integer(restore["archive_size_bytes"])
+                  ):
+                      raise ReceiptError
+                  projected["restore_diagnostic"] = {
+                      "restore_stage": restore["restore_stage"], "guard_reason": restore["guard_reason"],
+                      "free_bytes": restore["free_bytes"], "required_free_bytes": restore["required_free_bytes"],
+                      "temporary_database_created": restore["temporary_database_created"],
+                      "drop_outcome": restore["drop_outcome"],
+                      "temporary_database_absent": restore["temporary_database_absent"],
+                      "archive_size_bytes": restore["archive_size_bytes"],
+                  }
+              return projected
+
+
+          def main(argv: list[str] | None = None) -> int:
+              args = sys.argv[1:] if argv is None else argv
+              if len(args) != 3:
+                  print("{\"state\":\"unavailable\",\"reason\":\"invalid_binding\"}")
+                  return 0
+              run_id, attempt, source_sha = args
+              raw = sys.stdin.buffer.read(MAX_BYTES + 1)
+              try:
+                  result = project_receipt(raw, run_id, attempt, source_sha)
+              except (ReceiptError, ValueError, TypeError):
+                  result = {
+                      "schema": 1,
+                      "kind": "backup_failure_diagnostic",
+                      "status": "unavailable",
+                      "run_id": run_id,
+                      "attempt": attempt,
+                      "source_sha": source_sha,
+                      "reason": "receipt_contract",
+                  }
+              print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+              return 0
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+            BACKUP_FAILURE_HELPER
+            chmod 600 "$backup_failure_helper"
+            test "$(stat -c '%u:%a:%h' "$backup_failure_helper")" = "$(id -u):600:1"
+          fi
           set +e
           ssh \
             -F "$SSH_DIR/config" \
@@ -102,7 +380,8 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$EXPECTED_SHA" > "$remote_report" 2> "$ssh_error" <<'REMOTE'
+            bash -s -- "$EXPECTED_SHA" "$BACKUP_FAILURE_RUN_ID" \
+              "$BACKUP_FAILURE_RUN_ATTEMPT" "$BACKUP_FAILURE_SOURCE_SHA" > "$remote_report" 2> "$ssh_error" <<'REMOTE'
           set -Eeuo pipefail
           CURRENT_STAGE=identity
           trap 'diagnostic_rc=$?; trap - ERR; printf "{\"schema\":1,\"kind\":\"collection_failure\",\"status\":\"failed\",\"stage\":\"%s\",\"outcome\":\"producer_failed\",\"exit_code\":%d}\n" "$CURRENT_STAGE" "$diagnostic_rc"; exit "$diagnostic_rc"' ERR
@@ -116,6 +395,9 @@ jobs:
           }
 
           expected_sha="$1"
+          backup_failure_run_id="$2"
+          backup_failure_run_attempt="$3"
+          backup_failure_source_sha="$4"
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           python_bin="$runtime/shared/venv/bin/python"
@@ -1109,6 +1391,124 @@ jobs:
               "$CURRENT_STAGE" "$failure_code"
             exit "$failure_code"
           fi
+          if [[ -n "$backup_failure_run_id" ]]; then
+            CURRENT_STAGE=backup_failure_receipt
+            /usr/bin/python3 -I - "$runtime/shared" "$backup_failure_run_id" \
+              "$backup_failure_run_attempt" "$backup_failure_source_sha" 0 0 <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import stat
+          import sys
+
+          shared_path, run_id, attempt, source_sha, uid_raw, gid_raw = sys.argv[1:]
+          unavailable = {"schema": 1, "kind": "backup_failure_receipt_payload", "state": "unavailable", "reason": "invalid_binding"}
+          if (
+              re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None
+              or re.fullmatch(r"[1-9][0-9]{0,5}", attempt) is None
+              or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+              or uid_raw != "0" or gid_raw != "0"
+          ):
+              print(json.dumps(unavailable, sort_keys=True, separators=(",", ":")))
+              raise SystemExit(0)
+
+          def identity(value):
+              return tuple(getattr(value, name) for name in (
+                  "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+                  "st_size", "st_mtime_ns", "st_ctime_ns",
+              ))
+
+          def _pairs(pairs):
+              record = {}
+              for key, value in pairs:
+                  if key in record:
+                      raise ValueError
+                  record[key] = value
+              return record
+
+          shared_fd = -1
+          descriptor = -1
+          try:
+              named_shared = os.lstat(shared_path)
+              shared_fd = os.open(shared_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              shared = os.fstat(shared_fd)
+              if (
+                  not stat.S_ISDIR(shared.st_mode) or stat.S_ISLNK(named_shared.st_mode)
+                  or shared.st_uid != 0 or shared.st_gid != 0
+                  or stat.S_IMODE(shared.st_mode) != 0o755
+                  or identity(shared) != identity(named_shared)
+              ):
+                  result = {**unavailable, "reason": "shared_directory_identity"}
+              else:
+                  filename = f"backup-failure-{run_id}-{attempt}.json"
+                  try:
+                      named = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+                  except FileNotFoundError:
+                      result = {"schema": 1, "kind": "backup_failure_receipt_payload", "state": "missing"}
+                  else:
+                      if (
+                          not stat.S_ISREG(named.st_mode) or named.st_uid != 0 or named.st_gid != 0
+                          or stat.S_IMODE(named.st_mode) != 0o600 or named.st_nlink != 1
+                          or named.st_size < 1 or named.st_size > 65536
+                      ):
+                          result = {**unavailable, "reason": "receipt_identity"}
+                      else:
+                          descriptor = os.open(filename, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=shared_fd)
+                          opened = os.fstat(descriptor)
+                          if identity(opened) != identity(named):
+                              result = {**unavailable, "reason": "receipt_changed"}
+                          else:
+                              chunks = bytearray()
+                              while len(chunks) <= 65536:
+                                  block = os.read(descriptor, min(8192, 65537 - len(chunks)))
+                                  if not block:
+                                      break
+                                  chunks.extend(block)
+                              finished = os.fstat(descriptor)
+                              named_after = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+                              shared_after = os.fstat(shared_fd)
+                              named_shared_after = os.lstat(shared_path)
+                              if (
+                                  len(chunks) != opened.st_size or identity(finished) != identity(opened)
+                                  or identity(named_after) != identity(opened)
+                                  or identity(shared_after) != identity(shared)
+                                  or identity(named_shared_after) != identity(shared)
+                              ):
+                                  result = {**unavailable, "reason": "receipt_changed"}
+                              else:
+                                  try:
+                                      record = json.loads(bytes(chunks).decode("ascii"), object_pairs_hook=lambda pairs: _pairs(pairs))
+                                  except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                                      result = {**unavailable, "reason": "receipt_invalid"}
+                                  else:
+                                      if (
+                                          not isinstance(record, dict)
+                                          or type(record.get("schema")) is not int or record.get("schema") != 1
+                                          or record.get("event") != "platform_backup_failure"
+                                          or record.get("run_id") != run_id or record.get("attempt") != attempt
+                                          or record.get("source_sha") != source_sha
+                                          or record.get("operation") != "create"
+                                      ):
+                                          result = {**unavailable, "reason": "receipt_binding"}
+                                      else:
+                                          result = {
+                                              "schema": 1, "kind": "backup_failure_receipt_payload",
+                                              "state": "read", "payload_b64": base64.b64encode(chunks).decode("ascii"),
+                                          }
+          except FileNotFoundError:
+              result = {**unavailable, "reason": "shared_directory_unavailable"}
+          except OSError:
+              result = {**unavailable, "reason": "receipt_unavailable"}
+          finally:
+              if descriptor >= 0:
+                  os.close(descriptor)
+              if shared_fd >= 0:
+                  os.close(shared_fd)
+
+          print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+          PY
+          fi
           CURRENT_STAGE=identity_recheck
           test -L "$current" && test -L "$runtime/previous" \
             && test "$(readlink -f "$current")" = "$runtime/releases/$current_id" \
@@ -1118,6 +1518,192 @@ jobs:
           REMOTE
           remote_exit_code=$?
           set -e
+          if [[ -n "$BACKUP_FAILURE_RUN_ID" ]]; then
+            /usr/bin/python3 -I - "$remote_report" "$backup_failure_helper" \
+              "$backup_failure_receipt" "$BACKUP_FAILURE_RUN_ID" \
+              "$BACKUP_FAILURE_RUN_ATTEMPT" "$BACKUP_FAILURE_SOURCE_SHA" \
+              "$remote_exit_code" <<'SANITIZE_BACKUP_FAILURE'
+          import base64
+          import json
+          import os
+          import re
+          import stat
+          import subprocess
+          import sys
+
+          report_path, helper_path, receipt_path, run_id, attempt, source_sha, remote_exit = sys.argv[1:]
+          reasons = {
+              "invalid_binding", "shared_directory_unavailable", "shared_directory_identity",
+              "receipt_identity", "receipt_changed", "receipt_invalid", "receipt_binding",
+              "receipt_unavailable",
+          }
+
+          def reject_duplicates(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError
+                  result[key] = value
+              return result
+
+          def unavailable(reason):
+              return {
+                  "schema": 1, "kind": "backup_failure_diagnostic", "status": "unavailable",
+                  "run_id": run_id, "attempt": attempt, "source_sha": source_sha,
+                  "reason": reason,
+              }
+
+          def identity(value):
+              return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid, value.st_nlink)
+
+          before = os.lstat(report_path)
+          if (
+              not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+              or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) != 0o600
+              or before.st_nlink != 1 or before.st_size > 1_048_576
+          ):
+              raise SystemExit("private diagnostics stream identity is invalid")
+          report_fd = os.open(report_path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+          try:
+              opened = os.fstat(report_fd)
+              if identity(opened) != identity(before) or opened.st_size != before.st_size:
+                  raise SystemExit("private diagnostics stream changed before read")
+              chunks = bytearray()
+              while len(chunks) <= 1_048_576:
+                  block = os.read(report_fd, min(65536, 1_048_577 - len(chunks)))
+                  if not block:
+                      break
+                  chunks.extend(block)
+              read_stat = os.fstat(report_fd)
+              named = os.lstat(report_path)
+              if (
+                  len(chunks) != opened.st_size or len(chunks) > 1_048_576
+                  or identity(read_stat) != identity(opened) or identity(named) != identity(opened)
+                  or read_stat.st_mtime_ns != opened.st_mtime_ns or read_stat.st_ctime_ns != opened.st_ctime_ns
+                  or named.st_mtime_ns != opened.st_mtime_ns or named.st_ctime_ns != opened.st_ctime_ns
+              ):
+                  raise SystemExit("private diagnostics stream changed during read")
+              rows = []
+              sentinels = []
+              for line in bytes(chunks).splitlines():
+                  try:
+                      row = json.loads(line.decode("ascii"), object_pairs_hook=reject_duplicates)
+                  except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                      raise SystemExit("private diagnostics stream contains invalid JSON")
+                  if isinstance(row, dict) and row.get("kind") == "backup_failure_receipt_payload":
+                      sentinels.append(row)
+                  else:
+                      rows.append(line)
+              if len(sentinels) > 1 or (remote_exit == "0" and len(sentinels) != 1):
+                  raise SystemExit("backup failure receipt sentinel count is invalid")
+              if sentinels:
+                  sentinel = sentinels[0]
+                  summary = None
+                  if (
+                      set(sentinel) == {"schema", "kind", "state"}
+                      and type(sentinel.get("schema")) is int and sentinel["schema"] == 1
+                      and sentinel["state"] == "missing"
+                  ):
+                      summary = unavailable("missing")
+                  elif (
+                      set(sentinel) == {"schema", "kind", "state", "reason"}
+                      and type(sentinel.get("schema")) is int and sentinel["schema"] == 1
+                      and sentinel["state"] == "unavailable" and sentinel["reason"] in reasons
+                  ):
+                      summary = unavailable(sentinel["reason"])
+                  elif (
+                      set(sentinel) == {"schema", "kind", "state", "payload_b64"}
+                      and type(sentinel.get("schema")) is int and sentinel["schema"] == 1
+                      and sentinel["state"] == "read" and isinstance(sentinel["payload_b64"], str)
+                      and len(sentinel["payload_b64"]) <= 87384
+                      and re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", sentinel["payload_b64"]) is not None
+                  ):
+                      try:
+                          receipt_bytes = base64.b64decode(sentinel["payload_b64"], validate=True)
+                      except (ValueError, base64.binascii.Error):
+                          receipt_bytes = b""
+                      if not 1 <= len(receipt_bytes) <= 65536:
+                          summary = unavailable("invalid_payload")
+                      else:
+                          receipt_fd = os.open(
+                              receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600
+                          )
+                          try:
+                              view = memoryview(receipt_bytes)
+                              while view:
+                                  count = os.write(receipt_fd, view)
+                                  if count <= 0:
+                                      raise OSError("short write")
+                                  view = view[count:]
+                              os.fsync(receipt_fd)
+                              receipt_stat = os.fstat(receipt_fd)
+                              if (
+                                  not stat.S_ISREG(receipt_stat.st_mode)
+                                  or receipt_stat.st_uid != os.geteuid()
+                                  or stat.S_IMODE(receipt_stat.st_mode) != 0o600
+                                  or receipt_stat.st_nlink != 1
+                                  or receipt_stat.st_size != len(receipt_bytes)
+                              ):
+                                  raise OSError("private receipt identity is invalid")
+                          finally:
+                              os.close(receipt_fd)
+                          with open(receipt_path, "rb") as receipt_stream:
+                              result = subprocess.run(
+                                  ["/usr/bin/python3", "-I", helper_path, run_id, attempt, source_sha],
+                                  stdin=receipt_stream, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  timeout=10, check=False,
+                              )
+                          if result.returncode != 0 or len(result.stdout) > 8192:
+                              summary = unavailable("invalid_projection")
+                          else:
+                              try:
+                                  projected = json.loads(result.stdout, object_pairs_hook=reject_duplicates)
+                              except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                                  summary = unavailable("invalid_projection")
+                              else:
+                                  available_fields = {
+                                      "schema", "kind", "status", "run_id", "attempt", "source_sha", "operation",
+                                      "stage", "report_state", "report_error_class", "exit_code",
+                                      "backup_disk_diagnostic", "restore_diagnostic", "scratch_admission_diagnostic",
+                                  }
+                                  if (
+                                      not isinstance(projected, dict) or set(projected) != available_fields
+                                      or type(projected.get("schema")) is not int or projected.get("schema") != 1
+                                      or projected.get("kind") != "backup_failure_diagnostic"
+                                      or projected.get("status") != "available"
+                                      or projected.get("run_id") != run_id or projected.get("attempt") != attempt
+                                      or projected.get("source_sha") != source_sha or projected.get("operation") != "create"
+                                  ):
+                                      summary = unavailable("invalid_projection")
+                                  else:
+                                      summary = projected
+                  if summary is None:
+                      raise SystemExit("backup failure receipt payload contract is invalid")
+                  rows.append(json.dumps(summary, sort_keys=True, separators=(",", ":")).encode("ascii"))
+              encoded = b"\n".join(rows) + b"\n"
+              if b"payload_b64" in encoded or len(encoded) > 1_048_576:
+                  raise SystemExit("sanitized diagnostics stream contract is invalid")
+              os.lseek(report_fd, 0, os.SEEK_SET)
+              os.ftruncate(report_fd, 0)
+              view = memoryview(encoded)
+              while view:
+                  count = os.write(report_fd, view)
+                  if count <= 0:
+                      raise SystemExit("sanitized diagnostics stream write failed")
+                  view = view[count:]
+              os.ftruncate(report_fd, len(encoded))
+              os.fsync(report_fd)
+              finished = os.fstat(report_fd)
+              named_after = os.lstat(report_path)
+              if (
+                  identity(finished) != identity(opened) or identity(named_after) != identity(opened)
+                  or finished.st_size != len(encoded) or named_after.st_size != len(encoded)
+              ):
+                  raise SystemExit("sanitized diagnostics stream identity changed")
+          finally:
+              os.close(report_fd)
+          SANITIZE_BACKUP_FAILURE
+          fi
           if (( remote_exit_code == 0 )); then
             printf '{"schema":1,"kind":"collection_transport","status":"ok","stage":"complete","outcome":"none","exit_code":0}\n' \
               >>"$remote_report"
@@ -1174,6 +1760,58 @@ jobs:
           test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
           rm -f -- "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
           test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
+          /usr/bin/python3 -I - "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'CLEANUP_BACKUP_FAILURE_FILES'
+          import os
+          import re
+          import stat
+          import sys
+
+          runner_temp, run_id, attempt = sys.argv[1:]
+          if re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None or re.fullmatch(r"[1-9][0-9]{0,5}", attempt) is None:
+              raise SystemExit("backup failure cleanup binding is invalid")
+          names = (
+              f"platform-production-backup-failure-helper-{run_id}-{attempt}.py",
+              f"platform-production-backup-failure-receipt-{run_id}-{attempt}.json",
+          )
+          directory_fd = os.open(runner_temp, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              for name in names:
+                  try:
+                      named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                  except FileNotFoundError:
+                      continue
+                  if (
+                      not stat.S_ISREG(named.st_mode)
+                      or named.st_uid != os.geteuid()
+                      or stat.S_IMODE(named.st_mode) != 0o600
+                      or named.st_nlink != 1
+                  ):
+                      raise SystemExit("backup failure temporary file identity is invalid")
+                  descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+                  try:
+                      opened = os.fstat(descriptor)
+                      identity = lambda value: (
+                          value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                          value.st_gid, value.st_nlink, value.st_size,
+                          value.st_mtime_ns, value.st_ctime_ns,
+                      )
+                      current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                      if identity(opened) != identity(named) or identity(current) != identity(opened):
+                          raise SystemExit("backup failure temporary file changed during cleanup")
+                      os.unlink(name, dir_fd=directory_fd)
+                      try:
+                          os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                      except FileNotFoundError:
+                          pass
+                      else:
+                          raise SystemExit("backup failure temporary file remains after cleanup")
+                  finally:
+                      os.close(descriptor)
+          finally:
+              os.close(directory_fd)
+          CLEANUP_BACKUP_FAILURE_FILES
+          printf '%s\n' 'BACKUP_FAILURE_HELPER_PATH=' >> "$GITHUB_ENV"
+          printf '%s\n' 'BACKUP_FAILURE_RECEIPT_PATH=' >> "$GITHUB_ENV"
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
           unset SSH_DIR
           test -z "${SSH_DIR:-}"

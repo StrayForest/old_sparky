@@ -8,25 +8,22 @@ Use this document for the normal immutable release path. CSP mode changes and pr
 
 ## Preconditions
 
-1. Work from a clean, reviewed commit; release metadata records the exact
-   GitHub target SHA.
-2. Push the reviewed commit to `dev` and wait for the GitHub Actions
-   `Platform security and build` gate. A successful deployable full-route push
-   run for the current `dev` HEAD is the normal production release signal and
-   is consumed by the automatic deployment workflow; a docs-only,
-   out-of-scope or candidate-packaging-only full-route run is a successful
-   non-deployable no-op. A recovery-bootstrap-only result remains
-   non-deployable by itself; the automatic chain may route it through the
-   baseline checks below. Do not substitute local tests.
+1. Start from a clean, reviewed commit; release metadata records its exact GitHub target SHA.
+2. Push to `dev` and record the exact `Platform security and build` run ID, attempt and target SHA. While that run
+   is active, dispatch its source-bound production backup. Confirm the backup production job starts before that
+   Security attempt's final job completion bound; wait for Security success and the restore-verified backup receipt.
+   Follow the [backup runbook's exact dispatch procedure](backup-restore-runbook.md#local-verified-backup) and
+   confirm no deployment owns the shared slot first. A deployable full-route push for current `dev` HEAD is consumed
+   by auto-deploy; docs-only, out-of-scope and candidate-packaging-only routes succeed as non-deployable no-ops.
+   Recovery-bootstrap-only results are also non-deployable; the automatic chain may route them through baseline
+   checks below. Local tests do not substitute for these release gates.
 3. Confirm migration expand/rollback compatibility.
-4. Confirm services are healthy, disk has at least 5 GiB available and is at
-   most 85% conservative use, and `current`/`previous` releases are protected.
-5. Create a fresh restore-verified backup.
+4. Confirm healthy services, at least 5 GiB free and at most 85% conservative disk use; protect `current`/`previous`.
+5. The automatic chain validates the exact successful Security attempt and source-bound backup before dispatching
+   the production child. Never dispatch normal deployment manually.
 
-The active GitHub `Protect dev` ruleset does not require a pull-request
-approval for merge. It still protects the branch against deletion and
-force-push, and the exact-SHA security/build status plus automatic production
-deployment chain remain mandatory release gates.
+GitHub's active `Protect dev` ruleset requires no PR approval, but prevents branch deletion/force-push; exact-SHA
+security/build and the automatic production chain remain mandatory release gates.
 
 ## Normal production deploy through GitHub Actions
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import ast
 import fcntl
@@ -2066,6 +2067,54 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("journalctl --disk-usage", workflow)
         self.assertIn("du -x -s -B1 -- \"$path\"", workflow)
         self.assertIn("platform_storage_evidence_summary.py", workflow)
+        self.assertIn("backup_failure_run_id", workflow)
+        self.assertIn("backup_failure_run_attempt", workflow)
+        self.assertIn("backup_failure_source_sha", workflow)
+        self.assertIn('filename = f"backup-failure-{run_id}-{attempt}.json"', workflow)
+        self.assertIn("ulimit -f 2048", workflow)
+        self.assertIn("os.open(filename, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=shared_fd)", workflow)
+        self.assertIn('stat.S_IMODE(named.st_mode) != 0o600', workflow)
+        self.assertIn('not stat.S_ISREG(named.st_mode)', workflow)
+        self.assertIn('or named.st_nlink != 1', workflow)
+        self.assertIn('or record.get("source_sha") != source_sha', workflow)
+        self.assertIn('"payload_b64"', workflow)
+        self.assertIn("BACKUP_FAILURE_RECEIPT_PATH", workflow)
+        self.assertIn('"payload_b64" in encoded', workflow)
+        self.assertIn("backup_failure_receipt_payload", workflow)
+        self.assertIn('"state": "missing"', workflow)
+        self.assertIn('"state": "unavailable"', workflow)
+        self.assertIn('"state": "read"', workflow)
+        self.assertIn("platform-production-backup-failure-helper-", workflow)
+        parsed_workflow = yaml.safe_load(workflow)
+        collection_step = next(
+            step
+            for step in parsed_workflow["jobs"]["collect"]["steps"]
+            if step.get("id") == "collect_storage"
+        )
+        embedded = re.search(
+            r'cat > "\$backup_failure_helper" <<\'BACKUP_FAILURE_HELPER\'\n'
+            r"(?P<source>.*?)\n[ ]*BACKUP_FAILURE_HELPER(?:\n|$)",
+            collection_step["run"],
+            re.DOTALL,
+        )
+        self.assertIsNotNone(embedded)
+        self.assertEqual(
+            embedded.group("source") + "\n",
+            (PLATFORM_ROOT / "tools/platform_backup_failure_receipt.py").read_text(encoding="utf-8"),
+        )
+        self.assertIn("id: cleanup_ssh", workflow)
+        cleanup_start = workflow.index("      - name: Remove production SSH material")
+        cleanup_end = workflow.index("      - name: Upload storage diagnostic evidence", cleanup_start)
+        cleanup = workflow[cleanup_start:cleanup_end]
+        self.assertIn("if: ${{ always() }}", cleanup)
+        self.assertIn("CLEANUP_BACKUP_FAILURE_FILES", cleanup)
+        self.assertIn("os.O_NOFOLLOW", cleanup)
+        self.assertIn("os.fstat(descriptor)", cleanup)
+        self.assertIn("os.unlink(name, dir_fd=directory_fd)", cleanup)
+        self.assertIn("backup failure temporary file remains after cleanup", cleanup)
+        self.assertNotIn("actions/checkout@", workflow)
+        self.assertNotIn("rm -f -- \"$runtime/shared/backup-failure", workflow)
+        self.assertNotIn("systemctl restart", workflow)
         self.assertNotIn("df -hT", workflow)
         self.assertNotIn("findmnt", workflow)
         self.assertNotIn("fuser", workflow)
@@ -2076,6 +2125,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertNotIn("systemctl restart", workflow)
         self.assertNotIn("rm -rf", workflow)
         self.assertNotIn('exec 9>"$retained_load_lock"', workflow)
+
         self.assertIn("os.O_NOFOLLOW", workflow)
         self.assertIn("os.fstat(descriptor)", workflow)
         self.assertIn("named = lock_path.lstat()", workflow)
@@ -2266,6 +2316,89 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             self.assertNotIn("override.conf", changed_timer.stdout)
 
     @unittest.skipUnless(os.geteuid() == 0, "lock probe fixture requires root")
+    def test_storage_diagnostics_backup_receipt_reader_is_bound_and_private(self) -> None:
+        workflow = yaml.safe_load(
+            (WORKFLOW_DIR / "platform-production-storage-diagnostics.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        run = next(
+            step["run"]
+            for step in workflow["jobs"]["collect"]["steps"]
+            if step.get("id") == "collect_storage"
+        )
+        reader_match = re.search(
+            r"(?ms)^[ \t]*/usr/bin/python3 -I - \"\$runtime/shared\".*?<<'PY'\n(?P<script>.*?)^PY$",
+            run,
+        )
+        self.assertIsNotNone(reader_match)
+        reader = reader_match.group("script")
+        run_id, attempt, source_sha = "39248154270", "1", "a" * 40
+        binding = {"run_id": run_id, "attempt": attempt, "source_sha": source_sha}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            shared = Path(temporary) / "shared"
+            shared.mkdir(mode=0o755)
+            os.chmod(shared, 0o755)
+
+            def collect() -> dict[str, object]:
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-c",
+                        reader,
+                        str(shared),
+                        run_id,
+                        attempt,
+                        source_sha,
+                        str(os.geteuid()),
+                        str(os.getegid()),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                return json.loads(completed.stdout)
+
+            receipt_path = shared / f"backup-failure-{run_id}-{attempt}.json"
+            self.assertEqual(collect()["state"], "missing")
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "event": "platform_backup_failure",
+                        "operation": "create",
+                        **binding,
+                    }
+                ),
+                encoding="ascii",
+            )
+            os.chmod(receipt_path, 0o600)
+            payload = collect()
+            self.assertEqual(payload["state"], "read")
+            self.assertEqual(base64.b64decode(payload["payload_b64"]), receipt_path.read_bytes())
+
+            receipt_path.unlink()
+            receipt_path.symlink_to(Path(temporary) / "missing-target")
+            self.assertEqual(collect()["state"], "unavailable")
+
+            receipt_path.unlink()
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "event": "platform_backup_failure",
+                        "operation": "create",
+                        **(binding | {"source_sha": "b" * 40}),
+                    }
+                ),
+                encoding="ascii",
+            )
+            os.chmod(receipt_path, 0o600)
+            self.assertEqual(collect()["state"], "unavailable")
+
     def test_storage_diagnostic_lock_probe_output_reaches_canonical_summary(self) -> None:
         workflow = (
             WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"

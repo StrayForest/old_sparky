@@ -462,42 +462,42 @@ was observed.
 
 ### Re-verify the newest existing backup
 
-When the newest archive is present but its restore verification is missing or
-failed, use the workflow's `verify-existing` operation. It selects only the
-newest sidecar, validates that exact archive and metadata, and runs the same
-isolated-cluster restore/Alembic/table checks. It never falls back to an
-older pair, creates a dump, rotates pairs, or changes archive bytes. On success
-it updates only the selected sidecar's restore-verification fields; the
-original completion time remains the age reference. Failure leaves that pair
-unchanged. The restore monitor samples free space during each restore and
-terminates its owned child at the configured floor plus lead margin; the lead
-is not a hard bound on a single write burst.
+When the newest archive is present but its restore verification is missing or failed, use the workflow's
+`verify-existing` operation. It selects only the newest sidecar, validates that archive and metadata, and runs the
+same isolated-cluster restore/Alembic/table checks. It never falls back to an older pair, creates a dump, rotates
+pairs, or changes archive bytes. On success it updates only the selected sidecar's restore-verification fields;
+the original completion time remains the age reference. Failure leaves that pair unchanged. The restore monitor
+samples free space and terminates its owned child at the configured floor plus lead margin; the lead is not a
+hard bound on a single write burst.
 
-The workflow offers an explicit `evict_build_node_cache` opt-in for the case
-where the validated disposable builder cache is the remaining storage
-constraint. It is available only with `verify-existing`. While holding the
-release, retained-load, build-output and live-QA locks, the helper validates
-the pinned cache manifest and complete tree, checks for process references,
-records a durable intent, and removes only the exact pinned build-Node cache.
-It then records a durable completion receipt before starting the restore
-drill. The cache is regenerable from its pinned archive. A failure after the
-intent or during removal stops the workflow for operator review; it does not
-start the restore or alter a backup pair. This operation does not evict the
-separate live-QA runtime cache.
+The workflow offers an explicit `evict_build_node_cache` opt-in only with `verify-existing`, when the validated
+disposable builder cache is the remaining storage constraint. While holding release, retained-load, build-output
+and live-QA locks, the helper validates the pinned cache manifest/tree, checks process references, records durable
+intent, and removes only the exact pinned build-Node cache. It records a completion receipt before the restore
+drill. The cache is regenerable from its pinned archive. Failure after intent or during removal stops for operator
+review without starting restore or altering a backup pair; this never evicts the separate live-QA runtime cache.
 
-When an existing-backup restore stops, the root-private run receipt records a
-closed restore phase and guard reason, the observed free bytes and required
-threshold when available, whether the temporary database was created in the
-disposable cluster, and the drop outcome. It records catalog-confirmed absence
-only after the exact drill database is checked through the scratch admin
-connection. Missing evidence stays unknown; the receipt never includes the
-database name, raw command output, exception text, or credentials.
+When an existing-backup restore stops, its root-private receipt records the closed phase/reason, free-space
+measurement and threshold, temporary-database creation and drop outcome. It records catalog-confirmed absence only
+after checking the exact drill database through the scratch admin connection. Missing evidence stays unknown; the
+receipt excludes database names, raw command output, exception text and credentials.
 
-A failed backup creation can also stop at the disk-floor guard before or while
-`pg_dump` runs. Its root-private failure receipt records only a fixed phase,
-guard reason and available/required byte counts; unavailable measurements stay
-null. It never records raw command output or changes the disk floor, restore
-lead, or backup-preservation behavior.
+A failed backup creation can stop at the disk-floor guard before or during `pg_dump`. Its root-private receipt records
+only the fixed phase/reason and available/required bytes (null when unavailable); it never records raw output or
+changes the disk floor, restore lead or backup-preservation behavior.
+
+For a failed create, run the read-only storage diagnostics workflow with that backup's exact run ID, attempt and
+source SHA plus the SHA currently deployed. It reads only the fixed `backup-failure-<run-id>-<attempt>.json` after
+validating root ownership, mode `0600`, file identity and binding, then publishes closed fields, counts and hashes.
+`missing`/`unavailable` means no cause was established. Collection does not change the receipt, backup or services
+and does not authorize a retry.
+
+```bash
+gh workflow run platform-production-storage-diagnostics.yml --repo StrayForest/old_sparky --ref dev \
+  -f expected_sha=<exact-source-sha-currently-deployed> \
+  -f backup_failure_run_id=<exact-backup-workflow-run-id> -f backup_failure_run_attempt=<exact-backup-run-attempt> \
+  -f backup_failure_source_sha=<source-sha-bound-to-that-backup-run>
+```
 
 For this opt-in only, if the canonical local build-output lock path
 `/root/old_sparky/platform/dist/releases` is absent, maintenance initializes
