@@ -2099,6 +2099,24 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(shell_syntax.returncode, 0, shell_syntax.stderr)
+        remote_script = re.search(
+            r"<<'REMOTE'\n(?P<source>.*?)\n[ ]*REMOTE(?:\n|$)",
+            collection_step["run"],
+            re.DOTALL,
+        )
+        self.assertIsNotNone(remote_script)
+        remote_source = remote_script.group("source")
+        receipt_reader = remote_source.index('if [[ -n "$backup_failure_run_id" ]]; then')
+        deferred_retention_exit = remote_source.index(
+            'if (( retention_failure_code != 0 )); then'
+        )
+        self.assertLess(receipt_reader, deferred_retention_exit)
+        self.assertEqual(
+            remote_source.count('retention_failure_code="$failure_code"'),
+            3,
+        )
+        self.assertNotIn('exit "$failure_code"', remote_source[receipt_reader:])
+        self.assertIn('exit "$retention_failure_code"', remote_source[deferred_retention_exit:])
         embedded = re.search(
             r'cat > "\$backup_failure_helper" <<\'BACKUP_FAILURE_HELPER\'\n'
             r"(?P<source>.*?)\n[ ]*BACKUP_FAILURE_HELPER(?:\n|$)",
@@ -2341,6 +2359,24 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(reader_match)
         reader = reader_match.group("script")
+        remote_match = re.search(
+            r"<<'REMOTE'\n(?P<script>.*?)\n[ ]*REMOTE(?:\n|$)", run, re.DOTALL
+        )
+        self.assertIsNotNone(remote_match)
+        remote = remote_match.group("script")
+        retention_start = remote.index('retention_status="$(printf')
+        retention_end = remote.index(
+            "printf '{\"schema\":1,\"kind\":\"collection_status\"",
+            retention_start,
+        )
+        retention_section = remote[retention_start:retention_end]
+        sanitizer_match = re.search(
+            r"(?ms)^\s*/usr/bin/python3 -I - .*?<<'SANITIZE_BACKUP_FAILURE'\n"
+            r"(?P<script>.*?)^SANITIZE_BACKUP_FAILURE$",
+            run,
+        )
+        self.assertIsNotNone(sanitizer_match)
+        sanitizer = sanitizer_match.group("script")
         run_id, attempt, source_sha = "39248154270", "1", "a" * 40
         binding = {"run_id": run_id, "attempt": attempt, "source_sha": source_sha}
 
@@ -2406,6 +2442,121 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             )
             os.chmod(receipt_path, 0o600)
             self.assertEqual(collect()["state"], "unavailable")
+
+            def run_retention_and_sanitize(
+                case_name: str, receipt_bytes: bytes | None
+            ) -> tuple[int, list[dict[str, object]]]:
+                case_runtime = Path(temporary) / case_name
+                case_shared = case_runtime / "shared"
+                releases = case_runtime / "releases"
+                current_id = "current-release"
+                previous_id = "previous-release"
+                (releases / current_id).mkdir(parents=True)
+                (releases / previous_id).mkdir()
+                case_shared.mkdir(mode=0o755)
+                os.chmod(case_shared, 0o755)
+                (case_runtime / "current").symlink_to(releases / current_id)
+                (case_runtime / "previous").symlink_to(releases / previous_id)
+                case_receipt = case_shared / f"backup-failure-{run_id}-{attempt}.json"
+                if receipt_bytes is not None:
+                    case_receipt.write_bytes(receipt_bytes)
+                    case_receipt.chmod(0o600)
+                remote_report = Path(temporary) / f"{case_name}-remote.txt"
+                remote_report.touch(mode=0o600)
+                remote_report.chmod(0o600)
+                shell = "\n".join(
+                    (
+                        "set -Eeuo pipefail",
+                        "retention_classification='{" + '"status":"unhealthy"' + "}'",
+                        "retention_rc=0",
+                        f"backup_failure_run_id={run_id}",
+                        f"backup_failure_run_attempt={attempt}",
+                        f"backup_failure_source_sha={source_sha}",
+                        f"runtime={case_runtime}",
+                        'current="$runtime/current"',
+                        f"current_id={current_id}",
+                        f"previous_id={previous_id}",
+                        retention_section,
+                    )
+                )
+                remote_result = subprocess.run(
+                    ["bash", "-c", shell], capture_output=True, text=True, timeout=10
+                )
+                remote_report.write_text(remote_result.stdout, encoding="ascii")
+                receipt_temp = Path(temporary) / f"{case_name}-receipt.json"
+                helper = TOOLS_DIR / "platform_backup_failure_receipt.py"
+                sanitize_result = subprocess.run(
+                    [
+                        sys.executable, "-I", "-c", sanitizer,
+                        str(remote_report), str(helper), str(receipt_temp),
+                        run_id, attempt, source_sha, str(remote_result.returncode),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                self.assertEqual(sanitize_result.returncode, 0, sanitize_result.stderr)
+                rows = [json.loads(line) for line in remote_report.read_text().splitlines()]
+                self.assertNotIn("payload_b64", remote_report.read_text())
+                return remote_result.returncode, rows
+
+            valid_receipt = {
+                "schema": 1,
+                "event": "platform_backup_failure",
+                **binding,
+                "operation": "create",
+                "bundle_sha256": "b" * 64,
+                "stage": "backup_create",
+                "public_summary_error": "none",
+                "public_summary_normalizer_diagnostic": {
+                    "schema": 1,
+                    "status": "not_run",
+                    "normalizer_exit_code": None,
+                    "stdout_bytes": None,
+                    "stdout_sha256": None,
+                    "stdout_class": "not_run",
+                    "stderr_bytes": None,
+                    "stderr_sha256": None,
+                    "stderr_class": "not_run",
+                    "exception_class": "none",
+                    "collector_error_class": "none",
+                },
+                "exit_code": 1,
+                "report_state": "typed_failure",
+                "report_error_class": "storage",
+                "restore_diagnostic": None,
+                "scratch_unit_diagnostic": None,
+                "scratch_admission_diagnostic": None,
+                "backup_disk_diagnostic": None,
+                "scratch_host_guard_diagnostic": None,
+                "scratch_first_fault": None,
+                "scratch_resource_attribution": None,
+                "scratch_phase_attribution": None,
+                "scratch_cleanup_status": None,
+                "report_bytes": 31,
+                "report_sha256": "c" * 64,
+                "stderr_state": "read",
+                "stderr_exception_class": "none",
+                "stderr_bytes": 17,
+                "stderr_sha256": "d" * 64,
+            }
+            cases = (
+                ("present-valid", json.dumps(valid_receipt).encode("ascii"), "available"),
+                ("missing", None, "unavailable"),
+                ("present-invalid", json.dumps({**binding, "event": "platform_backup_failure", "operation": "create"}).encode("ascii"), "unavailable"),
+            )
+            for case_name, receipt_bytes, expected_diagnostic_status in cases:
+                with self.subTest(case=case_name):
+                    remote_exit, rows = run_retention_and_sanitize(case_name, receipt_bytes)
+                    self.assertEqual(remote_exit, 1)
+                    failure = next(row for row in rows if row.get("kind") == "collection_failure")
+                    self.assertEqual(failure["stage"], "retention_threshold")
+                    diagnostic = next(
+                        row for row in rows if row.get("kind") == "backup_failure_diagnostic"
+                    )
+                    self.assertEqual(diagnostic["status"], expected_diagnostic_status)
+                    if case_name == "present-valid":
+                        self.assertEqual(diagnostic["stage"], "backup_create")
 
     def test_storage_diagnostic_lock_probe_output_reaches_canonical_summary(self) -> None:
         workflow = (
