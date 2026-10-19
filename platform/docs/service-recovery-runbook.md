@@ -27,6 +27,12 @@ minimum-free-space and maximum-usage thresholds. Both API and worker must be
 exactly inactive/dead with `Result=success` and no running main process. Any
 different, unknown, or failed API/worker prestate is refused.
 
+The PostgreSQL unit check is not a database-health proof: the aggregate
+`postgresql.service` may be active while its cluster is unavailable. The
+normal release preflight also opens the configured database and executes a
+read-only `SELECT 1`; recovery refuses before starting application services if
+that check fails.
+
 In `api-worker` mode, Nginx must already be active and healthy. In
 `api-worker-nginx` mode, Nginx may be either active/running/success with a
 valid PID or inactive/dead/success with no PID; it must be enabled, use the

@@ -7,6 +7,8 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import pwd
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,80 @@ def _embedded_controller() -> bytes:
     end = source.index("          SERVICE_RECOVERY\n", start)
     lines = source[start:end].splitlines(keepends=True)
     return "".join(line[10:] if line.startswith("          ") else line for line in lines).encode()
+
+
+def _run_recovery_wrapper_as_nonroot(receipt: str, remote_status: int) -> subprocess.CompletedProcess[str]:
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    step = next(
+        item
+        for item in workflow["jobs"]["recover-services"]["steps"]
+        if item.get("name") == "Recover deadlock-api, deadlock-worker, and optional nginx"
+    )
+    with tempfile.TemporaryDirectory(prefix="service-recovery-wrapper-") as temporary:
+        root = Path(temporary)
+        runner_temp = root / "runner-temp"
+        ssh_dir = runner_temp / "platform-production-service-recovery-ssh"
+        stub_dir = root / "bin"
+        runner_temp.mkdir(parents=True)
+        ssh_dir.mkdir()
+        stub_dir.mkdir()
+        for name in ("id_ed25519", "known_hosts"):
+            path = ssh_dir / name
+            path.write_text("test-only\n", encoding="ascii")
+            path.chmod(0o600)
+        ssh_stub = stub_dir / "ssh"
+        ssh_stub.write_text(
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "test \"$(id -u)\" -ne 0\n"
+            "remote_payload=\"$(cat)\"\n"
+            "[[ \"$remote_payload\" == *platform_release_lock_open* ]]\n"
+            "[[ \"$remote_payload\" == *SERVICE_RECOVERY* ]]\n"
+            "[[ \"$remote_payload\" == *--expected-source-sha* ]]\n"
+            "printf '%s\\n' \"$TEST_STUB_RECEIPT\"\n"
+            "exit \"$TEST_STUB_STATUS\"\n",
+            encoding="ascii",
+        )
+        ssh_stub.chmod(0o755)
+        github_env = runner_temp / "github_env"
+        github_env.write_text("", encoding="ascii")
+        uid = os.geteuid()
+        gid = os.getegid()
+        prefix: list[str] = []
+        if uid == 0:
+            if shutil.which("setpriv") is None:
+                raise AssertionError("setpriv is required to exercise the wrapper as nonroot")
+            account = pwd.getpwnam("nobody")
+            uid, gid = account.pw_uid, account.pw_gid
+            prefix = [
+                "setpriv", "--reuid", str(uid), "--regid", str(gid), "--clear-groups", "--"
+            ]
+        for path in (root, runner_temp, ssh_dir, stub_dir):
+            os.chown(path, uid, gid)
+        for path in (ssh_dir / "id_ed25519", ssh_dir / "known_hosts", ssh_stub, github_env):
+            os.chown(path, uid, gid)
+        env = {
+            "PATH": f"{stub_dir}:/usr/bin:/bin",
+            "HOME": str(root),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_ENV": str(github_env),
+            "SSH_DIR": str(ssh_dir),
+            "PROD_SSH_USER": "test-user",
+            "PROD_SSH_HOST": "test-host.invalid",
+            "EXPECTED_SOURCE_SHA": "a" * 40,
+            "EXPECTED_RELEASE_SLUG": f"gha-1-2-{'a' * 12}",
+            "RECOVERY_MODE": "api-worker-nginx",
+            "TEST_STUB_RECEIPT": receipt,
+            "TEST_STUB_STATUS": str(remote_status),
+        }
+        return subprocess.run(
+            [*prefix, "/bin/bash", "-e", "-o", "pipefail", "-c", step["run"]],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=20,
+            check=False,
+        )
 
 
 class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
@@ -444,7 +520,16 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
             action, unit, *rest = args
             service = unit.removesuffix(".service")
             if action == "show":
-                output = "".join(f"{key}={value}\n" for key, value in states[service].items())
+                requested = next(
+                    item.partition("=")[2].split(",")
+                    for item in rest
+                    if item.startswith("--property=")
+                )
+                output = "".join(
+                    f"{key}={states[service][key]}\n"
+                    for key in requested
+                    if key in states[service]
+                )
                 return SimpleNamespace(returncode=0, stdout=output)
             if action == "is-enabled":
                 enabled = states[service]["UnitFileState"] == "enabled"
@@ -489,6 +574,74 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
             result = self.namespace["recover"](self.app, self.sha, self.slug, self.systemd, mode=mode)
         self.last_receipt = receipt.getvalue()
         return result, actions, states
+
+    def test_pointer_identity_accepts_the_canonical_absolute_release_targets(self) -> None:
+        for name, release in (("current", self.release), ("previous", self.previous)):
+            pointer = self.app / name
+            pointer.unlink()
+            pointer.symlink_to(release)
+            target, resolved, _identity = self.namespace["_pointer_identity"](self.app, name)
+            self.assertEqual(target, str(release))
+            self.assertEqual(resolved, str(release))
+
+    def test_recovery_succeeds_with_deploy_generated_absolute_pointers(self) -> None:
+        (self.app / "current").unlink()
+        (self.app / "previous").unlink()
+        (self.app / "current").symlink_to(self.release)
+        (self.app / "previous").symlink_to(self.previous)
+        result, actions, _states = self._run(mode="api-worker-nginx")
+        self.assertEqual(result, 0)
+        self.assertEqual([service for action, service in actions if action == "start"], [
+            "deadlock-api", "deadlock-worker", "nginx"
+        ])
+
+    def test_pointer_identity_rejects_traversal_and_release_alias_symlinks(self) -> None:
+        pointer = self.app / "current"
+        pointer.unlink()
+        pointer.symlink_to("releases/../shared")
+        with self.assertRaises(self.namespace["RecoveryRefusal"]) as caught:
+            self.namespace["_pointer_identity"](self.app, "current")
+        self.assertEqual(caught.exception.stage, "pointer_identity")
+
+        pointer.unlink()
+        alias = self.releases / "alias"
+        alias.symlink_to(self.release)
+        pointer.symlink_to("releases/alias")
+        with self.assertRaises(self.namespace["RecoveryRefusal"]) as caught:
+            self.namespace["_pointer_identity"](self.app, "current")
+        self.assertEqual(caught.exception.stage, "pointer_identity")
+
+    def test_yaml_wrapper_accepts_controller_receipt_as_nonroot_and_projects_failure_stage(self) -> None:
+        for name, release in (("current", self.release), ("previous", self.previous)):
+            pointer = self.app / name
+            pointer.unlink()
+            pointer.symlink_to(release)
+        controller_result, _actions, _states = self._run(mode="api-worker-nginx")
+        self.assertEqual(controller_result, 0)
+        passed = _run_recovery_wrapper_as_nonroot(self.last_receipt, controller_result)
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        self.assertIn("PRODUCTION_API_WORKER_RECOVERY schema=1 status=passed", passed.stdout)
+        self.assertNotIn("mode=api-worker-nginx", passed.stdout)
+
+        current = self.app / "current"
+        current.unlink()
+        current.symlink_to("releases/../shared")
+        controller_result, _actions, _states = self._run(mode="api-worker-nginx")
+        self.assertEqual(controller_result, 1)
+        self.assertIn("stage=pointer_identity", self.last_receipt)
+        self.assertIn("source_sha=unavailable release_slug=unavailable", self.last_receipt)
+        early_failure = _run_recovery_wrapper_as_nonroot(self.last_receipt, controller_result)
+        self.assertEqual(early_failure.returncode, 1)
+        self.assertIn("stage=pointer_identity observed_identity=unavailable", early_failure.stdout)
+        self.assertNotIn(self.sha, early_failure.stdout)
+
+    def test_yaml_wrapper_rejects_malformed_receipt_without_leaking_payload(self) -> None:
+        sentinel = "SECRET_SENTINEL_DO_NOT_PROJECT"
+        malformed = _run_recovery_wrapper_as_nonroot(sentinel, 1)
+        self.assertNotEqual(malformed.returncode, 0)
+        self.assertIn("error_class=receipt", malformed.stdout)
+        self.assertNotIn(sentinel, malformed.stdout)
+        self.assertNotIn(sentinel, malformed.stderr)
 
     def test_starts_only_api_then_worker_and_requires_ping(self) -> None:
         result, actions, states = self._run()
@@ -591,6 +744,41 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertFalse(any(action == "start" for action, _service in actions))
         self.assertIn("stage=timer_unit_identity", self.last_receipt)
+
+    def test_timer_snapshot_uses_only_timer_applicable_systemd_properties(self) -> None:
+        properties = self.namespace["TIMER_SHOW_PROPERTIES"]
+
+        def systemctl(_binary: str, *args: str, **_kwargs: object) -> SimpleNamespace:
+            if args[0] == "show":
+                unit = args[1]
+                active = unit != "deadlock-maintenance.timer"
+                values = {
+                    "LoadState": "loaded",
+                    "ActiveState": "active" if active else "inactive",
+                    "SubState": "waiting" if active else "dead",
+                    "Result": "success",
+                    "FragmentPath": str(self.systemd / unit),
+                    "DropInPaths": "",
+                    "UnitFileState": "enabled" if active else "disabled",
+                }
+                output = "".join(f"{key}={values[key]}\n" for key in properties)
+                return SimpleNamespace(returncode=0, stdout=output)
+            if args[0] == "is-enabled":
+                enabled = args[1] != "deadlock-maintenance.timer"
+                return SimpleNamespace(
+                    returncode=0 if enabled else 1,
+                    stdout="enabled\n" if enabled else "disabled\n",
+                )
+            raise AssertionError(args)
+
+        with patch.dict(self.namespace, {"_systemctl": systemctl}):
+            snapshot = self.namespace["_timer_snapshot"](
+                self.release, self.systemd, "/usr/bin/systemctl"
+            )
+        self.assertEqual(set(snapshot), set(self.timer_names))
+        self.assertTrue(all(len(value) == len(properties) + 2 for value in snapshot.values()))
+        self.assertEqual(snapshot["deadlock-maintenance.timer"][1], "disabled")
+        self.assertEqual(snapshot["deadlock-logrotate.timer"][1], "enabled")
 
     def test_nginx_config_drift_refuses_before_starting_proxy(self) -> None:
         result, actions, states = self._run(mode="api-worker-nginx", nginx_config_drift=True)
