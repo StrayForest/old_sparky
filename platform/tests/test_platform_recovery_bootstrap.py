@@ -760,13 +760,6 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         return frozenset(parsed)
 
     @classmethod
-    def _workflow_recovery_set(cls, source: str) -> frozenset[str]:
-        marker = "          recovery_bootstrap_files = {\n"
-        start = source.index(marker)
-        end = source.index("          }\n", start) + len("          }\n")
-        return cls._set_assignment(textwrap.dedent(source[start:end]), "recovery_bootstrap_files")
-
-    @classmethod
     def _workflow_bundle_set(cls, source: str) -> frozenset[str]:
         marker = "          expected = {\n"
         start = source.index(marker)
@@ -5588,15 +5581,21 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         artifact_files = self._set_assignment(
             artifact_source, "RECOVERY_BOOTSTRAP_FILES"
         )
-        workflow_files = self._workflow_recovery_set(auto_deploy_source)
         self.assertEqual(canonical, classifier_files)
         self.assertEqual(canonical, artifact_files)
-        self.assertEqual(canonical, workflow_files)
+        # Auto-deploy delegates manifest family checks to the shared trusted
+        # artifact validator rather than carrying a second inline allowlist.
+        self.assertIn(
+            "platform_production_classifier_artifact.py manifest",
+            auto_deploy_source,
+        )
+        self.assertIn("--allow-docs-only", auto_deploy_source)
+        self.assertIn("--allow-candidate-packaging", auto_deploy_source)
+        self.assertIn("--emit-manifest-base64", auto_deploy_source)
         for representation in (
             canonical,
             classifier_files,
             artifact_files,
-            workflow_files,
         ):
             self.assertIn(
                 "platform/tools/platform_recovery_bootstrap.py", representation
