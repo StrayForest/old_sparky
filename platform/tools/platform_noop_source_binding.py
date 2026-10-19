@@ -32,8 +32,12 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from tools.platform_ci_classifier import FULL_GATE_IDS
-from tools.platform_ci_classifier import ClassifierError
+from tools.platform_ci_classifier import (
+    DOCS_ONLY_GATE_IDS,
+    DOCS_ONLY_REASON,
+    FULL_GATE_IDS,
+    ClassifierError,
+)
 from tools.platform_deploy_baseline import (
     BASELINE_KEYS,
     HEX_DIGEST_RE,
@@ -256,15 +260,25 @@ def validate_noop_receipt_document(
         raise _fail("no-op receipt cumulative manifest digest is malformed")
     if hashlib.sha256(_canonical_json_bytes(manifest)).hexdigest() != manifest_digest:
         raise _fail("no-op receipt cumulative manifest digest does not match")
+    docs_only_manifest = bool(
+        manifest.get("class") == "docs-only"
+        and manifest.get("expected_gates") == list(DOCS_ONLY_GATE_IDS)
+        and manifest.get("reason") == DOCS_ONLY_REASON
+        and manifest.get("runtime_sensitive") is False
+        and manifest.get("deployable") is False
+    )
+    full_manifest = bool(
+        manifest.get("class") == "full"
+        and manifest.get("expected_gates") == list(FULL_GATE_IDS)
+        and manifest.get("runtime_sensitive") is False
+        and manifest.get("deployable") is False
+    )
     if (
         manifest.get("target_sha") != runner_sha
-        or manifest.get("deployable") is not False
-        or manifest.get("runtime_sensitive") is not False
         or manifest.get("fallback") is not False
-        or manifest.get("class") != "full"
-        or manifest.get("expected_gates") != list(FULL_GATE_IDS)
+        or not (docs_only_manifest or full_manifest)
     ):
-        raise _fail("no-op receipt cumulative route is deployable or runtime-sensitive")
+        raise _fail("no-op receipt cumulative route is not a canonical non-runtime route")
     try:
         from tools.platform_ci_classifier import validate_manifest
 

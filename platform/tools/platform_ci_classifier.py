@@ -53,6 +53,7 @@ FULL_GATE_IDS: tuple[str, ...] = (
     "verification-contract",
 )
 DOCS_ONLY_GATE_IDS: tuple[str, ...] = ("docs", "verification-contract")
+DOCS_ONLY_REASON = "strict platform/docs-only change"
 OUT_OF_SCOPE_GATE_IDS: tuple[str, ...] = ("verification-contract",)
 KNOWN_EVENTS = frozenset({"pull_request", "push", "merge_group", "workflow_dispatch"})
 
@@ -449,7 +450,7 @@ def _route_for_files(files: Sequence[str]) -> tuple[str, tuple[str, ...], str, b
         return (
             "docs-only",
             DOCS_ONLY_GATE_IDS,
-            "strict platform/docs-only change",
+            DOCS_ONLY_REASON,
             False,
         )
     if all(_is_out_of_scope(path) for path in files):

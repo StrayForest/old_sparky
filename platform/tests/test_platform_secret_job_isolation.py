@@ -369,7 +369,14 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertIn("RELEASE.provenance.json", deploy)
         self.assertIn("PUBLISHED_ARTIFACT_DIGEST", deploy)
         self.assertIn("sha256sum -c", deploy)
-        self.assertIn("classifier-manifest.json", deploy)
+        self.assertIn(
+            'trusted_tool="$trusted_root/platform/tools/platform_production_classifier_artifact.py"',
+            deploy,
+        )
+        self.assertIn('"$trusted_tool" manifest "$route_dir/artifact.zip"', deploy)
+        self.assertIn('--target-sha "$TARGET_SHA"', deploy)
+        self.assertIn("--require-reconcile-source", deploy)
+        self.assertIn("trusted_classifier_default.outputs.sha", deploy)
         self.assertIn("digest", deploy)
 
 

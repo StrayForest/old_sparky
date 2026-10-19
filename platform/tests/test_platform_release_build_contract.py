@@ -2128,7 +2128,29 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('if [[ "$RECONCILE_MODE" == "true" ]]', reconcile_validation)
         self.assertNotIn('if [[ "$DEPLOY_MODE" == "baseline-reconcile" ]]', reconcile_validation)
         self.assertIn('if [[ "$RECONCILE_MODE" == "true" ]]', production)
-        self.assertEqual(workflow.count("manifest_args+=(--require-reconcile-source)"), 2)
+        self.assertIn(
+            "manifest_args+=(--require-reconcile-source --allow-docs-only)",
+            workflow,
+        )
+        self.assertIn(
+            'if [[ "$BASELINE_RECONCILE_MODE" == "true" ]]',
+            workflow,
+        )
+        self.assertIn(
+            'manifest_args+=(--require-reconcile-source)',
+            workflow,
+        )
+        self.assertIn(
+            'manifest_args+=(--allow-docs-only)',
+            workflow,
+        )
+        # The recovery-deploy branch must remain strict: docs-only manifests
+        # are accepted only for baseline reconciliation.
+        self.assertLess(
+            workflow.index('if [[ "$BASELINE_RECONCILE_MODE" == "true" ]]'),
+            workflow.index('manifest_args+=(--allow-docs-only)',
+                           workflow.index('if [[ "$BASELINE_RECONCILE_MODE" == "true" ]]')),
+        )
 
         auto = (
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
@@ -2607,9 +2629,17 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('"classifier_run_id": sys.argv[1]', final_dispatch_step)
         self.assertIn('"autodeploy_run_id": sys.argv[4]', final_dispatch_step)
         dispatch = workflow_job(auto, "dispatch")
-        self.assertIn("candidate_packaging_reason =", dispatch)
-        self.assertIn("candidate_packaging_only = bool(", dispatch)
-        self.assertIn('manifest["runtime_sensitive"] is not False', dispatch)
+        self.assertIn("platform_production_classifier_artifact.py manifest", dispatch)
+        self.assertIn("--allow-docs-only", dispatch)
+        self.assertIn("--allow-candidate-packaging", dispatch)
+        self.assertIn("--emit-manifest-base64", dispatch)
+        self.assertIn("--max-filesize 4194304", dispatch)
+        self.assertIn("env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B", dispatch)
+        shared_validator = (
+            REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("extract_single_manifest", shared_validator)
+        self.assertIn("platform_safe_zip", shared_validator)
         self.assertIn('dispatch_mode=baseline-reconcile', dispatch)
         self.assertIn('ROUTE_CANDIDATE_PACKAGING_ONLY" == "true"', dispatch)
         self.assertIn('ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false"', dispatch)

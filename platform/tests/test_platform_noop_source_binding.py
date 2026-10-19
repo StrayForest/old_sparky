@@ -85,8 +85,11 @@ def _baseline_identity() -> dict[str, object]:
     }
 
 
-def _canonical_noop_manifests() -> tuple[dict[str, object], dict[str, object]]:
-    files = [".github/workflows/platform-production-autodeploy.yml"]
+def _canonical_noop_manifests(
+    files: list[str] | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    if files is None:
+        files = [".github/workflows/platform-production-autodeploy.yml"]
     incremental = platform_ci_classifier.classify(
         files,
         event="push",
@@ -97,8 +100,8 @@ def _canonical_noop_manifests() -> tuple[dict[str, object], dict[str, object]]:
     return incremental, incremental
 
 
-def _receipt_document() -> dict[str, object]:
-    incremental, cumulative = _canonical_noop_manifests()
+def _receipt_document(*, files: list[str] | None = None) -> dict[str, object]:
+    incremental, cumulative = _canonical_noop_manifests(files)
     return {
         "schema": 1,
         "kind": "platform-production-baseline-noop",
@@ -965,7 +968,6 @@ class NoopSourceBindingTests(unittest.TestCase):
         self.assertIn("APP_TARGET_SHA", app_sha_consumer["env"])
 
         archive = _zip_receipt(_receipt_document())
-        metadata = _artifact_metadata(archive)
         deploy_run = {
             "id": int(DEPLOY_RUN_ID),
             "run_attempt": int(DEPLOY_ATTEMPT),
@@ -1021,10 +1023,17 @@ class NoopSourceBindingTests(unittest.TestCase):
             duplicate_artifact: bool = False,
             wrong_event_for: str | None = None,
             boolean_field_for: str | None = None,
+            receipt_files: list[str] | None = None,
         ) -> tuple[dict[str, object], list[str], object, object, list[int]]:
             calls: list[str] = []
             redirects: list[object] = []
             archive_read_limits: list[int] = []
+            selected_archive = (
+                _zip_receipt(_receipt_document(files=receipt_files))
+                if receipt_files is not None
+                else archive
+            )
+            selected_metadata = _artifact_metadata(selected_archive)
             security_run["event"] = "push"
             security_run["run_attempt"] = int(SECURITY_ATTEMPT)
             security_run["workflow_id"] = 1
@@ -1069,7 +1078,7 @@ class NoopSourceBindingTests(unittest.TestCase):
                     elif path == f"/actions/runs/{AUTODEPLOY_RUN_ID}":
                         body = autodeploy_run
                     elif path == f"/actions/artifacts/{ARTIFACT_ID}":
-                        body = metadata
+                        body = selected_metadata
                     elif path == f"/actions/artifacts/{ARTIFACT_ID}/zip":
                         redirect_url = "https://objects.example.invalid/noop-receipt.zip"
                         redirected = self.handler.redirect_request(
@@ -1078,7 +1087,7 @@ class NoopSourceBindingTests(unittest.TestCase):
                         if redirected is None:
                             raise AssertionError("artifact redirect was rejected")
                         redirects.append(redirected)
-                        return Response(archive, archive_read_limits)
+                        return Response(selected_archive, archive_read_limits)
                     else:
                         raise AssertionError(f"unexpected source-binding API route: {path}")
                     return Response(json.dumps(body).encode("ascii"))
@@ -1117,6 +1126,67 @@ class NoopSourceBindingTests(unittest.TestCase):
         self.assertEqual(sum(url.endswith(f"/actions/runs/{SECURITY_RUN_ID}") for url in api_calls), 1)
         self.assertEqual(sum(url.endswith(f"/actions/runs/{AUTODEPLOY_RUN_ID}") for url in api_calls), 1)
         self.assertEqual(read_limits, [platform_noop_source_binding.MAX_ARCHIVE_BYTES + 1])
+
+        docs_binding, _, _, _, _ = run_resolver(
+            include_artifact=True,
+            receipt_files=["platform/docs/operations-runbook.md"],
+        )
+        self.assertEqual(docs_binding["runner_sha"], RUNNER_SHA)
+        self.assertEqual(docs_binding["app_target_sha"], APP_SHA)
+        self.assertEqual(docs_binding["source_binding"]["binding_mode"], "verified-noop")
+        self.assertEqual(
+            docs_binding["source_binding"]["cumulative_manifest_sha256"],
+            hashlib.sha256(
+                _canonical_json(
+                    platform_ci_classifier.classify(
+                        ["platform/docs/operations-runbook.md"],
+                        event="push",
+                        branch="dev",
+                        target_sha=RUNNER_SHA,
+                        repository_ready=True,
+                    )
+                )
+            ).hexdigest(),
+        )
+        live_schema2 = platform_workflow_input_guard.validate_live_payload(
+            {
+                "schema": 2,
+                "base_url": platform_workflow_input_guard.EXPECTED_ORIGIN,
+                "provision": "false",
+                "marker": "",
+                "target_sha": RUNNER_SHA,
+                "source_binding": docs_binding["source_binding"],
+            }
+        )
+        self.assertEqual(live_schema2["schema"], "2")
+        self.assertEqual(live_schema2["source_binding"]["app_target_sha"], APP_SHA)
+
+        docs_document = _receipt_document(files=["platform/docs/operations-runbook.md"])
+        validate_noop_receipt_document(docs_document, **_expected_run_bindings())
+        bad_digest = copy.deepcopy(docs_document)
+        bad_digest["route"]["cumulative_manifest_sha256"] = "0" * 64  # type: ignore[index]
+        with self.assertRaises(ProvenanceError):
+            validate_noop_receipt_document(bad_digest, **_expected_run_bindings())
+
+        mixed_manifest = platform_ci_classifier.classify(
+            ["platform/docs/operations-runbook.md", "platform/tools/platform_release_deploy.sh"],
+            event="push",
+            branch="dev",
+            target_sha=RUNNER_SHA,
+            repository_ready=True,
+        )
+        mixed_cumulative = copy.deepcopy(docs_document)
+        mixed_cumulative["route"]["cumulative_manifest"] = mixed_manifest  # type: ignore[index]
+        mixed_cumulative["route"]["cumulative_manifest_sha256"] = hashlib.sha256(  # type: ignore[index]
+            _canonical_json(mixed_manifest)
+        ).hexdigest()
+        with self.assertRaises(ProvenanceError):
+            validate_noop_receipt_document(mixed_cumulative, **_expected_run_bindings())
+
+        wrong_incremental = copy.deepcopy(docs_document)
+        wrong_incremental["route"]["incremental_manifest"] = mixed_manifest  # type: ignore[index]
+        with self.assertRaises(ProvenanceError):
+            validate_noop_receipt_document(wrong_incremental, **_expected_run_bindings())
 
         class MockHTTPResponse(io.BytesIO):
             def __init__(self, body: bytes, url: str, code: int, headers: object) -> None:

@@ -170,10 +170,18 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
         source = (WORKFLOW_ROOT / "platform-production-autodeploy.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("platform_safe_zip", source)
         self.assertNotIn("unzip -q", source)
-        self.assertIn("env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3", source)
-        self.assertIn("classifier reason is missing", source)
+        self.assertIn(
+            "env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B",
+            source,
+        )
+        self.assertIn("platform_production_classifier_artifact.py manifest", source)
+        self.assertIn("--max-filesize 4194304", source)
+        validator = (
+            REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("extract_single_manifest", validator)
+        self.assertIn("platform_safe_zip", validator)
 
     def test_production_secret_classifier_extractor_is_bounded_and_no_candidate(self) -> None:
         source = (WORKFLOW_ROOT / "platform-production-deploy.yml").read_text(

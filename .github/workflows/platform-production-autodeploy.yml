@@ -28,6 +28,7 @@ jobs:
       route_deployable: ${{ steps.route.outputs.route_deployable }}
       route_recovery_bootstrap_only: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
       route_candidate_packaging_only: ${{ steps.route.outputs.route_candidate_packaging_only }}
+      route_docs_only: ${{ steps.route.outputs.route_docs_only }}
       host_tools_sha: ${{ steps.host-tools-pin.outputs.host_tools_sha }}
       host_tools_toolset_version: ${{ steps.host-tools-build.outputs.toolset_version }}
       host_tools_artifact_id: ${{ steps.publish-host-tools.outputs.artifact-id }}
@@ -261,263 +262,73 @@ jobs:
           PY
           )"
           curl --fail-with-body --silent --show-error --location \
+            --max-filesize 4194304 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
             --output "$route_dir/artifact.zip"
-          # The artifact is data-only, but it is still an untrusted ZIP.  The
-          # dependency-free checked-out helper rejects absolute/traversal,
-          # symlink, duplicate and compression-bomb entries before a manifest
-          # reaches the output protocol.  This job has only the GitHub API
-          # token; it never receives production credentials.
-          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 - "$route_dir/artifact.zip" "$route_dir/unpacked" <<'PY'
-          import sys
-          from pathlib import Path
-
-          sys.path.insert(0, "platform/tools")
-          from platform_safe_zip import extract_single_manifest
-
-          extract_single_manifest(Path(sys.argv[1]), Path(sys.argv[2]))
-          PY
-          manifest_path="$route_dir/unpacked/classifier-manifest.json"
-          /usr/bin/python3 - "$manifest_path" "$TARGET_SHA" "$GITHUB_OUTPUT" <<'PY'
-          import hashlib
+          # Validate the exact artifact through the shared closed-route helper.
+          # The helper enforces schema, digest, target, event and exact docs-only
+          # acceptance; this projection only selects already-validated route fields.
+          manifest_b64="$(env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B platform/tools/platform_production_classifier_artifact.py manifest \
+            "$route_dir/artifact.zip" \
+            --target-sha "$TARGET_SHA" \
+            --allow-docs-only \
+            --allow-candidate-packaging \
+            --emit-manifest-base64)"
+          (( ${#manifest_b64} > 0 && ${#manifest_b64} <= 350000 ))
+          [[ "$manifest_b64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          /usr/bin/python3 - "$manifest_b64" "$GITHUB_OUTPUT" <<'PY'
+          import base64
           import json
           from pathlib import Path
           import sys
 
-          manifest_path, target_sha, output_path = sys.argv[1:]
-          manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-          fields = (
-              "schema", "version", "target_sha", "event", "class",
-              "expected_gates", "runtime_sensitive", "deployable", "fallback", "reason", "files",
+          sys.path.insert(0, "platform/tools")
+          from platform_ci_classifier import (
+              CANDIDATE_PACKAGING_REASON,
+              RECOVERY_BOOTSTRAP_REASON,
+              STORAGE_OPERATIONS_REASON,
+              _is_candidate_packaging_only,
+              _is_recovery_bootstrap_only,
+              _is_storage_operations_only,
           )
-          expected_gates = {
-              "docs-only": ["docs", "verification-contract"],
-              "out-of-scope": ["verification-contract"],
-              "full": [
-                  "backend", "python-quality", "security", "migration", "docs",
-                  "web-quality", "web-hermetic", "verification-contract",
-              ],
-          }
-          recovery_bootstrap_files = {
-              ".github/workflows/platform-production-recovery-bootstrap-build.yml",
-              ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
-              ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
-              ".github/workflows/platform-production-deploy.yml",
-              ".github/workflows/platform-production-release-abort.yml",
-              ".github/workflows/platform-production-release-recover.yml",
-              ".github/workflows/platform-production-autodeploy.yml",
-              "platform/tools/platform_recovery_bootstrap.py",
-              "platform/tools/platform_release_capture_probe.py",
-              "platform/tools/platform_release_active_artifact_proof.py",
-              "platform/tools/platform_maintenance_failure_evidence.py",
-              "platform/tools/platform_decrypt_maintenance_evidence.py",
-              "platform/tools/platform_tournament_list_read_model_recovery.py",
-              "platform/alembic/env.py",
-              "platform/tools/platform_abort_retained_only.sh",
-              "platform/tools/platform_release_lock.sh",
-              "platform/tools/platform_release_deploy.sh",
-              "platform/tools/platform_release_preflight.sh",
-              "platform/tools/platform_install_systemd_units.sh",
-              "platform/tools/platform_install_logging.sh",
-              "platform/tools/platform_install_nginx.py",
-              "platform/tools/platform_release_restore_runtime.sh",
-              "platform/tools/platform_update_cloudflare_ips.py",
-              "platform/tools/platform_deploy_smoke_impl.py",
-              "platform/tools/platform_validate_edge_policy.py",
-              "platform/tools/platform_health_monitor.py",
-              "platform/tools/platform_release_rollback.sh",
-              "platform/tools/platform_release_systemd_state.py",
-              "platform/tools/platform_recover_pending.sh",
-              "platform/tools/platform_release_retention.py",
-              "platform/tools/platform_release_transaction.py",
-              "platform/tools/platform_run_alembic.sh",
-              "platform/tools/platform_live_qa_guard.py",
-              "platform/tools/platform_build_live_qa_runtime.py",
-              "platform/tests/test_platform_recovery_bootstrap.py",
-              "platform/tests/test_platform_db.py",
-              "platform/tests/test_platform_release_audit_hardening.py",
-              "platform/tests/test_platform_release_build_contract.py",
-              "platform/tests/test_platform_release_recovery_boundaries.py",
-              "platform/tests/test_platform_release_retention.py",
-              "platform/tests/test_platform_storage_maintenance.py",
-              "platform/tests/test_platform_release_systemd_state.py",
-              "platform/tests/test_platform_release_venv_rollback.py",
-              "platform/tests/test_platform_live_qa_guard.py",
-              "platform/tests/test_platform_live_qa_runtime_install.py",
-              "platform/tests/test_platform_live_qa_wrappers.py",
-              "platform/tests/test_platform_ssh_host_key_scan.py",
-              "platform/tests/test_platform_release_build_diagnostics.py",
-              "platform/tests/test_platform_ci_classifier.py",
-              "platform/tools/platform_ci_classifier.py",
-              "platform/tools/platform_production_classifier_artifact.py",
-              "platform/tools/platform_deploy_baseline.py",
-              "platform/tools/platform_baseline_runtime_proof.py",
-              "platform/tools/platform_workflow_provenance.py",
-              "platform/tools/platform_host_tools_bundle.py",
-              "platform/tools/platform_validate_release_artifact.py",
-              "platform/tests/test_platform_workflow_provenance.py",
-              "platform/tools/platform_verify_contract.py",
-              "platform/tools/platform_test_catalog.py",
-              "platform/tools/platform_workflow_input_guard.py",
-              "platform/tools/platform_host_tools_bundle.py",
-              "platform/tools/platform_validate_release_artifact.py",
-              "platform/tests/test_platform_host_tools_bundle.py",
-              "platform/tests/test_platform_recovery_workflow_caller.py",
-              "platform/docs/adr/production-host-tools-provisioning.md",
-              "platform/tests/test_platform_workflow_provenance.py",
-              "platform/tests/test_platform_cloudflare_ips.py",
-              "platform/python_packages/platform_infra/db.py",
-              "platform/tests/test_platform_install_nginx.py",
-              "platform/deploy/systemd/deadlock-cloudflare-ips.service",
-              "platform/deploy/systemd/deadlock-health-monitor.service",
-              "platform/contracts/host_tools_pin.json",
-          }
-          candidate_packaging_files = {
-              ".github/workflows/platform-host-tools-candidate.yml",
-              ".github/workflows/platform-production-autodeploy.yml",
-              ".github/workflows/platform-security.yml",
-              "platform/tests/test_platform_ci_classifier.py",
-              "platform/tools/platform_host_tools_candidate.py",
-              "platform/tools/platform_ci_classifier.py",
-              "platform/tests/test_platform_host_tools_bundle.py",
-              "platform/tools/platform_test_catalog.py",
-              "platform/tools/platform_verify_contract.py",
-          }
-          recovery_bootstrap_reason = "retained-release recovery-bootstrap change requires full verification and is non-deployable"
-          candidate_packaging_reason = "trusted candidate-packaging change requires full verification and is non-deployable"
-          storage_operations_files = {
-              ".github/workflows/platform-production-storage-diagnostics.yml",
-              ".github/workflows/platform-production-storage-maintenance.yml",
-              ".github/workflows/platform-production-recovery-bootstrap-build.yml",
-              ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
-              ".github/workflows/platform-production-autodeploy.yml",
-              ".agents/skills/platform-storage-retention/SKILL.md",
-              "platform/tools/platform_ci_classifier.py",
-              "platform/tools/platform_production_classifier_artifact.py",
-              "platform/tests/test_platform_ci_classifier.py",
-              "platform/tests/test_platform_release_audit_hardening.py",
-              "platform/tests/test_platform_storage_evidence_privacy.py",
-              "platform/tests/test_platform_storage_maintenance.py",
-              "platform/tools/platform_backup_failure_receipt.py",
-              "platform/tools/platform_test_catalog.py",
-          }
-          storage_operations_triggers = {
-              ".github/workflows/platform-production-storage-diagnostics.yml",
-              ".github/workflows/platform-production-storage-maintenance.yml",
-              ".agents/skills/platform-storage-retention/SKILL.md",
-          }
-          storage_operations_reason = "storage operations change requires full verification and is non-deployable"
-          if manifest.get("schema") != 1 or manifest.get("version") != 1:
-              raise SystemExit("classifier manifest schema/version is invalid")
-          route_class = manifest.get("class")
-          if route_class not in expected_gates:
-              raise SystemExit("classifier manifest class is invalid")
-          if manifest.get("expected_gates") != expected_gates[route_class]:
-              raise SystemExit("classifier expected gates are invalid")
-          if manifest.get("target_sha") != target_sha:
-              raise SystemExit("classifier target SHA does not match workflow_run head SHA")
-          if manifest.get("event") != "push":
-              raise SystemExit("auto-deploy classifier event is not push")
-          if manifest.get("fallback") is not False:
-              raise SystemExit("fallback classifier routes cannot auto-deploy")
-          reason = manifest.get("reason")
-          if (
-              not isinstance(reason, str)
-              or not reason
-              or len(reason) > 512
-              or any(not 0x20 <= ord(character) <= 0x7E for character in reason)
-          ):
-              raise SystemExit("classifier reason is missing")
-          if not isinstance(manifest.get("files"), list):
-              raise SystemExit("classifier files are malformed")
+
+          manifest_b64, output_path = sys.argv[1:]
+          try:
+              manifest = json.loads(base64.b64decode(manifest_b64, validate=True))
+          except (ValueError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit("validated classifier projection is malformed") from None
+          if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
+              raise SystemExit("validated classifier projection is malformed")
+          route_class = manifest["class"]
+          reason = manifest["reason"]
           files = manifest["files"]
-          if any(not isinstance(path, str) or not path for path in files):
-              raise SystemExit("classifier files contain a malformed path")
-          recovery_bootstrap_only = bool(
-              reason == recovery_bootstrap_reason
-              and any(path in recovery_bootstrap_files for path in files)
-              and all(
-                  path in recovery_bootstrap_files
-                  or path.startswith("platform/docs/")
-                  for path in files
-              )
+          recovery_bootstrap_only = (
+              reason == RECOVERY_BOOTSTRAP_REASON and _is_recovery_bootstrap_only(files)
           )
-          candidate_packaging_only = bool(
-              reason == candidate_packaging_reason
-              and any(path in candidate_packaging_files for path in files)
-              and all(
-                  path in candidate_packaging_files
-                  or path.startswith("platform/docs/")
-                  for path in files
-              )
+          candidate_packaging_only = (
+              reason == CANDIDATE_PACKAGING_REASON and _is_candidate_packaging_only(files)
           )
-          storage_operations_only = bool(
-              reason == storage_operations_reason
-              and any(path in storage_operations_triggers for path in files)
-              and all(
-                  path in storage_operations_files
-                  or path.startswith("platform/docs/")
-                  for path in files
-              )
+          storage_operations_only = (
+              reason == STORAGE_OPERATIONS_REASON and _is_storage_operations_only(files)
           )
-          if not isinstance(manifest.get("runtime_sensitive"), bool):
-              raise SystemExit("classifier runtime-sensitive field is malformed")
-          payload = {field: manifest[field] for field in fields}
-          digest = hashlib.sha256(
-              json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-          ).hexdigest()
-          if manifest.get("digest") != digest:
-              raise SystemExit("classifier digest does not match manifest")
-          # A full route can intentionally be CI-only (for example, the
-          # trusted host-tools candidate packaging).  The classifier's
-          # deployable bit, not the route class alone, controls dispatch.
-          if type(manifest.get("deployable")) is not bool:
-              raise SystemExit("full route may be non-deployable, but its flag must be boolean")
-          if (
-              route_class == "full"
-              and manifest["deployable"] is False
-              and not (
-                  recovery_bootstrap_only
-                  or candidate_packaging_only
-                  or storage_operations_only
-              )
+          docs_only = route_class == "docs-only"
+          if route_class == "full" and manifest["deployable"] is False and not (
+              recovery_bootstrap_only or candidate_packaging_only or storage_operations_only
           ):
               raise SystemExit("full non-deployable classifier route is not recognized")
-          if recovery_bootstrap_only and manifest["deployable"]:
-              raise SystemExit("recovery-bootstrap route cannot be deployable")
-          if recovery_bootstrap_only and route_class != "full":
-              raise SystemExit("recovery-bootstrap route must use full verification")
-          if recovery_bootstrap_only and reason != recovery_bootstrap_reason:
-              raise SystemExit("recovery-bootstrap route reason is inconsistent")
-          if candidate_packaging_only and manifest["deployable"]:
-              raise SystemExit("candidate-packaging route cannot be deployable")
-          if candidate_packaging_only and route_class != "full":
-              raise SystemExit("candidate-packaging route must use full verification")
-          if candidate_packaging_only and manifest["runtime_sensitive"] is not False:
-              raise SystemExit("candidate-packaging route runtime sensitivity is inconsistent")
-          if candidate_packaging_only and reason != candidate_packaging_reason:
-              raise SystemExit("candidate-packaging route reason is inconsistent")
-          if storage_operations_only and (
-              route_class != "full"
-              or manifest["deployable"] is not False
-              or manifest["runtime_sensitive"] is not True
-              or manifest["fallback"] is not False
+          if route_class == "docs-only" and (
+              manifest["deployable"] is not False or manifest["runtime_sensitive"] is not False
           ):
-              raise SystemExit("storage-operations route fields are inconsistent")
-          if storage_operations_only and reason != storage_operations_reason:
-              raise SystemExit("storage-operations route reason is inconsistent")
-          if reason == storage_operations_reason and not storage_operations_only:
-              raise SystemExit("storage-operations route does not match its exact file family")
-          if route_class != "full" and manifest.get("deployable") is not False:
-              raise SystemExit("reduced classifier route must be non-deployable")
+              raise SystemExit("docs-only classifier route fields are inconsistent")
           with Path(output_path).open("a", encoding="utf-8") as output:
               output.write(f"route_class={route_class}\n")
               output.write(f"route_deployable={'true' if manifest['deployable'] else 'false'}\n")
               output.write(f"route_recovery_bootstrap_only={'true' if recovery_bootstrap_only else 'false'}\n")
               output.write(f"route_candidate_packaging_only={'true' if candidate_packaging_only else 'false'}\n")
+              output.write(f"route_docs_only={'true' if docs_only else 'false'}\n")
               output.write(f"route_storage_operations_only={'true' if storage_operations_only else 'false'}\n")
               output.write(f"route_fallback={'true' if manifest['fallback'] else 'false'}\n")
               output.write(f"route_digest={manifest['digest']}\n")
@@ -533,6 +344,7 @@ jobs:
           ROUTE_DEPLOYABLE: ${{ steps.route.outputs.route_deployable }}
           ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
           ROUTE_CANDIDATE_PACKAGING_ONLY: ${{ steps.route.outputs.route_candidate_packaging_only }}
+          ROUTE_DOCS_ONLY: ${{ steps.route.outputs.route_docs_only }}
           ROUTE_STORAGE_OPERATIONS_ONLY: ${{ steps.route.outputs.route_storage_operations_only }}
         run: |
           set -euo pipefail
@@ -571,7 +383,8 @@ jobs:
           if [[ "$ROUTE_DEPLOYABLE" != "true" \
             && ! ( "$ROUTE_CLASS" == "full" \
               && ( "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" \
-                || "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true" ) ) ]]; then
+                || "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true" ) ) \
+            && ! ( "$ROUTE_CLASS" == "docs-only" && "$ROUTE_DOCS_ONLY" == "true" ) ]]; then
             echo "Classifier route is non-deployable ($ROUTE_CLASS); no production deployment required."
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -579,9 +392,12 @@ jobs:
 
           dispatch_mode=deploy
           if [[ "$ROUTE_DEPLOYABLE" == "false" ]]; then
-            [[ "$ROUTE_CLASS" == "full" \
-              && ( ( "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ) \
-                || ( "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ) ) ]] || {
+            [[ ( "$ROUTE_CLASS" == "full" \
+                && ( ( "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ) \
+                  || ( "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ) ) ) \
+              || ( "$ROUTE_CLASS" == "docs-only" && "$ROUTE_DOCS_ONLY" == "true" \
+                && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
+                && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ) ]] || {
               echo "Refusing an unrecognized non-deployable route." >&2
               exit 1
             }
@@ -1243,6 +1059,7 @@ jobs:
           ROUTE_DEPLOYABLE: ${{ needs.dispatch.outputs.route_deployable }}
           ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ needs.dispatch.outputs.route_recovery_bootstrap_only }}
           ROUTE_CANDIDATE_PACKAGING_ONLY: ${{ needs.dispatch.outputs.route_candidate_packaging_only }}
+          ROUTE_DOCS_ONLY: ${{ needs.dispatch.outputs.route_docs_only }}
           AUTODEPLOY_RUN_ID: ${{ github.run_id }}
           AUTODEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
           HOST_TOOLS_SHA: ${{ needs.dispatch.outputs.host_tools_sha }}
@@ -1257,9 +1074,13 @@ jobs:
                 || { echo "Refusing an invalid ordinary deploy route." >&2; exit 1; }
               ;;
             baseline-reconcile)
-              [[ "$ROUTE_CLASS" == "full" && "$ROUTE_DEPLOYABLE" == "false" \
-                && ( ( "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ) \
-                  || ( "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ) ) ]] \
+              [[ "$ROUTE_DEPLOYABLE" == "false" \
+                && ( ( "$ROUTE_CLASS" == "full" \
+                    && ( ( "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ) \
+                      || ( "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ) ) ) \
+                  || ( "$ROUTE_CLASS" == "docs-only" && "$ROUTE_DOCS_ONLY" == "true" \
+                    && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
+                    && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ) ) ]] \
                 || { echo "Refusing an invalid baseline-reconcile route." >&2; exit 1; }
               ;;
             *) echo "Refusing an unknown production dispatch mode." >&2; exit 1 ;;
