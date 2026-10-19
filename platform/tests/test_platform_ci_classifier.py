@@ -23,6 +23,7 @@ from tools.platform_ci_classifier import (
     CANDIDATE_PACKAGING_FILES,
     CANDIDATE_PACKAGING_REASON,
     DOCS_ONLY_GATE_IDS,
+    DOCS_ONLY_REASON,
     FULL_GATE_IDS,
     OUT_OF_SCOPE_GATE_IDS,
     RECOVERY_BOOTSTRAP_FILES,
@@ -160,30 +161,46 @@ class PlatformCiClassifierTests(unittest.TestCase):
     def _run_auto_deploy_manifest_contract(
         self, manifest: dict[str, object], *, expect_success: bool = True
     ) -> dict[str, str]:
-        """Pass a generated manifest through auto-deploy's no-op boundary."""
+        """Pass a generated manifest through auto-deploy's shared validator and projection."""
 
         workflow = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
         marker = (
-            '          /usr/bin/python3 - "$manifest_path" "$TARGET_SHA" '
-            '"$GITHUB_OUTPUT" <<\'PY\'\n'
+            '          /usr/bin/python3 - "$manifest_b64" "$GITHUB_OUTPUT" <<\'PY\'\n'
         )
         start = workflow.index(marker) + len(marker)
         end = workflow.index("          PY\n", start)
         contract = textwrap.dedent(workflow[start:end])
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            manifest_path = root / "classifier-manifest.json"
+            archive_path = self._write_production_classifier_archive(root, manifest)
             output_path = root / "github-output"
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            completed = subprocess.run(
+            validated = subprocess.run(
                 [
                     sys.executable,
-                    "-",
-                    str(manifest_path),
+                    "-I",
+                    "-B",
+                    str(REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"),
+                    "manifest",
+                    str(archive_path),
+                    "--target-sha",
                     str(manifest["target_sha"]),
-                    str(output_path),
+                    "--allow-docs-only",
+                    "--allow-candidate-packaging",
+                    "--emit-manifest-base64",
                 ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if expect_success:
+                self.assertEqual(validated.returncode, 0, validated.stderr)
+            else:
+                self.assertNotEqual(validated.returncode, 0)
+                return {}
+            completed = subprocess.run(
+                [sys.executable, "-", validated.stdout.strip(), str(output_path)],
                 input=contract,
+                cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -1162,13 +1179,10 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertNotIn("fail-closed fallback route", security)
         self.assertIn('"$ROUTE_DEPLOYABLE" != "true"', auto)
         self.assertIn('echo "deploy=false" >> "$GITHUB_OUTPUT"', auto)
-        self.assertIn("Dispatch production deployment", auto)
+        self.assertIn("Dispatch production deployment or baseline reconciliation", auto)
         self.assertIn("steps.gate.outputs.deploy == 'true'", auto)
-        self.assertIn(
-            'type(manifest.get("deployable")) is not bool',
-            auto,
-        )
-        self.assertIn("full route may be non-deployable", auto)
+        self.assertIn("platform_production_classifier_artifact.py manifest", auto)
+        self.assertIn('"$ROUTE_CLASS" == "docs-only"', auto)
 
         for files in (
             ["platform/docs/deployment-runbook.md"],
@@ -1230,27 +1244,10 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_autodeploy_reconciles_only_exact_full_nondeployable_families(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
-        allowlist_marker = "          recovery_bootstrap_files = {\n"
-        allowlist_start = auto.index(allowlist_marker) + len(allowlist_marker)
-        allowlist_end = auto.index("          }\n", allowlist_start) + len("          }\n")
-        allowlist_source = textwrap.dedent(
-            "recovery_bootstrap_files = {\n"
-            + auto[allowlist_start:allowlist_end]
-        )
-        auto_allowlist = ast.literal_eval(ast.parse(allowlist_source).body[0].value)
-        self.assertEqual(auto_allowlist, set(RECOVERY_BOOTSTRAP_FILES))
-
-        candidate_marker = "          candidate_packaging_files = {\n"
-        candidate_start = auto.index(candidate_marker) + len(candidate_marker)
-        candidate_end = auto.index("          }\n", candidate_start) + len("          }\n")
-        candidate_source = textwrap.dedent(
-            "candidate_packaging_files = {\n"
-            + auto[candidate_start:candidate_end]
-        )
-        self.assertEqual(
-            ast.literal_eval(ast.parse(candidate_source).body[0].value),
-            set(CANDIDATE_PACKAGING_FILES),
-        )
+        self.assertIn("platform_production_classifier_artifact.py manifest", auto)
+        self.assertIn("_is_recovery_bootstrap_only", auto)
+        self.assertIn("_is_candidate_packaging_only", auto)
+        self.assertIn("_is_storage_operations_only", auto)
 
         bootstrap_path = sorted(RECOVERY_BOOTSTRAP_FILES)[0]
         special_route = classify(
@@ -1268,6 +1265,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(special_outputs["route_deployable"], "false")
         self.assertEqual(special_outputs["route_recovery_bootstrap_only"], "true")
         self.assertEqual(special_outputs["route_candidate_packaging_only"], "false")
+        self.assertEqual(special_outputs["route_docs_only"], "false")
 
         host_tools_adr = "platform/docs/adr/production-host-tools-provisioning.md"
         adr_push = classify(
@@ -1287,6 +1285,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(adr_outputs["route_deployable"], "false")
         self.assertEqual(adr_outputs["route_recovery_bootstrap_only"], "true")
         self.assertEqual(adr_outputs["route_candidate_packaging_only"], "false")
+        self.assertEqual(adr_outputs["route_docs_only"], "false")
 
         adr_pr = classify(
             [host_tools_adr],
@@ -1322,6 +1321,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         candidate_outputs = self._run_auto_deploy_manifest_contract(candidate_route)
         self.assertEqual(candidate_outputs["route_recovery_bootstrap_only"], "false")
         self.assertEqual(candidate_outputs["route_candidate_packaging_only"], "true")
+        self.assertEqual(candidate_outputs["route_docs_only"], "false")
         malformed_candidate = dict(candidate_route)
         malformed_candidate["runtime_sensitive"] = True
         malformed_candidate["digest"] = manifest_digest(malformed_candidate)
@@ -1343,6 +1343,15 @@ class PlatformCiClassifierTests(unittest.TestCase):
         docs_outputs = self._run_auto_deploy_manifest_contract(docs_only)
         self.assertEqual(docs_outputs["route_recovery_bootstrap_only"], "false")
         self.assertEqual(docs_outputs["route_candidate_packaging_only"], "false")
+        self.assertEqual(docs_outputs["route_docs_only"], "true")
+        self.assertIn('"$ROUTE_DOCS_ONLY" == "true"', auto)
+        self.assertIn("--allow-docs-only", PRODUCTION_WORKFLOW.read_text(encoding="utf-8"))
+        self.assertIn("--allow-candidate-packaging", auto)
+        self.assertNotIn(
+            "--allow-candidate-packaging",
+            RECOVERY_BUILD_WORKFLOW.read_text(encoding="utf-8"),
+        )
+        self.assertIn("env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B", auto)
 
         self.assertIn("route_recovery_bootstrap_only", auto)
         self.assertIn("route_candidate_packaging_only", auto)
@@ -1352,9 +1361,10 @@ class PlatformCiClassifierTests(unittest.TestCase):
         )
         production = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(
-            production.count("manifest_args+=(--require-reconcile-source)"),
-            2,
+            production.count("manifest_args+=(--require-reconcile-source --allow-docs-only)"),
+            1,
         )
+        self.assertEqual(production.count("manifest_args+=(--require-reconcile-source)"), 1)
         self.assertIn("dispatch_mode=baseline-reconcile", auto)
         self.assertIn('case "$DISPATCH_MODE" in', auto)
         self.assertIn('mode": sys.argv[3]', auto)
@@ -1616,7 +1626,6 @@ class PlatformCiClassifierTests(unittest.TestCase):
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
         production = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
         for workflow in (auto, production):
-            self.assertIn("classifier-manifest.json", workflow)
             self.assertIn("target_sha", workflow)
             self.assertIn("platform-ci-route", workflow)
             self.assertIn("digest", workflow)
@@ -1624,12 +1633,14 @@ class PlatformCiClassifierTests(unittest.TestCase):
         classifier_tool = (
             REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"
         ).read_text(encoding="utf-8")
+        self.assertIn("extract_single_manifest", classifier_tool)
         self.assertIn("runtime_sensitive", classifier_tool)
         self.assertIn("object_pairs_hook=_reject_duplicate_keys", classifier_tool)
         self.assertIn("type(manifest.get(\"deployable\")) is not bool", classifier_tool)
         self.assertIn("classifier_run_id", auto)
         self.assertIn("classifier_run_attempt", auto)
         self.assertIn("platform_production_classifier_artifact.py", production)
+        self.assertIn("--allow-docs-only", production)
 
     def test_production_manifest_validator_runs_with_isolated_python(self) -> None:
         manifest = classify(
@@ -1713,6 +1724,20 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 validate_production_classifier_manifest(
                     candidate_archive,
                     target_sha=self.TARGET_SHA,
+                    allow_docs_only=True,
+                )
+            accepted_auto_candidate = validate_production_classifier_manifest(
+                candidate_archive,
+                target_sha=self.TARGET_SHA,
+                allow_candidate_packaging=True,
+            )
+            self.assertEqual(
+                accepted_auto_candidate["reason"], CANDIDATE_PACKAGING_REASON
+            )
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    candidate_archive,
+                    target_sha=self.TARGET_SHA,
                     require_recovery_bootstrap=True,
                 )
 
@@ -1728,6 +1753,15 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 validate_production_classifier_manifest(
                     recovery_archive,
                     target_sha=self.TARGET_SHA,
+                    require_reconcile_source=True,
+                )["reason"],
+                RECOVERY_BOOTSTRAP_REASON,
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    recovery_archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_docs_only=True,
                     require_reconcile_source=True,
                 )["reason"],
                 RECOVERY_BOOTSTRAP_REASON,
@@ -2495,6 +2529,160 @@ class PlatformCiClassifierTests(unittest.TestCase):
             with self.assertRaises(UnsafeZipError):
                 extract_single_manifest(root / "valid.zip", existing)
 
+    def test_production_artifact_validator_accepts_only_exact_docs_only_mode(self) -> None:
+        files = ["platform/docs/operations-runbook.md"]
+        manifest = classify(
+            files,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(manifest["class"], "docs-only")
+        self.assertEqual(manifest["reason"], DOCS_ONLY_REASON)
+        self.assertEqual(manifest["expected_gates"], list(DOCS_ONLY_GATE_IDS))
+        self.assertIs(manifest["runtime_sensitive"], False)
+        self.assertIs(manifest["deployable"], False)
+        self.assertIs(manifest["fallback"], False)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = self._write_production_classifier_archive(root, manifest)
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    archive, target_sha=self.TARGET_SHA
+                )
+            exact = validate_production_classifier_manifest(
+                archive,
+                target_sha=self.TARGET_SHA,
+                require_docs_only=True,
+            )
+            self.assertEqual(exact, manifest)
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_docs_only=True,
+                ),
+                manifest,
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_docs_only=True,
+                    require_reconcile_source=True,
+                ),
+                manifest,
+            )
+            cli = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"),
+                    "manifest",
+                    str(archive),
+                    "--target-sha",
+                    self.TARGET_SHA,
+                    "--require-docs-only",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(cli.returncode, 0, cli.stderr)
+
+            malformed_docs = [
+                dict(manifest, reason="full verification required"),
+                dict(manifest, expected_gates=list(FULL_GATE_IDS)),
+                dict(manifest, runtime_sensitive=True),
+                dict(manifest, deployable=True),
+                dict(manifest, fallback=True),
+                dict(manifest, target_sha="b" * 40),
+            ]
+            malformed_docs.extend(
+                [
+                    dict(manifest, files=["platform/docs/../tools/runtime.py"]),
+                    dict(manifest, files=["platform/docs/.."]),
+                    dict(manifest, files=["platform/docs/."]),
+                    dict(manifest, files=["platform/docs/a/.."]),
+                    dict(manifest, files=["platform/docs\\runtime.md"]),
+                    dict(manifest, files=["platform/docs/a.md", "platform/docs/a.md"]),
+                ]
+            )
+            for changed in malformed_docs:
+                changed["digest"] = manifest_digest(changed)
+                changed_archive = self._write_production_classifier_archive(
+                    root, changed
+                )
+                with self.subTest(changed=changed):
+                    with self.assertRaises(ClassifierArtifactError):
+                        validate_production_classifier_manifest(
+                            changed_archive,
+                            target_sha=self.TARGET_SHA,
+                            require_docs_only=True,
+                        )
+                    with self.assertRaises(ClassifierArtifactError):
+                        validate_production_classifier_manifest(
+                            changed_archive,
+                            target_sha=self.TARGET_SHA,
+                            allow_docs_only=True,
+                        )
+
+            mixed = classify(
+                ["platform/docs/operations-runbook.md", "platform/tools/runtime.py"],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            mixed_archive = self._write_production_classifier_archive(root, mixed)
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    mixed_archive,
+                    target_sha=self.TARGET_SHA,
+                    require_docs_only=True,
+                )
+            # The producer's allow mode permits normal full routes; its caller
+            # must still branch on the validated class before deciding to skip.
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    mixed_archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_docs_only=True,
+                )["class"],
+                "full",
+            )
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    mixed_archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_docs_only=True,
+                    require_reconcile_source=True,
+                )
+
+            unknown = dict(manifest, **{"class": "unknown"})
+            unknown["digest"] = manifest_digest(unknown)
+            unknown_archive = self._write_production_classifier_archive(root, unknown)
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    unknown_archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_docs_only=True,
+                )
+
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_docs_only=True,
+                    require_docs_only=True,
+                )
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_docs_only=1,
+                )
+
     def test_storage_operations_classifier_and_artifact_route_are_exact(self) -> None:
         files = sorted(
             STORAGE_OPERATIONS_FILES | {"platform/docs/deployment-runbook.md"}
@@ -2601,6 +2789,14 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 archive, target_sha=self.TARGET_SHA
             )
             self.assertEqual(accepted["reason"], STORAGE_OPERATIONS_REASON)
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_docs_only=True,
+                )["reason"],
+                STORAGE_OPERATIONS_REASON,
+            )
             with self.assertRaises(ClassifierArtifactError):
                 validate_production_classifier_manifest(
                     archive,
@@ -2616,26 +2812,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_storage_operations_autodeploy_validates_then_skips_dispatch(self) -> None:
         workflow = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
-        storage_triggers_marker = "          storage_operations_triggers = {\n"
-        storage_triggers_start = workflow.index(storage_triggers_marker) + len(storage_triggers_marker)
-        storage_triggers_end = workflow.index("          }\n", storage_triggers_start) + len("          }\n")
-        storage_triggers_source = textwrap.dedent(
-            "storage_operations_triggers = {\n" + workflow[storage_triggers_start:storage_triggers_end]
-        )
-        self.assertEqual(
-            ast.literal_eval(ast.parse(storage_triggers_source).body[0].value),
-            set(STORAGE_OPERATIONS_TRIGGER_FILES),
-        )
-        storage_files_marker = "          storage_operations_files = {\n"
-        storage_files_start = workflow.index(storage_files_marker) + len(storage_files_marker)
-        storage_files_end = workflow.index("          }\n", storage_files_start) + len("          }\n")
-        storage_files_source = textwrap.dedent(
-            "storage_operations_files = {\n" + workflow[storage_files_start:storage_files_end]
-        )
-        self.assertEqual(
-            ast.literal_eval(ast.parse(storage_files_source).body[0].value),
-            set(STORAGE_OPERATIONS_FILES),
-        )
+        self.assertIn("_is_storage_operations_only", workflow)
+        self.assertIn("STORAGE_OPERATIONS_REASON", workflow)
 
         route = classify(
             sorted(STORAGE_OPERATIONS_FILES),
@@ -2744,15 +2922,16 @@ class PlatformCiClassifierTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-            self.assertEqual(values["storage_skip"], "true")
+            self.assertEqual(values["route_skip"], "true")
+            self.assertEqual(values["route_family"], "storage-operations")
             self.assertEqual(values["classifier_digest"], manifest["digest"])
             expected_files_digest = hashlib.sha256(
                 json.dumps(sorted(manifest["files"]), separators=(",", ":")).encode()
             ).hexdigest()
-            self.assertEqual(values["storage_files_sha256"], expected_files_digest)
+            self.assertEqual(values["route_files_sha256"], expected_files_digest)
 
             receipt_blocks = _workflow_python_blocks(
-                RECOVERY_BUILD_WORKFLOW, "Write exact storage-operations skip receipt"
+                RECOVERY_BUILD_WORKFLOW, "Write exact non-deployable route skip receipt"
             )
             self.assertEqual(len(receipt_blocks), 1)
             receipt_path = Path(temporary) / "receipt.json"
@@ -2763,8 +2942,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 "SECURITY_RUN_ATTEMPT": "3",
                 "RECOVERY_BUILD_RUN_ID": "401",
                 "RECOVERY_BUILD_RUN_ATTEMPT": "2",
+                "ROUTE_FAMILY": values["route_family"],
                 "CLASSIFIER_DIGEST": values["classifier_digest"],
-                "STORAGE_FILES_SHA256": values["storage_files_sha256"],
+                "ROUTE_FILES_SHA256": values["route_files_sha256"],
             }
             receipt_created = subprocess.run(
                 [sys.executable, "-I", "-", str(receipt_path)],
@@ -2773,8 +2953,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             )
             self.assertEqual(receipt_created.returncode, 0, receipt_created.stderr)
             emitted_receipt = json.loads(receipt_path.read_text(encoding="ascii"))
-            self.assertEqual(emitted_receipt["kind"], "platform-storage-operations-skip")
-            self.assertEqual(emitted_receipt["family_proof"], "storage-operations-v1")
+            self.assertEqual(emitted_receipt["schema"], 2)
+            self.assertEqual(emitted_receipt["kind"], "platform-recovery-bootstrap-skip")
+            self.assertEqual(emitted_receipt["route_family"], "storage-operations")
             self.assertEqual(emitted_receipt["security_run_id"], "77")
             self.assertEqual(stat.S_IMODE(receipt_path.stat().st_mode), 0o600)
 
@@ -2793,6 +2974,97 @@ class PlatformCiClassifierTests(unittest.TestCase):
             )
             self.assertNotEqual(rejected.returncode, 0)
 
+    def test_recovery_producer_docs_only_emits_authenticated_noop_not_bundle(self) -> None:
+        route_blocks = _workflow_python_blocks(
+            RECOVERY_BUILD_WORKFLOW,
+            "Download and validate exact security route artifact",
+        )
+        self.assertEqual(len(route_blocks), 1)
+        docs_manifest = classify(
+            ["platform/docs/operations-runbook.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        docs_encoded = base64.b64encode(
+            json.dumps(docs_manifest, sort_keys=True, separators=(",", ":")).encode()
+        ).decode("ascii")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "docs-output"
+            docs_run = subprocess.run(
+                [sys.executable, "-I", "-", docs_encoded, str(output), self.TARGET_SHA],
+                input=route_blocks[0], text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(docs_run.returncode, 0, docs_run.stderr)
+            docs_outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            self.assertEqual(docs_outputs["route_skip"], "true")
+            self.assertEqual(docs_outputs["route_family"], "docs-only")
+            self.assertEqual(docs_outputs["classifier_digest"], docs_manifest["digest"])
+
+            receipt_blocks = _workflow_python_blocks(
+                RECOVERY_BUILD_WORKFLOW,
+                "Write exact non-deployable route skip receipt",
+            )
+            receipt_path = root / "docs-receipt.json"
+            receipt_env = {
+                **os.environ,
+                "SOURCE_SHA": self.TARGET_SHA,
+                "SECURITY_RUN_ID": "77",
+                "SECURITY_RUN_ATTEMPT": "3",
+                "RECOVERY_BUILD_RUN_ID": "401",
+                "RECOVERY_BUILD_RUN_ATTEMPT": "2",
+                "ROUTE_FAMILY": "docs-only",
+                "CLASSIFIER_DIGEST": docs_outputs["classifier_digest"],
+                "ROUTE_FILES_SHA256": docs_outputs["route_files_sha256"],
+            }
+            receipt_run = subprocess.run(
+                [sys.executable, "-I", "-", str(receipt_path)],
+                input=receipt_blocks[0], text=True, capture_output=True,
+                check=False, env=receipt_env,
+            )
+            self.assertEqual(receipt_run.returncode, 0, receipt_run.stderr)
+            receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+            self.assertEqual(receipt["route_family"], "docs-only")
+            self.assertEqual(receipt["classifier_digest"], docs_manifest["digest"])
+            self.assertEqual(receipt["route_files_sha256"], docs_outputs["route_files_sha256"])
+            self.assertEqual(stat.S_IMODE(receipt_path.stat().st_mode), 0o600)
+
+            workflow = yaml.safe_load(RECOVERY_BUILD_WORKFLOW.read_text(encoding="utf-8"))
+            steps = workflow["jobs"]["build"]["steps"]
+            for name in (
+                "Build and validate deterministic recovery bundle",
+                "Attest immutable recovery bundle (producer B)",
+                "Upload immutable recovery bundle",
+            ):
+                step = next(item for item in steps if item.get("name") == name)
+                self.assertEqual(step["if"], "steps.route.outputs.route_skip != 'true'")
+            for name in (
+                "Write exact non-deployable route skip receipt",
+                "Attest exact non-deployable route skip receipt",
+                "Upload exact non-deployable route skip receipt",
+            ):
+                step = next(item for item in steps if item.get("name") == name)
+                self.assertEqual(step["if"], "steps.route.outputs.route_skip == 'true'")
+
+            mixed = classify(
+                ["platform/docs/operations-runbook.md", "platform/tools/runtime.py"],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            mixed_output = root / "mixed-output"
+            mixed_encoded = base64.b64encode(
+                json.dumps(mixed, sort_keys=True, separators=(",", ":")).encode()
+            ).decode("ascii")
+            mixed_run = subprocess.run(
+                [sys.executable, "-I", "-", mixed_encoded, str(mixed_output), self.TARGET_SHA],
+                input=route_blocks[0], text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(mixed_run.returncode, 0, mixed_run.stderr)
+            mixed_values = dict(line.split("=", 1) for line in mixed_output.read_text().splitlines())
+            self.assertEqual(mixed_values["route_skip"], "false")
+
     def test_recovery_publisher_receipt_selection_is_closed(self) -> None:
         blocks = _workflow_python_blocks(
             RECOVERY_PUBLISH_WORKFLOW,
@@ -2806,7 +3078,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         producer_sha = "b" * 40
         repository_id = 11223344
         receipt_name = (
-            f"platform-storage-operations-skip-{source_sha}-77-3-"
+            f"platform-recovery-bootstrap-skip-storage-operations-{source_sha}-77-3-"
             f"{producer_id}-{attempt}.json"
         )
         base_run = {
@@ -2866,8 +3138,17 @@ class PlatformCiClassifierTests(unittest.TestCase):
             selected = select([receipt_row])
             self.assertEqual(selected.returncode, 0, selected.stderr)
             selected_outputs = output.read_text(encoding="ascii")
-            self.assertIn("storage_skip=true", selected_outputs)
-            self.assertIn("storage_receipt_artifact_id=9001", selected_outputs)
+            self.assertIn("route_skip=true", selected_outputs)
+            self.assertIn("route_family=storage-operations", selected_outputs)
+            self.assertIn("route_receipt_artifact_id=9001", selected_outputs)
+            docs_receipt_row = json.loads(json.dumps(receipt_row))
+            docs_receipt_row["name"] = receipt_name.replace(
+                "skip-storage-operations-", "skip-docs-only-"
+            )
+            output.write_text("", encoding="ascii")
+            docs_selected = select([docs_receipt_row])
+            self.assertEqual(docs_selected.returncode, 0, docs_selected.stderr)
+            self.assertIn("route_family=docs-only", output.read_text(encoding="ascii"))
             wrong_attempt_name = json.loads(json.dumps(receipt_row))
             wrong_attempt_name["name"] = wrong_attempt_name["name"].rsplit("-", 1)[0] + "-3.json"
             self.assertNotEqual(select([wrong_attempt_name]).returncode, 0)
@@ -2887,11 +3168,11 @@ class PlatformCiClassifierTests(unittest.TestCase):
             }
             ordinary = select([bundle_row])
             self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
-            self.assertIn("storage_skip=false", output.read_text(encoding="ascii"))
+            self.assertIn("route_skip=false", output.read_text(encoding="ascii"))
 
             stale_receipt = {
                 **receipt_row,
-                "name": f"platform-storage-operations-skip-{source_sha}-76-2-{producer_id}-1.json",
+                "name": f"platform-recovery-bootstrap-skip-storage-operations-{source_sha}-76-2-{producer_id}-1.json",
             "workflow_run": {
                 "id": producer_id,
                 "head_sha": producer_sha,
@@ -2902,11 +3183,11 @@ class PlatformCiClassifierTests(unittest.TestCase):
             output.write_text("", encoding="ascii")
             prior_receipt_with_bundle = select([stale_receipt, bundle_row])
             self.assertEqual(prior_receipt_with_bundle.returncode, 0, prior_receipt_with_bundle.stderr)
-            self.assertIn("storage_skip=false", output.read_text(encoding="ascii"))
+            self.assertIn("route_skip=false", output.read_text(encoding="ascii"))
             output.write_text("", encoding="ascii")
             prior_and_current_receipt = select([stale_receipt, receipt_row])
             self.assertEqual(prior_and_current_receipt.returncode, 0, prior_and_current_receipt.stderr)
-            self.assertIn("storage_skip=true", output.read_text(encoding="ascii"))
+            self.assertIn("route_skip=true", output.read_text(encoding="ascii"))
 
             for invalid_rows in ([receipt_row, receipt_row], [receipt_row, {
                 "id": 9002,
@@ -2936,7 +3217,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
     def test_recovery_publisher_receipt_and_classifier_proof_reject_tampering(self) -> None:
         blocks = _workflow_python_blocks(
             RECOVERY_PUBLISH_WORKFLOW,
-            "Authenticate storage skip receipt and parent classifier proof",
+            "Authenticate route skip receipt and parent classifier proof",
         )
         self.assertEqual(len(blocks), 3)
         self.assertEqual(
@@ -2954,20 +3235,20 @@ class PlatformCiClassifierTests(unittest.TestCase):
             branch="dev",
         )
         receipt = {
-            "schema": 1,
-            "kind": "platform-storage-operations-skip",
+            "schema": 2,
+            "kind": "platform-recovery-bootstrap-skip",
+            "route_family": "storage-operations",
             "source_sha": self.TARGET_SHA,
             "security_run_id": "77",
             "security_run_attempt": "3",
             "producer_run_id": "401",
             "producer_run_attempt": "2",
             "classifier_digest": manifest["digest"],
-            "storage_files_sha256": hashlib.sha256(
+            "route_files_sha256": hashlib.sha256(
                 json.dumps(sorted(manifest["files"]), separators=(",", ":")).encode()
             ).hexdigest(),
-            "family_proof": "storage-operations-v1",
         }
-        receipt_name = f"platform-storage-operations-skip-{self.TARGET_SHA}-77-3-401-2.json"
+        receipt_name = f"platform-recovery-bootstrap-skip-storage-operations-{self.TARGET_SHA}-77-3-401-2.json"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             output = root / "output"
@@ -2980,12 +3261,12 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as archive:
                     archive.writestr(info, json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
                 return subprocess.run(
-                    [sys.executable, "-I", "-", str(zip_path), receipt_name, "401", "2", str(output)],
+                    [sys.executable, "-I", "-", str(zip_path), receipt_name, "401", "2", "storage-operations", str(output)],
                     input=blocks[0], text=True, capture_output=True, check=False,
                 )
             accepted = receipt_check(receipt)
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
-            tampered_receipt = dict(receipt, family_proof="recovery-bundle")
+            tampered_receipt = dict(receipt, route_family="docs-only")
             self.assertNotEqual(receipt_check(tampered_receipt).returncode, 0)
 
             encoded = base64.b64encode(
@@ -2993,11 +3274,13 @@ class PlatformCiClassifierTests(unittest.TestCase):
             ).decode("ascii")
             environment = {
                 **os.environ,
+                "SOURCE_SHA": self.TARGET_SHA,
+                "ROUTE_FAMILY": "storage-operations",
                 "CLASSIFIER_DIGEST": str(receipt["classifier_digest"]),
-                "STORAGE_FILES_SHA256": str(receipt["storage_files_sha256"]),
+                "ROUTE_FILES_SHA256": str(receipt["route_files_sha256"]),
             }
             proof = subprocess.run(
-                [sys.executable, "-I", "-", encoded, str(output)],
+                [sys.executable, "-I", "-", encoded, str(output), "storage-operations"],
                 input=blocks[2], text=True, capture_output=True, check=False, env=environment,
             )
             self.assertEqual(proof.returncode, 0, proof.stderr)
@@ -3007,10 +3290,86 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 json.dumps(tampered, sort_keys=True, separators=(",", ":")).encode()
             ).decode("ascii")
             rejected = subprocess.run(
-                [sys.executable, "-I", "-", tampered_encoded, str(output)],
+                [sys.executable, "-I", "-", tampered_encoded, str(output), "storage-operations"],
                 input=blocks[2], text=True, capture_output=True, check=False, env=environment,
             )
             self.assertNotEqual(rejected.returncode, 0)
+
+            docs_manifest = classify(
+                ["platform/docs/operations-runbook.md"],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            docs_receipt = {
+                **receipt,
+                "route_family": "docs-only",
+                "classifier_digest": docs_manifest["digest"],
+                "route_files_sha256": hashlib.sha256(
+                    json.dumps(sorted(docs_manifest["files"]), separators=(",", ":")).encode()
+                ).hexdigest(),
+            }
+            docs_receipt_name = f"platform-recovery-bootstrap-skip-docs-only-{self.TARGET_SHA}-77-3-401-2.json"
+            docs_selected = subprocess.run(
+                [sys.executable, "-I", "-", str(root / "docs-receipt.zip"), docs_receipt_name, "401", "2", "docs-only", str(output)],
+                input=blocks[0], text=True, capture_output=True, check=False,
+            )
+            # The independently exercised parser must reject a missing archive;
+            # now supply the exact one-member docs receipt and check it accepts.
+            self.assertNotEqual(docs_selected.returncode, 0)
+            docs_info = zipfile.ZipInfo(docs_receipt_name)
+            docs_info.create_system = 3
+            docs_info.external_attr = (stat.S_IFREG | 0o600) << 16
+            with zipfile.ZipFile(root / "docs-receipt.zip", "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr(docs_info, json.dumps(docs_receipt, sort_keys=True, separators=(",", ":")).encode())
+            docs_selected = subprocess.run(
+                [sys.executable, "-I", "-", str(root / "docs-receipt.zip"), docs_receipt_name, "401", "2", "docs-only", str(output)],
+                input=blocks[0], text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(docs_selected.returncode, 0, docs_selected.stderr)
+
+            docs_encoded = base64.b64encode(
+                json.dumps(docs_manifest, sort_keys=True, separators=(",", ":")).encode()
+            ).decode("ascii")
+            docs_env = {
+                **environment,
+                "ROUTE_FAMILY": "docs-only",
+                "CLASSIFIER_DIGEST": str(docs_manifest["digest"]),
+                "ROUTE_FILES_SHA256": str(docs_receipt["route_files_sha256"]),
+            }
+            docs_proof = subprocess.run(
+                [sys.executable, "-I", "-", docs_encoded, str(output), "docs-only"],
+                input=blocks[2], text=True, capture_output=True, check=False, env=docs_env,
+            )
+            self.assertEqual(docs_proof.returncode, 0, docs_proof.stderr)
+            bad_docs_digest = subprocess.run(
+                [sys.executable, "-I", "-", docs_encoded, str(output), "docs-only"],
+                input=blocks[2], text=True, capture_output=True, check=False,
+                env={**docs_env, "CLASSIFIER_DIGEST": "0" * 64},
+            )
+            self.assertNotEqual(bad_docs_digest.returncode, 0)
+            bad_docs_files = subprocess.run(
+                [sys.executable, "-I", "-", docs_encoded, str(output), "docs-only"],
+                input=blocks[2], text=True, capture_output=True, check=False,
+                env={**docs_env, "ROUTE_FILES_SHA256": "0" * 64},
+            )
+            self.assertNotEqual(bad_docs_files.returncode, 0)
+            mixed_manifest = classify(
+                ["platform/docs/operations-runbook.md", "platform/tools/runtime.py"],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            mixed_encoded = base64.b64encode(
+                json.dumps(mixed_manifest, sort_keys=True, separators=(",", ":")).encode()
+            ).decode("ascii")
+            self.assertNotEqual(
+                subprocess.run(
+                    [sys.executable, "-I", "-", mixed_encoded, str(output), "docs-only"],
+                    input=blocks[2], text=True, capture_output=True, check=False, env=docs_env,
+                ).returncode,
+                0,
+            )
 
             parent_run = {
                 "id": 77,
@@ -3045,9 +3404,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "head_repository_id": 11223344,
                 },
             }
-            (root / "storage-security-run.json").write_text(json.dumps(parent_run))
-            (root / "storage-security-jobs.json").write_text(json.dumps({"total_count": 1, "jobs": [parent_job]}))
-            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            (root / "route-security-run.json").write_text(json.dumps(parent_run))
+            (root / "route-security-jobs.json").write_text(json.dumps({"total_count": 1, "jobs": [parent_job]}))
+            (root / "route-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
             parent_check = subprocess.run(
                 [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
                 input=blocks[1], text=True, capture_output=True, check=False,
@@ -3055,43 +3414,43 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertEqual(parent_check.returncode, 0, parent_check.stderr)
             self.assertIn("route_artifact_id=901", output.read_text(encoding="ascii"))
             parent_artifact["name"] = "platform-ci-route-77-4"
-            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            (root / "route-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
             parent_name_rejected = subprocess.run(
                 [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
                 input=blocks[1], text=True, capture_output=True, check=False,
             )
             self.assertNotEqual(parent_name_rejected.returncode, 0)
             parent_artifact["name"] = "platform-ci-route-77-3"
-            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            (root / "route-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
             parent_run["run_attempt"] = 4
-            (root / "storage-security-run.json").write_text(json.dumps(parent_run))
+            (root / "route-security-run.json").write_text(json.dumps(parent_run))
             parent_api_attempt_rejected = subprocess.run(
                 [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
                 input=blocks[1], text=True, capture_output=True, check=False,
             )
             self.assertNotEqual(parent_api_attempt_rejected.returncode, 0)
             parent_run["run_attempt"] = 3
-            (root / "storage-security-run.json").write_text(json.dumps(parent_run))
+            (root / "route-security-run.json").write_text(json.dumps(parent_run))
             parent_artifact["workflow_run"]["repository_id"] = 11223345
-            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            (root / "route-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
             parent_repo_rejected = subprocess.run(
                 [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
                 input=blocks[1], text=True, capture_output=True, check=False,
             )
             self.assertNotEqual(parent_repo_rejected.returncode, 0)
             parent_artifact["workflow_run"]["repository_id"] = 11223344
-            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            (root / "route-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
             parent_artifact["workflow_run"]["run_attempt"] = 4
-            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            (root / "route-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
             parent_attempt_rejected = subprocess.run(
                 [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
                 input=blocks[1], text=True, capture_output=True, check=False,
             )
             self.assertNotEqual(parent_attempt_rejected.returncode, 0)
             del parent_artifact["workflow_run"]["run_attempt"]
-            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            (root / "route-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
             parent_run["conclusion"] = "failure"
-            (root / "storage-security-run.json").write_text(json.dumps(parent_run))
+            (root / "route-security-run.json").write_text(json.dumps(parent_run))
             parent_rejected = subprocess.run(
                 [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
                 input=blocks[1], text=True, capture_output=True, check=False,
@@ -3099,7 +3458,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertNotEqual(parent_rejected.returncode, 0)
             parent_run["conclusion"] = "success"
             parent_run["head_sha"] = "c" * 40
-            (root / "storage-security-run.json").write_text(json.dumps(parent_run))
+            (root / "route-security-run.json").write_text(json.dumps(parent_run))
             misbound = subprocess.run(
                 [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
                 input=blocks[1], text=True, capture_output=True, check=False,

@@ -29,6 +29,8 @@ if __package__:
     from .platform_ci_classifier import (
         CANDIDATE_PACKAGING_FILES,
         CANDIDATE_PACKAGING_REASON,
+        DOCS_ONLY_GATE_IDS,
+        DOCS_ONLY_REASON,
         STORAGE_OPERATIONS_REASON,
         _is_storage_operations_only,
     )
@@ -50,6 +52,8 @@ else:  # Executed as a script under Python isolated mode on a runner.
     )
     CANDIDATE_PACKAGING_FILES = _CI_CLASSIFIER_MODULE.CANDIDATE_PACKAGING_FILES
     CANDIDATE_PACKAGING_REASON = _CI_CLASSIFIER_MODULE.CANDIDATE_PACKAGING_REASON
+    DOCS_ONLY_GATE_IDS = _CI_CLASSIFIER_MODULE.DOCS_ONLY_GATE_IDS
+    DOCS_ONLY_REASON = _CI_CLASSIFIER_MODULE.DOCS_ONLY_REASON
     STORAGE_OPERATIONS_REASON = _CI_CLASSIFIER_MODULE.STORAGE_OPERATIONS_REASON
     _is_storage_operations_only = _CI_CLASSIFIER_MODULE._is_storage_operations_only
 
@@ -486,6 +490,20 @@ def _is_candidate_packaging_only(files: Sequence[object]) -> bool:
     )
 
 
+def _is_docs_only(files: Sequence[object]) -> bool:
+    if not files or any(not isinstance(path, str) for path in files):
+        return False
+    if len(files) != len(set(files)):
+        return False
+    for path in files:
+        if not path.startswith("platform/docs/") or "\\" in path:
+            return False
+        components = path.split("/")
+        if any(component in {"", ".", ".."} for component in components):
+            return False
+    return True
+
+
 def validate_manifest(
     archive: Path,
     *,
@@ -493,6 +511,9 @@ def validate_manifest(
     require_recovery_bootstrap: bool = False,
     require_reconcile_source: bool = False,
     require_runtime_sensitive: bool = False,
+    allow_docs_only: bool = False,
+    allow_candidate_packaging: bool = False,
+    require_docs_only: bool = False,
 ) -> dict[str, Any]:
     if SHA_RE.fullmatch(target_sha) is None:
         raise _fail("provenance")
@@ -528,9 +549,7 @@ def validate_manifest(
         raise _fail("manifest")
     if manifest.get("target_sha") != target_sha:
         raise _fail("provenance")
-    if manifest.get("event") != "push" or manifest.get("class") != "full":
-        raise _fail("manifest")
-    if manifest.get("expected_gates") != EXPECTED_MANIFEST_GATES:
+    if manifest.get("event") != "push":
         raise _fail("manifest")
     if type(manifest.get("runtime_sensitive")) is not bool:
         raise _fail("manifest")
@@ -542,6 +561,13 @@ def validate_manifest(
     recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
     candidate_packaging_only = _is_candidate_packaging_only(files)
     storage_operations_only = _is_storage_operations_only(files)
+    docs_only = manifest.get("class") == "docs-only"
+    if (
+        type(allow_docs_only) is not bool
+        or type(allow_candidate_packaging) is not bool
+        or type(require_docs_only) is not bool
+    ):
+        raise _fail("manifest")
     if type(require_recovery_bootstrap) is not bool:
         raise _fail("manifest")
     if type(require_reconcile_source) is not bool or (
@@ -549,6 +575,46 @@ def validate_manifest(
     ):
         raise _fail("manifest")
     if type(require_runtime_sensitive) is not bool:
+        raise _fail("manifest")
+    if allow_docs_only and require_docs_only:
+        raise _fail("manifest")
+    if require_docs_only and not docs_only:
+        raise _fail("manifest")
+    if docs_only:
+        if not _is_docs_only(files):
+            raise _fail("manifest")
+        if not (allow_docs_only or require_docs_only):
+            raise _fail("manifest")
+        if (
+            manifest.get("class") != "docs-only"
+            or manifest.get("expected_gates") != list(DOCS_ONLY_GATE_IDS)
+            or manifest.get("runtime_sensitive") is not False
+            or manifest.get("deployable") is not False
+            or manifest.get("fallback") is not False
+            or manifest.get("reason") != DOCS_ONLY_REASON
+            or files != sorted(files)
+        ):
+            raise _fail("manifest")
+        if (
+            require_recovery_bootstrap
+            or require_runtime_sensitive
+            or (
+                require_reconcile_source
+                and not (allow_docs_only or require_docs_only)
+            )
+        ):
+            raise _fail("manifest")
+        if type(manifest.get("fallback")) is not bool:
+            raise _fail("manifest")
+        digest = manifest.get("digest")
+        if not isinstance(digest, str) or DIGEST_RE.fullmatch(digest) is None:
+            raise _fail("manifest")
+        if digest != _manifest_digest(manifest):
+            raise _fail("manifest")
+        return dict(manifest)
+    if manifest.get("class") != "full":
+        raise _fail("manifest")
+    if manifest.get("expected_gates") != EXPECTED_MANIFEST_GATES:
         raise _fail("manifest")
     if require_runtime_sensitive and manifest.get("runtime_sensitive") is not True:
         raise _fail("manifest")
@@ -569,7 +635,7 @@ def validate_manifest(
             raise _fail("manifest")
     elif candidate_packaging_only:
         if (
-            not require_reconcile_source
+            not (require_reconcile_source or allow_candidate_packaging)
             or manifest["runtime_sensitive"] is not False
             or manifest["deployable"] is not False
             or manifest.get("reason") != CANDIDATE_PACKAGING_REASON
@@ -618,6 +684,10 @@ def _build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--require-recovery-bootstrap", action="store_true")
     manifest.add_argument("--require-reconcile-source", action="store_true")
     manifest.add_argument("--require-runtime-sensitive", action="store_true")
+    docs_mode = manifest.add_mutually_exclusive_group()
+    docs_mode.add_argument("--allow-docs-only", action="store_true")
+    docs_mode.add_argument("--require-docs-only", action="store_true")
+    manifest.add_argument("--allow-candidate-packaging", action="store_true")
     manifest.add_argument("--emit-manifest-base64", action="store_true")
     return parser
 
@@ -655,6 +725,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 require_recovery_bootstrap=arguments.require_recovery_bootstrap,
                 require_reconcile_source=arguments.require_reconcile_source,
                 require_runtime_sensitive=arguments.require_runtime_sensitive,
+                allow_docs_only=arguments.allow_docs_only,
+                allow_candidate_packaging=arguments.allow_candidate_packaging,
+                require_docs_only=arguments.require_docs_only,
             )
             if arguments.emit_manifest_base64:
                 encoded = base64.b64encode(

@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 from tools.platform_ci_classifier import (
     CANDIDATE_PACKAGING_FILES,
     CANDIDATE_PACKAGING_REASON,
+    DOCS_ONLY_GATE_IDS,
+    DOCS_ONLY_REASON,
     DOCS_PREFIX,
     FULL_GATE_IDS,
     RECOVERY_BOOTSTRAP_FILES,
@@ -301,12 +303,14 @@ def classify_cumulative_baseline(
 ) -> dict[str, object]:
     """Reclassify the complete active-baseline-to-target path set.
 
-    The incremental artifact is accepted only as one of the exact,
-    non-deployable recovery-bootstrap or candidate-packaging manifests. The
-    cumulative file list comes from the bounded first-parent diff and is
-    reclassified here with the canonical router, so an incremental
-    ``runtime_sensitive=false`` result cannot hide older runtime-sensitive
-    changes still present in the candidate range.
+    The incremental artifact is accepted only as one exact docs-only,
+    recovery-bootstrap, or candidate-packaging manifest. The cumulative file
+    list comes from the bounded first-parent diff and is reclassified here
+    with the canonical router, so an incremental ``runtime_sensitive=false``
+    result cannot hide older runtime-sensitive changes still present in the
+    candidate range. A docs-only incremental source is accepted only when
+    the complete active-release-to-target range is itself the canonical
+    docs-only route.
 
     The result is a closed wrapper containing the canonical cumulative
     manifest and an explicit ``no_op`` flag. A pure recovery-bootstrap or
@@ -324,14 +328,29 @@ def classify_cumulative_baseline(
     if not isinstance(incremental_manifest, Mapping):
         raise ProvenanceError("incremental classifier manifest is missing")
     incremental_files = incremental_manifest.get("files")
+    docs_only_source = bool(
+        incremental_manifest.get("event") == "push"
+        and incremental_manifest.get("class") == "docs-only"
+        and incremental_manifest.get("expected_gates") == list(DOCS_ONLY_GATE_IDS)
+        and incremental_manifest.get("fallback") is False
+        and incremental_manifest.get("runtime_sensitive") is False
+        and incremental_manifest.get("deployable") is False
+        and incremental_manifest.get("reason") == DOCS_ONLY_REASON
+        and isinstance(incremental_files, list)
+        and bool(incremental_files)
+        and all(isinstance(path, str) and path.startswith(DOCS_PREFIX) for path in incremental_files)
+    )
     if (
         incremental_manifest.get("event") != "push"
-        or incremental_manifest.get("class") != "full"
-        or incremental_manifest.get("expected_gates") != list(FULL_GATE_IDS)
         or incremental_manifest.get("fallback") is not False
+        or not isinstance(incremental_files, list)
+    ):
+        raise ProvenanceError("incremental manifest is not an eligible non-fallback push route")
+    if not docs_only_source and (
+        incremental_manifest.get("class") != "full"
+        or incremental_manifest.get("expected_gates") != list(FULL_GATE_IDS)
         or type(incremental_manifest.get("runtime_sensitive")) is not bool
         or incremental_manifest.get("deployable") is not False
-        or not isinstance(incremental_files, list)
     ):
         raise ProvenanceError("incremental manifest is not a full non-deployable source route")
     recovery_bootstrap_only = bool(
@@ -350,8 +369,24 @@ def classify_cumulative_baseline(
         )
         and incremental_manifest.get("reason") == CANDIDATE_PACKAGING_REASON
     )
-    if recovery_bootstrap_only == candidate_packaging_only:
+    reconcile_family_count = sum((docs_only_source, recovery_bootstrap_only, candidate_packaging_only))
+    if reconcile_family_count != 1:
         raise ProvenanceError("incremental manifest is not one exact reconcile source family")
+    if docs_only_source:
+        # Reclassification is the canonical check for reason, exact gates,
+        # path normalization and every remaining manifest field.
+        try:
+            canonical_incremental = classify(
+                incremental_files,
+                event="push",
+                branch="dev",
+                target_sha=expected_target_sha,
+                repository_ready=True,
+            )
+        except ClassifierError as exc:
+            raise ProvenanceError("incremental docs-only manifest cannot be reclassified") from exc
+        if canonical_incremental != dict(incremental_manifest):
+            raise ProvenanceError("incremental docs-only manifest is not the canonical path classification")
     if candidate_packaging_only and incremental_manifest.get("runtime_sensitive") is not False:
         raise ProvenanceError("candidate-packaging reconcile source is runtime-sensitive")
     if (
@@ -379,6 +414,23 @@ def classify_cumulative_baseline(
     except ClassifierError as exc:
         raise ProvenanceError(f"cumulative classifier route is unsafe: {exc}") from exc
     cumulative_files = cumulative.get("files")
+    if docs_only_source:
+        docs_only_cumulative = bool(
+            cumulative.get("class") == "docs-only"
+            and cumulative.get("expected_gates") == list(DOCS_ONLY_GATE_IDS)
+            and cumulative.get("fallback") is False
+            and cumulative.get("runtime_sensitive") is False
+            and cumulative.get("deployable") is False
+            and cumulative.get("reason") == DOCS_ONLY_REASON
+            and isinstance(cumulative_files, list)
+            and bool(cumulative_files)
+            and all(isinstance(path, str) and path.startswith(DOCS_PREFIX) for path in cumulative_files)
+        )
+        if not docs_only_cumulative:
+            raise ProvenanceError(
+                "docs-only incremental source does not cover an exact cumulative docs-only route"
+            )
+        return {"manifest": cumulative, "no_op": True}
     storage_recovery_no_op = bool(
         recovery_bootstrap_only
         and cumulative.get("class") == "full"
@@ -435,9 +487,9 @@ def classify_cumulative_baseline(
 def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
     """Validate the authenticated baseline-reconcile route families.
 
-    A no-op is allowed only for an exact canonical source family: the
-    established storage-plus-recovery family, pure recovery-bootstrap, or
-    pure candidate-packaging. A no-op never authorizes an application release.
+    A no-op is allowed only for an exact canonical source family: docs-only,
+    the established storage-plus-recovery family, pure recovery-bootstrap,
+    or pure candidate-packaging. A no-op never authorizes an application release.
     A real cumulative release is accepted only with every full gate and no
     fallback.
     """
@@ -446,16 +498,25 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
         raise ProvenanceError("cumulative classifier result is malformed")
     manifest = route.get("manifest")
     no_op = route.get("no_op")
-    if (
-        not isinstance(manifest, Mapping)
-        or type(no_op) is not bool
-        or manifest.get("class") != "full"
-        or manifest.get("expected_gates") != list(FULL_GATE_IDS)
-        or manifest.get("fallback") is not False
-        or type(manifest.get("runtime_sensitive")) is not bool
-        or type(manifest.get("deployable")) is not bool
-    ):
+    if not isinstance(manifest, Mapping) or type(no_op) is not bool:
         raise ProvenanceError("cumulative classifier route is not canonical full verification")
+    docs_only_manifest = bool(
+        manifest.get("class") == "docs-only"
+        and manifest.get("expected_gates") == list(DOCS_ONLY_GATE_IDS)
+        and manifest.get("fallback") is False
+        and manifest.get("runtime_sensitive") is False
+        and manifest.get("deployable") is False
+        and manifest.get("reason") == DOCS_ONLY_REASON
+    )
+    full_manifest = bool(
+        manifest.get("class") == "full"
+        and manifest.get("expected_gates") == list(FULL_GATE_IDS)
+        and manifest.get("fallback") is False
+        and type(manifest.get("runtime_sensitive")) is bool
+        and type(manifest.get("deployable")) is bool
+    )
+    if not (docs_only_manifest or full_manifest):
+        raise ProvenanceError("cumulative classifier route is not a canonical reconcile route")
     if no_op:
         files = manifest.get("files")
         target_sha = manifest.get("target_sha")
@@ -479,6 +540,11 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
             raise ProvenanceError("cumulative no-op manifest cannot be reclassified") from exc
         if canonical != dict(manifest):
             raise ProvenanceError("cumulative no-op manifest is not the canonical path classification")
+
+        docs_family = bool(
+            docs_only_manifest
+            and all(path.startswith(DOCS_PREFIX) for path in files)
+        )
 
         recovery_family = bool(
             any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
@@ -504,9 +570,11 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
             )
             and manifest["runtime_sensitive"] is True
         )
-        if sum((recovery_family, candidate_family, storage_recovery_family)) != 1:
+        if sum((docs_family, recovery_family, candidate_family, storage_recovery_family)) != 1:
             raise ProvenanceError("cumulative no-op route is outside the exact authorized file families")
         return {"no_op": True, "runtime_required": False}
+    if docs_only_manifest:
+        raise ProvenanceError("docs-only cumulative route cannot authorize an application release")
     if manifest["deployable"] is not True:
         raise ProvenanceError("cumulative non-no-op route is not deployable")
     return {

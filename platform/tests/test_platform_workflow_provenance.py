@@ -65,6 +65,7 @@ from tools.platform_deploy_baseline import (  # noqa: E402
 from tools.platform_ci_classifier import (  # noqa: E402
     CANDIDATE_PACKAGING_FILES,
     CANDIDATE_PACKAGING_REASON,
+    DOCS_ONLY_GATE_IDS,
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
     STORAGE_OPERATIONS_REASON,
@@ -704,6 +705,48 @@ class WorkflowProvenanceTests(unittest.TestCase):
             validate_cumulative_reconcile_route(no_op),
             {"no_op": True, "runtime_required": False},
         )
+
+        docs_path = "platform/docs/operations-runbook.md"
+        docs_incremental = classify(
+            [docs_path], event="push", branch="dev", target_sha=self.SHA
+        )
+        docs_no_op = classify_cumulative_baseline(
+            docs_incremental, [docs_path], expected_target_sha=self.SHA
+        )
+        self.assertEqual(docs_incremental["class"], "docs-only")
+        self.assertEqual(docs_incremental["expected_gates"], list(DOCS_ONLY_GATE_IDS))
+        self.assertFalse(docs_incremental["runtime_sensitive"])
+        self.assertFalse(docs_incremental["deployable"])
+        self.assertTrue(docs_no_op["no_op"])
+        self.assertEqual(
+            validate_cumulative_reconcile_route(docs_no_op),
+            {"no_op": True, "runtime_required": False},
+        )
+
+        with self.assertRaisesRegex(ProvenanceError, "cumulative docs-only route"):
+            classify_cumulative_baseline(
+                docs_incremental,
+                [docs_path, "platform/tools/platform_release_deploy.sh"],
+                expected_target_sha=self.SHA,
+            )
+
+        mixed_incremental = classify(
+            [docs_path, ".github/workflows/platform-production-storage-maintenance.yml"],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        with self.assertRaisesRegex(ProvenanceError, "one exact reconcile source family"):
+            classify_cumulative_baseline(
+                mixed_incremental,
+                [docs_path, ".github/workflows/platform-production-storage-maintenance.yml"],
+                expected_target_sha=self.SHA,
+            )
+
+        with self.assertRaisesRegex(ProvenanceError, "cannot authorize an application release"):
+            validate_cumulative_reconcile_route(
+                {"manifest": docs_incremental, "no_op": False}
+            )
 
         incremental_path = "platform/tests/test_platform_live_qa_wrappers.py"
         incremental = classify(

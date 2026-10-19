@@ -595,7 +595,7 @@ jobs:
             --output "$route_dir/artifact.zip"
           manifest_args=(--target-sha "$TARGET_SHA" --emit-manifest-base64)
           if [[ "$RECONCILE_MODE" == "true" ]]; then
-            manifest_args+=(--require-reconcile-source)
+            manifest_args+=(--require-reconcile-source --allow-docs-only)
           fi
           if [[ "$RECOVERY_DEPLOY_MODE" == "true" ]]; then
             manifest_args+=(--require-recovery-bootstrap --require-runtime-sensitive)
