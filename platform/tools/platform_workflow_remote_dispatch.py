@@ -116,6 +116,27 @@ LIVE_HELPER = ACTIVE_TOOLS_DIR / "platform_live_launch_supervisor.sh"
 LIVE_USER_QA_HELPER = ACTIVE_TOOLS_DIR / "platform_live_user_qa_dispatch.py"
 CPU_DIAGNOSTIC_PLAN_HELPER = ACTIVE_TOOLS_DIR / "platform_cpu_diagnostic_plan.py"
 CPU_DIAGNOSTIC_OUTPUT_CAP = 32_768
+EXPORT_REMOVE_STDOUT_CAP = 128
+EXPORT_REMOVE_ERROR_CLASSES = frozenset({
+    "dispatcher_preflight", "dispatcher_spawn_failed", "dispatcher_protocol",
+    "dispatcher_timeout", "dispatcher_output_limit", "dispatcher_transport",
+    "account_contract_invalid", "account_identity_collision", "account_lookup_failed",
+    "account_password_unlocked", "account_shadow_changed", "account_shadow_encoding",
+    "account_shadow_entry", "account_shadow_metadata", "account_shadow_unavailable",
+    "complete_marker_create_failed", "complete_marker_invalid",
+    "complete_marker_metadata_invalid", "complete_marker_sync_failed",
+    "entry_metadata_invalid", "entry_open_failed", "entry_stat_failed",
+    "export_entry_changed", "export_entry_unlink_failed", "export_root_changed",
+    "export_root_inventory_changed", "export_root_inventory_invalid",
+    "export_root_list_failed", "export_root_metadata_invalid", "export_root_not_empty",
+    "export_root_open_failed", "export_root_remove_failed", "filesystem_operation_failed",
+    "input_invalid", "input_too_large", "owner_check_requires_root",
+    "sudo_access_present_or_unknown", "sudo_binary_metadata", "sudo_policy_check_failed",
+    "sudo_policy_unavailable", "tmp_root_changed", "tmp_root_metadata",
+    "tmp_root_unavailable", "worker_capabilities_invalid", "worker_capabilities_unavailable",
+    "worker_descriptors_unavailable", "worker_identity_malformed", "worker_identity_mismatch",
+    "worker_identity_unavailable",
+})
 CAPACITY_MEMORY_WATCH_OUTPUT_CAP = 131_072
 CAPACITY_MEMORY_WATCH_LINE_CAP = 2048
 CPU_USAGE_ROW_FIELDS = {
@@ -728,7 +749,8 @@ def _run_sudo(
 def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
     """Cross the pinned root boundary for one fixed, bounded plan operation."""
 
-    if not _trusted_helper(CPU_DIAGNOSTIC_PLAN_HELPER):
+    if not _trusted_python_helper(CPU_DIAGNOSTIC_PLAN_HELPER):
+        print("CPU_DIAGNOSTIC_PLAN status=refused class=UntrustedHelper")
         return 2
     operation = payload.get("operation")
     if operation == "prepare":
@@ -753,7 +775,8 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
         return 2
     try:
         process = subprocess.Popen(  # nosec B603
-            [SUDO, "-n", "--", str(CPU_DIAGNOSTIC_PLAN_HELPER), helper_command],
+            [SUDO, "-n", "--", SYSTEM_PYTHON, "-I", "-B",
+             str(CPU_DIAGNOSTIC_PLAN_HELPER), helper_command],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -1113,7 +1136,8 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
 def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
     """Stream only the fixed, validated SSR cgroup memory-watch projection."""
 
-    if not _trusted_helper(CPU_DIAGNOSTIC_PLAN_HELPER):
+    if not _trusted_python_helper(CPU_DIAGNOSTIC_PLAN_HELPER):
+        print("CPU_DIAGNOSTIC_PLAN status=refused class=UntrustedHelper")
         return 2
     helper_payload = {
         "schema": payload["schema"], "run_id": payload["run_id"],
@@ -1124,7 +1148,8 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
     ).encode("ascii") + b"\n"
     try:
         process = subprocess.Popen(  # nosec B603
-            [SUDO, "-n", "--", str(CPU_DIAGNOSTIC_PLAN_HELPER), "memory-watch-stdin"],
+            [SUDO, "-n", "--", SYSTEM_PYTHON, "-I", "-B",
+             str(CPU_DIAGNOSTIC_PLAN_HELPER), "memory-watch-stdin"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             start_new_session=True, close_fds=True, umask=0o077,
         )
@@ -2361,6 +2386,33 @@ def _trusted_helper(helper: Path) -> bool:
     )
 
 
+def _trusted_python_helper(helper: Path) -> bool:
+    """Validate an immutable Python helper run by the fixed system interpreter.
+
+    Release tool sources are intentionally installed as root-owned 0644 data,
+    not executable programs.  This predicate keeps the same parent, owner,
+    link-count, and write-protection checks as `_trusted_helper`, while
+    requiring a read bit instead of an execute bit because the caller uses
+    `/usr/bin/python3.12 -I -B` explicitly.
+    """
+
+    if helper.parent != ACTIVE_TOOLS_DIR:
+        return False
+    try:
+        metadata = helper.lstat()
+    except OSError:
+        return False
+    mode = stat.S_IMODE(metadata.st_mode)
+    return bool(
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+        and metadata.st_nlink == 1
+        and not mode & 0o022
+        and mode & 0o400
+    )
+
+
 def _trusted_data(path: Path) -> bool:
     if path.parent != ACTIVE_TOOLS_DIR:
         return False
@@ -2954,12 +3006,18 @@ def _run_retained_export_executor(operation: str, payload: dict[str, object]) ->
         or not _trusted_generation()
         or not _trusted_export_executor(RETAINED_LOAD_EXPORT_EXECUTOR)
     ):
+        if operation == "remove":
+            print("ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=dispatcher_preflight")
         return 1
     owner = _retained_load_export_owner()
     if owner is None:
+        if operation == "remove":
+            print("ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=dispatcher_preflight")
         return 1
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
     if len(raw) > 256:
+        if operation == "remove":
+            print("ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=dispatcher_preflight")
         return 1
     command = [
         SETPRIV,
@@ -2981,7 +3039,7 @@ def _run_retained_export_executor(operation: str, payload: dict[str, object]) ->
         process = subprocess.Popen(  # nosec B603 - fixed command and closed JSON schemas.
             command,
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if operation == "remove" else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             cwd="/",
             env=EXPORT_EXECUTOR_ENV,
@@ -2989,12 +3047,94 @@ def _run_retained_export_executor(operation: str, payload: dict[str, object]) ->
             start_new_session=True,
             close_fds=True,
         )
+    except OSError:
+        if operation == "remove":
+            print("ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=dispatcher_spawn_failed")
+        return 1
+    if operation == "remove":
+        return _wait_for_export_remove(process, raw)
+    try:
         process.communicate(input=raw, timeout=CLEANUP_OPERATION_TIMEOUT_SECONDS)
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
         if "process" in locals() and process.poll() is None:
             _terminate_process_group(process)
         return 1
     return 0 if process.returncode == 0 else 1
+
+
+def _wait_for_export_remove(process: subprocess.Popen[bytes], payload: bytes) -> int:
+    """Forward one bounded, fixed export-removal result marker."""
+
+    def fail(error_class: str) -> int:
+        print(f"ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class={error_class}")
+        return 1
+
+    if process.stdin is None or process.stdout is None:
+        _terminate_process_group(process)
+        return fail("dispatcher_protocol")
+    output = bytearray()
+    selector: selectors.BaseSelector | None = None
+    try:
+        process.stdin.write(payload)
+        process.stdin.flush()
+        process.stdin.close()
+        selector = selectors.DefaultSelector()
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        selector.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + CLEANUP_OPERATION_TIMEOUT_SECONDS
+        eof = False
+        while process.poll() is None or not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process_group(process)
+                return fail("dispatcher_timeout")
+            for key, _mask in selector.select(min(remaining, 0.1)):
+                try:
+                    block = os.read(key.fd, EXPORT_REMOVE_STDOUT_CAP + 1 - len(output))
+                except BlockingIOError:
+                    continue
+                if not block:
+                    selector.unregister(key.fd)
+                    eof = True
+                    continue
+                output.extend(block)
+                if len(output) > EXPORT_REMOVE_STDOUT_CAP:
+                    _terminate_process_group(process)
+                    return fail("dispatcher_output_limit")
+        process.wait(timeout=0)
+    except (OSError, subprocess.SubprocessError):
+        if process.poll() is None:
+            _terminate_process_group(process)
+        return fail("dispatcher_transport")
+    finally:
+        if selector is not None:
+            selector.close()
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+    raw_output = bytes(output)
+    if process.returncode == 0:
+        match = re.fullmatch(
+            rb"ARTIFACT_EXPORT_REMOVE schema=1 status=passed removed_roots=[0-2]\n",
+            raw_output,
+        )
+        if match is not None:
+            print(raw_output[:-1].decode("ascii"))
+            return 0
+        return fail("dispatcher_protocol")
+    if process.returncode == 1:
+        match = re.fullmatch(
+            rb"ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=([a-z_]+)\n",
+            raw_output,
+        )
+        if match is not None and match.group(1).decode("ascii") in EXPORT_REMOVE_ERROR_CLASSES:
+            print(raw_output[:-1].decode("ascii"))
+            return 1
+    return fail("dispatcher_protocol")
 
 
 def _touch_complete(payload: dict[str, object]) -> int:
@@ -3027,6 +3167,7 @@ def _remove_exports(
             expected_baseline_identity=expected_baseline_identity,
         )
     ):
+        print("ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=dispatcher_preflight")
         return 1
     return _run_retained_export_executor(
         "remove",
@@ -3365,6 +3506,9 @@ def main(argv: list[str] | None = None) -> int:
             ).hexdigest(),
         )
     except (WorkflowInputError, OSError, ValueError, subprocess.SubprocessError):
+        if arguments in (["external-cleanup-exports"], ["retained-cleanup-exports"]):
+            print("ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=dispatcher_preflight")
+            return 1
         return _fail()
 
 

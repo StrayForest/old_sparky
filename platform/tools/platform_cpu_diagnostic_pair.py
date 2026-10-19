@@ -475,9 +475,11 @@ def _public_report(value: dict[str, Any]) -> dict[str, Any]:
         "namespace_closed": value.get("namespace_closed") is True,
         "plan_cleanup": value.get("plan_cleanup") if value.get("plan_cleanup") in {"complete", "failed", "unknown", "pending"} else "unknown",
         "plan_prepare_status": value.get("plan_prepare_status") if value.get("plan_prepare_status") in {"not_attempted", "prepared", "refused", "transport_failed", "bad_protocol"} else "not_attempted",
-        "plan_prepare_refusal_class": value.get("plan_prepare_refusal_class") if value.get("plan_prepare_refusal_class") in {"PlanError", "OSError", "ValueError", "KeyError", "unexpected"} else "none",
+        "plan_prepare_refusal_class": value.get("plan_prepare_refusal_class") if value.get("plan_prepare_refusal_class") in {"PlanError", "OSError", "ValueError", "KeyError", "UntrustedHelper", "unexpected"} else "none",
         "plan_cleanup_status": value.get("plan_cleanup_status") if value.get("plan_cleanup_status") in {"not_attempted", "pending", "complete", "refused", "transport_failed", "bad_protocol", "failed"} else "not_attempted",
-        "plan_cleanup_refusal_class": value.get("plan_cleanup_refusal_class") if value.get("plan_cleanup_refusal_class") in {"PlanError", "OSError", "ValueError", "KeyError", "unexpected"} else "none",
+        "plan_cleanup_refusal_class": value.get("plan_cleanup_refusal_class") if value.get("plan_cleanup_refusal_class") in {"PlanError", "OSError", "ValueError", "KeyError", "UntrustedHelper", "unexpected"} else "none",
+        "ssh_prepare_transport": _public_ssh_transport(value.get("ssh_prepare_transport")),
+        "ssh_cleanup_transport": _public_ssh_transport(value.get("ssh_cleanup_transport")),
         "plan_cleanup_failure_code": value.get("plan_cleanup_failure_code") if value.get("plan_cleanup_failure_code") in {"none", "plan_refused", "transport_failed", "bad_protocol", "cleanup_failed"} else "bad_protocol",
         "source_sha": value.get("source_sha") if isinstance(value.get("source_sha"), str) and SOURCE_SHA_RE.fullmatch(value["source_sha"]) else None,
         "app_target_sha": value.get("app_target_sha") if isinstance(value.get("app_target_sha"), str) and SOURCE_SHA_RE.fullmatch(value["app_target_sha"]) else None,
@@ -669,6 +671,26 @@ def _public_report(value: dict[str, Any]) -> dict[str, Any]:
                 clean_memory["rows"].append(item)
         output["memory_attribution"] = clean_memory
     return output
+
+
+def _public_ssh_transport(value: Any) -> dict[str, Any]:
+    """Expose only closed SSH child outcome fields, never stdout/stderr."""
+
+    allowed_stage = {
+        "not_started", "spawn_failed", "input", "read", "timeout", "output_limit",
+        "wait", "protocol", "complete", "transport_failed",
+    }
+    allowed_child = {"not_started", "running", "reaped", "unknown"}
+    allowed_shape = {"none", "single_line", "prepared_marker", "refusal_marker", "summary_marker", "malformed"}
+    if not isinstance(value, dict):
+        return {"stage": "not_started", "return_code": None, "stdout_shape": "none", "child_state": "not_started"}
+    code = value.get("return_code")
+    return {
+        "stage": value.get("stage") if value.get("stage") in allowed_stage else "transport_failed",
+        "return_code": code if type(code) is int and -255 <= code <= 255 else None,
+        "stdout_shape": value.get("stdout_shape") if value.get("stdout_shape") in allowed_shape else "malformed",
+        "child_state": value.get("child_state") if value.get("child_state") in allowed_child else "unknown",
+    }
 
 
 def _record_plan_cleanup_failure(report: dict[str, Any]) -> None:
@@ -1706,6 +1728,7 @@ def _parent(args: argparse.Namespace) -> int:
         )
         report["plan_prepare_status"] = ssh_lifecycle.get("plan_prepare_status", "bad_protocol")
         report["plan_prepare_refusal_class"] = ssh_lifecycle.get("plan_prepare_refusal_class", "none")
+        report["ssh_prepare_transport"] = ssh_lifecycle.get("prepare_transport")
         if not prepared:
             report["failure_stage"] = "preflight"
             report["failure_code"] = "ssh_preflight_failed"
@@ -1839,6 +1862,7 @@ def _parent(args: argparse.Namespace) -> int:
                     report["plan_cleanup_refusal_class"] = ssh_lifecycle.get(
                         "plan_cleanup_refusal_class", "none"
                     )
+                    report["ssh_cleanup_transport"] = ssh_lifecycle.get("cleanup_transport")
             except (OSError, PairError, subprocess.SubprocessError):
                 report["plan_cleanup"] = "failed"
                 report["plan_cleanup_status"] = "transport_failed"
@@ -1859,8 +1883,31 @@ def _parent(args: argparse.Namespace) -> int:
                                 "config_dir_ino": metadata.st_ino,
                             }
                             report["ssh_material_safe_to_remove"] = True
+                            if not _path_exists_nofollow(ssh_lifecycle_receipt_path):
+                                lifecycle_receipt = {
+                                    "schema": 1,
+                                    "event": "cpu_diagnostic_ssh_lifecycle",
+                                    "source_sha": args.source_sha,
+                                    "run_id": args.external_run_id,
+                                    "attempt": args.external_run_attempt,
+                                    "config_dir_dev": metadata.st_dev,
+                                    "config_dir_ino": metadata.st_ino,
+                                    "material_hidden": ssh_hidden.get("value") is True,
+                                }
+                                _write_report(ssh_lifecycle_receipt_path, lifecycle_receipt)
+                                _validate_ssh_lifecycle_receipt(
+                                    ssh_lifecycle_receipt_path,
+                                    expected={
+                                        "source_sha": args.source_sha,
+                                        "run_id": args.external_run_id,
+                                        "attempt": args.external_run_attempt,
+                                        "config_dir_dev": ssh_dir_identity.st_dev,
+                                        "config_dir_ino": ssh_dir_identity.st_ino,
+                                    },
+                                )
                     except PairError:
                         cleaned = False
+                        report["ssh_material_safe_to_remove"] = False
             if not cleaned:
                 status = 2
                 _record_plan_cleanup_failure(report)
@@ -1929,6 +1976,12 @@ def _ssh_plan(
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
     operation = payload.get("operation")
     status_key = "plan_prepare_status" if operation == "prepare" else "plan_cleanup_status"
+    transport_key = "prepare_transport" if operation == "prepare" else "cleanup_transport"
+    transport: dict[str, Any] = {
+        "stage": "not_started", "return_code": None,
+        "stdout_shape": "none", "child_state": "not_started",
+    }
+    lifecycle[transport_key] = transport
     refusal_key = (
         "plan_prepare_refusal_class" if operation == "prepare"
         else "plan_cleanup_refusal_class"
@@ -1958,8 +2011,11 @@ def _ssh_plan(
             start_new_session=True,
         )
     except OSError:
+        transport["stage"] = "spawn_failed"
+        lifecycle[status_key] = "transport_failed"
         return False, None, None
     lifecycle["closed"] = False
+    transport["child_state"] = "running"
     lifecycle["mux_off_enforced"] = True
     output = bytearray()
     selector: selectors.BaseSelector | None = None
@@ -1970,16 +2026,20 @@ def _ssh_plan(
         descriptor = process.stdout.fileno()
         os.set_blocking(descriptor, False)
         selector.register(descriptor, selectors.EVENT_READ)
+        transport["stage"] = "input"
         process.stdin.write(data)
         process.stdin.flush()
         process.stdin.close()
+        transport["stage"] = "read"
         deadline = time.monotonic() + 20
         eof = False
         while process.poll() is None or not eof:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                transport["stage"] = "timeout"
                 _terminate_worker(process)
                 lifecycle["closed"] = True
+                transport["child_state"] = "reaped"
                 return False, None, None
             for key_event, _mask in selector.select(min(remaining, 0.1)):
                 try:
@@ -1992,25 +2052,39 @@ def _ssh_plan(
                     continue
                 output.extend(chunk)
                 if len(output) > ROOT_USAGE_OUTPUT_CAP:
+                    transport["stage"] = "output_limit"
                     _terminate_worker(process)
                     lifecycle["closed"] = True
+                    transport["child_state"] = "reaped"
                     return False, None, None
+        transport["stage"] = "wait"
         _confirm_worker_closed(process)
         lifecycle["closed"] = True
         lifecycle["last_command_returned"] = True
+        transport["child_state"] = "reaped"
+        transport["return_code"] = process.returncode if type(process.returncode) is int else None
+        transport["stdout_shape"] = (
+            "none" if not output
+            else "single_line" if output.endswith(b"\n") and output.count(b"\n") == 1
+            else "malformed"
+        )
         if process.returncode != 0 or not output.endswith(b"\n") or output.count(b"\n") != 1:
             if process.returncode == 2:
                 refusal = re.fullmatch(
-                    rb"CPU_DIAGNOSTIC_PLAN status=refused class=(PlanError|OSError|ValueError|KeyError|unexpected)\n",
+                    rb"CPU_DIAGNOSTIC_PLAN status=refused class=(PlanError|OSError|ValueError|KeyError|UntrustedHelper|unexpected)\n",
                     bytes(output),
                 )
                 if refusal is not None:
                     lifecycle[status_key] = "refused"
                     lifecycle[refusal_key] = refusal.group(1).decode("ascii")
+                    transport["stdout_shape"] = "refusal_marker"
+                    transport["stage"] = "complete"
                 else:
                     lifecycle[status_key] = "bad_protocol"
+                    transport["stage"] = "protocol"
             elif process.returncode == 0:
                 lifecycle[status_key] = "bad_protocol"
+                transport["stage"] = "protocol"
             return False, None, None
         if payload.get("operation") == "prepare":
             try:
@@ -2022,9 +2096,14 @@ def _ssh_plan(
                 text,
             )
             lifecycle[status_key] = "prepared" if match else "bad_protocol"
+            transport["stdout_shape"] = "prepared_marker" if match else "malformed"
+            transport["stage"] = "complete" if match else "protocol"
             return (True, match.group(1), None) if match else (False, None, None)
         prefix = b"CPU_DIAGNOSTIC_PLAN "
         if not bytes(output).startswith(prefix):
+            lifecycle[status_key] = "bad_protocol"
+            transport["stdout_shape"] = "malformed"
+            transport["stage"] = "protocol"
             return False, None, None
         try:
             usage_value = _decode_canonical(bytes(output)[len(prefix):-1], cap=ROOT_USAGE_OUTPUT_CAP)
@@ -2034,13 +2113,22 @@ def _ssh_plan(
         usage = _validate_usage_summary(usage_value)
         if usage is None or (usage["service_count"] == 0 and not allow_noop_cleanup):
             lifecycle[status_key] = "bad_protocol"
+            transport["stdout_shape"] = "malformed"
+            transport["stage"] = "protocol"
             return False, None, None
         lifecycle[status_key] = "complete"
+        transport["stdout_shape"] = "summary_marker"
+        transport["stage"] = "complete"
         return True, None, usage
     except (OSError, subprocess.SubprocessError):
         lifecycle[status_key] = "transport_failed"
-        _terminate_worker(process)
-        lifecycle["closed"] = True
+        transport["stage"] = "transport_failed"
+        try:
+            _terminate_worker(process)
+            lifecycle["closed"] = True
+            transport["child_state"] = "reaped"
+        except (OSError, PairError, subprocess.SubprocessError):
+            transport["child_state"] = "unknown"
         return False, None, None
     finally:
         if selector is not None:
@@ -2056,11 +2144,23 @@ def _ssh_plan(
             except OSError:
                 pass
         if process.poll() is None:
-            _terminate_worker(process)
-            lifecycle["closed"] = True
+            try:
+                _terminate_worker(process)
+                lifecycle["closed"] = True
+                transport["child_state"] = "reaped"
+            except (OSError, PairError, subprocess.SubprocessError):
+                lifecycle["closed"] = False
+                transport["child_state"] = "unknown"
         else:
-            _confirm_worker_closed(process)
-            lifecycle["closed"] = True
+            try:
+                _confirm_worker_closed(process)
+                lifecycle["closed"] = True
+                transport["child_state"] = "reaped"
+                if type(process.returncode) is int:
+                    transport["return_code"] = process.returncode
+            except (OSError, PairError, subprocess.SubprocessError):
+                lifecycle["closed"] = False
+                transport["child_state"] = "unknown"
 
 
 def _process_group_exists(process_group_id: int) -> bool:
@@ -2156,7 +2256,7 @@ def _validate_ssh_lifecycle_receipt(path: Path, *, expected: dict[str, Any]) -> 
         type(receipt.get("schema")) is not int
         or receipt["schema"] != 1
         or receipt.get("event") != "cpu_diagnostic_ssh_lifecycle"
-        or receipt.get("material_hidden") is not True
+        or type(receipt.get("material_hidden")) is not bool
         or not isinstance(receipt.get("source_sha"), str)
         or not isinstance(receipt.get("run_id"), str)
         or not isinstance(receipt.get("attempt"), str)

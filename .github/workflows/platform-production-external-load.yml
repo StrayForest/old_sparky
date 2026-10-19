@@ -1880,7 +1880,7 @@ jobs:
                   or lifecycle.get("source_sha") != source_sha
                   or lifecycle.get("run_id") != run_id
                   or lifecycle.get("attempt") != attempt
-                  or lifecycle.get("material_hidden") is not True
+                  or type(lifecycle.get("material_hidden")) is not bool
                   or type(lifecycle.get("config_dir_dev")) is not int
                   or type(lifecycle.get("config_dir_ino")) is not int
                   or lifecycle["config_dir_dev"] < 0
@@ -2114,6 +2114,7 @@ jobs:
       cleanup_remote_diagnostic_status: ${{ steps.cleanup.outputs.cleanup_remote_diagnostic_status }}
       cleanup_exports_status: ${{ steps.cleanup.outputs.cleanup_exports_status }}
       cleanup_export_status: ${{ steps.cleanup.outputs.cleanup_export_status }}
+      cleanup_export_error_class: ${{ steps.cleanup.outputs.cleanup_export_error_class }}
       ssh_cleanup_status: ${{ steps.cleanup_ssh.outputs.ssh_cleanup_status }}
       cleanup_identity_status: ${{ steps.revalidate-finalizer.outputs.cleanup_identity_status }}
       handoff_status: ${{ steps.revalidate-finalizer.outputs.handoff_status }}
@@ -2628,6 +2629,8 @@ jobs:
           cleanup_remote_diagnostic_status=1
           cleanup_exports_status=1
           cleanup_export_status=1
+          cleanup_export_error_class=not_run
+          cleanup_export_marker_cleanup_status=1
           [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]] || HOST_TOOLS_SHA=""
           retained_load_dispatcher="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA/platform_workflow_remote_dispatch.py"
           cleanup_artifact_status=1
@@ -2832,15 +2835,90 @@ jobs:
 
             # Always attempt private export deletion after the primary cleanup
             # attempt.  Its status is independent and never hidden.
+            export_marker_path="$(mktemp "$RUNNER_TEMP/platform-export-remove.XXXXXX")"
             ssh -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes \
               -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
               -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
               /usr/bin/python3.12 -I -B "$retained_load_dispatcher" \
-              external-cleanup-exports < "$input_path" >/dev/null 2>&1
+              external-cleanup-exports < "$input_path" >"$export_marker_path" 2>/dev/null
             cleanup_export_status="$?"
             cleanup_exports_status="$cleanup_export_status"
+            cleanup_export_error_class="$(/usr/bin/python3 -I - "$export_marker_path" "$cleanup_export_status" <<'PY'
+          import re
+          import os
+          import stat
+          import sys
+
+          path = sys.argv[1]
+          try:
+              before = os.lstat(path)
+              if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                      or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600
+                      or before.st_size > 128):
+                  raise OSError
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                      raise OSError
+                  raw = os.read(descriptor, 129)
+                  after = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              if (len(raw) > 128 or (after.st_dev, after.st_ino, after.st_size,
+                      after.st_mtime_ns, after.st_ctime_ns) != (
+                      before.st_dev, before.st_ino, before.st_size,
+                      before.st_mtime_ns, before.st_ctime_ns)):
+                  raise OSError
+              status = sys.argv[2]
+              if status == "0" and re.fullmatch(
+                  rb"ARTIFACT_EXPORT_REMOVE schema=1 status=passed removed_roots=[0-2]\n", raw
+              ):
+                  print("none")
+              elif status == "1":
+                  match = re.fullmatch(
+                      rb"ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=([a-z_]+)\n", raw
+                  )
+                  allowed = {
+                      "dispatcher_preflight", "dispatcher_spawn_failed", "dispatcher_protocol",
+                      "dispatcher_timeout", "dispatcher_output_limit", "dispatcher_transport",
+                      "account_contract_invalid", "account_identity_collision", "account_lookup_failed",
+                      "account_password_unlocked", "account_shadow_changed", "account_shadow_encoding",
+                      "account_shadow_entry", "account_shadow_metadata", "account_shadow_unavailable",
+                      "complete_marker_create_failed", "complete_marker_invalid",
+                      "complete_marker_metadata_invalid", "complete_marker_sync_failed",
+                      "entry_metadata_invalid", "entry_open_failed", "entry_stat_failed",
+                      "export_entry_changed", "export_entry_unlink_failed", "export_root_changed",
+                      "export_root_inventory_changed", "export_root_inventory_invalid",
+                      "export_root_list_failed", "export_root_metadata_invalid", "export_root_not_empty",
+                      "export_root_open_failed", "export_root_remove_failed", "filesystem_operation_failed",
+                      "input_invalid", "input_too_large", "owner_check_requires_root",
+                      "sudo_access_present_or_unknown", "sudo_binary_metadata", "sudo_policy_check_failed",
+                      "sudo_policy_unavailable", "tmp_root_changed", "tmp_root_metadata",
+                      "tmp_root_unavailable", "worker_capabilities_invalid", "worker_capabilities_unavailable",
+                      "worker_descriptors_unavailable", "worker_identity_malformed", "worker_identity_mismatch",
+                      "worker_identity_unavailable",
+                  }
+                  error_class = match.group(1).decode("ascii") if match else ""
+                  print(error_class if error_class in allowed else "unavailable")
+              else:
+                  print("unavailable")
+          except (OSError, ValueError, UnicodeError):
+              print("unavailable")
+          PY
+          )"
+            rm -f -- "$export_marker_path"
+            if [[ ! -e "$export_marker_path" && ! -L "$export_marker_path" ]]; then
+              cleanup_export_marker_cleanup_status=0
+            else
+              cleanup_export_error_class=unavailable
+              cleanup_export_marker_cleanup_status=1
+            fi
             if [[ "$cleanup_status" == 0 ]] \
               && { [[ "$cleanup_artifact_status" != 0 ]] || [[ "$cleanup_exports_status" != 0 ]]; }; then
+              cleanup_status=1
+            fi
+            if [[ "$cleanup_export_marker_cleanup_status" != 0 ]]; then
               cleanup_status=1
             fi
             if [[ "$cleanup_status" != 0 || "$cleanup_exports_status" != 0 ]]; then
@@ -2862,6 +2940,8 @@ jobs:
           echo "cleanup_remote_diagnostic_status=$cleanup_remote_diagnostic_status" >> "$GITHUB_OUTPUT"
           echo "cleanup_exports_status=$cleanup_exports_status" >> "$GITHUB_OUTPUT"
           echo "cleanup_export_status=$cleanup_export_status" >> "$GITHUB_OUTPUT"
+          echo "cleanup_export_error_class=$cleanup_export_error_class" >> "$GITHUB_OUTPUT"
+          echo "cleanup_export_marker_cleanup_status=$cleanup_export_marker_cleanup_status" >> "$GITHUB_OUTPUT"
           printf 'External cleanup diagnostic: ssh_exit=%s stage=%s dispatch_exit=%s child_state=%s child_exit=%s stdout_eof=%s timed_out=%s bound=%s\n' \
             "$cleanup_remote_ssh_exit_code" "$cleanup_remote_stage" \
             "$cleanup_remote_dispatch_exit_code" "$cleanup_remote_child_state" \
@@ -2943,6 +3023,7 @@ jobs:
           ORIGIN_CLEANUP_REMOTE_TIMED_OUT: ${{ steps.cleanup.outputs.cleanup_remote_timed_out }}
           ORIGIN_CLEANUP_REMOTE_DIAGNOSTIC_STATUS: ${{ steps.cleanup.outputs.cleanup_remote_diagnostic_status }}
           ORIGIN_CLEANUP_EXPORTS_STATUS: ${{ steps.cleanup.outputs.cleanup_exports_status }}
+          ORIGIN_CLEANUP_EXPORT_ERROR_CLASS: ${{ steps.cleanup.outputs.cleanup_export_error_class }}
           ORIGIN_SSH_CLEANUP_STATUS: ${{ steps.cleanup_ssh.outputs.ssh_cleanup_status }}
           ORIGIN_CLEANUP_IDENTITY_STATUS: ${{ steps.revalidate-finalizer.outputs.cleanup_identity_status }}
           ORIGIN_SOURCE_SHA: ${{ github.sha }}
@@ -3029,6 +3110,28 @@ jobs:
                   else "invalid"
               ),
               "exports": classify("ORIGIN_CLEANUP_EXPORTS_STATUS", {"0": "ok", "1": "failed"}),
+              "export_error_class": classify(
+                  "ORIGIN_CLEANUP_EXPORT_ERROR_CLASS",
+                  {value: value for value in (
+                      "none", "not_run", "unavailable", "dispatcher_preflight",
+                      "dispatcher_spawn_failed", "dispatcher_protocol", "dispatcher_timeout",
+                      "dispatcher_output_limit", "dispatcher_transport", "account_contract_invalid",
+                      "account_identity_collision", "account_lookup_failed", "account_password_unlocked",
+                      "account_shadow_changed", "account_shadow_encoding", "account_shadow_entry",
+                      "account_shadow_metadata", "account_shadow_unavailable", "complete_marker_create_failed",
+                      "complete_marker_invalid", "complete_marker_metadata_invalid", "complete_marker_sync_failed",
+                      "entry_metadata_invalid", "entry_open_failed", "entry_stat_failed", "export_entry_changed",
+                      "export_entry_unlink_failed", "export_root_changed", "export_root_inventory_changed",
+                      "export_root_inventory_invalid", "export_root_list_failed", "export_root_metadata_invalid",
+                      "export_root_not_empty", "export_root_open_failed", "export_root_remove_failed",
+                      "filesystem_operation_failed", "input_invalid", "input_too_large", "owner_check_requires_root",
+                      "sudo_access_present_or_unknown", "sudo_binary_metadata", "sudo_policy_check_failed",
+                      "sudo_policy_unavailable", "tmp_root_changed", "tmp_root_metadata", "tmp_root_unavailable",
+                      "worker_capabilities_invalid", "worker_capabilities_unavailable",
+                      "worker_descriptors_unavailable", "worker_identity_malformed", "worker_identity_mismatch",
+                      "worker_identity_unavailable",
+                  )},
+              ),
               "ssh_cleanup": classify("ORIGIN_SSH_CLEANUP_STATUS", {"0": "ok", "1": "failed"}),
               "identity": classify("ORIGIN_CLEANUP_IDENTITY_STATUS", {"0": "ok", "1": "failed"}),
           }
@@ -3054,6 +3157,7 @@ jobs:
                   ("binding_app", "bound"),
                   ("binding_run", "bound"),
                   ("exports", "ok"),
+                  ("export_error_class", "none"),
                   ("ssh_cleanup", "ok"),
                   ("identity", "ok"),
               )

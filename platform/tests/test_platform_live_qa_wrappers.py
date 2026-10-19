@@ -604,7 +604,16 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 + "\n"
             )
 
-            def fake_popen(_command, **kwargs):
+            def fake_popen(command, **kwargs):
+                self.assertEqual(
+                    command,
+                    [
+                        platform_workflow_remote_dispatch.SUDO, "-n", "--",
+                        platform_workflow_remote_dispatch.SYSTEM_PYTHON, "-I", "-B",
+                        str(platform_workflow_remote_dispatch.CPU_DIAGNOSTIC_PLAN_HELPER),
+                        "cleanup-stdin",
+                    ],
+                )
                 return real_popen(
                     [sys.executable, "-c", "import sys; sys.stdin.buffer.read(); sys.stdout.write(" + repr(helper_json) + ")"],
                     **kwargs,
@@ -612,7 +621,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
             stdout = StringIO()
             with (
-                patch.object(platform_workflow_remote_dispatch, "_trusted_helper", return_value=True),
+                patch.object(platform_workflow_remote_dispatch, "_trusted_python_helper", return_value=True),
                 patch.object(platform_workflow_remote_dispatch.subprocess, "Popen", side_effect=fake_popen),
                 redirect_stdout(stdout),
             ):
@@ -628,7 +637,16 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         real_popen = subprocess.Popen
 
         def invoke_refusal(line: bytes) -> tuple[int, str]:
-            def fake_popen(_command, **kwargs):
+            def fake_popen(command, **kwargs):
+                self.assertEqual(
+                    command,
+                    [
+                        platform_workflow_remote_dispatch.SUDO, "-n", "--",
+                        platform_workflow_remote_dispatch.SYSTEM_PYTHON, "-I", "-B",
+                        str(platform_workflow_remote_dispatch.CPU_DIAGNOSTIC_PLAN_HELPER),
+                        "prepare-stdin",
+                    ],
+                )
                 script = (
                     "import sys; sys.stdin.buffer.read(); "
                     f"sys.stdout.buffer.write({line!r}); "
@@ -639,7 +657,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             stdout = StringIO()
             stderr = StringIO()
             with (
-                patch.object(platform_workflow_remote_dispatch, "_trusted_helper", return_value=True),
+                patch.object(platform_workflow_remote_dispatch, "_trusted_python_helper", return_value=True),
                 patch.object(platform_workflow_remote_dispatch.subprocess, "Popen", side_effect=fake_popen),
                 redirect_stdout(stdout),
                 redirect_stderr(stderr),
@@ -679,6 +697,122 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         bad_status, bad_output = invoke_with_helper_result(private_label)
         self.assertEqual(bad_status, 2)
         self.assertEqual(bad_output, "")
+
+    def test_cpu_python_helper_accepts_read_only_release_script_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tools_dir = Path(directory) / "tools"
+            tools_dir.mkdir()
+            helper = tools_dir / "platform_cpu_diagnostic_plan.py"
+            helper.write_text("# immutable helper fixture\n", encoding="ascii")
+            helper.chmod(0o644)
+            real_lstat = Path.lstat
+
+            def root_shaped_lstat(path: Path):
+                actual = real_lstat(path)
+                if path != helper:
+                    return actual
+                return SimpleNamespace(
+                    st_mode=actual.st_mode,
+                    st_uid=0,
+                    st_gid=0,
+                    st_nlink=1,
+                )
+
+            def accepted(mode: int, *, uid: int = 0, gid: int = 0,
+                         nlink: int = 1, file_type: int = stat.S_IFREG) -> bool:
+                with patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_dir):
+                    with patch.object(
+                        Path,
+                        "lstat",
+                        return_value=SimpleNamespace(
+                            st_mode=file_type | mode,
+                            st_uid=uid,
+                            st_gid=gid,
+                            st_nlink=nlink,
+                        ),
+                    ):
+                        return platform_workflow_remote_dispatch._trusted_python_helper(helper)
+
+            with patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_dir), \
+                 patch.object(Path, "lstat", root_shaped_lstat):
+                self.assertTrue(platform_workflow_remote_dispatch._trusted_python_helper(helper))
+            self.assertFalse(accepted(0o644, uid=1000))
+            self.assertFalse(accepted(0o644, gid=1000))
+            self.assertFalse(accepted(0o644, nlink=2))
+            self.assertFalse(accepted(0o664))
+            self.assertFalse(accepted(0o200))
+            self.assertFalse(accepted(0o644, file_type=stat.S_IFLNK))
+            with patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_dir.parent):
+                self.assertFalse(platform_workflow_remote_dispatch._trusted_python_helper(helper))
+
+    def test_cpu_python_helper_runs_real_0644_file_through_fixed_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools_dir = root / "tools"
+            tools_dir.mkdir()
+            helper = tools_dir / "platform_cpu_diagnostic_plan.py"
+            helper.write_text(
+                "import sys\n"
+                "sys.stdin.buffer.read()\n"
+                "sys.stdout.write('CPU_DIAGNOSTIC_PLAN {\\\"api_target_count\\\":2,\\\"release_slug\\\":\\\"release-123456789012\\\",\\\"status\\\":\\\"prepared\\\",\\\"web_target_count\\\":1}\\n')\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o644)
+            sudo_shim = root / "sudo-shim"
+            sudo_shim.write_text(
+                "#!/bin/sh\n"
+                "[ \"$1\" = -n ] && [ \"$2\" = -- ] || exit 125\n"
+                "shift 2\nexec \"$@\"\n",
+                encoding="ascii",
+            )
+            sudo_shim.chmod(0o755)
+            real_lstat = Path.lstat
+
+            def root_shaped_lstat(path: Path):
+                actual = real_lstat(path)
+                if path != helper:
+                    return actual
+                return SimpleNamespace(
+                    st_mode=actual.st_mode, st_uid=0, st_gid=0, st_nlink=1
+                )
+
+            payload = {
+                "schema": 1, "operation": "prepare", "run_id": "a" * 32,
+                "source_sha": "b" * 40, "workload": "authenticated_workspace_read_pair_v1",
+                "off_start_ms": 60_000, "off_end_ms": 80_000,
+                "on_start_ms": 85_000, "on_end_ms": 105_000,
+            }
+            stdout = StringIO()
+            real_popen = subprocess.Popen
+            children = []
+
+            def checked_popen(command, **kwargs):
+                try:
+                    child = real_popen(command, **kwargs)
+                    children.append(child)
+                    return child
+                except OSError as exc:
+                    raise AssertionError(type(exc).__name__) from None
+
+            with (
+                patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_dir),
+                patch.object(platform_workflow_remote_dispatch, "CPU_DIAGNOSTIC_PLAN_HELPER", helper),
+                patch.object(platform_workflow_remote_dispatch, "SUDO", str(sudo_shim)),
+                patch.object(Path, "lstat", root_shaped_lstat),
+                patch.object(platform_workflow_remote_dispatch.subprocess, "Popen", side_effect=checked_popen),
+                redirect_stdout(stdout),
+            ):
+                status = platform_workflow_remote_dispatch._run_cpu_diagnostic_plan(payload)
+                self.assertEqual(
+                    status, 0,
+                    f"stdout={stdout.getvalue()!r} child_rc={[child.returncode for child in children]!r}",
+                )
+            self.assertEqual(len(children), 1)
+            self.assertEqual(children[0].returncode, 0)
+            self.assertEqual(
+                stdout.getvalue(),
+                "CPU_DIAGNOSTIC_PLAN status=prepared targets=3 release_slug=release-123456789012\n",
+            )
 
     def test_external_fixture_forwards_control_identity_only_on_stdin(self) -> None:
         class CapturedInput:
@@ -2879,6 +3013,109 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 target_sha="not-a-source-sha"
             )
         )
+
+    def test_export_remove_dispatch_forwards_only_bounded_closed_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executor = root / "executor.py"
+            executor.write_text(
+                "import sys\n"
+                "sys.stdin.buffer.read()\n"
+                "sys.stdout.write(" + repr("ARTIFACT_EXPORT_REMOVE schema=1 status=passed removed_roots=2\n") + ")\n",
+                encoding="ascii",
+            )
+            executor.chmod(0o644)
+            setpriv_shim = root / "setpriv-shim"
+            setpriv_shim.write_text(
+                "#!/bin/sh\n"
+                "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n"
+                "[ \"$#\" -gt 0 ] || exit 125\nshift\nexec \"$@\"\n",
+                encoding="ascii",
+            )
+            setpriv_shim.chmod(0o755)
+
+            def invoke(output: bytes, status: int = 0, *, timeout: float = 1.0) -> tuple[int, str]:
+                script = (
+                    "import sys; sys.stdin.buffer.read(); "
+                    f"sys.stdout.buffer.write({output!r}); raise SystemExit({status})"
+                )
+                actual_popen = subprocess.Popen
+
+                def shimmed_popen(command, **kwargs):
+                    self.assertEqual(command[0], str(setpriv_shim))
+                    self.assertIn(str(executor), command)
+                    return actual_popen(
+                        [sys.executable, "-c", script], **kwargs
+                    )
+
+                stdout = StringIO()
+                with (
+                    patch.object(platform_workflow_remote_dispatch, "SETPRIV", str(setpriv_shim)),
+                    patch.object(platform_workflow_remote_dispatch, "SYSTEM_PYTHON", "/usr/bin/python3.12"),
+                    patch.object(platform_workflow_remote_dispatch, "RETAINED_LOAD_EXPORT_EXECUTOR", executor),
+                    patch.object(platform_workflow_remote_dispatch, "CLEANUP_OPERATION_TIMEOUT_SECONDS", timeout),
+                    patch.object(platform_workflow_remote_dispatch, "_trusted_generation", return_value=True),
+                    patch.object(platform_workflow_remote_dispatch, "_trusted_export_executor", return_value=True),
+                    patch.object(platform_workflow_remote_dispatch, "_retained_load_export_owner", return_value={"uid": 990, "gid": 982}),
+                    patch.object(platform_workflow_remote_dispatch.os, "geteuid", return_value=0),
+                    patch.object(platform_workflow_remote_dispatch.subprocess, "Popen", side_effect=shimmed_popen),
+                    redirect_stdout(stdout),
+                ):
+                    result = platform_workflow_remote_dispatch._run_retained_export_executor(
+                        "remove", {"schema": 1, "load_run_id": "41", "cleanup_run_id": "42"}
+                    )
+                return result, stdout.getvalue()
+
+            passed, passed_output = invoke(
+                b"ARTIFACT_EXPORT_REMOVE schema=1 status=passed removed_roots=2\n"
+            )
+            self.assertEqual(passed, 0)
+            self.assertEqual(
+                passed_output,
+                "ARTIFACT_EXPORT_REMOVE schema=1 status=passed removed_roots=2\n",
+            )
+            failed, failed_output = invoke(
+                b"ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=export_root_changed\n",
+                status=1,
+            )
+            self.assertEqual(failed, 1)
+            self.assertEqual(
+                failed_output,
+                "ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=export_root_changed\n",
+            )
+            for output, status in (
+                (b"PRIVATE_SENTINEL\n", 1),
+                (b"x" * 129, 0),
+            ):
+                result, forwarded = invoke(output, status=status)
+                self.assertEqual(result, 1)
+                self.assertEqual(
+                    forwarded,
+                    "ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=dispatcher_protocol\n"
+                    if len(output) <= 128
+                    else "ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=dispatcher_output_limit\n",
+                )
+                self.assertNotIn("PRIVATE_SENTINEL", forwarded)
+
+            preflight_stdout = StringIO()
+            with (
+                patch.object(
+                    platform_workflow_remote_dispatch,
+                    "load_stdin_payload",
+                    side_effect=platform_workflow_remote_dispatch.WorkflowInputError(
+                        "private payload detail"
+                    ),
+                ),
+                redirect_stdout(preflight_stdout),
+            ):
+                self.assertEqual(
+                    platform_workflow_remote_dispatch.main(["retained-cleanup-exports"]),
+                    1,
+                )
+            self.assertEqual(
+                preflight_stdout.getvalue(),
+                "ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=dispatcher_preflight\n",
+            )
 
     def test_cleanup_workflows_project_public_artifacts_before_private_deletion(self) -> None:
         external = (

@@ -1428,6 +1428,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "directory_ino": secret_dir_stat.st_ino,
                 "plan_prepare_status": "prepared",
                 "plan_prepare_refusal_class": "none",
+                "prepare_transport": {
+                    "stage": "complete", "return_code": 0,
+                    "stdout_shape": "prepared_marker", "child_state": "reaped",
+                },
             })
             command = captured["command"]
             self.assertIsInstance(command, list)
@@ -2141,13 +2145,22 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             ) for index in range(14)]
             def fake_plan(_args, _host, _user, _config, _key, payload, lifecycle, **_kwargs):
                 lifecycle["closed"] = True
+                lifecycle["mux_off_enforced"] = True
                 lifecycle["last_command_returned"] = True
                 if payload["operation"] == "prepare":
                     lifecycle["plan_prepare_status"] = "refused"
                     lifecycle["plan_prepare_refusal_class"] = "PlanError"
+                    lifecycle["prepare_transport"] = {
+                        "stage": "complete", "return_code": 2,
+                        "stdout_shape": "refusal_marker", "child_state": "reaped",
+                    }
                 else:
                     lifecycle["plan_cleanup_status"] = "refused"
                     lifecycle["plan_cleanup_refusal_class"] = "OSError"
+                    lifecycle["cleanup_transport"] = {
+                        "stage": "complete", "return_code": 2,
+                        "stdout_shape": "refusal_marker", "child_state": "reaped",
+                    }
                 return False, None, None
 
             argv = [
@@ -2178,6 +2191,36 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(public["plan_cleanup_status"], "refused")
             self.assertEqual(public["plan_cleanup_refusal_class"], "OSError")
             self.assertEqual(public["plan_cleanup_failure_code"], "plan_refused")
+            self.assertEqual(public["ssh_prepare_transport"], {
+                "stage": "complete", "return_code": 2,
+                "stdout_shape": "refusal_marker", "child_state": "reaped",
+            })
+            self.assertEqual(
+                cpu_pair._public_ssh_transport({
+                    "stage": "transport_failed", "return_code": -9,
+                    "stdout_shape": "none", "child_state": "reaped",
+                }),
+                {
+                    "stage": "transport_failed", "return_code": -9,
+                    "stdout_shape": "none", "child_state": "reaped",
+                },
+            )
+            self.assertIsNone(cpu_pair._public_ssh_transport({
+                "stage": "complete", "return_code": True,
+                "stdout_shape": "single_line", "child_state": "reaped",
+            })["return_code"])
+            self.assertTrue(public["ssh_material_safe_to_remove"])
+            lifecycle_path = root / "ssh-lifecycle.json"
+            lifecycle_receipt = json.loads(lifecycle_path.read_text(encoding="ascii"))
+            self.assertIs(lifecycle_receipt["material_hidden"], False)
+            cpu_pair._validate_ssh_lifecycle_receipt(
+                lifecycle_path,
+                expected={
+                    "source_sha": "a" * 40, "run_id": "123", "attempt": "1",
+                    "config_dir_dev": ssh_dir.stat().st_dev,
+                    "config_dir_ino": ssh_dir.stat().st_ino,
+                },
+            )
             self.assertFalse(public["capacity_slo_credit"])
             self.assertFalse(public["diagnostic_credit"])
             self.assertNotIn("operator@example.test", report_path.read_text(encoding="ascii"))

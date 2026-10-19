@@ -2100,6 +2100,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("cleanup_exports_status=", finalizer)
         self.assertIn("cleanup_status\" != 0 || \"$cleanup_exports_status\" != 0", finalizer)
         self.assertIn("cleanup summary projection input is invalid", finalizer)
+        self.assertIn("cleanup_export_marker_cleanup_status", finalizer)
+        self.assertIn("cleanup_export_error_class", finalizer)
         fixture_cleanup = _step_script(
             fixture_setup, "Remove fixture-setup SSH material"
         )
@@ -2562,6 +2564,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "ORIGIN_FINALIZE_STATUS": "0",
             "ORIGIN_CLEANUP_STATUS": "0",
             "ORIGIN_CLEANUP_EXPORTS_STATUS": "0",
+            "ORIGIN_CLEANUP_EXPORT_ERROR_CLASS": "none",
             "ORIGIN_SSH_CLEANUP_STATUS": "0",
             "ORIGIN_CLEANUP_IDENTITY_STATUS": "0",
             "ORIGIN_CLEANUP_REMOTE_SSH_EXIT": "0",
@@ -2740,6 +2743,159 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         evaluator = self.jobs["evaluate-load"]
         self.assertIn("sanitizer_status=0", evaluator)
         self.assertIn("External evidence projection/sanitizer failed.", evaluator)
+
+    def test_export_status_marker_is_bounded_and_reaches_public_diagnostics(self) -> None:
+        workflows = (
+            REPO_ROOT / ".github/workflows/platform-production-external-load.yml",
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml",
+        )
+        marker = b"ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=export_entry_unlink_failed\n"
+        oversized = b"x" * 129
+        for workflow_path in workflows:
+            source = workflow_path.read_text(encoding="utf-8")
+            parser_match = re.search(
+                r'cleanup_export_error_class="\$\(/usr/bin/python3 -I - "\$export_marker_path" '
+                r'"\$cleanup_export_status" <<\'PY\'\n(?P<body>.*?)^\s*PY\n\s*\)"',
+                source,
+                re.MULTILINE | re.DOTALL,
+            )
+            self.assertIsNotNone(parser_match, workflow_path.name)
+            parser = textwrap.dedent(parser_match.group("body"))
+            removal_match = re.search(
+                r'(?P<body>rm -f -- "\$export_marker_path"\n'
+                r'\s*if \[\[ ! -e "\$export_marker_path" && ! -L "\$export_marker_path" \]\]; then\n'
+                r'.*?^\s*fi)$',
+                source,
+                re.MULTILINE | re.DOTALL,
+            )
+            self.assertIsNotNone(removal_match, workflow_path.name)
+            removal = textwrap.dedent(removal_match.group("body"))
+            document = yaml.safe_load(source)
+            if workflow_path.name == "platform-production-external-load.yml":
+                job = document["jobs"]["fixture-finalize"]
+                diagnostic_step = next(
+                    step for step in job["steps"]
+                    if step.get("name") == "Diagnose origin evidence publication gate"
+                )
+                output_path = "external-evidence/cleanup-diagnostic.json"
+                env = {
+                    "GITHUB_SHA": "a" * 40,
+                    "ORIGIN_NAMESPACE_CLOSED": "0", "ORIGIN_MANUAL_REQUIRED": "0",
+                    "ORIGIN_CLEANUP_SSH_OUTCOME": "success", "ORIGIN_REMOTE_STATUS": "0",
+                    "ORIGIN_OBSERVER_READY": "1", "ORIGIN_FINALIZE_STATUS": "0",
+                    "ORIGIN_CLEANUP_STATUS": "1", "ORIGIN_CLEANUP_REMOTE_SSH_EXIT": "0",
+                    "ORIGIN_CLEANUP_REMOTE_STAGE": "complete", "ORIGIN_CLEANUP_REMOTE_DISPATCH_EXIT": "0",
+                    "ORIGIN_CLEANUP_REMOTE_CHILD_STATE": "exited", "ORIGIN_CLEANUP_REMOTE_CHILD_EXIT": "0",
+                    "ORIGIN_CLEANUP_REMOTE_STDOUT_EOF": "true", "ORIGIN_CLEANUP_REMOTE_TIMED_OUT": "false",
+                    "ORIGIN_CLEANUP_REMOTE_DIAGNOSTIC_STATUS": "0", "ORIGIN_CLEANUP_EXPORTS_STATUS": "1",
+                    "ORIGIN_SSH_CLEANUP_STATUS": "0", "ORIGIN_CLEANUP_IDENTITY_STATUS": "0",
+                    "ORIGIN_SOURCE_SHA": "a" * 40, "ORIGIN_APP_SHA": "b" * 40,
+                    "ORIGIN_RUN_ID": "123", "ORIGIN_RUN_ATTEMPT": "1", "ORIGIN_PROFILE_ID": "retained-test",
+                }
+            else:
+                job = document["jobs"]["cleanup"]
+                diagnostic_step = next(
+                    step for step in job["steps"]
+                    if step.get("name") == "Diagnose cleanup evidence inputs"
+                )
+                output_path = "production-retained-cleanup-artifacts/cleanup-diagnostic.json"
+                env = {
+                    "GITHUB_SHA": "a" * 40,
+                    "CLEANUP_REMOTE_EXIT": "1", "CLEANUP_SSH_EXIT_CODE": "0",
+                    "CLEANUP_REMOTE_STAGE": "export_cleanup", "CLEANUP_REMOTE_DISPATCH_EXIT": "1",
+                    "CLEANUP_REMOTE_CHILD_STATE": "exited", "CLEANUP_REMOTE_CHILD_EXIT": "0",
+                    "CLEANUP_REMOTE_STDOUT_EOF": "true", "CLEANUP_REMOTE_TIMED_OUT": "false",
+                    "CLEANUP_REMOTE_DIAGNOSTIC_STATUS": "0", "CLEANUP_ARTIFACT_STATUS": "0",
+                    "CLEANUP_EXPORT_STATUS": "1", "CLEANUP_SSH_STEP": "success",
+                    "CLEANUP_SOURCE_SHA": "a" * 40, "CLEANUP_APP_SHA": "b" * 40,
+                    "CLEANUP_RUN_ID": "124", "CLEANUP_RUN_ATTEMPT": "1", "CLEANUP_LOAD_RUN_ID": "123",
+                }
+            diagnostic_match = re.search(
+                r"/usr/bin/python3 - <<'PY'\n(?P<body>.*?)^\s*PY\n",
+                diagnostic_step["run"], re.MULTILINE | re.DOTALL,
+            )
+            self.assertIsNotNone(diagnostic_match, workflow_path.name)
+            diagnostic = textwrap.dedent(diagnostic_match.group("body"))
+            self.assertIn("export_error_class", diagnostic)
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                marker_path = root / "marker"
+
+                def parse(raw: bytes | None, status: str) -> str:
+                    marker_path.unlink(missing_ok=True)
+                    if raw is not None:
+                        marker_path.write_bytes(raw)
+                        marker_path.chmod(0o600)
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-", str(marker_path), status],
+                        input=parser, text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("ARTIFACT_EXPORT_REMOVE", result.stdout)
+                    return result.stdout.strip()
+
+                for raw, status, expected in (
+                    (marker, "1", "export_entry_unlink_failed"),
+                    (b"ARTIFACT_EXPORT_REMOVE schema=1 status=passed removed_roots=1\n", "0", "none"),
+                    (b"untrusted detail\n", "1", "unavailable"),
+                    (oversized, "1", "unavailable"),
+                    (marker, "0", "unavailable"),
+                    (None, "1", "unavailable"),
+                ):
+                    with self.subTest(workflow=workflow_path.name, expected=expected):
+                        parsed = parse(raw, status)
+                        self.assertEqual(parsed, expected)
+                        case_env = {
+                            **os.environ, **env,
+                            "RUNNER_TEMP": temp_dir,
+                            "GITHUB_OUTPUT": str(root / "github-output"),
+                        }
+                        (root / "github-output").write_text("", encoding="utf-8")
+                        case_env[
+                            "ORIGIN_CLEANUP_EXPORT_ERROR_CLASS"
+                            if workflow_path.name == "platform-production-external-load.yml"
+                            else "CLEANUP_EXPORT_ERROR_CLASS"
+                        ] = parsed
+                        if workflow_path.name == "platform-production-retained-load-cleanup.yml":
+                            case_env["CLEANUP_EXPORT_MARKER_CLEANUP_STATUS"] = "0"
+                        diagnostic_path = root / output_path
+                        diagnostic_path.unlink(missing_ok=True)
+                        projected = subprocess.run(
+                            [sys.executable, "-",],
+                            input=diagnostic, text=True, capture_output=True,
+                            env=case_env, check=False,
+                        )
+                        self.assertEqual(projected.returncode, 0, projected.stderr)
+                        public = json.loads((root / output_path).read_text(encoding="utf-8"))
+                        self.assertEqual(public["conditions"]["export_error_class"], parsed)
+                        self.assertNotIn("untrusted detail", json.dumps(public))
+
+                for marker_type, cleanup_status, expected_class in (
+                    ("regular", "0", "export_entry_unlink_failed"),
+                    ("directory", "1", "unavailable"),
+                ):
+                    marker_path.unlink(missing_ok=True)
+                    if marker_type == "regular":
+                        marker_path.write_bytes(marker)
+                    else:
+                        marker_path.mkdir()
+                    script = (
+                        f'export_marker_path={str(marker_path)!r}\n'
+                        'cleanup_export_error_class="export_entry_unlink_failed"\n'
+                        'cleanup_export_marker_cleanup_status=1\n'
+                        + removal
+                        + '\nprintf "%s %s\\n" "$cleanup_export_marker_cleanup_status" "$cleanup_export_error_class"\n'
+                    )
+                    result = subprocess.run(
+                        ["/bin/bash", "-c", script],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        result.stdout.strip(), f"{cleanup_status} {expected_class}"
+                    )
+                    self.assertEqual(marker_path.exists(), marker_type == "directory")
 
 
 if __name__ == "__main__":
