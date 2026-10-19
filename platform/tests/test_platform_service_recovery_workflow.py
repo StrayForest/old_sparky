@@ -108,6 +108,154 @@ def _run_recovery_wrapper_as_nonroot(receipt: str, remote_status: int) -> subpro
 
 
 class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
+    def _run_worker_readiness_bootstrap(self, env_contents: bytes | None) -> tuple[str, subprocess.CompletedProcess[str] | None, str]:
+        namespace = {"__name__": "service_recovery_test"}
+        exec(compile(_embedded_controller(), "embedded-service-recovery.py", "exec"), namespace)
+        sentinel = "fixture-broker-value-must-not-be-printed"
+        with tempfile.TemporaryDirectory(prefix="worker-runtime-bootstrap-") as temporary:
+            app_dir = Path(temporary) / "platform"
+            release = app_dir / "releases" / "gha-1-2-aaaaaaaaaaaa"
+            shared = app_dir / "shared"
+            tools = release / "tools"
+            env_dir = shared / "env"
+            python_packages = release / "python_packages"
+            infra_package = python_packages / "platform_infra"
+            worker_package = release / "apps" / "platform_worker"
+            for directory in (tools, env_dir, infra_package, worker_package, shared / "venv" / "bin"):
+                directory.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(PLATFORM_ROOT / "tools" / "platform_runtime_common.sh", tools)
+            shutil.copy2(PLATFORM_ROOT / "tools" / "platform_safe_env_exec.py", tools)
+            python = shared / "venv" / "bin" / "python"
+            python.symlink_to("/usr/bin/python3")
+            env_file = env_dir / "worker.env"
+            if env_contents is not None:
+                env_file.write_bytes(env_contents)
+                env_file.chmod(0o644)
+            (python_packages / "__init__.py").write_text("", encoding="utf-8")
+            (infra_package / "__init__.py").write_text("", encoding="utf-8")
+            (infra_package / "config.py").write_text(
+                "import os\nBROKER_SENTINEL = os.environ.get('PLATFORM_CELERY_BROKER_URL')\n",
+                encoding="utf-8",
+            )
+            (worker_package.parent / "__init__.py").write_text("", encoding="utf-8")
+            (worker_package / "__init__.py").write_text("", encoding="utf-8")
+            (worker_package / "worker.py").write_text(
+                "import os\n"
+                "from python_packages.platform_infra.config import BROKER_SENTINEL\n"
+                "class Control:\n"
+                "    def ping(self, *, timeout, limit, destination):\n"
+                f"        if BROKER_SENTINEL != {sentinel!r}: return []\n"
+                "        expected = os.environ.get('PLATFORM_EXPECTED_CELERY_NODE')\n"
+                "        return [{expected: {'ok': 'pong'}}] if destination == [expected] and timeout == 5.0 and limit == 1 else []\n"
+                "class App:\n"
+                "    control = Control()\n"
+                "celery_app = App()\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(os.access(python, os.X_OK))
+            if os.geteuid() == 0:
+                account = pwd.getpwnam("nobody")
+                uid, gid, username = account.pw_uid, account.pw_gid, account.pw_name
+                for directory, _dirs, files in os.walk(temporary):
+                    os.chown(directory, uid, gid)
+                    for filename in files:
+                        os.chown(Path(directory) / filename, uid, gid, follow_symlinks=False)
+                    for name in _dirs:
+                        os.chown(Path(directory) / name, uid, gid, follow_symlinks=False)
+                os.chown(python, uid, gid, follow_symlinks=False)
+                os.chmod(temporary, 0o755)
+            else:
+                username = pwd.getpwuid(os.geteuid()).pw_name
+            clock = SimpleNamespace(now=0.0)
+            captured: list[subprocess.CompletedProcess[str]] = []
+
+            def command(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                adjusted = list(argv)
+                if os.geteuid() == 0:
+                    adjusted[2] = username
+                else:
+                    adjusted = adjusted[4:]
+                result = subprocess.run(
+                    adjusted,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=float(kwargs["timeout"]),
+                    cwd=kwargs["cwd"],
+                    env=kwargs["env"],
+                )
+                captured.append(result)
+                if result.returncode != 0:
+                    clock.now = 31.0
+                return result
+
+            with patch.dict(namespace, {
+                "_command": command,
+                "_assert_service_unit": lambda **_kwargs: ({}, "disabled"),
+                "time": SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda _delay: None),
+            }):
+                ready = namespace["_worker_ready"](app_dir, release, Path(temporary) / "systemd")
+            return ready, (captured[-1] if captured else None), sentinel
+
+    def test_worker_readiness_uses_exact_safe_runtime_bootstrap_and_release_imports(self) -> None:
+        sentinel = "fixture-broker-value-must-not-be-printed"
+        env_contents = f"PLATFORM_CELERY_BROKER_URL={sentinel}\n".encode()
+        ready, result, observed_sentinel = self._run_worker_readiness_bootstrap(env_contents)
+        self.assertEqual(ready, "passed")
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "WORKER_PING status=passed\n")
+        self.assertNotIn(observed_sentinel, result.stdout + result.stderr)
+
+    def test_worker_readiness_fails_closed_for_missing_or_malformed_isolated_env(self) -> None:
+        for env_contents in (None, b"PLATFORM_TEST_BROKER_SENTINEL='unterminated\n"):
+            with self.subTest(env_contents=env_contents):
+                ready, result, sentinel = self._run_worker_readiness_bootstrap(env_contents)
+                self.assertEqual(ready, "bootstrap_failure")
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(sentinel, result.stdout + result.stderr)
+
+    def test_worker_readiness_matches_pinned_celery_ping_envelope(self) -> None:
+        from celery.worker.control import ping as celery_ping
+
+        expected = "celery@contract-host"
+        reply = celery_ping(None)
+        self.assertEqual(reply, {"ok": "pong"})
+        namespace: dict[str, object] = {"__name__": "service_recovery_contract"}
+        exec(compile(_embedded_controller(), "embedded-service-recovery.py", "exec"), namespace)
+
+        def run_probe(worker_reply: object) -> tuple[int, str]:
+            worker_module = ModuleType("apps.platform_worker.worker")
+            worker_module.celery_app = SimpleNamespace(
+                control=SimpleNamespace(
+                    ping=lambda **_kwargs: [{expected: worker_reply}],
+                ),
+            )
+            packages = {
+                "apps": ModuleType("apps"),
+                "apps.platform_worker": ModuleType("apps.platform_worker"),
+                "apps.platform_worker.worker": worker_module,
+            }
+            output = io.StringIO()
+            with patch.dict(sys.modules, packages), patch.dict(
+                os.environ, {"PLATFORM_EXPECTED_CELERY_NODE": expected}
+            ), contextlib.redirect_stdout(output):
+                with self.assertRaises(SystemExit) as raised:
+                    exec(
+                        compile(namespace["WORKER_READINESS_CODE"], "worker-readiness-probe.py", "exec"),
+                        {"__name__": "__main__"},
+                    )
+            return int(raised.exception.code), output.getvalue()
+
+        self.assertEqual(run_probe(reply), (0, "WORKER_PING status=passed\n"))
+        self.assertEqual(
+            run_probe("pong"),
+            (1, "WORKER_PING status=failed reason=unexpected_reply\n"),
+        )
+
     def test_yaml_parsed_workflow_run_steps_pass_bash_syntax(self) -> None:
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
         for job_name, job in workflow["jobs"].items():
@@ -161,15 +309,20 @@ class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
                 "_assert_service_unit": lambda **_kwargs: ({}, "disabled"),
                 "time": SimpleNamespace(monotonic=lambda: 1.0, sleep=lambda _delay: None),
             }):
-                self.assertTrue(namespace["_worker_ready"](app_dir, release, Path(temporary) / "systemd"))
+                self.assertEqual(namespace["_worker_ready"](app_dir, release, Path(temporary) / "systemd"), "passed")
         self.assertEqual(len(calls), 1)
         argv, kwargs = calls[0]
         self.assertEqual(argv[:4], ["/usr/sbin/runuser", "-u", "oldsparky-worker", "--"])
-        self.assertIn("control.ping", argv[-1])
-        self.assertIn("destination=[expected]", argv[-1])
-        self.assertIn("celery_app", argv[-1])
-        self.assertTrue(any(item.startswith("PLATFORM_EXPECTED_CELERY_NODE=celery@") for item in argv))
-        self.assertLessEqual(kwargs["timeout"], 7.0)
+        self.assertEqual(argv[-4], namespace["WORKER_READINESS_BOOTSTRAP"])
+        self.assertIn("platform_runtime_common.sh", argv[-4])
+        self.assertIn("platform_load_env_file", argv[-4])
+        self.assertIn("PYTHONPATH=\"$PLATFORM_ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}\"", argv[-4])
+        self.assertIn("control.ping", argv[-2])
+        self.assertIn("destination=[expected]", argv[-2])
+        self.assertIn("celery_app", argv[-2])
+        self.assertTrue(argv[-1].startswith("celery@"))
+        self.assertEqual(kwargs["timeout"], namespace["WORKER_PROBE_TIMEOUT"])
+        self.assertGreater(kwargs["timeout"], 8.27)
         self.assertNotIn("secret", " ".join(argv).lower())
 
     def test_proxy_readiness_uses_loopback_tls_and_bounds_health_body(self) -> None:
@@ -277,7 +430,7 @@ class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
 
         def command(argv: list[str], **_kwargs: object) -> SimpleNamespace:
             nonlocal code
-            code = argv[-1]
+            code = argv[-2]
             return SimpleNamespace(returncode=0, stdout="WORKER_PING status=passed\n")
 
         with tempfile.TemporaryDirectory() as temporary, patch.dict(namespace, {
@@ -286,13 +439,16 @@ class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
             "time": SimpleNamespace(monotonic=lambda: 1.0, sleep=lambda _delay: None),
             "socket": SimpleNamespace(gethostname=lambda: "local-host"),
         }):
-            self.assertTrue(namespace["_worker_ready"](Path(temporary), Path(temporary), Path(temporary)))
+            self.assertEqual(
+                namespace["_worker_ready"](Path(temporary), Path(temporary), Path(temporary)),
+                "passed",
+            )
 
         app = ModuleType("apps")
         platform_worker = ModuleType("apps.platform_worker")
         worker = ModuleType("apps.platform_worker.worker")
         worker.celery_app = SimpleNamespace(
-            control=SimpleNamespace(ping=lambda **_kwargs: [{"celery@other-host": "pong"}])
+            control=SimpleNamespace(ping=lambda **_kwargs: [{"celery@other-host": {"ok": "pong"}}])
         )
         modules = {"apps": app, "apps.platform_worker": platform_worker, "apps.platform_worker.worker": worker}
         output = io.StringIO()
@@ -300,23 +456,55 @@ class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 exec(compile(code, "worker-readiness-probe.py", "exec"), {"__name__": "__main__"})
         self.assertEqual(raised.exception.code, 1)
-        self.assertEqual(output.getvalue(), "WORKER_PING status=failed\n")
+        self.assertEqual(output.getvalue(), "WORKER_PING status=failed reason=unexpected_reply\n")
+
+    def test_embedded_ping_projects_closed_outcomes_and_rejects_legacy_pong(self) -> None:
+        namespace = {"__name__": "service_recovery_test"}
+        exec(compile(_embedded_controller(), "embedded-service-recovery.py", "exec"), namespace)
+        secret = "PRIVATE_PING_EXCEPTION_SENTINEL"
+
+        def raise_secret(**_kwargs: object) -> list[dict[str, str]]:
+            raise RuntimeError(secret)
+
+        cases = (
+            ([{"celery@local-host": "pong"}], "unexpected_reply"),
+            ([], "no_reply"),
+            (raise_secret, "exception"),
+        )
+        for reply, expected_reason in cases:
+            with self.subTest(reason=expected_reason):
+                app = ModuleType("apps")
+                platform_worker = ModuleType("apps.platform_worker")
+                worker = ModuleType("apps.platform_worker.worker")
+                ping = reply if callable(reply) else lambda **_kwargs: reply
+                worker.celery_app = SimpleNamespace(control=SimpleNamespace(ping=ping))
+                modules = {"apps": app, "apps.platform_worker": platform_worker, "apps.platform_worker.worker": worker}
+                output = io.StringIO()
+                with patch.dict(sys.modules, modules), patch.dict(os.environ, {"PLATFORM_EXPECTED_CELERY_NODE": "celery@local-host"}), contextlib.redirect_stdout(output):
+                    with self.assertRaises(SystemExit) as raised:
+                        exec(compile(namespace["WORKER_READINESS_CODE"], "worker-readiness-probe.py", "exec"), {"__name__": "__main__"})
+                self.assertEqual(raised.exception.code, 1)
+                self.assertEqual(output.getvalue(), f"WORKER_PING status=failed reason={expected_reason}\n")
+                self.assertNotIn(secret, output.getvalue())
 
     def test_embedded_worker_ping_retries_within_fixed_deadline(self) -> None:
         namespace = {"__name__": "service_recovery_test"}
         exec(compile(_embedded_controller(), "embedded-service-recovery.py", "exec"), namespace)
-        results = iter((SimpleNamespace(returncode=1, stdout=""), SimpleNamespace(returncode=0, stdout="WORKER_PING status=passed\n")))
+        results = iter((
+            SimpleNamespace(returncode=1, stdout="WORKER_PING status=failed reason=no_reply\n"),
+            SimpleNamespace(returncode=0, stdout="WORKER_PING status=passed\n"),
+        ))
         with tempfile.TemporaryDirectory() as temporary, patch.dict(namespace, {
             "_command": lambda *_args, **_kwargs: next(results),
             "_assert_service_unit": lambda **_kwargs: ({}, "disabled"),
             "time": SimpleNamespace(monotonic=lambda: 1.0, sleep=lambda _delay: None),
         }):
-            self.assertTrue(namespace["_worker_ready"](Path(temporary), Path(temporary), Path(temporary)))
+            self.assertEqual(namespace["_worker_ready"](Path(temporary), Path(temporary), Path(temporary)), "passed")
 
     def test_embedded_worker_probe_timeout_can_recover_before_deadline(self) -> None:
         namespace = {"__name__": "service_recovery_test"}
         exec(compile(_embedded_controller(), "embedded-service-recovery.py", "exec"), namespace)
-        outcomes = iter((namespace["RecoveryRefusal"]("command_unavailable"), SimpleNamespace(returncode=0, stdout="WORKER_PING status=passed\n")))
+        outcomes = iter((namespace["RecoveryRefusal"]("command_timeout"), SimpleNamespace(returncode=0, stdout="WORKER_PING status=passed\n")))
         calls = 0
 
         def command(*_args: object, **_kwargs: object) -> SimpleNamespace:
@@ -332,26 +520,27 @@ class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
             "_assert_service_unit": lambda **_kwargs: ({}, "disabled"),
             "time": SimpleNamespace(monotonic=lambda: 1.0, sleep=lambda _delay: None),
         }):
-            self.assertTrue(namespace["_worker_ready"](Path(temporary), Path(temporary), Path(temporary)))
+            self.assertEqual(namespace["_worker_ready"](Path(temporary), Path(temporary), Path(temporary)), "passed")
         self.assertEqual(calls, 2)
 
     def test_embedded_worker_readiness_stops_at_one_shared_deadline(self) -> None:
         namespace = {"__name__": "service_recovery_test"}
         exec(compile(_embedded_controller(), "embedded-service-recovery.py", "exec"), namespace)
-        moments = iter((0.0, 8.0, 16.0, 24.0, 32.0, 40.0))
+        clock = SimpleNamespace(now=0.0)
         calls = 0
 
         def command(*_args: object, **_kwargs: object) -> SimpleNamespace:
             nonlocal calls
             calls += 1
-            return SimpleNamespace(returncode=1, stdout="")
+            clock.now = 31.0
+            raise namespace["RecoveryRefusal"]("command_timeout")
 
         with tempfile.TemporaryDirectory() as temporary, patch.dict(namespace, {
             "_command": command,
             "_assert_service_unit": lambda **_kwargs: ({}, "disabled"),
-            "time": SimpleNamespace(monotonic=lambda: next(moments), sleep=lambda _delay: None),
+            "time": SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda _delay: None),
         }):
-            self.assertFalse(namespace["_worker_ready"](Path(temporary), Path(temporary), Path(temporary)))
+            self.assertEqual(namespace["_worker_ready"](Path(temporary), Path(temporary), Path(temporary)), "timeout")
         self.assertEqual(calls, 1)
 
     def test_input_and_unexpected_service_prestate_refuse_before_start(self) -> None:
@@ -563,7 +752,7 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
                 "_assert_disk": lambda *_args: None,
                 "_assert_active": lambda *_args: None,
                 "_wait_api_ready": lambda: True,
-                "_worker_ready": lambda *_args: worker_ping,
+                "_worker_ready": lambda *_args: "passed" if worker_ping else "no_reply",
                 "_wait_proxy_api_ready": lambda: proxy_ready,
                 "_nginx_configuration_identity": nginx_config_identity,
                 "NGINX_UNIT_PATH": self.nginx_unit,
@@ -661,6 +850,10 @@ class PlatformServiceRecoveryControllerTests(unittest.TestCase):
         self.assertEqual([item for item in actions if item[0] == "stop"], [
             ("stop", "deadlock-worker"), ("stop", "deadlock-api")
         ])
+        self.assertIn("stage=worker_readiness_no_reply", self.last_receipt)
+        projected = _run_recovery_wrapper_as_nonroot(self.last_receipt, result)
+        self.assertNotEqual(projected.returncode, 0)
+        self.assertIn("stage=worker_readiness_no_reply", projected.stdout)
         self.assertEqual(states["deadlock-api"]["ActiveState"], "inactive")
         self.assertEqual(states["deadlock-worker"]["ActiveState"], "inactive")
 
