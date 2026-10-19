@@ -302,7 +302,7 @@ jobs:
           test -f "$maintenance_unit_validator" && test ! -L "$maintenance_unit_validator" \
             || fail_with_status maintenance_unit_contract_unavailable 2
           loaded_maintenance_unit="$(systemctl show deadlock-maintenance.service \
-            --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
+            --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
             --no-pager 2>/dev/null)" \
             || fail_with_status maintenance_unit_contract_unavailable 2
           if ! printf '%s\n' "$loaded_maintenance_unit" \

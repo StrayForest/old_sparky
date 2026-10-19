@@ -50,7 +50,7 @@ calling the task complete.
    ```bash
    current_release="$(readlink -f /opt/oldsparky/platform/current)"
    systemctl show deadlock-maintenance.service \
-     --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
+     --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
      --no-pager \
      | /usr/bin/python3 -I "$current_release/tools/platform_maintenance_qa_evidence.py" \
        run-retention-preview \
@@ -63,6 +63,11 @@ calling the task complete.
    every explicit pin appears in `production_releases.retained` and is absent
    from `production_releases.deleted`. The `protected` field contains the
    dynamic `current`/`previous` pointers.
+
+   If an older active-release validator rejects the required `MainPID`
+   property, fail closed and retry after a reviewed release installs the
+   updated validator; see `platform/docs/operations-runbook.md`. Do not remove
+   the property or edit the immutable release.
 
 3. Apply the bounded sweep through the installed service using the reviewed
    production workflow. It creates a fresh restore-verified backup before

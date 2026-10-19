@@ -64,6 +64,7 @@ UNIT_PROPERTY_KEYS = frozenset(
         "NeedDaemonReload",
         "ActiveState",
         "SubState",
+        "MainPID",
         "ExecStart",
         "CPUQuotaPerSecUSec",
         "MemoryMax",
@@ -452,11 +453,29 @@ def _parse_systemd_exec_start(value: object) -> dict[str, str]:
         fields[key] = field_value
     if tuple(fields) != EXEC_START_FIELDS:
         _fail()
+    never_run_time = {"", "[n/a]"}
+    no_run = (
+        fields["pid"] == "0"
+        and fields["code"] == "(null)"
+        and fields["status"] == "0/0"
+        and fields["start_time"] in never_run_time
+        and fields["start_time"] == fields["stop_time"]
+        and fields["stop_time"] in never_run_time
+    )
+    pid_match = re.fullmatch(r"[1-9][0-9]{0,9}", fields["pid"])
+    completed = (
+        pid_match is not None
+        and int(fields["pid"], 10) <= 2**31 - 1
+        and fields["code"] in {"exited", "killed", "dumped"}
+        and re.fullmatch(r"[0-9]{1,3}(?:/[A-Za-z0-9_-]{1,32})?", fields["status"])
+        is not None
+        and fields["status"] != "0/0"
+        and fields["start_time"] not in never_run_time
+        and fields["stop_time"] not in never_run_time
+    )
     if (
         fields["ignore_errors"] != "no"
-        or fields["pid"] != "0"
-        or fields["code"] not in {"(null)", "exited", "killed", "dumped"}
-        or re.fullmatch(r"[0-9]{1,3}/[A-Za-z0-9_-]{1,32}", fields["status"]) is None
+        or not (no_run or completed)
         or any(
             len(fields[name]) > 128
             or any(ord(char) < 0x20 or ord(char) > 0x7E for char in fields[name])
@@ -506,6 +525,7 @@ def _validate_maintenance_unit_bytes(
         or properties["TimeoutStartUSec"] != "30min"
         or (properties["ActiveState"], properties["SubState"])
         not in {("inactive", "dead"), ("failed", "failed")}
+        or properties["MainPID"] != "0"
     ):
         _fail()
     exec_fields = _parse_systemd_exec_start(properties["ExecStart"])
