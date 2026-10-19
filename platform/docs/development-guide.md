@@ -66,6 +66,19 @@ The release artifact keeps a separate owner lock:
 quality/security tooling. They must not be silently substituted for one
 another.
 
+The developer bootstrap venv contains runtime dependencies, not the full local
+test/quality/security set. After bootstrap, install the exact locked test set
+into a separate fresh venv and use that interpreter for registry gates:
+
+```bash
+cd /root/old_sparky/platform
+PLATFORM_CI_VENV_DIR=.cache/platform-ci-venv tools/platform_install_ci_python.sh
+.cache/platform-ci-venv/bin/python tools/platform_verify.py ci
+```
+
+The installer requires Python 3.12 on Linux x86_64 and refuses to reuse an
+existing target venv. It does not replace the app/runtime `.venv_platform`.
+
 The generator bootstraps its exact hash-locked pip-tools environment from
 [`requirements-ci-locker.lock.txt`](../requirements-ci-locker.lock.txt), so it
 does not depend on an ambient `pip-compile`. Its default mode is a freshness
@@ -195,11 +208,13 @@ cd /root/old_sparky/platform
 .venv_platform/bin/python tools/platform_verify.py verification-contract
 ```
 
-Use `tools/platform_verify.py backend --focused <unittest-selector>` for
-focused feedback. Raw underlying commands are reserved for debugging the
-canonical runner itself or isolating a CI failure. The complete local
-deterministic aggregate is available as `tools/platform_verify.py ci`; it does
-not run production smoke, live QA or load testing.
+Use `tools/platform_verify.py backend-unit --focused <unittest-selector>` for
+DB-free focused domain feedback. `backend --focused` remains the complete
+five-contour aggregate and needs its DB, Redis and privileged prerequisites.
+Raw underlying commands are reserved for debugging the canonical runner or
+isolating a CI failure. The local deterministic aggregate is
+`tools/platform_verify.py ci`; it does not run production smoke, live QA or
+load testing.
 
 For a production-bound `dev` change, final verification is the GitHub chain for the same tested execution SHA:
 

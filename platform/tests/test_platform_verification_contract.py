@@ -100,6 +100,7 @@ from tools.platform_verification_lock import (
     provision_verification_lock,
     verification_resource_lock,
 )
+
 from tools.platform_verify_contract import (
     ALLOWED_ACTION_OWNERS,
     PRODUCTION_WORKFLOW,
@@ -116,6 +117,17 @@ from tools.platform_verify_contract import (
     security_status_permission_issues,
     source_bound_backup_dispatch_issues,
     workflow_level_permission_issues,
+)
+
+EXPECTED_LOCAL_CI_EXECUTION_ORDER = (
+    "verification-contract",
+    "docs",
+    "python-quality",
+    "security",
+    "migration",
+    "backend",
+    "web-quality",
+    "web-hermetic",
 )
 
 
@@ -2862,6 +2874,12 @@ except lock.VerificationLockError as exc:
             if GATES_BY_ID[gate_id].conditional
         }
         self.assertEqual(set(CI_GATE_IDS), set(DETERMINISTIC_GATE_IDS) - conditional)
+        self.assertEqual(set(CI_GATE_IDS), set(EXPECTED_LOCAL_CI_EXECUTION_ORDER))
+        self.assertEqual(len(CI_GATE_IDS), len(EXPECTED_LOCAL_CI_EXECUTION_ORDER))
+        self.assertEqual(
+            len(EXPECTED_LOCAL_CI_EXECUTION_ORDER),
+            len(set(EXPECTED_LOCAL_CI_EXECUTION_ORDER)),
+        )
         self.assertIn("backend", CI_GATE_IDS)
         self.assertIn("verification-contract", CI_GATE_IDS)
         self.assertTrue(GATES_BY_ID["release-runtime"].conditional)
@@ -2999,7 +3017,6 @@ except lock.VerificationLockError as exc:
             return 0
 
         with (
-            patch("tools.platform_verify.CI_GATE_IDS", ("migration", "backend")),
             patch("tools.platform_verify.dispatch", side_effect=record_gate),
             patch(
                 "tools.platform_verify._validated_privileged_environment",
@@ -3010,7 +3027,32 @@ except lock.VerificationLockError as exc:
             patch("tools.platform_verification_lock.verification_resource_lock", return_value=nullcontext()),
         ):
             self.assertEqual(dispatch_ci(), 0)
-        self.assertEqual(aggregate_order, ["migration", "schema-upgrade", "backend"])
+        self.assertEqual(
+            aggregate_order,
+            [
+                "verification-contract",
+                "docs",
+                "python-quality",
+                "security",
+                "migration",
+                "schema-upgrade",
+                "backend",
+                "web-quality",
+                "web-hermetic",
+            ],
+        )
+
+        early_failure_order: list[str] = []
+        with (
+            patch(
+                "tools.platform_verify.dispatch",
+                side_effect=lambda gate_id: early_failure_order.append(gate_id) or 19,
+            ),
+            patch("tools.platform_verify._prepare_ci_backend_database") as prepare_database,
+        ):
+            self.assertEqual(dispatch_ci(), 19)
+        self.assertEqual(early_failure_order, ["verification-contract"])
+        prepare_database.assert_not_called()
 
         failed_order: list[str] = []
 
@@ -3019,7 +3061,6 @@ except lock.VerificationLockError as exc:
             return 0
 
         with (
-            patch("tools.platform_verify.CI_GATE_IDS", ("migration", "backend")),
             patch("tools.platform_verify.dispatch", side_effect=record_failed_gate),
             patch(
                 "tools.platform_verify._validated_privileged_environment",
@@ -3030,7 +3071,10 @@ except lock.VerificationLockError as exc:
             patch("tools.platform_verification_lock.verification_resource_lock", return_value=nullcontext()),
         ):
             self.assertEqual(dispatch_ci(), 17)
-        self.assertEqual(failed_order, ["migration"])
+        self.assertEqual(
+            failed_order,
+            ["verification-contract", "docs", "python-quality", "security", "migration"],
+        )
         failed_upgrade.assert_called_once()
 
         unsafe_settings = {
@@ -3041,7 +3085,6 @@ except lock.VerificationLockError as exc:
         unsafe_order: list[str] = []
 
         with (
-            patch("tools.platform_verify.CI_GATE_IDS", ("migration", "backend")),
             patch("tools.platform_verify.dispatch", side_effect=lambda gate_id: unsafe_order.append(gate_id) or 0),
             patch(
                 "tools.platform_verify._validated_privileged_environment",
@@ -3051,7 +3094,10 @@ except lock.VerificationLockError as exc:
             self.assertRaises(VerificationError),
         ):
             dispatch_ci()
-        self.assertEqual(unsafe_order, ["migration"])
+        self.assertEqual(
+            unsafe_order,
+            ["verification-contract", "docs", "python-quality", "security", "migration"],
+        )
         unsafe_upgrade.assert_not_called()
         missing_seed = _integration_preflight_error(
             migration_heads=["test-head"],

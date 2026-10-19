@@ -1853,13 +1853,41 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             fake_sudo.chmod(0o700)
             projected_stdout = io.StringIO()
             with (
-                patch.object(remote_dispatch, "_trusted_helper", return_value=True),
+                patch.object(
+                    remote_dispatch,
+                    "_trusted_python_helper",
+                    return_value=True,
+                ) as trusted_python_helper,
                 patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
                 redirect_stdout(projected_stdout),
             ):
                 self.assertEqual(remote_dispatch._run_cpu_diagnostic_plan({
                     "operation": "cleanup", "schema": 1, "run_id": "a" * 32,
                 }), 0)
+            trusted_python_helper.assert_called_once_with(
+                remote_dispatch.CPU_DIAGNOSTIC_PLAN_HELPER
+            )
+            denied_stdout = io.StringIO()
+            with (
+                patch.object(
+                    remote_dispatch,
+                    "_trusted_python_helper",
+                    return_value=False,
+                ) as denied_helper,
+                patch.object(remote_dispatch.subprocess, "Popen") as denied_popen,
+                redirect_stdout(denied_stdout),
+            ):
+                self.assertEqual(remote_dispatch._run_cpu_diagnostic_plan({
+                    "operation": "cleanup", "schema": 1, "run_id": "a" * 32,
+                }), 2)
+            denied_helper.assert_called_once_with(
+                remote_dispatch.CPU_DIAGNOSTIC_PLAN_HELPER
+            )
+            denied_popen.assert_not_called()
+            self.assertEqual(
+                denied_stdout.getvalue(),
+                "CPU_DIAGNOSTIC_PLAN status=refused class=UntrustedHelper\n",
+            )
             projected_line = projected_stdout.getvalue().strip()
             self.assertTrue(projected_line.startswith("CPU_DIAGNOSTIC_PLAN {"))
             projected_value = json.loads(projected_line.removeprefix("CPU_DIAGNOSTIC_PLAN "))

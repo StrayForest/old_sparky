@@ -418,20 +418,20 @@ registry, for example:
 ```bash
 cd platform
 .venv_platform/bin/python tools/platform_verify.py list
-.venv_platform/bin/python tools/platform_verify.py backend --focused tests.test_platform_domain
+.venv_platform/bin/python tools/platform_verify.py backend-unit --focused tests.test_platform_domain
 .venv_platform/bin/python tools/platform_verify.py python-quality
 .venv_platform/bin/python tools/platform_verify.py verification-contract
 ```
 
-Use the repository's `.venv_platform` interpreter for Python gates; a system `python3` may lack the required dependencies and is not a canonical owner run.
-Before publishing release-tooling changes, run the full canonical focused owner
-slice, not only selected methods. If `.venv_platform` is unavailable, a
-documented system-Python supplement may cover dependency-safe owner cases, but
-the canonical gate remains `LOCAL GATE BLOCKED` until its external pass.
+Impact planning is advisory; run focused feedback and every affected full gate.
+`backend-unit --focused` is DB-free; `backend --focused` needs DB/Redis/privileged
+resources. Local `ci` orders verification-contract, docs, python-quality,
+security, migration, backend DB prep, backend, web-quality and web-hermetic;
+migration cleanup requires preparation; exact-SHA Actions gates publication.
 
-`LOCAL GATE BLOCKED` means a required safe dependency such as test PostgreSQL,
-isolated Redis or Chromium is unavailable. A smaller substitute must not be
-reported as a complete-gate pass.
+For full local Python gate dependencies, see [the development guide](development-guide.md#python-dependency-ownership).
+
+`LOCAL GATE BLOCKED` means required safe dependencies are unavailable; a smaller substitute is not a complete-gate pass.
 
 The privileged storage-maintenance host-contract test is catalogued with its
 GitHub-hosted Linux environment markers. The canonical verifier and runner
