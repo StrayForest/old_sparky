@@ -78,6 +78,10 @@ PLATFORM_CI_VENV_DIR=.cache/platform-ci-venv tools/platform_install_ci_python.sh
 
 The installer requires Python 3.12 on Linux x86_64 and refuses to reuse an
 existing target venv. It does not replace the app/runtime `.venv_platform`.
+On a checkout sharing a production filesystem, do not create duplicate CI
+venvs or run heavy local suites; hosted CI is authoritative. See the
+[test-suite resource policy](test-suite-governance.md)
+before any focused local check.
 
 The generator bootstraps its exact hash-locked pip-tools environment from
 [`requirements-ci-locker.lock.txt`](../requirements-ci-locker.lock.txt), so it
