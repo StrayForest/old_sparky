@@ -263,6 +263,8 @@ STORAGE_OPERATIONS_FILES = frozenset(
         "platform/tests/test_platform_ci_classifier.py",
         "platform/tests/test_platform_release_audit_hardening.py",
         "platform/tests/test_platform_storage_maintenance.py",
+        "platform/tests/test_platform_storage_evidence_privacy.py",
+        "platform/tools/platform_backup_failure_receipt.py",
         "platform/tools/platform_test_catalog.py",
     }
 )

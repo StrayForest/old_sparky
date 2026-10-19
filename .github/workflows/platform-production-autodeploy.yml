@@ -399,7 +399,9 @@ jobs:
               "platform/tools/platform_production_classifier_artifact.py",
               "platform/tests/test_platform_ci_classifier.py",
               "platform/tests/test_platform_release_audit_hardening.py",
+              "platform/tests/test_platform_storage_evidence_privacy.py",
               "platform/tests/test_platform_storage_maintenance.py",
+              "platform/tools/platform_backup_failure_receipt.py",
               "platform/tools/platform_test_catalog.py",
           }
           storage_operations_triggers = {
