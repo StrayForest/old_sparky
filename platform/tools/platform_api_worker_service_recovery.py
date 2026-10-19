@@ -68,6 +68,15 @@ SHOW_PROPERTIES = (
     "User",
     "Group",
 )
+TIMER_SHOW_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "FragmentPath",
+    "DropInPaths",
+    "UnitFileState",
+)
 MAX_CONFIG_BYTES = 1024 * 1024
 MIN_FREE_BYTES = 5 * 1024**3
 MAX_USED_PERCENT = 85.0
@@ -209,14 +218,30 @@ def _pointer_identity(app_dir: Path, name: str) -> tuple[str, str, tuple[int, in
         resolved = pointer.resolve(strict=True)
     except OSError as exc:
         raise RecoveryRefusal("pointer_identity") from exc
-    if not stat.S_ISLNK(link.st_mode) or target.startswith("/"):
+    if (
+        not stat.S_ISLNK(link.st_mode)
+        or link.st_uid != 0
+        or link.st_gid != 0
+        or link.st_nlink != 1
+    ):
         raise RecoveryRefusal("pointer_identity")
-    expected_prefix = "releases/"
-    if not target.startswith(expected_prefix) or target.count("/") != 1:
+    releases = app_dir / "releases"
+    if target.startswith("/"):
+        release = Path(target)
+        if release.parent != releases or str(release) != target:
+            raise RecoveryRefusal("pointer_identity")
+        release_name = release.name
+    else:
+        if not target.startswith("releases/") or target.count("/") != 1:
+            raise RecoveryRefusal("pointer_identity")
+        release_name = target.removeprefix("releases/")
+        if target != f"releases/{release_name}":
+            raise RecoveryRefusal("pointer_identity")
+        release = releases / release_name
+    if not release_name or release_name in {".", ".."}:
         raise RecoveryRefusal("pointer_identity")
-    release = app_dir / target
     try:
-        release_relative = release.relative_to(app_dir / "releases")
+        release_relative = release.relative_to(releases)
     except ValueError as exc:
         raise RecoveryRefusal("pointer_identity") from exc
     if len(release_relative.parts) != 1 or resolved != release:
@@ -247,12 +272,17 @@ def _systemctl(systemctl: str, *arguments: str, timeout: float = 10.0) -> subpro
     return _command([systemctl, *arguments], timeout=timeout)
 
 
-def _show_unit(systemctl: str, unit: str) -> dict[str, str]:
+def _show_unit(
+    systemctl: str,
+    unit: str,
+    *,
+    properties: tuple[str, ...] = SHOW_PROPERTIES,
+) -> dict[str, str]:
     result = _systemctl(
         systemctl,
         "show",
         unit,
-        "--property=" + ",".join(SHOW_PROPERTIES),
+        "--property=" + ",".join(properties),
         "--no-pager",
     )
     if result.returncode != 0:
@@ -260,10 +290,10 @@ def _show_unit(systemctl: str, unit: str) -> dict[str, str]:
     values: dict[str, str] = {}
     for line in result.stdout.splitlines():
         key, separator, value = line.partition("=")
-        if not separator or key not in SHOW_PROPERTIES or key in values:
+        if not separator or key not in properties or key in values:
             raise RecoveryRefusal("unit_state")
         values[key] = value
-    if set(values) != set(SHOW_PROPERTIES):
+    if set(values) != set(properties):
         raise RecoveryRefusal("unit_state")
     return values
 
@@ -543,14 +573,12 @@ def _timer_snapshot(release: Path, systemd_dir: Path, systemctl: str) -> dict[st
         installed_bytes = _owned_file(installed, mode=0o644, max_bytes=128 * 1024)
         if source_bytes != installed_bytes:
             raise RecoveryRefusal("timer_unit_identity")
-        state = _show_unit(systemctl, unit)
+        state = _show_unit(systemctl, unit, properties=TIMER_SHOW_PROPERTIES)
         enabled = _enabled_state(systemctl, unit)
         if (
             state["LoadState"] != "loaded"
             or state["FragmentPath"] != str(installed)
             or state["DropInPaths"] != ""
-            or state["User"] != ""
-            or state["Group"] != ""
             or enabled not in {"enabled", "disabled"}
             or state["UnitFileState"] != enabled
         ):
@@ -559,23 +587,19 @@ def _timer_snapshot(release: Path, systemd_dir: Path, systemctl: str) -> dict[st
             valid_state = (
                 state["SubState"] == "waiting"
                 and state["Result"] == "success"
-                and state["ExecMainStatus"] == "0"
-                and state["MainPID"] == "0"
             )
         else:
             valid_state = (
                 state["ActiveState"] == "inactive"
                 and state["SubState"] == "dead"
                 and state["Result"] == "success"
-                and state["ExecMainStatus"] == "0"
-                and state["MainPID"] == "0"
             )
         if not valid_state:
             raise RecoveryRefusal("timer_state")
         snapshot[unit] = (
             hashlib.sha256(source_bytes).hexdigest(),
             enabled,
-            *(state[key] for key in SHOW_PROPERTIES),
+            *(state[key] for key in TIMER_SHOW_PROPERTIES),
         )
     return snapshot
 
@@ -707,6 +731,8 @@ def _receipt(
     mode: str,
     status: str,
     stage: str,
+    requested_source_sha: str,
+    requested_release_slug: str,
     source_sha: str,
     release_slug: str,
     service_before: dict[str, dict[str, str]],
@@ -726,6 +752,8 @@ def _receipt(
         f"mode={mode}",
         f"status={status}",
         f"stage={stage}",
+        f"requested_source_sha={requested_source_sha}",
+        f"requested_release_slug={requested_release_slug}",
         f"source_sha={source_sha or 'unavailable'}",
         f"release_slug={release_slug or 'unavailable'}",
         f"api_before={service_before.get('deadlock-api', {}).get('ActiveState', 'unknown')}",
@@ -953,6 +981,8 @@ def recover(
             mode=mode,
             status="failed",
             stage=stage,
+            requested_source_sha=expected_sha,
+            requested_release_slug=expected_slug,
             source_sha=source_sha,
             release_slug=release_slug,
             service_before=service_before,
@@ -972,6 +1002,8 @@ def recover(
         mode=mode,
         status="passed",
         stage="complete",
+        requested_source_sha=expected_sha,
+        requested_release_slug=expected_slug,
         source_sha=source_sha,
         release_slug=release_slug,
         service_before=service_before,
