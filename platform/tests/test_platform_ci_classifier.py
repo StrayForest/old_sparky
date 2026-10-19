@@ -186,6 +186,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     str(manifest["target_sha"]),
                     "--allow-docs-only",
                     "--allow-candidate-packaging",
+                    "--allow-out-of-scope",
                     "--emit-manifest-base64",
                 ],
                 check=False,
@@ -1347,10 +1348,20 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn('"$ROUTE_DOCS_ONLY" == "true"', auto)
         self.assertIn("--allow-docs-only", PRODUCTION_WORKFLOW.read_text(encoding="utf-8"))
         self.assertIn("--allow-candidate-packaging", auto)
-        self.assertNotIn(
-            "--allow-candidate-packaging",
-            RECOVERY_BUILD_WORKFLOW.read_text(encoding="utf-8"),
+        recovery_build = RECOVERY_BUILD_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(recovery_build.count("--allow-candidate-packaging"), 1)
+        route_validation = next(
+            step["run"]
+            for step in yaml.safe_load(recovery_build)["jobs"]["build"]["steps"]
+            if step.get("name") == "Download and validate exact security route artifact"
         )
+        self.assertIn("--allow-candidate-packaging", route_validation)
+        bundle_step = next(
+            step["run"]
+            for step in yaml.safe_load(recovery_build)["jobs"]["build"]["steps"]
+            if step.get("name") == "Build and validate deterministic recovery bundle"
+        )
+        self.assertNotIn("--allow-candidate-packaging", bundle_step)
         self.assertIn("env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B", auto)
 
         self.assertIn("route_recovery_bootstrap_only", auto)
@@ -1734,6 +1745,47 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertEqual(
                 accepted_auto_candidate["reason"], CANDIDATE_PACKAGING_REASON
             )
+            accepted_candidate_skip = validate_production_classifier_manifest(
+                candidate_archive,
+                target_sha=self.TARGET_SHA,
+                require_candidate_packaging=True,
+            )
+            self.assertEqual(
+                accepted_candidate_skip["reason"], CANDIDATE_PACKAGING_REASON
+            )
+            candidate_skip_cli = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"),
+                    "manifest",
+                    str(candidate_archive),
+                    "--target-sha",
+                    self.TARGET_SHA,
+                    "--require-candidate-packaging",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                candidate_skip_cli.returncode, 0, candidate_skip_cli.stderr
+            )
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    candidate_archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_candidate_packaging=True,
+                    require_candidate_packaging=True,
+                )
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    candidate_archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_out_of_scope=True,
+                    require_candidate_packaging=True,
+                )
             with self.assertRaises(ClassifierArtifactError):
                 validate_production_classifier_manifest(
                     candidate_archive,
@@ -2810,10 +2862,106 @@ class PlatformCiClassifierTests(unittest.TestCase):
             with self.assertRaises(ClassifierError):
                 validate_manifest(inconsistent, expected_target_sha=self.TARGET_SHA)
 
+            out_of_scope = classify(
+                ["README.md", "tools/maintenance.py"],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            self.assertEqual(out_of_scope["class"], "out-of-scope")
+            self.assertEqual(out_of_scope["expected_gates"], list(OUT_OF_SCOPE_GATE_IDS))
+            self.assertFalse(out_of_scope["runtime_sensitive"])
+            self.assertFalse(out_of_scope["deployable"])
+            self.assertFalse(out_of_scope["fallback"])
+            out_of_scope_archive = self._write_production_classifier_archive(
+                root, out_of_scope
+            )
+            for options in ({}, {"allow_docs_only": True}, {"allow_candidate_packaging": True}):
+                with self.subTest(out_of_scope_options=options):
+                    with self.assertRaises(ClassifierArtifactError):
+                        validate_production_classifier_manifest(
+                            out_of_scope_archive,
+                            target_sha=self.TARGET_SHA,
+                            **options,
+                        )
+            accepted_out_of_scope = validate_production_classifier_manifest(
+                out_of_scope_archive,
+                target_sha=self.TARGET_SHA,
+                allow_out_of_scope=True,
+            )
+            self.assertEqual(accepted_out_of_scope["digest"], out_of_scope["digest"])
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    out_of_scope_archive,
+                    target_sha=self.TARGET_SHA,
+                    require_out_of_scope=True,
+                )["digest"],
+                out_of_scope["digest"],
+            )
+            required_out_of_scope_cli = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"),
+                    "manifest",
+                    str(out_of_scope_archive),
+                    "--target-sha",
+                    self.TARGET_SHA,
+                    "--require-out-of-scope",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                required_out_of_scope_cli.returncode,
+                0,
+                required_out_of_scope_cli.stderr,
+            )
+            for options in (
+                {"allow_out_of_scope": True, "require_out_of_scope": True},
+                {"allow_out_of_scope": True, "require_reconcile_source": True},
+                {"allow_out_of_scope": True, "require_runtime_sensitive": True},
+                {"allow_out_of_scope": True, "require_recovery_bootstrap": True},
+            ):
+                with self.subTest(out_of_scope_conflicting_options=options):
+                    with self.assertRaises(ClassifierArtifactError):
+                        validate_production_classifier_manifest(
+                            out_of_scope_archive,
+                            target_sha=self.TARGET_SHA,
+                            **options,
+                        )
+            for key, value in (
+                ("runtime_sensitive", True),
+                ("deployable", True),
+                ("fallback", True),
+                ("expected_gates", list(FULL_GATE_IDS)),
+                ("reason", "strict platform/docs-only change"),
+                ("files", ["tools/../README.md"]),
+                (
+                    "files",
+                    [*out_of_scope["files"], "platform/tools/runtime.py"],
+                ),
+            ):
+                tampered = dict(out_of_scope, **{key: value})
+                tampered["digest"] = manifest_digest(tampered)
+                tampered_archive = self._write_production_classifier_archive(
+                    root, tampered
+                )
+                with self.subTest(out_of_scope_tamper=key):
+                    with self.assertRaises(ClassifierArtifactError):
+                        validate_production_classifier_manifest(
+                            tampered_archive,
+                            target_sha=self.TARGET_SHA,
+                            allow_out_of_scope=True,
+                        )
+
     def test_storage_operations_autodeploy_validates_then_skips_dispatch(self) -> None:
         workflow = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("_is_storage_operations_only", workflow)
         self.assertIn("STORAGE_OPERATIONS_REASON", workflow)
+        self.assertIn("--allow-out-of-scope", workflow)
 
         route = classify(
             sorted(STORAGE_OPERATIONS_FILES),
@@ -2826,6 +2974,18 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(outputs["route_recovery_bootstrap_only"], "false")
         self.assertEqual(outputs["route_candidate_packaging_only"], "false")
         self.assertEqual(outputs["route_deployable"], "false")
+        out_of_scope_route = classify(
+            ["README.md", "tools/maintenance.py"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        out_of_scope_outputs = self._run_auto_deploy_manifest_contract(
+            out_of_scope_route
+        )
+        self.assertEqual(out_of_scope_outputs["route_class"], "out-of-scope")
+        self.assertEqual(out_of_scope_outputs["route_out_of_scope_only"], "true")
+        self.assertEqual(out_of_scope_outputs["route_deployable"], "false")
 
         step_start = workflow.index(
             "      - name: Verify tested SHA is current dev head\n"
@@ -2869,6 +3029,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 "ROUTE_RECOVERY_BOOTSTRAP_ONLY": "false",
                 "ROUTE_CANDIDATE_PACKAGING_ONLY": "false",
                 "ROUTE_STORAGE_OPERATIONS_ONLY": "true",
+                "ROUTE_OUT_OF_SCOPE_ONLY": "false",
             }
             completed = subprocess.run(
                 ["bash", "-euo", "pipefail", "-c", gate_script],
@@ -2887,6 +3048,27 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertIn("/branches/dev", calls[0])
             self.assertNotIn("/workflows/platform-production-deploy.yml/dispatches", calls[0])
+
+            output.write_text("", encoding="utf-8")
+            curl_calls.write_text("", encoding="utf-8")
+            environment.update(
+                {
+                    "ROUTE_CLASS": "out-of-scope",
+                    "ROUTE_STORAGE_OPERATIONS_ONLY": "false",
+                    "ROUTE_OUT_OF_SCOPE_ONLY": "true",
+                }
+            )
+            out_of_scope_gate = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", gate_script],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(out_of_scope_gate.returncode, 0, out_of_scope_gate.stderr)
+            self.assertIn("no application deployment or baseline reconciliation", out_of_scope_gate.stdout)
+            self.assertEqual(output.read_text(encoding="utf-8").strip(), "deploy=false")
+            self.assertEqual(len(curl_calls.read_text(encoding="utf-8").splitlines()), 1)
 
     def test_recovery_producer_storage_route_emits_bound_receipt_inputs(self) -> None:
         blocks = _workflow_python_blocks(
@@ -2975,6 +3157,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertNotEqual(rejected.returncode, 0)
 
     def test_recovery_producer_docs_only_emits_authenticated_noop_not_bundle(self) -> None:
+        recovery_workflow = RECOVERY_BUILD_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("--allow-out-of-scope", recovery_workflow)
+        self.assertIn("--allow-candidate-packaging", recovery_workflow)
         route_blocks = _workflow_python_blocks(
             RECOVERY_BUILD_WORKFLOW,
             "Download and validate exact security route artifact",
@@ -3030,6 +3215,137 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertEqual(receipt["route_files_sha256"], docs_outputs["route_files_sha256"])
             self.assertEqual(stat.S_IMODE(receipt_path.stat().st_mode), 0o600)
 
+            out_of_scope_manifest = classify(
+                ["README.md", "tools/maintenance.py"],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            out_of_scope_encoded = base64.b64encode(
+                json.dumps(
+                    out_of_scope_manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).decode("ascii")
+            out_of_scope_output = root / "out-of-scope-output"
+            out_of_scope_run = subprocess.run(
+                [sys.executable, "-I", "-", out_of_scope_encoded, str(out_of_scope_output), self.TARGET_SHA],
+                input=route_blocks[0],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(out_of_scope_run.returncode, 0, out_of_scope_run.stderr)
+            out_of_scope_values = dict(
+                line.split("=", 1) for line in out_of_scope_output.read_text().splitlines()
+            )
+            self.assertEqual(out_of_scope_values["route_skip"], "true")
+            self.assertEqual(out_of_scope_values["route_family"], "out-of-scope")
+            self.assertEqual(
+                out_of_scope_values["classifier_digest"], out_of_scope_manifest["digest"]
+            )
+            out_of_scope_receipt_path = root / "out-of-scope-receipt.json"
+            out_of_scope_env = {
+                **os.environ,
+                "SOURCE_SHA": self.TARGET_SHA,
+                "SECURITY_RUN_ID": "77",
+                "SECURITY_RUN_ATTEMPT": "3",
+                "RECOVERY_BUILD_RUN_ID": "401",
+                "RECOVERY_BUILD_RUN_ATTEMPT": "2",
+                "ROUTE_FAMILY": "out-of-scope",
+                "CLASSIFIER_DIGEST": out_of_scope_values["classifier_digest"],
+                "ROUTE_FILES_SHA256": out_of_scope_values["route_files_sha256"],
+            }
+            out_of_scope_receipt_created = subprocess.run(
+                [sys.executable, "-I", "-", str(out_of_scope_receipt_path)],
+                input=receipt_blocks[0],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=out_of_scope_env,
+            )
+            self.assertEqual(
+                out_of_scope_receipt_created.returncode,
+                0,
+                out_of_scope_receipt_created.stderr,
+            )
+            out_of_scope_receipt = json.loads(
+                out_of_scope_receipt_path.read_text(encoding="ascii")
+            )
+            self.assertEqual(out_of_scope_receipt["route_family"], "out-of-scope")
+            self.assertEqual(
+                out_of_scope_receipt["classifier_digest"], out_of_scope_manifest["digest"]
+            )
+            self.assertEqual(
+                stat.S_IMODE(out_of_scope_receipt_path.stat().st_mode), 0o600
+            )
+
+            candidate_manifest = classify(
+                sorted(CANDIDATE_PACKAGING_FILES),
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            candidate_encoded = base64.b64encode(
+                json.dumps(
+                    candidate_manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).decode("ascii")
+            candidate_output = root / "candidate-output"
+            candidate_run = subprocess.run(
+                [sys.executable, "-I", "-", candidate_encoded, str(candidate_output), self.TARGET_SHA],
+                input=route_blocks[0],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(candidate_run.returncode, 0, candidate_run.stderr)
+            candidate_values = dict(
+                line.split("=", 1)
+                for line in candidate_output.read_text(encoding="ascii").splitlines()
+            )
+            self.assertEqual(candidate_values["route_skip"], "true")
+            self.assertEqual(candidate_values["route_family"], "candidate-packaging")
+            self.assertEqual(candidate_values["classifier_digest"], candidate_manifest["digest"])
+            candidate_receipt_path = root / "candidate-receipt.json"
+            candidate_env = {
+                **os.environ,
+                "SOURCE_SHA": self.TARGET_SHA,
+                "SECURITY_RUN_ID": "77",
+                "SECURITY_RUN_ATTEMPT": "3",
+                "RECOVERY_BUILD_RUN_ID": "401",
+                "RECOVERY_BUILD_RUN_ATTEMPT": "2",
+                "ROUTE_FAMILY": "candidate-packaging",
+                "CLASSIFIER_DIGEST": candidate_values["classifier_digest"],
+                "ROUTE_FILES_SHA256": candidate_values["route_files_sha256"],
+            }
+            candidate_receipt_run = subprocess.run(
+                [sys.executable, "-I", "-", str(candidate_receipt_path)],
+                input=receipt_blocks[0],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=candidate_env,
+            )
+            self.assertEqual(
+                candidate_receipt_run.returncode, 0, candidate_receipt_run.stderr
+            )
+            candidate_receipt = json.loads(
+                candidate_receipt_path.read_text(encoding="ascii")
+            )
+            self.assertEqual(candidate_receipt["route_family"], "candidate-packaging")
+            self.assertEqual(
+                candidate_receipt["classifier_digest"], candidate_manifest["digest"]
+            )
+            self.assertEqual(
+                candidate_receipt["route_files_sha256"],
+                candidate_values["route_files_sha256"],
+            )
+            self.assertEqual(stat.S_IMODE(candidate_receipt_path.stat().st_mode), 0o600)
+
             workflow = yaml.safe_load(RECOVERY_BUILD_WORKFLOW.read_text(encoding="utf-8"))
             steps = workflow["jobs"]["build"]["steps"]
             for name in (
@@ -3046,6 +3362,14 @@ class PlatformCiClassifierTests(unittest.TestCase):
             ):
                 step = next(item for item in steps if item.get("name") == name)
                 self.assertEqual(step["if"], "steps.route.outputs.route_skip == 'true'")
+            self.assertIn(
+                "--allow-candidate-packaging",
+                next(
+                    step["run"]
+                    for step in steps
+                    if step.get("name") == "Download and validate exact security route artifact"
+                ),
+            )
 
             mixed = classify(
                 ["platform/docs/operations-runbook.md", "platform/tools/runtime.py"],
@@ -3149,6 +3473,28 @@ class PlatformCiClassifierTests(unittest.TestCase):
             docs_selected = select([docs_receipt_row])
             self.assertEqual(docs_selected.returncode, 0, docs_selected.stderr)
             self.assertIn("route_family=docs-only", output.read_text(encoding="ascii"))
+            out_of_scope_receipt_row = json.loads(json.dumps(receipt_row))
+            out_of_scope_receipt_row["name"] = receipt_name.replace(
+                "skip-storage-operations-", "skip-out-of-scope-"
+            )
+            output.write_text("", encoding="ascii")
+            out_of_scope_selected = select([out_of_scope_receipt_row])
+            self.assertEqual(
+                out_of_scope_selected.returncode, 0, out_of_scope_selected.stderr
+            )
+            self.assertIn(
+                "route_family=out-of-scope", output.read_text(encoding="ascii")
+            )
+            candidate_receipt_row = json.loads(json.dumps(receipt_row))
+            candidate_receipt_row["name"] = receipt_name.replace(
+                "skip-storage-operations-", "skip-candidate-packaging-"
+            )
+            output.write_text("", encoding="ascii")
+            candidate_selected = select([candidate_receipt_row])
+            self.assertEqual(candidate_selected.returncode, 0, candidate_selected.stderr)
+            self.assertIn(
+                "route_family=candidate-packaging", output.read_text(encoding="ascii")
+            )
             wrong_attempt_name = json.loads(json.dumps(receipt_row))
             wrong_attempt_name["name"] = wrong_attempt_name["name"].rsplit("-", 1)[0] + "-3.json"
             self.assertNotEqual(select([wrong_attempt_name]).returncode, 0)
@@ -3215,6 +3561,11 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertNotEqual(missing.returncode, 0)
 
     def test_recovery_publisher_receipt_and_classifier_proof_reject_tampering(self) -> None:
+        recovery_publisher_workflow = RECOVERY_PUBLISH_WORKFLOW.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--require-out-of-scope", recovery_publisher_workflow)
+        self.assertIn("--require-candidate-packaging", recovery_publisher_workflow)
         blocks = _workflow_python_blocks(
             RECOVERY_PUBLISH_WORKFLOW,
             "Authenticate route skip receipt and parent classifier proof",
@@ -3342,6 +3693,189 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 input=blocks[2], text=True, capture_output=True, check=False, env=docs_env,
             )
             self.assertEqual(docs_proof.returncode, 0, docs_proof.stderr)
+
+            out_of_scope_manifest = classify(
+                ["README.md", "tools/maintenance.py"],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            out_of_scope_encoded = base64.b64encode(
+                json.dumps(
+                    out_of_scope_manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).decode("ascii")
+            out_of_scope_receipt = {
+                **receipt,
+                "route_family": "out-of-scope",
+                "classifier_digest": out_of_scope_manifest["digest"],
+                "route_files_sha256": hashlib.sha256(
+                    json.dumps(
+                        sorted(out_of_scope_manifest["files"]),
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+            }
+            out_of_scope_receipt_name = (
+                f"platform-recovery-bootstrap-skip-out-of-scope-"
+                f"{self.TARGET_SHA}-77-3-401-2.json"
+            )
+            out_of_scope_receipt_zip = root / "out-of-scope-receipt.zip"
+            out_of_scope_info = zipfile.ZipInfo(out_of_scope_receipt_name)
+            out_of_scope_info.create_system = 3
+            out_of_scope_info.external_attr = (stat.S_IFREG | 0o600) << 16
+            with zipfile.ZipFile(
+                out_of_scope_receipt_zip, "w", compression=zipfile.ZIP_STORED
+            ) as archive:
+                archive.writestr(
+                    out_of_scope_info,
+                    json.dumps(
+                        out_of_scope_receipt,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode(),
+                )
+            out_of_scope_receipt_check = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    str(out_of_scope_receipt_zip),
+                    out_of_scope_receipt_name,
+                    "401",
+                    "2",
+                    "out-of-scope",
+                    str(output),
+                ],
+                input=blocks[0],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                out_of_scope_receipt_check.returncode,
+                0,
+                out_of_scope_receipt_check.stderr,
+            )
+            out_of_scope_env = {
+                **environment,
+                "ROUTE_FAMILY": "out-of-scope",
+                "CLASSIFIER_DIGEST": out_of_scope_manifest["digest"],
+                "ROUTE_FILES_SHA256": out_of_scope_receipt[
+                    "route_files_sha256"
+                ],
+            }
+            out_of_scope_proof = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    out_of_scope_encoded,
+                    str(output),
+                    "out-of-scope",
+                ],
+                input=blocks[2],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=out_of_scope_env,
+            )
+            self.assertEqual(
+                out_of_scope_proof.returncode, 0, out_of_scope_proof.stderr
+            )
+            self.assertIn(
+                "route_authenticated=true", output.read_text(encoding="ascii")
+            )
+            candidate_manifest = classify(
+                sorted(CANDIDATE_PACKAGING_FILES),
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            candidate_encoded = base64.b64encode(
+                json.dumps(
+                    candidate_manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).decode("ascii")
+            candidate_receipt = {
+                **receipt,
+                "route_family": "candidate-packaging",
+                "classifier_digest": candidate_manifest["digest"],
+                "route_files_sha256": hashlib.sha256(
+                    json.dumps(
+                        sorted(candidate_manifest["files"]), separators=(",", ":")
+                    ).encode()
+                ).hexdigest(),
+            }
+            candidate_receipt_name = (
+                f"platform-recovery-bootstrap-skip-candidate-packaging-"
+                f"{self.TARGET_SHA}-77-3-401-2.json"
+            )
+            candidate_receipt_zip = root / "candidate-receipt.zip"
+            candidate_info = zipfile.ZipInfo(candidate_receipt_name)
+            candidate_info.create_system = 3
+            candidate_info.external_attr = (stat.S_IFREG | 0o600) << 16
+            with zipfile.ZipFile(
+                candidate_receipt_zip, "w", compression=zipfile.ZIP_STORED
+            ) as archive:
+                archive.writestr(
+                    candidate_info,
+                    json.dumps(
+                        candidate_receipt,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode(),
+                )
+            candidate_receipt_check = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    str(candidate_receipt_zip),
+                    candidate_receipt_name,
+                    "401",
+                    "2",
+                    "candidate-packaging",
+                    str(output),
+                ],
+                input=blocks[0],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                candidate_receipt_check.returncode,
+                0,
+                candidate_receipt_check.stderr,
+            )
+            candidate_env = {
+                **environment,
+                "ROUTE_FAMILY": "candidate-packaging",
+                "CLASSIFIER_DIGEST": candidate_manifest["digest"],
+                "ROUTE_FILES_SHA256": candidate_receipt["route_files_sha256"],
+            }
+            candidate_proof = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    candidate_encoded,
+                    str(output),
+                    "candidate-packaging",
+                ],
+                input=blocks[2],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=candidate_env,
+            )
+            self.assertEqual(candidate_proof.returncode, 0, candidate_proof.stderr)
+            self.assertIn("route_authenticated=true", output.read_text(encoding="ascii"))
+            self.assertIn("--require-out-of-scope", RECOVERY_PUBLISH_WORKFLOW.read_text(encoding="utf-8"))
             bad_docs_digest = subprocess.run(
                 [sys.executable, "-I", "-", docs_encoded, str(output), "docs-only"],
                 input=blocks[2], text=True, capture_output=True, check=False,

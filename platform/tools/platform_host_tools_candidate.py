@@ -80,6 +80,47 @@ def _load_trusted_bundle() -> ModuleType:
 bundle = _load_trusted_bundle()
 
 
+def _load_trusted_classifier() -> ModuleType:
+    """Load the canonical router from this trusted checkout, never candidate data."""
+
+    script = Path(__file__)
+    if script.is_symlink() or script.name != "platform_host_tools_candidate.py":
+        raise ImportError("trusted candidate validator path is unsafe")
+    trusted_tools = script.resolve(strict=True).parent
+    classifier_path = trusted_tools / "platform_ci_classifier.py"
+    provenance_path = trusted_tools / "platform_workflow_provenance.py"
+    for path in (classifier_path, provenance_path):
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise ImportError("trusted classifier dependency is unavailable") from exc
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ImportError("trusted classifier dependency metadata is unsafe")
+
+    # The classifier's script-mode fallback imports its sibling provenance
+    # helper by name. In isolated mode, temporarily add only this validated
+    # trusted tools directory; candidate-data is never put on sys.path.
+    previous_path = sys.path[:]
+    try:
+        sys.path.insert(0, str(trusted_tools))
+        spec = importlib.util.spec_from_file_location(
+            "_platform_ci_classifier_trusted", classifier_path
+        )
+        loader = spec.loader if spec is not None else None
+        if spec is None or loader is None or spec.origin is None:
+            raise ImportError("trusted classifier loader is unavailable")
+        if Path(spec.origin).resolve(strict=True) != classifier_path.resolve(strict=True):
+            raise ImportError("trusted classifier origin changed")
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+    finally:
+        sys.path[:] = previous_path
+
+
+classifier = _load_trusted_classifier()
+
+
 # The context/evidence schema deliberately changed when the PR source head
 # was separated from the synthetic merge commit that GitHub tests.  Do not
 # accept the old one-field context: it was the source of the P1 confusion.
@@ -177,6 +218,7 @@ EXPECTED_JOB_NAMES = frozenset(
         "CI route classifier",
         "status-start",
         "Authenticate internal baseline runtime proof",
+        "Exact-source host-tools pin preflight",
         "Backend DB-free contours",
         "Backend PostgreSQL and Redis integration",
         "Backend privileged ephemeral contour",
@@ -197,6 +239,7 @@ EXPECTED_JOB_NAMES = frozenset(
 REQUIRED_SUCCESS_JOB_NAMES = frozenset(
     {
         "CI route classifier",
+        "Exact-source host-tools pin preflight",
         "Backend DB-free contours",
         "Backend PostgreSQL and Redis integration",
         "Backend privileged ephemeral contour",
@@ -226,6 +269,23 @@ PR_ALWAYS_SKIPPED_JOB_NAMES = frozenset(
         "Dispatch exact baseline proof finalizer",
     }
 )
+GATE_JOB_NAMES: Mapping[str, frozenset[str]] = {
+    "backend": frozenset(
+        {
+            "Backend DB-free contours",
+            "Backend PostgreSQL and Redis integration",
+            "Backend privileged ephemeral contour",
+            "Backend aggregate",
+        }
+    ),
+    "python-quality": frozenset({"Python quality"}),
+    "security": frozenset({"Security gates"}),
+    "migration": frozenset({"Migration scenarios"}),
+    "docs": frozenset({"Documentation consistency"}),
+    "web-quality": frozenset({"web-quality"}),
+    "web-hermetic": frozenset({"Web hermetic"}),
+    "verification-contract": frozenset({"Verification contract"}),
+}
 
 
 class CandidateError(ValueError):
@@ -1105,14 +1165,12 @@ def _verify_closed_archive(
     return member
 
 
-def verify_summary_artifact(
+def _read_summary_artifact(
     context_path: Path,
     metadata_path: Path,
     archive_path: Path,
     *,
     expected_artifact_id: str,
-    output: Path | None = None,
-    github_output: Path | None = None,
 ) -> dict[str, object]:
     context = load_context(context_path)
     metadata = _object(_read_json(metadata_path, description="summary artifact metadata"), "summary artifact metadata")
@@ -1144,8 +1202,8 @@ def verify_summary_artifact(
         raise
     except (OSError, UnicodeError, json.JSONDecodeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
         raise CandidateError("summary artifact is invalid") from exc
-    _validate_summary(summary, context)
     result = {
+        "context": context,
         "schema": SCHEMA,
         "artifact_id": int(metadata["id"]),
         "artifact_name": metadata["name"],
@@ -1154,6 +1212,28 @@ def verify_summary_artifact(
         "archive_sha256": hashlib.sha256(_read_bytes(archive_path, maximum=MAX_SUMMARY_ARCHIVE_BYTES, description="summary archive")).hexdigest(),
         "summary": summary,
     }
+    return result
+
+
+def verify_summary_artifact(
+    context_path: Path,
+    metadata_path: Path,
+    archive_path: Path,
+    *,
+    expected_artifact_id: str,
+    output: Path | None = None,
+    github_output: Path | None = None,
+) -> dict[str, object]:
+    result = _read_summary_artifact(
+        context_path,
+        metadata_path,
+        archive_path,
+        expected_artifact_id=expected_artifact_id,
+    )
+    context = result.pop("context")
+    if not isinstance(context, RunContext):
+        raise CandidateError("summary artifact context is invalid")
+    _validate_summary(_object(result["summary"], "security summary"), context)
     if output is not None:
         output.write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
     if github_output is not None:
@@ -1218,15 +1298,12 @@ def _validate_route_manifest(
         raise CandidateError("route manifest digest does not match security summary")
 
 
-def verify_route_artifact(
+def _read_route_artifact(
     context_path: Path,
     metadata_path: Path,
     archive_path: Path,
     *,
     expected_artifact_id: str,
-    expected_manifest_digest: str,
-    output: Path | None = None,
-    github_output: Path | None = None,
 ) -> dict[str, object]:
     """Validate the classifier artifact and bind its target to tested_merge_sha."""
 
@@ -1255,15 +1332,8 @@ def verify_route_artifact(
         manifest = _object(json.loads(member.decode("utf-8"), object_pairs_hook=_strict_object), "route manifest")
     except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise CandidateError("route manifest is invalid") from exc
-    # The summary is validated separately, then supplies the exact digest
-    # expected here.  This function accepts it as a required argument rather
-    # than trusting the route artifact's self-reported digest.
-    _validate_route_manifest(
-        manifest,
-        context,
-        expected_digest=expected_manifest_digest,
-    )
     result = {
+        "context": context,
         "artifact_id": int(metadata["id"]),
         "artifact_name": metadata["name"],
         "artifact_size": metadata["size_in_bytes"],
@@ -1271,6 +1341,33 @@ def verify_route_artifact(
         "archive_sha256": hashlib.sha256(_read_bytes(archive_path, maximum=MAX_ARTIFACT_BYTES, description="route archive")).hexdigest(),
         "manifest": manifest,
     }
+    return result
+
+
+def verify_route_artifact(
+    context_path: Path,
+    metadata_path: Path,
+    archive_path: Path,
+    *,
+    expected_artifact_id: str,
+    expected_manifest_digest: str,
+    output: Path | None = None,
+    github_output: Path | None = None,
+) -> dict[str, object]:
+    result = _read_route_artifact(
+        context_path,
+        metadata_path,
+        archive_path,
+        expected_artifact_id=expected_artifact_id,
+    )
+    context = result.pop("context")
+    if not isinstance(context, RunContext):
+        raise CandidateError("route artifact context is invalid")
+    _validate_route_manifest(
+        _object(result["manifest"], "route manifest"),
+        context,
+        expected_digest=expected_manifest_digest,
+    )
     if output is not None:
         output.write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
     if github_output is not None:
@@ -1366,7 +1463,40 @@ def _validate_summary(summary: Mapping[str, object], context: RunContext) -> Non
         raise CandidateError("pull request status-start must be skipped")
 
 
-def verify_jobs(jobs_path: Path, context: RunContext, summary: Mapping[str, object]) -> None:
+def _validate_summary_provenance(summary: Mapping[str, object], context: RunContext) -> None:
+    base_keys = {
+        "schema", "tested_sha", "event", "route_event", "class", "reason", "deployable", "fallback",
+        "manifest_digest", "expected_gates", "gate_results", "conditional_gate_results", "runtime_sensitive",
+        "requires_release_runtime", "requires_real_release_runtime", "missing_or_failed", "route_errors",
+        "status_start_result", "passed",
+    }
+    extra = set(summary) - base_keys
+    if not base_keys.issubset(summary) or (extra and frozenset(extra) not in SUMMARY_PROVENANCE_FIELD_SETS):
+        raise CandidateError("security final summary schema is not closed")
+    if frozenset(extra) == SUMMARY_PROVENANCE_FIELD_SETS[2]:
+        if (
+            summary.get("proof_mode") != "standard"
+            or summary.get("proof_run_id") != context.run_id
+            or summary.get("proof_run_attempt") != context.run_attempt
+            or summary.get("baseline_guard_result") != "skipped"
+        ):
+            raise CandidateError("security final summary PR run proof is invalid")
+    elif extra:
+        source_key, tree_key, parents_key = (
+            ("source_head_sha", "tested_tree_sha", "tested_parents")
+            if frozenset(extra) == SUMMARY_PROVENANCE_FIELD_SETS[0]
+            else ("source_sha", "tree_sha", "parents")
+        )
+        if summary.get(source_key) != context.original_source_head_sha or summary.get("base_sha") != context.original_base_sha:
+            raise CandidateError("security final summary source/base identity is invalid")
+        if summary.get(tree_key) != context.tested_tree_sha:
+            raise CandidateError("security final summary tree identity is invalid")
+        parents = summary.get(parents_key)
+        if not isinstance(parents, list) or len(parents) != 2 or tuple(parents) != context.tested_parents:
+            raise CandidateError("security final summary ordered parents are invalid")
+
+
+def _read_security_jobs(jobs_path: Path, context: RunContext) -> dict[str, Mapping[str, object]]:
     payload = _object(_read_json(jobs_path, description="security jobs"), "security jobs")
     rows = payload.get("jobs")
     if not isinstance(rows, list) or len(rows) != len(EXPECTED_JOB_NAMES):
@@ -1383,11 +1513,6 @@ def verify_jobs(jobs_path: Path, context: RunContext, summary: Mapping[str, obje
             raise CandidateError("security job id set is invalid")
         if job.get("status") != "completed" or job.get("conclusion") not in {"success", "skipped"}:
             raise CandidateError("security job is not completed with an allowed conclusion")
-        # The exact-attempt workflow-jobs response documents all five fields.
-        # Require them here: accepting a row with an omitted identity would
-        # turn the endpoint's attempt path into an unverifiable latest/all
-        # jobs mix.  The optional check_run_url is validated when supplied by
-        # GitHub but is not used as authority.
         for required_field in ("run_id", "run_attempt", "head_sha", "head_branch", "workflow_name"):
             if required_field not in job:
                 raise CandidateError(f"security job {required_field} identity is missing")
@@ -1397,18 +1522,164 @@ def verify_jobs(jobs_path: Path, context: RunContext, summary: Mapping[str, obje
             raise CandidateError("security job attempt identity is invalid")
         if _sha(job.get("head_sha"), "security job source head SHA") != context.original_source_head_sha:
             raise CandidateError("security job source head SHA identity is invalid")
-        if job.get("head_branch") != context.original_head_ref:
-            raise CandidateError("security job head ref identity is invalid")
-        if job.get("workflow_name") != SECURITY_WORKFLOW_NAME:
-            raise CandidateError("security job workflow name identity is invalid")
+        if job.get("head_branch") != context.original_head_ref or job.get("workflow_name") != SECURITY_WORKFLOW_NAME:
+            raise CandidateError("security job source or workflow identity is invalid")
         if "check_run_url" in job:
             _text(job.get("check_run_url"), "security job check-run URL", CHECK_RUN_URL_RE)
         by_name[name] = job
         job_ids.add(job_id)
-    if payload.get("total_count") != len(rows):
-        raise CandidateError("security job total count is invalid")
-    if set(by_name) != EXPECTED_JOB_NAMES:
+    if payload.get("total_count") != len(rows) or set(by_name) != EXPECTED_JOB_NAMES:
         raise CandidateError("security job allowlist is incomplete")
+    return by_name
+
+
+def _validate_disposition_jobs(
+    jobs_path: Path,
+    context: RunContext,
+    *,
+    expected_gates: Sequence[str],
+) -> None:
+    by_name = _read_security_jobs(jobs_path, context)
+    successful = {
+        "CI route classifier",
+        "Exact-source host-tools pin preflight",
+        "status-final",
+    }
+    for gate in expected_gates:
+        successful.update(GATE_JOB_NAMES[gate])
+    for name, job in by_name.items():
+        expected = "success" if name in successful else "skipped"
+        if job.get("conclusion") != expected:
+            raise CandidateError("security job conclusions do not match the canonical route")
+
+
+def _validate_noop_summary(
+    summary: Mapping[str, object],
+    manifest: Mapping[str, object],
+    context: RunContext,
+) -> None:
+    _validate_summary_provenance(summary, context)
+    route_class = manifest.get("class")
+    if route_class not in {"docs-only", "out-of-scope"}:
+        raise CandidateError("security summary is not an authenticated no-op route")
+    if (
+        type(summary.get("schema")) is not int
+        or summary.get("schema") != 1
+        or summary.get("tested_sha") != context.tested_merge_sha
+        or summary.get("event") != SECURITY_EVENT
+        or summary.get("route_event") != SECURITY_EVENT
+        or summary.get("class") != route_class
+        or summary.get("reason") != manifest.get("reason")
+        or summary.get("manifest_digest") != manifest.get("digest")
+        or summary.get("expected_gates") != manifest.get("expected_gates")
+        or summary.get("deployable") is not False
+        or summary.get("fallback") is not False
+        or summary.get("runtime_sensitive") is not False
+        or summary.get("requires_release_runtime") is not False
+        or summary.get("requires_real_release_runtime") is not False
+        or summary.get("missing_or_failed") != []
+        or summary.get("route_errors") != []
+        or summary.get("passed") is not True
+        or summary.get("status_start_result") != "skipped"
+    ):
+        raise CandidateError("security final summary does not match the authenticated route")
+    same_repository_dev_pr = (
+        context.original_base_ref == "dev"
+        and context.original_base_repository == context.repository
+        and context.original_head_repository == context.repository
+    )
+    if not same_repository_dev_pr:
+        raise CandidateError("security final summary PR repositories are not canonical")
+    expected_gates = tuple(manifest["expected_gates"])
+    gate_results = summary.get("gate_results")
+    if not isinstance(gate_results, Mapping) or set(gate_results) != set(FULL_GATE_IDS):
+        raise CandidateError("security final summary gate results are invalid")
+    if any(gate_results[gate] != ("success" if gate in expected_gates else "skipped") for gate in FULL_GATE_IDS):
+        raise CandidateError("security final summary gate results do not match its route")
+    conditional = summary.get("conditional_gate_results")
+    if not isinstance(conditional, Mapping) or set(conditional) != {"release-runtime", "release-runtime-real"}:
+        raise CandidateError("security final summary conditional results are invalid")
+    if conditional != {"release-runtime": "skipped", "release-runtime-real": "skipped"}:
+        raise CandidateError("security final summary unexpectedly ran release runtime gates")
+
+
+def classify_security_disposition(
+    context_path: Path,
+    jobs_path: Path,
+    summary_metadata_path: Path,
+    summary_archive_path: Path,
+    route_metadata_path: Path,
+    route_archive_path: Path,
+    *,
+    expected_summary_artifact_id: str,
+    expected_route_artifact_id: str,
+    github_output: Path | None = None,
+) -> str:
+    """Authenticate exact route evidence and mark only valid PR no-op routes."""
+
+    summary_result = _read_summary_artifact(
+        context_path, summary_metadata_path, summary_archive_path,
+        expected_artifact_id=expected_summary_artifact_id,
+    )
+    context = summary_result.pop("context")
+    if not isinstance(context, RunContext):
+        raise CandidateError("security summary context is invalid")
+    summary = _object(summary_result["summary"], "security summary")
+    route_result = _read_route_artifact(
+        context_path, route_metadata_path, route_archive_path,
+        expected_artifact_id=expected_route_artifact_id,
+    )
+    route_context = route_result.pop("context")
+    if not isinstance(route_context, RunContext) or route_context != context:
+        raise CandidateError("route and summary contexts differ")
+    manifest = _object(route_result["manifest"], "route manifest")
+    if set(manifest) != ROUTE_MANIFEST_KEYS:
+        raise CandidateError("route manifest schema is not closed")
+    try:
+        classifier.validate_manifest(manifest, expected_target_sha=context.tested_merge_sha)
+        canonical = classifier.classify(
+            manifest.get("files", []),
+            event=SECURITY_EVENT,
+            target_sha=context.tested_merge_sha,
+            repository_ready=True,
+        )
+    except (classifier.ClassifierError, TypeError, ValueError) as exc:
+        raise CandidateError("route manifest is not a valid canonical route") from exc
+    if canonical != manifest:
+        raise CandidateError("route manifest differs from canonical classification")
+    if (
+        manifest.get("event") != SECURITY_EVENT
+        or manifest.get("target_sha") != context.tested_merge_sha
+        or summary.get("manifest_digest") != manifest.get("digest")
+        or summary.get("class") != manifest.get("class")
+    ):
+        raise CandidateError("route and summary artifact identities differ")
+
+    route_class = manifest.get("class")
+    if route_class in {"docs-only", "out-of-scope"}:
+        _validate_noop_summary(summary, manifest, context)
+        _validate_disposition_jobs(
+            jobs_path, context, expected_gates=manifest["expected_gates"]
+        )
+        disposition = "not_applicable"
+        candidate = "false"
+    elif route_class == "full":
+        # The ordinary full-only verifier remains the authority for all full
+        # route summaries and jobs in the next workflow step.
+        disposition = "full"
+        candidate = "true"
+    else:
+        raise CandidateError("security route class is not recognized")
+    if github_output is not None:
+        with github_output.open("a", encoding="ascii") as stream:
+            stream.write(f"candidate={candidate}\n")
+            stream.write(f"route_class={route_class}\n")
+            stream.write(f"disposition={disposition}\n")
+    return disposition
+
+
+def verify_jobs(jobs_path: Path, context: RunContext, summary: Mapping[str, object]) -> None:
+    by_name = _read_security_jobs(jobs_path, context)
     for name in REQUIRED_SUCCESS_JOB_NAMES:
         if by_name[name].get("conclusion") != "success":
             raise CandidateError("required security job did not succeed")
@@ -1862,6 +2133,16 @@ def _parser() -> argparse.ArgumentParser:
     security.add_argument("--route-artifact-id", required=True)
     security.add_argument("--output", required=True, type=Path)
     security.add_argument("--github-output", type=Path)
+    disposition = sub.add_parser("route-disposition")
+    disposition.add_argument("--context", required=True, type=Path)
+    disposition.add_argument("--jobs", required=True, type=Path)
+    disposition.add_argument("--summary-metadata", required=True, type=Path)
+    disposition.add_argument("--summary-archive", required=True, type=Path)
+    disposition.add_argument("--summary-artifact-id", required=True)
+    disposition.add_argument("--route-metadata", required=True, type=Path)
+    disposition.add_argument("--route-archive", required=True, type=Path)
+    disposition.add_argument("--route-artifact-id", required=True)
+    disposition.add_argument("--github-output", required=True, type=Path)
     ancestry = sub.add_parser("verify-ancestry")
     ancestry.add_argument("--source-root", required=True, type=Path)
     ancestry.add_argument("--base-sha", required=True)
@@ -1954,6 +2235,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output=args.output,
                 github_output=args.github_output,
             )
+        elif args.command == "route-disposition":
+            disposition = classify_security_disposition(
+                args.context,
+                args.jobs,
+                args.summary_metadata,
+                args.summary_archive,
+                args.route_metadata,
+                args.route_archive,
+                expected_summary_artifact_id=args.summary_artifact_id,
+                expected_route_artifact_id=args.route_artifact_id,
+                github_output=args.github_output,
+            )
+            print(f"HOST_TOOLS_CANDIDATE disposition={disposition}")
         elif args.command == "verify-ancestry":
             eligible = verify_ancestry(
                 args.source_root,

@@ -166,7 +166,7 @@ jobs:
             --header 'X-GitHub-Api-Version: 2022-11-28' "$GITHUB_API_URL/repos/$REPOSITORY/actions/artifacts/$ROUTE_ARTIFACT_ID/zip" \
             --output "$route_archive"
           test "$(sha256sum "$route_archive" | awk '{print $1}')" = "$ROUTE_ARTIFACT_SHA256"
-          route_manifest="$(env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B trusted-source/platform/tools/platform_production_classifier_artifact.py manifest "$route_archive" --target-sha "$SOURCE_SHA" --allow-docs-only --emit-manifest-base64)"
+          route_manifest="$(env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B trusted-source/platform/tools/platform_production_classifier_artifact.py manifest "$route_archive" --target-sha "$SOURCE_SHA" --allow-docs-only --allow-out-of-scope --allow-candidate-packaging --emit-manifest-base64)"
           /usr/bin/python3 -I -B - "$route_manifest" "$GITHUB_OUTPUT" "$SOURCE_SHA" <<'PY'
           import base64
           import hashlib
@@ -224,10 +224,43 @@ jobs:
               and files == sorted(set(files))
               and manifest.get("target_sha") == sys.argv[3]
           )
+          out_of_scope_only = (
+              manifest.get("class") == "out-of-scope"
+              and manifest.get("reason") == "change is outside the active platform application"
+              and manifest.get("expected_gates") == ["verification-contract"]
+              and manifest.get("runtime_sensitive") is False
+              and manifest.get("deployable") is False
+              and manifest.get("fallback") is False
+              and all(isinstance(path, str) for path in files)
+              and files == sorted(set(files))
+              and manifest.get("target_sha") == sys.argv[3]
+          )
+          candidate_packaging_only = (
+              manifest.get("class") == "full"
+              and manifest.get("reason") == "trusted candidate-packaging change requires full verification and is non-deployable"
+              and manifest.get("expected_gates") == ["backend", "python-quality", "security", "migration", "docs", "web-quality", "web-hermetic", "verification-contract"]
+              and manifest.get("runtime_sensitive") is False
+              and manifest.get("deployable") is False
+              and manifest.get("fallback") is False
+              and isinstance(files, list)
+              and bool(files)
+              and files == sorted(set(files))
+              and manifest.get("target_sha") == sys.argv[3]
+          )
           if manifest.get("class") == "docs-only" and not docs_only:
               raise SystemExit("docs-only classifier proof is inconsistent")
-          route_skip = storage_only or docs_only
-          route_family = "storage-operations" if storage_only else "docs-only" if docs_only else ""
+          if manifest.get("class") == "out-of-scope" and not out_of_scope_only:
+              raise SystemExit("out-of-scope classifier proof is inconsistent")
+          if manifest.get("reason") == "trusted candidate-packaging change requires full verification and is non-deployable" and not candidate_packaging_only:
+              raise SystemExit("candidate-packaging classifier proof is inconsistent")
+          route_skip = storage_only or docs_only or out_of_scope_only or candidate_packaging_only
+          route_family = (
+              "storage-operations" if storage_only
+              else "docs-only" if docs_only
+              else "out-of-scope" if out_of_scope_only
+              else "candidate-packaging" if candidate_packaging_only
+              else ""
+          )
           digest = manifest.get("digest")
           if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
               raise SystemExit("classifier digest is invalid")
@@ -292,7 +325,7 @@ jobs:
               "classifier_digest": os.environ["CLASSIFIER_DIGEST"],
               "route_files_sha256": os.environ["ROUTE_FILES_SHA256"],
           }
-          if fields["route_family"] not in {"storage-operations", "docs-only"}:
+          if fields["route_family"] not in {"storage-operations", "docs-only", "out-of-scope", "candidate-packaging"}:
               raise SystemExit("skip receipt route family is invalid")
           for key in ("source_sha",):
               if re.fullmatch(r"[0-9a-f]{40}", fields[key]) is None:

@@ -241,7 +241,25 @@ jobs:
             "$api/actions/artifacts/$route_id/zip" \
             --output "$RUNNER_TEMP/platform-host-tools-route.zip"
 
+      - name: Authenticate route disposition for the exact security attempt
+        id: disposition
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            route-disposition \
+            --context "$RUNNER_TEMP/platform-host-tools-context.json" \
+            --jobs "$RUNNER_TEMP/platform-host-tools-security-jobs.json" \
+            --summary-metadata "$RUNNER_TEMP/platform-host-tools-summary-metadata.json" \
+            --summary-archive "$RUNNER_TEMP/platform-host-tools-summary.zip" \
+            --summary-artifact-id "$(cat "$RUNNER_TEMP/platform-host-tools-summary-id")" \
+            --route-metadata "$RUNNER_TEMP/platform-host-tools-route-metadata.json" \
+            --route-archive "$RUNNER_TEMP/platform-host-tools-route.zip" \
+            --route-artifact-id "$(cat "$RUNNER_TEMP/platform-host-tools-route-id")" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Verify allowlisted completed-success jobs and closed final summary
+        if: ${{ steps.disposition.outputs.candidate == 'true' }}
         id: security
         shell: bash
         run: |
@@ -260,6 +278,7 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Checkout exact PR head E as data only
+        if: ${{ steps.disposition.outputs.candidate == 'true' }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: StrayForest/old_sparky
@@ -269,6 +288,7 @@ jobs:
           persist-credentials: false
 
       - name: Resolve C from E host_tools_pin with the trusted parser
+        if: ${{ steps.disposition.outputs.candidate == 'true' }}
         id: host-tools
         shell: bash
         env:
@@ -288,6 +308,7 @@ jobs:
           printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
 
       - name: Determine PR-introduced C eligibility
+        if: ${{ steps.disposition.outputs.candidate == 'true' }}
         id: eligibility
         shell: bash
         env:
@@ -310,6 +331,17 @@ jobs:
             echo "### Host-tools candidate no-op"
             echo
             echo "The resolved host-tools generation is already reachable from the current PR base; no candidate artifact was built, uploaded, or attested."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Finish successfully without a candidate for a non-candidate route
+        if: ${{ steps.disposition.outputs.candidate == 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Host-tools candidate not applicable"
+            echo
+            echo "The exact successful security attempt authenticated a non-deployable docs-only or out-of-scope route. No candidate checkout, build, attestation, or artifact upload was run."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build and verify deterministic existing host-tools bundle from T

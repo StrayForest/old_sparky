@@ -287,9 +287,7 @@ root-owned release metadata and belongs to `backend-privileged`; catalog snapsho
 The existing SSH-key contract generates an ephemeral OpenSSH key and validates its multiline private-key format with `/usr/bin/ssh-keygen`; that executable is a required test prerequisite. Negative configuration cases assert only closed reason codes and the existing exit contract, never secret values, digests or public-key output. If the parser executable is unavailable, report `LOCAL GATE BLOCKED` rather than skipping the case or substituting a mock parser.
 The `verification-contract` gate runs pinned actionlint 1.7.12 on every workflow YAML file with shellcheck and pyflakes disabled; owner tests exercise positive and negative `runner.environment` context fixtures. Security CI downloads the official archive into private `RUNNER_TEMP`, checks its fixed SHA-256, and verifies its GitHub attestation against the exact release tag and [upstream release workflow](https://github.com/rhysd/actionlint/blob/v1.7.12/.github/workflows/release.yaml) before extraction or execution. The [installation guide](https://github.com/rhysd/actionlint/blob/v1.7.12/docs/install.md) and [GitHub CLI attestation command](https://cli.github.com/manual/gh_attestation_verify) document this verification; a missing exact local binary is `LOCAL GATE BLOCKED`, never a skipped workflow check.
 The same gate invokes `host_tools_candidate_workflow_issues()` so default-branch guards, narrow permissions, pinned actions, data-only candidate handling, isolated-Python use, TOCTOU rechecks and production artifact isolation fail closed. A base-reachable pin is a successful no-op; only a novel eligible pin reaches build, attestation and upload. `test_platform_noop_source_binding` belongs to `backend-tool-contract` and covers the closed no-op receipt, distinct runner/application SHA binding, authenticated artifact metadata, bounded archive extraction and redirect handling without production access. Its output is review evidence only, not production authority.
-That output is review evidence only: it grants no deploy/provision authority, and production
-workflows must not consume its artifact prefixes.
-
+Production workflows must not consume the candidate workflow's artifact prefixes.
 The handoff context keeps the triggering PR source head **E** separate from
 the synthetic merge SHA **M** that the security workflow tested.  The trusted
 validator binds the exact workflow/run/attempt and its embedded PR snapshot,
@@ -308,28 +306,27 @@ base/head/merge-ref/tree changes and reruns fail closed.  The candidate
 checkout remains data-only, while all validator code is checked out from
 trusted `dev` and invoked with `python -I -B`.
 
-Unknown/global paths, malformed input or provenance, a shallow/unavailable
-repository, an unknown event and every `merge_group` event use the full route
-with `fallback=true` and `deployable=false`; these routes also run the
-conditional `release-runtime` fixture gate, and a sensitive/fallback or
-deployable full push to `dev` runs `release-runtime-real`. Recognized platform paths use
-`fallback=false`; full verification alone does not imply production authority.
-The candidate-packaging and exact storage-operations families are separately
-closed, full-coverage, non-deployable routes. The storage family requires
-runtime-sensitive gates. AUTO takes its no-deploy branch before baseline or
-production. The producer uploads a provenance-attested skip receipt; the
-publisher binds its artifact and payload to exact producer and parent
-CI/classifier evidence, without cryptographically verifying the attestation or
-publishing a recovery bundle. Tests stay in the existing `verification-contract`
-classifier module and `backend-privileged` storage diagnostics module. A known deployable full path with valid exact-SHA provenance
-is distinct from both review-only families. A successful `platform-security-build` status therefore remains the exact-SHA CI result, not permission to deploy by itself:
-auto-deploy must download and validate the matching classifier artifact, and
-production repeats that guard before any artifact build or server-side effect.
-This preserves the release authority while preventing a documentation or
-uncertain route from producing a false production success. The implementation
-is the [classifier source](../tools/platform_ci_classifier.py);
-the [security workflow](../../.github/workflows/platform-security.yml)
-and release workflows consume its digest-bound manifest.
+Unknown paths/events or malformed provenance fail into full verification with
+`fallback=true`, `deployable=false` and `release-runtime`; sensitive/fallback or
+deployable `dev` pushes also require `release-runtime-real`. Recognized paths
+use `fallback=false`; full verification alone grants no production authority.
+Each consumer applies its policy to the authenticated, digest-bound manifest:
+
+| Consumer | Docs-only / out-of-scope | Full routes |
+| --- | --- | --- |
+| Trusted PR candidate workflow | Authenticated no-candidate completion; no candidate artifacts | Strict full verification and existing candidate eligibility checks |
+| Push auto-deploy | Docs-only uses authenticated baseline reconciliation with no app writes; out-of-scope completes no-deploy/no-backup | Preserve route policy: candidate uses source-bound baseline reconciliation and backup but grants no app-release authority; recovery uses baseline reconciliation, storage skips deployment/backup, ordinary eligible full push may deploy |
+| Recovery bootstrap producer/publisher | Docs, out-of-scope, storage and candidate-packaging each produce their distinct authenticated skip receipt; no recovery bundle | Ordinary eligible full and recovery-bootstrap routes retain bundle validation; candidate-packaging is CI-only and grants no recovery authority |
+
+Consumers bind route family, source, run/attempt and digest; malformed,
+failed or mismatched evidence fails closed without retry, `continue-on-error`
+or reduced-pass fallback. Candidate handling belongs to
+`test_platform_host_tools_bundle`; classifier and recovery skip routes to
+`test_platform_ci_classifier`; auto-deploy/provenance to
+`test_platform_release_build_contract` and `test_platform_workflow_provenance`;
+bundle validation to `test_platform_recovery_bootstrap`. The
+[classifier](../tools/platform_ci_classifier.py) and release workflows own
+implementation.
 
 The event and conditional-job behavior follows the primary GitHub Actions
 contracts for [workflow events](https://docs.github.com/en/actions/reference/events-that-trigger-workflows),

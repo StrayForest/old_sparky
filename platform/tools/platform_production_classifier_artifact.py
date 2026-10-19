@@ -31,7 +31,9 @@ if __package__:
         CANDIDATE_PACKAGING_REASON,
         DOCS_ONLY_GATE_IDS,
         DOCS_ONLY_REASON,
+        OUT_OF_SCOPE_GATE_IDS,
         STORAGE_OPERATIONS_REASON,
+        _is_out_of_scope,
         _is_storage_operations_only,
     )
 else:  # Executed as a script under Python isolated mode on a runner.
@@ -54,7 +56,9 @@ else:  # Executed as a script under Python isolated mode on a runner.
     CANDIDATE_PACKAGING_REASON = _CI_CLASSIFIER_MODULE.CANDIDATE_PACKAGING_REASON
     DOCS_ONLY_GATE_IDS = _CI_CLASSIFIER_MODULE.DOCS_ONLY_GATE_IDS
     DOCS_ONLY_REASON = _CI_CLASSIFIER_MODULE.DOCS_ONLY_REASON
+    OUT_OF_SCOPE_GATE_IDS = _CI_CLASSIFIER_MODULE.OUT_OF_SCOPE_GATE_IDS
     STORAGE_OPERATIONS_REASON = _CI_CLASSIFIER_MODULE.STORAGE_OPERATIONS_REASON
+    _is_out_of_scope = _CI_CLASSIFIER_MODULE._is_out_of_scope
     _is_storage_operations_only = _CI_CLASSIFIER_MODULE._is_storage_operations_only
 
 
@@ -514,6 +518,9 @@ def validate_manifest(
     allow_docs_only: bool = False,
     allow_candidate_packaging: bool = False,
     require_docs_only: bool = False,
+    allow_out_of_scope: bool = False,
+    require_out_of_scope: bool = False,
+    require_candidate_packaging: bool = False,
 ) -> dict[str, Any]:
     if SHA_RE.fullmatch(target_sha) is None:
         raise _fail("provenance")
@@ -562,10 +569,14 @@ def validate_manifest(
     candidate_packaging_only = _is_candidate_packaging_only(files)
     storage_operations_only = _is_storage_operations_only(files)
     docs_only = manifest.get("class") == "docs-only"
+    out_of_scope_only = manifest.get("class") == "out-of-scope"
     if (
         type(allow_docs_only) is not bool
         or type(allow_candidate_packaging) is not bool
         or type(require_docs_only) is not bool
+        or type(allow_out_of_scope) is not bool
+        or type(require_out_of_scope) is not bool
+        or type(require_candidate_packaging) is not bool
     ):
         raise _fail("manifest")
     if type(require_recovery_bootstrap) is not bool:
@@ -578,7 +589,29 @@ def validate_manifest(
         raise _fail("manifest")
     if allow_docs_only and require_docs_only:
         raise _fail("manifest")
+    if allow_out_of_scope and require_out_of_scope:
+        raise _fail("manifest")
+    if require_candidate_packaging and (
+        allow_candidate_packaging
+        or allow_docs_only
+        or require_docs_only
+        or allow_out_of_scope
+        or require_out_of_scope
+        or not candidate_packaging_only
+        or require_recovery_bootstrap
+        or require_reconcile_source
+        or require_runtime_sensitive
+        or files != sorted(set(files))
+        or manifest.get("reason") != CANDIDATE_PACKAGING_REASON
+        or manifest.get("class") != "full"
+        or manifest.get("expected_gates") != EXPECTED_MANIFEST_GATES
+        or manifest.get("runtime_sensitive") is not False
+        or manifest.get("deployable") is not False
+    ):
+        raise _fail("manifest")
     if require_docs_only and not docs_only:
+        raise _fail("manifest")
+    if require_out_of_scope and not out_of_scope_only:
         raise _fail("manifest")
     if docs_only:
         if not _is_docs_only(files):
@@ -612,6 +645,37 @@ def validate_manifest(
         if digest != _manifest_digest(manifest):
             raise _fail("manifest")
         return dict(manifest)
+    if out_of_scope_only:
+        if (
+            not (allow_out_of_scope or require_out_of_scope)
+            or not files
+            or files != sorted(set(files))
+            or not all(
+                _is_out_of_scope(path)
+                and "\x00" not in path
+                and "\\" not in path
+                and not path.startswith(("/", "./", "../"))
+                and "/../" not in path
+                and not path.endswith("/")
+                for path in files
+            )
+            or manifest.get("class") != "out-of-scope"
+            or manifest.get("expected_gates") != list(OUT_OF_SCOPE_GATE_IDS)
+            or manifest.get("runtime_sensitive") is not False
+            or manifest.get("deployable") is not False
+            or manifest.get("fallback") is not False
+            or manifest.get("reason") != "change is outside the active platform application"
+            or require_recovery_bootstrap
+            or require_reconcile_source
+            or require_runtime_sensitive
+        ):
+            raise _fail("manifest")
+        digest = manifest.get("digest")
+        if not isinstance(digest, str) or DIGEST_RE.fullmatch(digest) is None:
+            raise _fail("manifest")
+        if digest != _manifest_digest(manifest):
+            raise _fail("manifest")
+        return dict(manifest)
     if manifest.get("class") != "full":
         raise _fail("manifest")
     if manifest.get("expected_gates") != EXPECTED_MANIFEST_GATES:
@@ -635,7 +699,11 @@ def validate_manifest(
             raise _fail("manifest")
     elif candidate_packaging_only:
         if (
-            not (require_reconcile_source or allow_candidate_packaging)
+            not (
+                require_reconcile_source
+                or allow_candidate_packaging
+                or require_candidate_packaging
+            )
             or manifest["runtime_sensitive"] is not False
             or manifest["deployable"] is not False
             or manifest.get("reason") != CANDIDATE_PACKAGING_REASON
@@ -688,6 +756,10 @@ def _build_parser() -> argparse.ArgumentParser:
     docs_mode.add_argument("--allow-docs-only", action="store_true")
     docs_mode.add_argument("--require-docs-only", action="store_true")
     manifest.add_argument("--allow-candidate-packaging", action="store_true")
+    manifest.add_argument("--require-candidate-packaging", action="store_true")
+    out_of_scope_mode = manifest.add_mutually_exclusive_group()
+    out_of_scope_mode.add_argument("--allow-out-of-scope", action="store_true")
+    out_of_scope_mode.add_argument("--require-out-of-scope", action="store_true")
     manifest.add_argument("--emit-manifest-base64", action="store_true")
     return parser
 
@@ -728,6 +800,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_docs_only=arguments.allow_docs_only,
                 allow_candidate_packaging=arguments.allow_candidate_packaging,
                 require_docs_only=arguments.require_docs_only,
+                allow_out_of_scope=arguments.allow_out_of_scope,
+                require_out_of_scope=arguments.require_out_of_scope,
+                require_candidate_packaging=arguments.require_candidate_packaging,
             )
             if arguments.emit_manifest_base64:
                 encoded = base64.b64encode(
