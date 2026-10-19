@@ -809,6 +809,197 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertIn('if [[ "$poll_state" = success ]]; then', self.source)
         self.assertIn('run.get("status") != "completed"', self.source)
         self.assertIn('run.get("conclusion") != "success"', self.source)
+
+        # Execute the exact extracted attempt-job poller with a secret-free
+        # curl boundary. This covers the workflow's real shell/Python path,
+        # rather than only checking that polling syntax is present.
+        source_proof_shell = _workflow_run_scalar(
+            self.source, "Download and verify exact-source backup helper bundle"
+        )
+        poll_start = source_proof_shell.index("source_jobs_ready=0")
+        poll_end = source_proof_shell.index(
+            "curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2",
+            poll_start,
+        )
+        source_jobs_poll = source_proof_shell[poll_start:poll_end]
+
+        def run_source_jobs_poll(
+            runs: list[dict[str, object]],
+            snapshots: list[list[dict[str, object]]],
+            *,
+            expire_after_sleep: bool = False,
+        ) -> tuple[tempfile.TemporaryDirectory[str], subprocess.CompletedProcess[str], dict[str, int], Path]:
+            temporary = tempfile.TemporaryDirectory()
+            root = Path(temporary.name)
+            artifact_dir = root / "artifact"
+            bin_dir = root / "bin"
+            artifact_dir.mkdir(mode=0o700)
+            bin_dir.mkdir(mode=0o700)
+            fixture_path = root / "responses.json"
+            counter_path = root / "counters.json"
+            expired_path = root / "expired"
+            fixture_path.write_text(json.dumps({"runs": runs, "jobs": snapshots}), encoding="utf-8")
+            counter_path.write_text(json.dumps({"runs": 0, "jobs": 0}), encoding="utf-8")
+            curl_path = bin_dir / "curl"
+            curl_path.write_text(
+                "#!/bin/sh\n"
+                "exec /usr/bin/python3 -I - \"$POLL_FIXTURE\" \"$POLL_COUNTERS\" \"$@\" <<'PY'\n"
+                "import json\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "fixture_path, counters_path, *args = sys.argv[1:]\n"
+                "url = next(value for value in args if value.startswith('https://'))\n"
+                "destination = Path(args[args.index('--output') + 1])\n"
+                "key = 'jobs' if '/attempts/' in url and '/jobs?' in url else 'runs'\n"
+                "fixture = json.loads(Path(fixture_path).read_text(encoding='utf-8'))\n"
+                "counters = json.loads(Path(counters_path).read_text(encoding='utf-8'))\n"
+                "index = counters[key]\n"
+                "responses = fixture[key]\n"
+                "response = responses[min(index, len(responses) - 1)]\n"
+                "if key == 'jobs': response = {'total_count': len(response), 'jobs': response}\n"
+                "destination.write_text(json.dumps(response), encoding='utf-8')\n"
+                "counters[key] = index + 1\n"
+                "Path(counters_path).write_text(json.dumps(counters), encoding='utf-8')\n"
+                "PY\n",
+                encoding="utf-8",
+            )
+            curl_path.chmod(0o700)
+            sleep_path = bin_dir / "sleep"
+            sleep_path.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${EXPIRE_AFTER_SLEEP:-false}\" = true ]; then : >\"$POLL_EXPIRED\"; fi\n",
+                encoding="utf-8",
+            )
+            sleep_path.chmod(0o700)
+            prelude = "\n".join((
+                "set -euo pipefail",
+                f"artifact_dir={str(artifact_dir)!r}",
+                'REPOSITORY="StrayForest/old_sparky"',
+                'api="https://api.github.com/repos/$REPOSITORY"',
+                f"SECURITY_RUN_ID={SECURITY_ID}",
+                f"SECURITY_RUN_ATTEMPT={SECURITY_ATTEMPT}",
+                f"SOURCE_SHA={SOURCE_SHA}",
+                "poll_deadline_ns=1",
+                "poll_remaining_seconds() {",
+                '  [[ ! -e "$POLL_EXPIRED" ]] || return 1',
+                '  printf \'%s\\n\' "$1"',
+                "}",
+                "sleep() {",
+                '  if [[ "${EXPIRE_AFTER_SLEEP:-false}" = true ]]; then : >"$POLL_EXPIRED"; fi',
+                "}",
+            ))
+            environment = os.environ.copy()
+            environment.update({
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "POLL_FIXTURE": str(fixture_path),
+                "POLL_COUNTERS": str(counter_path),
+                "POLL_EXPIRED": str(expired_path),
+                "EXPIRE_AFTER_SLEEP": "true" if expire_after_sleep else "false",
+                "RUNNER_TEMP": str(root),
+                "GITHUB_OUTPUT": str(root / "github-output"),
+                "GH_TOKEN": "test-only-token",
+            })
+            result = subprocess.run(
+                ["bash", "-c", prelude + "\n" + source_jobs_poll],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            counters = json.loads(counter_path.read_text(encoding="utf-8"))
+            return temporary, result, counters, artifact_dir
+
+        exact_run = {
+            "id": int(SECURITY_ID),
+            "run_attempt": int(SECURITY_ATTEMPT),
+            "path": ".github/workflows/platform-security.yml",
+            "event": "push",
+            "head_branch": "dev",
+            "head_sha": SOURCE_SHA,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        pending_snapshot = [
+            {
+                "id": 101,
+                "run_id": int(SECURITY_ID),
+                "run_attempt": int(SECURITY_ATTEMPT),
+                "head_sha": SOURCE_SHA,
+                "name": "Verification contract",
+                "status": "in_progress",
+                "conclusion": None,
+            },
+            {
+                "id": 102,
+                "run_id": int(SECURITY_ID),
+                "run_attempt": int(SECURITY_ATTEMPT),
+                "head_sha": SOURCE_SHA,
+                "name": "Backend aggregate",
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        completed_snapshot = [
+            {**pending_snapshot[0], "status": "completed", "conclusion": "success"},
+            dict(pending_snapshot[1]),
+        ]
+        temporary, result, counts, artifact_dir = run_source_jobs_poll(
+            [exact_run, exact_run], [pending_snapshot, completed_snapshot]
+        )
+        try:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(counts, {"runs": 2, "jobs": 2})
+            self.assertEqual(
+                json.loads((artifact_dir / "jobs.json").read_text(encoding="utf-8")),
+                {"total_count": 2, "jobs": completed_snapshot},
+            )
+            self.assertIn("bounded settle window", result.stdout)
+        finally:
+            temporary.cleanup()
+
+        failed_snapshot = [
+            dict(pending_snapshot[0]),
+            {**pending_snapshot[1], "conclusion": "failure"},
+        ]
+        temporary, result, counts, _ = run_source_jobs_poll([exact_run], [failed_snapshot])
+        try:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(counts, {"runs": 1, "jobs": 1})
+            self.assertIn("allowed terminal result", result.stderr)
+            self.assertNotIn("test-only-token", result.stdout + result.stderr)
+        finally:
+            temporary.cleanup()
+
+        malformed_pending = [dict(row) for row in pending_snapshot]
+        malformed_pending[0].pop("conclusion")
+        temporary, result, counts, _ = run_source_jobs_poll([exact_run], [malformed_pending])
+        try:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(counts, {"runs": 1, "jobs": 1})
+            self.assertIn("nonterminal security job", result.stderr)
+        finally:
+            temporary.cleanup()
+
+        changed_run = {**exact_run, "head_sha": "c" * 40}
+        temporary, result, counts, _ = run_source_jobs_poll(
+            [exact_run, changed_run], [pending_snapshot, completed_snapshot]
+        )
+        try:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(counts, {"runs": 2, "jobs": 2})
+            self.assertIn("identity changed", result.stderr)
+        finally:
+            temporary.cleanup()
+
+        temporary, result, counts, _ = run_source_jobs_poll(
+            [exact_run], [pending_snapshot], expire_after_sleep=True
+        )
+        try:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(counts, {"runs": 1, "jobs": 1})
+            self.assertIn("bounded wait", result.stderr)
+        finally:
+            temporary.cleanup()
         wrapper_start = self.source.index("run_remote_operation() {")
         ssh_invocation = self.source.index("if ssh \\", wrapper_start)
         self.assertLess(self.source.index("verify_current_dev_source", wrapper_start), ssh_invocation)

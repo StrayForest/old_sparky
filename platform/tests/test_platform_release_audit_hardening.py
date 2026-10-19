@@ -2800,7 +2800,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             loaded_properties = (
                 "FragmentPath=/etc/systemd/system/deadlock-maintenance.service\n"
                 "DropInPaths=\nNeedDaemonReload=no\nActiveState=inactive\n"
-                "SubState=dead\n"
+                "SubState=dead\nMainPID=0\n"
                 f"ExecStart={exec_start}\n"
                 "CPUQuotaPerSecUSec=500ms\nMemoryMax=536870912\n"
                 "TimeoutStartUSec=30min\n"
@@ -3521,6 +3521,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                         "NeedDaemonReload=no",
                         "ActiveState=inactive",
                         "SubState=dead",
+                        "MainPID=0",
                         mocked_exec_start,
                         "CPUQuotaPerSecUSec=500ms",
                         "MemoryMax=536870912",
@@ -3535,7 +3536,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     "if args[:1] == ['start']:\n"
                     f"    pathlib.Path({str(started)!r}).write_text('called')\n"
                     "    raise SystemExit(1)\n"
-                    "if prop == 'FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec':\n"
+                    "if prop == 'FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec':\n"
                     f"    print({unit_properties!r})\n"
                     "elif prop == 'ActiveState':\n"
                     "    print('inactive')\n"

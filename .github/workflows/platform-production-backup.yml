@@ -214,12 +214,141 @@ jobs:
           ):
               raise SystemExit("dev moved away from the exact backup source SHA")
           PY
-          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
-            --max-filesize 1048576 \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$artifact_dir/jobs.json"
+          source_jobs_ready=0
+          previous_job_ids=""
+          poll_deadline_ns="$(/usr/bin/python3 -I -B - "$poll_deadline_ns" <<'PY'
+          import sys
+          import time
+
+          overall_deadline_ns = int(sys.argv[1])
+          settle_deadline_ns = time.monotonic_ns() + 900_000_000_000
+          print(min(overall_deadline_ns, settle_deadline_ns))
+          PY
+          )"
+          for poll in $(seq 1 360); do
+            request_timeout="$(poll_remaining_seconds 10)" || break
+            run_poll_path="$artifact_dir/jobs-run-poll-$poll.json"
+            jobs_poll_path="$artifact_dir/jobs-poll-$poll.json"
+            test ! -e "$run_poll_path" && test ! -L "$run_poll_path"
+            test ! -e "$jobs_poll_path" && test ! -L "$jobs_poll_path"
+            curl --fail-with-body --silent --show-error --connect-timeout "$request_timeout" --max-time "$request_timeout" \
+              --max-filesize 1048576 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "$api/actions/runs/$SECURITY_RUN_ID" --output "$run_poll_path"
+            curl --fail-with-body --silent --show-error --connect-timeout "$request_timeout" --max-time "$request_timeout" \
+              --max-filesize 1048576 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$jobs_poll_path"
+            poll_result="$(/usr/bin/python3 -I -B - "$run_poll_path" "$jobs_poll_path" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" "$SOURCE_SHA" "$previous_job_ids" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          run_path, jobs_path, expected_run_id, expected_attempt, expected_sha, previous_job_ids = sys.argv[1:]
+          expected_run_id = int(expected_run_id)
+          expected_attempt = int(expected_attempt)
+          run = json.loads(Path(run_path).read_text(encoding="utf-8"))
+          if (
+              not isinstance(run, dict)
+              or type(run.get("id")) is not int
+              or run.get("id") != expected_run_id
+              or type(run.get("run_attempt")) is not int
+              or run.get("run_attempt") != expected_attempt
+              or run.get("path") != ".github/workflows/platform-security.yml"
+              or run.get("event") != "push"
+              or run.get("head_branch") != "dev"
+              or run.get("head_sha") != expected_sha
+              or run.get("status") != "completed"
+              or run.get("conclusion") != "success"
+          ):
+              raise SystemExit("exact security run identity changed or is not successful")
+          payload = json.loads(Path(jobs_path).read_text(encoding="utf-8"))
+          jobs = payload.get("jobs") if isinstance(payload, dict) else None
+          if (
+              not isinstance(jobs, list)
+              or type(payload.get("total_count")) is not int
+              or payload["total_count"] != len(jobs)
+              or not 0 < len(jobs) <= 100
+          ):
+              raise SystemExit("security jobs response is incomplete")
+          seen_ids = set()
+          pending_statuses = {"queued", "in_progress", "requested", "waiting", "pending"}
+          has_pending = False
+          producer_rows = []
+          for row in jobs:
+              if not isinstance(row, dict):
+                  raise SystemExit("security job row is malformed")
+              job_id = row.get("id")
+              if type(job_id) is not int or job_id <= 0 or job_id in seen_ids:
+                  raise SystemExit("security job IDs are malformed or duplicate")
+              seen_ids.add(job_id)
+              if type(row.get("run_id")) is not int or row["run_id"] != expected_run_id:
+                  raise SystemExit("security job belongs to a different workflow run")
+              if "run_attempt" in row and (
+                  type(row["run_attempt"]) is not int or row["run_attempt"] != expected_attempt
+              ):
+                  raise SystemExit("security job belongs to a different run attempt")
+              if "head_sha" in row and (
+                  not isinstance(row["head_sha"], str) or row["head_sha"] != expected_sha
+              ):
+                  raise SystemExit("security job belongs to a different source SHA")
+              status = row.get("status")
+              conclusion = row.get("conclusion")
+              if not isinstance(status, str):
+                  raise SystemExit("security job status is malformed")
+              if status in pending_statuses:
+                  if "conclusion" not in row or conclusion is not None:
+                      raise SystemExit("nonterminal security job has a terminal conclusion")
+                  has_pending = True
+              elif (
+                  status != "completed"
+                  or not isinstance(conclusion, str)
+                  or conclusion not in {"success", "skipped"}
+              ):
+                  raise SystemExit("security job did not reach an allowed terminal result")
+              if row.get("name") == "Verification contract":
+                  producer_rows.append(row)
+          if len(producer_rows) != 1:
+              raise SystemExit("exact verification-contract job is missing or ambiguous")
+          current_job_ids = ",".join(str(job_id) for job_id in sorted(seen_ids))
+          if previous_job_ids and current_job_ids != previous_job_ids:
+              raise SystemExit("exact security attempt job set changed during polling")
+          producer = producer_rows[0]
+          if (
+              type(producer.get("run_attempt")) is not int
+              or producer["run_attempt"] != expected_attempt
+              or producer.get("head_sha") != expected_sha
+          ):
+              raise SystemExit("verification-contract job identity is not exact")
+          if producer.get("status") == "completed" and producer.get("conclusion") != "success":
+              raise SystemExit("exact verification-contract job did not succeed")
+          print(("pending" if has_pending else "success") + ":" + current_job_ids)
+          PY
+            )"
+            poll_state="${poll_result%%:*}"
+            previous_job_ids="${poll_result#*:}"
+            if [[ "$poll_state" = success ]]; then
+              poll_remaining_seconds 0.001 >/dev/null || break
+              mv -- "$run_poll_path" "$artifact_dir/run.json"
+              mv -- "$jobs_poll_path" "$artifact_dir/jobs.json"
+              source_jobs_ready=1
+              break
+            fi
+            if (( poll == 1 || poll % 4 == 0 )); then
+              echo "Exact Security attempt jobs remain nonterminal; waiting within the bounded settle window."
+            fi
+            rm -f -- "$run_poll_path" "$jobs_poll_path"
+            sleep_seconds="$(poll_remaining_seconds 15)" || break
+            sleep "$sleep_seconds"
+          done
+          test "$source_jobs_ready" = 1 || {
+            echo "Exact Security attempt jobs did not reach allowed terminal results within the bounded wait" >&2
+            exit 1
+          }
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --max-filesize 1048576 \
             --header "Authorization: Bearer $GH_TOKEN" \
