@@ -332,6 +332,138 @@ class BackupSuccessGuardTests(unittest.TestCase):
             ],
         )
 
+        # GitHub can briefly expose nonterminal job rows after the exact run
+        # itself is already completed successfully. The guard waits on that
+        # exact attempt, then keeps the ordinary completion-time proof bound.
+        api = FakeBackupProofApi()
+        pending_rows = [dict(row) for row in api.security_job_rows]
+        pending_rows[0].update({"status": "in_progress", "conclusion": None})
+        completed_rows = [dict(row) for row in api.security_job_rows]
+        snapshots = iter((pending_rows, completed_rows))
+
+        def changing_security_jobs(run_id: str, attempt: str) -> list[dict[str, Any]]:
+            api.calls.append("security_jobs")
+            api.job_queries.append(("security", run_id, attempt))
+            return [dict(row) for row in next(snapshots)]
+
+        api.security_jobs = changing_security_jobs
+        clock = FakeClock()
+        self.assertEqual(
+            backup_guard.wait_for_backup_success(api, _binding(), clock=clock, sleep=clock.sleep),
+            _receipt(),
+        )
+        self.assertEqual(api.calls.count("security_run"), 2)
+        self.assertEqual(api.calls.count("security_jobs"), 2)
+        self.assertEqual(clock.sleeps, [backup_guard.POLL_INTERVAL_SECONDS])
+        self.assertEqual(api.calls.count("backup_runs"), 1)
+
+        # Validate every row before deciding that a snapshot is merely
+        # pending, so a failure later in the same response cannot be hidden.
+        for failure in (
+            [
+                {**pending_rows[0]},
+                {**completed_rows[1], "conclusion": "failure"},
+            ],
+            [
+                {**pending_rows[0]},
+                {**completed_rows[1], "run_attempt": SECURITY_ATTEMPT + 1},
+            ],
+        ):
+            api = FakeBackupProofApi()
+            api.security_job_rows = failure
+            with self.subTest(snapshot=failure), self.assertRaises(backup_guard.BackupProofError):
+                backup_guard.wait_for_backup_success(api, _binding())
+            self.assertNotIn("backup_workflow", api.calls)
+            self.assertNotIn("backup_runs", api.calls)
+
+        # Only the documented nonterminal states are retryable. A completed
+        # failure is terminal and must be rejected without another API read.
+        api = FakeBackupProofApi()
+        api.security_job_rows[0].update({"status": "completed", "conclusion": "failure"})
+        with self.assertRaisesRegex(backup_guard.BackupProofError, "allowed terminal result"):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertEqual(api.calls.count("security_jobs"), 1)
+        self.assertNotIn("backup_workflow", api.calls)
+
+        api = FakeBackupProofApi()
+        api.security_job_rows = [dict(pending_rows[0]), dict(completed_rows[1])]
+        api.security_job_rows[0].pop("conclusion")
+        with self.assertRaisesRegex(backup_guard.BackupProofError, "allowed terminal result"):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertEqual(api.calls.count("security_jobs"), 1)
+        self.assertNotIn("backup_workflow", api.calls)
+
+        api = FakeBackupProofApi()
+        api.security_job_rows = pending_rows
+        changed_job_set = [dict(row) for row in completed_rows]
+        changed_job_set[1]["id"] = 913
+        snapshots = iter((pending_rows, changed_job_set))
+
+        def changing_security_job_set(run_id: str, attempt: str) -> list[dict[str, Any]]:
+            api.calls.append("security_jobs")
+            api.job_queries.append(("security", run_id, attempt))
+            return [dict(row) for row in next(snapshots)]
+
+        api.security_jobs = changing_security_job_set
+        with self.assertRaisesRegex(backup_guard.BackupProofError, "job set changed"):
+            backup_guard.wait_for_backup_success(api, _binding(), sleep=FakeClock().sleep)
+        self.assertEqual(api.calls.count("security_jobs"), 2)
+        self.assertNotIn("backup_workflow", api.calls)
+
+        # A refetch that changes the exact run binding is never treated as a
+        # transient job snapshot, even if the next job response looks valid.
+        api = FakeBackupProofApi()
+        api.security_job_rows = pending_rows
+        original_security_run = api.security_run
+
+        def changed_security_run(run_id: str) -> dict[str, Any]:
+            run = original_security_run(run_id)
+            if api.calls.count("security_run") == 2:
+                run["head_sha"] = "b" * 40
+            return run
+
+        api.security_run = changed_security_run
+        with self.assertRaisesRegex(backup_guard.BackupProofError, "not successful or source-bound"):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertEqual(api.calls.count("security_jobs"), 1)
+        self.assertNotIn("backup_workflow", api.calls)
+
+        # The snapshot-settle cap is shorter than the full proof deadline and
+        # is exercised with a fake clock, without a wall-clock wait.
+        api = FakeBackupProofApi()
+        api.security_job_rows = pending_rows
+        clock = FakeClock()
+        with self.assertRaisesRegex(backup_guard.BackupProofError, "bounded settle deadline"):
+            backup_guard.wait_for_backup_success(
+                api,
+                _binding(),
+                deadline_seconds=backup_guard.ATTEMPT_JOB_SETTLE_DEADLINE_SECONDS + 100,
+                clock=clock,
+                sleep=clock.sleep,
+            )
+        self.assertEqual(clock.now, backup_guard.ATTEMPT_JOB_SETTLE_DEADLINE_SECONDS)
+        self.assertEqual(
+            api.calls.count("security_jobs"),
+            int(backup_guard.ATTEMPT_JOB_SETTLE_DEADLINE_SECONDS / backup_guard.POLL_INTERVAL_SECONDS),
+        )
+        self.assertNotIn("backup_workflow", api.calls)
+
+        # Polling uses the same overall proof deadline; a stuck nonterminal
+        # endpoint cannot enter backup-run or deployment-candidate checks.
+        api = FakeBackupProofApi()
+        api.security_job_rows = pending_rows
+        clock = FakeClock()
+        with self.assertRaisesRegex(backup_guard.BackupProofError, "bounded settle deadline"):
+            backup_guard.wait_for_backup_success(
+                api,
+                _binding(),
+                deadline_seconds=5,
+                clock=clock,
+                sleep=clock.sleep,
+            )
+        self.assertEqual(api.calls.count("security_jobs"), 1)
+        self.assertNotIn("backup_workflow", api.calls)
+
     def test_dev_moving_during_artifact_download_invalidates_the_proof(self) -> None:
         api = FakeBackupProofApi()
         original_download = api.download_artifact
@@ -504,7 +636,7 @@ class BackupSuccessGuardTests(unittest.TestCase):
             {"head_branch": "other"},
             {"head_sha": "e" * 40},
             {"run_attempt": SECURITY_ATTEMPT - 1},
-            {"status": "in_progress"},
+            {"status": "started"},
             {"conclusion": "failure"},
             {"updated_at": None},
             {"updated_at": _gh_time("18:58:59")},
@@ -526,7 +658,7 @@ class BackupSuccessGuardTests(unittest.TestCase):
             {"run_attempt": None},
             {"head_sha": "b" * 40},
             {"head_sha": None},
-            {"status": "in_progress"},
+            {"status": "started"},
             {"status": []},
             {"conclusion": "failure"},
             {"conclusion": []},

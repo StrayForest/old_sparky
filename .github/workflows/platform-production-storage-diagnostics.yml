@@ -1270,7 +1270,7 @@ jobs:
           maintenance_unit_source="$runtime/releases/$current_id/deploy/systemd/deadlock-maintenance.service"
           maintenance_unit_validator="$current/tools/platform_maintenance_qa_evidence.py"
           loaded_maintenance_unit="$(systemctl show deadlock-maintenance.service \
-            --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
+            --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
             --no-pager 2>/dev/null)" \
             || report_failure retention_dry_run maintenance_unit_unavailable 2
           if printf '%s\n' "$loaded_maintenance_unit" \

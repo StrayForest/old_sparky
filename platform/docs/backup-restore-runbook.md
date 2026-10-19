@@ -228,19 +228,18 @@ restore-status class where applicable. It does not hash dump payloads. Drift
 fails closed, but pruning that already began is not transactional. Public
 summaries omit manifest names, paths and proof digests.
 
-For a reviewed `dev` release, an operator may run the same guarded backup
-through GitHub Actions without opening a direct production shell. The backup
-workflow requires the exact `Platform security and build` run ID, attempt, and
-source SHA for the current `dev` head. Dispatch it while that exact CI run is
-still running, after confirming that no production deployment currently owns
-the shared production workflow slot. The backup workflow waits on that one run
-for at most 30 minutes of monotonic wall time within its 120-minute job
-deadline. The attestation verifier is capped at 10 minutes; before SSH starts,
-the workflow requires at least 60 minutes to remain, allowing a 45-minute
-backup/restore budget plus 15 minutes for completion and cleanup. Each API
-request and sleep is capped by the remaining poll deadline. It never substitutes another run or a newer `dev`
-head. It validates the exact successful verification job, artifact digest,
-attestation, and seven-file helper manifest before staging anything on the host.
+For a reviewed `dev` release, run the guarded backup through GitHub Actions
+without a direct production shell. Bind the exact `Platform security and build`
+run ID, attempt, and source SHA; dispatch while that run is active and the shared
+production slot is unowned. The workflow waits at most 30 minutes within its
+120-minute job deadline. Attestation verification is capped at 10 minutes; SSH
+requires 60 minutes remaining for a 45-minute backup/restore budget plus
+15 minutes for completion and cleanup. Each API
+request and sleep is capped by the remaining poll deadline; guards never substitute another
+run or newer `dev` head. After exact-run success, both guards re-fetch that same run/attempt
+and stable job-ID set for at most 15 minutes within existing deadlines. Only source-bound
+success/skips pass; failures, malformed rows, and identity drift fail closed. Backup validates
+the exact verification job, artifact digest, attestation, and helper manifest before staging.
 Attempt-job timestamps are parsed and bounded to that exact run. Start must not
 exceed completion for executed jobs. On the validated `push` route, the
 conditional `Dispatch exact baseline proof finalizer` and `Authenticate

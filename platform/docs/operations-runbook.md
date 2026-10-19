@@ -103,13 +103,13 @@ Preview storage cleanup without backup or deletion:
 ```bash
 current_release="$(readlink -f /opt/oldsparky/platform/current)"
 systemctl show deadlock-maintenance.service --no-pager \
-  --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
+  --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
   | /usr/bin/python3 -I "$current_release/tools/platform_maintenance_qa_evidence.py" run-retention-preview \
     "$current_release/deploy/systemd/deadlock-maintenance.service" \
     /etc/systemd/system/deadlock-maintenance.service
 ```
 
-This validated preview lists pointers in `protected`, unit pins in `retained`, and the complete removal set in `deleted`. For emergency release-only staging,
+This validated preview lists pointers in `protected`, unit pins in `retained`, and the complete removal set in `deleted`. During rollout, an older active-release validator may reject the required `MainPID=0` property; maintenance and preview fail closed, while storage diagnostics retain earlier bounded evidence and report the retention stage as failed. Keep `MainPID` and retry the preview after a reviewed release installs the updated validator; do not edit the immutable active release. For emergency release-only staging,
 follow the [storage-retention skill](../../.agents/skills/platform-storage-retention/SKILL.md) and pass every installed pin to both direct commands.
 
 Preview live-QA runtime cache retention (also machine-locked and idle-gated):

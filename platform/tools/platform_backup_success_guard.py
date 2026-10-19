@@ -41,6 +41,10 @@ MAX_ARTIFACT_ZIP_BYTES = 1_048_576
 MAX_RECEIPT_BYTES = 4_096
 POLL_INTERVAL_SECONDS = 15.0
 POLL_DEADLINE_SECONDS = 9_000.0
+ATTEMPT_JOB_SETTLE_DEADLINE_SECONDS = 900.0
+ATTEMPT_JOB_PENDING_STATUSES = frozenset(
+    {"queued", "in_progress", "requested", "waiting", "pending"}
+)
 
 _ID_RE = re.compile(r"[1-9][0-9]{0,19}\Z")
 _ATTEMPT_RE = re.compile(r"[1-9][0-9]{0,5}\Z")
@@ -318,13 +322,15 @@ def _validate_attempt_jobs(
     source_event: str,
     run_started: datetime,
     run_updated: datetime,
-) -> datetime:
+    allow_nonterminal: bool = False,
+) -> datetime | None:
     """Validate all jobs returned by an exact run-attempt endpoint."""
 
     if not isinstance(rows, list) or not 1 <= len(rows) <= 1_000:
         raise BackupProofError("attempt job list is empty, malformed or excessive")
     ids: set[int] = set()
     latest_completion: datetime | None = None
+    has_nonterminal = False
     for row in rows:
         if not isinstance(row, dict):
             raise BackupProofError("attempt job row is malformed")
@@ -346,12 +352,14 @@ def _validate_attempt_jobs(
             raise BackupProofError("attempt job belongs to a different source SHA")
         status = row.get("status")
         conclusion = row.get("conclusion")
-        if (
-            not isinstance(status, str)
-            or status != "completed"
-            or not isinstance(conclusion, str)
-            or conclusion not in {"success", "skipped"}
-        ):
+        if not isinstance(status, str):
+            raise BackupProofError("attempt job did not reach an allowed terminal result")
+        if status in ATTEMPT_JOB_PENDING_STATUSES:
+            if not allow_nonterminal or "conclusion" not in row or conclusion is not None:
+                raise BackupProofError("attempt job did not reach an allowed terminal result")
+            has_nonterminal = True
+            continue
+        if status != "completed" or not isinstance(conclusion, str) or conclusion not in {"success", "skipped"}:
             raise BackupProofError("attempt job did not reach an allowed terminal result")
         started = _parse_time(row.get("started_at"), "attempt job start")
         completed = _parse_time(row.get("completed_at"), "attempt job completion")
@@ -408,6 +416,8 @@ def _validate_attempt_jobs(
             raise BackupProofError("attempt job timestamps are inconsistent with its exact run")
         if latest_completion is None or completed > latest_completion:
             latest_completion = completed
+    if has_nonterminal:
+        return None
     if latest_completion is None:
         raise BackupProofError("attempt job completion bound is unavailable")
     return latest_completion
@@ -504,7 +514,49 @@ def wait_for_backup_success(
         source_event=security_run["event"],
         run_started=security_started,
         run_updated=security_updated,
+        allow_nonterminal=True,
     )
+    security_job_ids = frozenset(row["id"] for row in security_jobs)
+    attempt_jobs_deadline = min(deadline, clock() + ATTEMPT_JOB_SETTLE_DEADLINE_SECONDS)
+    if last_job_completed_at is None and hasattr(api, "set_deadline"):
+        api.set_deadline(attempt_jobs_deadline, clock)
+    pending_polls = 0
+    while last_job_completed_at is None:
+        if clock() >= attempt_jobs_deadline:
+            raise BackupProofError("exact Security attempt jobs remained nonterminal until the bounded settle deadline")
+        sleep(min(POLL_INTERVAL_SECONDS, max(0.0, attempt_jobs_deadline - clock())))
+        if clock() >= attempt_jobs_deadline:
+            raise BackupProofError("exact Security attempt jobs remained nonterminal until the bounded settle deadline")
+        refreshed_run = api.security_run(expected.source_security_run_id)
+        if clock() >= attempt_jobs_deadline:
+            raise BackupProofError("exact Security attempt jobs remained nonterminal until the bounded settle deadline")
+        refreshed_started, refreshed_updated = _validate_security_run(refreshed_run, expected)
+        if refreshed_started != security_started or refreshed_updated < security_updated:
+            raise BackupProofError("exact security run identity changed during attempt-job polling")
+        security_updated = refreshed_updated
+        security_jobs = api.security_jobs(
+            expected.source_security_run_id, expected.source_security_run_attempt
+        )
+        if clock() >= attempt_jobs_deadline:
+            raise BackupProofError("exact Security attempt jobs remained nonterminal until the bounded settle deadline")
+        last_job_completed_at = _validate_attempt_jobs(
+            security_jobs,
+            run_id=expected.source_security_run_id,
+            run_attempt=expected.source_security_run_attempt,
+            source_sha=expected.source_sha,
+            source_event=refreshed_run["event"],
+            run_started=security_started,
+            run_updated=security_updated,
+            allow_nonterminal=True,
+        )
+        refreshed_job_ids = frozenset(row["id"] for row in security_jobs)
+        if refreshed_job_ids != security_job_ids:
+            raise BackupProofError("exact security attempt job set changed during polling")
+        pending_polls += 1
+        if last_job_completed_at is None and (pending_polls == 1 or pending_polls % 20 == 0):
+            print("Exact Security attempt jobs remain nonterminal; waiting within the bounded settle window.")
+    if hasattr(api, "set_deadline"):
+        api.set_deadline(deadline, clock)
     _check_deadline(deadline, clock)
     workflow = api.backup_workflow(BACKUP_WORKFLOW_PATH)
     _check_deadline(deadline, clock)

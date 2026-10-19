@@ -97,22 +97,95 @@ def _zip_report(member_name: str, report: dict[str, object]) -> bytes:
     return buffer.getvalue()
 
 
-def _loaded_unit_properties(argv: tuple[str, ...] | None = None) -> str:
+def _loaded_unit_properties(
+    argv: tuple[str, ...] | None = None,
+    *,
+    lifecycle: str = "never-run",
+    main_pid: str = "0",
+) -> str:
     selected_argv = argv or evidence.EXPECTED_MAINTENANCE_ARGV
+    lifecycle_fields = {
+        "never-run": ("", "", "0", "(null)", "0/0", "inactive", "dead"),
+        "cleared-after-success": (
+            "[n/a]",
+            "[n/a]",
+            "0",
+            "(null)",
+            "0/0",
+            "inactive",
+            "dead",
+        ),
+        "failed-before-exec": (
+            "[n/a]",
+            "[n/a]",
+            "0",
+            "(null)",
+            "0/0",
+            "failed",
+            "failed",
+        ),
+        "success": (
+            "[Mon 2026-10-19 10:00:00 UTC]",
+            "[Mon 2026-10-19 10:00:01 UTC]",
+            "4242",
+            "exited",
+            "0",
+            "inactive",
+            "dead",
+        ),
+        "failure": (
+            "[Mon 2026-10-19 10:00:00 UTC]",
+            "[Mon 2026-10-19 10:00:01 UTC]",
+            "4242",
+            "exited",
+            "1",
+            "failed",
+            "failed",
+        ),
+        "signal": (
+            "[Mon 2026-10-19 10:00:00 UTC]",
+            "[Mon 2026-10-19 10:00:01 UTC]",
+            "4242",
+            "killed",
+            "15/TERM",
+            "failed",
+            "failed",
+        ),
+        "running": (
+            "[Mon 2026-10-19 10:00:00 UTC]",
+            "[n/a]",
+            "4242",
+            "(null)",
+            "0/0",
+            "active",
+            "running",
+        ),
+    }
+    start_time, stop_time, pid, code, status, active_state, sub_state = lifecycle_fields[lifecycle]
     exec_start = (
         "{ path="
         + selected_argv[0]
         + " ; argv[]="
         + " ".join(selected_argv)
-        + " ; ignore_errors=no ; start_time= ; stop_time="
-        + " ; pid=0 ; code=(null) ; status=0/0 }"
+        + " ; ignore_errors=no ; start_time="
+        + start_time
+        + " ; stop_time="
+        + stop_time
+        + " ; pid="
+        + pid
+        + " ; code="
+        + code
+        + " ; status="
+        + status
+        + " }"
     )
     properties = {
         "FragmentPath": "/etc/systemd/system/deadlock-maintenance.service",
         "DropInPaths": "",
         "NeedDaemonReload": "no",
-        "ActiveState": "inactive",
-        "SubState": "dead",
+        "ActiveState": active_state,
+        "SubState": sub_state,
+        "MainPID": main_pid,
         "ExecStart": exec_start,
         "CPUQuotaPerSecUSec": "500ms",
         "MemoryMax": "536870912",
@@ -472,6 +545,35 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
         installed_path = "/etc/systemd/system/deadlock-maintenance.service"
         validate = evidence._validate_maintenance_unit_bytes
         validate(source_bytes, source_bytes, installed_path, _loaded_unit_properties())
+        for lifecycle in (
+            "cleared-after-success",
+            "failed-before-exec",
+            "success",
+            "failure",
+            "signal",
+        ):
+            with self.subTest(lifecycle=lifecycle):
+                validate(
+                    source_bytes,
+                    source_bytes,
+                    installed_path,
+                    _loaded_unit_properties(lifecycle=lifecycle),
+                )
+
+        running = _loaded_unit_properties(lifecycle="running", main_pid="4242")
+        with self.subTest(lifecycle="still-running"), self.assertRaises(
+            evidence.EvidenceError
+        ):
+            validate(source_bytes, source_bytes, installed_path, running)
+        with self.subTest(lifecycle="inactive-with-live-main-pid"), self.assertRaises(
+            evidence.EvidenceError
+        ):
+            validate(
+                source_bytes,
+                source_bytes,
+                installed_path,
+                _loaded_unit_properties(lifecycle="success", main_pid="4242"),
+            )
 
         invalid_outputs = (
             ("legacy-preserve-unit", _loaded_unit_properties(_legacy_preserve_maintenance_argv())),
@@ -520,8 +622,32 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                 _loaded_unit_properties().replace("status=0/0", "status=", 1),
             ),
             (
+                "cleared-exec-with-success-label",
+                _loaded_unit_properties().replace(
+                    "status=0/0", "status=0/SUCCESS", 1
+                ),
+            ),
+            (
                 "malformed-exec-fields",
                 _loaded_unit_properties().replace(" ; pid=0 ;", " ; pid= ;", 1),
+            ),
+            (
+                "unbounded-exec-pid",
+                _loaded_unit_properties(lifecycle="success").replace(
+                    " ; pid=4242 ;", " ; pid=2147483648 ;", 1
+                ),
+            ),
+            (
+                "completed-exec-with-missing-stop-time",
+                _loaded_unit_properties(lifecycle="success").replace(
+                    "stop_time=[Mon 2026-10-19 10:00:01 UTC]",
+                    "stop_time=[n/a]",
+                    1,
+                ),
+            ),
+            (
+                "nonzero-current-main-pid",
+                _loaded_unit_properties(lifecycle="success", main_pid="4242"),
             ),
         )
         for case, output in invalid_outputs:
@@ -545,6 +671,18 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             'run-retention-preview "$maintenance_unit_source"',
             diagnostics_workflow,
         )
+        self.assertIn(
+            "--property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec",
+            diagnostics_workflow,
+        )
+        for operator_example in (
+            REPO_ROOT / ".agents/skills/platform-storage-retention/SKILL.md",
+            REPO_ROOT / "platform/docs/operations-runbook.md",
+        ):
+            self.assertIn(
+                "--property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec",
+                operator_example.read_text(encoding="utf-8"),
+            )
         self.assertNotIn(
             'maintenance_unit_source="$current/deploy/systemd/deadlock-maintenance.service"',
             diagnostics_workflow,
@@ -678,6 +816,10 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
         preflight_start = workflow.index('          loaded_maintenance_unit="$(systemctl show')
         preflight_end = workflow.index("          service_state_before=", preflight_start)
         preflight = textwrap.dedent(workflow[preflight_start:preflight_end])
+        self.assertIn(
+            "--property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec",
+            preflight,
+        )
         source_bytes = (
             REPO_ROOT / "platform/deploy/systemd/deadlock-maintenance.service"
         ).read_bytes()
