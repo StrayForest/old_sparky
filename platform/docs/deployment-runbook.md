@@ -38,15 +38,14 @@ to `dev`. The chain is:
 3. The auto-deploy gate downloads the classifier artifact from that exact
    security run, validates its schema, digest, target SHA and non-fallback
    route, then consumes its `deployable` bit: a deployable `full` route
-   proceeds while a valid full CI-only route completes as a no-op. A route
-   classified as recovery-bootstrap-only stays `deployable=false`; the automatic
-   chain may send it to `baseline-reconcile` to authenticate the active baseline
-   and full baseline-to-target range. Reconcile is a verified no-op for an
-   allowed cumulative no-op; an application release requires a deployable full
-   cumulative route with every canonical gate, no fallback, and exact-target
-   runtime proof. Every deployable full push to `dev` runs both exact-target
-   runtime gates, so a later test-only push cannot suppress proof required by
-   runtime changes earlier in the undelivered range. A storage no-op is allowed only for an
+   proceeds while a valid full CI-only route completes as a no-op. Recovery-bootstrap-only or
+   strict docs-only routes stay non-deployable; the automatic chain may send either to
+   `baseline-reconcile` to authenticate the active baseline and full baseline-to-target range.
+   Reconcile is a verified no-op for an allowed cumulative no-op; app releases require a
+   deployable full cumulative route with every canonical gate, no fallback, and exact-target
+   runtime proof. Every deployable full push to `dev` runs both exact-target runtime gates,
+   so a later test-only push cannot suppress proof required by runtime changes earlier in
+   the undelivered range. A storage no-op is allowed only for an
    authenticated recovery input and a range wholly in the closed recovery,
    storage and docs sets; it changes no classifier field and authorizes no app
    work. Other ranges need normal release checks. Changes to `platform_production_deploy_supervisor.sh` require a deployable full route and exact-target release, not the recovery-bootstrap no-op. The gate re-reads current `dev` HEAD and refuses a stale successful CI result.
@@ -60,16 +59,17 @@ to `dev`. The chain is:
    successful deploy attempt has its exact bot-authored marker.
    Before child dispatch, the guard revalidates the exact Security run/attempt/source and requires complete, terminal, source-bound pages from that attempt's [workflow-jobs endpoint](https://docs.github.com/en/rest/actions/workflow-jobs), with valid start/completion times. It derives the conservative `last_job_completed_at` bound as the maximum job `completed_at`.
    The reserved backup workflow and production job must start strictly before that bound; `updated_at` is only a consistency upper bound, and event `workflow_run.completed_at` is never a fallback. Missing, malformed or incomplete jobs abort. This bound may reject starts after the final job but before overall workflow completion; it is not the exact workflow-finish time.
-4. The automatic chain dispatches `mode=deploy` for ordinary deployable full
-   routes. For a recovery-bootstrap-only route it dispatches
-   `mode=baseline-reconcile` only as part of the validated automatic chain; the
-   production workflow authenticates source and caller, validates the complete
-   cumulative range and active baseline's unique latest bot-authored deploy marker,
-   attempt URL and successful exact `Deploy production` job. Legacy support is
-   limited to a root-validated `gha-<run_id>-1-<UTC timestamp>` slug whose run ID matches the
-   latest bot-authored bare URL; GitHub must report attempt 1 and exact checks must pass.
-   Unknown formats, reruns or ambiguity fail closed. New markers use attempt
-   URLs; never dispatch this mode.
+4. The automatic chain dispatches `mode=deploy` for deployable full routes and
+   `mode=baseline-reconcile` for validated recovery-bootstrap-only or docs-only
+   routes; never dispatch either mode manually. The production workflow
+   authenticates source/caller, validates the cumulative range and active
+   baseline's latest bot-authored deploy marker, attempt URL and successful exact
+   `Deploy production` job. Legacy slugs require root validation, GitHub attempt 1
+   and passing exact checks; unknown formats, reruns and ambiguity fail closed.
+   An allowed docs-only no-op publishes an authenticated source receipt binding
+   workflow SHA to active app baseline without deployment. Wait for it before
+   live QA, which targets the unchanged app. Recovery-bootstrap build/publisher
+   separately emits its own authenticated skip receipt, not the QA receipt.
 5. A secret-free prerequisite independently downloads and validates the exact
    classifier artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately
