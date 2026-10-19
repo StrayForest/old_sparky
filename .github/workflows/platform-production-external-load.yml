@@ -49,6 +49,14 @@ on:
         required: false
         default: false
         type: boolean
+      ssr_capacity_concurrency:
+        description: "SSR capacity concurrency preset (8 or 16); non-SSR runs use 8"
+        required: false
+        default: "8"
+        type: choice
+        options:
+          - "8"
+          - "16"
 
 permissions:
   contents: read
@@ -78,6 +86,7 @@ jobs:
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       CPU_DIAGNOSTIC_ONLY: ${{ inputs.cpu_diagnostic_only }}
       SSR_CAPACITY_DIAGNOSTIC_ONLY: ${{ inputs.ssr_capacity_diagnostic_only }}
+      SSR_CAPACITY_CONCURRENCY: ${{ inputs.ssr_capacity_concurrency }}
       TARGET_SHA: ${{ github.sha }}
     steps:
       - name: Mask and stage the control identity from the event file
@@ -127,7 +136,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -194,6 +203,12 @@ jobs:
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "External load requires an exact target SHA." >&2; exit 1; }
           CPU_DIAGNOSTIC_PAIR='${{ inputs.cpu_diagnostic_pair }}'
           SSR_CAPACITY_DIAGNOSTIC_ONLY='${{ inputs.ssr_capacity_diagnostic_only }}'
+          SSR_CAPACITY_CONCURRENCY='${{ inputs.ssr_capacity_concurrency }}'
+          case "$SSR_CAPACITY_CONCURRENCY" in 8|16) ;; *) echo "SSR capacity concurrency preset is invalid." >&2; exit 1 ;; esac
+          if [[ "$SSR_CAPACITY_DIAGNOSTIC_ONLY" != true && "$SSR_CAPACITY_CONCURRENCY" != 8 ]]; then
+            echo "SSR capacity concurrency override requires SSR diagnostic mode." >&2
+            exit 1
+          fi
           case "$TIMEOUT_DIAGNOSTICS:$PROFILE_ID:$QA_CONFIRMATION:$CPU_DIAGNOSTIC_PAIR:$CPU_DIAGNOSTIC_ONLY:$SSR_CAPACITY_DIAGNOSTIC_ONLY" in
             false:authenticated-page-load-v1:RUN-PRODUCTION-CPU-DIAGNOSTIC:false:true:false) ;;
             false:authenticated-page-load-v1:RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC:false:false:true) ;;
@@ -361,6 +376,8 @@ jobs:
                                "external_load"),
               "timeout_diagnostics": timeout_diagnostics,
           }
+          if ssr_capacity_diagnostic_only == "true":
+              payload["ssr_capacity_concurrency"] = os.environ["SSR_CAPACITY_CONCURRENCY"]
           if binding is not None:
               payload["source_binding"] = binding
           _write_private_json(Path(output_path), validate_external_payload(payload))
@@ -504,7 +521,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -610,7 +627,7 @@ jobs:
           binding_keys = {"schema", "binding_mode", "runner_sha", "app_target_sha", "baseline_identity", "receipt_document_sha256", "receipt_artifact_id", "receipt_artifact_name", "receipt_artifact_digest", "receipt_archive_sha256", "cumulative_manifest_sha256", "source_security_run_id", "source_security_run_attempt", "autodeploy_run_id", "autodeploy_run_attempt", "production_deploy_run_id", "production_deploy_run_attempt"}
           schema = payload.get("schema")
           binding = payload.get("source_binding")
-          expected = base_keys | ({"fixture_kind"} if "fixture_kind" in payload else set()) | ({"source_binding"} if schema in (2, "2") else set())
+          expected = base_keys | ({"fixture_kind"} if "fixture_kind" in payload else set()) | ({"ssr_capacity_concurrency"} if payload.get("fixture_kind") == "ssr_capacity_diagnostic_v1" else set()) | ({"source_binding"} if schema in (2, "2") else set())
           if set(payload) != expected:
               raise SystemExit("external handoff schema is not closed")
           if schema not in (1, "1", 2, "2") or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id:
@@ -641,6 +658,11 @@ jobs:
               or payload.get("users_per_tournament") != "14"
           ):
               raise SystemExit("CPU diagnostic fixture dimensions are invalid")
+          ssr_concurrency = payload.get("ssr_capacity_concurrency")
+          if (fixture_kind == "ssr_capacity_diagnostic_v1" and ssr_concurrency not in {"8", "16"}) or (
+              fixture_kind != "ssr_capacity_diagnostic_v1" and ssr_concurrency is not None
+          ):
+              raise SystemExit("SSR capacity concurrency is invalid")
           if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None or re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None:
               raise SystemExit("external handoff exact target SHA is malformed")
           for key, maximum in (("setup_concurrency", 256), ("tournament_count", 40), ("users_per_tournament", 500)):
@@ -698,24 +720,14 @@ jobs:
           artifact_dir="$RUNNER_TEMP/external-fixture"
           export_dir="/tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID"
           manifest_path="$artifact_dir/manifest.json"
+          if [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,31}$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,8}$ ]]; then
+            echo "GitHub fixture run identity is invalid." >&2
+            exit 1
+          fi
           mkdir -p "$artifact_dir"; chmod 700 "$artifact_dir"
           manifest_ready=0; setup_status=1; supervisor_exit_status=""; pre_candidate_cleanup_allowed=0
-          set +e
-          ssh -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -i "$SSH_DIR/id_ed25519" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST" /usr/bin/python3.12 -I -B /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py external-fixture < "$input_path" >/dev/null 2>&1
-          launch_status="$?"
-          if [[ "$launch_status" == 0 ]]; then
-            for _ in $(seq 1 900); do
-              rm -f -- "$artifact_dir/ready" "$manifest_path"
-              if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/ready" "$artifact_dir/ready" >/dev/null 2>&1 \
-                && scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/manifest.json" "$manifest_path" >/dev/null 2>&1; then
-                chmod 600 "$manifest_path"; manifest_ready=1; setup_status=0; break
-              fi
-              rm -f -- "$artifact_dir/supervisor.exit.download"
-              if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" \
-                "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/supervisor.exit" \
-                "$artifact_dir/supervisor.exit.download" >/dev/null 2>&1; then
-                supervisor_status="$(/usr/bin/python3 - "$artifact_dir/supervisor.exit.download" <<'PY'
+          read_supervisor_exit_status() {
+            /usr/bin/python3 - "$1" <<'PY'
           import os
           from pathlib import Path
           import re
@@ -771,8 +783,23 @@ jobs:
               raise SystemExit(2)
           print(value)
           PY
-          )"
-                marker_status="$?"
+          }
+          set +e
+          ssh -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" /usr/bin/python3.12 -I -B /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py external-fixture --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" < "$input_path" >/dev/null 2>&1
+          launch_status="$?"
+          if [[ "$launch_status" == 0 ]]; then
+            for _ in $(seq 1 900); do
+              rm -f -- "$artifact_dir/ready" "$manifest_path"
+              if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/ready" "$artifact_dir/ready" >/dev/null 2>&1 \
+                && scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/manifest.json" "$manifest_path" >/dev/null 2>&1; then
+                chmod 600 "$manifest_path"; manifest_ready=1; setup_status=0; break
+              fi
+              rm -f -- "$artifact_dir/supervisor.exit.download"
+              if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/supervisor.exit" \
+                "$artifact_dir/supervisor.exit.download" >/dev/null 2>&1; then
+                if supervisor_status="$(read_supervisor_exit_status "$artifact_dir/supervisor.exit.download")"; then marker_status=0; else marker_status=1; fi
                 rm -f -- "$artifact_dir/supervisor.exit.download"
                 if [[ "$marker_status" != 0 ]]; then
                   supervisor_exit_status="invalid"
@@ -780,7 +807,8 @@ jobs:
                 fi
                 supervisor_exit_status="$supervisor_status"
                 if [[ "$supervisor_status" != 0 ]]; then
-                  if [[ '${{ inputs.cpu_diagnostic_only }}' == true || '${{ inputs.ssr_capacity_diagnostic_only }}' == true ]]; then
+                  if [[ "$GITHUB_RUN_ATTEMPT" == 1 \
+                    && ( '${{ inputs.cpu_diagnostic_only }}' == true || '${{ inputs.ssr_capacity_diagnostic_only }}' == true ) ]]; then
                     pre_candidate_cleanup_allowed=1
                   fi
                   break
@@ -792,6 +820,29 @@ jobs:
                   && scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/manifest.json" "$manifest_path" >/dev/null 2>&1; then
                   chmod 600 "$manifest_path"; manifest_ready=1; setup_status=0
                 fi
+                break
+              fi
+              sleep 2
+            done
+          else
+            # A failed dispatcher launch can happen after Popen started the
+            # fixture supervisor. Read only its fixed exit marker; never
+            # accept ready/manifest on this branch.
+            for _ in $(seq 1 5); do
+              rm -f -- "$artifact_dir/supervisor.exit.download"
+              if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/supervisor.exit" \
+                "$artifact_dir/supervisor.exit.download" >/dev/null 2>&1; then
+                if supervisor_status="$(read_supervisor_exit_status "$artifact_dir/supervisor.exit.download")"; then
+                  supervisor_exit_status="$supervisor_status"
+                  if [[ "$GITHUB_RUN_ATTEMPT" == 1 && "$supervisor_status" != 0 \
+                    && ( '${{ inputs.cpu_diagnostic_only }}' == true || '${{ inputs.ssr_capacity_diagnostic_only }}' == true ) ]]; then
+                    pre_candidate_cleanup_allowed=1
+                  fi
+                else
+                  supervisor_exit_status="invalid"
+                fi
+                rm -f -- "$artifact_dir/supervisor.exit.download"
                 break
               fi
               sleep 2
@@ -978,7 +1029,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -1708,7 +1759,7 @@ jobs:
             --report "$RUNNER_TEMP/ssr-capacity-report/report.json" \
             --source-sha "$TARGET_SHA" --app-target-sha "$APP_TARGET_SHA" \
             --external-run-id "$GITHUB_RUN_ID" --external-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --concurrency 8 \
+            --concurrency '${{ inputs.ssr_capacity_concurrency }}' \
             --ssh-config "$RUNNER_TEMP/external-ssh/config" \
             --ssh-key "$RUNNER_TEMP/external-ssh/id_ed25519"
           capacity_status="$?"
@@ -2126,7 +2177,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -2248,6 +2299,8 @@ jobs:
           handoff = json.loads(Path(handoff_path).read_text(encoding="ascii"))
           source_binding = handoff.get("source_binding")
           base_handoff_keys = {"schema", "confirmation", "target_sha", "control_email", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics"}
+          if handoff.get("fixture_kind") == "ssr_capacity_diagnostic_v1":
+              base_handoff_keys.add("ssr_capacity_concurrency")
           if (
               not isinstance(handoff, dict)
               or handoff.get("schema") not in (1, "1", 2, "2")

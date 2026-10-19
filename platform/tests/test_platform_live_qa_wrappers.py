@@ -725,14 +725,15 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             with patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", root), \
                 patch.object(platform_workflow_remote_dispatch, "EXTERNAL_HELPER", helper), \
                 patch.object(platform_workflow_remote_dispatch, "SUDO", "/usr/bin/sudo"), \
-                patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2"}), \
                 patch.object(
                     platform_workflow_remote_dispatch.subprocess,
                     "Popen",
                     return_value=child,
                 ) as popen:
                 self.assertEqual(
-                    platform_workflow_remote_dispatch._external_fixture(payload), 0
+                    platform_workflow_remote_dispatch._external_fixture(
+                        payload, run_id="123456", run_attempt="2"
+                    ), 0
                 )
             command = popen.call_args.args[0]
             self.assertEqual(
@@ -762,14 +763,30 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             ) as failed_popen, patch.object(
                 platform_workflow_remote_dispatch,
                 "_terminate_process_group",
-            ) as terminate, patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2"}):
+            ) as terminate:
                 self.assertEqual(
-                    platform_workflow_remote_dispatch._external_fixture(payload), 2
+                    platform_workflow_remote_dispatch._external_fixture(
+                        payload, run_id="123456", run_attempt="2"
+                    ), 2
                 )
             terminate.assert_called_once_with(failed_child)
             self.assertTrue(failed_child.stdin.closed)
             failed_command = failed_popen.call_args.args[0]
             self.assertNotIn(payload["control_email"], failed_command)
+
+            mismatched_child = Mock(pid=9012)
+            mismatched_child.stdin = CapturedInput()
+            with patch.object(
+                platform_workflow_remote_dispatch.subprocess,
+                "Popen",
+                return_value=mismatched_child,
+            ) as mismatched_popen:
+                self.assertEqual(
+                    platform_workflow_remote_dispatch._external_fixture(
+                        payload, run_id="123457", run_attempt="2"
+                    ), 2
+                )
+            mismatched_popen.assert_not_called()
 
             helper_source = (
                 PLATFORM_ROOT / "tools" / "platform_production_external_fixture_qa.sh"
@@ -1460,13 +1477,35 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             patch.object(platform_workflow_remote_dispatch.subprocess, "Popen") as popen, \
             redirect_stderr(stderr):
             self.assertEqual(
-                platform_workflow_remote_dispatch.main(["external-fixture"]),
+                platform_workflow_remote_dispatch.main(
+                    ["external-fixture", "--run-id", "123456", "--run-attempt", "2"]
+                ),
                 2,
             )
         run.assert_not_called()
         popen.assert_not_called()
         self.assertEqual(stderr.getvalue(), "remote workflow input is invalid\n")
         self.assertNotIn(invalid_emails[0], stderr.getvalue())
+
+        # CLI identity is mandatory and must agree with the exact payload
+        # before the helper process can be started.
+        valid_external = {
+            **valid_external,
+            "run_id": "123456",
+        }
+        for argv in (
+            ["external-fixture", "--run-id", "123456"],
+            ["external-fixture", "--run-id", "123457", "--run-attempt", "2"],
+            ["external-fixture", "--run-id", "123456", "--run-attempt", "0"],
+        ):
+            stdin = TextIOWrapper(
+                BytesIO((json.dumps(valid_external) + "\n").encode("utf-8")),
+                encoding="utf-8",
+            )
+            with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
+                patch.object(platform_workflow_remote_dispatch.subprocess, "Popen") as popen:
+                self.assertEqual(platform_workflow_remote_dispatch.main(argv), 2)
+            popen.assert_not_called()
 
         # A valid payload still produces a fixed helper argv; shell quoting is
         # not involved at this local subprocess boundary.

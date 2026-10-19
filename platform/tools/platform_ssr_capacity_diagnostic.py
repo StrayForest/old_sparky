@@ -51,6 +51,8 @@ CONTROL_BASENAME = "capacity-control.json"
 REMOTE_WATCH_PREFIX = b"CAPACITY_MEMORY_GUARD "
 REMOTE_WATCH_CAP = 128 * 1024
 REMOTE_ROW_CAP = 2_048
+CPU_EDGE_TOLERANCE_NS = 250_000_000
+CPU_WINDOW_TOLERANCE_NS = 500_000_000
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_RE = re.compile(r"^[0-9a-f]{32}$")
 ATTEMPT_RE = re.compile(r"^[1-9][0-9]{0,8}$")
@@ -602,6 +604,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
 
     if time.time_ns() // 1_000_000 - capacity["off_start_ms"] > 250:
         return fail_off("off_probe_window_missed", submitted=0, completed=0)
+    off_start_edge = _capture_cpu_edge(capacity["off_start_ms"])
     off_probe_start = time.monotonic()
     barrier = threading.Barrier(probe_count)
     probe_futures = [
@@ -624,6 +627,8 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     except TimeoutError:
         off_failed = True
     off_probe_elapsed = time.monotonic() - off_probe_start
+    off_end_edge = _capture_cpu_edge(capacity["off_end_ms"])
+    off_cpu_window = _cpu_window_row("off", off_start_edge, off_end_edge)
     if len(off_results) != probe_count or off_failed or off_probe_elapsed > 11.0:
         return fail_off(
             "off_probe_failed", submitted=probe_count, completed=len(off_results),
@@ -642,6 +647,8 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
                 manifest_sha256=capacity["manifest_sha256"],
             )
         time.sleep(min(0.025, on_start_monotonic - time.monotonic()))
+
+    on_start_edge = _capture_cpu_edge(capacity["on_start_ms"])
 
     local_window_end_monotonic = on_start_monotonic + ON_WINDOW_MS / 1000
 
@@ -673,6 +680,8 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         )
     finally:
         capacity_executor.shutdown(wait=True, cancel_futures=True)
+    on_end_edge = _capture_cpu_edge(capacity["on_end_ms"])
+    on_cpu_window = _cpu_window_row("on", on_start_edge, on_end_edge)
     results = phase_result["results"]
     statuses = Counter(
         str(item.status) if type(item.status) is int and 100 <= item.status <= 599 else "unknown"
@@ -728,8 +737,11 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         "off_probe": {
             "submitted": probe_count, "completed": probe_count, "http_status": 200,
         },
+        "process_cpu_windows": [off_cpu_window, on_cpu_window],
         "resource_abort_reason": final_reason,
-        "generator_headroom": "pending_parent_observer",
+        "generator_cpu_evidence": _generator_cpu_evidence_status(
+            [off_cpu_window, on_cpu_window],
+        ),
         "server_capacity_claim": None,
         "server_capacity_claim_reason": "resource_correlation_not_provided",
         "diagnostic_credit": False,
@@ -767,11 +779,97 @@ def _incomplete_report(
             "submitted": off_probe_submitted, "completed": off_probe_completed,
             "http_status": off_probe_status,
         },
+        "process_cpu_windows": _unknown_cpu_windows(),
         "resource_abort_reason": reason,
-        "generator_headroom": "pending_parent_observer",
+        "generator_cpu_evidence": "incomplete",
         "server_capacity_claim": None,
         "server_capacity_claim_reason": "resource_correlation_not_provided",
         "namespace_closed": False,
+    }
+
+
+def _unknown_cpu_windows() -> list[dict[str, Any]]:
+    return [
+        {"window": name, "status": "incomplete", "cpu_ns": None,
+         "elapsed_ns": None, "cores": None}
+        for name in ("off", "on")
+    ]
+
+
+def _valid_cpu_window_rows(value: Any) -> bool:
+    if not isinstance(value, list) or len(value) != 2:
+        return False
+    if [row.get("window") if isinstance(row, dict) else None for row in value] != ["off", "on"]:
+        return False
+    for row in value:
+        if not isinstance(row, dict) or set(row) != {
+            "window", "status", "cpu_ns", "elapsed_ns", "cores",
+        }:
+            return False
+        if row["status"] == "incomplete":
+            if any(row[key] is not None for key in ("cpu_ns", "elapsed_ns", "cores")):
+                return False
+        elif row["status"] == "complete":
+            if (type(row["cpu_ns"]) is not int or row["cpu_ns"] < 0
+                    or type(row["elapsed_ns"]) is not int or row["elapsed_ns"] <= 0
+                    or abs(row["elapsed_ns"] - 20_000_000_000) > CPU_WINDOW_TOLERANCE_NS
+                    or type(row["cores"]) not in (int, float)
+                    or isinstance(row["cores"], bool) or not math.isfinite(row["cores"])
+                    or row["cores"] < 0 or row["cores"] > 128
+                    or abs(row["cores"] - row["cpu_ns"] / row["elapsed_ns"]) > 0.00001):
+                return False
+        else:
+            return False
+    return True
+
+
+def _generator_cpu_evidence_status(rows: Any) -> str:
+    if (not _valid_cpu_window_rows(rows)
+            or any(row["status"] != "complete" for row in rows)):
+        return "incomplete"
+    return "measured"
+
+
+def _capture_cpu_edge(target_ms: int) -> dict[str, int]:
+    target_ns = target_ms * 1_000_000
+    while True:
+        remaining_ns = target_ns - time.time_ns()
+        if remaining_ns <= 0:
+            break
+        time.sleep(min(0.025, remaining_ns / 1_000_000_000))
+    wall_before = time.time_ns()
+    mono_before = time.monotonic_ns()
+    cpu_ns = time.process_time_ns()
+    mono_after = time.monotonic_ns()
+    wall_after = time.time_ns()
+    return {
+        "target_ns": target_ns, "wall_before_ns": wall_before,
+        "wall_after_ns": wall_after, "mono_before_ns": mono_before,
+        "mono_after_ns": mono_after, "cpu_ns": cpu_ns,
+    }
+
+
+def _cpu_window_row(
+    window: str, start: Mapping[str, int], end: Mapping[str, int],
+) -> dict[str, Any]:
+    elapsed_ns = end["mono_before_ns"] - start["mono_before_ns"]
+    cpu_ns = end["cpu_ns"] - start["cpu_ns"]
+    duration_ns = end["target_ns"] - start["target_ns"]
+    aligned = all(
+        abs((edge["wall_before_ns"] + edge["wall_after_ns"]) // 2 - edge["target_ns"])
+        <= CPU_EDGE_TOLERANCE_NS
+        for edge in (start, end)
+    )
+    complete = (
+        aligned and cpu_ns >= 0
+        and abs(elapsed_ns - duration_ns) <= CPU_WINDOW_TOLERANCE_NS
+    )
+    return {
+        "window": window,
+        "status": "complete" if complete else "incomplete",
+        "cpu_ns": cpu_ns if complete else None,
+        "elapsed_ns": elapsed_ns if complete else None,
+        "cores": round(cpu_ns / elapsed_ns, 6) if complete and elapsed_ns > 0 else None,
     }
 
 
@@ -897,13 +995,18 @@ def run_isolated_capacity_worker(
         "window_ms": ON_WINDOW_MS,
         "namespace_closed": namespace_closed,
         "worker": {
-            key: worker_payload.get(key) for key in (
+            key: worker_payload.get(key, _unknown_cpu_windows() if key == "process_cpu_windows" else None) for key in (
                 "status", "submitted", "completed", "http_status_counts", "error_counts",
                 "latency_ms", "resource_abort_reason", "on_window_start_ms", "on_window_end_ms",
                 "observed_duration_ms", "max_inflight", "fixture_manifest_bytes",
-                "response_bytes_total", "off_probe",
+                "response_bytes_total", "off_probe", "process_cpu_windows",
             )
         } if valid_worker else None,
+        "generator_cpu_evidence": (
+            _generator_cpu_evidence_status(
+                worker_payload.get("process_cpu_windows", _unknown_cpu_windows()),
+            ) if valid_worker else "incomplete"
+        ),
         "memory_guard": memory,
         "runner_headroom": runner_headroom,
         "server_capacity_claim": None,
@@ -924,12 +1027,13 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         "fixture_manifest_sha256", "on_window_start_ms", "on_window_end_ms",
         "observed_duration_ms", "submitted", "completed", "max_inflight",
         "fixture_manifest_bytes", "response_bytes_total", "http_status_counts",
-        "error_counts", "latency_ms", "off_probe", "resource_abort_reason",
-        "generator_headroom", "server_capacity_claim", "server_capacity_claim_reason",
+        "error_counts", "latency_ms", "off_probe", "process_cpu_windows", "resource_abort_reason",
+        "generator_cpu_evidence", "server_capacity_claim", "server_capacity_claim_reason",
         "diagnostic_credit", "namespace_closed",
     }
-    if set(payload) != expected_fields:
+    if set(payload) not in (expected_fields, expected_fields - {"process_cpu_windows"}):
         return False
+    cpu_rows = payload.get("process_cpu_windows", _unknown_cpu_windows())
     return bool(
         payload.get("report_complete") is True
         and type(payload.get("schema")) is int and payload.get("schema") == SCHEMA
@@ -948,8 +1052,10 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         and payload.get("concurrency") == capacity_config.get("concurrency")
         and payload.get("max_inflight") == capacity_config.get("concurrency")
         and payload.get("actors") == 8
+        and payload.get("generator_cpu_evidence") == _generator_cpu_evidence_status(cpu_rows)
         and payload.get("fixture_tournaments") == FIXTURE_TOURNAMENTS
         and payload.get("fixture_users") == FIXTURE_USERS
+        and _valid_cpu_window_rows(cpu_rows)
         and payload.get("on_window_start_ms") == capacity_config.get("on_start_ms")
         and payload.get("on_window_end_ms") == capacity_config.get("on_end_ms")
         and isinstance(payload.get("off_probe"), dict)
@@ -1375,6 +1481,7 @@ def _parent_run(args: argparse.Namespace) -> dict[str, Any]:
             "load_model": "closed_loop_best_effort", "window_ms": ON_WINDOW_MS,
             "namespace_closed": False,
             "worker": None,
+            "generator_cpu_evidence": "incomplete",
             "memory_guard": {
                 "status": "incomplete", "samples": 0,
                 "current_min_bytes": None, "current_max_bytes": None,
@@ -1419,6 +1526,7 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         "max_inflight", "load_model", "window_ms", "namespace_closed", "worker",
         "memory_guard", "runner_headroom", "server_capacity_claim",
         "server_capacity_claim_reason", "remote_plan_cleanup", "server_telemetry",
+        "generator_cpu_evidence",
     }
     if not isinstance(value, dict) or set(value) != top_fields:
         return None
@@ -1452,6 +1560,7 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             or type(value.get("namespace_closed")) is not bool
             or value.get("server_capacity_claim") is not None
             or value.get("server_capacity_claim_reason") != "resource_correlation_not_provided"
+            or value.get("generator_cpu_evidence") not in {"measured", "incomplete"}
             or value.get("remote_plan_cleanup") not in {"complete", "failed"}):
         return None
     worker = value.get("worker")
@@ -1460,9 +1569,15 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             "status", "submitted", "completed", "http_status_counts", "error_counts",
             "latency_ms", "resource_abort_reason", "on_window_start_ms",
             "on_window_end_ms", "observed_duration_ms", "off_probe", "max_inflight",
-            "fixture_manifest_bytes", "response_bytes_total",
+            "fixture_manifest_bytes", "response_bytes_total", "process_cpu_windows",
         }
-        if (not isinstance(worker, dict) or set(worker) != expected_worker
+        if (not isinstance(worker, dict)
+                or set(worker) not in (expected_worker, expected_worker - {"process_cpu_windows"})):
+            return None
+        if "process_cpu_windows" not in worker:
+            worker = {**worker, "process_cpu_windows": _unknown_cpu_windows()}
+            value["worker"] = worker
+        if (set(worker) != expected_worker
                 or worker.get("status") not in {"complete", "incomplete", "failed"}
                 or type(worker.get("submitted")) is not int
                 or type(worker.get("completed")) is not int
@@ -1489,7 +1604,8 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or (worker.get("status") == "complete" and worker["off_probe"] != {
                     "submitted": value.get("concurrency"),
                     "completed": value.get("concurrency"), "http_status": 200,
-                })):
+                })
+                or not _valid_cpu_window_rows(worker.get("process_cpu_windows"))):
             return None
         latency = worker.get("latency_ms")
         if (not isinstance(latency, dict)
@@ -1645,6 +1761,10 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or row.get("gc_overflow") not in {True, False, None}
                 or any(item is not None and type(item) is not int for item in (row[key] for key in node_integer_fields))):
             return None
+    cpu_rows = (value["worker"].get("process_cpu_windows", _unknown_cpu_windows())
+                if value.get("worker") else _unknown_cpu_windows())
+    if value.get("generator_cpu_evidence") != _generator_cpu_evidence_status(cpu_rows):
+        return None
     return value
 
 

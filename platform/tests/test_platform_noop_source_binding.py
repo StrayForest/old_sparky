@@ -669,9 +669,12 @@ class NoopSourceBindingTests(unittest.TestCase):
             child.stdin.write.side_effect = written.append
             with patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_root), \
                 patch.object(platform_workflow_remote_dispatch, "EXTERNAL_HELPER", helper), \
-                patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "4"}), \
                 patch.object(platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child) as popen:
-                self.assertEqual(platform_workflow_remote_dispatch._external_fixture(payload), 0)
+                self.assertEqual(
+                    platform_workflow_remote_dispatch._external_fixture(
+                        payload, run_id="567890", run_attempt="4"
+                    ), 0
+                )
 
         command = popen.call_args.args[0]
         self.assertEqual(command[5], RUNNER_SHA)

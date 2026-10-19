@@ -2696,7 +2696,9 @@ def _trusted_live_launch_helper() -> bool:
     )
 
 
-def _external_fixture(payload: dict[str, object]) -> int:
+def _external_fixture(
+    payload: dict[str, object], *, run_id: str, run_attempt: str
+) -> int:
     try:
         source_arguments = _source_binding_arguments(payload)
         canonical_payload = json.dumps(
@@ -2704,8 +2706,11 @@ def _external_fixture(payload: dict[str, object]) -> int:
         ).encode("ascii") + b"\n"
     except (TypeError, ValueError, UnicodeEncodeError):
         return 2
-    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
-    if not re.fullmatch(r"[1-9][0-9]{0,8}", attempt):
+    if (
+        RUN_ID_RE.fullmatch(run_id) is None
+        or not re.fullmatch(r"[1-9][0-9]{0,8}", run_attempt)
+        or payload.get("run_id") != run_id
+    ):
         return 2
     input_handoff_sha256 = hashlib.sha256(canonical_payload).hexdigest()
     arguments = [
@@ -2718,7 +2723,7 @@ def _external_fixture(payload: dict[str, object]) -> int:
         payload["users_per_tournament"],
         payload["timeout_diagnostics"],
         *source_arguments,
-        "--run-attempt", attempt,
+        "--run-attempt", run_attempt,
         "--input-handoff-sha256", input_handoff_sha256,
     ]
     if (
@@ -3099,6 +3104,7 @@ def _prepare_deployment(payload: dict[str, str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    external_fixture_identity: tuple[str, str] | None = None
     if len(arguments) == 4 and arguments[0] == "host-contract":
         generation_sha, manifest_sha, capabilities_sha = arguments[1:]
         if (
@@ -3149,8 +3155,16 @@ def main(argv: list[str] | None = None) -> int:
         mode = "cpu-diagnostic"
     elif arguments == ["cpu-diagnostic-memory-watch"]:
         mode = "cpu-memory-watch"
-    elif arguments == ["external-fixture"]:
+    elif (
+        len(arguments) == 5
+        and arguments[0] == "external-fixture"
+        and arguments[1] == "--run-id"
+        and RUN_ID_RE.fullmatch(arguments[2]) is not None
+        and arguments[3] == "--run-attempt"
+        and re.fullmatch(r"[1-9][0-9]{0,8}", arguments[4]) is not None
+    ):
         mode = "external"
+        external_fixture_identity = (arguments[2], arguments[4])
     elif arguments == ["external-finalize"]:
         mode = "external"
     elif (
@@ -3196,8 +3210,12 @@ def main(argv: list[str] | None = None) -> int:
             return _run_cpu_diagnostic_plan(payload)
         if arguments == ["cpu-diagnostic-memory-watch"]:
             return _run_cpu_diagnostic_memory_watch(payload)
-        if arguments == ["external-fixture"]:
-            return _external_fixture(payload)
+        if external_fixture_identity is not None:
+            return _external_fixture(
+                payload,
+                run_id=external_fixture_identity[0],
+                run_attempt=external_fixture_identity[1],
+            )
         if arguments == ["external-finalize"]:
             return _touch_complete(payload)
         if len(arguments) == 5 and arguments[:2] == ["external-cleanup", "--run-attempt"]:

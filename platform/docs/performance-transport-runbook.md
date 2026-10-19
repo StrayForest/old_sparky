@@ -61,9 +61,13 @@ The separate `authenticated_workspace_read_capacity_v1` diagnostic is a
 best-effort closed-loop SSR read workload with zero load-matrix credit. Its
 small physical fixture has one tournament and 14 QA-contract users; 14 is an
 existing diagnostic fixture minimum, not an API or business minimum. It uses
-eight actors and a closed preset of 8 or 16 concurrent reads for one 20-second
-ON window. The initial operational run uses 8; 16 requires a clean 8 run and
-independent review of the observed memory margin and generator evidence. The
+eight actors and a typed preset of 8 or 16 concurrent reads for one 20-second
+ON window; the workflow defaults to 8. The OFF and ON windows also carry
+process-wide worker CPU aggregates, aligned to their planned 20-second phase
+boundaries. Missing or misaligned CPU samples leave generator attribution
+unknown; measured CPU and cgroup capacity are evidence, not a pass threshold or
+a server-capacity claim. The 16 preset remains a separate diagnostic run whose
+memory margin and generator evidence require independent review. The
 untraced warmup and OFF marker burst are separate from ON request counts, use
 the same persistent HTTP/1.1 connection pool as the ON window, and are aligned
 to the bound plan's wall-clock boundaries. The OFF burst must reach both API

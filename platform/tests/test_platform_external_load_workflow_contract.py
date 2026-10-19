@@ -335,7 +335,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("inputs.ssr_capacity_diagnostic_only != true", pair.split(
             "Run the fixed authenticated workspace CPU pair", 1
         )[1])
-        self.assertIn("--concurrency 8", pair)
+        self.assertIn("ssr_capacity_concurrency:", self.source)
+        self.assertIn('default: "8"', self.source)
+        self.assertIn('options:\n          - "8"\n          - "16"', self.source)
+        self.assertIn("--concurrency '${{ inputs.ssr_capacity_concurrency }}'", pair)
+        self.assertIn('payload["ssr_capacity_concurrency"] = os.environ["SSR_CAPACITY_CONCURRENCY"]', validate)
         self.assertNotIn("platform_external_load.py", pair)
         self.assertIn('"tournament_count": "1" if diagnostic_only else tournaments', validate)
         self.assertIn('"users_per_tournament": "14" if diagnostic_only else users', validate)
@@ -345,6 +349,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             validate, "Reject invalid external-load dispatch before checkout"
         ).replace("${{ inputs.cpu_diagnostic_pair }}", "false").replace(
             "${{ inputs.ssr_capacity_diagnostic_only }}", "true"
+        ).replace(
+            "${{ inputs.ssr_capacity_concurrency }}", "8"
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             env = {
@@ -363,6 +369,21 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 env=env, capture_output=True, text=True, check=False,
             )
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            accepted_16_script = guard_script.replace("SSR_CAPACITY_CONCURRENCY='8'", "SSR_CAPACITY_CONCURRENCY='16'")
+            accepted_16 = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", accepted_16_script],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(accepted_16.returncode, 0, accepted_16.stderr)
+            non_ssr_16_script = accepted_16_script.replace(
+                "SSR_CAPACITY_DIAGNOSTIC_ONLY='true'", "SSR_CAPACITY_DIAGNOSTIC_ONLY='false'"
+            )
+            non_ssr_16 = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", non_ssr_16_script],
+                env={**env, "QA_CONFIRMATION": "RUN-PRODUCTION-EXTERNAL-LOAD"},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(non_ssr_16.returncode, 0)
             rejected = subprocess.run(
                 ["/bin/bash", "-euo", "pipefail", "-c", guard_script],
                 env={**env, "QA_CONFIRMATION": "RUN-PRODUCTION-EXTERNAL-LOAD"},
@@ -915,6 +936,192 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             archive_path.write_bytes(archive_bytes + b"tampered")
             self.assertNotEqual(verify().returncode, 0)
 
+    def test_fixture_setup_transports_attempt_and_fails_closed_after_launch_error(self) -> None:
+        """Run the extracted workflow SSH command through the real dispatcher CLI."""
+        script = _step_script(
+            self.jobs["fixture-setup"], "Prepare external fixture with ephemeral SSH"
+        )
+        script = script.replace("'${{ inputs.cpu_diagnostic_only }}'", "true")
+        script = script.replace("'${{ inputs.ssr_capacity_diagnostic_only }}'", "false")
+        self.assertIn(
+            'external-fixture --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"',
+            script,
+        )
+
+        ssh_program = textwrap.dedent(
+            '''\
+            #!/usr/bin/python3
+            import json, os, sys
+            from pathlib import Path
+            sys.path.insert(0, os.environ["PLATFORM_ROOT"])
+            from tools import platform_workflow_remote_dispatch as dispatcher
+            args = sys.argv[1:]
+            host_index = next(i for i, value in enumerate(args) if value == "fixture-user@fixture-host")
+            remote = args[host_index + 1:]
+            if remote[:3] != ["/usr/bin/python3.12", "-I", "-B"]:
+                raise SystemExit(97)
+            os.environ.pop("GITHUB_RUN_ATTEMPT", None)
+            helper_dir = Path(os.environ["HELPER_DIR"])
+            dispatcher.ACTIVE_TOOLS_DIR = helper_dir
+            dispatcher.EXTERNAL_HELPER = helper_dir / "platform_production_external_fixture_qa.sh"
+            dispatcher.SUDO = "/usr/bin/sudo"
+            class Pipe:
+                def write(self, data):
+                    if os.environ.get("MOCK_BROKEN_PIPE") == "1":
+                        raise BrokenPipeError
+                    return len(data)
+                def flush(self): pass
+                def close(self): pass
+            class Process:
+                pid = 4567
+                stdin = Pipe()
+            def popen(command, **kwargs):
+                Path(os.environ["POpen_MARKER"]).write_text("yes", encoding="ascii")
+                Path(os.environ["HELPER_ATTEMPT"]).write_text(command[-3], encoding="ascii")
+                return Process()
+            dispatcher.subprocess.Popen = popen
+            dispatcher._terminate_process_group = lambda process: None
+            rc = dispatcher.main(remote[4:])
+            payload = json.loads(Path(os.environ["INPUT_PATH"]).read_text(encoding="utf-8"))
+            capture = {
+                "mode": remote[4],
+                "run_id": remote[6] if len(remote) > 6 else None,
+                "run_attempt": remote[8] if len(remote) > 8 else None,
+                "payload_run_id_matches": payload.get("run_id") == (remote[6] if len(remote) > 6 else None),
+                "rc": rc,
+                "popen_called": Path(os.environ["POpen_MARKER"]).exists(),
+            }
+            Path(os.environ["SSH_CAPTURE"]).write_text(json.dumps(capture), encoding="ascii")
+            raise SystemExit(rc)
+            '''
+        )
+        scp_program = textwrap.dedent(
+            '''\
+            #!/usr/bin/python3
+            import os, sys
+            from pathlib import Path
+            source, destination = sys.argv[-2:]
+            with Path(os.environ["SCP_REQUESTS"]).open("a", encoding="ascii") as stream:
+                stream.write(source.rsplit("/", 1)[-1] + "\\n")
+            if source.endswith("/supervisor.exit"):
+                marker = os.environ.get("MOCK_MARKER", "missing")
+                if marker == "missing": raise SystemExit(1)
+                Path(destination).write_bytes({"nonzero": b"2\\n", "stale": b"2\\n", "zero": b"0\\n", "invalid": b"02\\n"}[marker])
+                raise SystemExit(0)
+            if os.environ.get("MOCK_MARKER") == "stale": raise SystemExit(1)
+            Path(destination).write_bytes(b"ready")
+            raise SystemExit(0)
+            '''
+        )
+        payload = {
+            "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD", "schema": "1",
+            "target_sha": "a" * 40, "control_email": "control@example.invalid",
+            "setup_concurrency": "8", "run_id": "123456", "profile": "external-vote",
+            "tournament_count": "1", "users_per_tournament": "14",
+            "timeout_diagnostics": "false",
+        }
+
+        with tempfile.TemporaryDirectory(prefix="external-fixture-transport-") as temporary:
+            root = Path(temporary)
+            helper_dir = root / "helpers"
+            helper_dir.mkdir(mode=0o700)
+            helper = helper_dir / "platform_production_external_fixture_qa.sh"
+            helper.write_text("#!/bin/sh\\n", encoding="ascii")
+            helper.chmod(0o700)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            for name, source in (("ssh", ssh_program), ("scp", scp_program)):
+                path = bin_dir / name
+                path.write_text(source, encoding="utf-8")
+                path.chmod(0o700)
+            sleep = bin_dir / "sleep"
+            sleep.write_text("#!/bin/sh\\nexit 0\\n", encoding="ascii")
+            sleep.chmod(0o700)
+            ssh_dir = root / "ssh"
+            ssh_dir.mkdir(mode=0o700)
+            (ssh_dir / "config").write_text("Host fixture-host\\n", encoding="ascii")
+            (ssh_dir / "id_ed25519").write_text("test key material\\n", encoding="ascii")
+            input_dir = root / "external-input"
+            input_dir.mkdir(mode=0o700)
+            input_path = input_dir / "platform-production-external-load-input.json"
+            input_path.write_text(json.dumps(payload), encoding="ascii")
+
+            def run_case(attempt: str, pipe: bool, marker: str = "missing"):
+                case = root / f"case-{attempt}-{pipe}-{marker}"
+                case.mkdir(mode=0o700)
+                env = {
+                    **os.environ, "PATH": f"{bin_dir}:/usr/bin:/bin",
+                    "PLATFORM_ROOT": str(REPO_ROOT / "platform"),
+                    "HELPER_DIR": str(helper_dir), "INPUT_PATH": str(input_path),
+                    "RUNNER_TEMP": str(root), "SSH_DIR": str(ssh_dir),
+                    "PROD_SSH_USER": "fixture-user", "PROD_SSH_HOST": "fixture-host",
+                    "GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": attempt,
+                    "GITHUB_OUTPUT": str(case / "github-output"),
+                    "MOCK_BROKEN_PIPE": "1" if pipe else "0", "MOCK_MARKER": marker,
+                    "POpen_MARKER": str(case / "popen-called"),
+                    "HELPER_ATTEMPT": str(case / "helper-attempt"),
+                    "SSH_CAPTURE": str(case / "ssh-capture.json"),
+                    "SCP_REQUESTS": str(case / "scp-requests"),
+                }
+                result = subprocess.run(
+                    ["/bin/bash", "-c", script], env=env, capture_output=True,
+                    text=True, check=False, timeout=5,
+                )
+                capture_path = case / "ssh-capture.json"
+                capture = json.loads(capture_path.read_text(encoding="ascii")) if capture_path.exists() else {}
+                request_path = case / "scp-requests"
+                requests = request_path.read_text(encoding="ascii").splitlines() if request_path.exists() else []
+                output = (case / "github-output").read_text(encoding="ascii") if (case / "github-output").exists() else ""
+                return result, capture, requests, output
+
+            success, capture, requests, output = run_case("1", False)
+            self.assertEqual(success.returncode, 0, success.stderr)
+            self.assertEqual(capture["mode"], "external-fixture")
+            self.assertEqual(capture["run_id"], "123456")
+            self.assertEqual(capture["run_attempt"], "1")
+            self.assertTrue(capture["payload_run_id_matches"])
+            self.assertEqual(capture["rc"], 0)
+            self.assertTrue(capture["popen_called"])
+            self.assertEqual(requests[:2], ["ready", "manifest.json"])
+            self.assertIn("manifest_ready=1", output)
+            self.assertIn("setup_status=0", output)
+
+            failed, capture, requests, output = run_case("1", True, "nonzero")
+            self.assertEqual(failed.returncode, 1)
+            self.assertEqual(capture["rc"], 2)
+            self.assertTrue(capture["popen_called"])
+            self.assertEqual(requests, ["supervisor.exit"])
+            self.assertIn("supervisor_exit_status=2", output)
+            self.assertIn("pre_candidate_cleanup_allowed=1", output)
+
+            for marker in ("missing", "zero", "invalid"):
+                closed, capture, requests, output = run_case("1", True, marker)
+                self.assertEqual(closed.returncode, 1)
+                self.assertTrue(capture["popen_called"])
+                self.assertEqual(
+                    requests,
+                    ["supervisor.exit"] * (5 if marker == "missing" else 1),
+                )
+                self.assertNotIn("pre_candidate_cleanup_allowed=1", output)
+                self.assertNotIn("ready", requests)
+                self.assertNotIn("manifest.json", requests)
+
+            rerun, capture, requests, output = run_case("2", True, "nonzero")
+            self.assertEqual(rerun.returncode, 1)
+            self.assertTrue(capture["popen_called"])
+            self.assertEqual(requests, ["supervisor.exit"])
+            self.assertIn("supervisor_exit_status=2", output)
+            self.assertNotIn("pre_candidate_cleanup_allowed=1", output)
+
+            # A successful SSH handoff can still find a stale export from an
+            # earlier attempt. The same run-id marker must not authorize cleanup.
+            stale_rerun, capture, requests, output = run_case("2", False, "stale")
+            self.assertEqual(stale_rerun.returncode, 1)
+            self.assertEqual(capture["rc"], 0)
+            self.assertEqual(requests, ["ready", "supervisor.exit"])
+            self.assertIn("supervisor_exit_status=2", output)
+            self.assertNotIn("pre_candidate_cleanup_allowed=1", output)
+
     def test_evaluator_uses_declared_source_sha_for_artifact_and_candidate_binding(self) -> None:
         workflow = yaml.safe_load(self.source)
         evaluator_job = workflow["jobs"]["evaluate-load"]
@@ -1181,6 +1388,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "cpu_diagnostic_pair": False,
             "cpu_diagnostic_only": False,
             "ssr_capacity_diagnostic_only": False,
+            "ssr_capacity_concurrency": "8",
         }
         invalid_payloads = (
             json.dumps({"inputs": {**valid_inputs, "unexpected": "value"}}),

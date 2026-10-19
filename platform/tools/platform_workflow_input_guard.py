@@ -404,7 +404,12 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "timeout_diagnostics",
     }
     schema, source_binding = _validate_source_binding_schema(payload)
+    fixture_kind = payload.get("fixture_kind", "external_load")
+    if not isinstance(fixture_kind, str):
+        raise _invalid()
     keys = base_keys | {"fixture_kind"}
+    if fixture_kind == "ssr_capacity_diagnostic_v1":
+        keys.add("ssr_capacity_concurrency")
     if schema == 2:
         keys.add("source_binding")
     if set(payload) != keys and set(payload) != keys - {"fixture_kind"}:
@@ -430,9 +435,6 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     timeout_diagnostics = _require_string(payload, "timeout_diagnostics")
     if timeout_diagnostics not in {"true", "false"}:
         raise _invalid()
-    fixture_kind = payload.get("fixture_kind", "external_load")
-    if not isinstance(fixture_kind, str):
-        raise _invalid()
     if fixture_kind not in {
         "external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1",
     }:
@@ -449,11 +451,18 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             or users_per_tournament != "14"
         ):
             raise _invalid()
-    elif timeout_diagnostics == "true":
-        if confirmation != TIMEOUT_DIAGNOSTICS_CONFIRMATION:
+    if fixture_kind == "ssr_capacity_diagnostic_v1":
+        concurrency = _require_string(payload, "ssr_capacity_concurrency")
+        if concurrency not in {"8", "16"}:
             raise _invalid()
-    elif confirmation != EXTERNAL_CONFIRMATION:
+    elif "ssr_capacity_concurrency" in payload:
         raise _invalid()
+    elif fixture_kind == "external_load":
+        if timeout_diagnostics == "true":
+            if confirmation != TIMEOUT_DIAGNOSTICS_CONFIRMATION:
+                raise _invalid()
+        elif confirmation != EXTERNAL_CONFIRMATION:
+            raise _invalid()
     if SHA_RE.fullmatch(target_sha) is None:
         raise _invalid()
     if source_binding is not None and source_binding.get("runner_sha") != target_sha:
@@ -472,6 +481,8 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
     if "fixture_kind" in payload:
         result["fixture_kind"] = fixture_kind
+    if fixture_kind == "ssr_capacity_diagnostic_v1":
+        result["ssr_capacity_concurrency"] = concurrency
     if source_binding is not None:
         result["source_binding"] = source_binding
     return result

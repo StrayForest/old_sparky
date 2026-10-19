@@ -190,6 +190,7 @@ class SourceBindingDispatchTests(unittest.TestCase):
         )
         validated = validate_external_payload(payload)
         self.assertEqual(validated["fixture_kind"], "cpu_diagnostic_only_v1")
+        self.assertNotIn("ssr_capacity_concurrency", validated)
         for mutation in (
             {**payload, "tournament_count": "2"},
             {**payload, "users_per_tournament": "500"},
@@ -206,11 +207,20 @@ class SourceBindingDispatchTests(unittest.TestCase):
         payload.update(
             confirmation="RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC",
             fixture_kind="ssr_capacity_diagnostic_v1",
+            ssr_capacity_concurrency="8",
             tournament_count="1",
             users_per_tournament="14",
         )
         validated = validate_external_payload(payload)
         self.assertEqual(validated["fixture_kind"], "ssr_capacity_diagnostic_v1")
+        self.assertEqual(validated["ssr_capacity_concurrency"], "8")
+        for concurrency in ("8", "16"):
+            self.assertEqual(
+                validate_external_payload({**payload, "ssr_capacity_concurrency": concurrency})[
+                    "ssr_capacity_concurrency"
+                ],
+                concurrency,
+            )
         for mutation in (
             {**payload, "confirmation": EXTERNAL_CONFIRMATION},
             {**payload, "tournament_count": "2"},
@@ -218,10 +228,26 @@ class SourceBindingDispatchTests(unittest.TestCase):
             {**payload, "timeout_diagnostics": "true"},
             {**payload, "fixture_kind": "cpu_diagnostic_only_v1"},
             {**payload, "fixture_kind": "external_load"},
+            {**payload, "ssr_capacity_concurrency": "4"},
+            {**payload, "fixture_kind": "cpu_diagnostic_only_v1", "ssr_capacity_concurrency": "16"},
         ):
             with self.subTest(mutation=mutation):
                 with self.assertRaises(WorkflowInputError):
                     validate_external_payload(mutation)
+
+        cpu_payload = _external_payload()
+        cpu_payload.update(
+            confirmation="RUN-PRODUCTION-CPU-DIAGNOSTIC",
+            fixture_kind="cpu_diagnostic_only_v1",
+            tournament_count="1", users_per_tournament="14",
+        )
+        self.assertEqual(
+            validate_external_payload(cpu_payload)["fixture_kind"],
+            "cpu_diagnostic_only_v1",
+        )
+        ordinary = _external_payload()
+        with self.assertRaises(WorkflowInputError):
+            validate_external_payload({**ordinary, "ssr_capacity_concurrency": "16"})
 
     def test_legacy_schema_one_preserves_same_source_shape(self) -> None:
         payload = _external_payload(schema=1)
@@ -261,10 +287,13 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 patch.object(dispatcher, "ACTIVE_TOOLS_DIR", root),
                 patch.object(dispatcher, "EXTERNAL_HELPER", helper),
                 patch.object(dispatcher, "SUDO", "/usr/bin/sudo"),
-                patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "3"}),
                 patch.object(dispatcher.subprocess, "Popen", return_value=process) as popen,
             ):
-                self.assertEqual(dispatcher._external_fixture(payload), 0)
+                self.assertEqual(
+                    dispatcher._external_fixture(
+                        payload, run_id="567890", run_attempt="3"
+                    ), 0
+                )
         command = popen.call_args.args[0]
         self.assertEqual(command[:4], ["/usr/bin/sudo", "-n", "--", str(helper)])
         self.assertEqual(

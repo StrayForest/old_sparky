@@ -292,12 +292,22 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "http_status_counts": {"200": 40}, "error_counts": {},
             "latency_ms": {"sample_count": 40, "p50": 10.0, "p95": 20.0, "p99": 25.0, "max": 30.0},
             "off_probe": {"submitted": 8, "completed": 8, "http_status": 200},
+            "process_cpu_windows": [
+                {"window": name, "status": "complete", "cpu_ns": 4_000_000_000,
+                 "elapsed_ns": 20_000_000_000, "cores": 0.2}
+                for name in ("off", "on")
+            ],
             "resource_abort_reason": None, "passed": True,
-            "generator_headroom": {"status": "complete"},
+            "generator_cpu_evidence": "measured",
             "server_capacity_claim": None,
             "server_capacity_claim_reason": "resource_correlation_not_provided",
         }
         self.assertTrue(capacity_diagnostic._worker_report_matches(report, config))
+        runner_capacity = {"status": "complete", "effective_cpu_capacity_cores": 4.0}
+        self.assertEqual(
+            capacity_diagnostic._generator_cpu_evidence_status(report["process_cpu_windows"]),
+            "measured",
+        )
         one_probe = json.loads(json.dumps(report))
         one_probe["off_probe"] = {"submitted": 1, "completed": 1, "http_status": 200}
         self.assertFalse(capacity_diagnostic._worker_report_matches(one_probe, config))
@@ -312,6 +322,59 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.assertFalse(capacity_diagnostic._worker_report_matches(
                     {**report, key: value}, config,
                 ))
+
+        incomplete_cpu = json.loads(json.dumps(report))
+        incomplete_cpu["process_cpu_windows"][1] = {
+            "window": "on", "status": "incomplete", "cpu_ns": None,
+            "elapsed_ns": None, "cores": None,
+        }
+        incomplete_cpu["generator_cpu_evidence"] = "incomplete"
+        self.assertEqual(
+            capacity_diagnostic._generator_cpu_evidence_status(
+                incomplete_cpu["process_cpu_windows"],
+            ),
+            "incomplete",
+        )
+        self.assertTrue(capacity_diagnostic._worker_report_matches(incomplete_cpu, config))
+        missing_cpu = {key: value for key, value in report.items() if key != "process_cpu_windows"}
+        missing_cpu["generator_cpu_evidence"] = "incomplete"
+        self.assertTrue(capacity_diagnostic._worker_report_matches(missing_cpu, config))
+        self.assertEqual(
+            capacity_diagnostic.evaluate_capacity_report(
+                {"not": "a full report"}, source_sha="b" * 40,
+                app_target_sha="c" * 40, run_id="12345", attempt="1",
+                manifest_sha256="e" * 64,
+            ),
+            "INVALID",
+        )
+
+        start = {
+            "target_ns": 1_000_000_000, "wall_before_ns": 999_999_990,
+            "wall_after_ns": 1_000_000_010, "mono_before_ns": 5_000_000_000,
+            "mono_after_ns": 5_000_000_010, "cpu_ns": 1_000_000_000,
+        }
+        end = {
+            "target_ns": 21_000_000_000, "wall_before_ns": 20_999_999_990,
+            "wall_after_ns": 21_000_000_010, "mono_before_ns": 25_000_000_000,
+            "mono_after_ns": 25_000_000_010, "cpu_ns": 5_000_000_000,
+        }
+        self.assertEqual(
+            capacity_diagnostic._cpu_window_row("off", start, end),
+            {"window": "off", "status": "complete", "cpu_ns": 4_000_000_000,
+             "elapsed_ns": 20_000_000_000, "cores": 0.2},
+        )
+        late_end = {**end, "wall_before_ns": 21_300_000_000,
+                    "wall_after_ns": 21_300_000_020}
+        self.assertEqual(
+            capacity_diagnostic._cpu_window_row("on", start, late_end),
+            {"window": "on", "status": "incomplete", "cpu_ns": None,
+             "elapsed_ns": None, "cores": None},
+        )
+        self.assertFalse(capacity_diagnostic._valid_cpu_window_rows([
+            capacity_diagnostic._cpu_window_row("off", start, end),
+            {"window": "on", "status": "complete", "cpu_ns": 200_000_000,
+             "elapsed_ns": 1_000_000_000, "cores": 0.2},
+        ]))
 
     def test_ssr_capacity_remote_complete_cannot_end_local_window_early(self) -> None:
         self.assertEqual(
@@ -356,6 +419,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "on_window_start_ms": 100_000, "on_window_end_ms": 120_000,
                 "observed_duration_ms": 20_000,
                 "off_probe": {"submitted": 8, "completed": 8, "http_status": 200},
+                "process_cpu_windows": [
+                    {"window": name, "status": "complete", "cpu_ns": 4_000_000_000,
+                     "elapsed_ns": 20_000_000_000, "cores": 0.2}
+                    for name in ("off", "on")
+                ],
             },
             "memory_guard": {
                 "status": "complete", "samples": 250,
@@ -442,11 +510,22 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             },
             "server_capacity_claim": None,
             "server_capacity_claim_reason": "resource_correlation_not_provided",
+            "generator_cpu_evidence": "measured",
             "remote_plan_cleanup": "complete",
         }
         self.assertIsNotNone(capacity_diagnostic._project_capacity_report(report))
         self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
             report, source_sha="b" * 40, app_target_sha="c" * 40,
+            run_id="12345", attempt="1", manifest_sha256="e" * 64,
+        ), "PASS")
+        incomplete_window_report = json.loads(json.dumps(report))
+        incomplete_window_report["worker"]["process_cpu_windows"][1] = {
+            "window": "on", "status": "incomplete", "cpu_ns": None,
+            "elapsed_ns": None, "cores": None,
+        }
+        incomplete_window_report["generator_cpu_evidence"] = "incomplete"
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            incomplete_window_report, source_sha="b" * 40, app_target_sha="c" * 40,
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
         ), "PASS")
         self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
