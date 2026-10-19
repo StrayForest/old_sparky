@@ -9,8 +9,7 @@ generation.  The immutable path is:
 
 `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>/`
 
-The application release SHA (`TARGET_SHA`) and host-control generation SHA
-(`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
+The application release SHA (`TARGET_SHA`) and host-control generation SHA (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
 is the only source for `HOST_TOOLS_SHA` and selects `fcbfe3dc41c999ae298a8b1f958a07f9c1fd0ff1`; pin-only commit `43783b31699d498776a70b2a644b081d828cd41b` records source A's exact 15-member closure, but does not prove installation.
 The active installed generation remains recorded in [`CURRENT.md`](../CURRENT.md); this differs from installed host generation **C1** and application source **G** (`TARGET_SHA`).
@@ -485,6 +484,8 @@ SHA proves installation.
 The backup START/DONE barrier and source-bound receipt use **C7** `56036d18604df69da2f8ac79ce7196142a803a0f` and pin-only **P7**
 `c5f80abdc41ac012ec97cf305c01340cfa4aec09`. P7 records C7's 15-member closure.
 Full CI, signed preflight, approved provisioning and installed self-test remain required; neither SHA proves C7 is installed or active in production.
+
+The CPU-diagnostic first-fault and exact abort-evidence follow-up uses source **C8** `f0f4b460ea56075febab9b53ce42c21d776d6675` and pin-only **P8** `cf90411596ae4cca7a810727d74740d4437b64d5`. Its 15-member v4 closure changes only `platform_cpu_diagnostic_plan.py` and `platform_workflow_remote_dispatch.py`; P8 records their exact modes and digests. Exact-P8 CI, signed preflight, approved provisioning and installed self-test remain required. Neither commit proves that C8 is provisioned or active in production.
 
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
