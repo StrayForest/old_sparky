@@ -68,6 +68,9 @@ RUNTIME_SENSITIVE_FILES = frozenset(
         "platform/tools/platform_live_qa_guard.py",
         "platform/tools/platform_live_qa_machine_lock.py",
         "platform/tools/platform_live_qa_runtime_install.py",
+        # Settings selects the dotenv source for every active app process. A
+        # change must be exercised by the existing release runtime fixture.
+        "platform/python_packages/platform_infra/config.py",
         # The public live-launch workflow passes validated inputs as argv to
         # this release-managed root entrypoint; changes require the active app
         # release to install the corrected trusted helper.

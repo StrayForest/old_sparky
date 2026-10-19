@@ -124,6 +124,9 @@ class WorkflowProvenanceTests(unittest.TestCase):
             )
 
     SHA = "a" * 40
+    # Status fixtures use a fixed timestamp; bounded authorization tests must
+    # inject the matching clock instead of aging with wall time.
+    STATUS_FIXTURE_NOW = datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
 
     def _run_finalizer_dispatch_wait(
         self,
@@ -2520,6 +2523,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
             "current_dev_sha": self.SHA,
             "first_parent_shas": [self.SHA],
             "jobs_complete": True,
+            "now": self.STATUS_FIXTURE_NOW,
         }
         for candidate_statuses, complete in (
             (statuses, False),
@@ -2594,6 +2598,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
                 expected_run_url=run["html_url"],
+                now=self.STATUS_FIXTURE_NOW,
             ),
             "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/2",
         )
@@ -2607,6 +2612,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
                 expected_run_url=f"{run['html_url']}/wrong",
+                now=self.STATUS_FIXTURE_NOW,
             )
 
     def test_exact_failed_report_deployment_requires_failed_run_job_and_bot_marker(self) -> None:
@@ -2899,6 +2905,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
             expected_run_id=1234,
             expected_attempt=2,
             expected_target_sha=self.SHA,
+            now=self.STATUS_FIXTURE_NOW,
         )
         self.assertTrue(
             validate_deployment_event(
@@ -2909,6 +2916,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_run_id=1234,
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
+                now=self.STATUS_FIXTURE_NOW,
             )
         )
         for bad_name in (
@@ -2996,10 +3004,13 @@ class WorkflowProvenanceTests(unittest.TestCase):
     def test_spoofed_status_cannot_authorize_mutation(self) -> None:
         workflow, run, jobs, statuses = self._payload()
         spoof = copy.deepcopy(statuses[0])
+        spoof["id"] = 5678
         spoof["creator"] = {"login": "attacker", "type": "User", "id": 1}
         statuses.append(spoof)
         statuses[0]["updated_at"] = "2026-09-19T09:00:00Z"
-        with self.assertRaises(ProvenanceError):
+        with self.assertRaisesRegex(
+            ProvenanceError, "status creator is not the GitHub Actions bot"
+        ):
             validate_deployment_marker(
                 workflow,
                 run,
@@ -3008,6 +3019,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_run_id=1234,
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
+                now=self.STATUS_FIXTURE_NOW,
             )
         for label, creator in (
             ("missing", "__missing__"),
@@ -3020,7 +3032,14 @@ class WorkflowProvenanceTests(unittest.TestCase):
             else:
                 candidate_statuses[0]["creator"] = creator
             with self.subTest(creator=label):
-                with self.assertRaises(ProvenanceError):
+                expected_error = (
+                    "status creator is missing"
+                    if label in {"missing", "null"}
+                    else "status creator is not the GitHub Actions bot"
+                )
+                with self.assertRaisesRegex(
+                    ProvenanceError, expected_error
+                ):
                     validate_deployment_marker(
                         workflow,
                         run,
@@ -3029,6 +3048,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                         expected_run_id=1234,
                         expected_attempt=2,
                         expected_target_sha=self.SHA,
+                        now=self.STATUS_FIXTURE_NOW,
                     )
 
     def test_wrong_repository_or_workflow_cannot_authorize_mutation(self) -> None:
@@ -3142,7 +3162,9 @@ class WorkflowProvenanceTests(unittest.TestCase):
     def test_status_description_and_target_are_bound_to_the_exact_attempt(self) -> None:
         workflow, run, jobs, statuses = self._payload()
         statuses[0]["description"] = "spoofed description"
-        with self.assertRaises(ProvenanceError):
+        with self.assertRaisesRegex(
+            ProvenanceError, "status description is not canonical"
+        ):
             validate_deployment_marker(
                 workflow,
                 run,
@@ -3151,12 +3173,15 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_run_id=1234,
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
+                now=self.STATUS_FIXTURE_NOW,
             )
         statuses[0]["description"] = "Production deployment and live smoke passed"
         statuses[0]["target_url"] = statuses[0]["target_url"].replace(
             "/attempts/2", "/attempts/1"
         )
-        with self.assertRaises(ProvenanceError):
+        with self.assertRaisesRegex(
+            ProvenanceError, "status target URL is not the exact attempt"
+        ):
             validate_deployment_marker(
                 workflow,
                 run,
@@ -3165,6 +3190,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_run_id=1234,
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
+                now=self.STATUS_FIXTURE_NOW,
             )
         for field, value in (
             ("context", "another-context"),
@@ -3173,7 +3199,12 @@ class WorkflowProvenanceTests(unittest.TestCase):
             candidate_statuses = copy.deepcopy(self._payload()[3])
             candidate_statuses[0][field] = value
             with self.subTest(field=field):
-                with self.assertRaises(ProvenanceError):
+                expected_error = (
+                    "status is missing"
+                    if field == "context"
+                    else "status state is not canonical"
+                )
+                with self.assertRaisesRegex(ProvenanceError, expected_error):
                     validate_deployment_marker(
                         workflow,
                         run,
@@ -3182,6 +3213,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                         expected_run_id=1234,
                         expected_attempt=2,
                         expected_target_sha=self.SHA,
+                        now=self.STATUS_FIXTURE_NOW,
                     )
 
     def test_complete_paginated_status_payload_rejects_truncation(self) -> None:

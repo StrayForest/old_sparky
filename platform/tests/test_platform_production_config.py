@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -36,6 +39,73 @@ class PlatformProductionConfigTests(unittest.TestCase):
         }
         values.update(overrides)
         return PlatformSettings(_env_file=None, **values)
+
+    def test_settings_env_file_honors_runtime_path_and_absent_path_isolated(self) -> None:
+        platform_root = Path(__file__).resolve().parents[1]
+        script = (
+            "from python_packages.platform_infra.config import PlatformSettings; "
+            "print(PlatformSettings.model_config['env_file']); "
+            "print(PlatformSettings().platform_environment)"
+        )
+        default_file_script = (
+            "from python_packages.platform_infra.config import PlatformSettings; "
+            "print(PlatformSettings.model_config['env_file'])"
+        )
+
+        def load_environment(
+            env_file: Path | None,
+            *,
+            process_environment: str | None = None,
+        ) -> tuple[str, str]:
+            child_environment = {"PYTHONPATH": str(platform_root)}
+            if env_file is not None:
+                child_environment["PLATFORM_ENV_FILE"] = str(env_file)
+            if process_environment is not None:
+                child_environment["PLATFORM_ENVIRONMENT"] = process_environment
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=platform_root,
+                env=child_environment,
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            configured_path, environment_name = result.stdout.splitlines()
+            return str(Path(configured_path).resolve()), environment_name
+
+        default_file = subprocess.run(
+            [sys.executable, "-c", default_file_script],
+            cwd=platform_root,
+            env={"PYTHONPATH": str(platform_root)},
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(default_file.returncode, 0, default_file.stderr)
+        self.assertEqual(default_file.stdout.strip(), str(platform_root / ".env.platform"))
+        with tempfile.TemporaryDirectory(prefix="platform-settings-env-") as temporary:
+            env_file = Path(temporary) / "test.env"
+            env_file.write_text("PLATFORM_ENVIRONMENT=development\n", encoding="utf-8")
+            env_file.chmod(0o600)
+            self.assertEqual(
+                load_environment(env_file), (str(env_file), "development")
+            )
+            relative_env_file = Path(os.path.relpath(env_file, platform_root))
+            self.assertEqual(
+                load_environment(relative_env_file), (str(env_file), "development")
+            )
+            self.assertEqual(
+                load_environment(env_file, process_environment="test"),
+                (str(env_file), "test"),
+            )
+            absent_env_file = Path(temporary) / "absent.env"
+            self.assertEqual(
+                load_environment(absent_env_file),
+                (str(absent_env_file), "development"),
+            )
 
     def test_production_requires_explicit_secret(self) -> None:
         settings = self.production_settings(platform_secret_key=DEVELOPMENT_SECRET_KEY)

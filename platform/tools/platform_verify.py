@@ -1540,14 +1540,26 @@ def dispatch_ci() -> int:
 
     if any(not GATES_BY_ID[gate_id].deterministic for gate_id in CI_GATE_IDS):
         raise VerificationError("CI aggregate contains a non-deterministic gate.")
+    # Fail cheap, independent contracts before migration/database setup. Keep
+    # the registry as the membership authority and require this order to name
+    # every required gate exactly once when a new gate is added.
+    ordered_gate_ids = (
+        "docs",
+        "python-quality",
+        "security",
+        "verification-contract",
+        "migration",
+        "backend",
+        "web-quality",
+        "web-hermetic",
+    )
+    if len(ordered_gate_ids) != len(set(ordered_gate_ids)) or set(ordered_gate_ids) != set(CI_GATE_IDS):
+        raise VerificationError(
+            "Local CI execution order must contain every canonical CI gate exactly once."
+        )
     # The migration scenario always clears its disposable schema in its
     # finally block. Reapply the source head before backend preflight, using
     # the same validated test target and migration lock.
-    ordered_gate_ids = (
-        "migration",
-        "backend",
-        *(gate_id for gate_id in CI_GATE_IDS if gate_id not in {"migration", "backend"}),
-    )
     for gate_id in ordered_gate_ids:
         status = dispatch(gate_id)
         if status:
