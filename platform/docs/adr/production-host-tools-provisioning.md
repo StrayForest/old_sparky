@@ -585,16 +585,14 @@ cleanup repeat the tuple check before touching release state. Reports retain
 both runner and application identities and the canonical binding digest, so
 candidate, origin, evaluator and sanitized evidence cannot conflate them.
 
-This delegated binding does not weaken the immutable host-tools generation
-pin: the provider remains separately verified against its manifest and
-provenance, and the app-side binding capability must be present in the
-installed C2/P generation before a runner/application mismatch is accepted.
+Delegated binding preserves the immutable host-tools pin: the provider is
+verified against its manifest/provenance, and installed C2/P must include the
+app-side capability before accepting runner/application mismatch.
 
 ## Consequences
 
-The host-control trust boundary is independent of application releases and
-cannot be repaired by a candidate commit during a secret-bearing job.  A host
-image or operator process must therefore provision each reviewed generation
-before that SHA can deploy.  This intentional operational cost is the
-rollback/supply-chain trade-off for preventing candidate source from becoming
-the production authority.
+Source **C** `ac49b9c57c9f61734e5f85ed9a475411f03e4df9` updates the 15-member v4 pin (dispatcher/input-guard only; SSR stays app-side).
+This is provenance, not installation proof; production requires exact-target CI, signed preflight/provenance, approved provisioning and installed self-test.
+
+The host-control trust boundary is independent of application releases and cannot be repaired by candidate code in a secret-bearing job.
+A host image or operator must provision each reviewed generation before deployment; this is the rollback/supply-chain trade-off for preventing candidate source from becoming production authority.
