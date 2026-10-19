@@ -39,6 +39,7 @@ from tools import platform_fetch_artifact_metadata
 from tools import platform_configure_shared_env
 from tools import platform_build_node_cache
 from tools import platform_live_qa_guard
+from tools import platform_test_catalog
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from platform_render_service_envs import render_service_env  # noqa: E402
@@ -228,8 +229,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             )
         )
 
-    @staticmethod
     def _install_supervisor_fixture(
+        self,
         root: Path, *, include_cpu_diagnostic_tool: bool = False
     ) -> tuple[Path, Path, Path, Path]:
         """Install an exact supervisor copy under the production path shape.
@@ -240,8 +241,24 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         no production helper or shared lock is replaced.
         """
 
+        caller_id = self.id()
+        if caller_id not in platform_test_catalog.TEST_ENVIRONMENT_REQUIREMENTS:
+            raise RuntimeError(
+                "LOCAL GATE BLOCKED: supervisor ownership fixture caller is not "
+                "registered for the hosted root test environment"
+            )
+        requirement_issues = platform_test_catalog.test_environment_requirement_issues(
+            (caller_id,), os.environ
+        )
+        if requirement_issues:
+            raise RuntimeError(
+                "LOCAL GATE BLOCKED: supervisor ownership fixture requires "
+                "the canonical hosted root test environment"
+            )
         if os.geteuid() != 0:
-            raise AssertionError("supervisor ownership fixture requires root")
+            raise RuntimeError(
+                "LOCAL GATE BLOCKED: supervisor ownership fixture requires root"
+            )
         host_tools_root = Path("/opt/oldsparky/platform/shared/host-tools")
         host_tools_root.mkdir(parents=True, exist_ok=True)
         generation = hashlib.sha1(str(root).encode("utf-8")).hexdigest()
@@ -2855,6 +2872,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         dispatch_region = autodeploy[dispatch_step:]
         guarded_region = autodeploy[proof_step:dispatch_step]
         self.assertIn("steps.gate.outputs.deploy == 'true'", guarded_region)
+        self.assertIn("steps.gate.outputs.backup_required != 'false'", guarded_region)
+        self.assertIn(
+            'backup_required=false',
+            autodeploy[autodeploy.index('      - name: Verify tested SHA is current dev head'):proof_step],
+        )
         self.assertIn("github.event.workflow_run.id", guarded_region)
         self.assertIn("github.event.workflow_run.run_attempt", guarded_region)
         self.assertNotIn("github.event.workflow_run.completed_at", guarded_region)
@@ -4161,6 +4183,8 @@ fail 'private lock detail must not cross the public channel'
             self.assertEqual(failed.stderr, "safe helper failure\n")
 
     def test_supervisor_cleanup_covers_upload_failures_and_closes_locks(self) -> None:
+        self._assert_supervisor_fixture_guard_blocks_unsupported_contexts()
+
         supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
         cleanup_start = supervisor.index("cleanup() {")
         cleanup_end = supervisor.index("\ntrap cleanup EXIT", cleanup_start)
@@ -4313,11 +4337,52 @@ fail 'private lock detail must not cross the public channel'
             self.assertFalse(artifact.exists())
             self.assertFalse(artifact.is_symlink())
 
+    def _assert_supervisor_fixture_guard_blocks_unsupported_contexts(self) -> None:
+        expected_environment = {
+            "GITHUB_ACTIONS": "true",
+            "RUNNER_OS": "Linux",
+            "RUNNER_ENVIRONMENT": "github-hosted",
+        }
+        fixture_test_ids = (
+            "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_supervisor_cleanup_covers_upload_failures_and_closes_locks",
+            "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_host_tools_contract_failure_emits_marker_before_locks",
+            "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_deploy_only_artifact_preparation_errors_emit_markers_without_app_writes",
+            "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_retained_lock_supervisor_preserves_callback_failure_marker",
+        )
+        for test_id in fixture_test_ids:
+            self.assertEqual(
+                platform_test_catalog.TEST_ENVIRONMENT_REQUIREMENTS.get(test_id),
+                expected_environment,
+            )
+
+        # The helper itself must fail closed before reaching any host-owned
+        # path if it is invoked directly outside the canonical runner, or by
+        # a future caller that is not registered in the catalog.
+        unregistered_id = f"{self.id()}_unregistered"
+        guard_cases = (
+            ("unregistered-caller", unregistered_id, expected_environment, False),
+            (
+                "wrong-runner-environment",
+                self.id(),
+                {**expected_environment, "RUNNER_ENVIRONMENT": "self-hosted"},
+                False,
+            ),
+            ("non-root", self.id(), expected_environment, True),
+        )
+        for case, caller_id, environment, nonroot in guard_cases:
+            with self.subTest(guard_case=case):
+                with (
+                    patch.object(self, "id", return_value=caller_id),
+                    patch.dict(os.environ, environment, clear=False),
+                    patch.object(os, "geteuid", return_value=1000 if nonroot else os.geteuid()),
+                    patch.object(Path, "mkdir") as mkdir,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "LOCAL GATE BLOCKED"):
+                        self._install_supervisor_fixture(Path("/tmp/fixture-must-not-be-created"))
+                    mkdir.assert_not_called()
+
     def test_host_tools_contract_failure_emits_marker_before_locks(self) -> None:
         """A silent closure-validator failure reaches the closed marker path."""
-
-        if os.geteuid() != 0:
-            self.skipTest("immutable supervisor fixture requires root")
         with tempfile.TemporaryDirectory() as temporary:
             fixture_root = Path(temporary)
             supervisor, release_lock, retained_lock, generation_dir = (
@@ -5548,9 +5613,6 @@ fail 'private lock detail must not cross the public channel'
     def test_deploy_only_artifact_preparation_errors_emit_markers_without_app_writes(
         self,
     ) -> None:
-        if os.geteuid() != 0:
-            self.skipTest("immutable supervisor fixture requires root")
-
         failure_cases = (
             ("find_count", 17, "artifact_count_invalid"),
             ("find_path", 19, "artifact_missing"),

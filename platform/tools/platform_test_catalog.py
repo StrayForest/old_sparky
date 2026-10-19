@@ -50,6 +50,26 @@ TEST_ENVIRONMENT_REQUIREMENTS: Mapping[str, Mapping[str, str]] = {
         "RUNNER_OS": "Linux",
         "RUNNER_ENVIRONMENT": "github-hosted",
     },
+    "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_supervisor_cleanup_covers_upload_failures_and_closes_locks": {
+        "GITHUB_ACTIONS": "true",
+        "RUNNER_OS": "Linux",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+    },
+    "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_host_tools_contract_failure_emits_marker_before_locks": {
+        "GITHUB_ACTIONS": "true",
+        "RUNNER_OS": "Linux",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+    },
+    "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_deploy_only_artifact_preparation_errors_emit_markers_without_app_writes": {
+        "GITHUB_ACTIONS": "true",
+        "RUNNER_OS": "Linux",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+    },
+    "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_retained_lock_supervisor_preserves_callback_failure_marker": {
+        "GITHUB_ACTIONS": "true",
+        "RUNNER_OS": "Linux",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+    },
 }
 
 # These cases execute the real PID-namespace supervisor and require the

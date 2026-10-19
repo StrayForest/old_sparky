@@ -3153,8 +3153,23 @@ except lock.VerificationLockError as exc:
         mutations = [
             autodeploy.replace(guard, "", 1),
             autodeploy.replace(
-                "        if: ${{ steps.gate.outputs.deploy == 'true' }}\n        shell: bash\n        env:\n          GH_TOKEN: ${{ github.token }}\n          GITHUB_REPOSITORY: ${{ github.repository }}\n          GITHUB_API_URL: ${{ github.api_url }}\n          SOURCE_SECURITY_RUN_ID:",
+                "        if: ${{ steps.gate.outputs.deploy == 'true' && steps.gate.outputs.backup_required != 'false' }}\n        shell: bash\n        env:\n          GH_TOKEN: ${{ github.token }}\n          GITHUB_REPOSITORY: ${{ github.repository }}\n          GITHUB_API_URL: ${{ github.api_url }}\n          SOURCE_SECURITY_RUN_ID:",
                 "        if: ${{ always() }}\n        shell: bash\n        env:\n          GH_TOKEN: ${{ github.token }}\n          GITHUB_REPOSITORY: ${{ github.repository }}\n          GITHUB_API_URL: ${{ github.api_url }}\n          SOURCE_SECURITY_RUN_ID:",
+                1,
+            ),
+            autodeploy.replace(
+                "      backup_required: ${{ steps.gate.outputs.backup_required }}\n",
+                "",
+                1,
+            ),
+            autodeploy.replace(
+                "        if: ${{ needs.dispatch.outputs.backup_required != 'false' }}\n",
+                "        if: ${{ always() }}\n",
+                1,
+            ),
+            autodeploy.replace(
+                '          [[ "$BACKUP_REQUIRED" == "true" || "$BACKUP_REQUIRED" == "false" ]]',
+                '          [[ "$BACKUP_REQUIRED" == "false" ]]',
                 1,
             ),
             autodeploy.replace(
