@@ -155,7 +155,7 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertIn("namespace_closed_status == '0'", finalizer[finalizer.index("id: cleanup"):])
 
         parser_match = re.search(
-            r'(?ms)^\s*supervisor_status="\$\(/usr/bin/python3 - "\$artifact_dir/supervisor\.exit\.download" <<\'PY\'\n(.*?)^\s*PY\n\s*\)"',
+            r"(?ms)^\s*read_supervisor_exit_status\(\) \{\n\s*/usr/bin/python3 - \"\$1\" <<'PY'\n(.*?)^\s*PY\n\s*\}",
             fixture_setup,
         )
         self.assertIsNotNone(parser_match)
@@ -322,8 +322,14 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertIn('stdin=subprocess.PIPE', dispatcher)
         self.assertIn('_control_email_stdin(payload["control_email"])', dispatcher)
         external = _workflow("platform-production-external-load.yml")
-        self.assertIn("external-fixture < \"$input_path\"", external)
-        self.assertNotIn("external-fixture < \"$input_path\" &", external)
+        self.assertIn(
+            'external-fixture --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" < "$input_path"',
+            external,
+        )
+        self.assertNotIn(
+            'external-fixture --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" < "$input_path" &',
+            external,
+        )
         self.assertNotIn("ssh \"$PROD_SSH_USER@$PROD_SSH_HOST\" bash", external)
 
     def test_deploy_validation_is_always_running_and_precedes_mode_branches(self) -> None:

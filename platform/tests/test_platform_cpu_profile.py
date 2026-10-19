@@ -303,7 +303,6 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "server_capacity_claim_reason": "resource_correlation_not_provided",
         }
         self.assertTrue(capacity_diagnostic._worker_report_matches(report, config))
-        runner_capacity = {"status": "complete", "effective_cpu_capacity_cores": 4.0}
         self.assertEqual(
             capacity_diagnostic._generator_cpu_evidence_status(report["process_cpu_windows"]),
             "measured",
