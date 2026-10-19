@@ -1372,24 +1372,25 @@ jobs:
           printf '%s\n' "$retention_classification"
           retention_status="$(printf '%s\n' "$retention_classification" \
             | /usr/bin/python3 -I -c 'import json,sys; value=json.load(sys.stdin); print(value.get("status", "invalid"))')"
+          retention_failure_code=0
           if [[ "$retention_status" == unhealthy ]]; then
             CURRENT_STAGE=retention_threshold
             failure_code=$(( retention_rc != 0 ? retention_rc : 1 ))
             printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"%s","outcome":"threshold","exit_code":%d}\n' \
               "$CURRENT_STAGE" "$failure_code"
-            exit "$failure_code"
+            retention_failure_code="$failure_code"
           elif [[ "$retention_status" == failed ]]; then
             CURRENT_STAGE=retention_tool
             failure_code=$(( retention_rc != 0 ? retention_rc : 1 ))
             printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"%s","outcome":"bounded_error_class","exit_code":%d}\n' \
               "$CURRENT_STAGE" "$failure_code"
-            exit "$failure_code"
+            retention_failure_code="$failure_code"
           elif [[ "$retention_status" != ok || "$retention_rc" != 0 ]]; then
             CURRENT_STAGE=retention_dry_run
             failure_code=$(( retention_rc != 0 ? retention_rc : 2 ))
             printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"%s","outcome":"inconsistent_result","exit_code":%d}\n' \
               "$CURRENT_STAGE" "$failure_code"
-            exit "$failure_code"
+            retention_failure_code="$failure_code"
           fi
           if [[ -n "$backup_failure_run_id" ]]; then
             CURRENT_STAGE=backup_failure_receipt
@@ -1514,6 +1515,9 @@ jobs:
             && test "$(readlink -f "$current")" = "$runtime/releases/$current_id" \
             && test "$(readlink -f "$runtime/previous")" = "$runtime/releases/$previous_id" \
             || report_failure identity_recheck release_pointer_changed 1
+          if (( retention_failure_code != 0 )); then
+            exit "$retention_failure_code"
+          fi
           printf '{"schema":1,"kind":"collection_status","status":"ok","stage":"complete","exit_code":0}\n'
           REMOTE
           remote_exit_code=$?

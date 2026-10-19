@@ -44,7 +44,7 @@ Maintenance keeps:
 
 | Data | Policy |
 | --- | --- |
-| production releases | newest 5; always protect `current` and `previous`, plus provisionally protect `gha-38182702358-1-f1154c7dba4f` pending dependency review (transitive role unknown; not a verified provider) |
+| production releases | newest 5; protect `current`, `previous`, and every explicit `--protected-release` in the validated installed maintenance `ExecStart` |
 | local release artifacts | newest 5 matching release groups |
 | verified DB backups | generic callers retain their existing default; backup-only preserves all complete pairs; the canonical unit in this source tree opts into fixed-manifest rotation, protecting named pairs plus the newest `max(keep, 15)` verified pairs ([policy](backup-retention-protection.md)) |
 | Playwright results on the production/pre-production host | 7 days |
@@ -60,38 +60,31 @@ It never deletes shared env/runtimes, upload staging, current/previous releases,
 Live-QA cache pruning holds the machine-wide lock, requires an idle browser cgroup and user, accepts only root-owned non-symlink `runtime-<40 lowercase hex>` trees, retains the newest valid unprotected fallback, and treats keep as a hard cap rather than an age window.
 Health monitoring and storage maintenance share one conservative hard gate: available free space must be at least 5 GiB and conservative use (`total - available`, including filesystem-reserved headroom) must be at most 85%; exact 5 GiB and 85% boundaries pass, and 80% is not a failure threshold.
 The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it.
-Application services write structured JSON to journald. Nginx remains the
-request-log owner, so the production Gunicorn access stream is disabled to
-avoid duplicate records; warnings, exceptions and slow/contended request
-records remain available. The worker baseline is `WARNING`, while the API
-keeps `INFO` for lifecycle diagnostics. Journald is not forwarded into the
-duplicate syslog stream. UFW records remain in `ufw.log`, and the platform
-logrotate timer checks Nginx, rsyslog and `btmp` files every 15 minutes. These
-limits are operational bounds, not a reason to suppress 5xx or slow-request
-diagnostics.
+Application services write structured JSON to journald. Nginx owns request
+logs, so Gunicorn access logging is disabled to avoid duplicates; warnings,
+exceptions and slow/contended records remain. The worker baseline is
+`WARNING`; the API keeps `INFO` for lifecycle diagnostics. Journald is not
+forwarded to duplicate syslog. UFW stays in `ufw.log`; the 15-minute logrotate
+timer checks Nginx, rsyslog and `btmp`. These limits never justify suppressing
+5xx or slow-request diagnostics.
 
-This policy follows the documented size/retention controls in
-[systemd-journald](https://www.freedesktop.org/software/systemd/man/252/journald.conf.html)
-and [logrotate](https://man7.org/linux/man-pages/man8/logrotate.8.html),
-uses Nginx's supported
-[log-reopen operation](https://nginx.org/en/docs/control.html), and keeps
-structured application records aligned with the
-[OpenTelemetry log data model](https://opentelemetry.io/docs/specs/otel/logs/data-model/).
-The practical rule is to retain actionable, structured events and never log
-secrets, following the [AWS logging best practices](https://docs.aws.amazon.com/prescriptive-guidance/latest/logging-monitoring-for-application-owners/logging-best-practices.html).
+This policy follows [systemd-journald](https://www.freedesktop.org/software/systemd/man/252/journald.conf.html)
+and [logrotate](https://man7.org/linux/man-pages/man8/logrotate.8.html), uses
+Nginx's supported [log-reopen operation](https://nginx.org/en/docs/control.html),
+and aligns structured records with the [OpenTelemetry log data model](https://opentelemetry.io/docs/specs/otel/logs/data-model/).
+Retain actionable events and never log secrets, following the [AWS logging
+best practices](https://docs.aws.amazon.com/prescriptive-guidance/latest/logging-monitoring-for-application-owners/logging-best-practices.html).
 
-Apply mode holds locks in the fixed order: platform release operation,
-retained-load, source build output, then live-QA machine lock; this keeps
-release pointers stable through backup/deletion and avoids deadlocks with
-install, rollback, build, retained-load and browser workflows. Backup-only uses the same order without retention; exceptional cache compaction follows the [dedicated runbook](fallback-runtime-cache-compaction-runbook.md).
+Apply mode holds locks in fixed order—platform release operation,
+retained-load, source build output, then live-QA machine lock—to keep pointers
+stable and avoid install, rollback, build and browser deadlocks. Backup-only
+omits retention; cache compaction follows its [runbook](fallback-runtime-cache-compaction-runbook.md).
 
-Retention intentionally does not recompute each multi-gigabyte tree's content
-digest. Destructive eligibility instead requires the exact 40-hex name,
-matching immutable manifest identity, root ownership, expected read-only modes,
-same-device regular file/directory types and non-escaping symlinks. Runtime
-reuse still recomputes and compares the full tree digest before execution.
-Deletion first renames a revalidated cache to a strict hidden tombstone; the
-next maintenance run validates and reclaims a tombstone left by interruption.
+Retention does not recompute multi-gigabyte tree digests. Deletion requires the
+exact 40-hex name, matching manifest identity, root ownership, expected
+read-only modes, same-device file/directory types and non-escaping symlinks.
+Runtime reuse verifies the full digest. Deletion renames revalidated caches to
+hidden tombstones; a later run validates and reclaims interrupted tombstones.
 
 Apply the bounded sweep through the reviewed workflow after reviewing the read-only candidate inventory:
 
@@ -108,9 +101,16 @@ It reports filesystem/journal/service usage, retention candidates, current/previ
 Preview storage cleanup without backup or deletion:
 
 ```bash
-/opt/oldsparky/platform/shared/venv/bin/python \
-  /opt/oldsparky/platform/current/tools/platform_storage_maintenance.py
+current_release="$(readlink -f /opt/oldsparky/platform/current)"
+systemctl show deadlock-maintenance.service --no-pager \
+  --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
+  | /usr/bin/python3 -I "$current_release/tools/platform_maintenance_qa_evidence.py" run-retention-preview \
+    "$current_release/deploy/systemd/deadlock-maintenance.service" \
+    /etc/systemd/system/deadlock-maintenance.service
 ```
+
+This validated preview lists pointers in `protected`, unit pins in `retained`, and the complete removal set in `deleted`. For emergency release-only staging,
+follow the [storage-retention skill](../../.agents/skills/platform-storage-retention/SKILL.md) and pass every installed pin to both direct commands.
 
 Preview live-QA runtime cache retention (also machine-locked and idle-gated):
 

@@ -1570,6 +1570,48 @@ class PlatformCiClassifierTests(unittest.TestCase):
             {"no_op": True, "runtime_required": False},
         )
 
+    def test_service_recovery_source_and_secret_workflow_keep_full_runtime_route(self) -> None:
+        paths = (
+            ".github/workflows/platform-production-service-recovery.yml",
+            "platform/tools/platform_api_worker_service_recovery.py",
+            "platform/tests/test_platform_service_recovery_workflow.py",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertIn(path, RUNTIME_SENSITIVE_FILES)
+                manifest = classify(
+                    [path], event="push", target_sha=self.TARGET_SHA, branch="dev"
+                )
+                self.assertEqual(manifest["class"], "full")
+                self.assertFalse(manifest["fallback"])
+                self.assertTrue(manifest["runtime_sensitive"])
+                self.assertTrue(manifest["deployable"])
+        for path in (
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tests/test_platform_ci_classifier.py",
+        ):
+            # The recovery runtime paths are separately classified above;
+            # these classifier paths retain their non-deployable bootstrap route.
+            with self.subTest(classifier_path=path):
+                self.assertNotIn(path, RUNTIME_SENSITIVE_FILES)
+                classifier_change = classify(
+                    [path], event="push", target_sha=self.TARGET_SHA, branch="dev"
+                )
+                self.assertEqual(classifier_change["class"], "full")
+                self.assertFalse(classifier_change["fallback"])
+                self.assertFalse(classifier_change["runtime_sensitive"])
+                self.assertFalse(classifier_change["deployable"])
+        combined = classify(
+            [*paths, "platform/tools/platform_ci_classifier.py", "platform/tests/test_platform_ci_classifier.py"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(combined["class"], "full")
+        self.assertFalse(combined["fallback"])
+        self.assertTrue(combined["runtime_sensitive"])
+        self.assertTrue(combined["deployable"])
+
     def test_deploy_consumers_validate_the_exact_classifier_artifact(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
         production = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")

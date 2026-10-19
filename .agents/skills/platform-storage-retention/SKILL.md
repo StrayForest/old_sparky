@@ -44,13 +44,25 @@ calling the task complete.
 
    On the production host, confirm `current`, `previous`, absence of
    `.release-operation.json`, active service state, and the candidate list.
-   Use the deployed tool in dry-run mode:
+   Validate the installed maintenance `ExecStart` against the active release,
+   then run its exact arguments for the read-only preview:
 
    ```bash
-   /opt/oldsparky/platform/shared/venv/bin/python \
-     /opt/oldsparky/platform/current/tools/platform_storage_maintenance.py \
-     --json
+   current_release="$(readlink -f /opt/oldsparky/platform/current)"
+   systemctl show deadlock-maintenance.service \
+     --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
+     --no-pager \
+     | /usr/bin/python3 -I "$current_release/tools/platform_maintenance_qa_evidence.py" \
+       run-retention-preview \
+       "$current_release/deploy/systemd/deadlock-maintenance.service" \
+       /etc/systemd/system/deadlock-maintenance.service
    ```
+
+   Record the `current`/`previous` roles and every explicit
+   `--protected-release` value in the validated installed `ExecStart`; confirm
+   every explicit pin appears in `production_releases.retained` and is absent
+   from `production_releases.deleted`. The `protected` field contains the
+   dynamic `current`/`previous` pointers.
 
 3. Apply the bounded sweep through the installed service using the reviewed
    production workflow. It creates a fresh restore-verified backup before
@@ -95,19 +107,37 @@ calling the task complete.
 
 4. If the full sweep cannot create its backup because the filesystem is
    already full, first use the identity-checked production retention tool
-   after an explicit operator decision and a read-only candidate review:
+   after an explicit operator decision and a read-only candidate review. Use
+   every `--protected-release` value from the validated installed `ExecStart`
+   in both preview and apply; never use a bare command that omits those pins:
 
    ```bash
+   # Include every explicit pin from the validated installed ExecStart.
+   protected_releases=("<exact-installed-pin-1>" "<exact-installed-pin-2>" "<exact-installed-pin-3>")
+   # Include the complete candidate list from this exact dry-run.
+   expected_candidates=("<exact-preview-candidate-1>" "<exact-preview-candidate-2>" "<exact-preview-candidate-3>")
+   retention_args=(--app-dir /opt/oldsparky/platform --keep 5 --min-age-days 0)
+   for slug in "${protected_releases[@]}"; do
+     retention_args+=(--protected-release "$slug")
+   done
    /opt/oldsparky/platform/shared/venv/bin/python \
      /opt/oldsparky/platform/current/tools/platform_release_retention.py \
-     --app-dir /opt/oldsparky/platform --keep 5 --min-age-days 0 --apply
+     "${retention_args[@]}"
+   for slug in "${expected_candidates[@]}"; do
+     retention_args+=(--expected-candidate "$slug")
+   done
+   /opt/oldsparky/platform/shared/venv/bin/python \
+     /opt/oldsparky/platform/current/tools/platform_release_retention.py \
+     "${retention_args[@]}" --apply
    ```
 
-   Repeat `--protected-release <validated-release-slug>` to keep an exact release
-   out of the computed deletion candidates. This only narrows the candidate
-   set; `--expected-candidate`, when supplied, must still list the complete
-   remaining deletion set. A protected release does not bypass the release
-   lock, pointer checks, or candidate revalidation.
+   The first invocation is read-only. Compare its full candidate set with the
+   validated maintenance preview; record the named pins and `current`/
+   `previous` roles, and ensure the candidate set excludes every pin. Replace
+   the sample arrays with the exact values observed; do not guess IDs or counts.
+   `--expected-candidate` must list the complete remaining deletion set. A
+   protected release does not bypass the release lock, pointer checks, or
+   candidate revalidation.
 
    Signed task-retention wrappers may add `--json-receipt` only with `--apply`
    and the complete `--expected-candidate` set. It emits a fixed success count
