@@ -3859,6 +3859,266 @@ raise SystemExit(module.main(["host-capabilities"]))
                     with self.assertRaises(candidate.CandidateError):
                         candidate._validate_summary(changed, context)
 
+            def artifact_pair(root: Path, name: str, payload: dict[str, object], member: str, artifact_id: int) -> tuple[Path, Path]:
+                fixture_name = f"{len(list(root.iterdir()))}-{name}"
+                archive = root / f"{fixture_name}.zip"
+                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as opened:
+                    opened.writestr(member, json.dumps(payload, sort_keys=True, separators=(",", ":")))
+                digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+                metadata = root / f"{fixture_name}.json"
+                metadata.write_text(
+                    json.dumps(
+                        {
+                            "id": artifact_id,
+                            "name": name,
+                            "expired": False,
+                            "size_in_bytes": archive.stat().st_size,
+                            "digest": f"sha256:{digest}",
+                            "workflow_run": {
+                                "id": int(context.run_id),
+                                "run_attempt": int(context.run_attempt),
+                                "head_sha": context.original_source_head_sha,
+                                "head_branch": context.original_head_ref,
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return metadata, archive
+
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                context_path = root / "context.json"
+                context_path.write_text(json.dumps(context.as_payload()), encoding="utf-8")
+                jobs_path = root / "jobs.json"
+                output = root / "github-output"
+                trusted_tools = root / "trusted-dev/platform/tools"
+                trusted_tools.mkdir(parents=True)
+                for filename in (
+                    "platform_host_tools_candidate.py",
+                    "platform_host_tools_bundle.py",
+                    "platform_ci_classifier.py",
+                    "platform_workflow_provenance.py",
+                ):
+                    shutil.copyfile(TOOLS_ROOT / filename, trusted_tools / filename)
+
+                for route_class, changed_files in (
+                    ("docs-only", ["platform/docs/example.md"]),
+                    ("out-of-scope", [".gitignore"]),
+                ):
+                    manifest = candidate.classifier.classify(
+                        changed_files,
+                        event="pull_request",
+                        target_sha=context.tested_merge_sha,
+                    )
+                    self.assertEqual(manifest["class"], route_class)
+                    no_op_summary = {
+                        **summary,
+                        "class": route_class,
+                        "reason": manifest["reason"],
+                        "fallback": False,
+                        "runtime_sensitive": False,
+                        "manifest_digest": manifest["digest"],
+                        "expected_gates": manifest["expected_gates"],
+                        "gate_results": {
+                            gate: ("success" if gate in manifest["expected_gates"] else "skipped")
+                            for gate in candidate.FULL_GATE_IDS
+                        },
+                    }
+                    successful_jobs = {
+                        "CI route classifier",
+                        "Exact-source host-tools pin preflight",
+                        "status-final",
+                    }
+                    for gate in manifest["expected_gates"]:
+                        successful_jobs.update(candidate.GATE_JOB_NAMES[gate])
+                    no_op_jobs = [
+                        {
+                            **job,
+                            "conclusion": "success" if job["name"] in successful_jobs else "skipped",
+                        }
+                        for job in jobs
+                    ]
+                    jobs_path.write_text(
+                        json.dumps({"total_count": len(no_op_jobs), "jobs": no_op_jobs}),
+                        encoding="utf-8",
+                    )
+                    summary_metadata, summary_archive = artifact_pair(
+                        root,
+                        f"platform-ci-summary-{context.run_id}-{context.run_attempt}",
+                        no_op_summary,
+                        "platform-security-summary.json",
+                        123,
+                    )
+                    route_metadata, route_archive = artifact_pair(
+                        root,
+                        f"platform-ci-route-{context.run_id}-{context.run_attempt}",
+                        manifest,
+                        candidate.ROUTE_MANIFEST_MEMBER,
+                        124,
+                    )
+                    self.assertEqual(
+                        candidate.classify_security_disposition(
+                            context_path,
+                            jobs_path,
+                            summary_metadata,
+                            summary_archive,
+                            route_metadata,
+                            route_archive,
+                            expected_summary_artifact_id="123",
+                            expected_route_artifact_id="124",
+                            github_output=output,
+                        ),
+                        "not_applicable",
+                    )
+                    self.assertIn("candidate=false\n", output.read_text(encoding="ascii"))
+                    if route_class == "docs-only":
+                        cli_output = root / "cli-github-output"
+                        completed = subprocess.run(
+                            [
+                                "/usr/bin/python3", "-I", "-B",
+                                str(trusted_tools / "platform_host_tools_candidate.py"),
+                                "route-disposition",
+                                "--context", str(context_path),
+                                "--jobs", str(jobs_path),
+                                "--summary-metadata", str(summary_metadata),
+                                "--summary-archive", str(summary_archive),
+                                "--summary-artifact-id", "123",
+                                "--route-metadata", str(route_metadata),
+                                "--route-archive", str(route_archive),
+                                "--route-artifact-id", "124",
+                                "--github-output", str(cli_output),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            cwd=root,
+                            env={},
+                        )
+                        self.assertEqual(completed.returncode, 0, completed.stderr)
+                        self.assertIn("disposition=not_applicable", completed.stdout)
+                        self.assertIn("candidate=false\n", cli_output.read_text(encoding="ascii"))
+
+                    # Matching summary/route digests are insufficient if an
+                    # artifact's exact workflow run or a required job changes.
+                    wrong_target = {**no_op_summary, "tested_sha": context.original_source_head_sha}
+                    bad_summary_metadata, bad_summary_archive = artifact_pair(
+                        root,
+                        f"platform-ci-summary-{context.run_id}-{context.run_attempt}",
+                        wrong_target,
+                        "platform-security-summary.json",
+                        123,
+                    )
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.classify_security_disposition(
+                            context_path, jobs_path, bad_summary_metadata, bad_summary_archive,
+                            route_metadata, route_archive,
+                            expected_summary_artifact_id="123", expected_route_artifact_id="124",
+                        )
+                    wrong_runner_metadata = root / f"wrong-runner-{route_class}.json"
+                    wrong_runner = json.loads(summary_metadata.read_text(encoding="utf-8"))
+                    wrong_runner["workflow_run"]["head_sha"] = "5" * 40
+                    wrong_runner_metadata.write_text(json.dumps(wrong_runner), encoding="utf-8")
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.classify_security_disposition(
+                            context_path, jobs_path, wrong_runner_metadata, summary_archive,
+                            route_metadata, route_archive,
+                            expected_summary_artifact_id="123", expected_route_artifact_id="124",
+                        )
+                    if route_class == "docs-only":
+                        forged_manifest = {**manifest, "files": [".gitignore"]}
+                        forged_manifest["digest"] = candidate._route_manifest_digest(forged_manifest)
+                        forged_summary = {
+                            **no_op_summary,
+                            "manifest_digest": forged_manifest["digest"],
+                        }
+                        forged_route_metadata, forged_route_archive = artifact_pair(
+                            root,
+                            f"platform-ci-route-{context.run_id}-{context.run_attempt}",
+                            forged_manifest,
+                            candidate.ROUTE_MANIFEST_MEMBER,
+                            124,
+                        )
+                        forged_summary_metadata, forged_summary_archive = artifact_pair(
+                            root,
+                            f"platform-ci-summary-{context.run_id}-{context.run_attempt}",
+                            forged_summary,
+                            "platform-security-summary.json",
+                            123,
+                        )
+                        with self.assertRaises(candidate.CandidateError):
+                            candidate.classify_security_disposition(
+                                context_path, jobs_path, forged_summary_metadata, forged_summary_archive,
+                                forged_route_metadata, forged_route_archive,
+                                expected_summary_artifact_id="123", expected_route_artifact_id="124",
+                            )
+                    changed_jobs = [
+                        {**job, "run_attempt": 3} if job["name"] == "Documentation consistency" else job
+                        for job in no_op_jobs
+                    ]
+                    jobs_path.write_text(
+                        json.dumps({"total_count": len(changed_jobs), "jobs": changed_jobs}),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.classify_security_disposition(
+                            context_path, jobs_path, summary_metadata, summary_archive,
+                            route_metadata, route_archive,
+                            expected_summary_artifact_id="123", expected_route_artifact_id="124",
+                        )
+                    jobs_path.write_text(
+                        json.dumps({"total_count": len(no_op_jobs), "jobs": no_op_jobs}),
+                        encoding="utf-8",
+                    )
+                    output.unlink(missing_ok=True)
+
+                full_manifest = candidate.classifier.classify(
+                    [".github/workflows/platform-host-tools-candidate.yml"],
+                    event="pull_request",
+                    target_sha=context.tested_merge_sha,
+                )
+                full_summary = {
+                    **summary,
+                    "reason": full_manifest["reason"],
+                    "manifest_digest": full_manifest["digest"],
+                }
+                jobs_path.write_text(
+                    json.dumps({"total_count": len(jobs), "jobs": jobs}),
+                    encoding="utf-8",
+                )
+                summary_metadata, summary_archive = artifact_pair(
+                    root,
+                    f"platform-ci-summary-{context.run_id}-{context.run_attempt}",
+                    full_summary,
+                    "platform-security-summary.json",
+                    123,
+                )
+                route_metadata, route_archive = artifact_pair(
+                    root,
+                    f"platform-ci-route-{context.run_id}-{context.run_attempt}",
+                    full_manifest,
+                    candidate.ROUTE_MANIFEST_MEMBER,
+                    124,
+                )
+                self.assertEqual(
+                    candidate.classify_security_disposition(
+                        context_path, jobs_path, summary_metadata, summary_archive,
+                        route_metadata, route_archive,
+                        expected_summary_artifact_id="123", expected_route_artifact_id="124",
+                        github_output=output,
+                    ),
+                    "full",
+                )
+                self.assertIn("candidate=true\n", output.read_text(encoding="ascii"))
+                # The full route still proceeds through the existing strict
+                # success verifier; disposition does not bless job evidence.
+                candidate.verify_security_run(
+                    context_path, jobs_path, summary_metadata, summary_archive,
+                    route_metadata, route_archive,
+                    expected_summary_artifact_id="123", expected_route_artifact_id="124",
+                    output=root / "security-evidence.json",
+                )
+
     def test_candidate_artifacts_bind_route_target_digest_and_attempt(self) -> None:
         """Classifier output is data-only and must target the tested merge."""
 
@@ -4240,6 +4500,32 @@ raise SystemExit(module.main(["host-capabilities"]))
             re.match(r"^      - name: (?P<name>[^\n]+)", block, re.MULTILINE).group("name")
             for block in blocks
         ]
+        disposition_index = names.index("Authenticate route disposition for the exact security attempt")
+        security_index = names.index("Verify allowlisted completed-success jobs and closed final summary")
+        self.assertLess(disposition_index, security_index)
+        self.assertIn("steps.disposition.outputs.candidate == 'true'", blocks[security_index])
+        for guarded_step in (
+            "Checkout exact PR head E as data only",
+            "Resolve C from E host_tools_pin with the trusted parser",
+            "Determine PR-introduced C eligibility",
+        ):
+            index = names.index(guarded_step)
+            self.assertIn("steps.disposition.outputs.candidate == 'true'", blocks[index])
+        for guarded_step in (
+            "Build and verify deterministic existing host-tools bundle from T",
+            "Attest exact inner host-tools ZIP",
+            "Upload exact candidate inner ZIP without overwrite",
+            "Verify uploaded candidate artifact outer digest and metadata",
+            "Upload closed candidate evidence without overwrite",
+            "Verify uploaded evidence artifact envelope",
+            "Publish exact candidate and evidence receipt",
+        ):
+            index = names.index(guarded_step)
+            self.assertIn("steps.eligibility.outputs.eligible == 'true'", blocks[index])
+        self.assertIn(
+            "Finish successfully without a candidate for a non-candidate route",
+            names,
+        )
         attestation_index = names.index("Attest exact inner host-tools ZIP")
         attestation_recheck_index = names.index(
             "Recheck PR, security run, attempt, and head before attestation"
@@ -4285,6 +4571,8 @@ raise SystemExit(module.main(["host-capabilities"]))
             trusted_tools.mkdir(parents=True)
             shutil.copyfile(TOOLS_ROOT / "platform_host_tools_candidate.py", trusted_tools / "platform_host_tools_candidate.py")
             shutil.copyfile(TOOLS_ROOT / "platform_host_tools_bundle.py", trusted_tools / "platform_host_tools_bundle.py")
+            shutil.copyfile(TOOLS_ROOT / "platform_ci_classifier.py", trusted_tools / "platform_ci_classifier.py")
+            shutil.copyfile(TOOLS_ROOT / "platform_workflow_provenance.py", trusted_tools / "platform_workflow_provenance.py")
             candidate_tools = root / "candidate-data/platform/tools"
             candidate_tools.mkdir(parents=True)
             (candidate_tools / "platform_host_tools_bundle.py").write_text(
