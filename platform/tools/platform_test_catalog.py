@@ -338,6 +338,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_secret_artifact_boundary
     test_platform_secret_scan
     test_platform_secret_job_isolation
+    test_platform_service_recovery_workflow
     test_platform_security_reports
     test_platform_ssh_host_key_scan
     test_platform_slugs
@@ -439,6 +440,7 @@ PRIVILEGED_MODULES = frozenset(
         "test_platform_release_systemd_state",
         "test_platform_release_venv_rollback",
         "test_platform_retained_load_export_executor",
+        "test_platform_service_recovery_workflow",
         "test_platform_recovery_bootstrap",
         "test_platform_remote_workflow_guards",
         "test_platform_safe_env_exec",
@@ -607,16 +609,16 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 170,
-    "module_digest": "514ecaf735c3c338cc9d1759bdeadea72fbafdc819d17a6fe2d031dce6f684f6",
-    "test_count": 2081,
-    "test_id_digest": "2b9538100a488fe3c085c91dfd47dea48e6179782d60c15e611c97326c6fdd18",
-    "backend_test_count": 2007,
-    "backend_test_id_digest": "460ec83cf01332359517d42a94ea66a74ab6c0d4739975587e095042edf2cb45",
-    "verification_test_count": 74,
-    "verification_test_id_digest": "757f12e70c708e7b69affcdd79cfdb963a06bac46e4c2b022b3b6db7c101c783",
-    "verification_classifier_test_count": 38,
-    "verification_classifier_test_id_digest": "3071e068f59bbb5fa0d26d6b9128bf5469d7def96bd163238df356a89ae08c34",
+    "module_count": 171,
+    "module_digest": "c0f368cefc4f365a817e2ec2b61e64f4f733a5a56568242c8236cdc3094ce21c",
+    "test_count": 2094,
+    "test_id_digest": "17452aa7895a8cde5d8323e3f57c744b14bde75d6576bdc4aeee6b13bd1781b5",
+    "backend_test_count": 2019,
+    "backend_test_id_digest": "266e04de460c46540f2bd788a6259784ab7dd0df4240e9a6def4ffda4833b05d",
+    "verification_test_count": 75,
+    "verification_test_id_digest": "b8ccea4169fb104edfcd940e6859be53ea4a0078e05957172c50840caa8f28d6",
+    "verification_classifier_test_count": 39,
+    "verification_classifier_test_id_digest": "d19f5b3ae6309c9807cb63bdcdbe3adfc807fe13dc8c65d1f3a4bf849f6770d6",
 }
 # Keep each executable contour's boundary independently snapshotted.  The
 # aggregate snapshot proves total ownership, while these entries make a
@@ -627,7 +629,7 @@ CONTOUR_RATIONALE: Mapping[str, str] = {
     "backend-unit": "pure unit/domain/backend behavior without external operator resources",
     "backend-tool-contract": "hermetic repository tools, backup restore diagnostics, source-bound artifact proofs and read-only release-capture diagnostics without root-owned host state",
     "backend-integration": "PostgreSQL/Redis workflows and concurrency behavior",
-    "backend-privileged": "root/service-identity, release/install/systemd, artifact ownership, privileged wrappers and verified ephemeral scratch PostgreSQL diagnostics",
+    "backend-privileged": "root/service-identity, release/install/systemd, artifact ownership, privileged wrappers, verified ephemeral scratch PostgreSQL diagnostics and root-owned API/worker service-recovery fixtures",
     "performance-contract": "deterministic load, observer and acceptance contracts",
     VERIFICATION_CONTOUR: "registry, workflow and profile ownership self-tests",
 }
@@ -651,10 +653,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "baef477986dbda481ca0c79a19694015fdc1cc6ea5b2ee0a32723fc5e310eaf6",
     },
     "backend-privileged": {
-        "module_count": 26,
-        "module_digest": "210efce670a082b8360377da86457b71db79310b02abffc0d3849445b073748a",
-        "test_count": 645,
-        "test_id_digest": "74d39f3a82b04eafaa7dca7d26d6d9feedcb5bd2adaf5f6c8e976c8e1bb0ebaf",
+        "module_count": 27,
+        "module_digest": "60b3e4ffd2556af3a341b6f18a33740f75dcad5e97fa53b77a9a4ed70cd3aed0",
+        "test_count": 657,
+        "test_id_digest": "51e4dce88efac40320a45483b5b936df4a09e4ea8945fab3a6b5743e2bf23b5e",
     },
     "performance-contract": {
         "module_count": 11,
@@ -665,8 +667,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     VERIFICATION_CONTOUR: {
         "module_count": 3,
         "module_digest": "bc3b5eb1bc4e61842407a5e9edd6ab07f4bb21581ac2663b4754f6dcdaf5c02c",
-        "test_count": 74,
-        "test_id_digest": "757f12e70c708e7b69affcdd79cfdb963a06bac46e4c2b022b3b6db7c101c783",
+        "test_count": 75,
+        "test_id_digest": "b8ccea4169fb104edfcd940e6859be53ea4a0078e05957172c50840caa8f28d6",
     },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])

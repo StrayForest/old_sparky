@@ -319,8 +319,11 @@ workflow queries that run's workflow identity, event, branch, SHA, completion
 and conclusion, then requires the `platform-security-build` status to point to
 the same run URL; a missing, stale or mixed-attempt pair is rejected.
 
-The recovery workflow does not change the active release, database, Redis, Nginx configuration or application data. Failures emit only a closed `RECOVERY_FAILURE` stage and optional fixed class; raw remote stdout/stderr are deleted by the runner.
+The web mode above does not change the active release, database, Redis, Nginx configuration or application data. Failures emit only a closed `RECOVERY_FAILURE` stage and optional fixed class; raw remote stdout/stderr are deleted by the runner.
 Use that bounded marker with the retained transaction receipt and systemd journal; do not retry or weaken preflight until the exact failure stage is verified.
+
+For API/worker-only recovery on the current immutable release, follow the
+[service recovery runbook](service-recovery-runbook.md).
 
 ## Release state, activation and recovery
 

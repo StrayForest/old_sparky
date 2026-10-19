@@ -99,6 +99,13 @@ RUNTIME_SENSITIVE_FILES = frozenset(
         ".github/workflows/platform-production-storage-diagnostics.yml",
         ".github/workflows/platform-production-storage-maintenance.yml",
         ".agents/skills/platform-storage-retention/SKILL.md",
+        # Service recovery embeds this exact bounded controller in a
+        # no-checkout secret workflow. Its source, workflow and contract test
+        # need the exact-target runtime fixture gate. The classifier itself
+        # retains its existing candidate-packaging route contract.
+        ".github/workflows/platform-production-service-recovery.yml",
+        "platform/tools/platform_api_worker_service_recovery.py",
+        "platform/tests/test_platform_service_recovery_workflow.py",
     }
 )
 

@@ -3,9 +3,25 @@ name: Platform production service recovery
 on:
   workflow_dispatch:
     inputs:
-      confirmation:
-        description: "Type RECOVER-DEADLOCK-WEB after reviewing the service failure"
+      mode:
+        description: "Select the narrowly scoped recovery target"
         required: true
+        type: choice
+        options:
+          - web
+          - api-worker
+        default: web
+      confirmation:
+        description: "Type the exact confirmation for the selected recovery mode"
+        required: true
+        type: string
+      expected_source_sha:
+        description: "Required for api-worker mode: exact currently active release source SHA"
+        required: false
+        type: string
+      expected_release_slug:
+        description: "Required for api-worker mode: exact currently active release slug"
+        required: false
         type: string
 
 permissions:
@@ -16,13 +32,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  recover-web:
-    name: Recover deadlock-web
+  recover-services:
+    name: Recover production services
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: production
     env:
+      RECOVERY_MODE: ${{ inputs.mode }}
       RECOVERY_CONFIRMATION: ${{ inputs.confirmation }}
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      EXPECTED_RELEASE_SLUG: ${{ inputs.expected_release_slug }}
     steps:
       - name: Validate explicit recovery confirmation
         shell: bash
@@ -30,8 +49,21 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production service recovery must run from the reviewed dev ref" >&2; exit 1; }
-          test "$RECOVERY_CONFIRMATION" = "RECOVER-DEADLOCK-WEB" \
-            || { echo "Refusing recovery without exact confirmation" >&2; exit 1; }
+          case "$RECOVERY_MODE" in
+            web)
+              test "$RECOVERY_CONFIRMATION" = "RECOVER-DEADLOCK-WEB" \
+                || { echo "Refusing web recovery without exact confirmation" >&2; exit 1; }
+              ;;
+            api-worker)
+              test "$RECOVERY_CONFIRMATION" = "RECOVER-DEADLOCK-API-WORKER" \
+                || { echo "Refusing API/worker recovery without exact confirmation" >&2; exit 1; }
+              [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+                || { echo "API/worker recovery requires an exact source SHA" >&2; exit 1; }
+              [[ "$EXPECTED_RELEASE_SLUG" =~ ^gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-${EXPECTED_SOURCE_SHA:0:12}$ ]] \
+                || { echo "API/worker recovery requires the matching release slug" >&2; exit 1; }
+              ;;
+            *) echo "Unknown service recovery mode" >&2; exit 1 ;;
+          esac
 
       - name: Validate production SSH inputs
         shell: bash
@@ -75,6 +107,7 @@ jobs:
           printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Restart and verify deadlock-web
+        if: ${{ inputs.mode == 'web' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -228,6 +261,758 @@ jobs:
           printf '%s\n' 'PRODUCTION_SERVICE_RECOVERY schema=1 status=passed error_class=none'
           rm -f -- "$remote_log" "$remote_error"
 
+      - name: Recover deadlock-api and deadlock-worker
+        if: ${{ inputs.mode == 'api-worker' }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          remote_log="$RUNNER_TEMP/platform-production-api-worker-recovery.log"
+          remote_error="$RUNNER_TEMP/platform-production-api-worker-recovery-error.log"
+          : >"$remote_log"; : >"$remote_error"; chmod 600 "$remote_log" "$remote_error"
+          trap 'rm -f -- "$remote_log" "$remote_error"' EXIT
+          set +e
+          ssh \
+            -F /dev/null \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=40 \
+            -o ConnectTimeout=10 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            'bash -s --' "$EXPECTED_SOURCE_SHA" "$EXPECTED_RELEASE_SLUG" \
+            >"$remote_log" 2>"$remote_error" <<'REMOTE'
+          set -Eeuo pipefail
+          expected_source_sha="$1"
+          expected_release_slug="$2"
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          shared="$runtime/shared"
+          test "$(id -u)" -eq 0 || { echo "Production service recovery must run as root" >&2; exit 1; }
+          test -d "$runtime" && test ! -L "$runtime" || { echo "Production runtime directory is unsafe" >&2; exit 1; }
+          test -d "$shared" && test ! -L "$shared" || { echo "Production shared directory is unsafe" >&2; exit 1; }
+          test -L "$current" || { echo "Current release symlink is missing" >&2; exit 1; }
+          shared_owner="$(stat -c %u "$shared")"
+          shared_mode="$(stat -c %a "$shared")"
+          test "$shared_owner" = "0" && test $((8#$shared_mode & 8#022)) -eq 0 \
+            || { echo "Production shared directory permissions are unsafe" >&2; exit 1; }
+          lock_helper="$current/tools/platform_release_lock.sh"
+          test -f "$lock_helper" && test ! -L "$lock_helper" && test -x "$lock_helper" \
+            || { echo "Canonical release lock helper is missing or unsafe" >&2; exit 1; }
+          "$lock_helper" --run /bin/bash -s -- "$expected_source_sha" "$expected_release_slug" <<'LOCKED'
+          set -Eeuo pipefail
+          expected_source_sha="$1"
+          expected_release_slug="$2"
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          shared="$runtime/shared"
+          # shellcheck source=/dev/null
+          source "$current/tools/platform_release_lock.sh"
+          platform_release_lock_open || { echo "Canonical release lock supervisor could not be validated" >&2; exit 75; }
+          platform_release_lock_supervisor_holds || { echo "Platform release lock was lost" >&2; exit 75; }
+          test ! -e "$shared/.release-operation.json" && test ! -L "$shared/.release-operation.json" \
+            || { echo "A release transaction is already pending" >&2; exit 75; }
+          test ! -e "$shared/.release-systemd-state.json" && test ! -L "$shared/.release-systemd-state.json" \
+            || { echo "A systemd release receipt is pending" >&2; exit 75; }
+          test ! -e "$shared/.release-rollback.json" && test ! -L "$shared/.release-rollback.json" \
+            || { echo "A rollback receipt is pending" >&2; exit 75; }
+          /usr/bin/python3 -I - \
+            --app-dir "$runtime" \
+            --expected-source-sha "$expected_source_sha" \
+            --expected-release-slug "$expected_release_slug" \
+            --systemd-dir /etc/systemd/system <<'SERVICE_RECOVERY'
+          #!/usr/bin/env python3
+          """Restore only API and worker services for the exact active release.
+
+          The service-recovery workflow embeds this file verbatim because its SSH job
+          must not check out or fetch repository code. Keep the embedding contract in
+          ``test_platform_service_recovery_workflow``. This controller changes no
+          release pointers, systemd unit files, enablement, timers, environment files,
+          database schema, or backup state. Starting the normal services resumes their
+          ordinary application processing.
+
+          Worker readiness targets the local systemd worker's default ``celery@hostname``
+          node name so a different worker sharing the broker cannot satisfy the probe.
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import pwd
+          import re
+          import shutil
+          import socket
+          import stat
+          import subprocess
+          import time
+          from typing import Any
+          from urllib.error import URLError
+          from urllib.request import ProxyHandler, Request, build_opener
+
+
+          SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+          SLUG_RE = re.compile(r"gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}\Z")
+          SERVICE_NAMES = ("deadlock-api", "deadlock-worker")
+          SERVICE_USERS = {"deadlock-api": "oldsparky-api", "deadlock-worker": "oldsparky-worker"}
+          PRESTATE = {
+              "ActiveState": "inactive",
+              "SubState": "dead",
+              "Result": "success",
+              "ExecMainStatus": "0",
+              "MainPID": "0",
+          }
+          SHOW_PROPERTIES = (
+              "LoadState",
+              "ActiveState",
+              "SubState",
+              "Result",
+              "ExecMainStatus",
+              "MainPID",
+              "FragmentPath",
+              "DropInPaths",
+              "UnitFileState",
+              "User",
+              "Group",
+          )
+          MAX_CONFIG_BYTES = 1024 * 1024
+          MIN_FREE_BYTES = 5 * 1024**3
+          MAX_USED_PERCENT = 85.0
+          API_READY_URL = "http://127.0.0.1:8010/api/v1/health/ready"
+
+
+          class RecoveryRefusal(RuntimeError):
+              def __init__(self, stage: str) -> None:
+                  super().__init__(stage)
+                  self.stage = stage
+
+
+          def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+              result: dict[str, Any] = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate object key")
+                  result[key] = value
+              return result
+
+
+          def _owned_file(path: Path, *, mode: int, gid: int = 0, max_bytes: int = MAX_CONFIG_BYTES) -> bytes:
+              try:
+                  metadata = path.lstat()
+                  resolved = path.resolve(strict=True)
+              except OSError as exc:
+                  raise RecoveryRefusal("file_identity") from exc
+              if (
+                  not stat.S_ISREG(metadata.st_mode)
+                  or stat.S_ISLNK(metadata.st_mode)
+                  or metadata.st_uid != 0
+                  or metadata.st_gid != gid
+                  or metadata.st_nlink != 1
+                  or stat.S_IMODE(metadata.st_mode) != mode
+                  or resolved != path
+                  or metadata.st_size > max_bytes
+              ):
+                  raise RecoveryRefusal("file_identity")
+              descriptor = -1
+              try:
+                  descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                  opened = os.fstat(descriptor)
+
+                  def fingerprint(item: os.stat_result) -> tuple[int, ...]:
+                      return (
+                          item.st_dev,
+                          item.st_ino,
+                          item.st_uid,
+                          item.st_gid,
+                          item.st_nlink,
+                          stat.S_IMODE(item.st_mode),
+                          item.st_size,
+                          item.st_mtime_ns,
+                          item.st_ctime_ns,
+                      )
+                  if fingerprint(opened) != fingerprint(metadata):
+                      raise RecoveryRefusal("file_identity")
+                  with os.fdopen(descriptor, "rb") as stream:
+                      descriptor = -1
+                      payload = stream.read(max_bytes + 1)
+                      after = os.fstat(stream.fileno())
+                  if fingerprint(after) != fingerprint(opened):
+                      raise RecoveryRefusal("file_changed")
+              except OSError as exc:
+                  raise RecoveryRefusal("file_read") from exc
+              finally:
+                  if descriptor >= 0:
+                      os.close(descriptor)
+              if len(payload) > max_bytes:
+                  raise RecoveryRefusal("file_size")
+              return payload
+
+
+          def _owned_directory(path: Path, *, mode: int, minimum_links: int = 2) -> os.stat_result:
+              try:
+                  metadata = path.lstat()
+                  resolved = path.resolve(strict=True)
+              except OSError as exc:
+                  raise RecoveryRefusal("directory_identity") from exc
+              if (
+                  not stat.S_ISDIR(metadata.st_mode)
+                  or stat.S_ISLNK(metadata.st_mode)
+                  or metadata.st_uid != 0
+                  or metadata.st_gid != 0
+                  or metadata.st_nlink < minimum_links
+                  or stat.S_IMODE(metadata.st_mode) != mode
+                  or resolved != path
+              ):
+                  raise RecoveryRefusal("directory_identity")
+              descriptor = -1
+              try:
+                  descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY)
+                  opened = os.fstat(descriptor)
+              except OSError as exc:
+                  raise RecoveryRefusal("directory_identity") from exc
+              finally:
+                  if descriptor >= 0:
+                      os.close(descriptor)
+              if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                  raise RecoveryRefusal("directory_identity")
+              return metadata
+
+
+          def _release_identity(release: Path, *, expected_slug: str | None = None) -> tuple[str, str, str]:
+              _owned_directory(release, mode=0o755)
+              slug = release.name
+              if SLUG_RE.fullmatch(slug) is None:
+                  raise RecoveryRefusal("release_slug")
+              raw = _owned_file(release / "RELEASE.json", mode=0o444, max_bytes=64 * 1024)
+              try:
+                  metadata = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+              except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                  raise RecoveryRefusal("release_metadata") from exc
+              if (
+                  not isinstance(metadata, dict)
+                  or metadata.get("artifact_format_version") != 1
+                  or metadata.get("release_slug") != slug
+                  or not isinstance(metadata.get("source_git_commit"), str)
+                  or SHA_RE.fullmatch(metadata["source_git_commit"]) is None
+                  or not slug.endswith("-" + metadata["source_git_commit"][:12])
+                  or (expected_slug is not None and slug != expected_slug)
+              ):
+                  raise RecoveryRefusal("release_metadata")
+              return slug, metadata["source_git_commit"], hashlib.sha256(raw).hexdigest()
+
+
+          def _pointer_identity(app_dir: Path, name: str) -> tuple[str, str, tuple[int, int]]:
+              pointer = app_dir / name
+              try:
+                  link = pointer.lstat()
+                  target = os.readlink(pointer)
+                  resolved = pointer.resolve(strict=True)
+              except OSError as exc:
+                  raise RecoveryRefusal("pointer_identity") from exc
+              if not stat.S_ISLNK(link.st_mode) or target.startswith("/"):
+                  raise RecoveryRefusal("pointer_identity")
+              expected_prefix = "releases/"
+              if not target.startswith(expected_prefix) or target.count("/") != 1:
+                  raise RecoveryRefusal("pointer_identity")
+              release = app_dir / target
+              try:
+                  release_relative = release.relative_to(app_dir / "releases")
+              except ValueError as exc:
+                  raise RecoveryRefusal("pointer_identity") from exc
+              if len(release_relative.parts) != 1 or resolved != release:
+                  raise RecoveryRefusal("pointer_identity")
+              _owned_directory(release, mode=0o755)
+              return target, str(resolved), (link.st_dev, link.st_ino)
+
+
+          def _command(
+              command: list[str], *, timeout: float = 10.0, cwd: Path | None = None,
+              env: dict[str, str] | None = None,
+          ) -> subprocess.CompletedProcess[str]:
+              try:
+                  return subprocess.run(
+                      command,
+                      capture_output=True,
+                      text=True,
+                      check=False,
+                      timeout=timeout,
+                      cwd=cwd,
+                      env=env or {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
+                  )
+              except (OSError, subprocess.TimeoutExpired) as exc:
+                  raise RecoveryRefusal("command_unavailable") from exc
+
+
+          def _systemctl(systemctl: str, *arguments: str, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+              return _command([systemctl, *arguments], timeout=timeout)
+
+
+          def _show_unit(systemctl: str, unit: str) -> dict[str, str]:
+              result = _systemctl(
+                  systemctl,
+                  "show",
+                  unit,
+                  "--property=" + ",".join(SHOW_PROPERTIES),
+                  "--no-pager",
+              )
+              if result.returncode != 0:
+                  raise RecoveryRefusal("unit_state")
+              values: dict[str, str] = {}
+              for line in result.stdout.splitlines():
+                  key, separator, value = line.partition("=")
+                  if not separator or key not in SHOW_PROPERTIES or key in values:
+                      raise RecoveryRefusal("unit_state")
+                  values[key] = value
+              if set(values) != set(SHOW_PROPERTIES):
+                  raise RecoveryRefusal("unit_state")
+              return values
+
+
+          def _enabled_state(systemctl: str, unit: str) -> str:
+              result = _systemctl(systemctl, "is-enabled", unit)
+              value = result.stdout.strip()
+              if (result.returncode, value) in {(0, "enabled"), (1, "disabled")}:
+                  return value
+              raise RecoveryRefusal("unit_enablement")
+
+
+          def _assert_service_unit(
+              *,
+              release: Path,
+              systemd_dir: Path,
+              systemctl: str,
+              service: str,
+              before: bool,
+              enabled_before: str | None = None,
+          ) -> tuple[dict[str, str], str]:
+              unit = service + ".service"
+              source = release / "deploy" / "systemd" / unit
+              installed = systemd_dir / unit
+              source_bytes = _owned_file(source, mode=0o644, max_bytes=128 * 1024)
+              installed_bytes = _owned_file(installed, mode=0o644, max_bytes=128 * 1024)
+              if source_bytes != installed_bytes:
+                  raise RecoveryRefusal("unit_identity")
+              state = _show_unit(systemctl, unit)
+              if (
+                  state["LoadState"] != "loaded"
+                  or state["FragmentPath"] != str(installed)
+                  or state["DropInPaths"] != ""
+                  or state["User"] != SERVICE_USERS[service]
+                  or state["Group"] != SERVICE_USERS[service]
+              ):
+                  raise RecoveryRefusal("unit_identity")
+              enabled = _enabled_state(systemctl, unit)
+              if state["UnitFileState"] != enabled:
+                  raise RecoveryRefusal("unit_enablement")
+              if before:
+                  if any(state[key] != value for key, value in PRESTATE.items()):
+                      raise RecoveryRefusal("service_prestate")
+              elif (
+                  state["ActiveState"] != "active"
+                  or state["SubState"] != "running"
+                  or state["Result"] != "success"
+                  or state["ExecMainStatus"] != "0"
+                  or not state["MainPID"].isdigit()
+                  or int(state["MainPID"]) <= 1
+              ):
+                  raise RecoveryRefusal("service_health")
+              if enabled_before is not None and enabled != enabled_before:
+                  raise RecoveryRefusal("unit_enablement_changed")
+              return state, enabled
+
+
+          def _assert_active(systemctl: str, units: tuple[str, ...]) -> None:
+              for unit in units:
+                  result = _systemctl(systemctl, "is-active", "--quiet", unit)
+                  if result.returncode != 0:
+                      raise RecoveryRefusal("backing_service")
+
+
+          def _assert_release_preflight(app_dir: Path, release: Path, expected_sha: str, expected_slug: str) -> None:
+              helper = release / "tools" / "platform_release_preflight.sh"
+              _owned_file(helper, mode=0o755, max_bytes=2 * 1024 * 1024)
+              result = _command(["/bin/bash", str(helper), "--require-previous"], timeout=180.0)
+              marker = next((line for line in result.stdout.splitlines() if line.startswith("RELEASE_PREFLIGHT ")), "")
+              expected = f"RELEASE_PREFLIGHT schema=1 status=passed class=preflight release_slug={expected_slug} source_sha={expected_sha}"
+              if result.returncode != 0 or marker != expected or result.stdout.splitlines()[-1:] != [expected]:
+                  raise RecoveryRefusal("release_preflight")
+
+
+          def _config_snapshot(app_dir: Path) -> dict[str, str]:
+              shared = app_dir / "shared"
+              _owned_directory(shared, mode=0o755)
+              source_env = _owned_file(shared / ".env.platform", mode=0o600)
+              env_dir = shared / "env"
+              _owned_directory(env_dir, mode=0o711)
+              rendered: dict[str, bytes] = {}
+              for service in SERVICE_NAMES:
+                  user = SERVICE_USERS[service]
+                  try:
+                      gid = pwd.getpwnam(user).pw_gid
+                  except KeyError as exc:
+                      raise RecoveryRefusal("service_identity") from exc
+                  rendered[service] = _owned_file(env_dir / f"{service.removeprefix('deadlock-')}.env", mode=0o640, gid=gid)
+              result = {"source_env": hashlib.sha256(source_env).hexdigest()}
+              result.update(
+                  {
+                      f"{service}_env": hashlib.sha256(payload).hexdigest()
+                      for service, payload in rendered.items()
+                  }
+              )
+              return result
+
+
+          def _assert_disk(app_dir: Path) -> None:
+              try:
+                  usage = shutil.disk_usage(app_dir)
+              except OSError as exc:
+                  raise RecoveryRefusal("disk_state") from exc
+              if usage.total <= 0 or usage.free < MIN_FREE_BYTES:
+                  raise RecoveryRefusal("disk_state")
+              used_percent = (usage.used / usage.total) * 100
+              if used_percent > MAX_USED_PERCENT:
+                  raise RecoveryRefusal("disk_state")
+
+
+          def _api_ready() -> bool:
+              request = Request(API_READY_URL, headers={"Accept": "application/json", "User-Agent": "oldsparky-service-recovery/1"})
+              try:
+                  with build_opener(ProxyHandler({})).open(request, timeout=2) as response:
+                      if response.status != 200:
+                          return False
+                      body = response.read(4097)
+              except (OSError, TimeoutError, URLError, ValueError):
+                  return False
+              if len(body) > 4096:
+                  return False
+              try:
+                  payload = json.loads(body.decode("utf-8"), object_pairs_hook=_strict_object)
+              except (UnicodeError, json.JSONDecodeError, ValueError):
+                  return False
+              return (
+                  isinstance(payload, dict)
+                  and payload.get("status") == "ok"
+                  and payload.get("service") == "deadlock-platform-api"
+              )
+
+
+          def _wait_api_ready(*, timeout: float = 30.0) -> bool:
+              deadline = time.monotonic() + timeout
+              while time.monotonic() < deadline:
+                  if _api_ready():
+                      return True
+                  time.sleep(0.5)
+              return False
+
+
+          def _worker_ready(app_dir: Path, release: Path, systemd_dir: Path) -> bool:
+              shared = app_dir / "shared"
+              code = (
+                  "import os; from apps.platform_worker.worker import celery_app; "
+                  "expected=os.environ['PLATFORM_EXPECTED_CELERY_NODE']; "
+                  "replies=celery_app.control.ping(timeout=5.0, limit=1, destination=[expected]); "
+                  "ok=replies==[{expected:'pong'}]; "
+                  "print('WORKER_PING status=passed' if ok else 'WORKER_PING status=failed'); "
+                  "raise SystemExit(0 if ok else 1)"
+              )
+              command = [
+                  "/usr/sbin/runuser", "-u", SERVICE_USERS["deadlock-worker"], "--",
+                  "/usr/bin/env",
+                  "PLATFORM_RUNTIME_SERVICE=worker",
+                  f"PLATFORM_ROOT_DIR={release}",
+                  f"PLATFORM_APP_DIR={app_dir}",
+                  f"PLATFORM_SHARED_DIR={shared}",
+                  f"PLATFORM_ENV_FILE={shared / 'env/worker.env'}",
+                  f"PLATFORM_PYTHON_BIN={shared / 'venv/bin/python'}",
+                  "PLATFORM_WORKER_CONCURRENCY=2",
+                  f"PLATFORM_EXPECTED_CELERY_NODE=celery@{socket.gethostname()}",
+                  f"PYTHONPATH={release}",
+                  str(shared / "venv/bin/python"), "-c", code,
+              ]
+              deadline = time.monotonic() + 30.0
+              while time.monotonic() < deadline:
+                  try:
+                      _assert_service_unit(
+                          release=release,
+                          systemd_dir=systemd_dir,
+                          systemctl="/usr/bin/systemctl",
+                          service="deadlock-worker",
+                          before=False,
+                      )
+                  except RecoveryRefusal:
+                      return False
+                  remaining = deadline - time.monotonic()
+                  try:
+                      result = _command(
+                          command,
+                          timeout=min(7.0, remaining),
+                          cwd=release,
+                          env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
+                      )
+                  except RecoveryRefusal as exc:
+                      if exc.stage != "command_unavailable":
+                          return False
+                      result = subprocess.CompletedProcess(command, 1, stdout="", stderr="")
+                  if result.returncode == 0 and result.stdout.splitlines() == ["WORKER_PING status=passed"]:
+                      return True
+                  if time.monotonic() < deadline:
+                      time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+              return False
+
+
+          def _receipt(
+              *,
+              status: str,
+              stage: str,
+              source_sha: str,
+              release_slug: str,
+              service_before: dict[str, dict[str, str]],
+              enabled_before: dict[str, str],
+              service_after: dict[str, dict[str, str]],
+              enabled_after: dict[str, str],
+              rollback: str,
+          ) -> None:
+              values = [
+                  "API_WORKER_RECOVERY",
+                  "schema=1",
+                  f"status={status}",
+                  f"stage={stage}",
+                  f"source_sha={source_sha or 'unavailable'}",
+                  f"release_slug={release_slug or 'unavailable'}",
+                  f"api_before={service_before.get('deadlock-api', {}).get('ActiveState', 'unknown')}",
+                  f"api_enabled_before={enabled_before.get('deadlock-api', 'unknown')}",
+                  f"api_after={service_after.get('deadlock-api', {}).get('ActiveState', 'unknown')}",
+                  f"worker_before={service_before.get('deadlock-worker', {}).get('ActiveState', 'unknown')}",
+                  f"worker_enabled_before={enabled_before.get('deadlock-worker', 'unknown')}",
+                  f"worker_after={service_after.get('deadlock-worker', {}).get('ActiveState', 'unknown')}",
+                  "worker_readiness=celery_control_ping",
+                  "post_release_qa=required",
+                  f"rollback={rollback}",
+              ]
+              print(" ".join(values))
+
+
+          def recover(app_dir: Path, expected_sha: str, expected_slug: str, systemd_dir: Path) -> int:
+              source_sha = ""
+              release_slug = ""
+              service_before: dict[str, dict[str, str]] = {}
+              enabled_before: dict[str, str] = {}
+              service_after: dict[str, dict[str, str]] = {}
+              enabled_after: dict[str, str] = {}
+              attempted: list[str] = []
+              stage = "input"
+              rollback = "not_needed"
+              config_before: dict[str, str] = {}
+              pointers_before: dict[str, tuple[str, str, tuple[int, int]]] = {}
+              release_before: tuple[str, str, str] | None = None
+              unit_digests: dict[str, str] = {}
+              try:
+                  if SHA_RE.fullmatch(expected_sha) is None or SLUG_RE.fullmatch(expected_slug) is None:
+                      raise RecoveryRefusal("input")
+                  if not expected_slug.endswith("-" + expected_sha[:12]):
+                      raise RecoveryRefusal("input")
+                  if os.geteuid() != 0:
+                      raise RecoveryRefusal("privilege")
+                  _owned_directory(app_dir, mode=0o755)
+                  releases = app_dir / "releases"
+                  _owned_directory(releases, mode=0o755)
+                  for marker in (".release-operation.json", ".release-systemd-state.json", ".release-rollback.json"):
+                      if (app_dir / "shared" / marker).exists() or (app_dir / "shared" / marker).is_symlink():
+                          raise RecoveryRefusal("pending_release_state")
+                  pointers_before["current"] = _pointer_identity(app_dir, "current")
+                  pointers_before["previous"] = _pointer_identity(app_dir, "previous")
+                  release = Path(pointers_before["current"][1])
+                  release_slug, source_sha, release_digest = _release_identity(release, expected_slug=expected_slug)
+                  if source_sha != expected_sha:
+                      raise RecoveryRefusal("release_sha")
+                  _release_identity(Path(pointers_before["previous"][1]))
+                  release_before = (release_slug, source_sha, release_digest)
+                  _assert_release_preflight(app_dir, release, expected_sha, expected_slug)
+                  config_before = _config_snapshot(app_dir)
+                  _assert_disk(app_dir)
+                  _assert_active("/usr/bin/systemctl", ("postgresql.service", "redis-server.service", "deadlock-web.service", "nginx.service"))
+
+                  for service in SERVICE_NAMES:
+                      unit = service + ".service"
+                      source_unit = release / "deploy" / "systemd" / unit
+                      unit_bytes = _owned_file(source_unit, mode=0o644, max_bytes=128 * 1024)
+                      unit_digests[service] = hashlib.sha256(unit_bytes).hexdigest()
+                      service_before[service], enabled_before[service] = _assert_service_unit(
+                          release=release,
+                          systemd_dir=systemd_dir,
+                          systemctl="/usr/bin/systemctl",
+                          service=service,
+                          before=True,
+                      )
+
+                  for service in SERVICE_NAMES:
+                      stage = "start_api" if service == "deadlock-api" else "start_worker"
+                      attempted.append(service)
+                      result = _systemctl("/usr/bin/systemctl", "start", service + ".service", timeout=35.0)
+                      if result.returncode != 0:
+                          raise RecoveryRefusal(stage)
+                      if service == "deadlock-api":
+                          stage = "api_readiness"
+                          if not _wait_api_ready():
+                              raise RecoveryRefusal(stage)
+
+                  stage = "worker_readiness"
+                  if not _worker_ready(app_dir, release, systemd_dir):
+                      raise RecoveryRefusal(stage)
+
+                  stage = "service_health"
+                  for service in SERVICE_NAMES:
+                      service_after[service], enabled_after[service] = _assert_service_unit(
+                          release=release,
+                          systemd_dir=systemd_dir,
+                          systemctl="/usr/bin/systemctl",
+                          service=service,
+                          before=False,
+                          enabled_before=enabled_before[service],
+                      )
+                  _assert_active("/usr/bin/systemctl", ("deadlock-web.service", "nginx.service", "postgresql.service", "redis-server.service"))
+                  stage = "state_stability"
+                  if _config_snapshot(app_dir) != config_before:
+                      raise RecoveryRefusal(stage)
+                  if {name: _pointer_identity(app_dir, name) for name in ("current", "previous")} != pointers_before:
+                      raise RecoveryRefusal(stage)
+                  if _release_identity(release, expected_slug=expected_slug) != release_before:
+                      raise RecoveryRefusal(stage)
+                  for service in SERVICE_NAMES:
+                      current_unit = _owned_file(release / "deploy" / "systemd" / (service + ".service"), mode=0o644, max_bytes=128 * 1024)
+                      installed_unit = _owned_file(systemd_dir / (service + ".service"), mode=0o644, max_bytes=128 * 1024)
+                      if hashlib.sha256(current_unit).hexdigest() != unit_digests[service] or current_unit != installed_unit:
+                          raise RecoveryRefusal(stage)
+              except Exception as exc:
+                  stage = exc.stage if isinstance(exc, RecoveryRefusal) else "internal"
+                  if attempted:
+                      rollback = "verified"
+                      for service in reversed(attempted):
+                          stop_result = _systemctl("/usr/bin/systemctl", "stop", service + ".service", timeout=35.0)
+                          if stop_result.returncode != 0:
+                              rollback = "unverified"
+                          clear_result = _systemctl("/usr/bin/systemctl", "reset-failed", service + ".service", timeout=10.0)
+                          if clear_result.returncode != 0:
+                              rollback = "unverified"
+                      if rollback == "verified":
+                          try:
+                              for service in SERVICE_NAMES:
+                                  service_after[service], enabled_after[service] = _assert_service_unit(
+                                      release=release,
+                                      systemd_dir=systemd_dir,
+                                      systemctl="/usr/bin/systemctl",
+                                      service=service,
+                                      before=True,
+                                      enabled_before=enabled_before.get(service),
+                                  )
+                              if _config_snapshot(app_dir) != config_before:
+                                  rollback = "unverified"
+                              if {name: _pointer_identity(app_dir, name) for name in ("current", "previous")} != pointers_before:
+                                  rollback = "unverified"
+                          except RecoveryRefusal:
+                              rollback = "unverified"
+                  _receipt(
+                      status="failed",
+                      stage=stage,
+                      source_sha=source_sha,
+                      release_slug=release_slug,
+                      service_before=service_before,
+                      enabled_before=enabled_before,
+                      service_after=service_after,
+                      enabled_after=enabled_after,
+                      rollback=rollback,
+                  )
+                  return 1
+
+              _receipt(
+                  status="passed",
+                  stage="complete",
+                  source_sha=source_sha,
+                  release_slug=release_slug,
+                  service_before=service_before,
+                  enabled_before=enabled_before,
+                  service_after=service_after,
+                  enabled_after=enabled_after,
+                  rollback="not_needed",
+              )
+              return 0
+
+
+          def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--app-dir", required=True)
+              parser.add_argument("--expected-source-sha", required=True)
+              parser.add_argument("--expected-release-slug", required=True)
+              parser.add_argument("--systemd-dir", default="/etc/systemd/system")
+              return parser.parse_args(argv)
+
+
+          def main(argv: list[str] | None = None) -> int:
+              args = parse_args(argv)
+              return recover(
+                  Path(args.app_dir),
+                  args.expected_source_sha,
+                  args.expected_release_slug,
+                  Path(args.systemd_dir),
+              )
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          SERVICE_RECOVERY
+          LOCKED
+          REMOTE
+          remote_status=$?
+          set -e
+          /usr/bin/python3 -I - "$EXPECTED_SOURCE_SHA" "$EXPECTED_RELEASE_SLUG" "$remote_log" "$remote_status" <<'PROJECT'
+          import os
+          import re
+          import stat
+          import sys
+          expected_sha, expected_slug, path, raw_remote_status = sys.argv[1:]
+          try:
+              metadata = os.lstat(path)
+              if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid() or metadata.st_size > 4096:
+                  raise ValueError("unsafe private report")
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              with os.fdopen(descriptor, "rb") as report:
+                  opened = os.fstat(report.fileno())
+                  if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                      raise ValueError("changed private report")
+                  payload = report.read(4097)
+              if len(payload) > 4096:
+                  raise ValueError("oversized private report")
+              lines = [line for line in payload.decode("ascii").splitlines() if line.startswith("API_WORKER_RECOVERY ")]
+          except (OSError, UnicodeError, ValueError):
+              print("PRODUCTION_API_WORKER_RECOVERY schema=1 status=failed error_class=receipt")
+              raise SystemExit(1)
+          pattern = re.compile(r"API_WORKER_RECOVERY schema=1 status=(?P<status>passed|failed) stage=(?P<stage>[a-z_]+) source_sha=(?P<source_sha>[0-9a-f]{40}) release_slug=(?P<release_slug>gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}) api_before=(?:inactive|unknown) api_enabled_before=(?:enabled|disabled|unknown) api_after=(?P<api_after>inactive|active|unknown) worker_before=(?:inactive|unknown) worker_enabled_before=(?:enabled|disabled|unknown) worker_after=(?P<worker_after>inactive|active|unknown) worker_readiness=celery_control_ping post_release_qa=required rollback=(?P<rollback>not_needed|verified|unverified)")
+          matches = [pattern.fullmatch(line) for line in lines]
+          if len(matches) != 1 or matches[0] is None:
+              raise SystemExit("PRODUCTION_API_WORKER_RECOVERY schema=1 status=failed error_class=receipt")
+          match = matches[0]
+          fields = match.groupdict()
+          success = raw_remote_status == "0" and fields["status"] == "passed" and fields["stage"] == "complete" and fields["source_sha"] == expected_sha and fields["release_slug"] == expected_slug and fields["api_after"] == "active" and fields["worker_after"] == "active" and fields["rollback"] == "not_needed"
+          if success:
+              print("PRODUCTION_API_WORKER_RECOVERY schema=1 status=passed worker_readiness=celery_control_ping post_release_qa=required")
+          elif fields["status"] == "failed" and fields["source_sha"] == expected_sha and fields["release_slug"] == expected_slug:
+              print(f"PRODUCTION_API_WORKER_RECOVERY schema=1 status=failed stage={fields['stage']} rollback={fields['rollback']}")
+              raise SystemExit(1)
+          else:
+              print("PRODUCTION_API_WORKER_RECOVERY schema=1 status=failed error_class=controller")
+              raise SystemExit(1)
+          PROJECT
+          rm -f -- "$remote_log" "$remote_error"
+
       - name: Remove production SSH material
         id: cleanup_ssh
         if: ${{ always() }}
@@ -260,9 +1045,13 @@ jobs:
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
           rm -f -- \
             "$RUNNER_TEMP/platform-production-service-recovery.log" \
-            "$RUNNER_TEMP/platform-production-service-recovery-error.log"
+            "$RUNNER_TEMP/platform-production-service-recovery-error.log" \
+            "$RUNNER_TEMP/platform-production-api-worker-recovery.log" \
+            "$RUNNER_TEMP/platform-production-api-worker-recovery-error.log"
           test ! -e "$RUNNER_TEMP/platform-production-service-recovery.log"
           test ! -e "$RUNNER_TEMP/platform-production-service-recovery-error.log"
+          test ! -e "$RUNNER_TEMP/platform-production-api-worker-recovery.log"
+          test ! -e "$RUNNER_TEMP/platform-production-api-worker-recovery-error.log"
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
