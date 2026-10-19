@@ -366,7 +366,7 @@ jobs:
 
           if __name__ == "__main__":
               raise SystemExit(main())
-            BACKUP_FAILURE_HELPER
+          BACKUP_FAILURE_HELPER
             chmod 600 "$backup_failure_helper"
             test "$(stat -c '%u:%a:%h' "$backup_failure_helper")" = "$(id -u):600:1"
           fi

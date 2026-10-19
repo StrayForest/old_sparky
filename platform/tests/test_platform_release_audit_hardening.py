@@ -2091,6 +2091,14 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             for step in parsed_workflow["jobs"]["collect"]["steps"]
             if step.get("id") == "collect_storage"
         )
+        shell_syntax = subprocess.run(
+            ["bash", "-n"],
+            input=collection_step["run"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(shell_syntax.returncode, 0, shell_syntax.stderr)
         embedded = re.search(
             r'cat > "\$backup_failure_helper" <<\'BACKUP_FAILURE_HELPER\'\n'
             r"(?P<source>.*?)\n[ ]*BACKUP_FAILURE_HELPER(?:\n|$)",
