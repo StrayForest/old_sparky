@@ -66,16 +66,6 @@ async function expectRobotsTag(page: Page, expected: RegExp | null) {
   }
 }
 
-async function expectRawRobots(
-  page: Page,
-  path: string,
-  expectedStatus: number,
-  expectedRobots: RegExp | null,
-) {
-  const response = await page.request.get(path);
-  await expectRawRobotsResponse(response, expectedStatus, expectedRobots);
-}
-
 async function expectRawRobotsResponse(
   response: { status(): number; text(): Promise<string> } | null,
   expectedStatus: number,
@@ -854,7 +844,8 @@ test("mobile authenticated header keeps compact icon actions beside the brand", 
 
 test("authenticated header shows the profile avatar when available", async ({ page }) => {
   await authenticateTestUser(page, [{ name: "header-avatar-smoke", value: "1" }]);
-  await page.goto("/tournaments");
+  const navigation = await page.goto("/tournaments");
+  await expectRawRobotsResponse(navigation, 200, null);
 
   const profileLink = page.getByRole("banner").getByRole("link", { name: "Профиль: lisalexy" });
   await expect(profileLink).toBeVisible();
@@ -899,14 +890,16 @@ test("service-only pages use metadata noindex while public profiles stay discove
     await expectRobotsTag(page, /noindex,? ?nofollow/u);
   }
 
-  for (const path of ["/platform-ops", "/tournaments/night-veil-open-5/profiles/u_lisalexy"]) {
-    await page.goto(path);
-    await expectRobotsTag(page, /^noindex$/u);
-  }
+  const anonymousOperationsNavigation = await page.goto("/platform-ops");
+  await expectRobotsTag(page, /^noindex$/u);
+  await expectRawRobotsResponse(anonymousOperationsNavigation, 404, /^noindex$/u);
+  await page.goto("/tournaments/night-veil-open-5/profiles/u_lisalexy");
+  await expectRobotsTag(page, /^noindex$/u);
 
   await authenticateTestUser(page);
-  await page.goto("/tournaments/night-veil-open-5/profiles/u_shadow");
+  const privateProfileNavigation = await page.goto("/tournaments/night-veil-open-5/profiles/u_shadow");
   await expectRobotsTag(page, /noindex,? ?nofollow/u);
+  await expectRawRobotsResponse(privateProfileNavigation, 200, /noindex,? ?nofollow/u);
 
   await page.goto("/profile/lisalexy");
   await expectRobotsTag(page, null);
@@ -993,6 +986,7 @@ test("notFound routes keep a real 404 during a held slow navigation", async ({ p
     "/tournaments/night-veil-open-5/profiles/u_shadow",
   );
   expect(missingProfile?.status()).toBe(404);
+  await expectRawRobotsResponse(missingProfile, 404, /^noindex$/u);
   await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
   await expectRobotsTag(page, /^noindex$/u);
 
@@ -1050,19 +1044,16 @@ test("robots metadata stays singular across hydrated public, private, and missin
   await page.getByRole("banner").getByRole("link", { name: "Турниры", exact: true }).click();
   await expect(page).toHaveURL(/\/tournaments$/u);
   await expectRobotsTag(page, null);
-  await expectRawRobots(page, "/tournaments", 200, null);
 
   await page.getByRole("main").getByRole("link", { name: "Открыть турнир: Night Veil Open #5", exact: true }).click();
   await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5$/u);
   await expectRobotsTag(page, null);
-  await expectRawRobots(page, "/tournaments/night-veil-open-5", 200, null);
 
   await page.getByRole("button", { name: "Состав" }).first().click();
   await page.getByRole("row").filter({ hasText: "ShadowHawk" }).getByRole("link", { name: "Профиль" }).click();
   await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5\/profiles\/u_shadow$/u);
   await expect(page.getByRole("heading", { name: "ShadowHawk" })).toBeVisible();
   await expectRobotsTag(page, /noindex,? ?nofollow/u);
-  await expectRawRobots(page, "/tournaments/night-veil-open-5/profiles/u_shadow", 200, /noindex,? ?nofollow/u);
 
   await page.getByRole("link", { name: "Назад к турниру", exact: true }).click();
   await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5$/u);
@@ -1078,12 +1069,10 @@ test("robots metadata stays singular across hydrated public, private, and missin
   await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5\/profiles\/u_shadow$/u);
   await expect(page.getByRole("banner")).toHaveCount(1);
   await expectRobotsTag(page, /^noindex$/u);
-  await expectRawRobots(page, "/tournaments/night-veil-open-5/profiles/u_shadow", 404, /^noindex$/u);
 
   await page.getByRole("link", { name: "На главную", exact: true }).click();
   await expect(page).toHaveURL(/\/$/u);
   await expectRobotsTag(page, null);
-  await expectRawRobots(page, "/", 200, null);
 
   // Keep the authenticated header mounted while removing the cookie. This
   // exercises the same soft-navigation boundary an expired session uses.
@@ -1093,7 +1082,6 @@ test("robots metadata stays singular across hydrated public, private, and missin
   await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
   await expect(page.getByRole("banner")).toHaveCount(1);
   await expectRobotsTag(page, /^noindex$/u);
-  await expectRawRobots(page, "/platform-ops", 404, /^noindex$/u);
 });
 
 test("site pages keep the same space between hero and working area", async ({ page }, testInfo) => {
@@ -1264,7 +1252,8 @@ test("authenticated tournament hydrates from one SSR workspace request", async (
     },
   ]);
 
-  await page.goto("/tournaments/night-veil-open-5");
+  const detailNavigation = await page.goto("/tournaments/night-veil-open-5");
+  await expectRawRobotsResponse(detailNavigation, 200, null);
   await expect(page.getByRole("heading", { name: "Night Veil Open #5", level: 1 })).toBeVisible();
 
   const bootstrapCount = await readSsrRequestCount(page, countScope, "/api/v1/auth/bootstrap");
@@ -2377,7 +2366,9 @@ test("home uses a balanced hero, numbered workflow, and featured patch hierarchy
 });
 
 test("home hierarchy collapses without overflow on configured viewports", async ({ page }) => {
-  await page.goto("/");
+  const navigation = await page.goto("/");
+  await expectRawRobotsResponse(navigation, 200, null);
+  await expectRobotsTag(page, null);
   await expect(page.locator("article.patch-featured")).toBeVisible();
   await expectNoHorizontalOverflow(page);
 
