@@ -44,6 +44,7 @@ TRUSTED_SECRET_ROOT = Path("/root/.oldsparky/liveqa")
 TRUSTED_PAYLOAD_ROOT = TRUSTED_SECRET_ROOT / "releases"
 TRUSTED_ACTIVE_MANIFEST = TRUSTED_SECRET_ROOT / "active-manifest.json"
 TRUSTED_ACTIVE_POINTER = TRUSTED_SECRET_ROOT / "active"
+TRUSTED_FAILURE_DIAGNOSTICS_ROOT = TRUSTED_SECRET_ROOT / "diagnostics"
 LIVE_QA_USER = "oldsparky-liveqa"
 RUNNER_CACHE_ROOT = Path("/var/lib/oldsparky-liveqa")
 BUILD_NODE_ROOT = Path("/var/lib/oldsparky-build")
@@ -56,7 +57,7 @@ LIVE_QA_CHILD_CAPTURE_BYTES = 64 * 1024
 LIVE_QA_CHILD_MARKER_RE = re.compile(
     r"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(none|playwright_cli_usage|"
     r"node_module_missing|browser_executable_missing|browser_launch_error|"
-    r"child_timeout|cleanup_failure|unclassified) stdout_bytes=([0-9]{1,16}) "
+    r"child_timeout|cleanup_failure|failure_report_unavailable|unclassified) stdout_bytes=([0-9]{1,16}) "
     r"stderr_bytes=([0-9]{1,16}) truncated=(true|false) child_exit=([0-9]{1,3})\n"
 )
 LIVE_QA_CGROUP = Path("/sys/fs/cgroup/system.slice") / LIVE_QA_SYSTEMD_UNIT
@@ -129,6 +130,12 @@ LIVE_QA_BROWSER_ROOTS = frozenset(
 STATE_NAME_PATTERN = re.compile(r"^live-user-qa\.[A-Za-z0-9]{6}$")
 SETUP_NAME_PATTERN = re.compile(r"^\.live-user-qa\.setup-[0-9a-f]{32}$")
 PUBLIC_GATE_NAME_PATTERN = re.compile(r"^public-live-qa\.[a-z0-9_]{8}$")
+LIVE_BROWSER_FAILURE_REPORT_NAME_PATTERN = re.compile(
+    r"^public-live-qa\.[a-z0-9_]{8}\.failure-v1\.json$"
+)
+LIVE_BROWSER_FAILURE_TEMP_NAME_PATTERN = re.compile(
+    r"^\.public-live-qa\.[a-z0-9_]{8}\.failure-v1\.json\.[0-9a-f]{32}\.tmp$"
+)
 PUBLICATION_TEMP_PATTERN = re.compile(r"^\.(?:inventory|phase)\.json\.[a-z0-9_]{8}$")
 MARKER_PATTERN = re.compile(r"^liveqa-[a-z0-9-]{6,56}$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -220,6 +227,38 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 LIVE_BROWSER_COUNTS_FILE = "live-counts-v1.json"
 LIVE_BROWSER_COUNTS_MAX_BYTES = 1024
+LIVE_BROWSER_FAILURES_FILE = "live-failures-v1.json"
+LIVE_BROWSER_FAILURES_MAX_BYTES = 16 * 1024
+LIVE_BROWSER_FAILURES_STORE_MAX_FILES = 10
+LIVE_BROWSER_FAILURES_RETENTION_SECONDS = 7 * 24 * 60 * 60
+LIVE_BROWSER_FAILURE_REPORT_EXIT = 42
+LIVE_BROWSER_FAILURE_COUNTS_EXIT = 43
+LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES = frozenset(
+    {
+        "route_root_overflow",
+        "route_info_overflow",
+        "route_tournaments_overflow",
+        "route_tournaments_new_overflow",
+        "route_profile_me_overflow",
+        "route_profile_lisalexy_overflow",
+        "chromium_sandbox",
+        "csp_nonce_rotation",
+        "csp_negative_probes",
+        "tournament_hub",
+        "tournament_catalog_containment",
+        "tournament_detail_bracket",
+        "admin_anonymous_protection",
+        "home_steps_overflow",
+        "contact_recipient_privacy",
+        "objective_icons",
+        "analytics_csp",
+        "image_csp_hosts",
+    }
+)
+LIVE_BROWSER_FAILURE_SOURCE_FILES = {
+    "tests/smoke/live-launch.spec.ts": "runtime/web/tests/smoke/live-launch.spec.ts",
+    "tests/support/live-qa-sandbox.ts": "runtime/web/tests/support/live-qa-sandbox.ts",
+}
 LIVE_BROWSER_COUNTS_RUN_STATUSES = frozenset(
     {"passed", "failed", "timedout", "interrupted"}
 )
@@ -258,6 +297,24 @@ except ModuleNotFoundError as exc:
     sys.modules[_machine_lock_name] = _machine_lock_module
     _machine_lock_spec.loader.exec_module(_machine_lock_module)
 GuardError = _machine_lock_module.GuardError
+
+
+class BrowserFailureReportUnavailable(GuardError):
+    """Carry the already-validated public counts through a private-write failure."""
+
+    def __init__(self, count_line: str) -> None:
+        super().__init__("private browser failure report could not be published")
+        self.count_line = count_line
+
+
+class BrowserFailureCounts(GuardError):
+    """Carry validated failed counts through the private CLI without losing the line."""
+
+    def __init__(self, count_line: str) -> None:
+        super().__init__("public browser QA counts indicate failure")
+        self.count_line = count_line
+
+
 MACHINE_LOCK_PATH = _machine_lock_module.MACHINE_LOCK_PATH
 _open_shared_machine_lock = _machine_lock_module.open_machine_lock
 _open_shared_machine_lock_directory = (
@@ -2021,6 +2078,781 @@ def prepare_public_browser_gate() -> Path:
     return gate
 
 
+def _assert_public_browser_failure_lock() -> None:
+    bundle_text = os.environ.get("PLATFORM_LIVE_CSP_QA_BUNDLE", "")
+    descriptor_text = os.environ.get(LOCK_ENV_NAME, "")
+    if (
+        bundle_text != str(TRUSTED_SECRET_ROOT / "csp-live-qa.json")
+        or not descriptor_text.isascii()
+        or not descriptor_text.isdecimal()
+    ):
+        raise GuardError("private browser diagnostics require the canonical QA lock")
+    try:
+        descriptor = int(descriptor_text)
+    except ValueError as exc:
+        raise GuardError("private browser diagnostics require the canonical QA lock") from exc
+    assert_bundle_lock(Path(bundle_text), descriptor)
+
+
+def _validate_public_browser_gate(gate: Path, *, source_sha: str, app_sha: str, marker_sha256: str) -> None:
+    if (
+        gate.parent != RUN_GATE_ROOT
+        or PUBLIC_GATE_NAME_PATTERN.fullmatch(gate.name) is None
+        or COMMIT_PATTERN.fullmatch(source_sha) is None
+        or COMMIT_PATTERN.fullmatch(app_sha) is None
+        or DIGEST_PATTERN.fullmatch(marker_sha256) is None
+    ):
+        raise GuardError("private browser diagnostics binding is invalid")
+    try:
+        root_metadata = RUN_GATE_ROOT.lstat()
+        gate_metadata = gate.lstat()
+        results_path = gate / "test-results"
+        results_metadata = results_path.lstat()
+    except OSError as exc:
+        raise GuardError("private browser diagnostics gate is unavailable") from exc
+    uid, gid = liveqa_identity()
+    if (
+        stat.S_ISLNK(root_metadata.st_mode)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or RUN_GATE_ROOT.resolve(strict=True) != RUN_GATE_ROOT
+        or root_metadata.st_uid != 0
+        or root_metadata.st_gid != 0
+        or stat.S_IMODE(root_metadata.st_mode) != 0o711
+        or stat.S_ISLNK(gate_metadata.st_mode)
+        or not stat.S_ISDIR(gate_metadata.st_mode)
+        or gate_metadata.st_uid != uid
+        or gate_metadata.st_gid != gid
+        or stat.S_IMODE(gate_metadata.st_mode) != 0o700
+        or stat.S_ISLNK(results_metadata.st_mode)
+        or not stat.S_ISDIR(results_metadata.st_mode)
+        or results_metadata.st_uid != uid
+        or results_metadata.st_gid != gid
+        or stat.S_IMODE(results_metadata.st_mode) != 0o700
+    ):
+        raise GuardError("private browser diagnostics gate metadata is unsafe")
+
+
+def _read_active_failure_manifest(app_sha: str) -> dict[str, object]:
+    install_root = Path(os.environ.get("PLATFORM_LIVE_QA_INSTALL_ROOT", ""))
+    target_sha = os.environ.get("PLATFORM_LIVE_QA_TARGET_SHA", "")
+    expected_root = TRUSTED_PAYLOAD_ROOT / app_sha
+    _validate_root_secret_parent(TRUSTED_ACTIVE_MANIFEST)
+    if (
+        COMMIT_PATTERN.fullmatch(app_sha) is None
+        or target_sha != app_sha
+        or str(install_root) != str(expected_root)
+    ):
+        raise GuardError("private browser diagnostics target is not the active payload")
+    try:
+        root_metadata = TRUSTED_SECRET_ROOT.lstat()
+        releases_metadata = TRUSTED_PAYLOAD_ROOT.lstat()
+        manifest_metadata = TRUSTED_ACTIVE_MANIFEST.lstat()
+        pointer_metadata = TRUSTED_ACTIVE_POINTER.lstat()
+        pointer_target = TRUSTED_ACTIVE_POINTER.resolve(strict=True)
+        payload_metadata = expected_root.lstat()
+    except OSError as exc:
+        raise GuardError("active private browser diagnostics manifest is unavailable") from exc
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != 0
+        or root_metadata.st_gid != 0
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        or not stat.S_ISDIR(releases_metadata.st_mode)
+        or releases_metadata.st_uid != 0
+        or releases_metadata.st_gid != 0
+        or stat.S_IMODE(releases_metadata.st_mode) != 0o755
+        or stat.S_ISLNK(manifest_metadata.st_mode)
+        or not stat.S_ISREG(manifest_metadata.st_mode)
+        or manifest_metadata.st_uid != 0
+        or manifest_metadata.st_gid != 0
+        or manifest_metadata.st_nlink != 1
+        or stat.S_IMODE(manifest_metadata.st_mode) != 0o444
+        or manifest_metadata.st_size > MAX_ACTIVE_MANIFEST_BYTES
+        or not stat.S_ISLNK(pointer_metadata.st_mode)
+        or pointer_metadata.st_uid != 0
+        or pointer_metadata.st_gid != 0
+        or pointer_metadata.st_nlink != 1
+        or pointer_target != expected_root
+        or stat.S_ISLNK(payload_metadata.st_mode)
+        or not stat.S_ISDIR(payload_metadata.st_mode)
+        or payload_metadata.st_uid != 0
+        or payload_metadata.st_gid != 0
+        or stat.S_IMODE(payload_metadata.st_mode) != 0o555
+        or expected_root.resolve(strict=True) != expected_root
+    ):
+        raise GuardError("active private browser diagnostics metadata is unsafe")
+    try:
+        descriptor = os.open(
+            TRUSTED_ACTIVE_MANIFEST,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            raw = os.read(descriptor, MAX_ACTIVE_MANIFEST_BYTES + 1)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            len(raw) > MAX_ACTIVE_MANIFEST_BYTES
+            or _fingerprint(opened) != _fingerprint(manifest_metadata)
+            or _fingerprint(after) != _fingerprint(opened)
+        ):
+            raise GuardError("active private browser diagnostics manifest changed")
+        manifest = json.loads(
+            raw.decode("ascii"),
+            object_pairs_hook=_strict_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                GuardError("active private browser diagnostics manifest is invalid")
+            ),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise GuardError("active private browser diagnostics manifest is invalid") from exc
+    expected_fields = {
+        "version",
+        "source_sha",
+        "release_slug",
+        "payload",
+        "payload_tree_sha256",
+        "files",
+    }
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != expected_fields
+        or manifest.get("version") != 1
+        or manifest.get("source_sha") != app_sha
+        or manifest.get("payload") != str(expected_root)
+        or not isinstance(manifest.get("release_slug"), str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", manifest["release_slug"]) is None
+        or not isinstance(manifest.get("payload_tree_sha256"), str)
+        or DIGEST_PATTERN.fullmatch(manifest["payload_tree_sha256"]) is None
+        or not isinstance(files, dict)
+        or any(
+            not isinstance(relative, str)
+            or not relative
+            or relative.startswith("/")
+            or "\\" in relative
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+            or not isinstance(digest, str)
+            or DIGEST_PATTERN.fullmatch(digest) is None
+            for relative, digest in files.items()
+        )
+    ):
+        raise GuardError("active private browser diagnostics manifest schema is invalid")
+    return {
+        "source_sha": app_sha,
+        "payload_root": expected_root,
+        "payload_tree_sha256": manifest["payload_tree_sha256"],
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "files": files,
+    }
+
+
+def _read_bound_failure_source(
+    manifest: Mapping[str, object],
+    relative: str,
+) -> bytes:
+    if relative not in LIVE_BROWSER_FAILURE_SOURCE_FILES:
+        raise GuardError("private browser failure source is outside its fixed manifest")
+    payload_root = manifest.get("payload_root")
+    files = manifest.get("files")
+    manifest_path = LIVE_BROWSER_FAILURE_SOURCE_FILES[relative]
+    if not isinstance(payload_root, Path) or not isinstance(files, dict):
+        raise GuardError("private browser failure source manifest is invalid")
+    expected_digest = files.get(manifest_path)
+    if not isinstance(expected_digest, str) or DIGEST_PATTERN.fullmatch(expected_digest) is None:
+        raise GuardError("private browser failure source is absent from the active manifest")
+    source_path = payload_root / manifest_path
+    try:
+        metadata = source_path.lstat()
+        descriptor = os.open(
+            source_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            raw = os.read(descriptor, 1024 * 1024 + 1)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) not in {0o444, 0o555}
+            or metadata.st_size > 1024 * 1024
+            or source_path.resolve(strict=True) != source_path
+            or len(raw) != metadata.st_size
+            or _fingerprint(opened) != _fingerprint(metadata)
+            or _fingerprint(after) != _fingerprint(opened)
+            or hashlib.sha256(raw).hexdigest() != expected_digest
+        ):
+            raise GuardError("private browser failure source changed from its manifest")
+    except OSError as exc:
+        raise GuardError("private browser failure source is unavailable") from exc
+    return raw
+
+
+def _validate_failure_location(
+    record: Mapping[str, object],
+    manifest: Mapping[str, object],
+) -> None:
+    source_file = record.get("source_file")
+    source_line = record.get("source_line")
+    source_column = record.get("source_column")
+    source_kind = record.get("source_kind")
+    if source_kind == "unavailable":
+        if source_file is not None or source_line is not None or source_column is not None:
+            raise GuardError("private browser failure location is malformed")
+        return
+    if (
+        not isinstance(source_file, str)
+        or source_file not in LIVE_BROWSER_FAILURE_SOURCE_FILES
+        or source_file.startswith("/")
+        or "\\" in source_file
+        or any(part in {"", ".", ".."} for part in source_file.split("/"))
+        or type(source_line) is not int
+        or not 1 <= source_line <= 10000
+        or type(source_column) is not int
+        or not 1 <= source_column <= 10000
+        or not isinstance(source_kind, str)
+        or source_kind not in {"assertion", "test_source", "declaration"}
+    ):
+        raise GuardError("private browser failure location is malformed")
+    source = _read_bound_failure_source(manifest, source_file)
+    lines = source.splitlines()
+    if source_line > len(lines) or source_column > len(lines[source_line - 1]) + 1:
+        raise GuardError("private browser failure location is outside its source")
+    line = lines[source_line - 1]
+    assertion = re.search(rb"\bexpect(?:\.poll)?\s*\(|\.to[A-Z][A-Za-z0-9]*\s*\(", line)
+    if source_kind == "assertion" and assertion is None:
+        raise GuardError("private browser assertion location is not an assertion")
+    if source_kind == "declaration" and (
+        source_file != "tests/smoke/live-launch.spec.ts"
+        or re.search(rb"\btest\s*\(", line) is None
+    ):
+        raise GuardError("private browser declaration location is not a test declaration")
+
+
+def _failure_report_store_directory(*, create: bool) -> int:
+    _validate_root_secret_parent(TRUSTED_FAILURE_DIAGNOSTICS_ROOT)
+    if create:
+        _ensure_root_directory(TRUSTED_FAILURE_DIAGNOSTICS_ROOT, 0o700)
+    try:
+        path_metadata = TRUSTED_FAILURE_DIAGNOSTICS_ROOT.lstat()
+        descriptor = os.open(
+            TRUSTED_FAILURE_DIAGNOSTICS_ROOT,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        resolved = TRUSTED_FAILURE_DIAGNOSTICS_ROOT.resolve(strict=True)
+    except OSError as exc:
+        raise GuardError("private browser diagnostics store is unavailable") from exc
+    if (
+        resolved != TRUSTED_FAILURE_DIAGNOSTICS_ROOT
+        or stat.S_ISLNK(path_metadata.st_mode)
+        or not stat.S_ISDIR(path_metadata.st_mode)
+        or path_metadata.st_uid != 0
+        or path_metadata.st_gid != 0
+        or stat.S_IMODE(path_metadata.st_mode) != 0o700
+        or path_metadata.st_nlink < 2
+        or (path_metadata.st_dev, path_metadata.st_ino)
+        != (opened.st_dev, opened.st_ino)
+    ):
+        os.close(descriptor)
+        raise GuardError("private browser diagnostics store metadata is unsafe")
+    return descriptor
+
+
+def _assert_failure_report_name_unused(gate: Path) -> None:
+    descriptor = _failure_report_store_directory(create=False)
+    try:
+        name = f"{gate.name}.failure-v1.json"
+        try:
+            os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise GuardError("private browser diagnostics gate identity cannot be checked") from exc
+        raise GuardError("private browser diagnostics gate identity was already used")
+    finally:
+        os.close(descriptor)
+
+
+def _read_failure_store_file(directory_fd: int, name: str) -> tuple[os.stat_result, bytes]:
+    try:
+        path_metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(path_metadata.st_mode)
+                or stat.S_ISLNK(path_metadata.st_mode)
+                or path_metadata.st_uid != 0
+                or path_metadata.st_gid != 0
+                or path_metadata.st_nlink != 1
+                or stat.S_IMODE(path_metadata.st_mode) != 0o600
+                or path_metadata.st_size > LIVE_BROWSER_FAILURES_MAX_BYTES
+                or _fingerprint(path_metadata) != _fingerprint(opened)
+            ):
+                raise GuardError("private browser diagnostics entry metadata is unsafe")
+            raw = os.read(descriptor, LIVE_BROWSER_FAILURES_MAX_BYTES + 1)
+            after = os.fstat(descriptor)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                len(raw) != opened.st_size
+                or len(raw) > LIVE_BROWSER_FAILURES_MAX_BYTES
+                or _fingerprint(after) != _fingerprint(opened)
+                or _fingerprint(current) != _fingerprint(opened)
+            ):
+                raise GuardError("private browser diagnostics entry changed while reading")
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise GuardError("private browser diagnostics entry is unavailable") from exc
+    return path_metadata, raw
+
+
+def _validate_retained_failure_report(name: str, raw: bytes) -> None:
+    gate = name.removesuffix(".failure-v1.json")
+    try:
+        payload = json.loads(
+            raw.decode("ascii"),
+            object_pairs_hook=_strict_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                GuardError("private browser diagnostics JSON is invalid")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise GuardError("retained private browser diagnostics record is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {
+            "schema", "gate", "source_sha", "app_sha", "marker_sha256",
+            "payload_manifest_sha256", "payload_tree_sha256", "observed_at",
+            "run_status", "failures",
+        }
+        or type(payload.get("schema")) is not int
+        or payload.get("schema") != 1
+        or payload.get("gate") != gate
+        or not PUBLIC_GATE_NAME_PATTERN.fullmatch(gate)
+        or not isinstance(payload.get("source_sha"), str)
+        or COMMIT_PATTERN.fullmatch(payload["source_sha"]) is None
+        or not isinstance(payload.get("app_sha"), str)
+        or COMMIT_PATTERN.fullmatch(payload["app_sha"]) is None
+        or not isinstance(payload.get("marker_sha256"), str)
+        or DIGEST_PATTERN.fullmatch(payload["marker_sha256"]) is None
+        or not isinstance(payload.get("payload_manifest_sha256"), str)
+        or DIGEST_PATTERN.fullmatch(payload["payload_manifest_sha256"]) is None
+        or not isinstance(payload.get("payload_tree_sha256"), str)
+        or DIGEST_PATTERN.fullmatch(payload["payload_tree_sha256"]) is None
+        or not isinstance(payload.get("observed_at"), str)
+        or re.fullmatch(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", payload["observed_at"]) is None
+        or not isinstance(payload.get("run_status"), str)
+        or payload.get("run_status") not in {"failed", "timedout", "interrupted"}
+        or not isinstance(payload.get("failures"), list)
+        or len(payload["failures"]) > 32768
+    ):
+        raise GuardError("retained private browser diagnostics schema is invalid")
+    seen: set[tuple[str, str, int]] = set()
+    for failure in payload["failures"]:
+        if (
+            not isinstance(failure, dict)
+            or set(failure) != {
+                "id", "project", "status", "attempt", "source_file",
+                "source_line", "source_column", "source_kind",
+            }
+            or not isinstance(failure.get("id"), str)
+            or failure["id"] not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
+            or not isinstance(failure.get("project"), str)
+            or failure["project"] not in {
+                "live-desktop", "live-mobile", "live-webkit-mobile",
+            }
+            or not isinstance(failure.get("status"), str)
+            or failure["status"] not in {"failed", "timedOut", "interrupted"}
+            or type(failure.get("attempt")) is not int
+            or not 1 <= failure["attempt"] <= 32768
+        ):
+            raise GuardError("retained private browser diagnostics record is invalid")
+        key = (failure["id"], failure["project"], failure["attempt"])
+        if key in seen:
+            raise GuardError("retained private browser diagnostics record is duplicated")
+        seen.add(key)
+        source_file = failure.get("source_file")
+        source_line = failure.get("source_line")
+        source_column = failure.get("source_column")
+        source_kind = failure.get("source_kind")
+        if source_kind == "unavailable":
+            if source_file is not None or source_line is not None or source_column is not None:
+                raise GuardError("retained private browser diagnostics location is invalid")
+            continue
+        if (
+            not isinstance(source_file, str)
+            or source_file not in LIVE_BROWSER_FAILURE_SOURCE_FILES
+            or type(source_line) is not int
+            or not 1 <= source_line <= 10000
+            or type(source_column) is not int
+            or not 1 <= source_column <= 10000
+            or not isinstance(source_kind, str)
+            or source_kind not in {"assertion", "test_source", "declaration"}
+        ):
+            raise GuardError("retained private browser diagnostics location is invalid")
+
+
+def _prune_browser_failure_diagnostics(*, reserve_slots: int) -> None:
+    directory_fd = _failure_report_store_directory(create=False)
+    try:
+        reports: list[tuple[str, os.stat_result, bytes]] = []
+        names = os.listdir(directory_fd)
+        if len(names) > LIVE_BROWSER_FAILURES_STORE_MAX_FILES + 22:
+            raise GuardError("private browser diagnostics store exceeds its entry bound")
+        for name in names:
+            if LIVE_BROWSER_FAILURE_REPORT_NAME_PATTERN.fullmatch(name):
+                metadata, raw = _read_failure_store_file(directory_fd, name)
+                _validate_retained_failure_report(name, raw)
+                reports.append((name, metadata, raw))
+            elif LIVE_BROWSER_FAILURE_TEMP_NAME_PATTERN.fullmatch(name):
+                metadata, _raw = _read_failure_store_file(directory_fd, name)
+                _unlink_failure_store_entry(directory_fd, name, metadata)
+            else:
+                raise GuardError("private browser diagnostics store contains an unknown entry")
+        now = time.time()
+        for name, metadata, _raw in list(reports):
+            if metadata.st_mtime > now + 300:
+                raise GuardError("private browser diagnostics timestamp is unsafe")
+            if now - metadata.st_mtime > LIVE_BROWSER_FAILURES_RETENTION_SECONDS:
+                _unlink_failure_store_entry(directory_fd, name, metadata)
+                reports.remove((name, metadata, _raw))
+        target_count = LIVE_BROWSER_FAILURES_STORE_MAX_FILES - reserve_slots
+        if target_count < 0:
+            raise GuardError("private browser diagnostics retention reservation is invalid")
+        reports.sort(key=lambda item: (item[1].st_mtime_ns, item[0]))
+        while len(reports) > target_count:
+            name, metadata, _raw = reports.pop(0)
+            _unlink_failure_store_entry(directory_fd, name, metadata)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _unlink_failure_store_entry(
+    directory_fd: int,
+    name: str,
+    expected: os.stat_result,
+) -> None:
+    if not (
+        LIVE_BROWSER_FAILURE_REPORT_NAME_PATTERN.fullmatch(name)
+        or LIVE_BROWSER_FAILURE_TEMP_NAME_PATTERN.fullmatch(name)
+    ):
+        raise GuardError("private browser diagnostics retention name is invalid")
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise GuardError("private browser diagnostics retention entry changed") from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or stat.S_ISLNK(current.st_mode)
+        or current.st_uid != 0
+        or current.st_gid != 0
+        or current.st_nlink != 1
+        or stat.S_IMODE(current.st_mode) != 0o600
+        or _fingerprint(current) != _fingerprint(expected)
+    ):
+        raise GuardError("private browser diagnostics retention entry changed")
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except OSError as exc:
+        raise GuardError("private browser diagnostics retention cleanup failed") from exc
+    os.fsync(directory_fd)
+
+
+def prepare_public_browser_failure_diagnostics(
+    gate: Path,
+    *,
+    source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+) -> None:
+    _validate_public_browser_gate(
+        gate,
+        source_sha=source_sha,
+        app_sha=app_sha,
+        marker_sha256=marker_sha256,
+    )
+    manifest = _read_active_failure_manifest(app_sha)
+    for source_file in LIVE_BROWSER_FAILURE_SOURCE_FILES:
+        _read_bound_failure_source(manifest, source_file)
+    descriptor = _failure_report_store_directory(create=True)
+    os.close(descriptor)
+    _assert_failure_report_name_unused(gate)
+    _prune_browser_failure_diagnostics(reserve_slots=1)
+
+
+def _failure_report_required(counts: Mapping[str, object]) -> bool:
+    return (
+        counts.get("run_status") != "passed"
+        or any(
+            counts.get(field, 0) > 0
+            for field in (
+                "logical_fail", "logical_expected_fail", "logical_flaky",
+                "logical_interrupted", "attempt_fail", "attempt_interrupted",
+                "attempt_timedout",
+            )
+        )
+    )
+
+
+def _read_ephemeral_failure_report(
+    gate: Path,
+    *,
+    source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+    counts: Mapping[str, object],
+    manifest: Mapping[str, object],
+) -> list[dict[str, object]]:
+    uid, gid = liveqa_identity()
+    results_path = gate / "test-results"
+    try:
+        results_path_metadata = results_path.lstat()
+        results_fd = os.open(
+            results_path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened_results = os.fstat(results_fd)
+            path_metadata = os.stat(
+                LIVE_BROWSER_FAILURES_FILE,
+                dir_fd=results_fd,
+                follow_symlinks=False,
+            )
+            descriptor = os.open(
+                LIVE_BROWSER_FAILURES_FILE,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=results_fd,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                raw = os.read(descriptor, LIVE_BROWSER_FAILURES_MAX_BYTES + 1)
+                after = os.fstat(descriptor)
+                current = os.stat(
+                    LIVE_BROWSER_FAILURES_FILE,
+                    dir_fd=results_fd,
+                    follow_symlinks=False,
+                )
+                results_after = results_path.lstat()
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(results_fd)
+    except OSError as exc:
+        raise GuardError("ephemeral browser failure report is unavailable") from exc
+    if (
+        stat.S_ISLNK(results_path_metadata.st_mode)
+        or not stat.S_ISDIR(results_path_metadata.st_mode)
+        or results_path_metadata.st_uid != uid
+        or results_path_metadata.st_gid != gid
+        or stat.S_IMODE(results_path_metadata.st_mode) != 0o700
+        or _fingerprint(results_path_metadata) != _fingerprint(opened_results)
+        or _fingerprint(results_after) != _fingerprint(opened_results)
+        or stat.S_ISLNK(path_metadata.st_mode)
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_uid != uid
+        or path_metadata.st_gid != gid
+        or path_metadata.st_nlink != 1
+        or stat.S_IMODE(path_metadata.st_mode) != 0o600
+        or path_metadata.st_size > LIVE_BROWSER_FAILURES_MAX_BYTES
+        or len(raw) != path_metadata.st_size
+        or len(raw) > LIVE_BROWSER_FAILURES_MAX_BYTES
+        or _fingerprint(opened) != _fingerprint(path_metadata)
+        or _fingerprint(after) != _fingerprint(opened)
+        or _fingerprint(current) != _fingerprint(opened)
+    ):
+        raise GuardError("ephemeral browser failure report metadata is unsafe")
+    try:
+        payload = json.loads(
+            raw.decode("ascii"),
+            object_pairs_hook=_strict_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                GuardError("ephemeral browser failure JSON is invalid")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise GuardError("ephemeral browser failure report is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {
+            "schema", "gate", "source_sha", "app_sha", "marker_sha256", "run_status", "failures",
+        }
+        or type(payload.get("schema")) is not int
+        or payload.get("schema") != 1
+        or payload.get("gate") != gate.name
+        or payload.get("source_sha") != source_sha
+        or payload.get("app_sha") != app_sha
+        or payload.get("marker_sha256") != marker_sha256
+        or payload.get("run_status") != counts.get("run_status")
+        or not isinstance(payload.get("failures"), list)
+    ):
+        raise GuardError("ephemeral browser failure report binding is invalid")
+    failures = payload["failures"]
+    expected_attempt_failures = sum(
+        int(counts[field])
+        for field in ("attempt_fail", "attempt_interrupted", "attempt_timedout")
+    )
+    if len(failures) != expected_attempt_failures:
+        raise GuardError("ephemeral browser failure report is incomplete")
+    seen: set[tuple[str, str, int]] = set()
+    failure_status_counts = {"failed": 0, "interrupted": 0, "timedOut": 0}
+    for record in failures:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {
+                "id", "project", "status", "attempt", "source_file", "source_line",
+                "source_column", "source_kind",
+            }
+            or record.get("id") not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
+            or record.get("project") not in {"live-desktop", "live-mobile", "live-webkit-mobile"}
+            or record.get("status") not in {"failed", "timedOut", "interrupted"}
+            or type(record.get("attempt")) is not int
+            or not 1 <= record["attempt"] <= 32768
+        ):
+            raise GuardError("ephemeral browser failure record is invalid")
+        key = (str(record["id"]), str(record["project"]), record["attempt"])
+        if key in seen:
+            raise GuardError("ephemeral browser failure record is duplicated")
+        seen.add(key)
+        failure_status_counts[record["status"]] += 1
+        _validate_failure_location(record, manifest)
+    if failure_status_counts != {
+        "failed": counts["attempt_fail"],
+        "interrupted": counts["attempt_interrupted"],
+        "timedOut": counts["attempt_timedout"],
+    }:
+        raise GuardError("private browser failure statuses do not match the count record")
+    return failures
+
+
+def _publish_private_browser_failure_report(
+    gate: Path,
+    *,
+    source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+    counts: Mapping[str, object],
+) -> None:
+    if not _failure_report_required(counts):
+        return
+    manifest = _read_active_failure_manifest(app_sha)
+    failures = _read_ephemeral_failure_report(
+        gate,
+        source_sha=source_sha,
+        app_sha=app_sha,
+        marker_sha256=marker_sha256,
+        counts=counts,
+        manifest=manifest,
+    )
+    observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    payload = {
+        "schema": 1,
+        "gate": gate.name,
+        "source_sha": source_sha,
+        "app_sha": app_sha,
+        "marker_sha256": marker_sha256,
+        "payload_manifest_sha256": manifest["manifest_sha256"],
+        "payload_tree_sha256": manifest["payload_tree_sha256"],
+        "observed_at": observed_at,
+        "run_status": counts["run_status"],
+        "failures": failures,
+    }
+    encoded = (json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+    if len(encoded) > LIVE_BROWSER_FAILURES_MAX_BYTES:
+        raise GuardError("private browser failure report exceeds its size limit")
+    _assert_failure_report_name_unused(gate)
+    _prune_browser_failure_diagnostics(reserve_slots=1)
+    directory_fd = _failure_report_store_directory(create=False)
+    final_name = f"{gate.name}.failure-v1.json"
+    temporary_name = f".{final_name}.{uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, encoded, failure="private browser failure report could not be written")
+        os.fsync(descriptor)
+        temporary_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(temporary_metadata.st_mode)
+            or temporary_metadata.st_uid != 0
+            or temporary_metadata.st_gid != 0
+            or temporary_metadata.st_nlink != 1
+            or stat.S_IMODE(temporary_metadata.st_mode) != 0o600
+            or temporary_metadata.st_size != len(encoded)
+        ):
+            raise GuardError("private browser failure report temp metadata is unsafe")
+        os.close(descriptor)
+        descriptor = None
+        # linkat-style publication is atomic and refuses to replace an existing run record.
+        os.link(
+            temporary_name,
+            final_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        final_metadata = os.stat(final_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(final_metadata.st_mode)
+            or final_metadata.st_uid != 0
+            or final_metadata.st_gid != 0
+            or final_metadata.st_nlink != 1
+            or stat.S_IMODE(final_metadata.st_mode) != 0o600
+            or final_metadata.st_size != len(encoded)
+        ):
+            raise GuardError("private browser failure report publication metadata is unsafe")
+    except OSError as exc:
+        raise GuardError("private browser failure report could not be published") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(directory_fd)
+
+
 def _browser_count_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
     return (
         metadata.st_dev,
@@ -2037,6 +2869,8 @@ def public_browser_counts_line(
     source_sha: str,
     app_sha: str,
     marker_sha256: str,
+    persist_failure_report: bool = False,
+    fail_on_failure_counts: bool = False,
 ) -> str:
     """Read one exact private Playwright count record and project closed fields."""
 
@@ -2193,7 +3027,23 @@ def public_browser_counts_line(
         f"app_sha={app_sha}",
         f"marker_sha256={marker_sha256}",
     ]
-    return "LIVE_BROWSER_COUNTS schema=1 " + " ".join(ordered) + "\n"
+    line = "LIVE_BROWSER_COUNTS schema=1 " + " ".join(ordered) + "\n"
+    if persist_failure_report:
+        try:
+            _publish_private_browser_failure_report(
+                gate,
+                source_sha=source_sha,
+                app_sha=app_sha,
+                marker_sha256=marker_sha256,
+                counts=payload,
+            )
+        except Exception as exc:
+            # Preserve the public counts record and original browser exit. The
+            # wrapper converts this fixed status into its closed marker kind.
+            raise BrowserFailureReportUnavailable(line) from exc
+    if fail_on_failure_counts and _failure_report_required(payload):
+        raise BrowserFailureCounts(line)
+    return line
 
 
 def _walk_nofollow(root: Path) -> list[Path]:
@@ -5806,11 +6656,18 @@ def _parser() -> argparse.ArgumentParser:
     gate.add_argument("--bundle-path", type=Path, required=True)
     gate.add_argument("--state-dir", type=Path, required=True)
     commands.add_parser("prepare-public-browser-gate")
+    failure_diagnostics = commands.add_parser("prepare-public-failure-diagnostics")
+    failure_diagnostics.add_argument("--gate", type=Path, required=True)
+    failure_diagnostics.add_argument("--source-sha", required=True)
+    failure_diagnostics.add_argument("--app-sha", required=True)
+    failure_diagnostics.add_argument("--marker-sha256", required=True)
     browser_counts = commands.add_parser("emit-public-browser-counts")
     browser_counts.add_argument("--gate", type=Path, required=True)
     browser_counts.add_argument("--source-sha", required=True)
     browser_counts.add_argument("--app-sha", required=True)
     browser_counts.add_argument("--marker-sha256", required=True)
+    browser_counts.add_argument("--persist-failure-report", action="store_true")
+    browser_counts.add_argument("--fail-on-failure-counts", action="store_true")
     merge = commands.add_parser("merge-browser-inventory")
     merge.add_argument("--bundle-path", type=Path, required=True)
     merge.add_argument("--state-dir", type=Path, required=True)
@@ -5946,16 +6803,35 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(prepare_browser_gate(args.bundle_path, args.state_dir))
         elif args.command == "prepare-public-browser-gate":
             print(prepare_public_browser_gate())
+        elif args.command == "prepare-public-failure-diagnostics":
+            _assert_public_browser_failure_lock()
+            prepare_public_browser_failure_diagnostics(
+                args.gate,
+                source_sha=args.source_sha,
+                app_sha=args.app_sha,
+                marker_sha256=args.marker_sha256,
+            )
         elif args.command == "emit-public-browser-counts":
-            print(
-                public_browser_counts_line(
+            if args.fail_on_failure_counts and not args.persist_failure_report:
+                raise GuardError("failure-count rejection requires a private failure report")
+            if args.persist_failure_report:
+                _assert_public_browser_failure_lock()
+            try:
+                line = public_browser_counts_line(
                     args.gate,
                     source_sha=args.source_sha,
                     app_sha=args.app_sha,
                     marker_sha256=args.marker_sha256,
-                ),
-                end="",
-            )
+                    persist_failure_report=args.persist_failure_report,
+                    fail_on_failure_counts=args.fail_on_failure_counts,
+                )
+            except BrowserFailureReportUnavailable as exc:
+                print(exc.count_line, end="")
+                return LIVE_BROWSER_FAILURE_REPORT_EXIT
+            except BrowserFailureCounts as exc:
+                print(exc.count_line, end="")
+                return LIVE_BROWSER_FAILURE_COUNTS_EXIT
+            print(line, end="")
         elif args.command == "merge-browser-inventory":
             merge_browser_inventory(args.bundle_path, args.state_dir)
         elif args.command == "remove-browser-gate":

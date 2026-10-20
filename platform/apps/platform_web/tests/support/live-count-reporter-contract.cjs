@@ -11,6 +11,7 @@ const {
   bindingsFromEnvironment,
   summarizeRun,
   writeBoundedSummary,
+  writeBoundedFailureSummary,
 } = require("./live-count-reporter.cjs");
 
 function test(outcome, results = [], expectedStatus = "passed") {
@@ -365,6 +366,219 @@ try {
   assert.equal(userReport.run_status, "passed");
 } finally {
   fs.rmSync(temporary, { recursive: true, force: true });
+}
+
+function diagnosticFixture(root, suffix = "d1a2b3c4") {
+  const gateRoot = path.join(root, "gate-root");
+  const gate = path.join(gateRoot, `public-live-qa.${suffix}`);
+  const results = path.join(gate, "test-results");
+  const sourceRoot = path.join(root, "source");
+  const spec = path.join(sourceRoot, "tests", "smoke", "live-launch.spec.ts");
+  const helper = path.join(sourceRoot, "tests", "support", "live-qa-sandbox.ts");
+  fs.mkdirSync(results, { recursive: true, mode: 0o700 });
+  fs.chmodSync(gateRoot, 0o711);
+  fs.mkdirSync(path.dirname(spec), { recursive: true, mode: 0o755 });
+  fs.mkdirSync(path.dirname(helper), { recursive: true, mode: 0o755 });
+  fs.writeFileSync(spec, 'test("declaration", async () => {\n  await helper();\n});\n');
+  fs.writeFileSync(helper, 'async function check() {\n  await expect.poll(readSnapshot).toEqual({ ok: true });\n}\n');
+  return {
+    gateRoot,
+    gate,
+    results,
+    sourceRoot,
+    spec,
+    helper,
+    binding: {
+      gate,
+      source_sha: "b".repeat(40),
+      app_sha: "a".repeat(40),
+      marker_sha256: "c".repeat(64),
+    },
+  };
+}
+
+function withRootOwnedGate(gateRoot, run) {
+  const originalLstat = fs.lstatSync;
+  try {
+    if (process.getuid() !== 0) {
+      fs.lstatSync = function lstatWithRootOwnedGate(target, ...args) {
+        const metadata = originalLstat.call(fs, target, ...args);
+        if (target !== gateRoot) return metadata;
+        return new Proxy(metadata, {
+          get(value, key, receiver) {
+            return key === "uid" ? 0 : Reflect.get(value, key, receiver);
+          },
+        });
+      };
+    }
+    return run();
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
+}
+
+function failureTest(fixture, { title = publicTitles[6], project = "live-desktop", errorLocation, results } = {}) {
+  return {
+    title,
+    expectedStatus: "passed",
+    parent: { project: () => ({ name: project }) },
+    results: results ?? [{
+      status: "failed",
+      errors: [{ message: "private assertion text", location: errorLocation }],
+    }],
+    outcome: () => "unexpected",
+    location: { file: fixture.spec, line: 1, column: 1 },
+  };
+}
+
+function publicPlanWithFailure(failure) {
+  const project = failure.parent.project().name;
+  let matches = 0;
+  const selected = publicTests.map((testCase) => {
+    if (testCase.title !== failure.title || testCase.parent.project().name !== project) {
+      return testCase;
+    }
+    matches += 1;
+    return failure;
+  });
+  assert.equal(matches, 1, "a failure must belong to one planned public case");
+  return selected;
+}
+
+const failureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "live-failure-contract-"));
+try {
+  const successFixture = diagnosticFixture(failureRoot, "c1a2b3c4");
+  const successfulSummary = summarizeRun(publicSuite, "passed", { publicGate: true });
+  assert.equal(successfulSummary.run_status, "passed");
+  assert.equal(withRootOwnedGate(successFixture.gateRoot, () => writeBoundedFailureSummary(
+    successFixture.binding,
+    publicSuite,
+    successfulSummary,
+    { gateRoot: successFixture.gateRoot, sourceRoot: successFixture.sourceRoot },
+  )), false, "a successful public suite does not create private failure details");
+  assert.equal(
+    fs.existsSync(path.join(successFixture.results, "live-failures-v1.json")),
+    false,
+  );
+
+  const fixture = diagnosticFixture(failureRoot);
+  const failure = failureTest(fixture, {
+    errorLocation: { file: fixture.helper, line: 2, column: 3 },
+  });
+  const failurePlan = publicPlanWithFailure(failure);
+  const failedSummary = summarizeRun(
+    { allTests: () => failurePlan },
+    "failed",
+    { publicGate: true },
+  );
+  assert.equal(failedSummary.run_status, "failed");
+  assert.equal(withRootOwnedGate(fixture.gateRoot, () => writeBoundedFailureSummary(
+    fixture.binding,
+    { allTests: () => failurePlan },
+    failedSummary,
+    { gateRoot: fixture.gateRoot, sourceRoot: fixture.sourceRoot },
+  )), true, "a shared support-helper assertion is retained as a closed failure record");
+  const reportPath = path.join(fixture.results, "live-failures-v1.json");
+  const reportMetadata = fs.lstatSync(reportPath);
+  const reportBytes = fs.readFileSync(reportPath);
+  const report = JSON.parse(reportBytes.toString("ascii"));
+  assert.equal(reportMetadata.isFile(), true);
+  assert.equal(reportMetadata.nlink, 1);
+  assert.equal(reportMetadata.mode & 0o777, 0o600);
+  assert.ok(reportBytes.length <= 16 * 1024);
+  assert.deepEqual(Object.keys(report).sort(), [
+    "app_sha", "failures", "gate", "marker_sha256", "run_status", "schema", "source_sha",
+  ].sort());
+  assert.deepEqual(report.failures, [{
+    id: "chromium_sandbox",
+    project: "live-desktop",
+    status: "failed",
+    attempt: 1,
+    source_file: "tests/support/live-qa-sandbox.ts",
+    source_line: 2,
+    source_column: 3,
+    source_kind: "assertion",
+  }]);
+  assert.equal(reportBytes.includes(Buffer.from("private assertion text")), false);
+  assert.equal(reportBytes.includes(Buffer.from("private-playwright-id")), false);
+  assert.equal(reportBytes.includes(Buffer.from("private title")), false);
+  assert.equal(reportBytes.includes(Buffer.from(failureRoot)), false);
+
+  const malformedFixture = diagnosticFixture(failureRoot, "e1a2b3c4");
+  const malformed = failureTest(malformedFixture, {
+    errorLocation: { file: "../../etc/passwd", line: 2, column: 3 },
+  });
+  const malformedPlan = publicPlanWithFailure(malformed);
+  assert.equal(withRootOwnedGate(malformedFixture.gateRoot, () => writeBoundedFailureSummary(
+    malformedFixture.binding,
+    { allTests: () => malformedPlan },
+    failedSummary,
+    { gateRoot: malformedFixture.gateRoot, sourceRoot: malformedFixture.sourceRoot },
+  )), true);
+  const fallbackReport = JSON.parse(
+    fs.readFileSync(path.join(malformedFixture.results, "live-failures-v1.json"), "ascii"),
+  );
+  assert.equal(fallbackReport.failures[0].source_file, "tests/smoke/live-launch.spec.ts");
+  assert.equal(fallbackReport.failures[0].source_kind, "declaration");
+  assert.equal(fallbackReport.failures[0].source_line, 1);
+
+  const unknownFixture = diagnosticFixture(failureRoot, "f1a2b3c4");
+  const unknown = failureTest(unknownFixture, { title: "arbitrary private test title" });
+  const unknownPlan = [...publicTests];
+  unknownPlan[0] = unknown;
+  assert.equal(withRootOwnedGate(unknownFixture.gateRoot, () => writeBoundedFailureSummary(
+    unknownFixture.binding,
+    { allTests: () => unknownPlan },
+    failedSummary,
+    { gateRoot: unknownFixture.gateRoot, sourceRoot: unknownFixture.sourceRoot },
+  )), false, "a test outside the complete fixed public manifest is not serialized");
+  assert.equal(fs.existsSync(path.join(unknownFixture.results, "live-failures-v1.json")), false);
+
+  const symlinkFixture = diagnosticFixture(failureRoot, "a1a2b3c4");
+  const symlinkPath = path.join(symlinkFixture.results, "live-failures-v1.json");
+  fs.symlinkSync("/dev/null", symlinkPath);
+  const symlinkCase = failureTest(symlinkFixture, {
+    errorLocation: { file: symlinkFixture.helper, line: 2, column: 3 },
+  });
+  assert.equal(withRootOwnedGate(symlinkFixture.gateRoot, () => writeBoundedFailureSummary(
+    symlinkFixture.binding,
+    { allTests: () => [symlinkCase] },
+    failedSummary,
+    { gateRoot: symlinkFixture.gateRoot, sourceRoot: symlinkFixture.sourceRoot },
+  )), false, "a preexisting symlink failure report is never followed or replaced");
+  assert.equal(fs.lstatSync(symlinkPath).isSymbolicLink(), true);
+
+  const sizeFixture = diagnosticFixture(failureRoot, "b1a2b3c4");
+  const requiredSkips = new Set(
+    publicTests
+      .filter((testCase) => testCase.outcome() === "skipped")
+      .slice(0, 6)
+      .map((testCase) => `${testCase.parent.project().name}:${testCase.title}`),
+  );
+  const fullPlanFailures = publicTests.map((testCase) => {
+    const key = `${testCase.parent.project().name}:${testCase.title}`;
+    return requiredSkips.has(key) ? testCase : failureTest(sizeFixture, {
+      title: testCase.title,
+      project: testCase.parent.project().name,
+      errorLocation: { file: sizeFixture.helper, line: 2, column: 3 },
+    });
+  });
+  const fullFailureSummary = summarizeRun(
+    { allTests: () => fullPlanFailures },
+    "failed",
+    { publicGate: true },
+  );
+  assert.equal(fullFailureSummary.attempts.fail, 48);
+  assert.equal(fullFailureSummary.logical.skip, 6);
+  assert.equal(withRootOwnedGate(sizeFixture.gateRoot, () => writeBoundedFailureSummary(
+    sizeFixture.binding,
+    { allTests: () => fullPlanFailures },
+    fullFailureSummary,
+    { gateRoot: sizeFixture.gateRoot, sourceRoot: sizeFixture.sourceRoot },
+  )), true, "48 fixed attempt failures fit within the bounded report");
+  assert.ok(fs.statSync(path.join(sizeFixture.results, "live-failures-v1.json")).size <= 16 * 1024);
+} finally {
+  fs.rmSync(failureRoot, { recursive: true, force: true });
 }
 
 process.stdout.write("live-count-reporter-contract: PASS\n");

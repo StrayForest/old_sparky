@@ -7,8 +7,10 @@ const path = require("node:path");
 
 const MAX_TESTS = 4096;
 const MAX_REPORT_BYTES = 1024;
+const MAX_FAILURE_REPORT_BYTES = 16 * 1024;
 const MAX_ATTEMPTS = 32768;
 const GATE_ROOT = "/run/oldsparky-liveqa";
+const FAILURE_REPORT_FILE = "live-failures-v1.json";
 const RUN_STATUSES = new Set(["passed", "failed", "timedout", "interrupted"]);
 const ATTEMPT_STATUSES = new Set([
   "passed",
@@ -28,6 +30,31 @@ const PUBLIC_PROJECTS = new Set([
   "live-mobile",
   "live-webkit-mobile",
 ]);
+const PUBLIC_TEST_IDS = new Map([
+  ["live route / renders without horizontal overflow", "route_root_overflow"],
+  ["live route /info renders without horizontal overflow", "route_info_overflow"],
+  ["live route /tournaments renders without horizontal overflow", "route_tournaments_overflow"],
+  ["live route /tournaments/new renders without horizontal overflow", "route_tournaments_new_overflow"],
+  ["live route /profile/me renders without horizontal overflow", "route_profile_me_overflow"],
+  ["live route /profile/lisalexy renders without horizontal overflow", "route_profile_lisalexy_overflow"],
+  ["production Chromium live QA keeps its process sandbox enabled", "chromium_sandbox"],
+  ["live CSP nonce is stable on soft navigation and rotates on hard reload", "csp_nonce_rotation"],
+  ["local enforced CSP blocks negative inline and external probes", "csp_negative_probes"],
+  ["live tournaments hub exposes a valid empty or populated list", "tournament_hub"],
+  ["live 1920 catalog stays contained after every card asset loads", "tournament_catalog_containment"],
+  ["live tournament detail and bracket routes render from the current public data", "tournament_detail_bracket"],
+  ["live admin route is protected for anonymous users", "admin_anonymous_protection"],
+  ["live home uses text-only tournament steps without overflow", "home_steps_overflow"],
+  ["live public contact surfaces do not publish the support recipient", "contact_recipient_privacy"],
+  ["live patch renders separate Urn and Rift objectives with source icons", "objective_icons"],
+  ["live Cloudflare Analytics is conditionally observed without widening CSP", "analytics_csp"],
+  ["live image currentSrc inventory stays inside the exact CSP hosts", "image_csp_hosts"],
+]);
+const FAILURE_SOURCE_FILES = new Set([
+  "tests/smoke/live-launch.spec.ts",
+  "tests/support/live-qa-sandbox.ts",
+]);
+const FAILURE_ATTEMPT_STATUSES = new Set(["failed", "timedOut", "interrupted"]);
 const PUBLIC_TEST_TITLES = new Set([
   ...[
     "/", "/info", "/tournaments", "/tournaments/new", "/profile/me", "/profile/lisalexy",
@@ -194,7 +221,7 @@ function summarizeRun(suite, runStatus, { publicGate = false } = {}) {
   };
 }
 
-function bindingsFromEnvironment(env = process.env) {
+function bindingsFromEnvironment(env = process.env, { gateRoot = GATE_ROOT } = {}) {
   const gate = env.PLATFORM_QA_BROWSER_GATE_DIR;
   const sessions = env.PLATFORM_LIVE_USER_QA_SESSIONS;
   const appSha = env.PLATFORM_LIVE_QA_TARGET_SHA;
@@ -205,7 +232,7 @@ function bindingsFromEnvironment(env = process.env) {
   const liveUserGate = LIVE_USER_GATE_NAME.test(gateName);
   if (
     typeof gate !== "string"
-    || path.dirname(gate) !== GATE_ROOT
+    || path.dirname(gate) !== gateRoot
     || !supportedGateName(gateName)
     || (publicGate && Object.prototype.hasOwnProperty.call(env, "PLATFORM_LIVE_USER_QA_SESSIONS"))
     || (liveUserGate && sessions !== path.join(gate, "browser-sessions.json"))
@@ -300,16 +327,233 @@ function writeBoundedSummary(binding, summary, { gateRoot = GATE_ROOT } = {}) {
   }
 }
 
+function normalizedFailureLocation(location, sourceRoot, fallbackKind) {
+  if (
+    !location
+    || typeof location.file !== "string"
+    || location.file.length > 4096
+    || /[\\\u0000-\u001f\u007f]/u.test(location.file)
+    || location.file.split(/[\\/]/u).includes("..")
+    || !Number.isSafeInteger(location.line)
+    || location.line < 1
+    || location.line > 10000
+    || !Number.isSafeInteger(location.column)
+    || location.column < 1
+    || location.column > 10000
+  ) return null;
+
+  let root;
+  let candidate;
+  let rootMetadata;
+  let fileMetadata;
+  try {
+    root = fs.realpathSync(sourceRoot);
+    candidate = path.resolve(root, location.file);
+    const relative = path.relative(root, candidate).split(path.sep).join("/");
+    if (
+      !relative
+      || relative.startsWith("../")
+      || relative === ".."
+      || relative !== path.posix.normalize(relative)
+      || !FAILURE_SOURCE_FILES.has(relative)
+    ) return null;
+    rootMetadata = fs.lstatSync(root);
+    fileMetadata = fs.lstatSync(candidate);
+    if (
+      !rootMetadata.isDirectory()
+      || rootMetadata.isSymbolicLink()
+      || !fileMetadata.isFile()
+      || fileMetadata.isSymbolicLink()
+      || fs.realpathSync(candidate) !== candidate
+    ) return null;
+    const sourceLines = fs.readFileSync(candidate, "utf8").split("\n");
+    if (
+      location.line > sourceLines.length
+      || location.column > sourceLines[location.line - 1].length + 1
+    ) return null;
+    const sourceLine = sourceLines[location.line - 1];
+    const assertion = /\bexpect(?:\.poll)?\s*\(|\.to[A-Z][A-Za-z0-9]*\s*\(/u.test(sourceLine);
+    return {
+      file: relative,
+      line: location.line,
+      column: location.column,
+      kind: fallbackKind === "declaration"
+        ? "declaration"
+        : assertion ? "assertion" : "test_source",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function failureRecordForAttempt(test, result, attempt, sourceRoot) {
+  const project = typeof test?.parent?.project === "function"
+    ? test.parent.project()?.name
+    : undefined;
+  const id = typeof test?.title === "string" ? PUBLIC_TEST_IDS.get(test.title) : undefined;
+  if (!id || !PUBLIC_PROJECTS.has(project) || !FAILURE_ATTEMPT_STATUSES.has(result?.status)) {
+    return null;
+  }
+  let location = null;
+  if (Array.isArray(result.errors)) {
+    for (const error of result.errors) {
+      location = normalizedFailureLocation(error?.location, sourceRoot, "failure");
+      if (location) break;
+    }
+  }
+  if (!location) {
+    location = normalizedFailureLocation(test.location, sourceRoot, "declaration");
+  }
+  return {
+    id,
+    project,
+    status: result.status,
+    attempt,
+    source_file: location?.file ?? null,
+    source_line: location?.line ?? null,
+    source_column: location?.column ?? null,
+    source_kind: location?.kind ?? "unavailable",
+  };
+}
+
+function writeBoundedFailureSummary(
+  binding,
+  suite,
+  summary,
+  { gateRoot = GATE_ROOT, sourceRoot = process.cwd() } = {},
+) {
+  if (!binding || !summary || !suite || typeof suite.allTests !== "function") return false;
+  const gateName = path.basename(binding.gate);
+  if (
+    path.dirname(binding.gate) !== gateRoot
+    || !PUBLIC_GATE_NAME.test(gateName)
+    || !RUN_STATUSES.has(summary.run_status)
+  ) return false;
+  const tests = suite.allTests();
+  if (
+    !Array.isArray(tests)
+    || tests.length > MAX_TESTS
+    || !summary.logical
+    || !publicCoverageIsComplete(tests, summary.logical)
+  ) return false;
+  const failures = [];
+  let attempts = 0;
+  for (const test of tests) {
+    if (!test || !Array.isArray(test.results)) return false;
+    for (const result of test.results) {
+      attempts += 1;
+      if (attempts > MAX_ATTEMPTS) return false;
+      if (FAILURE_ATTEMPT_STATUSES.has(result?.status)) {
+        const record = failureRecordForAttempt(test, result, attemptsForTest(test, result), sourceRoot);
+        if (!record) return false;
+        failures.push(record);
+      }
+    }
+  }
+  const failureExpected = summary.run_status !== "passed"
+    || summary.logical.fail > 0
+    || summary.logical.flaky > 0
+    || summary.logical.interrupted > 0
+    || summary.attempts.fail > 0
+    || summary.attempts.interrupted > 0
+    || summary.attempts.timedout > 0;
+  if (!failureExpected) return false;
+
+  let gateMetadata;
+  let resultsMetadata;
+  let rootMetadata;
+  try {
+    rootMetadata = fs.lstatSync(gateRoot);
+    gateMetadata = fs.lstatSync(binding.gate);
+    resultsMetadata = fs.lstatSync(path.join(binding.gate, "test-results"));
+  } catch {
+    return false;
+  }
+  if (
+    !rootMetadata.isDirectory()
+    || rootMetadata.isSymbolicLink()
+    || rootMetadata.uid !== 0
+    || (rootMetadata.mode & 0o777) !== 0o711
+    || fs.realpathSync(gateRoot) !== gateRoot
+    || !gateMetadata.isDirectory()
+    || gateMetadata.isSymbolicLink()
+    || gateMetadata.uid !== process.geteuid()
+    || (gateMetadata.mode & 0o777) !== 0o700
+    || !resultsMetadata.isDirectory()
+    || resultsMetadata.isSymbolicLink()
+    || resultsMetadata.uid !== process.geteuid()
+    || (resultsMetadata.mode & 0o777) !== 0o700
+  ) return false;
+
+  const payload = {
+    schema: 1,
+    gate: gateName,
+    source_sha: binding.source_sha,
+    app_sha: binding.app_sha,
+    marker_sha256: binding.marker_sha256,
+    run_status: summary.run_status,
+    failures,
+  };
+  const bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+  if (bytes.length > MAX_FAILURE_REPORT_BYTES) return false;
+  const output = path.join(binding.gate, "test-results", FAILURE_REPORT_FILE);
+  let fd;
+  try {
+    fd = fs.openSync(
+      output,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+        | (fs.constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    const metadata = fs.fstatSync(fd);
+    if (
+      !metadata.isFile()
+      || metadata.nlink !== 1
+      || metadata.uid !== process.geteuid()
+      || (metadata.mode & 0o777) !== 0o600
+    ) return false;
+    fs.writeFileSync(fd, bytes);
+    fs.fsyncSync(fd);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function attemptsForTest(test, result) {
+  return test.results.indexOf(result) + 1;
+}
+
 class LiveCountReporter {
+  constructor(options = {}) {
+    this.gateRoot = options.gateRoot ?? GATE_ROOT;
+    this.sourceRoot = options.sourceRoot ?? process.cwd();
+  }
+
   onBegin(_config, suite) {
     this.suite = suite;
   }
 
   onEnd(result) {
-    const binding = bindingsFromEnvironment();
+    const binding = bindingsFromEnvironment(process.env, { gateRoot: this.gateRoot });
     const publicGate = binding !== null && PUBLIC_GATE_NAME.test(path.basename(binding.gate));
     const summary = summarizeRun(this.suite, result?.status, { publicGate });
-    if (!writeBoundedSummary(binding, summary)) return { status: "failed" };
+    if (publicGate && summary) {
+      try {
+        writeBoundedFailureSummary(binding, this.suite, summary, {
+          gateRoot: this.gateRoot,
+          sourceRoot: this.sourceRoot,
+        });
+      } catch {
+        // The guard emits a closed failure_report_unavailable marker if the
+        // optional private record cannot be consumed or persisted.
+      }
+    }
+    if (!writeBoundedSummary(binding, summary, { gateRoot: this.gateRoot })) {
+      return { status: "failed" };
+    }
     return undefined;
   }
 
@@ -322,3 +566,4 @@ module.exports = LiveCountReporter;
 module.exports.summarizeRun = summarizeRun;
 module.exports.bindingsFromEnvironment = bindingsFromEnvironment;
 module.exports.writeBoundedSummary = writeBoundedSummary;
+module.exports.writeBoundedFailureSummary = writeBoundedFailureSummary;

@@ -593,5 +593,6 @@ app-side capability before accepting runner/application mismatch.
 
 Source **C** `5849001b78aed824527f474c4c3586108019c402` updates the 15-member v4 pin with the dispatcher’s bounded Python-helper launch and export-removal status protocol. Application workflow and CPU-pair changes remain app-side. This is provenance, not installation proof; production requires exact-target CI, signed preflight/provenance, approved provisioning and installed self-test.
 
-The host-control trust boundary is independent of application releases and cannot be repaired by candidate code in a secret-bearing job.
-A host image or operator must provision each reviewed generation before deployment; this is the rollback/supply-chain trade-off for preventing candidate source from becoming production authority.
+The host-control trust boundary is independent of application releases and cannot be repaired by candidate code in a secret-bearing job. A host image or operator must provision each reviewed generation before deployment; this is the rollback/supply-chain trade-off for preventing candidate source from becoming production authority.
+
+Source **C** `c635240ba9e146e12e1d3a4d43c65224bf87553e` adds bounded private public-browser failure reports and makes validated failed counts fail the outer launch even when Playwright exits zero. Pin-only **P** `e78b290344d288ae9b137390871b3d28187ade09` records its exact 15-member closure, including dispatcher SHA-256 `5d62f944185af3926705b563844ff819268cf7827ca9d7cb5b01398a8da12da6`. Exact-P CI, signed preflight, approved provisioning and installed self-test remain required. At PR preparation on 2026-10-20, installed **C** was `5849001b78aed824527f474c4c3586108019c402` per CURRENT; this is historical state, not activation proof.
