@@ -38,7 +38,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_safe_env_exec.py",
-      "sha256": "819ccc9e489c3fb8b14b3cb61eae500c111c5edb663161504b6ca6e02868399d"
+      "sha256": "c412916e4325a01fa339ea89854dbbf2660ed09a0be760c17fea6523d0294a22"
     },
     {
       "mode": 493,
@@ -76,7 +76,7 @@
       "sha256": "f62c33b8712b8ef30e8f704345d351c7d00c3ab2071ae1ff723b97f4c15c9396"
     }
   ],
-  "host_tools_sha": "995f46f9b522b3446375346ce71d8c7cc57eb280",
+  "host_tools_sha": "8ea7678183ac1bd600d06a628cbf78c49d029672",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }

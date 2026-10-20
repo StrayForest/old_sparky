@@ -344,6 +344,11 @@ def _validate_regular_metadata(
         or metadata.st_nlink != 1
         or stat.S_IMODE(metadata.st_mode) & 0o022
         or (
+            allow_sandbox
+            and path.name == "chrome_sandbox"
+            and stat.S_IMODE(metadata.st_mode) != 0o4755
+        )
+        or (
             metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
             and not (
                 allow_sandbox
@@ -708,7 +713,10 @@ def _validate_source_tree(source: Path, relative: str) -> None:
                 raise InstallerError("trusted live-QA source directory metadata is unsafe")
             continue
         relative_name = PurePosixPath(rel).as_posix()
-        allow_sandbox = relative_name == "liveqa-runtime/" + RUNTIME_SANDBOX_RELATIVE.as_posix()
+        allow_sandbox = (
+            root.name in {"liveqa-runtime", "runtime"}
+            and relative_name == root.name + "/" + RUNTIME_SANDBOX_RELATIVE.as_posix()
+        )
         if path.name == "chrome_sandbox" and not allow_sandbox:
             raise InstallerError("trusted live-QA source contains an unexpected sandbox helper")
         _regular(path, allow_sandbox=allow_sandbox)
