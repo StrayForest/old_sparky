@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-10-19
+- Last reviewed: 2026-10-20
 
 ## Runtime checks
 
@@ -54,7 +54,7 @@ Maintenance keeps:
 
 It never deletes shared env/runtimes, upload staging, current/previous releases, active/source-protected live-QA generations or caches, business rows or canonical reports; backup failure stops pruning. The canonical unit in this source tree uses the fixed protected-pair manifest while running other retention. Backup-only preserves complete pairs but skips other retention; generic callers retain their existing rotation (see the [backup and restore runbook](backup-restore-runbook.md)). The currently deployed unit remains unchanged until the reviewed source is released; see the [named backup retention policy](backup-retention-protection.md).
 Live-QA cache pruning holds the machine-wide lock, requires an idle browser cgroup and user, accepts only root-owned non-symlink `runtime-<40 lowercase hex>` trees, retains the newest valid unprotected fallback, and treats keep as a hard cap rather than an age window.
-Health monitoring and storage maintenance share one conservative hard gate: available free space must be at least 5 GiB and conservative use (`total - available`, including filesystem-reserved headroom) must be at most 85%; exact 5 GiB and 85% boundaries pass, and 80% is not a failure threshold.
+The generic 5 GiB free/85% use gate is not sufficient for canonical full-maintenance `disk_ext4_image_v1`: its admission requires `max(5 GiB, ceil(15% of filesystem total)) + 256 MiB lead + 576 MiB image` free on the image filesystem after the temporary dump exists. Before `pg_dump`, include the expected dump allocation when it shares that filesystem (`platform_backup_restore_drill._scratch_disk_image_required_free_bytes` and `_scratch_prepare_disk_image`; see the [backup/restore runbook](backup-restore-runbook.md)). The source-bound backup workflow defaults to `tmpfs_v1`, so its success does not exercise this image gate. An explicitly selected disk backend exercises image admission, but `--backup-only` still preserves existing pairs rather than testing maintenance rotation. Keep the floors; admission fails closed.
 The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it.
 Application services write structured JSON to journald. Nginx owns request
 logs, so Gunicorn access logging is disabled to avoid duplicates; warnings,
@@ -82,7 +82,7 @@ read-only modes, same-device file/directory types and non-escaping symlinks.
 Runtime reuse verifies the full digest. Deletion renames revalidated caches to
 hidden tombstones; a later run validates and reclaims interrupted tombstones.
 
-Apply the bounded sweep through the reviewed workflow after reviewing the read-only candidate inventory:
+Apply the bounded sweep through the reviewed workflow after reviewing the `run-retention-preview` plan below; the generic diagnostics inventory is not an apply plan:
 
 ```bash
 gh workflow run platform-production-storage-maintenance.yml --repo StrayForest/old_sparky --ref dev \
@@ -96,7 +96,7 @@ each report must carry the authenticated `verified-noop` source-binding digest. 
 
 Storage diagnostics/maintenance workflow or exact storage-retention skill changes use the closed storage-operations route: full, runtime-sensitive verification but no application or baseline action. AUTO takes its no-deploy branch. The recovery producer uploads a bound skip receipt with a provenance attestation; the publisher checks its fields against exact producer and parent CI/classifier evidence, but does not verify the attestation cryptographically or publish a host bundle/production marker. When an activation reports a full filesystem or unusable temporary directory, collect bounded read-only evidence before cleanup:
 `gh workflow run platform-production-storage-diagnostics.yml --repo StrayForest/old_sparky --ref dev -f expected_sha=<exact-source-sha-currently-deployed>`
-It reports filesystem/journal/service usage, retention candidates, current/previous release identities, latest restore-verified backup age/checksum, and timer state/times; it compares the installed and release-owned timer units, emitting only drop-in presence. Backup checksum reads are timeout-bounded. Diagnostics never create/delete backups or files or apply runtime settings; failure artifacts contain bounded partial evidence and closed outcomes, never raw host output. Maintenance evidence binds to one invocation; a verified backup and nonzero exit can follow deletions when thresholds still fail, so failure proves neither no deletion nor successful cleanup.
+It reports filesystem/journal/service usage, generic `release_retention_preview` candidates (`keep=5`, age 0, report-only, no maintenance-unit pins; it may list unit-pinned releases), current/previous release identities, latest restore-verified backup age/checksum, and timer state/times; it compares the installed and release-owned timer units, emitting only drop-in presence. This inventory is not the maintenance deletion set: the maintenance-QA `run-retention-preview` command validates the loaded unit and derives a no-apply plan from its exact pin-bearing maintenance argv. Backup checksum reads are timeout-bounded. Diagnostics never create/delete backups or files or apply runtime settings; failure artifacts contain bounded partial evidence and closed outcomes, never raw host output. Maintenance evidence binds to one invocation; a verified backup and nonzero exit can follow deletions when thresholds still fail, so failure proves neither no deletion nor successful cleanup.
 
 Preview storage cleanup without backup or deletion:
 
@@ -120,7 +120,7 @@ Preview live-QA runtime cache retention (also machine-locked and idle-gated):
   prune-runtime-cache --keep 1
 ```
 
-The preview is dry-run unless `--apply` and takes release then live-QA locks; the maintenance unit in this source tree uses the fixed named-pair policy while running other retention and health checks. Growth is bounded by its named-plus-recent policy and unchanged 5 GiB/85% gates. The rollout enables the timer only through the source-bound workflow after load/CPU/live-QA evidence passes. After each run, follow `.agents/skills/platform-storage-retention/SKILL.md` for exact cleanup; never use broad deletion.
+The preview is dry-run unless `--apply` and takes release then live-QA locks; the maintenance unit in this source tree uses the fixed named-pair policy while running other retention and health checks. Growth is bounded by its named-plus-recent policy and unchanged 5 GiB/85% gates. The rollout enables the timer only through the source-bound workflow after load/CPU/live-QA evidence passes. After enabling, let any timer-started service finish and confirm it is inactive with no operation locks before final diagnostics; do not weaken guards or blindly retry. After each run, follow `.agents/skills/platform-storage-retention/SKILL.md` for exact cleanup; never use broad deletion.
 
 ## Prepared media and R2
 

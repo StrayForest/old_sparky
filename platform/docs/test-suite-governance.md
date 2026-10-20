@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-18
+- Last reviewed: 2026-10-20
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
@@ -410,6 +410,9 @@ its own sequential one-worker contour and explicit desktop/mobile projects in
 [`playwright.participant.config.ts`](../apps/platform_web/playwright.participant.config.ts).
 Do not infer viewport ownership from a test name or silently add an exclusion;
 update the owning config and its contract test when the matrix changes.
+
+Raw SSR metadata in `apps/platform_web/tests/smoke/platform-routes.spec.ts` comes from full-document `page.goto()` responses.
+SPA flows check client URLs and hydrated DOM, preserving project/auth/fixture coverage without a second raw request.
 
 ## Local and GitHub verification
 

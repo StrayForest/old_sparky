@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-13
+- Last reviewed: 2026-10-20
 
 ## Invariants
 
@@ -244,6 +244,15 @@ retains a durable receipt through pointer activation, runtime readiness, Nginx
 apply and smoke before committing. DB changes are expand-first. Rollback
 switches code and never downgrades Alembic automatically. See
 [`release-state-machine.md`](release-state-machine.md).
+
+Live User QA separates three identities. The app release (`TARGET_SHA`) owns its
+source-bound suite and configuration; the pinned `HOST_TOOLS_SHA` generation
+supplies trusted host-control helpers; a separately validated Live QA engine
+provider (`provider_sha`) owns Node, Playwright, browsers and sandbox. The wrapper
+exposes suite and engine through distinct read-only aliases rather than copying
+provider bytes into the app release. See the
+[`host-tools provisioning ADR`](adr/production-host-tools-provisioning.md) and
+[`CSP/live-QA runbook`](csp-live-qa-runbook.md).
 
 Daily maintenance restore-verifies DB backups before pruning known artifacts. Off-host encrypted backup remains an operator gate until separate bucket/token and offline key-recovery evidence exist.
 
