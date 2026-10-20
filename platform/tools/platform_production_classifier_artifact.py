@@ -118,8 +118,6 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_release_retention.py",
         "platform/tools/platform_release_transaction.py",
         "platform/tools/platform_run_alembic.sh",
-        "platform/tools/platform_live_qa_guard.py",
-        "platform/tools/platform_build_live_qa_runtime.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
         "platform/tests/test_platform_db.py",
         "platform/tests/test_platform_release_audit_hardening.py",

@@ -1096,12 +1096,44 @@ def verify_helper_binding(
     platform_root: Path,
     installed_helper: Path,
 ) -> None:
+    _verify_helper_binding_modes(
+        platform_root=platform_root,
+        installed_helper=installed_helper,
+        source_mode=0o755,
+    )
+
+
+def _verify_active_immutable_helper_binding(
+    *,
+    platform_root: Path,
+    installed_helper: Path,
+) -> None:
+    """Bind a helper copied from an already-validated immutable release.
+
+    Callers must validate the exact active immutable payload before using this
+    path. Release extraction stores non-executable Python source as root-owned
+    mode 0444; the separately installed helper remains mode 0500.
+    """
+
+    _verify_helper_binding_modes(
+        platform_root=platform_root,
+        installed_helper=installed_helper,
+        source_mode=0o444,
+    )
+
+
+def _verify_helper_binding_modes(
+    *,
+    platform_root: Path,
+    installed_helper: Path,
+    source_mode: int,
+) -> None:
     _validate_root_secret_parent(installed_helper)
     source_helper = platform_root / "tools/platform_live_qa_mailbox_helper.py"
     source_digest = _sha256_regular(
         source_helper,
         expected_uid=0,
-        expected_mode=0o755,
+        expected_mode=source_mode,
     )
     installed_digest = _sha256_regular(
         installed_helper,
@@ -1668,7 +1700,10 @@ def _validated_stale_bundle_roster(
     expected_helper = TRUSTED_SECRET_ROOT / "platform_live_qa_mailbox_helper.py"
     if helper != expected_helper:
         raise GuardError("stale bundle mailbox helper is not the active fixed helper")
-    verify_helper_binding(platform_root=platform_root, installed_helper=helper)
+    _verify_active_immutable_helper_binding(
+        platform_root=platform_root,
+        installed_helper=helper,
+    )
 
     payload = _read_private_json(bundle_path)
     created_at = payload.get("created_at")

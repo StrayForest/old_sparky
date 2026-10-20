@@ -1391,11 +1391,19 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_live_qa_runtime_installer_change_is_deployable_and_runtime_sensitive(self) -> None:
         installer = "platform/tools/platform_live_qa_runtime_install.py"
+        live_qa_guard = "platform/tools/platform_live_qa_guard.py"
+        live_qa_runtime_builder = "platform/tools/platform_build_live_qa_runtime.py"
+        live_qa_guard_test = "platform/tests/test_platform_live_qa_guard.py"
+        live_qa_wrapper_test = "platform/tests/test_platform_live_qa_wrappers.py"
         launch_helper = "platform/tools/platform_live_launch_trusted.sh"
         dispatcher = "platform/tools/platform_workflow_remote_dispatch.py"
         self.assertNotIn(installer, RECOVERY_BOOTSTRAP_FILES)
+        self.assertNotIn(live_qa_guard, RECOVERY_BOOTSTRAP_FILES)
+        self.assertNotIn(live_qa_runtime_builder, RECOVERY_BOOTSTRAP_FILES)
         self.assertNotIn(launch_helper, RECOVERY_BOOTSTRAP_FILES)
         self.assertNotIn(dispatcher, RECOVERY_BOOTSTRAP_FILES)
+        self.assertIn(live_qa_guard, RUNTIME_SENSITIVE_FILES)
+        self.assertIn(live_qa_runtime_builder, RUNTIME_SENSITIVE_FILES)
         self.assertIn(launch_helper, RUNTIME_SENSITIVE_FILES)
         self.assertIn(dispatcher, RUNTIME_SENSITIVE_FILES)
 
@@ -1410,6 +1418,74 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertTrue(manifest["deployable"])
         self.assertFalse(manifest["fallback"])
         self.assertTrue(manifest["runtime_sensitive"])
+
+        current_fix_paths = [
+            live_qa_guard,
+            live_qa_guard_test,
+            live_qa_wrapper_test,
+        ]
+        for event, expected_deployable in (("push", True), ("pull_request", False)):
+            current_fix = classify(
+                current_fix_paths,
+                event=event,
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            self.assertEqual(current_fix["class"], "full")
+            self.assertFalse(current_fix["fallback"])
+            self.assertTrue(current_fix["runtime_sensitive"])
+            self.assertIs(current_fix["deployable"], expected_deployable)
+            if event == "push":
+                auto_route = self._run_auto_deploy_manifest_contract(current_fix)
+                self.assertEqual(auto_route["route_deployable"], "true")
+                self.assertEqual(auto_route["route_recovery_bootstrap_only"], "false")
+                with tempfile.TemporaryDirectory() as temporary:
+                    archive = self._write_production_classifier_archive(
+                        Path(temporary), current_fix
+                    )
+                    trusted_route = validate_production_classifier_manifest(
+                        archive,
+                        target_sha=self.TARGET_SHA,
+                        require_runtime_sensitive=True,
+                    )
+                self.assertEqual(trusted_route["files"], sorted(current_fix_paths))
+                self.assertTrue(trusted_route["deployable"])
+
+        helper_only = classify(
+            [live_qa_guard],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(helper_only["deployable"])
+        self.assertTrue(helper_only["runtime_sensitive"])
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                helper_only,
+                [live_qa_guard],
+                expected_target_sha=self.TARGET_SHA,
+            )
+
+        runtime_builder_only = classify(
+            [live_qa_runtime_builder],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(runtime_builder_only["class"], "full")
+        self.assertTrue(runtime_builder_only["deployable"])
+        self.assertTrue(runtime_builder_only["runtime_sensitive"])
+        with tempfile.TemporaryDirectory() as temporary:
+            builder_archive = self._write_production_classifier_archive(
+                Path(temporary), runtime_builder_only
+            )
+            trusted_builder = validate_production_classifier_manifest(
+                builder_archive,
+                target_sha=self.TARGET_SHA,
+                require_runtime_sensitive=True,
+            )
+        self.assertEqual(trusted_builder["files"], [live_qa_runtime_builder])
+        self.assertTrue(trusted_builder["deployable"])
 
         launch_helper_manifest = classify(
             [launch_helper],
@@ -1559,13 +1635,14 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
         cumulative = classify_cumulative_baseline(
             incremental,
-            m2_to_s_paths + classifier_fix_paths,
+            m2_to_s_paths + classifier_fix_paths + [live_qa_guard],
             expected_target_sha=self.TARGET_SHA,
         )
         decision = validate_cumulative_reconcile_route(cumulative)
         self.assertEqual(decision, {"no_op": False, "runtime_required": True})
         self.assertTrue(cumulative["manifest"]["deployable"])
         self.assertTrue(cumulative["manifest"]["runtime_sensitive"])
+        self.assertFalse(cumulative["no_op"])
 
         incremental_auto = self._run_auto_deploy_manifest_contract(incremental)
         self.assertEqual(incremental_auto["route_recovery_bootstrap_only"], "true")

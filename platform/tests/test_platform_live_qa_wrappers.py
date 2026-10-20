@@ -4579,6 +4579,98 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertTrue((state / "inventory.json").is_file())
             self.assertFalse(removed_marker.exists())
 
+        def shell_function(source: str, name: str) -> str:
+            start = source.index(f"{name}() {{")
+            end = source.index("\n}\n", start) + len("\n}\n")
+            return source[start:end]
+
+        with tempfile.TemporaryDirectory(prefix="live-qa-db-argv-") as temporary:
+            root = Path(temporary)
+            recorder = root / "system-python-recorder"
+            recorder.write_text(
+                "#!/bin/sh\n"
+                "n=0\n"
+                "if [ -f \"$CALL_INDEX\" ]; then n=$(cat \"$CALL_INDEX\"); fi\n"
+                "n=$((n + 1))\n"
+                "printf '%s' \"$n\" > \"$CALL_INDEX\"\n"
+                "printf '%s\\n' \"$@\" > \"$CALL_PREFIX.$n\"\n",
+                encoding="ascii",
+            )
+            recorder.chmod(0o700)
+            tools = Path("/payload/platform/tools")
+            python = Path("/opt/oldsparky/platform/shared/venv/bin/python")
+            pythonpath = Path("/root/.oldsparky/liveqa/releases") / ("a" * 40)
+            inventory = root / "inventory.json"
+            shell_fixture = "\n".join(
+                (
+                    "set -euo pipefail",
+                    f"SYSTEM_PYTHON={shlex.quote(str(recorder))}",
+                    f"TOOLS_DIR={shlex.quote(str(tools))}",
+                    f"SAFE_PYTHONPATH={shlex.quote(str(pythonpath))}",
+                    f"QA_PYTHON={shlex.quote(str(python))}",
+                    shell_function(live_user, "safe_database_python"),
+                    shell_function(live_user, "reconcile_and_cleanup"),
+                    "reconcile_and_cleanup liveqa-stale-marker "
+                    + shlex.quote(str(inventory)),
+                )
+            )
+            prefix = root / "argv"
+            result = subprocess.run(
+                ["/usr/bin/bash", "--noprofile", "--norc", "-c", shell_fixture],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    "LANG": "C",
+                    "PATH": "/usr/bin:/bin",
+                    "CALL_INDEX": str(root / "call-index"),
+                    "CALL_PREFIX": str(prefix),
+                },
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (root / "argv.1").read_text(encoding="ascii").splitlines(),
+                [
+                    "-I",
+                    "-B",
+                    str(tools / "platform_safe_env_exec.py"),
+                    "exec",
+                    "--pythonpath",
+                    str(pythonpath),
+                    "--",
+                    str(python),
+                    str(tools / "platform_recover_live_user_qa.py"),
+                    "--marker",
+                    "liveqa-stale-marker",
+                    "--inventory",
+                    str(inventory),
+                    "--confirm",
+                    "recover-live-user-qa",
+                ],
+            )
+            self.assertEqual(
+                (root / "argv.2").read_text(encoding="ascii").splitlines(),
+                [
+                    "-I",
+                    "-B",
+                    str(tools / "platform_safe_env_exec.py"),
+                    "exec",
+                    "--pythonpath",
+                    str(pythonpath),
+                    "--",
+                    str(python),
+                    str(tools / "platform_cleanup_live_user_qa.py"),
+                    "--marker",
+                    "liveqa-stale-marker",
+                    "--inventory",
+                    str(inventory),
+                    "--confirm",
+                    "cleanup-live-user-qa",
+                ],
+            )
+
         with tempfile.TemporaryDirectory(prefix="live-qa-stale-bundle-recovery-") as temporary:
             root = Path(temporary)
             stub = root / "guard-stub.sh"
