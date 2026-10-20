@@ -13,6 +13,9 @@ const {
   summarizeRun,
   writeBoundedSummary,
   writeBoundedFailureSummary,
+  createPageErrorAttachment,
+  trustedSuccessfulNextScriptPath,
+  pageErrorClass,
 } = require("./live-count-reporter.cjs");
 
 function test(outcome, results = [], expectedStatus = "passed") {
@@ -198,6 +201,98 @@ assert.equal(
   null,
 );
 assert.equal(cappedResultReads, 32768, "attempt cap is enforced before reading another result");
+
+const liveChunkUrl = "https://old-sparky.com/_next/static/chunks/abcdefghijklm.js";
+const successfulScriptResponse = {
+  url: liveChunkUrl,
+  status: 200,
+  resourceType: "script",
+};
+assert.equal(
+  trustedSuccessfulNextScriptPath(successfulScriptResponse),
+  "/_next/static/chunks/abcdefghijklm.js",
+  "the strict chunk grammar accepts a hashed Next chunk basename",
+);
+for (const response of [
+  { ...successfulScriptResponse, status: 404 },
+  { ...successfulScriptResponse, resourceType: "image" },
+  { ...successfulScriptResponse, url: "https://third-party.invalid/_next/static/chunks/abcdefghijklm.js" },
+  { ...successfulScriptResponse, url: `${liveChunkUrl}?token=private` },
+  { ...successfulScriptResponse, url: "https://old-sparky.com/_next/static/chunks/not-a-next-chunk.js" },
+]) {
+  assert.equal(trustedSuccessfulNextScriptPath(response), null);
+}
+const pageError = new TypeError("private pageerror text and token");
+pageError.stack = `TypeError: private pageerror text and token\n    at render (${liveChunkUrl}:12:34)`;
+const pageErrorAttachment = createPageErrorAttachment({
+  pageUrl: "https://old-sparky.com/patches/12345?marker=private",
+  errors: [pageError],
+  successfulScriptResponses: [successfulScriptResponse],
+});
+assert.ok(pageErrorAttachment);
+assert.equal(pageErrorAttachment.name, "live-pageerror-evidence-v1");
+assert.equal(pageErrorAttachment.contentType, "application/json");
+assert.equal(Buffer.isBuffer(pageErrorAttachment.body), true);
+assert.deepEqual(JSON.parse(pageErrorAttachment.body.toString("ascii")), {
+  schema: 1,
+  truncated: false,
+  events: [{
+    class: "TypeError",
+    route: "patch",
+    asset_basename: "abcdefghijklm.js",
+    line: 12,
+    column: 34,
+  }],
+});
+assert.equal(pageErrorClass({ name: "SecurityError" }), "DOMException");
+for (const privateValue of [
+  "private pageerror text",
+  "token=private",
+  "12345",
+  "https://old-sparky.com",
+]) {
+  assert.equal(pageErrorAttachment.body.includes(Buffer.from(privateValue)), false);
+}
+const unmatchedPageError = createPageErrorAttachment({
+  pageUrl: "https://old-sparky.com/",
+  errors: [pageError],
+  successfulScriptResponses: [{ ...successfulScriptResponse, status: 500 }],
+});
+assert.deepEqual(JSON.parse(unmatchedPageError.body.toString("ascii")).events[0], {
+  class: "TypeError",
+  route: "home",
+  asset_basename: null,
+  line: null,
+  column: null,
+});
+const unknownPageError = new Error("private message");
+unknownPageError.name = "private dynamic error name";
+assert.equal(pageErrorClass(unknownPageError), "unknown");
+assert.deepEqual(
+  JSON.parse(createPageErrorAttachment({
+    pageUrl: "https://old-sparky.com/",
+    errors: [
+      unknownPageError,
+      new Error("another private error"),
+      new Error("third private error"),
+      new Error("fourth private error"),
+      new Error("fifth private error"),
+    ],
+    successfulScriptResponses: [],
+  }).body.toString("ascii")),
+  {
+    schema: 1,
+    truncated: true,
+    events: ["unknown", "Error", "Error", "Error"].map((errorClass) => ({
+      class: errorClass,
+      route: "home",
+      asset_basename: null,
+      line: null,
+      column: null,
+    })),
+  },
+  "the real collector caps events and projects unknown names without dynamic text",
+);
 
 const bindingEnv = {
   PLATFORM_QA_BROWSER_GATE_DIR: "/run/oldsparky-liveqa/public-live-qa.a1b2c3d4",
@@ -418,7 +513,10 @@ function withRootOwnedGate(gateRoot, run) {
   }
 }
 
-function failureTest(fixture, { title = publicTitles[6], project = "live-desktop", errorLocation, results } = {}) {
+function failureTest(
+  fixture,
+  { title = publicTitles[6], project = "live-desktop", errorLocation, attachments, results } = {},
+) {
   return {
     title,
     expectedStatus: "passed",
@@ -426,6 +524,7 @@ function failureTest(fixture, { title = publicTitles[6], project = "live-desktop
     results: results ?? [{
       status: "failed",
       errors: [{ message: "private assertion text", location: errorLocation }],
+      attachments,
     }],
     outcome: () => "unexpected",
     location: { file: fixture.spec, line: 1, column: 1 },
@@ -458,13 +557,16 @@ try {
     { gateRoot: successFixture.gateRoot, sourceRoot: successFixture.sourceRoot },
   )), false, "a successful public suite does not create private failure details");
   assert.equal(
-    fs.existsSync(path.join(successFixture.results, "live-failures-v1.json")),
+    fs.existsSync(path.join(successFixture.results, "live-failures-v2.json")),
     false,
   );
 
   const fixture = diagnosticFixture(failureRoot);
   const failure = failureTest(fixture, {
+    title: publicTitles.at(-1),
+    project: "live-webkit-mobile",
     errorLocation: { file: fixture.helper, line: 2, column: 3 },
+    attachments: [pageErrorAttachment],
   });
   const failurePlan = publicPlanWithFailure(failure);
   const failedSummary = summarizeRun(
@@ -479,7 +581,7 @@ try {
     failedSummary,
     { gateRoot: fixture.gateRoot, sourceRoot: fixture.sourceRoot },
   )), true, "a shared support-helper assertion is retained as a closed failure record");
-  const reportPath = path.join(fixture.results, "live-failures-v1.json");
+  const reportPath = path.join(fixture.results, "live-failures-v2.json");
   const reportMetadata = fs.lstatSync(reportPath);
   const reportBytes = fs.readFileSync(reportPath);
   const report = JSON.parse(reportBytes.toString("ascii"));
@@ -490,20 +592,169 @@ try {
   assert.deepEqual(Object.keys(report).sort(), [
     "app_sha", "failures", "gate", "marker_sha256", "run_status", "schema", "source_sha",
   ].sort());
+  assert.equal(report.schema, 2);
   assert.deepEqual(report.failures, [{
-    id: "chromium_sandbox",
-    project: "live-desktop",
+    id: "image_csp_hosts",
+    project: "live-webkit-mobile",
     status: "failed",
     attempt: 1,
     source_file: "tests/support/live-qa-sandbox.ts",
     source_line: 2,
     source_column: 3,
     source_kind: "assertion",
+    page_error_state: "captured",
+    page_errors_truncated: false,
+    page_errors: [["TypeError", "patch", "abcdefghijklm.js", 12, 34]],
   }]);
   assert.equal(reportBytes.includes(Buffer.from("private assertion text")), false);
   assert.equal(reportBytes.includes(Buffer.from("private-playwright-id")), false);
   assert.equal(reportBytes.includes(Buffer.from("private title")), false);
   assert.equal(reportBytes.includes(Buffer.from(failureRoot)), false);
+  assert.equal(reportBytes.includes(Buffer.from("abcdefghijklm.js:12:34")), false);
+
+  const unavailableFixture = diagnosticFixture(failureRoot, "c2a2b3c4");
+  const unavailable = failureTest(unavailableFixture, {
+    errorLocation: { file: unavailableFixture.helper, line: 2, column: 3 },
+  });
+  const unavailablePlan = publicPlanWithFailure(unavailable);
+  assert.equal(withRootOwnedGate(unavailableFixture.gateRoot, () => writeBoundedFailureSummary(
+    unavailableFixture.binding,
+    { allTests: () => unavailablePlan },
+    failedSummary,
+    { gateRoot: unavailableFixture.gateRoot, sourceRoot: unavailableFixture.sourceRoot },
+  )), true);
+  const unavailableReport = JSON.parse(fs.readFileSync(
+    path.join(unavailableFixture.results, "live-failures-v2.json"),
+    "ascii",
+  ));
+  assert.deepEqual(
+    [
+      unavailableReport.failures[0].page_error_state,
+      unavailableReport.failures[0].page_errors_truncated,
+      unavailableReport.failures[0].page_errors,
+    ],
+    ["unavailable", false, []],
+    "a missing attachment is unavailable, not an empty captured pageerror set",
+  );
+
+  const absentFixture = diagnosticFixture(failureRoot, "c3a2b3c4");
+  const explicitAbsence = failureTest(absentFixture, {
+    errorLocation: { file: absentFixture.helper, line: 2, column: 3 },
+    attachments: [createPageErrorAttachment({
+      pageUrl: "https://old-sparky.com/",
+      errors: [],
+      successfulScriptResponses: [],
+    })],
+  });
+  const absentPlan = publicPlanWithFailure(explicitAbsence);
+  assert.equal(withRootOwnedGate(absentFixture.gateRoot, () => writeBoundedFailureSummary(
+    absentFixture.binding,
+    { allTests: () => absentPlan },
+    failedSummary,
+    { gateRoot: absentFixture.gateRoot, sourceRoot: absentFixture.sourceRoot },
+  )), true);
+  const absentReport = JSON.parse(fs.readFileSync(
+    path.join(absentFixture.results, "live-failures-v2.json"),
+    "ascii",
+  ));
+  assert.deepEqual(
+    [
+      absentReport.failures[0].page_error_state,
+      absentReport.failures[0].page_errors_truncated,
+      absentReport.failures[0].page_errors,
+    ],
+    ["absent", false, []],
+    "an explicit empty attachment records an observed absence",
+  );
+
+  const invalidEvidenceCases = [
+    ["wrong content type", [{ ...pageErrorAttachment, contentType: "text/plain" }]],
+    ["path instead of body", [{ name: pageErrorAttachment.name, contentType: "application/json", path: "/private/file" }]],
+    ["body and path", [{ ...pageErrorAttachment, path: "/private/file" }]],
+    ["duplicate attachment", [pageErrorAttachment, pageErrorAttachment]],
+    ["oversize attachment", [{
+      name: pageErrorAttachment.name,
+      contentType: "application/json",
+      body: Buffer.alloc(2049, 0x61),
+    }]],
+    ["malformed JSON", [{
+      name: pageErrorAttachment.name,
+      contentType: "application/json",
+      body: Buffer.from("{", "ascii"),
+    }]],
+    ["unsafe basename", [{
+      name: pageErrorAttachment.name,
+      contentType: "application/json",
+      body: Buffer.from(JSON.stringify({
+        schema: 1,
+        truncated: false,
+        events: [{
+          class: "TypeError",
+          route: "patch",
+          asset_basename: "../../private.js",
+          line: 12,
+          column: 34,
+        }],
+      }), "ascii"),
+    }]],
+    ["non-string class", [{
+      name: pageErrorAttachment.name,
+      contentType: "application/json",
+      body: Buffer.from(JSON.stringify({
+        schema: 1,
+        truncated: false,
+        events: [[{ value: "TypeError" }, "patch", null, null, null]],
+      }), "ascii"),
+    }]],
+    ["non-string route", [{
+      name: pageErrorAttachment.name,
+      contentType: "application/json",
+      body: Buffer.from(JSON.stringify({
+        schema: 1,
+        truncated: false,
+        events: [["TypeError", [], null, null, null]],
+      }), "ascii"),
+    }]],
+    ["malformed tuple length", [{
+      name: pageErrorAttachment.name,
+      contentType: "application/json",
+      body: Buffer.from(JSON.stringify({
+        schema: 1,
+        truncated: false,
+        events: [["TypeError", "patch", null, null]],
+      }), "ascii"),
+    }]],
+  ];
+  for (const [index, [label, attachments]] of invalidEvidenceCases.entries()) {
+    const invalidFixture = diagnosticFixture(
+      failureRoot,
+      `d${index.toString().padStart(2, "0")}2b3c4`,
+    );
+    const invalid = failureTest(invalidFixture, {
+      errorLocation: { file: invalidFixture.helper, line: 2, column: 3 },
+      attachments,
+    });
+    const invalidPlan = publicPlanWithFailure(invalid);
+    assert.equal(withRootOwnedGate(invalidFixture.gateRoot, () => writeBoundedFailureSummary(
+      invalidFixture.binding,
+      { allTests: () => invalidPlan },
+      failedSummary,
+      { gateRoot: invalidFixture.gateRoot, sourceRoot: invalidFixture.sourceRoot },
+    )), true, `${label} does not suppress the original failed QA record`);
+    const invalidReport = JSON.parse(fs.readFileSync(
+      path.join(invalidFixture.results, "live-failures-v2.json"),
+      "ascii",
+    ));
+    assert.deepEqual(
+      [
+        invalidReport.failures[0].page_error_state,
+        invalidReport.failures[0].page_errors_truncated,
+        invalidReport.failures[0].page_errors,
+      ],
+      ["unavailable", false, []],
+      `${label} fails closed without changing failure status`,
+    );
+  }
 
   const malformedFixture = diagnosticFixture(failureRoot, "e1a2b3c4");
   const malformed = failureTest(malformedFixture, {
@@ -517,7 +768,7 @@ try {
     { gateRoot: malformedFixture.gateRoot, sourceRoot: malformedFixture.sourceRoot },
   )), true);
   const fallbackReport = JSON.parse(
-    fs.readFileSync(path.join(malformedFixture.results, "live-failures-v1.json"), "ascii"),
+    fs.readFileSync(path.join(malformedFixture.results, "live-failures-v2.json"), "ascii"),
   );
   assert.equal(fallbackReport.failures[0].source_file, "tests/smoke/live-launch.spec.ts");
   assert.equal(fallbackReport.failures[0].source_kind, "declaration");
@@ -533,10 +784,10 @@ try {
     failedSummary,
     { gateRoot: unknownFixture.gateRoot, sourceRoot: unknownFixture.sourceRoot },
   )), false, "a test outside the complete fixed public manifest is not serialized");
-  assert.equal(fs.existsSync(path.join(unknownFixture.results, "live-failures-v1.json")), false);
+  assert.equal(fs.existsSync(path.join(unknownFixture.results, "live-failures-v2.json")), false);
 
   const symlinkFixture = diagnosticFixture(failureRoot, "a1a2b3c4");
-  const symlinkPath = path.join(symlinkFixture.results, "live-failures-v1.json");
+  const symlinkPath = path.join(symlinkFixture.results, "live-failures-v2.json");
   fs.symlinkSync("/dev/null", symlinkPath);
   const symlinkCase = failureTest(symlinkFixture, {
     errorLocation: { file: symlinkFixture.helper, line: 2, column: 3 },
@@ -550,34 +801,112 @@ try {
   assert.equal(fs.lstatSync(symlinkPath).isSymbolicLink(), true);
 
   const sizeFixture = diagnosticFixture(failureRoot, "b1a2b3c4");
+  const maxError = new AggregateError([], "private max-size error");
+  maxError.stack = `AggregateError: private max-size error\n    at render (https://old-sparky.com/_next/static/chunks/turbopack-abcdefghijklm.js:1000000:1000000)`;
+  const maxAttachment = createPageErrorAttachment({
+    pageUrl: "https://old-sparky.com/tournaments",
+    errors: [maxError, maxError, maxError, maxError],
+    successfulScriptResponses: [{
+      url: "https://old-sparky.com/_next/static/chunks/turbopack-abcdefghijklm.js",
+      status: 200,
+      resourceType: "script",
+    }],
+  });
+  assert.ok(maxAttachment);
+  fs.writeFileSync(
+    sizeFixture.helper,
+    `${"\n".repeat(9_999)}expect(${"x".repeat(9_993)})\n`,
+    "utf8",
+  );
+  const maxSourceLocation = {
+    file: sizeFixture.helper,
+    line: 10_000,
+    column: 10_000,
+  };
   const requiredSkips = new Set(
     publicTests
       .filter((testCase) => testCase.outcome() === "skipped")
       .slice(0, 6)
       .map((testCase) => `${testCase.parent.project().name}:${testCase.title}`),
   );
-  const fullPlanFailures = publicTests.map((testCase) => {
-    const key = `${testCase.parent.project().name}:${testCase.title}`;
-    return requiredSkips.has(key) ? testCase : failureTest(sizeFixture, {
+  const maxFailedAttempts = publicTests.map((testCase) => {
+    const project = testCase.parent.project().name;
+    const key = `${project}:${testCase.title}`;
+    const failureResult = {
+      status: "interrupted",
+      errors: [{
+        message: "private assertion text",
+        location: maxSourceLocation,
+      }],
+      attachments: [maxAttachment],
+    };
+    if (!requiredSkips.has(key)) {
+      return failureTest(sizeFixture, {
+        title: testCase.title,
+        project,
+        errorLocation: maxSourceLocation,
+        attachments: [maxAttachment],
+        results: [failureResult],
+      });
+    }
+    const terminalSkip = {
+      ...testCase.results.at(-1),
+      status: "skipped",
+    };
+    return {
       title: testCase.title,
-      project: testCase.parent.project().name,
-      errorLocation: { file: sizeFixture.helper, line: 2, column: 3 },
-    });
+      expectedStatus: "skipped",
+      parent: testCase.parent,
+      results: [failureResult, terminalSkip],
+      outcome: () => "skipped",
+      location: { file: sizeFixture.spec, line: 1, column: 1 },
+    };
   });
   const fullFailureSummary = summarizeRun(
-    { allTests: () => fullPlanFailures },
+    { allTests: () => maxFailedAttempts },
     "failed",
     { publicGate: true },
   );
-  assert.equal(fullFailureSummary.attempts.fail, 48);
+  assert.equal(fullFailureSummary.attempts.interrupted, 54);
   assert.equal(fullFailureSummary.logical.skip, 6);
   assert.equal(withRootOwnedGate(sizeFixture.gateRoot, () => writeBoundedFailureSummary(
     sizeFixture.binding,
-    { allTests: () => fullPlanFailures },
+    { allTests: () => maxFailedAttempts },
     fullFailureSummary,
     { gateRoot: sizeFixture.gateRoot, sourceRoot: sizeFixture.sourceRoot },
-  )), true, "48 fixed attempt failures fit within the bounded report");
-  assert.ok(fs.statSync(path.join(sizeFixture.results, "live-failures-v1.json")).size <= 16 * 1024);
+  )), true, "all 54 validated failed attempts survive the bounded report");
+  const maximumReportBytes = fs.readFileSync(
+    path.join(sizeFixture.results, "live-failures-v2.json"),
+  );
+  const maximumReport = JSON.parse(maximumReportBytes.toString("ascii"));
+  assert.ok(maximumReportBytes.length <= 16 * 1024);
+  assert.ok(maximumReportBytes.length <= 16 * 1024 - 256);
+  assert.equal(maximumReport.failures.length, 54);
+  assert.ok(maximumReport.failures.every((failure) => failure.status === "interrupted"));
+  assert.ok(maximumReport.failures.every((failure) => (
+    failure.source_line === 10_000 && failure.source_column === 10_000
+  )));
+  assert.ok(maximumReport.failures.every((failure) => failure.page_errors_truncated));
+  assert.ok(maximumReport.failures.some((failure) => failure.page_errors.length === 0));
+  assert.ok(maximumReport.failures.some((failure) => failure.page_errors.some((event) => (
+    event[0] === "AggregateError"
+      && event[1] === "tournaments"
+      && event[2] === "turbopack-abcdefghijklm.js"
+      && event[3] === 1_000_000
+      && event[4] === 1_000_000
+  ))));
+  assert.equal(maximumReportBytes.includes(Buffer.from("private max-size error")), false);
+  assert.equal(maximumReportBytes.includes(Buffer.from("https://old-sparky.com")), false);
+  assert.equal(
+    maximumReportBytes.includes(Buffer.from("turbopack-abcdefghijklm.js:1000000:1000000")),
+    false,
+  );
+  assert.ok(maximumReport.failures.every((failure) => (
+    failure.page_error_state === "captured" ? failure.page_errors.length >= 1 : (
+      failure.page_error_state === "unavailable" && failure.page_errors.length === 0
+    )
+  )));
+  assert.ok(maximumReport.failures.every((failure) => failure.id && failure.project && failure.status));
 } finally {
   fs.rmSync(failureRoot, { recursive: true, force: true });
 }

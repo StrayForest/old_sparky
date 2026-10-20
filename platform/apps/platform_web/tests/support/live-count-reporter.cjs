@@ -8,9 +8,23 @@ const path = require("node:path");
 const MAX_TESTS = 4096;
 const MAX_REPORT_BYTES = 1024;
 const MAX_FAILURE_REPORT_BYTES = 16 * 1024;
+// The guard adds three fixed metadata fields (two 64-char digests and a
+// 20-char UTC timestamp) before durable publication. Keep a little headroom
+// beyond their measured 219-byte JSON envelope while retaining the 16 KiB
+// durable-file limit.
+const FAILURE_REPORT_GUARD_ENVELOPE_RESERVE_BYTES = 256;
+const MAX_EPHEMERAL_FAILURE_REPORT_BYTES = (
+  MAX_FAILURE_REPORT_BYTES - FAILURE_REPORT_GUARD_ENVELOPE_RESERVE_BYTES
+);
+const MAX_PAGE_ERROR_EVIDENCE_BYTES = 2048;
+const MAX_PAGE_ERROR_EVENTS = 4;
+const MAX_PAGE_ERROR_STACK_CHARS = 16 * 1024;
+const MAX_PAGE_ERROR_STACK_LINES = 32;
+const MAX_TRACKED_NEXT_SCRIPTS = 256;
 const MAX_ATTEMPTS = 32768;
 const GATE_ROOT = "/run/oldsparky-liveqa";
-const FAILURE_REPORT_FILE = "live-failures-v1.json";
+const FAILURE_REPORT_FILE = "live-failures-v2.json";
+const PAGE_ERROR_ATTACHMENT_NAME = "live-pageerror-evidence-v1";
 const RUN_STATUSES = new Set(["passed", "failed", "timedout", "interrupted"]);
 const ATTEMPT_STATUSES = new Set([
   "passed",
@@ -55,6 +69,50 @@ const FAILURE_SOURCE_FILES = new Set([
   "tests/support/live-qa-sandbox.ts",
 ]);
 const FAILURE_ATTEMPT_STATUSES = new Set(["failed", "timedOut", "interrupted"]);
+const PAGE_ERROR_CLASSES = new Set([
+  "Error",
+  "TypeError",
+  "ReferenceError",
+  "SyntaxError",
+  "RangeError",
+  "URIError",
+  "EvalError",
+  "AggregateError",
+  "DOMException",
+  "unknown",
+]);
+const PAGE_ERROR_ROUTES = new Set(["home", "patch", "tournaments", "other", "unknown"]);
+const PAGE_ERROR_ASSET_BASENAME = /^(?:[a-z0-9][a-z0-9_-]{12}|turbopack-[a-z0-9_-]{13})\.js$/u;
+const PAGE_ERROR_SCRIPT_SEGMENT = /^[A-Za-z0-9()[\]@._~-]+$/u;
+const PAGE_ERROR_LIVE_ORIGIN = "https://old-sparky.com";
+const PAGE_ERROR_ATTACHMENT_SCHEMA = 1;
+const PAGE_ERROR_JS_CLASSES = new Set([
+  "Error",
+  "TypeError",
+  "ReferenceError",
+  "SyntaxError",
+  "RangeError",
+  "URIError",
+  "EvalError",
+  "AggregateError",
+]);
+const PAGE_ERROR_DOM_EXCEPTION_NAMES = new Set([
+  "AbortError",
+  "DataError",
+  "EncodingError",
+  "InvalidAccessError",
+  "InvalidStateError",
+  "NetworkError",
+  "NotAllowedError",
+  "NotFoundError",
+  "NotReadableError",
+  "NotSupportedError",
+  "OperationError",
+  "QuotaExceededError",
+  "SecurityError",
+  "TimeoutError",
+  "TransactionInactiveError",
+]);
 const PUBLIC_TEST_TITLES = new Set([
   ...[
     "/", "/info", "/tournaments", "/tournaments/new", "/profile/me", "/profile/lisalexy",
@@ -386,6 +444,238 @@ function normalizedFailureLocation(location, sourceRoot, fallbackKind) {
   }
 }
 
+function unavailablePageErrorEvidence() {
+  return { state: "unavailable", truncated: false, events: [] };
+}
+
+function pageErrorClass(error) {
+  let name = "";
+  try {
+    if (typeof error?.name === "string") name = error.name;
+  } catch {
+    return "unknown";
+  }
+  if (PAGE_ERROR_JS_CLASSES.has(name)) return name;
+  if (PAGE_ERROR_DOM_EXCEPTION_NAMES.has(name)) return "DOMException";
+  return "unknown";
+}
+
+function pageErrorRoute(pageUrl) {
+  if (typeof pageUrl !== "string" || pageUrl.length > 2048) return "unknown";
+  try {
+    const parsed = new URL(pageUrl);
+    if (
+      parsed.origin !== PAGE_ERROR_LIVE_ORIGIN
+      || parsed.username
+      || parsed.password
+    ) return "unknown";
+    if (parsed.pathname === "/") return "home";
+    if (/^\/patches\/[0-9]{1,32}$/u.test(parsed.pathname)) return "patch";
+    if (parsed.pathname === "/tournaments") return "tournaments";
+    return "other";
+  } catch {
+    return "unknown";
+  }
+}
+
+function trustedNextScriptPath(rawUrl) {
+  if (
+    typeof rawUrl !== "string"
+    || rawUrl.length > 2048
+    || !rawUrl.startsWith(`${PAGE_ERROR_LIVE_ORIGIN}/_next/static/chunks/`)
+    || rawUrl.includes("?")
+    || rawUrl.includes("#")
+    || rawUrl.includes("%")
+    || rawUrl.includes("\\")
+  ) return null;
+  try {
+    const parsed = new URL(rawUrl);
+    if (
+      parsed.origin !== PAGE_ERROR_LIVE_ORIGIN
+      || parsed.username
+      || parsed.password
+      || parsed.search
+      || parsed.hash
+      || `${parsed.origin}${parsed.pathname}` !== rawUrl
+    ) return null;
+    const relative = parsed.pathname.slice("/_next/static/chunks/".length);
+    const segments = relative.split("/");
+    const basename = segments.at(-1) ?? "";
+    if (
+      segments.some((segment) => (
+        !segment
+        || segment === "."
+        || segment === ".."
+        || !PAGE_ERROR_SCRIPT_SEGMENT.test(segment)
+      ))
+      || !PAGE_ERROR_ASSET_BASENAME.test(basename)
+    ) return null;
+    return { path: parsed.pathname, basename };
+  } catch {
+    return null;
+  }
+}
+
+function trustedSuccessfulNextScriptPath(response) {
+  if (
+    !response
+    || response.resourceType !== "script"
+    || !Number.isSafeInteger(response.status)
+    || response.status < 200
+    || response.status >= 300
+  ) return null;
+  return trustedNextScriptPath(response.url)?.path ?? null;
+}
+
+function pageErrorLocation(stack, successfulScriptPaths) {
+  if (
+    typeof stack !== "string"
+    || stack.length > MAX_PAGE_ERROR_STACK_CHARS
+    || !(successfulScriptPaths instanceof Set)
+  ) return null;
+  for (const stackLine of stack.split(/\r?\n/u).slice(0, MAX_PAGE_ERROR_STACK_LINES)) {
+    const match = stackLine.match(
+      /(?:^|\s|\()(https:\/\/old-sparky\.com\/\S+\.js):([1-9][0-9]{0,6}):([1-9][0-9]{0,6})\)?$/u,
+    );
+    if (!match) continue;
+    const script = trustedNextScriptPath(match[1]);
+    const line = Number(match[2]);
+    const column = Number(match[3]);
+    if (
+      !script
+      || !successfulScriptPaths.has(script.path)
+      || !Number.isSafeInteger(line)
+      || line > 1_000_000
+      || !Number.isSafeInteger(column)
+      || column > 1_000_000
+    ) continue;
+    return { asset_basename: script.basename, line, column };
+  }
+  return null;
+}
+
+function projectPageErrorEvent(error, pageUrl, successfulScriptPaths) {
+  let stack;
+  try {
+    stack = error?.stack;
+  } catch {
+    stack = null;
+  }
+  const location = pageErrorLocation(stack, successfulScriptPaths);
+  return {
+    class: pageErrorClass(error),
+    route: pageErrorRoute(pageUrl),
+    asset_basename: location?.asset_basename ?? null,
+    line: location?.line ?? null,
+    column: location?.column ?? null,
+  };
+}
+
+function createPageErrorAttachment(input) {
+  if (
+    !input
+    || typeof input !== "object"
+    || !Array.isArray(input.errors)
+    || !Array.isArray(input.successfulScriptResponses)
+  ) return null;
+  const successfulScriptPaths = new Set();
+  for (const response of input.successfulScriptResponses.slice(0, MAX_TRACKED_NEXT_SCRIPTS)) {
+    const scriptPath = trustedSuccessfulNextScriptPath(response);
+    if (scriptPath) successfulScriptPaths.add(scriptPath);
+  }
+  const events = input.errors
+    .slice(0, MAX_PAGE_ERROR_EVENTS)
+    .map((error) => projectPageErrorEvent(error, input.pageUrl, successfulScriptPaths));
+  const payload = {
+    schema: PAGE_ERROR_ATTACHMENT_SCHEMA,
+    truncated: input.truncated === true || input.errors.length > events.length,
+    events,
+  };
+  const body = Buffer.from(JSON.stringify(payload), "ascii");
+  if (body.length > MAX_PAGE_ERROR_EVIDENCE_BYTES) return null;
+  return {
+    name: PAGE_ERROR_ATTACHMENT_NAME,
+    contentType: "application/json",
+    body,
+  };
+}
+
+function normalizedPageErrorEvent(event) {
+  if (
+    !event
+    || typeof event !== "object"
+    || Array.isArray(event)
+    || Object.keys(event).sort().join(",") !== "asset_basename,class,column,line,route"
+    || typeof event.class !== "string"
+    || !PAGE_ERROR_CLASSES.has(event.class)
+    || typeof event.route !== "string"
+    || !PAGE_ERROR_ROUTES.has(event.route)
+  ) return null;
+  const noAsset = event.asset_basename === null
+    && event.line === null
+    && event.column === null;
+  const withAsset = typeof event.asset_basename === "string"
+    && PAGE_ERROR_ASSET_BASENAME.test(event.asset_basename)
+    && Number.isSafeInteger(event.line)
+    && event.line >= 1
+    && event.line <= 1_000_000
+    && Number.isSafeInteger(event.column)
+    && event.column >= 1
+    && event.column <= 1_000_000;
+  if (!noAsset && !withAsset) return null;
+  return [
+    event.class,
+    event.route,
+    noAsset ? null : event.asset_basename,
+    noAsset ? null : event.line,
+    noAsset ? null : event.column,
+  ];
+}
+
+function pageErrorEvidenceForAttempt(result) {
+  if (!Array.isArray(result?.attachments)) return unavailablePageErrorEvidence();
+  const attachments = result.attachments.filter(
+    (attachment) => attachment?.name === PAGE_ERROR_ATTACHMENT_NAME,
+  );
+  if (attachments.length !== 1) return unavailablePageErrorEvidence();
+  const attachment = attachments[0];
+  if (
+    attachment?.contentType !== "application/json"
+    || attachment.path !== undefined
+    || !Buffer.isBuffer(attachment.body)
+    || attachment.body.length > MAX_PAGE_ERROR_EVIDENCE_BYTES
+    || attachment.body.some((byte) => byte > 0x7f)
+  ) return unavailablePageErrorEvidence();
+
+  const raw = attachment.body;
+  let payload;
+  try {
+    payload = JSON.parse(attachment.body.toString("ascii"));
+  } catch {
+    return unavailablePageErrorEvidence();
+  }
+  if (
+    !payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+    || Object.keys(payload).sort().join(",") !== "events,schema,truncated"
+    || payload.schema !== 1
+    || typeof payload.truncated !== "boolean"
+    || !Array.isArray(payload.events)
+    || payload.events.length > MAX_PAGE_ERROR_EVENTS
+    || (payload.truncated && payload.events.length !== MAX_PAGE_ERROR_EVENTS)
+    || raw.toString("ascii") !== JSON.stringify(payload)
+  ) return unavailablePageErrorEvidence();
+  const events = payload.events.map(normalizedPageErrorEvent);
+  if (events.some((event) => event === null)) return unavailablePageErrorEvidence();
+  if (events.length === 0 && payload.truncated) return unavailablePageErrorEvidence();
+  return {
+    state: events.length === 0 ? "absent" : "captured",
+    truncated: payload.truncated,
+    events,
+  };
+}
+
 function failureRecordForAttempt(test, result, attempt, sourceRoot) {
   const project = typeof test?.parent?.project === "function"
     ? test.parent.project()?.name
@@ -404,6 +694,7 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
   if (!location) {
     location = normalizedFailureLocation(test.location, sourceRoot, "declaration");
   }
+  const pageErrorEvidence = pageErrorEvidenceForAttempt(result);
   return {
     id,
     project,
@@ -413,7 +704,39 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
     source_line: location?.line ?? null,
     source_column: location?.column ?? null,
     source_kind: location?.kind ?? "unavailable",
+    page_error_state: pageErrorEvidence.state,
+    page_errors_truncated: pageErrorEvidence.truncated,
+    page_errors: pageErrorEvidence.events,
   };
+}
+
+function boundedFailureReportBytes(payload) {
+  let bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+  if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) return bytes;
+
+  // Keep one event per failed attempt before retaining additional detail.
+  for (const failure of [...payload.failures].reverse()) {
+    while (
+      bytes.length > MAX_EPHEMERAL_FAILURE_REPORT_BYTES
+      && failure.page_errors.length > 1
+    ) {
+      failure.page_errors.pop();
+      failure.page_errors_truncated = true;
+      bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+    }
+  }
+  // If the report still exceeds the cap, remove event details from later
+  // records while preserving every test identity, status, and source location.
+  for (const failure of [...payload.failures].reverse()) {
+    if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
+    if (failure.page_errors.length > 0) {
+      failure.page_errors.pop();
+      failure.page_errors_truncated = true;
+      failure.page_error_state = "unavailable";
+      bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+    }
+  }
+  return bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES ? bytes : null;
 }
 
 function writeBoundedFailureSummary(
@@ -486,7 +809,7 @@ function writeBoundedFailureSummary(
   ) return false;
 
   const payload = {
-    schema: 1,
+    schema: 2,
     gate: gateName,
     source_sha: binding.source_sha,
     app_sha: binding.app_sha,
@@ -494,8 +817,8 @@ function writeBoundedFailureSummary(
     run_status: summary.run_status,
     failures,
   };
-  const bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
-  if (bytes.length > MAX_FAILURE_REPORT_BYTES) return false;
+  const bytes = boundedFailureReportBytes(payload);
+  if (!bytes) return false;
   const output = path.join(binding.gate, "test-results", FAILURE_REPORT_FILE);
   let fd;
   try {
@@ -567,3 +890,8 @@ module.exports.summarizeRun = summarizeRun;
 module.exports.bindingsFromEnvironment = bindingsFromEnvironment;
 module.exports.writeBoundedSummary = writeBoundedSummary;
 module.exports.writeBoundedFailureSummary = writeBoundedFailureSummary;
+module.exports.createPageErrorAttachment = createPageErrorAttachment;
+module.exports.trustedSuccessfulNextScriptPath = trustedSuccessfulNextScriptPath;
+module.exports.pageErrorClass = pageErrorClass;
+module.exports.MAX_PAGE_ERROR_EVENTS = MAX_PAGE_ERROR_EVENTS;
+module.exports.MAX_TRACKED_NEXT_SCRIPTS = MAX_TRACKED_NEXT_SCRIPTS;
