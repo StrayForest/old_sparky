@@ -2777,19 +2777,23 @@ class LiveQaGuardTests(unittest.TestCase):
 
     def test_live_browser_runner_maps_all_read_only_runtime_paths_in_unit_namespace(self) -> None:
         runner = SCRIPT_PATH.with_name("platform_live_browser_qa.sh").read_text()
+        child_command_start = runner.index("CHILD_COMMAND=(\n")
+        child_command_end = runner.index("\n)\n", child_command_start)
+        child_command = runner[child_command_start:child_command_end]
         self.assertIn("--property=BindReadOnlyPaths=$RUNTIME_SUITE_SOURCE:$RUNTIME_MOUNT_SUITE_TARGET", runner)
         self.assertIn("--property=BindReadOnlyPaths=$RUNTIME_ENGINE_SOURCE:$RUNTIME_MOUNT_ENGINE_TARGET", runner)
         self.assertIn('--working-directory="$RUNTIME_SUITE/web"', runner)
-        self.assertIn('PATH="$RUNTIME_CACHE/node/bin:/usr/bin:/bin"', runner)
-        self.assertIn('NODE_PATH="$RUNTIME_CACHE/web/node_modules"', runner)
-        self.assertIn('PLAYWRIGHT_BROWSERS_PATH="$RUNTIME_CACHE/browsers"', runner)
-        self.assertIn('CHROME_DEVEL_SANDBOX="$CHROMIUM_SANDBOX"', runner)
+        self.assertIn("/usr/bin/env -i", child_command)
+        self.assertIn('"PATH=$RUNTIME_CACHE/node/bin:/usr/bin:/bin"', child_command)
+        self.assertIn('"NODE_PATH=$RUNTIME_CACHE/web/node_modules"', child_command)
+        self.assertIn('"PLAYWRIGHT_BROWSERS_PATH=$RUNTIME_CACHE/browsers"', child_command)
+        self.assertIn('"CHROME_DEVEL_SANDBOX=$CHROMIUM_SANDBOX"', child_command)
         self.assertIn('"$RUNTIME_CACHE/web/node_modules/@playwright/test/cli.js"', runner)
-        self.assertIn('"$RUNTIME_SUITE/web/playwright.live.config.ts"', runner)
+        self.assertIn('"--config=$RUNTIME_SUITE/web/playwright.live.config.ts"', runner)
         self.assertIn('"$RUNTIME_SUITE/web/tests/smoke/live-launch.spec.ts"', runner)
-        self.assertIn('HOME="$BROWSER_GATE/home"', runner)
-        self.assertIn('TMPDIR="$BROWSER_GATE/tmp"', runner)
-        self.assertIn('PLATFORM_QA_BROWSER_GATE_DIR="$BROWSER_GATE"', runner)
+        self.assertIn('"HOME=$BROWSER_GATE/home"', child_command)
+        self.assertIn('"TMPDIR=$BROWSER_GATE/tmp"', child_command)
+        self.assertIn('"PLATFORM_QA_BROWSER_GATE_DIR=$BROWSER_GATE"', child_command)
 
     def test_runtime_contract_rejects_64_character_commits_end_to_end(self) -> None:
         self.assertIsNotNone(guard.COMMIT_PATTERN.fullmatch("a" * 40))
