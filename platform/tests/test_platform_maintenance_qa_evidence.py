@@ -24,7 +24,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _canonical_workflow_report(
-    workflow_name: str, runner_sha: str, app_target_sha: str | None = None
+    workflow_name: str,
+    runner_sha: str,
+    app_target_sha: str | None = None,
+    *,
+    child_kind: str | None = None,
+    child_exit: int = 0,
+    launch_status: str = "passed",
+    count_status: str = "passed",
+    include_counts: bool = True,
+    invalid_counts: bool = False,
 ) -> dict[str, object]:
     app_target_sha = app_target_sha or runner_sha
     workflow_path = REPO_ROOT / ".github" / "workflows" / workflow_name
@@ -38,20 +47,31 @@ def _canonical_workflow_report(
         )
         marker = "maintenance-contract"
         marker_digest = hashlib.sha256(marker.encode("ascii")).hexdigest()
+        failed_counts = count_status != "passed"
+        logical_pass = 46 if failed_counts else 47
+        attempt_pass = 46 if failed_counts else 47
         count_line = (
-            "LIVE_BROWSER_COUNTS schema=1 run_status=passed logical_total=54 logical_pass=47 "
-            "logical_fail=0 logical_expected_fail=0 logical_flaky=0 logical_skip=7 "
-            f"logical_interrupted=0 attempt_total=54 attempt_pass=47 attempt_fail=0 "
+            f"LIVE_BROWSER_COUNTS schema=1 run_status={count_status} logical_total=54 logical_pass={logical_pass} "
+            f"logical_fail={1 if failed_counts else 0} logical_expected_fail=0 logical_flaky=0 logical_skip=7 "
+            f"logical_interrupted=0 attempt_total=54 attempt_pass={attempt_pass} attempt_fail={1 if failed_counts else 0} "
             f"attempt_skip=7 attempt_interrupted=0 attempt_timedout=0 source_sha={runner_sha} "
             f"app_sha={app_target_sha} marker_sha256={marker_digest}\n"
         )
+        if invalid_counts:
+            count_line = count_line.replace("logical_total=54", "logical_total=53")
+        status_stage = "complete" if launch_status == "passed" else "browser_qa"
+        status_check = "none" if launch_status == "passed" else "browser_qa"
         status_line = (
-            "LIVE_LAUNCH_STATUS schema=2 status=passed stage=complete check=none "
-            f"child_exit=0 source_sha={runner_sha}\n"
+            f"LIVE_LAUNCH_STATUS schema=2 status={launch_status} stage={status_stage} check={status_check} "
+            f"child_exit={child_exit} source_sha={runner_sha}\n"
         )
         binding_digest = "" if app_target_sha == runner_sha else "c" * 64
-        arguments = ("0", runner_sha, app_target_sha, binding_digest, marker)
-        raw = (count_line + status_line).encode("ascii")
+        arguments = (str(child_exit), runner_sha, app_target_sha, binding_digest, marker)
+        diagnostic = "" if child_kind is None else (
+            f"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind={child_kind} stdout_bytes=0 stderr_bytes=0 "
+            f"truncated=false child_exit={child_exit}\n"
+        )
+        raw = (diagnostic + (count_line if include_counts else "") + status_line).encode("ascii")
         output_name = "safe.json"
     else:
         pattern = (
@@ -209,6 +229,60 @@ def _legacy_preserve_maintenance_argv() -> tuple[str, ...]:
 
 
 class MaintenanceQaEvidenceTests(unittest.TestCase):
+    def test_failure_report_marker_only_describes_existing_failed_qa(self) -> None:
+        sha = "a" * 40
+        rejected_success = _canonical_workflow_report(
+            "platform-live-launch.yml",
+            sha,
+            child_kind="failure_report_unavailable",
+        )
+        self.assertFalse(rejected_success["success"])
+        self.assertEqual(rejected_success["status"], "unavailable")
+        rejected_missing_counts = _canonical_workflow_report(
+            "platform-live-launch.yml",
+            sha,
+            child_kind="failure_report_unavailable",
+            include_counts=False,
+        )
+        self.assertFalse(rejected_missing_counts["success"])
+        self.assertEqual(rejected_missing_counts["status"], "unavailable")
+
+        failed_counts = _canonical_workflow_report(
+            "platform-live-launch.yml",
+            sha,
+            child_kind="failure_report_unavailable",
+            count_status="failed",
+        )
+        self.assertFalse(failed_counts["success"])
+        self.assertEqual(failed_counts["status"], "failed")
+        self.assertEqual(
+            failed_counts["error_class_counts"],
+            {"browser_child_failure_report_unavailable": 1},
+        )
+
+        failed_before_counts = _canonical_workflow_report(
+            "platform-live-launch.yml",
+            sha,
+            child_kind="failure_report_unavailable",
+            child_exit=1,
+            launch_status="failed",
+            include_counts=False,
+        )
+        self.assertFalse(failed_before_counts["success"])
+        self.assertEqual(failed_before_counts["status"], "failed")
+        self.assertEqual(failed_before_counts["process_exit_code"], 1)
+
+        malformed_count_failure = _canonical_workflow_report(
+            "platform-live-launch.yml",
+            sha,
+            child_kind="unclassified",
+            child_exit=1,
+            launch_status="failed",
+            invalid_counts=True,
+        )
+        self.assertEqual(malformed_count_failure["status"], "failed")
+        self.assertFalse(malformed_count_failure["success"])
+
     def test_closed_qa_reports_reject_inconsistent_counts_and_bindings(self) -> None:
         runner_sha = "a" * 40
         app_target_sha = "a" * 40

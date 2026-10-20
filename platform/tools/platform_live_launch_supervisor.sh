@@ -300,7 +300,7 @@ if browser_diagnostic="$(env -i \
 else
   browser_status=$?
 fi
-if [[ "$browser_diagnostic" =~ (^|$'\n')LIVE_QA_CHILD_DIAGNOSTIC\ schema=1\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=[0-9]{1,3}($|$'\n') ]]; then
+if [[ "$browser_diagnostic" =~ (^|$'\n')LIVE_QA_CHILD_DIAGNOSTIC\ schema=1\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=[0-9]{1,3}($|$'\n') ]]; then
   child_diagnostic="${BASH_REMATCH[0]}"
   child_diagnostic="${child_diagnostic//$'\n'/}"
   printf '%s\n' "$child_diagnostic" >&3 || true

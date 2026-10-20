@@ -163,6 +163,19 @@ cleanup_gate() {
 }
 trap cleanup_gate EXIT INT TERM HUP
 
+if (( TRUSTED_MODE == 1 )); then
+  # Private diagnostics are auxiliary: a store problem must not skip the
+  # browser suite or turn a passing suite into a failure. Failed counts below
+  # still require successful publication and emit the fixed unavailable kind.
+  if ! "${GUARD[@]}" prepare-public-failure-diagnostics \
+    --gate "$BROWSER_GATE" \
+    --source-sha "$LIVE_QA_RUNNER_SHA" \
+    --app-sha "$LIVE_QA_TARGET_SHA" \
+    --marker-sha256 "$LIVE_QA_MARKER_SHA256" >/dev/null 2>&1; then
+    :
+  fi
+fi
+
 SYSTEMD_BIND_ARGS=()
 if (( TRUSTED_MODE == 1 )); then
   IFS=$'\t' read -r \
@@ -240,21 +253,53 @@ if browser_diagnostic="$("${GUARD[@]}" capture-qa-browser-child -- \
 else
   browser_status=$?
 fi
-if [[ "$browser_diagnostic" =~ ^LIVE_QA_CHILD_DIAGNOSTIC\ schema=1\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=[0-9]{1,3}$ ]]; then
-  printf '%s\n' "$browser_diagnostic"
+diagnostic_valid=0
+diagnostic_kind="unclassified"
+diagnostic_stdout_bytes=0
+diagnostic_stderr_bytes=0
+diagnostic_truncated=false
+diagnostic_child_exit="$browser_status"
+if [[ "$browser_diagnostic" =~ ^LIVE_QA_CHILD_DIAGNOSTIC\ schema=1\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|unclassified)\ stdout_bytes=([0-9]{1,16})\ stderr_bytes=([0-9]{1,16})\ truncated=(true|false)\ child_exit=([0-9]{1,3})$ ]]; then
+  diagnostic_valid=1
+  diagnostic_kind="${BASH_REMATCH[1]}"
+  diagnostic_stdout_bytes="${BASH_REMATCH[2]}"
+  diagnostic_stderr_bytes="${BASH_REMATCH[3]}"
+  diagnostic_truncated="${BASH_REMATCH[4]}"
+  diagnostic_child_exit="${BASH_REMATCH[5]}"
 else
   browser_status=2
+  diagnostic_child_exit=2
 fi
 
 count_status=0
+COUNT_DIAGNOSTIC_ARGS=()
+if (( TRUSTED_MODE == 1 )); then
+  COUNT_DIAGNOSTIC_ARGS+=(--persist-failure-report --fail-on-failure-counts)
+fi
 if "${GUARD[@]}" emit-public-browser-counts \
   --gate "$BROWSER_GATE" \
   --source-sha "$LIVE_QA_RUNNER_SHA" \
   --app-sha "$LIVE_QA_TARGET_SHA" \
-  --marker-sha256 "$LIVE_QA_MARKER_SHA256" >&3; then
+  --marker-sha256 "$LIVE_QA_MARKER_SHA256" \
+  "${COUNT_DIAGNOSTIC_ARGS[@]}" >&3; then
   count_status=0
 else
   count_status=$?
+fi
+if (( count_status == 42 )); then
+  diagnostic_valid=1
+  diagnostic_kind="failure_report_unavailable"
+  diagnostic_child_exit="$browser_status"
+elif (( count_status == 43 && browser_status == 0 )); then
+  # Validated failed counts are a QA failure even if the Playwright child
+  # itself exited zero. The private report was published successfully.
+  browser_status=1
+  diagnostic_valid=0
+fi
+if (( diagnostic_valid == 1 )); then
+  printf 'LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=%s stdout_bytes=%s stderr_bytes=%s truncated=%s child_exit=%s\n' \
+    "$diagnostic_kind" "$diagnostic_stdout_bytes" "$diagnostic_stderr_bytes" \
+    "$diagnostic_truncated" "$diagnostic_child_exit"
 fi
 if (( browser_status != 0 )); then
   exit "$browser_status"

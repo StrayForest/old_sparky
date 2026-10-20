@@ -217,7 +217,7 @@ LIVE_QA_DIAGNOSTIC_LINE_MAX_BYTES = 512
 LIVE_QA_DIAGNOSTIC_RE = re.compile(
     rb"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(?P<kind>none|playwright_cli_usage|"
     rb"node_module_missing|browser_executable_missing|browser_launch_error|"
-    rb"child_timeout|cleanup_failure|unclassified|dispatch_failure)"
+    rb"child_timeout|cleanup_failure|failure_report_unavailable|unclassified|dispatch_failure)"
     rb"(?: stage=(?P<stage>validation|identity|trusted_generation|dispatch) "
     rb"check=(?P<check>input_shape|source_binding|source_binding_io|source_binding_schema|"
     rb"source_binding_recheck|root_uid|generation_manifest|trusted_entry|"
@@ -240,7 +240,14 @@ LIVE_QA_DISPATCH_FAILURE_CHECKS = {
 
 def _valid_live_qa_diagnostic(line: bytes, child_status: int) -> bool:
     match = LIVE_QA_DIAGNOSTIC_RE.fullmatch(line)
-    if match is None or int(match.group("child_exit")) != child_status:
+    if match is None:
+        return False
+    diagnostic_child_exit = int(match.group("child_exit"))
+    if diagnostic_child_exit != child_status and not (
+        match.group("kind") == b"failure_report_unavailable"
+        and diagnostic_child_exit == 0
+        and child_status == 1
+    ):
         return False
     if match.group("kind") != b"dispatch_failure":
         return match.group("stage") is None and match.group("check") is None
@@ -2308,6 +2315,30 @@ def _wait_for_live_launch_status(
                 expected_app_sha=expected_app_sha,
                 expected_marker_sha256=expected_marker_sha256,
             )
+        if parsed is not None and child_diagnostic is not None:
+            diagnostic_match = LIVE_QA_DIAGNOSTIC_RE.fullmatch(child_diagnostic)
+            if diagnostic_match is not None and diagnostic_match.group("kind") == b"failure_report_unavailable":
+                diagnostic_status, diagnostic_counts = parsed
+                report_failure_counts = diagnostic_counts is not None and (
+                    diagnostic_counts["run_status"] != "passed"
+                    or any(
+                        diagnostic_counts[field] > 0
+                        for field in (
+                            "logical_fail", "logical_expected_fail", "logical_flaky",
+                            "logical_interrupted", "attempt_fail", "attempt_interrupted",
+                            "attempt_timedout",
+                        )
+                    )
+                )
+                if not (
+                    report_failure_counts
+                    or (
+                        diagnostic_counts is None
+                        and len(protocol_output.splitlines(keepends=True)) == 1
+                        and diagnostic_status[0] == "failed"
+                    )
+                ):
+                    parsed = None
         if parsed is None:
             safe_exit = child_status if 0 < child_status <= 255 else 2
             _emit_live_launch_status(
