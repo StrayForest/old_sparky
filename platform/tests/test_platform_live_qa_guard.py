@@ -3150,6 +3150,21 @@ class LiveQaGuardTests(unittest.TestCase):
             wrapper_bytes = SCRIPT_PATH.with_name("platform_live_user_qa.sh").read_bytes()
             fixture_runtime = b'QA_PYTHON="/opt/oldsparky/platform/shared/venv/bin/python"'
             self.assertEqual(wrapper_bytes.count(fixture_runtime), 1)
+            fixture_uid = "1001"
+            fixture_gid = "1002"
+            fixture_id_commands = (
+                (
+                    b'LIVE_QA_UID="$(/usr/bin/id -u oldsparky-liveqa)"',
+                    f'LIVE_QA_UID="{fixture_uid}"'.encode("ascii"),
+                ),
+                (
+                    b'LIVE_QA_GID="$(/usr/bin/id -g oldsparky-liveqa)"',
+                    f'LIVE_QA_GID="{fixture_gid}"'.encode("ascii"),
+                ),
+            )
+            for source, replacement in fixture_id_commands:
+                self.assertEqual(wrapper_bytes.count(source), 1)
+                wrapper_bytes = wrapper_bytes.replace(source, replacement)
             wrapper_path.write_bytes(
                 wrapper_bytes.replace(fixture_runtime, b'QA_PYTHON="/usr/bin/true"')
             )
@@ -3228,9 +3243,12 @@ class LiveQaGuardTests(unittest.TestCase):
             capture = next(args for args in trace if args[0] == "capture-qa-browser-child")
             self.assertIn(f"--property=BindReadOnlyPaths={install_root}/runtime:{suite_alias}", capture)
             self.assertIn(f"--property=BindReadOnlyPaths={engine_root}:{engine_alias}", capture)
+            self.assertIn(f"--uid={fixture_uid}", capture)
+            self.assertIn(f"--gid={fixture_gid}", capture)
             self.assertIn(f"--working-directory={suite_alias}/web", capture)
             self.assertIn(f"NODE_PATH={engine_alias}/web/node_modules", capture)
             self.assertIn(f"PATH={engine_alias}/node/bin:/usr/bin:/bin", capture)
+            self.assertIn(f"PLATFORM_LIVE_USER_QA_UID={fixture_uid}", capture)
             self.assertIn(
                 f"{engine_alias}/web/node_modules/@playwright/test/cli.js", capture
             )
