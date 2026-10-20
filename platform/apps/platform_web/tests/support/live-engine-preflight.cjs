@@ -1,5 +1,7 @@
 "use strict";
 
+/* eslint @typescript-eslint/no-require-imports: "off" -- This helper is CommonJS. */
+
 const { chromium, devices, webkit } = require("@playwright/test");
 
 async function checkEngine(engine, contextOptions) {

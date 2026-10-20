@@ -636,9 +636,19 @@ try {
       },
     };
   `, "utf8");
-  const preflightScript = path.resolve(
-    __dirname,
+  // Resolve the fake Playwright package from this disposable fixture. If the
+  // repository helper path were used directly, Node would prefer an installed
+  // platform_web/node_modules package over NODE_PATH and launch real browsers.
+  const preflightScript = path.join(
+    enginePreflightRoot,
     "live-engine-preflight.cjs",
+  );
+  const sourcePreflightScript = path.resolve(__dirname, "live-engine-preflight.cjs");
+  fs.copyFileSync(sourcePreflightScript, preflightScript);
+  assert.deepEqual(
+    fs.readFileSync(preflightScript),
+    fs.readFileSync(sourcePreflightScript),
+    "the disposable child must execute the checked-in helper bytes",
   );
   const eventsPath = path.join(enginePreflightRoot, "events.jsonl");
   const runPreflight = (failEngine = "", failContextClose = "") => spawnSync(
@@ -646,6 +656,7 @@ try {
     [preflightScript],
     {
       encoding: "utf8",
+      cwd: enginePreflightRoot,
       env: {
         NODE_PATH: path.join(enginePreflightRoot, "node_modules"),
         PREFLIGHT_EVENTS: eventsPath,
