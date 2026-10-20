@@ -178,7 +178,7 @@ class LiveQaGuardTests(unittest.TestCase):
         *,
         created_at: str = "2020-01-01T00:00:00Z",
         source_sha: str = "a" * 40,
-    ) -> tuple[Path, Path, Path, tuple[str, ...]]:
+    ) -> tuple[Path, Path, Path, tuple[str, ...], Path, Path, Path]:
         private = root / "private"
         private.mkdir(mode=0o700)
         install_root = root / "payload" / "releases" / source_sha
@@ -189,10 +189,61 @@ class LiveQaGuardTests(unittest.TestCase):
         (payload_tools / "platform_live_qa_mailbox_helper.py").write_bytes(
             helper_bytes
         )
-        os.chmod(payload_tools / "platform_live_qa_mailbox_helper.py", 0o755)
+        os.chmod(payload_tools / "platform_live_qa_mailbox_helper.py", 0o444)
         helper = private / "platform_live_qa_mailbox_helper.py"
         helper.write_bytes(helper_bytes)
         os.chmod(helper, 0o500)
+        os.chmod(payload_tools, 0o555)
+        os.chmod(payload_platform, 0o555)
+        os.chmod(install_root, 0o555)
+        releases = install_root.parent
+        os.chmod(releases, 0o755)
+        payload_digest = hashlib.sha256()
+        payload_files: dict[str, str] = {}
+        for path in sorted(install_root.rglob("*")):
+            relative = path.relative_to(install_root).as_posix()
+            payload_digest.update(relative.encode("utf-8") + b"\0")
+            if path.is_dir():
+                payload_digest.update(b"d\0")
+                continue
+            file_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            payload_files[relative] = file_digest
+            payload_digest.update(b"f\0" + bytes.fromhex(file_digest))
+        active_pointer = private / "active"
+        active_pointer.symlink_to(install_root)
+        manifest_path = private / "active-manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "source_sha": source_sha,
+                    "release_slug": "liveqa-stale-mode-fixture",
+                    "payload": str(install_root),
+                    "payload_tree_sha256": payload_digest.hexdigest(),
+                    "files": payload_files,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="ascii",
+        )
+        os.chown(manifest_path, 0, 0)
+        os.chmod(manifest_path, 0o444)
+        app_dir = root / "app"
+        app_releases = app_dir / "releases"
+        app_release = app_releases / f"fixture-{source_sha[:8]}"
+        app_release.mkdir(parents=True)
+        (app_release / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": source_sha}), encoding="ascii"
+        )
+        os.chown(app_release / "RELEASE.json", 0, 0)
+        os.chmod(app_release / "RELEASE.json", 0o444)
+        os.chown(app_release, 0, 0)
+        os.chmod(app_release, 0o555)
+        os.chown(app_releases, 0, 0)
+        os.chmod(app_releases, 0o555)
+        (app_dir / "current").symlink_to(app_release)
         marker = "liveqa-stale-guard-fixture"
         roster = [
             {
@@ -219,6 +270,9 @@ class LiveQaGuardTests(unittest.TestCase):
             install_root,
             payload_platform,
             tuple(item["id"] for item in roster),
+            private,
+            releases,
+            app_dir,
         )
 
     def make_zip(self, root: Path, entries: list[tuple[str, bytes]]) -> Path:
@@ -634,7 +688,8 @@ class LiveQaGuardTests(unittest.TestCase):
             tools = platform_root / "tools"
             tools.mkdir(parents=True)
             source = tools / "platform_live_qa_mailbox_helper.py"
-            source.write_bytes(b"reviewed")
+            source_bytes = b"reviewed"
+            source.write_bytes(source_bytes)
             os.chmod(source, 0o755)
             installed_parent = root / "private"
             installed_parent.mkdir(mode=0o700)
@@ -644,6 +699,22 @@ class LiveQaGuardTests(unittest.TestCase):
             with (
                 mock.patch.object(guard, "TRUSTED_SECRET_ROOT", installed_parent),
                 self.assertRaisesRegex(guard.GuardError, "does not match"),
+            ):
+                guard.verify_helper_binding(
+                    platform_root=platform_root,
+                    installed_helper=installed,
+                )
+
+            installed.write_bytes(source_bytes)
+            with mock.patch.object(guard, "TRUSTED_SECRET_ROOT", installed_parent):
+                guard.verify_helper_binding(
+                    platform_root=platform_root,
+                    installed_helper=installed,
+                )
+            os.chmod(source, 0o444)
+            with (
+                mock.patch.object(guard, "TRUSTED_SECRET_ROOT", installed_parent),
+                self.assertRaisesRegex(guard.GuardError, "helper file metadata"),
             ):
                 guard.verify_helper_binding(
                     platform_root=platform_root,
@@ -1148,6 +1219,9 @@ class LiveQaGuardTests(unittest.TestCase):
             "future_bundle",
             "malformed_timestamp",
             "wrong_helper",
+            "unsafe_source_mode",
+            "wrong_external_digest",
+            "unsafe_external_mode",
             "symlink_bundle",
             "other_state",
             "setup_state",
@@ -1175,17 +1249,24 @@ class LiveQaGuardTests(unittest.TestCase):
                         )
                     )
                     target_sha = "b" * 40 if scenario == "wrong_source" else source_sha
-                    bundle, install_root, payload_platform, expected_ids = (
+                    (
+                        bundle,
+                        install_root,
+                        payload_platform,
+                        expected_ids,
+                        secret_root,
+                        payload_releases,
+                        app_dir,
+                    ) = (
                         self.make_stale_cleanup_bundle_fixture(
                             root, created_at=created_at, source_sha=target_sha
                         )
                     )
-                    secret_root = bundle.parent
                     gate_root = root / "run-gates"
                     env = {
                         "PLATFORM_LIVE_QA_INSTALL_ROOT": str(install_root),
                         "PLATFORM_LIVE_QA_TARGET_SHA": target_sha,
-                        "PLATFORM_APP_DIR": str(guard.APP_DIR),
+                        "PLATFORM_APP_DIR": str(app_dir),
                         "PLATFORM_LIVE_CSP_QA_BUNDLE": str(bundle),
                     }
                     if scenario == "wrong_helper":
@@ -1193,6 +1274,22 @@ class LiveQaGuardTests(unittest.TestCase):
                         payload["mailbox_helper"] = str(secret_root / "other-helper")
                         bundle.write_text(json.dumps(payload), encoding="utf-8")
                         os.chmod(bundle, 0o600)
+                    elif scenario == "unsafe_source_mode":
+                        os.chmod(
+                            payload_platform
+                            / "tools/platform_live_qa_mailbox_helper.py",
+                            0o644,
+                        )
+                    elif scenario == "wrong_external_digest":
+                        external_helper = secret_root / "platform_live_qa_mailbox_helper.py"
+                        external_helper.chmod(0o600)
+                        external_helper.write_text("different helper\n", encoding="ascii")
+                        external_helper.chmod(0o500)
+                    elif scenario == "unsafe_external_mode":
+                        os.chmod(
+                            secret_root / "platform_live_qa_mailbox_helper.py",
+                            0o444,
+                        )
                     if scenario == "symlink_bundle":
                         real_bundle = secret_root / "bundle-data.json"
                         bundle.rename(real_bundle)
@@ -1214,6 +1311,9 @@ class LiveQaGuardTests(unittest.TestCase):
                     elif scenario in {
                         "wrong_source",
                         "wrong_helper",
+                        "unsafe_source_mode",
+                        "wrong_external_digest",
+                        "unsafe_external_mode",
                         "symlink_bundle",
                         "other_state",
                         "setup_state",
@@ -1225,8 +1325,14 @@ class LiveQaGuardTests(unittest.TestCase):
                         lock_context = self.assertRaises(guard.GuardError)
                     else:
                         lock_context = self.subTest("prepared exact stale inventory")
-                    source_validation = (
+                    installed_payload_validation = (
                         mock.patch.object(
+                            guard,
+                            "_validate_installed_payload_root",
+                            wraps=guard._validate_installed_payload_root,
+                        )
+                        if scenario == "success"
+                        else mock.patch.object(
                             guard,
                             "_validate_installed_payload_root",
                             side_effect=(
@@ -1234,14 +1340,34 @@ class LiveQaGuardTests(unittest.TestCase):
                                 if scenario == "wrong_source"
                                 else lambda *_args, **_kwargs: target_sha
                             ),
+                        )
+                    )
+                    source_validation = (
+                        installed_payload_validation,
+                        mock.patch.object(
+                            guard,
+                            "_active_release_commit",
+                            side_effect=lambda: guard._release_pointer_commit(
+                                "current", app_dir
+                            ),
                         ),
-                        mock.patch.object(guard, "_active_release_commit", return_value=source_sha),
+                        mock.patch.object(guard, "APP_DIR", app_dir),
                         mock.patch.object(guard, "_assert_release_lock_supervisor"),
                         mock.patch.object(guard, "assert_bundle_lock"),
                         mock.patch.object(guard, "assert_liveqa_idle"),
                         mock.patch.object(guard, "TRUSTED_SECRET_ROOT", secret_root),
                         mock.patch.object(
-                            guard, "TRUSTED_PAYLOAD_ROOT", install_root.parent
+                            guard, "TRUSTED_PAYLOAD_ROOT", payload_releases
+                        ),
+                        mock.patch.object(
+                            guard,
+                            "TRUSTED_ACTIVE_MANIFEST",
+                            secret_root / "active-manifest.json",
+                        ),
+                        mock.patch.object(
+                            guard,
+                            "TRUSTED_ACTIVE_POINTER",
+                            secret_root / "active",
                         ),
                         mock.patch.object(guard, "RUN_GATE_ROOT", gate_root),
                         mock.patch.dict(os.environ, env, clear=True),
