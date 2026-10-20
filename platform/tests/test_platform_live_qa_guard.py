@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import grp
 import hashlib
@@ -2064,6 +2064,97 @@ class LiveQaGuardTests(unittest.TestCase):
             ):
                 guard._sandbox_path(cache)
 
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned runtime provider contract")
+    def test_sandbox_path_resolves_only_the_installed_suite_provider(self) -> None:
+        source_sha = "a" * 40
+        external_provider_sha = "b" * 40
+
+        def make_provider(base: Path, *, version: int, self_owned: bool = False) -> tuple[Path, Path, Path]:
+            payloads = base / "trusted" / "releases"
+            active_payload = payloads / source_sha
+            provider_sha = source_sha if self_owned else external_provider_sha
+            provider_payload = payloads / provider_sha
+            runtime = active_payload / "runtime"
+            runtime.mkdir(mode=0o755, parents=True)
+            sandbox_root = provider_payload / ("provider-runtime" if version == 2 else "runtime")
+            sandbox = sandbox_root / guard.CHROMIUM_SANDBOX_RELATIVE
+            sandbox.parent.mkdir(mode=0o755, parents=True)
+            sandbox.write_bytes(platform_chromium_sandbox_fixture.read_bytes())
+            os.chown(sandbox, 0, 0)
+            os.chmod(sandbox, 0o4755)
+            for directory in sorted(
+                (path for path in payloads.rglob("*") if path.is_dir()),
+                key=lambda path: len(path.parts),
+                reverse=True,
+            ):
+                os.chown(directory, 0, 0)
+                os.chmod(directory, 0o555)
+            active_pointer = base / "trusted" / "active"
+            active_pointer.symlink_to(Path("releases") / source_sha)
+            return active_pointer, payloads, runtime
+
+        for version, self_owned in ((2, False), (2, True), (1, False)):
+            with self.subTest(version=version, self_owned=self_owned), tempfile.TemporaryDirectory(
+                dir="/root"
+            ) as temporary:
+                base = Path(temporary)
+                pointer, payloads, suite_root = make_provider(
+                    base, version=version, self_owned=self_owned
+                )
+                active_payload = pointer.resolve(strict=True)
+                engine_root = payloads / (
+                    source_sha if self_owned else external_provider_sha
+                ) / ("provider-runtime" if version == 2 else "runtime")
+                with (
+                    mock.patch.object(guard, "TRUSTED_ACTIVE_POINTER", pointer),
+                    mock.patch.object(guard, "TRUSTED_PAYLOAD_ROOT", payloads),
+                    mock.patch.object(
+                        guard, "_validate_installed_payload_root", return_value=source_sha
+                    ),
+                    mock.patch.object(guard, "_trusted_runtime_root", return_value=engine_root),
+                ):
+                    engine_output = io.StringIO()
+                    with redirect_stdout(engine_output):
+                        self.assertEqual(guard.main(["runtime-root"]), 0)
+                    self.assertEqual(engine_output.getvalue(), f"{engine_root}\n")
+                    sandbox_output = io.StringIO()
+                    with redirect_stdout(sandbox_output):
+                        self.assertEqual(
+                            guard.main(["sandbox-path", "--runtime-cache", str(suite_root)]),
+                            0,
+                        )
+                    self.assertEqual(
+                        sandbox_output.getvalue(),
+                        f"{engine_root / guard.CHROMIUM_SANDBOX_RELATIVE}\n",
+                    )
+                    error_output = io.StringIO()
+                    with redirect_stderr(error_output):
+                        self.assertEqual(
+                            guard.main(
+                                [
+                                    "sandbox-path",
+                                    "--runtime-cache",
+                                    str(payloads / ("c" * 40) / "provider-runtime"),
+                                ]
+                            ),
+                            2,
+                        )
+                    self.assertIn("refused", error_output.getvalue())
+                    self.assertEqual(active_payload, payloads / source_sha)
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            cache_root = root / "cache"
+            cache_root.mkdir(mode=0o755)
+            cache = cache_root / f"runtime-{source_sha}"
+            sandbox = cache / guard.CHROMIUM_SANDBOX_RELATIVE
+            sandbox.parent.mkdir(mode=0o755, parents=True)
+            sandbox.write_bytes(platform_chromium_sandbox_fixture.read_bytes())
+            os.chown(sandbox, 0, 0)
+            os.chmod(sandbox, 0o4755)
+            with mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache_root):
+                self.assertEqual(guard._sandbox_path(cache), sandbox)
+
     @unittest.skipUnless(os.geteuid() == 0, "root-owned cache contract")
     def test_runtime_retention_protects_releases_and_hard_caps_fallbacks(
         self,
@@ -2336,6 +2427,7 @@ class LiveQaGuardTests(unittest.TestCase):
             node_mode: int = 0o444,
             node_symlink: bool = False,
             recovery_provider: bool = False,
+            self_owned_provider: bool = False,
             omit_source_marker: bool = False,
             source_marker_value: str | None = None,
             extra_provider_entry: bool = False,
@@ -2348,7 +2440,9 @@ class LiveQaGuardTests(unittest.TestCase):
             payloads = base / "trusted" / "releases"
             active_payload = payloads / source_sha
             actual_provider_sha = (
-                guard.PROVIDER_RECOVERY_SOURCE_SHA if recovery_provider else provider_sha
+                guard.PROVIDER_RECOVERY_SOURCE_SHA
+                if recovery_provider
+                else source_sha if self_owned_provider else provider_sha
             )
             provider_payload = payloads / actual_provider_sha
             active_payload.mkdir(mode=0o755, parents=True)
@@ -2516,12 +2610,32 @@ class LiveQaGuardTests(unittest.TestCase):
             ):
                 return guard._trusted_runtime_root()
 
+        def sandbox(pointer: Path, payloads: Path) -> Path:
+            active_payload = pointer.resolve(strict=True)
+            with (
+                mock.patch.object(guard, "TRUSTED_ACTIVE_POINTER", pointer),
+                mock.patch.object(guard, "TRUSTED_PAYLOAD_ROOT", payloads),
+                mock.patch.object(
+                    guard, "_validate_installed_payload_root", return_value=source_sha
+                ),
+            ):
+                return guard._sandbox_path(active_payload / "runtime")
+
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             base = Path(temporary)
             pointer, node = make_provider(base)
             self.assertEqual(
                 resolve(pointer, base / "trusted" / "releases"),
                 base / "trusted" / "releases" / provider_sha / "runtime",
+            )
+            self.assertEqual(
+                sandbox(pointer, base / "trusted" / "releases"),
+                base
+                / "trusted"
+                / "releases"
+                / provider_sha
+                / "runtime"
+                / guard.CHROMIUM_SANDBOX_RELATIVE,
             )
             with self.assertRaisesRegex(
                 guard.GuardError, "helper file metadata is unsafe"
@@ -2544,6 +2658,15 @@ class LiveQaGuardTests(unittest.TestCase):
                     / "releases"
                     / provider_sha
                     / "provider-runtime",
+                )
+                self.assertEqual(
+                    sandbox(pointer, base / "trusted" / "releases"),
+                    base
+                    / "trusted"
+                    / "releases"
+                    / provider_sha
+                    / "provider-runtime"
+                    / guard.CHROMIUM_SANDBOX_RELATIVE,
                 )
             with tempfile.TemporaryDirectory(dir="/root") as temporary:
                 base = Path(temporary)
@@ -2568,6 +2691,22 @@ class LiveQaGuardTests(unittest.TestCase):
                     guard.GuardError, "unreviewed directory|unreviewed file"
                 ):
                     resolve(pointer, base / "trusted" / "releases")
+
+        with self.subTest("provider v2 self-owned"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(
+                    base,
+                    provider_version=2,
+                    self_owned_provider=True,
+                    link_alias=True,
+                )
+                expected_root = base / "trusted" / "releases" / source_sha / "provider-runtime"
+                self.assertEqual(resolve(pointer, base / "trusted" / "releases"), expected_root)
+                self.assertEqual(
+                    sandbox(pointer, base / "trusted" / "releases"),
+                    expected_root / guard.CHROMIUM_SANDBOX_RELATIVE,
+                )
 
         self.assertEqual(
             guard.PROVIDER_RECOVERY_SOURCE_SHA,
@@ -2710,6 +2849,398 @@ class LiveQaGuardTests(unittest.TestCase):
                 guard._cleanup_runtime_mount_aliases(*values)
                 self.assertFalse(suite.exists())
                 self.assertFalse(engine.exists())
+
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned runtime mapping contract")
+    def test_runtime_mount_aliases_accept_the_exact_private_user_qa_gate(self) -> None:
+        source_sha = "a" * 40
+        provider_sha = "b" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            base = Path(temporary)
+            cache = base / "cache"
+            cache.mkdir(mode=0o755)
+            gate_root = base / "run"
+            gate_root.mkdir(mode=0o711)
+            gate = gate_root / "live-user-qa.a1B2c3"
+            gate.mkdir(mode=0o700)
+            os.chown(gate, 12345, 12345)
+            engine_root = cache / provider_sha / "provider-runtime"
+            engine_root.parent.mkdir(mode=0o755)
+            engine_root.mkdir(mode=0o555)
+            pointer_target = base / "active-payload"
+            pointer_target.mkdir()
+            active_pointer = base / "active"
+            active_pointer.symlink_to(pointer_target)
+            expected_suffix = hashlib.sha256(gate.name.encode("ascii")).hexdigest()[:8]
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache),
+                mock.patch.object(guard, "RUN_GATE_ROOT", gate_root),
+                mock.patch.object(guard, "TRUSTED_ACTIVE_POINTER", active_pointer),
+                mock.patch.object(guard, "liveqa_identity", return_value=(12345, 12345)),
+                mock.patch.object(
+                    guard, "_validate_installed_payload_root", return_value=source_sha
+                ),
+                mock.patch.object(guard, "_trusted_runtime_root", return_value=engine_root),
+            ):
+                values = guard._runtime_mount_aliases(gate)
+                self.assertEqual(values[:3], (source_sha, provider_sha, expected_suffix))
+                suite = cache / f"runtime-suite-{source_sha}-{expected_suffix}"
+                engine = cache / f"runtime-engine-{provider_sha}-{expected_suffix}"
+                self.assertEqual(values[3:], tuple(
+                    f"{path.lstat().st_dev}:{path.lstat().st_ino}"
+                    for path in (suite, engine)
+                ))
+                guard._cleanup_runtime_mount_aliases(*values)
+                self.assertFalse(suite.exists())
+                self.assertFalse(engine.exists())
+
+    def test_live_user_browser_command_binds_suite_and_engine_roots_exactly(self) -> None:
+        source_sha = "a" * 40
+        provider_sha = "b" * 40
+        suffix = "a1b2c3d4"
+        suite = f"/var/lib/oldsparky-liveqa/runtime-suite-{source_sha}-{suffix}"
+        engine = f"/var/lib/oldsparky-liveqa/runtime-engine-{provider_sha}-{suffix}"
+        command = [
+            "/usr/bin/systemd-run",
+            "--no-ask-password",
+            "--quiet",
+            "--wait",
+            "--collect",
+            "--pipe",
+            "--service-type=exec",
+            "--expand-environment=no",
+            "--unit=oldsparky-liveqa-browser.service",
+            "--uid=1001",
+            "--gid=1001",
+            f"--working-directory={suite}/web",
+            "--property=KillMode=control-group",
+            "--property=Restart=no",
+            "--property=RuntimeMaxSec=30min",
+            "--property=SendSIGKILL=yes",
+            "--property=TimeoutStopSec=5s",
+            "--property=UMask=0077",
+            f"--property=BindReadOnlyPaths={suite}:{suite}",
+            f"--property=BindReadOnlyPaths={engine}:{engine}",
+            "--",
+            "/usr/bin/env",
+            "-i",
+            f"CHROME_DEVEL_SANDBOX={engine}/{guard.CHROMIUM_SANDBOX_RELATIVE.as_posix()}",
+            "HOME=/run/oldsparky-liveqa/live-user-qa.abc123/home",
+            "LANG=C.UTF-8",
+            f"NODE_PATH={engine}/web/node_modules",
+            f"PATH={engine}/node/bin:/usr/bin:/bin",
+            "PLATFORM_LIVE_EXPECTED_ORIGIN=https://old-sparky.com",
+            "PLATFORM_LIVE_USER_QA_UID=1001",
+            "PLATFORM_QA_BROWSER_GATE_DIR=/run/oldsparky-liveqa/live-user-qa.abc123",
+            f"PLATFORM_LIVE_QA_RUNNER_SHA={source_sha}",
+            f"PLATFORM_LIVE_QA_TARGET_SHA={source_sha}",
+            f"PLATFORM_LIVE_QA_MARKER_SHA256={'c' * 64}",
+            "PLATFORM_LIVE_USER_QA=1",
+            "PLATFORM_LIVE_USER_QA_INVENTORY=/run/oldsparky-liveqa/live-user-qa.abc123/inventory.json",
+            "PLATFORM_LIVE_USER_QA_MARKER=marker",
+            "PLATFORM_LIVE_USER_QA_SESSIONS=/run/oldsparky-liveqa/live-user-qa.abc123/browser-sessions.json",
+            f"PLAYWRIGHT_BROWSERS_PATH={engine}/browsers",
+            "PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com",
+            "TMPDIR=/run/oldsparky-liveqa/live-user-qa.abc123/tmp",
+            "XDG_CACHE_HOME=/run/oldsparky-liveqa/live-user-qa.abc123/home/.cache",
+            f"{engine}/node/bin/node",
+            f"{engine}/web/node_modules/@playwright/test/cli.js",
+            "test",
+            f"--config={suite}/web/playwright.live.config.ts",
+            f"{suite}/web/tests/smoke/live-user-journey.spec.ts",
+            "--project=live-desktop",
+        ]
+        self.assertTrue(guard._is_fixed_live_user_browser_command(command))
+        for invalid in (
+            [
+                f"NODE_PATH={suite}/web/node_modules" if item.startswith("NODE_PATH=") else item
+                for item in command
+            ],
+            [
+                item.replace(f"{engine}/web/node_modules/@playwright/test/cli.js", f"{suite}/web/node_modules/@playwright/test/cli.js")
+                if item.endswith("/web/node_modules/@playwright/test/cli.js")
+                else item
+                for item in command
+            ],
+            [
+                f"--property=BindReadOnlyPaths=/root/.oldsparky/liveqa/releases/{provider_sha}/provider-runtime:/root/.oldsparky/liveqa/releases/{provider_sha}/provider-runtime"
+                if item == f"--property=BindReadOnlyPaths={engine}:{engine}"
+                else item
+                for item in command
+            ],
+        ):
+            self.assertFalse(guard._is_fixed_live_user_browser_command(invalid))
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required for module-resolution contract")
+    def test_split_runtime_resolves_suite_config_dependencies_from_engine_node_modules(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            suite_web = root / "runtime-suite" / "web"
+            package = root / "runtime-engine" / "web/node_modules/@playwright/test"
+            suite_web.mkdir(mode=0o700, parents=True)
+            package.mkdir(mode=0o755, parents=True)
+            (package / "package.json").write_text(
+                '{"name":"@playwright/test","main":"index.js"}\n',
+                encoding="ascii",
+            )
+            (package / "index.js").write_text("module.exports = {};\n", encoding="ascii")
+            result = subprocess.run(
+                [
+                    shutil.which("node") or "node",
+                    "-e",
+                    "process.stdout.write(require.resolve('@playwright/test'))",
+                ],
+                cwd=suite_web,
+                env={
+                    "LANG": "C.UTF-8",
+                    "NODE_PATH": str(root / "runtime-engine/web/node_modules"),
+                    "PATH": "/usr/bin:/bin",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, str(package / "index.js"))
+
+    def test_live_user_wrapper_keeps_suite_and_engine_paths_separate(self) -> None:
+        wrapper = SCRIPT_PATH.with_name("platform_live_user_qa.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('RUNTIME_SUITE_SOURCE="$TRUSTED_INSTALL_ROOT/runtime"', wrapper)
+        self.assertIn('RUNTIME_ENGINE_SOURCE="$("${GUARD[@]}" runtime-root)"', wrapper)
+        self.assertIn('prepare-runtime-mounts --gate-path "$BROWSER_GATE"', wrapper)
+        self.assertIn('"--property=BindReadOnlyPaths=$RUNTIME_SUITE_SOURCE:$RUNTIME_SUITE"', wrapper)
+        self.assertIn('"--property=BindReadOnlyPaths=$RUNTIME_ENGINE_SOURCE:$RUNTIME_ENGINE"', wrapper)
+        self.assertIn('--working-directory="$RUNTIME_SUITE/web"', wrapper)
+        self.assertIn('NODE_PATH="$RUNTIME_ENGINE/web/node_modules"', wrapper)
+        self.assertIn('"$RUNTIME_ENGINE/web/node_modules/@playwright/test/cli.js"', wrapper)
+        self.assertIn('--config="$RUNTIME_SUITE/web/playwright.live.config.ts"', wrapper)
+        self.assertIn('"$RUNTIME_SUITE/web/tests/smoke/live-user-journey.spec.ts"', wrapper)
+        self.assertIn('cleanup-runtime-mounts', wrapper)
+
+    @unittest.skipUnless(os.geteuid() == 0, "trusted wrapper execution contract")
+    def test_live_user_wrapper_reports_runtime_setup_before_state_creation(self) -> None:
+        releases = Path("/root/.oldsparky/liveqa/releases")
+        releases.mkdir(mode=0o755, parents=True, exist_ok=True)
+        source_sha = "f" * 40
+        install_root = releases / source_sha
+        self.assertFalse(install_root.exists())
+        trace_fd, trace_name = tempfile.mkstemp(prefix="liveqa-wrapper-trace-", dir="/root")
+        os.close(trace_fd)
+        trace_path = Path(trace_name)
+        trace_path.unlink()
+
+        try:
+            install_root.mkdir(mode=0o700)
+            tools = install_root / "platform" / "tools"
+            tools.mkdir(mode=0o755, parents=True)
+            wrapper_path = tools / "platform_live_user_qa.sh"
+            shutil.copyfile(
+                SCRIPT_PATH.with_name("platform_live_user_qa.sh"), wrapper_path
+            )
+            os.chmod(wrapper_path, 0o500)
+
+            guard_stub = tools / "platform_live_qa_guard.py"
+            guard_stub.write_text(
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "with Path(os.environ['TRACE_PATH']).open('a', encoding='utf-8') as f:\n"
+                "    f.write((args[0] if args else '<empty>') + '\\n')\n"
+                "if args and args[0] == 'runtime-root':\n"
+                "    print(os.environ['ENGINE_ROOT'])\n"
+                "elif args and args[0] == 'sandbox-path':\n"
+                "    print('stub diagnostic must stay suppressed', file=sys.stderr)\n"
+                "    raise SystemExit(2)\n"
+                "elif args and args[0] in {'assert-lock', 'preflight'}:\n"
+                "    raise SystemExit(0)\n"
+                "else:\n"
+                "    raise SystemExit(91)\n",
+                encoding="utf-8",
+            )
+            safe_env_stub = tools / "platform_safe_env_exec.py"
+            safe_env_stub.write_text(
+                "import sys\n"
+                "args = sys.argv[1:]\n"
+                "if args == ['validate-runtime']:\n"
+                "    raise SystemExit(0)\n"
+                "if args == ['print-public-value', 'PLATFORM_WEB_ORIGIN']:\n"
+                "    print('https://old-sparky.com')\n"
+                "    raise SystemExit(0)\n"
+                "if args == ['print-public-value', 'PLATFORM_ENVIRONMENT']:\n"
+                "    print('production')\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(92)\n",
+                encoding="utf-8",
+            )
+            runtime_root = install_root / "runtime"
+            runtime_root.mkdir(mode=0o755)
+            engine_root = Path("/root/.oldsparky/liveqa/releases") / ("e" * 40) / "provider-runtime"
+
+            result = subprocess.run(
+                ["/usr/bin/bash", str(wrapper_path)],
+                cwd="/",
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "TRACE_PATH": str(trace_path),
+                    "ENGINE_ROOT": str(engine_root),
+                    "PLATFORM_LIVE_QA_INSTALL_ROOT": str(install_root),
+                    "PLATFORM_LIVE_QA_TARGET_SHA": source_sha,
+                    "PLATFORM_APP_DIR": "/opt/oldsparky/platform",
+                    "PLATFORM_LIVE_CSP_QA_BUNDLE": "/root/private-test-bundle.json",
+                    "PLATFORM_LIVE_QA_LOCK_FD": "9",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(
+                result.stdout,
+                "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "
+                "stage=dispatch check=runtime_setup stdout_bytes=0 stderr_bytes=0 "
+                "truncated=false child_exit=2\n",
+            )
+            self.assertNotIn("stub diagnostic", result.stderr)
+            self.assertEqual(
+                trace_path.read_text(encoding="utf-8").splitlines(),
+                ["assert-lock", "preflight", "runtime-root", "sandbox-path"],
+            )
+            self.assertFalse((install_root / "qa-state").exists())
+        finally:
+            trace_path.unlink(missing_ok=True)
+            if install_root.exists():
+                shutil.rmtree(install_root)
+
+    @unittest.skipUnless(os.geteuid() == 0, "trusted wrapper execution contract")
+    def test_live_user_wrapper_captures_split_runtime_before_browser_launch(self) -> None:
+        releases = Path("/root/.oldsparky/liveqa/releases")
+        releases.mkdir(mode=0o755, parents=True, exist_ok=True)
+        source_sha = "d" * 40
+        runner_sha = "c" * 40
+        provider_sha = "e" * 40
+        install_root = releases / source_sha
+        self.assertFalse(install_root.exists())
+        temp_root = Path(tempfile.mkdtemp(prefix="liveqa-wrapper-split-", dir="/root"))
+        trace_path = temp_root / "trace.jsonl"
+        state_path = temp_root / "state"
+        gate_path = temp_root / "gate"
+        engine_root = releases / provider_sha / "provider-runtime"
+        suite_alias = f"/var/lib/oldsparky-liveqa/runtime-suite-{source_sha}-deadbeef"
+        engine_alias = f"/var/lib/oldsparky-liveqa/runtime-engine-{provider_sha}-deadbeef"
+        sandbox_path = f"{engine_root}/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+        marker = "fixture-marker"
+        marker_digest = hashlib.sha256(marker.encode("utf-8")).hexdigest()
+
+        try:
+            install_root.mkdir(mode=0o700)
+            tools = install_root / "platform" / "tools"
+            tools.mkdir(mode=0o755, parents=True)
+            wrapper_path = tools / "platform_live_user_qa.sh"
+            shutil.copyfile(SCRIPT_PATH.with_name("platform_live_user_qa.sh"), wrapper_path)
+            os.chmod(wrapper_path, 0o500)
+            (install_root / "runtime" / "web").mkdir(mode=0o755, parents=True)
+
+            (tools / "platform_live_qa_guard.py").write_text(
+                "import json, os, re, shutil, sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "with Path(os.environ['TRACE_PATH']).open('a', encoding='utf-8') as f:\n"
+                "    f.write(json.dumps(args) + '\\n')\n"
+                "command = args[0] if args else ''\n"
+                "if command == 'runtime-root': print(os.environ['ENGINE_ROOT'])\n"
+                "elif command == 'sandbox-path': print(os.environ['SANDBOX_PATH'])\n"
+                "elif command == 'prepare-root-state':\n"
+                "    Path(os.environ['STATE_PATH']).mkdir(mode=0o700, exist_ok=True); print(os.environ['STATE_PATH'])\n"
+                "elif command == 'validate-recovery': print(os.environ['MARKER'])\n"
+                "elif command == 'prepare-browser-gate':\n"
+                "    gate=Path(os.environ['GATE_PATH']); (gate/'home/.cache').mkdir(mode=0o700, parents=True, exist_ok=True); (gate/'tmp').mkdir(mode=0o700, exist_ok=True); print(gate)\n"
+                "elif command == 'prepare-runtime-mounts': print(os.environ['MOUNT_RECORD'])\n"
+                "elif command == 'capture-qa-browser-child':\n"
+                "    print('LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=browser_launch_error stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=1')\n"
+                "elif command == 'emit-public-browser-counts':\n"
+                "    values={args[i]:args[i+1] for i in range(len(args)-1) if args[i].startswith('--')}\n"
+                "    print('LIVE_BROWSER_COUNTS schema=1 run_status=failed logical_total=0 logical_pass=0 logical_fail=0 logical_expected_fail=0 logical_flaky=0 logical_skip=0 logical_interrupted=0 attempt_total=0 attempt_pass=0 attempt_fail=0 attempt_skip=0 attempt_interrupted=0 attempt_timedout=0 source_sha=%s app_sha=%s marker_sha256=%s' % (values['--source-sha'], values['--app-sha'], values['--marker-sha256']))\n"
+                "elif command == 'remove-root-state': shutil.rmtree(os.environ['STATE_PATH'])\n"
+                "elif command in {'assert-lock','preflight','merge-browser-inventory','remove-browser-gate','cleanup-runtime-mounts'}: pass\n"
+                "else: raise SystemExit(93)\n",
+                encoding="utf-8",
+            )
+            (tools / "platform_safe_env_exec.py").write_text(
+                "import sys\n"
+                "args=sys.argv[1:]\n"
+                "if args == ['validate-runtime']: raise SystemExit(0)\n"
+                "if args == ['print-public-value','PLATFORM_WEB_ORIGIN']: print('https://old-sparky.com'); raise SystemExit(0)\n"
+                "if args == ['print-public-value','PLATFORM_ENVIRONMENT']: print('production'); raise SystemExit(0)\n"
+                "if 'prepare-browser-sessions' in args: print('fixture-marker')\n"
+                "raise SystemExit(0)\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                ["/usr/bin/bash", str(wrapper_path)],
+                cwd="/",
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "TRACE_PATH": str(trace_path),
+                    "ENGINE_ROOT": str(engine_root),
+                    "SANDBOX_PATH": sandbox_path,
+                    "STATE_PATH": str(state_path),
+                    "GATE_PATH": str(gate_path),
+                    "MARKER": marker,
+                    "MOUNT_RECORD": f"{source_sha}\t{provider_sha}\tdeadbeef\t123:456\t123:456",
+                    "PLATFORM_LIVE_QA_INSTALL_ROOT": str(install_root),
+                    "PLATFORM_LIVE_QA_TARGET_SHA": source_sha,
+                    "PLATFORM_LIVE_QA_RUNNER_SHA": runner_sha,
+                    "PLATFORM_APP_DIR": "/opt/oldsparky/platform",
+                    "PLATFORM_LIVE_CSP_QA_BUNDLE": "/root/private-test-bundle.json",
+                    "PLATFORM_LIVE_QA_LOCK_FD": "9",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=browser_launch_error",
+                result.stdout,
+            )
+            self.assertIn("LIVE_BROWSER_COUNTS schema=1 run_status=failed", result.stdout)
+            trace = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+            capture = next(args for args in trace if args[0] == "capture-qa-browser-child")
+            self.assertIn(f"--property=BindReadOnlyPaths={install_root}/runtime:{suite_alias}", capture)
+            self.assertIn(f"--property=BindReadOnlyPaths={engine_root}:{engine_alias}", capture)
+            self.assertIn(f"--working-directory={suite_alias}/web", capture)
+            self.assertIn(f"NODE_PATH={engine_alias}/web/node_modules", capture)
+            self.assertIn(f"PATH={engine_alias}/node/bin:/usr/bin:/bin", capture)
+            self.assertIn(
+                f"{engine_alias}/web/node_modules/@playwright/test/cli.js", capture
+            )
+            self.assertIn(f"--config={suite_alias}/web/playwright.live.config.ts", capture)
+            self.assertIn(
+                f"{suite_alias}/web/tests/smoke/live-user-journey.spec.ts", capture
+            )
+            self.assertIn(f"CHROME_DEVEL_SANDBOX={engine_alias}/browsers/chromium-1228/chrome-linux64/chrome_sandbox", capture)
+            counts = next(args for args in trace if args[0] == "emit-public-browser-counts")
+            self.assertIn(runner_sha, counts)
+            self.assertIn(source_sha, counts)
+            self.assertIn(marker_digest, counts)
+            self.assertIn("remove-root-state", [args[0] for args in trace])
+            self.assertFalse(state_path.exists())
+        finally:
+            if install_root.exists():
+                shutil.rmtree(install_root)
+            shutil.rmtree(temp_root)
 
     @unittest.skipUnless(os.geteuid() == 0, "root-owned runtime mapping contract")
     def test_runtime_mount_alias_collision_and_changed_identity_fail_closed(self) -> None:
