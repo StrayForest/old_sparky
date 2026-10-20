@@ -222,8 +222,15 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             '\n  if ! "$APP_DIR/shared/venv/bin/python"', gate_start
         )
         gate = wrapper_source[gate_start:gate_end]
-        canonical_parser = REPO_ROOT / "platform/tools/platform_safe_env_exec.py"
-        parser_bytes = canonical_parser.read_bytes()
+        # The recovery wrapper validates the parser from original_current. At
+        # this boundary that is the deployed S release, while the candidate
+        # source has its own independently pinned parser bytes. Keep the
+        # historical parser as inert fixture data; never import or execute it.
+        original_current_parser = (
+            REPO_ROOT
+            / "platform/tests/fixtures/recovery-original-current/platform_safe_env_exec.py"
+        )
+        parser_bytes = original_current_parser.read_bytes()
         self.assertEqual(
             hashlib.sha256(parser_bytes).hexdigest(),
             "819ccc9e489c3fb8b14b3cb61eae500c111c5edb663161504b6ca6e02868399d",
