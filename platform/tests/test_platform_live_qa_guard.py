@@ -3038,8 +3038,11 @@ class LiveQaGuardTests(unittest.TestCase):
             tools = install_root / "platform" / "tools"
             tools.mkdir(mode=0o755, parents=True)
             wrapper_path = tools / "platform_live_user_qa.sh"
-            shutil.copyfile(
-                SCRIPT_PATH.with_name("platform_live_user_qa.sh"), wrapper_path
+            wrapper_bytes = SCRIPT_PATH.with_name("platform_live_user_qa.sh").read_bytes()
+            fixture_runtime = b'QA_PYTHON="/opt/oldsparky/platform/shared/venv/bin/python"'
+            self.assertEqual(wrapper_bytes.count(fixture_runtime), 1)
+            wrapper_path.write_bytes(
+                wrapper_bytes.replace(fixture_runtime, b'QA_PYTHON="/usr/bin/true"')
             )
             os.chmod(wrapper_path, 0o500)
 
@@ -3144,7 +3147,12 @@ class LiveQaGuardTests(unittest.TestCase):
             tools = install_root / "platform" / "tools"
             tools.mkdir(mode=0o755, parents=True)
             wrapper_path = tools / "platform_live_user_qa.sh"
-            shutil.copyfile(SCRIPT_PATH.with_name("platform_live_user_qa.sh"), wrapper_path)
+            wrapper_bytes = SCRIPT_PATH.with_name("platform_live_user_qa.sh").read_bytes()
+            fixture_runtime = b'QA_PYTHON="/opt/oldsparky/platform/shared/venv/bin/python"'
+            self.assertEqual(wrapper_bytes.count(fixture_runtime), 1)
+            wrapper_path.write_bytes(
+                wrapper_bytes.replace(fixture_runtime, b'QA_PYTHON="/usr/bin/true"')
+            )
             os.chmod(wrapper_path, 0o500)
             (install_root / "runtime" / "web").mkdir(mode=0o755, parents=True)
 

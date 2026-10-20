@@ -3670,11 +3670,65 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         arbitrary[23] = "/bin/sh"
         self.assertFalse(platform_live_qa_guard._is_fixed_live_browser_command(arbitrary))
 
-        browser_command = list(command)
-        browser_command[-1] = f"{runtime}/web/tests/smoke/live-user-journey.spec.ts"
-        browser_command.append("--project=live-desktop")
+        suite_root = (
+            "/var/lib/oldsparky-liveqa/runtime-suite-"
+            + "a" * 40
+            + "-fixture1"
+        )
+        engine_root = (
+            "/var/lib/oldsparky-liveqa/runtime-engine-"
+            + "b" * 40
+            + "-fixture1"
+        )
+        browser_command = [
+            "/usr/bin/systemd-run",
+            "--no-ask-password",
+            "--quiet",
+            "--wait",
+            "--collect",
+            "--pipe",
+            "--service-type=exec",
+            "--expand-environment=no",
+            "--unit=oldsparky-liveqa-browser.service",
+            "--uid=1001",
+            "--gid=1001",
+            f"--working-directory={suite_root}/web",
+            "--property=KillMode=control-group",
+            "--property=Restart=no",
+            "--property=RuntimeMaxSec=30min",
+            "--property=SendSIGKILL=yes",
+            "--property=TimeoutStopSec=5s",
+            "--property=UMask=0077",
+            f"--property=BindReadOnlyPaths={suite_root}:{suite_root}",
+            f"--property=BindReadOnlyPaths={engine_root}:{engine_root}",
+            "--",
+            "/usr/bin/env",
+            "-i",
+            (
+                "CHROME_DEVEL_SANDBOX="
+                f"{engine_root}/{platform_live_qa_guard.CHROMIUM_SANDBOX_RELATIVE.as_posix()}"
+            ),
+            "LANG=C.UTF-8",
+            f"NODE_PATH={engine_root}/web/node_modules",
+            f"PATH={engine_root}/node/bin:/usr/bin:/bin",
+            f"PLAYWRIGHT_BROWSERS_PATH={engine_root}/browsers",
+            f"{engine_root}/node/bin/node",
+            f"{engine_root}/web/node_modules/@playwright/test/cli.js",
+            "test",
+            f"--config={suite_root}/web/playwright.live.config.ts",
+            f"{suite_root}/web/tests/smoke/live-user-journey.spec.ts",
+            "--project=live-desktop",
+        ]
         self.assertTrue(
             platform_live_qa_guard._is_fixed_live_user_browser_command(browser_command)
+        )
+        mismatched_engine = list(browser_command)
+        node_position = mismatched_engine.index(f"{engine_root}/node/bin/node")
+        mismatched_engine[node_position] = f"{suite_root}/node/bin/node"
+        self.assertFalse(
+            platform_live_qa_guard._is_fixed_live_user_browser_command(
+                mismatched_engine
+            )
         )
         with self.assertRaises(platform_live_qa_guard.GuardError):
             platform_live_qa_guard._capture_qa_child(

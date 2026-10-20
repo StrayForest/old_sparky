@@ -3647,6 +3647,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 for helper_name in (
                     "platform_backup_restore_drill.py",
                     "platform_disk_policy.py",
+                    "platform_release_retention.py",
                 ):
                     shutil.copyfile(
                         TOOLS_DIR / helper_name,
