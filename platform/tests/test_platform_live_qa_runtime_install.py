@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, redirect_stderr
-import importlib.util
 import hashlib
+import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
-import shutil
 import tempfile
 import unittest
 from unittest import mock
 from uuid import uuid4
+
+from tests import platform_chromium_sandbox_fixture
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "platform_live_qa_runtime_install.py"
@@ -46,7 +48,6 @@ GUARD_SPEC = importlib.util.spec_from_file_location(
 assert GUARD_SPEC is not None and GUARD_SPEC.loader is not None
 guard = importlib.util.module_from_spec(GUARD_SPEC)
 GUARD_SPEC.loader.exec_module(guard)
-from tests import platform_chromium_sandbox_fixture
 
 
 @unittest.skipUnless(os.geteuid() == 0, "installer contract requires root-owned test paths")
@@ -586,9 +587,6 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     prefixes=("node/", "browsers/", "web/node_modules/"),
                 )
                 lock_sha = runtime._digest_regular(legacy_runtime / "web/package-lock.json")
-                engine_v1 = runtime._engine_digest(
-                    legacy_files, node_version="26.3.1", package_lock_sha256=lock_sha
-                )
                 tree_v1, files_v1 = runtime._tree_digest(
                     legacy_runtime,
                     ignored=frozenset({runtime.RUNTIME_MANIFEST_RELATIVE.as_posix()}),
@@ -644,7 +642,6 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     (release / "RELEASE.json").write_text(json.dumps(release_json) + "\n", encoding="ascii")
                     os.chmod(release / "RELEASE.json", 0o444)
                     source_runtime = release / "liveqa-runtime"
-                    web = source_runtime / "web"
                     suite_content = {
                         "web/package-lock.json": b"lock\n",
                         "web/playwright.live.config.ts": b"config\n",
