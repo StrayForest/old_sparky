@@ -80,6 +80,9 @@ EMAIL_RE = re.compile(
     r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
 )
 CHROMIUM_SANDBOX_RELATIVE = "runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+PROVIDER_CHROMIUM_SANDBOX_RELATIVE = (
+    "provider-runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+)
 CHROMIUM_SANDBOX_SIZE = 15232
 CHROMIUM_SANDBOX_SHA256 = (
     "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
@@ -119,6 +122,11 @@ def _validate_regular_metadata(
         or metadata.st_gid != 0
         or metadata.st_nlink != 1
         or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (
+            allow_sandbox
+            and path.name == "chrome_sandbox"
+            and stat.S_IMODE(metadata.st_mode) != 0o4755
+        )
         or (
             metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
             and not (
@@ -396,23 +404,217 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _payload_tree_digest(root: Path) -> tuple[str, dict[str, str]]:
+def _payload_provider_links(root: Path, source_sha: str) -> dict[str, str]:
+    """Return only links declared by this payload's self-owned provider v2."""
+    provider_path = root / "runtime-provider.json"
+    try:
+        metadata = provider_path.lstat()
+    except FileNotFoundError:
+        return {}
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o444
+        or metadata.st_size > 256 * 1024
+    ):
+        raise RuntimeError("installed live-QA provider metadata is unsafe")
+    raw = _read_bounded_regular(
+        provider_path, metadata=metadata, maximum=256 * 1024, mode=0o444
+    )
+    provider = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+    if not isinstance(provider, dict):
+        raise RuntimeError("installed live-QA provider identity is invalid")
+    version = provider.get("version")
+    if type(version) is not int or version not in {1, 2}:
+        raise RuntimeError("installed live-QA provider identity is invalid")
+    if version == 1:
+        expected_v1 = {
+            "version", "source_sha", "provider_sha", "engine_tree_sha256",
+            "node_version", "package_lock_sha256", "engine_files",
+        }
+        if (
+            set(provider) != expected_v1
+            or provider.get("source_sha") != source_sha
+            or not isinstance(provider.get("provider_sha"), str)
+            or not SHA_RE.fullmatch(provider["provider_sha"])
+            or provider.get("node_version") != "26.3.1"
+            or not isinstance(provider.get("engine_tree_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", provider["engine_tree_sha256"])
+            or not isinstance(provider.get("package_lock_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", provider["package_lock_sha256"])
+            or not isinstance(provider.get("engine_files"), dict)
+            or len(provider["engine_files"]) > MAX_PAYLOAD_FILES
+        ):
+            raise RuntimeError("installed live-QA provider identity is invalid")
+        for relative, file_digest in provider["engine_files"].items():
+            parts = relative.split("/") if isinstance(relative, str) else []
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or relative.startswith("/")
+                or "\\" in relative
+                or any(part in {"", ".", ".."} for part in parts)
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in relative)
+                or relative.startswith("web/node_modules/")
+                and "/node_modules/" in relative.removeprefix("web/node_modules/")
+                or not (
+                    relative == "node/bin/node"
+                    or relative.startswith("browsers/") and len(parts) >= 3
+                    and parts[1] in {"chromium-1228", "chromium_headless_shell-1228", "webkit-2311", "ffmpeg-1011"}
+                    or any(relative.startswith(f"web/node_modules/{pkg}/") for pkg in ("@playwright/test", "playwright", "playwright-core"))
+                )
+                or not isinstance(file_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", file_digest)
+            ):
+                raise RuntimeError("installed live-QA provider file map is invalid")
+        paths = set(provider["engine_files"])
+        if any("/".join(path.split("/")[:index]) in paths for path in paths for index in range(1, len(path.split("/")))):
+            raise RuntimeError("installed live-QA provider file map has a path conflict")
+        if os.path.lexists(root / "provider-runtime"):
+            raise RuntimeError("legacy live-QA provider has an unexpected local tree")
+        return {}
+    expected = {
+        "version", "source_sha", "provider_sha", "engine_tree_sha256",
+        "node_version", "package_lock_sha256", "engine_files", "engine_links",
+    }
+    if (
+        set(provider) != expected
+        or provider.get("source_sha") != source_sha
+        or not isinstance(provider.get("provider_sha"), str)
+        or not SHA_RE.fullmatch(provider["provider_sha"])
+        or not isinstance(provider.get("engine_files"), dict)
+        or not isinstance(provider.get("engine_links"), dict)
+        or not isinstance(provider.get("engine_tree_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", provider["engine_tree_sha256"])
+        or provider.get("node_version") != "26.3.1"
+        or not isinstance(provider.get("package_lock_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", provider["package_lock_sha256"])
+    ):
+        raise RuntimeError("installed live-QA provider identity is invalid")
+    external_provider = provider["provider_sha"] != source_sha
+    if external_provider:
+        if os.path.lexists(root / "provider-runtime"):
+            raise RuntimeError("external live-QA provider has an unexpected local tree")
+    links = provider["engine_links"]
+    files = provider["engine_files"]
+    browser_roots = {
+        "chromium-1228", "chromium_headless_shell-1228", "webkit-2311", "ffmpeg-1011"
+    }
+    if (
+        len(links) > MAX_PAYLOAD_FILES
+        or set(files) & set(links)
+        or any(
+            not isinstance(path, str)
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in path)
+            or path.startswith("web/node_modules/")
+            and "/node_modules/" in path.removeprefix("web/node_modules/")
+            or not (
+                path == "node/bin/node"
+                or path.startswith("browsers/")
+                and len(path.split("/")) >= 3
+                and path.split("/", 2)[1] in browser_roots
+                or any(path.startswith(f"web/node_modules/{pkg}/") for pkg in ("@playwright/test", "playwright", "playwright-core"))
+            )
+            or not isinstance(file_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", file_digest)
+            for path, file_digest in files.items()
+        )
+    ):
+        raise RuntimeError("installed live-QA provider link map is invalid")
+    paths = set(files) | set(links)
+    if any("/".join(path.split("/")[:index]) in paths for path in paths for index in range(1, len(path.split("/")))):
+        raise RuntimeError("installed live-QA provider link map has a path conflict")
+    terminals: dict[str, str] = {}
+    for alias, target in links.items():
+        if (
+            not isinstance(alias, str)
+            or not isinstance(target, str)
+            or "\\" in alias or "\\" in target
+            or alias.startswith("/") or target.startswith("/")
+            or "\x00" in alias or "\x00" in target
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in target)
+        ):
+            raise RuntimeError("installed live-QA provider link map is invalid")
+        parts = alias.split("/")
+        if (
+            len(parts) < 3 or parts[0] != "browsers"
+            or parts[1] not in {"chromium-1228", "chromium_headless_shell-1228", "webkit-2311", "ffmpeg-1011"}
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in alias)
+        ):
+            raise RuntimeError("installed live-QA provider link map is invalid")
+        resolved = parts[:-1]
+        target_parts = target.split("/")
+        if not target_parts or any(part in {"", "."} for part in target_parts):
+            raise RuntimeError("installed live-QA provider link target is invalid")
+        for part in target_parts:
+            if part == "..":
+                if len(resolved) <= 2:
+                    raise RuntimeError("installed live-QA provider link escapes browser root")
+                resolved.pop()
+            else:
+                resolved.append(part)
+        if resolved[:2] != parts[:2] or len(resolved) < 3:
+            raise RuntimeError("installed live-QA provider link escapes browser root")
+        terminals[alias] = "/".join(resolved)
+    for alias in links:
+        current = alias
+        visited: set[str] = set()
+        while current in terminals:
+            if current in visited:
+                raise RuntimeError("installed live-QA provider link map contains a cycle")
+            visited.add(current)
+            current = terminals[current]
+        if current not in files:
+            raise RuntimeError("installed live-QA provider link target is not a regular file")
+    if external_provider:
+        return {}
+    return {f"provider-runtime/{path}": target for path, target in links.items()}
+
+
+def _payload_tree_digest(root: Path, source_sha: str) -> tuple[str, dict[str, str]]:
     _directory(root, mode=0o555)
+    allowed_links = _payload_provider_links(root, source_sha)
     digest = hashlib.sha256()
     files: dict[str, str] = {}
+    seen_links: dict[str, str] = {}
     count = 0
     total = 0
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         metadata = path.lstat()
         if stat.S_ISLNK(metadata.st_mode):
-            raise RuntimeError("installed live-QA payload contains a symlink")
+            target = os.readlink(path)
+            if (
+                relative not in allowed_links or target != allowed_links[relative]
+                or not relative.startswith("provider-runtime/browsers/")
+                or metadata.st_uid != 0 or metadata.st_gid != 0
+                or metadata.st_nlink != 1
+                or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+            ):
+                raise RuntimeError("installed live-QA payload contains an undeclared symlink")
+            try:
+                provider_root = root / "provider-runtime"
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(provider_root.resolve(strict=True))
+                if not stat.S_ISREG(resolved.lstat().st_mode):
+                    raise ValueError("link target is not a regular file")
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("installed live-QA payload symlink target is unsafe") from exc
+            seen_links[relative] = target
+            digest.update(relative.encode("utf-8") + b"\0l\0" + target.encode("utf-8") + b"\0")
+            continue
         digest.update(relative.encode("utf-8") + b"\0")
         if stat.S_ISDIR(metadata.st_mode):
             _directory(path, mode=0o555)
             digest.update(b"d\0")
             continue
-        is_sandbox = relative == CHROMIUM_SANDBOX_RELATIVE
+        is_sandbox = relative in {CHROMIUM_SANDBOX_RELATIVE, PROVIDER_CHROMIUM_SANDBOX_RELATIVE}
         if path.name == "chrome_sandbox" and not is_sandbox:
             raise RuntimeError("installed live-QA payload contains an unexpected sandbox helper")
         _regular(path, allow_sandbox=is_sandbox, maximum=MAX_PAYLOAD_FILE_BYTES)
@@ -432,6 +634,8 @@ def _payload_tree_digest(root: Path) -> tuple[str, dict[str, str]]:
             raise RuntimeError("installed Chromium sandbox checksum is invalid")
         files[relative] = file_digest
         digest.update(b"f\0" + bytes.fromhex(file_digest))
+    if seen_links != allowed_links:
+        raise RuntimeError("installed live-QA payload is missing a declared symlink")
     return digest.hexdigest(), files
 
 
@@ -445,7 +649,7 @@ def _verify_install(target_sha: str) -> dict[str, object]:
     payload_root = Path(str(manifest["payload"]))
     if payload_root != PAYLOAD_ROOT / target_sha:
         raise RuntimeError("installed live-QA payload path is invalid")
-    tree_digest, files = _payload_tree_digest(payload_root)
+    tree_digest, files = _payload_tree_digest(payload_root, target_sha)
     if (
         tree_digest != manifest["payload_tree_sha256"]
         or files != manifest["files"]

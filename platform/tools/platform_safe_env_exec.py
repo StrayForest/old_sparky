@@ -30,6 +30,9 @@ LIVE_QA_RELEASE_ROOT = LIVE_QA_ROOT / "releases"
 LIVE_QA_ACTIVE_MANIFEST = LIVE_QA_ROOT / "active-manifest.json"
 LIVE_QA_ACTIVE_POINTER = LIVE_QA_ROOT / "active"
 LIVE_QA_SANDBOX_RELATIVE = "runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+LIVE_QA_PROVIDER_SANDBOX_RELATIVE = (
+    "provider-runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+)
 LIVE_QA_SANDBOX_SIZE = 15232
 LIVE_QA_SANDBOX_SHA256 = (
     "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
@@ -266,14 +269,38 @@ def _read_liveqa_manifest() -> dict[str, object]:
 
 
 def _validate_liveqa_payload_tree(root: Path, manifest: dict[str, object]) -> None:
+    source_sha = manifest.get("source_sha")
+    if not isinstance(source_sha, str) or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
+        raise SafeEnvError("installed live-QA manifest source identity is invalid")
+    allowed_links = _liveqa_payload_links(root, source_sha)
     digest = hashlib.sha256()
     files: dict[str, str] = {}
+    seen_links: dict[str, str] = {}
     total = 0
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         metadata = path.lstat()
         if stat.S_ISLNK(metadata.st_mode):
-            raise SafeEnvError("installed live-QA payload contains a symlink")
+            target = os.readlink(path)
+            if (
+                relative not in allowed_links or target != allowed_links[relative]
+                or not relative.startswith("provider-runtime/browsers/")
+                or metadata.st_uid != 0 or metadata.st_gid != 0
+                or metadata.st_nlink != 1
+                or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+            ):
+                raise SafeEnvError("installed live-QA payload contains an undeclared symlink")
+            try:
+                provider_root = root / "provider-runtime"
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(provider_root.resolve(strict=True))
+                if not stat.S_ISREG(resolved.lstat().st_mode):
+                    raise ValueError("link target is not a regular file")
+            except (OSError, ValueError) as exc:
+                raise SafeEnvError("installed live-QA payload symlink target is unsafe") from exc
+            seen_links[relative] = target
+            digest.update(relative.encode("utf-8") + b"\0l\0" + target.encode("utf-8") + b"\0")
+            continue
         digest.update(relative.encode("utf-8") + b"\0")
         if stat.S_ISDIR(metadata.st_mode):
             if (
@@ -285,7 +312,7 @@ def _validate_liveqa_payload_tree(root: Path, manifest: dict[str, object]) -> No
                 raise SafeEnvError("installed live-QA payload directory mode is unsafe")
             digest.update(b"d\0")
             continue
-        sandbox = relative == LIVE_QA_SANDBOX_RELATIVE
+        sandbox = relative in {LIVE_QA_SANDBOX_RELATIVE, LIVE_QA_PROVIDER_SANDBOX_RELATIVE}
         mode = stat.S_IMODE(metadata.st_mode)
         expected_modes = {0o4755} if sandbox else {0o444, 0o555}
         if (
@@ -311,8 +338,181 @@ def _validate_liveqa_payload_tree(root: Path, manifest: dict[str, object]) -> No
             raise SafeEnvError("installed Chromium sandbox checksum is invalid")
         files[relative] = file_digest
         digest.update(b"f\0" + bytes.fromhex(file_digest))
-    if digest.hexdigest() != manifest["payload_tree_sha256"] or files != manifest["files"]:
+    if (
+        seen_links != allowed_links
+        or digest.hexdigest() != manifest["payload_tree_sha256"]
+        or files != manifest["files"]
+    ):
         raise SafeEnvError("installed live-QA payload digest does not match manifest")
+
+
+def _liveqa_payload_links(root: Path, source_sha: str) -> dict[str, str]:
+    """Parse only the exact self-owned v2 aliases permitted in a payload."""
+    provider_path = root / "runtime-provider.json"
+    try:
+        metadata = provider_path.lstat()
+    except FileNotFoundError:
+        if os.path.lexists(root / "provider-runtime"):
+            raise SafeEnvError("live-QA payload has an unreferenced provider tree")
+        return {}
+    if (
+        not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0
+        or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o444
+        or metadata.st_size > MAX_ACTIVE_MANIFEST_BYTES
+    ):
+        raise SafeEnvError("installed live-QA provider metadata is unsafe")
+    def validate_provider_metadata(value: os.stat_result) -> None:
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or value.st_uid != 0 or value.st_gid != 0 or value.st_nlink != 1
+            or stat.S_IMODE(value.st_mode) != 0o444
+            or value.st_size > MAX_ACTIVE_MANIFEST_BYTES
+        ):
+            raise SafeEnvError("installed live-QA provider metadata is unsafe")
+
+    provider = _read_bounded_json(
+        provider_path,
+        metadata=metadata,
+        maximum=MAX_ACTIVE_MANIFEST_BYTES,
+        validate_metadata=validate_provider_metadata,
+        unavailable_message="installed live-QA provider is unavailable",
+        invalid_message="installed live-QA provider is invalid",
+    )
+    if not isinstance(provider, dict):
+        raise SafeEnvError("installed live-QA provider identity is invalid")
+    version = provider.get("version")
+    if type(version) is not int or version not in {1, 2}:
+        raise SafeEnvError("installed live-QA provider identity is invalid")
+    if version == 1:
+        expected_v1 = {
+            "version", "source_sha", "provider_sha", "engine_tree_sha256",
+            "node_version", "package_lock_sha256", "engine_files",
+        }
+        if (
+            set(provider) != expected_v1
+            or provider.get("source_sha") != source_sha
+            or not isinstance(provider.get("provider_sha"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", provider["provider_sha"]) is None
+            or provider.get("node_version") != "26.3.1"
+            or not isinstance(provider.get("engine_tree_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", provider["engine_tree_sha256"]) is None
+            or not isinstance(provider.get("package_lock_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", provider["package_lock_sha256"]) is None
+            or not isinstance(provider.get("engine_files"), dict)
+            or len(provider["engine_files"]) > 200_000
+        ):
+            raise SafeEnvError("installed live-QA provider identity is invalid")
+        for relative, file_digest in provider["engine_files"].items():
+            parts = relative.split("/") if isinstance(relative, str) else []
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or relative.startswith("/")
+                or "\\" in relative
+                or any(part in {"", ".", ".."} for part in parts)
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in relative)
+                or relative.startswith("web/node_modules/")
+                and "/node_modules/" in relative.removeprefix("web/node_modules/")
+                or not (
+                    relative == "node/bin/node"
+                    or relative.startswith("browsers/") and len(parts) >= 3
+                    and parts[1] in {"chromium-1228", "chromium_headless_shell-1228", "webkit-2311", "ffmpeg-1011"}
+                    or any(relative.startswith(f"web/node_modules/{pkg}/") for pkg in ("@playwright/test", "playwright", "playwright-core"))
+                )
+                or not isinstance(file_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", file_digest) is None
+            ):
+                raise SafeEnvError("installed live-QA provider file map is invalid")
+        paths = set(provider["engine_files"])
+        if any("/".join(path.split("/")[:index]) in paths for path in paths for index in range(1, len(path.split("/")))):
+            raise SafeEnvError("installed live-QA provider file map has a path conflict")
+        if os.path.lexists(root / "provider-runtime"):
+            raise SafeEnvError("legacy live-QA provider has an unexpected local tree")
+        return {}
+    expected = {
+        "version", "source_sha", "provider_sha", "engine_tree_sha256",
+        "node_version", "package_lock_sha256", "engine_files", "engine_links",
+    }
+    if (
+        set(provider) != expected or provider.get("source_sha") != source_sha
+        or not isinstance(provider.get("provider_sha"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", provider["provider_sha"]) is None
+        or not isinstance(provider.get("engine_files"), dict)
+        or not isinstance(provider.get("engine_links"), dict)
+        or not isinstance(provider.get("engine_tree_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", provider["engine_tree_sha256"]) is None
+        or provider.get("node_version") != "26.3.1"
+        or not isinstance(provider.get("package_lock_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", provider["package_lock_sha256"]) is None
+    ):
+        raise SafeEnvError("installed live-QA provider identity is invalid")
+    external_provider = provider["provider_sha"] != source_sha
+    if external_provider:
+        if os.path.lexists(root / "provider-runtime"):
+            raise SafeEnvError("external live-QA provider has an unexpected local tree")
+    links = provider["engine_links"]
+    files = provider["engine_files"]
+    browser_roots = {"chromium-1228", "chromium_headless_shell-1228", "webkit-2311", "ffmpeg-1011"}
+    if (
+        len(links) > 200_000
+        or set(links) & set(files)
+        or any(
+            not isinstance(path, str)
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in path)
+            or path.startswith("web/node_modules/")
+            and "/node_modules/" in path.removeprefix("web/node_modules/")
+            or not (
+                path == "node/bin/node"
+                or path.startswith("browsers/") and len(path.split("/")) >= 3 and path.split("/", 2)[1] in browser_roots
+                or any(path.startswith(f"web/node_modules/{pkg}/") for pkg in ("@playwright/test", "playwright", "playwright-core"))
+            )
+            or not isinstance(file_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", file_digest) is None
+            for path, file_digest in files.items()
+        )
+    ):
+        raise SafeEnvError("installed live-QA provider link map is invalid")
+    paths = set(files) | set(links)
+    if any("/".join(path.split("/")[:index]) in paths for path in paths for index in range(1, len(path.split("/")))):
+        raise SafeEnvError("installed live-QA provider link map has a path conflict")
+    terminals: dict[str, str] = {}
+    browser_roots = {"chromium-1228", "chromium_headless_shell-1228", "webkit-2311", "ffmpeg-1011"}
+    for alias, target in links.items():
+        if not isinstance(alias, str) or not isinstance(target, str) or "\\" in alias or "\\" in target or alias.startswith("/") or target.startswith("/") or "\x00" in alias or "\x00" in target:
+            raise SafeEnvError("installed live-QA provider link map is invalid")
+        parts = alias.split("/")
+        if len(parts) < 3 or parts[0] != "browsers" or parts[1] not in browser_roots or any(part in {"", ".", ".."} for part in parts) or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in alias):
+            raise SafeEnvError("installed live-QA provider link map is invalid")
+        resolved = parts[:-1]
+        target_parts = target.split("/")
+        if not target_parts or any(part in {"", "."} for part in target_parts) or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in target):
+            raise SafeEnvError("installed live-QA provider link target is invalid")
+        for part in target_parts:
+            if part == "..":
+                if len(resolved) <= 2:
+                    raise SafeEnvError("installed live-QA provider link escapes browser root")
+                resolved.pop()
+            else:
+                resolved.append(part)
+        if resolved[:2] != parts[:2] or len(resolved) < 3:
+            raise SafeEnvError("installed live-QA provider link escapes browser root")
+        terminals[alias] = "/".join(resolved)
+    for alias in links:
+        current = alias
+        visited: set[str] = set()
+        while current in terminals:
+            if current in visited:
+                raise SafeEnvError("installed live-QA provider link map contains a cycle")
+            visited.add(current)
+            current = terminals[current]
+        if current not in files:
+            raise SafeEnvError("installed live-QA provider link target is not a regular file")
+    if external_provider:
+        return {}
+    return {f"provider-runtime/{path}": target for path, target in links.items()}
 
 
 def _open_component(

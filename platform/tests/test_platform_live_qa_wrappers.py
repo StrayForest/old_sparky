@@ -1561,6 +1561,58 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         user_wrapper = (TOOLS_ROOT / "platform_live_user_qa.sh").read_text(
             encoding="utf-8"
         )
+        # The workflow embeds a second closed marker grammar. Keep every
+        # emitted stage/check in lockstep with that parser and its failure gate.
+        marker_pattern_start = source.index("marker_pattern = re.compile(")
+        marker_pattern_end = source.index("count_fields = (", marker_pattern_start)
+        marker_pattern_literals = re.findall(
+            r'rb"([^"]*)"', source[marker_pattern_start:marker_pattern_end]
+        )
+        self.assertTrue(marker_pattern_literals)
+        workflow_marker_pattern = re.compile(
+            "".join(marker_pattern_literals).encode("ascii")
+        )
+
+        def marker_values(pattern: bytes, field: str) -> set[str]:
+            field_bytes = field.encode("ascii")
+            match = re.search(
+                rb"\b" + field_bytes + rb"=\((?:\?P<" + field_bytes + rb">)?([^)]*)\)",
+                pattern,
+            )
+            self.assertIsNotNone(match, f"missing closed {field} alternatives")
+            assert match is not None
+            return set(match.group(1).decode("ascii").split("|"))
+
+        workflow_stages = marker_values(workflow_marker_pattern.pattern, "stage")
+        workflow_checks = marker_values(workflow_marker_pattern.pattern, "check")
+        remote_pattern = platform_workflow_remote_dispatch.LIVE_LAUNCH_STATUS_RE.pattern
+        remote_stages = marker_values(remote_pattern, "stage")
+        remote_checks = marker_values(remote_pattern, "check")
+
+        canonical_failure_stages = set(
+            platform_workflow_remote_dispatch.LIVE_LAUNCH_FAILURE_STAGES
+        )
+        canonical_stages = canonical_failure_stages | {"complete"}
+        canonical_checks = set(platform_workflow_remote_dispatch.LIVE_LAUNCH_CHECK_IDS)
+        self.assertSetEqual(remote_stages, canonical_stages)
+        self.assertSetEqual(remote_checks, canonical_checks)
+        self.assertSetEqual(workflow_stages, canonical_stages)
+        self.assertSetEqual(workflow_checks, canonical_checks)
+        failure_stage_start = source.index("stage in {", marker_pattern_end)
+        failure_stage_end = source.index("}", failure_stage_start)
+        workflow_failure_stages = set(
+            re.findall(r'"([a-z_]+)"', source[failure_stage_start:failure_stage_end])
+        )
+        self.assertSetEqual(workflow_failure_stages, canonical_failure_stages)
+        supervisor_stages = set(re.findall(r'launch_stage="([a-z_]+)"', supervisor)) | {
+            "complete"
+        }
+        supervisor_checks = set(re.findall(r'launch_check="([a-z_]+)"', supervisor)) | {
+            "none"
+        }
+        self.assertTrue(supervisor_stages <= workflow_stages)
+        self.assertTrue(supervisor_checks <= workflow_checks)
+
         route_cases = re.findall(r'^  \{ path: "[^"]+", text:', browser_spec, re.MULTILINE)
         explicit_tests = re.findall(r"^test\(", browser_spec, re.MULTILINE)
         browser_projects = re.findall(r'^      name: "live-[a-z-]+",$', browser_config, re.MULTILINE)

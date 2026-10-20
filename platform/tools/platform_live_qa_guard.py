@@ -881,11 +881,31 @@ def _provider_link_map(provider: object) -> dict[str, str]:
     files = provider.get("engine_files")
     if not isinstance(links, dict) or not isinstance(files, dict):
         raise GuardError("active live-QA engine provider link map is invalid")
-    if (
-        any(not isinstance(path, str) for path in files)
-        or set(files) & set(links)
-        or len(links) > MAX_ZIP_ENTRIES
-    ):
+    if len(files) > MAX_ZIP_ENTRIES or any(
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in path)
+            or path.startswith("web/node_modules/")
+            and "/node_modules/" in path.removeprefix("web/node_modules/")
+            or not (
+                path == "node/bin/node"
+                or path.startswith("browsers/")
+                and len(path.split("/")) >= 3
+                and path.split("/", 2)[1] in LIVE_QA_BROWSER_ROOTS
+                or any(
+                    path.startswith(f"web/node_modules/{package}/")
+                    for package in ("@playwright/test", "playwright", "playwright-core")
+                )
+            )
+            or not isinstance(files[path], str)
+            or not DIGEST_PATTERN.fullmatch(files[path])
+            for path in files
+        ):
+        raise GuardError("active live-QA engine file map is invalid")
+    if set(files) & set(links) or len(links) > MAX_ZIP_ENTRIES:
         raise GuardError("active live-QA engine provider link map is invalid")
     paths = set(files) | set(links)
     if any(
@@ -959,6 +979,8 @@ def _active_payload_provider_files(
     try:
         metadata = provider_path.lstat()
     except FileNotFoundError:
+        if os.path.lexists(payload_root / "provider-runtime"):
+            raise GuardError("live-QA payload has an unreferenced provider tree")
         return {}, {}
     except OSError as exc:
         raise GuardError("active live-QA engine provider is unavailable") from exc
@@ -977,10 +999,12 @@ def _active_payload_provider_files(
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise GuardError("active live-QA engine provider is unavailable") from exc
     version = provider.get("version") if isinstance(provider, dict) else None
-    if version == 1:
-        return {}, {}
-    if version != 2:
+    if type(version) is not int or version not in {1, 2}:
         raise GuardError("active live-QA engine provider identity is invalid")
+    if version == 1:
+        if os.path.lexists(payload_root / "provider-runtime"):
+            raise GuardError("legacy live-QA provider has an unexpected local tree")
+        return {}, {}
     expected = {
         "version", "source_sha", "provider_sha", "engine_tree_sha256",
         "node_version", "package_lock_sha256", "engine_files", "engine_links",
@@ -994,6 +1018,8 @@ def _active_payload_provider_files(
         raise GuardError("active live-QA engine provider identity is invalid")
     links = _provider_link_map(provider)
     if provider.get("provider_sha") != source_sha:
+        if os.path.lexists(payload_root / "provider-runtime"):
+            raise GuardError("external live-QA provider has an unexpected local tree")
         return {}, {}
     engine_files = provider["engine_files"]
     if any(
@@ -1182,7 +1208,10 @@ def _validate_installed_payload_root(
                 raise GuardError("installed live-QA payload directory mode is unsafe")
             digest.update(b"d\0")
             continue
-        sandbox = relative == "runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+        sandbox = relative in {
+            "runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox",
+            "provider-runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox",
+        }
         expected_modes = {0o4755} if sandbox else {0o444, 0o555}
         if (
             not stat.S_ISREG(item.st_mode)
@@ -4158,18 +4187,19 @@ def _trusted_runtime_root() -> Path:
         )
     ):
         raise GuardError("referenced live-QA engine provider metadata is unsafe")
-    try:
-        provider_entries = {entry.name for entry in provider_payload.iterdir()}
-    except OSError as exc:
-        raise GuardError("referenced live-QA engine provider is unavailable") from exc
-    expected_provider_entries = {
-        "provider-runtime" if provider_version == 2 else "runtime",
-        "source-sha",
-    }
-    if recovered_provider:
-        expected_provider_entries = {"runtime"}
-    if provider_entries != expected_provider_entries:
-        raise GuardError("referenced live-QA engine provider has unexpected entries")
+    if provider_sha != source_sha:
+        try:
+            provider_entries = {entry.name for entry in provider_payload.iterdir()}
+        except OSError as exc:
+            raise GuardError("referenced live-QA engine provider is unavailable") from exc
+        required_provider_entries = {
+            "provider-runtime" if provider_version == 2 else "runtime",
+            "source-sha",
+        }
+        if recovered_provider:
+            required_provider_entries = {"runtime"}
+        if not required_provider_entries.issubset(provider_entries):
+            raise GuardError("referenced live-QA engine provider is incomplete")
     expected_files = provider["engine_files"]
     if any(
         not isinstance(path, str)

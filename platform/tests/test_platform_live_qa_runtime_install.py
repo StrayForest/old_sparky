@@ -32,6 +32,21 @@ SAFE_ENV_SPEC = importlib.util.spec_from_file_location(
 assert SAFE_ENV_SPEC is not None and SAFE_ENV_SPEC.loader is not None
 safe_env = importlib.util.module_from_spec(SAFE_ENV_SPEC)
 SAFE_ENV_SPEC.loader.exec_module(safe_env)
+DISPATCH_SPEC = importlib.util.spec_from_file_location(
+    "platform_live_user_qa_dispatch_runtime_install_tested",
+    SCRIPT.with_name("platform_live_user_qa_dispatch.py"),
+)
+assert DISPATCH_SPEC is not None and DISPATCH_SPEC.loader is not None
+dispatch = importlib.util.module_from_spec(DISPATCH_SPEC)
+DISPATCH_SPEC.loader.exec_module(dispatch)
+GUARD_SPEC = importlib.util.spec_from_file_location(
+    "platform_live_qa_guard_runtime_install_tested",
+    SCRIPT.with_name("platform_live_qa_guard.py"),
+)
+assert GUARD_SPEC is not None and GUARD_SPEC.loader is not None
+guard = importlib.util.module_from_spec(GUARD_SPEC)
+GUARD_SPEC.loader.exec_module(guard)
+from tests import platform_chromium_sandbox_fixture
 
 
 @unittest.skipUnless(os.geteuid() == 0, "installer contract requires root-owned test paths")
@@ -535,6 +550,479 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     runtime._cleanup_staging(apply=True)
                 self.assertTrue(unsafe.exists())
                 self.assertTrue(keep.exists())
+
+        self._assert_installer_published_v2_payload_crosses_all_trusted_readers()
+
+    def _assert_installer_published_v2_payload_crosses_all_trusted_readers(self) -> None:
+        """Publish real installer generations and run every independent reader."""
+        legacy_sha, repaired_sha, reused_sha = "1" * 40, "2" * 40, "3" * 40
+        link_map = {
+            "browsers/webkit-2311/lib/libwpe.so": "libwpe.so.1",
+            "browsers/webkit-2311/lib/libwpe.so.1": "libwpe.so.1.9.3",
+        }
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            with self.canonical_runtime_tree(root, legacy_sha) as (
+                app_dir, legacy_release, trusted, payload_root
+            ):
+                legacy_runtime, _files, _lock = self._engine_provider_fixture(root / "legacy-engine")
+                for directory in (legacy_runtime, *[p for p in legacy_runtime.rglob("*") if p.is_dir()]):
+                    os.chmod(directory, 0o755)
+                sandbox = legacy_runtime / runtime.RUNTIME_SANDBOX_RELATIVE
+                sandbox.write_bytes(platform_chromium_sandbox_fixture.read_bytes())
+                os.chmod(sandbox, 0o4755)
+                library = legacy_runtime / "browsers/webkit-2311/lib"
+                library.mkdir(mode=0o755, parents=True, exist_ok=True)
+                terminal_bytes = b"installer published WPE terminal\n"
+                (library / "libwpe.so.1.9.3").write_bytes(terminal_bytes)
+                os.chmod(library / "libwpe.so.1.9.3", 0o444)
+                for alias in link_map:
+                    (legacy_runtime / alias).write_bytes(terminal_bytes)
+                    os.chmod(legacy_runtime / alias, 0o444)
+                (legacy_runtime / "web/tests/support/live-engine-preflight.cjs").write_bytes(b"preflight fixture\n")
+                os.chmod(legacy_runtime / "web/tests/support/live-engine-preflight.cjs", 0o444)
+                legacy_files = runtime._runtime_file_map(
+                    legacy_runtime,
+                    prefixes=("node/", "browsers/", "web/node_modules/"),
+                )
+                lock_sha = runtime._digest_regular(legacy_runtime / "web/package-lock.json")
+                engine_v1 = runtime._engine_digest(
+                    legacy_files, node_version="26.3.1", package_lock_sha256=lock_sha
+                )
+                tree_v1, files_v1 = runtime._tree_digest(
+                    legacy_runtime,
+                    ignored=frozenset({runtime.RUNTIME_MANIFEST_RELATIVE.as_posix()}),
+                    sandbox_relative=runtime.RUNTIME_SANDBOX_RELATIVE,
+                )
+                runtime._write_manifest(
+                    legacy_runtime / runtime.RUNTIME_MANIFEST_RELATIVE,
+                    {
+                        "version": 1,
+                        "node_version": "26.3.1",
+                        "package_lock_sha256": lock_sha,
+                        "tree_sha256": tree_v1,
+                        "files": files_v1,
+                    },
+                )
+                runtime._normalize_tree(
+                    legacy_runtime,
+                    sandbox_relative=runtime.RUNTIME_SANDBOX_RELATIVE,
+                )
+                shutil.rmtree(legacy_release / "liveqa-runtime")
+                shutil.copytree(legacy_runtime, legacy_release / "liveqa-runtime", symlinks=True)
+                repaired_files = {path: digest for path, digest in legacy_files.items() if path not in link_map}
+                engine_v2 = runtime._engine_map_digest(
+                    repaired_files, link_map, node_version="26.3.1", package_lock_sha256=lock_sha
+                )
+
+                # First publish the existing flattened provider, then let the
+                # normal source-only installer perform its v1-to-v2 repair.
+                with mock.patch.object(runtime, "_validate_runtime_source", new=ORIGINAL_VALIDATE_RUNTIME_SOURCE):
+                    runtime.install(app_dir, legacy_release)
+                    runtime.verify(app_dir, legacy_sha)
+
+                def make_candidate(candidate_sha: str) -> Path:
+                    release = app_dir / "releases" / f"release-{candidate_sha[:8]}"
+                    release.mkdir(mode=0o755)
+                    tools = release / "tools"
+                    tools.mkdir(mode=0o755)
+                    for name in runtime.TOOL_FILES:
+                        source = SCRIPT.parent / name
+                        target = tools / name
+                        target.write_bytes(source.read_bytes())
+                        os.chmod(target, 0o555 if name.endswith(".sh") else 0o444)
+                    for relative in runtime.SOURCE_FILES:
+                        source = SCRIPT.parents[1] / relative
+                        target = release / relative
+                        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+                        target.write_bytes(source.read_bytes())
+                        os.chmod(target, 0o444)
+                    release_json = {
+                        "source_git_commit": candidate_sha,
+                        "release_slug": release.name,
+                    }
+                    (release / "RELEASE.json").write_text(json.dumps(release_json) + "\n", encoding="ascii")
+                    os.chmod(release / "RELEASE.json", 0o444)
+                    source_runtime = release / "liveqa-runtime"
+                    web = source_runtime / "web"
+                    suite_content = {
+                        "web/package-lock.json": b"lock\n",
+                        "web/playwright.live.config.ts": b"config\n",
+                        "web/tests/smoke/live-launch.spec.ts": b"launch\n",
+                        "web/tests/smoke/live-user-journey.spec.ts": b"journey\n",
+                        "web/tests/support/live-qa-origin.ts": b"origin\n",
+                        "web/tests/support/live-qa-sandbox.ts": b"sandbox\n",
+                        "web/tests/support/live-count-reporter.cjs": b"reporter\n",
+                        "web/tests/support/live-engine-preflight.cjs": b"preflight\n",
+                    }
+                    for relative, content in suite_content.items():
+                        target = source_runtime / relative
+                        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+                        target.write_bytes(content)
+                        os.chmod(target, 0o444)
+                    suite_files = runtime._runtime_file_map(
+                        source_runtime,
+                        prefixes=("web/",),
+                        excluded_prefixes=("web/node_modules/",),
+                    )
+                    lock_digest = hashlib.sha256(suite_content["web/package-lock.json"]).hexdigest()
+                    source_manifest = {
+                        "version": 3,
+                        "node_version": "26.3.1",
+                        "package_lock_sha256": lock_digest,
+                        "engine_tree_sha256": engine_v2,
+                        "engine_files": repaired_files,
+                        "engine_links": link_map,
+                        "suite_tree_sha256": runtime._file_map_digest(
+                            suite_files, domain=b"oldsparky-liveqa-suite-v1\0"
+                        ),
+                        "suite_files": suite_files,
+                    }
+                    runtime._write_manifest(source_runtime / runtime.RUNTIME_MANIFEST_RELATIVE, source_manifest)
+                    runtime._normalize_tree(source_runtime)
+                    return release
+
+                repaired_release = make_candidate(repaired_sha)
+                with mock.patch.object(runtime, "_validate_runtime_source", new=ORIGINAL_VALIDATE_RUNTIME_SOURCE):
+                    # Provider planning consumes the already-published legacy
+                    # generation and installer publication creates the v2 one.
+                    runtime.install(app_dir, repaired_release)
+                    (app_dir / "current").unlink()
+                    (app_dir / "current").symlink_to(repaired_release)
+                    runtime.verify(app_dir, repaired_sha)
+
+                def validate_all(source_sha: str) -> Path:
+                    payload = payload_root / source_sha
+                    manifest = runtime._read_manifest()
+                    self.assertEqual(manifest["source_sha"], source_sha)
+                    with mock.patch.object(runtime, "_validate_runtime_source", new=ORIGINAL_VALIDATE_RUNTIME_SOURCE):
+                        runtime.verify(app_dir, source_sha)
+                    with (
+                        mock.patch.multiple(
+                            dispatch,
+                            RUNTIME=app_dir,
+                            CURRENT=app_dir / "current",
+                            TRUSTED_LIVE_QA_ROOT=trusted,
+                            QA_HELPER=trusted / "platform_live_user_qa_trusted.sh",
+                            LAUNCH_HELPER=trusted / "platform_live_launch_trusted.sh",
+                            REMOTE_DISPATCHER=trusted / "platform_workflow_remote_dispatch.py",
+                            REMOTE_INPUT_GUARD=trusted / "platform_workflow_input_guard.py",
+                            RELEASE_LOCK_EXEC=trusted / "platform_release_lock_exec.sh",
+                            RELEASE_LOCK=trusted / "platform_release_lock.sh",
+                            MAILBOX_HELPER=trusted / "platform_live_qa_mailbox_helper.py",
+                            ACTIVE_MANIFEST=trusted / "active-manifest.json",
+                            PAYLOAD_ROOT=payload_root,
+                            ACTIVE_POINTER=trusted / "active",
+                        ),
+                        mock.patch.multiple(
+                            safe_env,
+                            PRODUCTION_RUNTIME_ROOT=app_dir,
+                            ACTIVE_PLATFORM_ROOT=app_dir / "current",
+                            LIVE_QA_ROOT=trusted,
+                            LIVE_QA_RELEASE_ROOT=payload_root,
+                            LIVE_QA_ACTIVE_MANIFEST=trusted / "active-manifest.json",
+                            LIVE_QA_ACTIVE_POINTER=trusted / "active",
+                        ),
+                        mock.patch.multiple(
+                            guard,
+                            TRUSTED_SECRET_ROOT=trusted,
+                            TRUSTED_PAYLOAD_ROOT=payload_root,
+                            TRUSTED_ACTIVE_MANIFEST=trusted / "active-manifest.json",
+                            TRUSTED_ACTIVE_POINTER=trusted / "active",
+                        ),
+                        mock.patch.object(guard, "_active_release_commit", return_value=source_sha),
+                    ):
+                        self.assertEqual(dispatch.main(["verify", source_sha]), 0)
+                        self.assertEqual(safe_env.main(["validate-runtime"]), 0)
+                        self.assertEqual(guard._validate_installed_payload_root(payload, target_sha=source_sha), source_sha)
+                        engine_root = guard._trusted_runtime_root()
+                        gate_root = root / f"gates-{source_sha[:4]}"
+                        gate_root.mkdir(mode=0o755)
+                        gate = gate_root / f"public-live-qa.{source_sha[:8]}"
+                        gate.mkdir(mode=0o700)
+                        with (
+                            mock.patch.object(guard, "RUN_GATE_ROOT", gate_root),
+                            mock.patch.object(guard, "RUNNER_CACHE_ROOT", root / "cache"),
+                            mock.patch.object(guard, "liveqa_identity", return_value=(0, 0)),
+                        ):
+                            mount_values = guard._runtime_mount_aliases(gate)
+                            guard._cleanup_runtime_mount_aliases(*mount_values)
+                        return engine_root
+
+                os.chmod(app_dir / "releases", 0o755)
+                os.chmod(app_dir, 0o755)
+                engine_root = validate_all(repaired_sha)
+                self.assertEqual(engine_root, payload_root / repaired_sha / "provider-runtime")
+                self.assertEqual(
+                    os.readlink(engine_root / "browsers/webkit-2311/lib/libwpe.so"),
+                    "libwpe.so.1",
+                )
+                self.assertFalse((payload_root / repaired_sha / "runtime-provider.json").is_symlink())
+
+                def assert_published_payload_rejected() -> None:
+                    with (
+                        mock.patch.multiple(
+                            dispatch,
+                            RUNTIME=app_dir,
+                            CURRENT=app_dir / "current",
+                            TRUSTED_LIVE_QA_ROOT=trusted,
+                            ACTIVE_MANIFEST=trusted / "active-manifest.json",
+                            PAYLOAD_ROOT=payload_root,
+                            ACTIVE_POINTER=trusted / "active",
+                        ),
+                        mock.patch.multiple(
+                            safe_env,
+                            PRODUCTION_RUNTIME_ROOT=app_dir,
+                            ACTIVE_PLATFORM_ROOT=app_dir / "current",
+                            LIVE_QA_ROOT=trusted,
+                            LIVE_QA_RELEASE_ROOT=payload_root,
+                            LIVE_QA_ACTIVE_MANIFEST=trusted / "active-manifest.json",
+                            LIVE_QA_ACTIVE_POINTER=trusted / "active",
+                        ),
+                        mock.patch.multiple(
+                            guard,
+                            TRUSTED_SECRET_ROOT=trusted,
+                            TRUSTED_PAYLOAD_ROOT=payload_root,
+                            TRUSTED_ACTIVE_MANIFEST=trusted / "active-manifest.json",
+                            TRUSTED_ACTIVE_POINTER=trusted / "active",
+                        ),
+                        mock.patch.object(guard, "_active_release_commit", return_value=repaired_sha),
+                        redirect_stderr(io.StringIO()),
+                    ):
+                        self.assertNotEqual(dispatch.main(["verify", repaired_sha]), 0)
+                        self.assertNotEqual(safe_env.main(["validate-runtime"]), 0)
+                        with self.assertRaises(runtime.InstallerError):
+                            runtime.verify(app_dir, repaired_sha)
+                        with self.assertRaises(guard.GuardError):
+                            guard._validate_installed_payload_root(
+                                payload_root / repaired_sha, target_sha=repaired_sha
+                            )
+                        with self.assertRaises(guard.GuardError):
+                            guard._trusted_runtime_root()
+
+                # The actual installed generation rejects topology, content,
+                # and sandbox metadata mutations at every trusted reader.
+                alias_path = engine_root / "browsers/webkit-2311/lib/libwpe.so"
+                alias_path.unlink()
+                alias_path.symlink_to("../../../../outside")
+                os.chown(alias_path, 0, 0, follow_symlinks=False)
+                with self.subTest(installed_mutation="escaping-alias"):
+                    assert_published_payload_rejected()
+                alias_path.unlink()
+                alias_path.symlink_to("libwpe.so.1")
+                os.chown(alias_path, 0, 0, follow_symlinks=False)
+
+                terminal_path = engine_root / "browsers/webkit-2311/lib/libwpe.so.1.9.3"
+                terminal_bytes = terminal_path.read_bytes()
+                terminal_path.chmod(0o644)
+                terminal_path.write_bytes(b"mutated engine target\n")
+                terminal_path.chmod(0o444)
+                with self.subTest(installed_mutation="changed-link-terminal"):
+                    assert_published_payload_rejected()
+                terminal_path.chmod(0o644)
+                terminal_path.write_bytes(terminal_bytes)
+                terminal_path.chmod(0o444)
+
+                sandbox_path = engine_root / runtime.RUNTIME_SANDBOX_RELATIVE
+                sandbox_path.chmod(0o755)
+                with self.subTest(installed_mutation="sandbox-mode"):
+                    assert_published_payload_rejected()
+                sandbox_path.chmod(0o4755)
+                sandbox_bytes = sandbox_path.read_bytes()
+                sandbox_path.chmod(0o755)
+                sandbox_path.write_bytes(b"mutated sandbox\n")
+                sandbox_path.chmod(0o4755)
+                with self.subTest(installed_mutation="sandbox-bytes"):
+                    assert_published_payload_rejected()
+                sandbox_path.chmod(0o755)
+                sandbox_path.write_bytes(sandbox_bytes)
+                sandbox_path.chmod(0o4755)
+
+                misplaced_sandbox = (
+                    engine_root / "browsers/webkit-2311/unexpected/chrome_sandbox"
+                )
+                misplaced_sandbox.parent.mkdir(mode=0o555, parents=True)
+                shutil.copyfile(sandbox_path, misplaced_sandbox)
+                os.chown(misplaced_sandbox, 0, 0)
+                os.chmod(misplaced_sandbox, 0o4755)
+                with self.subTest(installed_mutation="sandbox-path"):
+                    assert_published_payload_rejected()
+                misplaced_sandbox.unlink()
+                misplaced_sandbox.parent.rmdir()
+
+                reused_release = make_candidate(reused_sha)
+                with mock.patch.object(runtime, "_validate_runtime_source", new=ORIGINAL_VALIDATE_RUNTIME_SOURCE):
+                    runtime.install(app_dir, reused_release)
+                    (app_dir / "previous").symlink_to(repaired_release)
+                    (app_dir / "current").unlink()
+                    (app_dir / "current").symlink_to(reused_release)
+                    runtime.verify(app_dir, reused_sha)
+                reused_payload = payload_root / reused_sha
+                self.assertFalse(os.path.lexists(reused_payload / "provider-runtime"))
+                reused_root = validate_all(reused_sha)
+                self.assertEqual(reused_root, payload_root / repaired_sha / "provider-runtime")
+
+                # External-provider metadata is still parsed strictly even
+                # though its engine bytes live in another immutable payload.
+                external_provider_path = reused_payload / "runtime-provider.json"
+                external_provider_bytes = external_provider_path.read_bytes()
+                active_manifest_path = trusted / "active-manifest.json"
+                active_manifest_bytes = active_manifest_path.read_bytes()
+                malformed_external = json.loads(external_provider_bytes)
+                malformed_external["engine_links"] = {
+                    "browsers/webkit-2311/lib/escape.so": "../../../../outside"
+                }
+                external_provider_path.chmod(0o644)
+                external_provider_path.write_text(
+                    json.dumps(malformed_external, sort_keys=True) + "\n",
+                    encoding="ascii",
+                )
+                external_provider_path.chmod(0o444)
+                changed_tree_digest, changed_files = runtime._tree_digest(reused_payload)
+                changed_active_manifest = json.loads(active_manifest_bytes)
+                changed_active_manifest["payload_tree_sha256"] = changed_tree_digest
+                changed_active_manifest["files"] = changed_files
+                active_manifest_path.chmod(0o644)
+                active_manifest_path.write_text(
+                    json.dumps(changed_active_manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                active_manifest_path.chmod(0o444)
+                with (
+                    mock.patch.multiple(
+                        dispatch,
+                        RUNTIME=app_dir,
+                        CURRENT=app_dir / "current",
+                        TRUSTED_LIVE_QA_ROOT=trusted,
+                        ACTIVE_MANIFEST=active_manifest_path,
+                        PAYLOAD_ROOT=payload_root,
+                        ACTIVE_POINTER=trusted / "active",
+                    ),
+                    mock.patch.multiple(
+                        safe_env,
+                        PRODUCTION_RUNTIME_ROOT=app_dir,
+                        ACTIVE_PLATFORM_ROOT=app_dir / "current",
+                        LIVE_QA_ROOT=trusted,
+                        LIVE_QA_RELEASE_ROOT=payload_root,
+                        LIVE_QA_ACTIVE_MANIFEST=active_manifest_path,
+                        LIVE_QA_ACTIVE_POINTER=trusted / "active",
+                    ),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    self.assertNotEqual(dispatch.main(["verify", reused_sha]), 0)
+                    self.assertNotEqual(safe_env.main(["validate-runtime"]), 0)
+                external_provider_path.chmod(0o644)
+                external_provider_path.write_bytes(external_provider_bytes)
+                external_provider_path.chmod(0o444)
+                active_manifest_path.chmod(0o644)
+                active_manifest_path.write_bytes(active_manifest_bytes)
+                active_manifest_path.chmod(0o444)
+
+                # A stray local provider tree is rejected at every whole-payload reader.
+                stray = reused_payload / "provider-runtime"
+                stray.mkdir(mode=0o555)
+                with (
+                    mock.patch.multiple(
+                        dispatch,
+                        RUNTIME=app_dir,
+                        CURRENT=app_dir / "current",
+                        TRUSTED_LIVE_QA_ROOT=trusted,
+                        ACTIVE_MANIFEST=trusted / "active-manifest.json",
+                        PAYLOAD_ROOT=payload_root,
+                        ACTIVE_POINTER=trusted / "active",
+                    ),
+                    mock.patch.multiple(
+                        safe_env,
+                        PRODUCTION_RUNTIME_ROOT=app_dir,
+                        ACTIVE_PLATFORM_ROOT=app_dir / "current",
+                        LIVE_QA_ROOT=trusted,
+                        LIVE_QA_RELEASE_ROOT=payload_root,
+                        LIVE_QA_ACTIVE_MANIFEST=trusted / "active-manifest.json",
+                        LIVE_QA_ACTIVE_POINTER=trusted / "active",
+                    ),
+                    mock.patch.multiple(
+                        guard,
+                        TRUSTED_SECRET_ROOT=trusted,
+                        TRUSTED_PAYLOAD_ROOT=payload_root,
+                        TRUSTED_ACTIVE_MANIFEST=trusted / "active-manifest.json",
+                        TRUSTED_ACTIVE_POINTER=trusted / "active",
+                    ),
+                ):
+                    with redirect_stderr(io.StringIO()):
+                        self.assertNotEqual(dispatch.main(["verify", reused_sha]), 0)
+                        self.assertNotEqual(safe_env.main(["validate-runtime"]), 0)
+                    with self.assertRaises(RuntimeError):
+                        dispatch._payload_tree_digest(reused_payload, reused_sha)
+                    with self.assertRaises(safe_env.SafeEnvError):
+                        safe_env._validate_liveqa_payload_tree(reused_payload, runtime._read_manifest())
+                    with self.assertRaises(guard.GuardError):
+                        guard._validate_installed_payload_root(reused_payload, target_sha=reused_sha)
+                    with mock.patch.object(guard, "_active_release_commit", return_value=reused_sha):
+                        with self.assertRaises(guard.GuardError):
+                            guard._trusted_runtime_root()
+
+                # The standalone parsers independently reject the same malformed
+                # provider map, before a full-payload digest can obscure the cause.
+                valid_provider = json.loads((payload_root / repaired_sha / "runtime-provider.json").read_text())
+                malformed_cases = (
+                    {**link_map, "browsers/webkit-2311/lib/libwpe.so": "../../escape"},
+                    {
+                        "browsers/webkit-2311/lib/libwpe.so": "libwpe.so.1",
+                        "browsers/webkit-2311/lib/libwpe.so.1": "libwpe.so",
+                    },
+                    {"browsers/webkit-2311/lib/missing.so": "absent.so"},
+                    {"browsers/webkit-2311/lib/bad\x7f.so": "libwpe.so.1.9.3"},
+                    {"browsers/webkit-2311/lib/libwpe.so": "libwpe.so.1\n"},
+                )
+                parser_root = root / "provider-parser-cases"
+                parser_root.mkdir(mode=0o700)
+                for case_index, bad_links in enumerate(malformed_cases):
+                    case_root = parser_root / str(case_index)
+                    case_root.mkdir(mode=0o700)
+                    provider_path = case_root / "runtime-provider.json"
+                    provider_path.write_text(
+                        json.dumps({**valid_provider, "engine_links": bad_links}, sort_keys=True) + "\n",
+                        encoding="ascii",
+                    )
+                    os.chmod(provider_path, 0o444)
+                    with self.subTest(provider_link_case=case_index):
+                        with self.assertRaises(RuntimeError):
+                            dispatch._payload_provider_links(case_root, repaired_sha)
+                        with self.assertRaises(safe_env.SafeEnvError):
+                            safe_env._liveqa_payload_links(case_root, repaired_sha)
+                        with self.assertRaises(guard.GuardError):
+                            guard._provider_link_map({**valid_provider, "engine_links": bad_links})
+
+                boolean_version_root = parser_root / "boolean-version"
+                boolean_version_root.mkdir(mode=0o700)
+                (boolean_version_root / "runtime-provider.json").write_text(
+                    json.dumps({**valid_provider, "version": True}) + "\n",
+                    encoding="ascii",
+                )
+                with self.assertRaises(RuntimeError):
+                    dispatch._payload_provider_links(boolean_version_root, repaired_sha)
+                with self.assertRaises(safe_env.SafeEnvError):
+                    safe_env._liveqa_payload_links(boolean_version_root, repaired_sha)
+                with self.assertRaises(guard.GuardError):
+                    guard._active_payload_provider_files(boolean_version_root, repaired_sha)
+                nested_package_provider = {
+                    **valid_provider,
+                    "engine_files": {
+                        **valid_provider["engine_files"],
+                        "web/node_modules/playwright/node_modules/extra/index.js": "a" * 64,
+                    },
+                }
+                nested_package_root = parser_root / "nested-package"
+                nested_package_root.mkdir(mode=0o700)
+                (nested_package_root / "runtime-provider.json").write_text(
+                    json.dumps(nested_package_provider) + "\n", encoding="ascii"
+                )
+                with self.assertRaises(RuntimeError):
+                    dispatch._payload_provider_links(nested_package_root, repaired_sha)
+                with self.assertRaises(safe_env.SafeEnvError):
+                    safe_env._liveqa_payload_links(nested_package_root, repaired_sha)
+                with self.assertRaises(guard.GuardError):
+                    guard._provider_link_map(nested_package_provider)
 
     def _provider_recovery_fixture(self, root: Path):
         source_sha = runtime.PROVIDER_RECOVERY_SOURCE_SHA
