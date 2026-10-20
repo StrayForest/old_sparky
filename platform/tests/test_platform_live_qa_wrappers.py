@@ -1624,11 +1624,6 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 "run_status=passed logical_total=54 logical_pass=48 logical_fail=0",
             ).replace("attempt_pass=47 attempt_fail=1", "attempt_pass=48 attempt_fail=0")
             count_tail = browser_wrapper[browser_wrapper.index("count_status=0\nCOUNT_DIAGNOSTIC_ARGS=()"):]
-            diagnostic_line = (
-                "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none stdout_bytes=0 stderr_bytes=0 "
-                "truncated=false child_exit=0"
-            )
-
             def run_count_tail(status: int, count_line: str, *, browser_exit: int = 0, preflight: bool = False):
                 fake_guard = fixture / f"guard-{status}-{browser_exit}-{int(preflight)}"
                 fake_guard.write_text(
@@ -1641,10 +1636,6 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 fake_guard.chmod(0o700)
                 count_output = fixture / f"counts-{status}-{browser_exit}-{int(preflight)}.txt"
                 initial_kind = "browser_launch_error" if browser_exit else "none"
-                initial_diagnostic = (
-                    f"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind={initial_kind} stdout_bytes=0 "
-                    f"stderr_bytes=0 truncated=false child_exit={browser_exit}"
-                )
                 script = "\n".join(
                     (
                         "set -euo pipefail",
