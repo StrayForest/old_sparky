@@ -214,14 +214,18 @@ LIVE_LAUNCH_STATUS_MAX_BYTES = 256
 LIVE_LAUNCH_STREAM_MAX_BYTES = 4096
 LIVE_LAUNCH_PROTOCOL_MAX_BYTES = 1024
 LIVE_QA_DIAGNOSTIC_LINE_MAX_BYTES = 512
+LIVE_QA_DIAGNOSTIC_BYTE_COUNT_MAX = 9_999_999_999_999_999
 LIVE_QA_DIAGNOSTIC_RE = re.compile(
     rb"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(?P<kind>none|playwright_cli_usage|"
     rb"node_module_missing|browser_executable_missing|browser_launch_error|"
-    rb"child_timeout|cleanup_failure|failure_report_unavailable|unclassified|dispatch_failure)"
+    rb"child_timeout|cleanup_failure|failure_report_unavailable|unclassified|"
+    rb"dispatch_failure|protocol_failure)"
     rb"(?: stage=(?P<stage>validation|identity|trusted_generation|dispatch) "
     rb"check=(?P<check>input_shape|source_binding|source_binding_io|source_binding_schema|"
     rb"source_binding_recheck|root_uid|generation_manifest|trusted_entry|"
-    rb"active_manifest|bundle_mailbox|wrapper|release_lock|dispatch))? "
+    rb"active_manifest|bundle_mailbox|wrapper|release_lock|dispatch|child_spawn|"
+    rb"qa_preflight|runtime_setup|root_state|session_setup|browser_gate|"
+    rb"live_identity|marker_digest|child_protocol|cleanup))? "
     rb"stdout_bytes=(?P<stdout_bytes>[0-9]{1,16}) "
     rb"stderr_bytes=(?P<stderr_bytes>[0-9]{1,16}) "
     rb"truncated=(?P<truncated>true|false) child_exit=(?P<child_exit>[0-9]{1,3})\n"
@@ -234,7 +238,13 @@ LIVE_QA_DISPATCH_FAILURE_CHECKS = {
     "trusted_generation": frozenset(
         {"generation_manifest", "trusted_entry", "active_manifest", "bundle_mailbox", "wrapper"}
     ),
-    "dispatch": frozenset({"release_lock", "dispatch"}),
+    "dispatch": frozenset(
+        {
+            "release_lock", "dispatch", "child_spawn", "qa_preflight", "runtime_setup",
+            "root_state", "session_setup", "browser_gate", "live_identity",
+            "marker_digest", "child_protocol", "cleanup",
+        }
+    ),
 }
 
 
@@ -247,8 +257,28 @@ def _valid_live_qa_diagnostic(line: bytes, child_status: int) -> bool:
         match.group("kind") == b"failure_report_unavailable"
         and diagnostic_child_exit == 0
         and child_status == 1
+    ) and not (
+        match.group("kind") == b"protocol_failure"
+        and match.group("stage") == b"dispatch"
+        and match.group("check") == b"child_protocol"
+        and diagnostic_child_exit == 0
+        and child_status == 2
     ):
         return False
+    if match.group("kind") == b"protocol_failure":
+        return (
+            match.group("stage") == b"dispatch"
+            and match.group("check") == b"child_protocol"
+            and diagnostic_child_exit == 0
+            and child_status == 2
+        )
+    if match.group("kind") == b"child_timeout":
+        return (
+            match.group("stage") is None
+            and match.group("check") is None
+            and diagnostic_child_exit == 124
+            and child_status == 124
+        )
     if match.group("kind") != b"dispatch_failure":
         return match.group("stage") is None and match.group("check") is None
     stage = match.group("stage")
@@ -264,6 +294,55 @@ def _valid_live_qa_diagnostic(line: bytes, child_status: int) -> bool:
         and match.group("stderr_bytes") == b"0"
         and match.group("truncated") == b"false"
     )
+
+
+def _live_qa_diagnostic_line(
+    *,
+    kind: str,
+    child_exit: int,
+    stage: str | None = None,
+    check: str | None = None,
+    stdout_bytes: int = 0,
+    stderr_bytes: int = 0,
+    truncated: bool = False,
+) -> bytes:
+    """Build one fixed diagnostic line without retaining child text."""
+
+    stdout_bytes = max(0, stdout_bytes)
+    stderr_bytes = max(0, stderr_bytes)
+    did_truncate = truncated or max(stdout_bytes, stderr_bytes) > LIVE_QA_DIAGNOSTIC_BYTE_COUNT_MAX
+    stdout_bytes = min(stdout_bytes, LIVE_QA_DIAGNOSTIC_BYTE_COUNT_MAX)
+    stderr_bytes = min(stderr_bytes, LIVE_QA_DIAGNOSTIC_BYTE_COUNT_MAX)
+    location = "" if stage is None or check is None else f" stage={stage} check={check}"
+    return (
+        "LIVE_QA_CHILD_DIAGNOSTIC schema=1 "
+        f"kind={kind}{location} stdout_bytes={stdout_bytes} stderr_bytes={stderr_bytes} "
+        f"truncated={'true' if did_truncate else 'false'} child_exit={child_exit}\n"
+    ).encode("ascii")
+
+
+def _emit_live_qa_diagnostic(
+    *,
+    kind: str,
+    child_exit: int,
+    stage: str | None = None,
+    check: str | None = None,
+    stdout_bytes: int = 0,
+    stderr_bytes: int = 0,
+    truncated: bool = False,
+) -> None:
+    sys.stdout.buffer.write(
+        _live_qa_diagnostic_line(
+            kind=kind,
+            child_exit=child_exit,
+            stage=stage,
+            check=check,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            truncated=truncated,
+        )
+    )
+    sys.stdout.buffer.flush()
 LIVE_LAUNCH_CHECK_IDS = frozenset(
     {
         "none",
@@ -1302,6 +1381,14 @@ def _run_live_user_qa_sudo(
     """Capture only a fixed QA diagnostic from the trusted browser wrapper."""
 
     if not _trusted_helper(LIVE_USER_QA_HELPER):
+        _emit_live_qa_diagnostic(
+            kind="dispatch_failure",
+            stage="trusted_generation",
+            check="trusted_entry",
+            stdout_bytes=0,
+            stderr_bytes=0,
+            child_exit=2,
+        )
         return 2
     try:
         process = subprocess.Popen(  # nosec B603
@@ -1313,6 +1400,14 @@ def _run_live_user_qa_sudo(
             close_fds=True,
         )
     except OSError:
+        _emit_live_qa_diagnostic(
+            kind="dispatch_failure",
+            stage="dispatch",
+            check="child_spawn",
+            stdout_bytes=0,
+            stderr_bytes=0,
+            child_exit=2,
+        )
         return 2
     streams = {"stdout": process.stdout, "stderr": process.stderr}
     selector: selectors.BaseSelector | None = None
@@ -1338,6 +1433,13 @@ def _run_live_user_qa_sudo(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_process_group(process)
+                _emit_live_qa_diagnostic(
+                    kind="child_timeout",
+                    stdout_bytes=total["stdout"],
+                    stderr_bytes=total["stderr"],
+                    truncated=True,
+                    child_exit=124,
+                )
                 return 124
             for key, _ in selector.select(min(remaining, 0.1)):
                 try:
@@ -1385,16 +1487,38 @@ def _run_live_user_qa_sudo(
                             line_buffer.clear()
                             line_too_long.add(key.fd)
         child_status = process.returncode if process.returncode is not None else 2
-        if diagnostic_count == 1 and diagnostic is not None:
-            if _valid_live_qa_diagnostic(diagnostic, child_status):
-                sys.stdout.buffer.write(diagnostic)
-                sys.stdout.buffer.flush()
+        valid_diagnostic = (
+            diagnostic
+            if diagnostic_count == 1
+            and diagnostic is not None
+            and _valid_live_qa_diagnostic(diagnostic, child_status)
+            else None
+        )
         counts_valid = browser_counts_count == 1 and browser_counts is not None
-        if counts_valid:
+        if counts_valid and browser_counts is not None:
             sys.stdout.buffer.write(browser_counts)
             sys.stdout.buffer.flush()
-        if child_status == 0 and not counts_valid:
+        if child_status == 0 and (not counts_valid or valid_diagnostic is None):
+            _emit_live_qa_diagnostic(
+                kind="protocol_failure",
+                stage="dispatch",
+                check="child_protocol",
+                stdout_bytes=total["stdout"],
+                stderr_bytes=total["stderr"],
+                child_exit=0,
+            )
             return 2
+        if valid_diagnostic is not None:
+            sys.stdout.buffer.write(valid_diagnostic)
+            sys.stdout.buffer.flush()
+        normalized_status = child_status if 0 <= child_status <= 255 else 2
+        if child_status != 0 and valid_diagnostic is None:
+            _emit_live_qa_diagnostic(
+                kind="unclassified",
+                stdout_bytes=total["stdout"],
+                stderr_bytes=total["stderr"],
+                child_exit=normalized_status,
+            )
         counts_passed = bool(
             browser_counts_payload is not None
             and browser_counts_payload["run_status"] == "passed"
@@ -1426,7 +1550,17 @@ def _run_live_user_qa_sudo(
             )
         )
         if child_status == 0 and counts_passed:
-            print("LIVE_USER_QA_SUCCESS")
+            diagnostic_match = (
+                None
+                if valid_diagnostic is None
+                else LIVE_QA_DIAGNOSTIC_RE.fullmatch(valid_diagnostic)
+            )
+            if diagnostic_match is not None and diagnostic_match.group("kind") == b"none":
+                print("LIVE_USER_QA_SUCCESS")
+                return 0
+            # A complete count record cannot authorize success without the
+            # fixed child success diagnostic.  The valid non-success child
+            # marker remains the sole diagnosis; omit the success marker.
             return 0
         if child_status == 0:
             # The browser process itself succeeded, but the bound report may
@@ -1434,10 +1568,32 @@ def _run_live_user_qa_sudo(
             # intact and omit the success marker; the workflow validator
             # rejects the sanitized report while preserving its counts.
             return 0
-        return child_status if 0 <= child_status <= 255 else 2
+        return normalized_status
     except (OSError, ValueError):
         _terminate_process_group(process)
-        return 2
+        child_status = process.poll()
+        normalized_status = (
+            child_status if child_status is not None and 0 < child_status <= 255 else 2
+        )
+        if child_status == 0:
+            _emit_live_qa_diagnostic(
+                kind="protocol_failure",
+                stage="dispatch",
+                check="child_protocol",
+                stdout_bytes=total["stdout"],
+                stderr_bytes=total["stderr"],
+                truncated=True,
+                child_exit=0,
+            )
+            return 2
+        _emit_live_qa_diagnostic(
+            kind="unclassified",
+            stdout_bytes=total["stdout"],
+            stderr_bytes=total["stderr"],
+            truncated=True,
+            child_exit=normalized_status,
+        )
+        return normalized_status
     finally:
         if selector is not None:
             selector.close()
@@ -3379,7 +3535,25 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if mode == "deployment" and not _trusted_generation():
             return _fail()
-        payload = load_stdin_payload(mode=mode)
+        try:
+            payload = load_stdin_payload(mode=mode)
+        except (
+            WorkflowInputError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            subprocess.SubprocessError,
+        ):
+            if arguments == ["live-user-qa"]:
+                _emit_live_qa_diagnostic(
+                    kind="dispatch_failure",
+                    stage="validation",
+                    check="input_shape",
+                    child_exit=2,
+                )
+                return 2
+            raise
         if arguments == ["cpu-diagnostic-plan"]:
             return _run_cpu_diagnostic_plan(payload)
         if arguments == ["cpu-diagnostic-memory-watch"]:
@@ -3517,8 +3691,30 @@ def main(argv: list[str] | None = None) -> int:
                 or payload["provision"] != "false"
                 or payload["marker"] != ""
             ):
-                return _fail()
-            app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
+                _emit_live_qa_diagnostic(
+                    kind="dispatch_failure",
+                    stage="validation",
+                    check="input_shape",
+                    child_exit=2,
+                )
+                return 2
+            try:
+                app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
+            except (
+                WorkflowInputError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                subprocess.SubprocessError,
+            ):
+                _emit_live_qa_diagnostic(
+                    kind="dispatch_failure",
+                    stage="validation",
+                    check="source_binding",
+                    child_exit=2,
+                )
+                return 2
             return _run_live_user_qa_sudo(
                 [payload["target_sha"], *source_arguments],
                 expected_sha=payload["target_sha"],
@@ -3542,6 +3738,11 @@ def main(argv: list[str] | None = None) -> int:
         if arguments in (["external-cleanup-exports"], ["retained-cleanup-exports"]):
             print("ARTIFACT_EXPORT_REMOVE schema=1 status=failed error_class=dispatcher_preflight")
             return 1
+        if arguments == ["live-user-qa"]:
+            # This catches only otherwise-unclassified parent exceptions.  The
+            # child may already have reached app work, so expose no stage.
+            _emit_live_qa_diagnostic(kind="unclassified", child_exit=2)
+            return 2
         return _fail()
 
 

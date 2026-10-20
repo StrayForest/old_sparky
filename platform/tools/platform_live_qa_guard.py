@@ -4024,25 +4024,20 @@ def _install_locked_dependencies(target: Path) -> Path:
 
 
 def _sandbox_path(runtime_cache: Path) -> Path:
-    trusted_payload = False
+    sandbox_root = runtime_cache
     if runtime_cache.parent == RUNNER_CACHE_ROOT and RUNTIME_NAME_PATTERN.fullmatch(
         runtime_cache.name
     ):
         pass
     else:
-        payload = runtime_cache.parent
-        if (
-            payload.parent != TRUSTED_PAYLOAD_ROOT
-            or COMMIT_PATTERN.fullmatch(payload.name) is None
-        ):
+        engine_root = _trusted_runtime_root()
+        active_payload = TRUSTED_ACTIVE_POINTER.resolve(strict=True)
+        if runtime_cache != active_payload / "runtime":
             raise GuardError("runtime cache path is unsafe")
-        _validate_installed_payload_root(payload)
-        trusted_payload = True
-    if trusted_payload and runtime_cache.name != "runtime":
-        raise GuardError("installed live-QA runtime path is unsafe")
-    sandbox = runtime_cache / CHROMIUM_SANDBOX_RELATIVE
+        sandbox_root = engine_root
+    sandbox = sandbox_root / CHROMIUM_SANDBOX_RELATIVE
     try:
-        sandboxes = list(runtime_cache.rglob("chrome_sandbox"))
+        sandboxes = list(sandbox_root.rglob("chrome_sandbox"))
     except OSError as exc:
         raise GuardError("runtime cache sandbox helper is unavailable") from exc
     if sandboxes != [sandbox]:
@@ -4350,11 +4345,15 @@ def _trusted_runtime_root() -> Path:
 def _runtime_mount_aliases(gate_path: Path) -> tuple[str, str, str, str, str]:
     """Create empty root-owned mount targets for one validated QA gate."""
 
-    if gate_path.parent != RUN_GATE_ROOT or not PUBLIC_GATE_NAME_PATTERN.fullmatch(gate_path.name):
-        raise GuardError("public browser gate path is unsafe for runtime mapping")
-    suffix = gate_path.name.removeprefix("public-live-qa.")
-    if re.fullmatch(r"[a-z0-9_]{8}", suffix) is None:
-        raise GuardError("public browser gate nonce is invalid")
+    public_gate = PUBLIC_GATE_NAME_PATTERN.fullmatch(gate_path.name)
+    user_gate = STATE_NAME_PATTERN.fullmatch(gate_path.name)
+    if gate_path.parent != RUN_GATE_ROOT or not (public_gate or user_gate):
+        raise GuardError("browser gate path is unsafe for runtime mapping")
+    suffix = (
+        gate_path.name.removeprefix("public-live-qa.")
+        if public_gate
+        else hashlib.sha256(gate_path.name.encode("ascii")).hexdigest()[:8]
+    )
     uid, gid = liveqa_identity()
     try:
         gate_metadata = gate_path.lstat()
@@ -6910,13 +6909,69 @@ def _is_fixed_live_browser_command(command: list[str]) -> bool:
 
 
 def _is_fixed_live_user_browser_command(command: list[str]) -> bool:
-    return (
-        _is_fixed_live_browser_command(command)
-        and any(
-            item.endswith("/web/tests/smoke/live-user-journey.spec.ts")
-            for item in command
+    if not _is_fixed_live_browser_command(command) or command[-1] != "--project=live-desktop":
+        return False
+    separator = command.index("--")
+    before = command[:separator]
+    tail = command[separator + 3 :]
+    env: dict[str, str] = {}
+    env_end = 0
+    while env_end < len(tail) and "=" in tail[env_end]:
+        key, value = tail[env_end].split("=", 1)
+        env[key] = value
+        env_end += 1
+    if env_end + 5 > len(tail):
+        return False
+    node, cli, subcommand, config, spec, *extra = tail[env_end:]
+    if subcommand != "test" or extra != ["--project=live-desktop"]:
+        return False
+    cli_suffix = "/web/node_modules/@playwright/test/cli.js"
+    node_suffix = "/node/bin/node"
+    if not node.endswith(node_suffix) or not cli.endswith(cli_suffix):
+        return False
+    engine_root = node[: -len(node_suffix)]
+    if cli != engine_root + cli_suffix:
+        return False
+    if not config.startswith("--config="):
+        return False
+    config_path = config.removeprefix("--config=")
+    config_suffix = "/web/playwright.live.config.ts"
+    if not config_path.endswith(config_suffix):
+        return False
+    suite_root = config_path[: -len(config_suffix)]
+    if (
+        not suite_root
+        or spec != suite_root + "/web/tests/smoke/live-user-journey.spec.ts"
+        or not any(
+            item == f"--working-directory={suite_root}/web" for item in before
         )
-        and command[-1] == "--project=live-desktop"
+        or env.get("NODE_PATH") != engine_root + "/web/node_modules"
+        or env.get("PATH") != engine_root + "/node/bin:/usr/bin:/bin"
+        or env.get("PLAYWRIGHT_BROWSERS_PATH") != engine_root + "/browsers"
+        or env.get("CHROME_DEVEL_SANDBOX")
+        != engine_root + "/" + CHROMIUM_SANDBOX_RELATIVE.as_posix()
+    ):
+        return False
+    bind_paths = [
+        item.removeprefix("--property=BindReadOnlyPaths=")
+        for item in before
+        if item.startswith("--property=BindReadOnlyPaths=")
+    ]
+    if suite_root == engine_root:
+        return not bind_paths and RUNTIME_NAME_PATTERN.fullmatch(Path(suite_root).name) is not None
+    suite_match = re.fullmatch(
+        r"/var/lib/oldsparky-liveqa/runtime-suite-([0-9a-f]{40})-([a-z0-9_]{8})",
+        suite_root,
+    )
+    engine_match = re.fullmatch(
+        r"/var/lib/oldsparky-liveqa/runtime-engine-([0-9a-f]{40})-([a-z0-9_]{8})",
+        engine_root,
+    )
+    return (
+        suite_match is not None
+        and engine_match is not None
+        and suite_match.group(2) == engine_match.group(2)
+        and bind_paths == [f"{suite_root}:{suite_root}", f"{engine_root}:{engine_root}"]
     )
 
 

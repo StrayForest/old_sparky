@@ -215,18 +215,35 @@ fi
   --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
   --mode automated
 if (( TRUSTED_MODE == 1 )); then
-  RUNTIME_CACHE="$TRUSTED_INSTALL_ROOT/runtime"
+  RUNTIME_SUITE_SOURCE="$TRUSTED_INSTALL_ROOT/runtime"
+  RUNTIME_ENGINE_SOURCE="$("${GUARD[@]}" runtime-root)"
 else
-  RUNTIME_CACHE="$(
+  RUNTIME_ENGINE_SOURCE="$(
     "${GUARD[@]}" prepare-runtime-cache \
       --platform-root "$PLATFORM_ROOT" \
       --commit "$SOURCE_COMMIT"
   )"
+  RUNTIME_SUITE_SOURCE="$RUNTIME_ENGINE_SOURCE"
 fi
-RUNTIME_NODE="$RUNTIME_CACHE/node/bin/node"
-CHROMIUM_SANDBOX="$(
-  "${GUARD[@]}" sandbox-path --runtime-cache "$RUNTIME_CACHE"
-)"
+if CHROMIUM_SANDBOX_SOURCE="$(
+  "${GUARD[@]}" sandbox-path --runtime-cache "$RUNTIME_SUITE_SOURCE" 2>/dev/null
+)"; then
+  :
+else
+  runtime_setup_status=$?
+  printf 'LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure stage=dispatch check=runtime_setup stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=%s\n' \
+    "$runtime_setup_status"
+  exit "$runtime_setup_status"
+fi
+if (( TRUSTED_MODE == 1 )) \
+  && [[ "$CHROMIUM_SANDBOX_SOURCE" != "$RUNTIME_ENGINE_SOURCE/browsers/chromium-1228/chrome-linux64/chrome_sandbox" ]]; then
+  printf 'LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure stage=dispatch check=runtime_setup stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=2\n'
+  exit 2
+fi
+RUNTIME_SUITE="$RUNTIME_SUITE_SOURCE"
+RUNTIME_ENGINE="$RUNTIME_ENGINE_SOURCE"
+RUNTIME_NODE="$RUNTIME_ENGINE/node/bin/node"
+CHROMIUM_SANDBOX="$CHROMIUM_SANDBOX_SOURCE"
 
 QA_STATE_DIR="$(
   "${GUARD[@]}" prepare-root-state \
@@ -240,14 +257,36 @@ MARKER="$(
     --state-dir "$QA_STATE_DIR"
 )"
 BROWSER_GATE=""
+RUNTIME_MOUNTS_READY=0
+RUNTIME_MOUNT_SOURCE_SHA=""
+RUNTIME_MOUNT_PROVIDER_SHA=""
+RUNTIME_MOUNT_SUFFIX=""
+RUNTIME_MOUNT_SUITE_IDENTITY=""
+RUNTIME_MOUNT_ENGINE_IDENTITY=""
+SYSTEMD_BIND_ARGS=()
 
 cleanup() {
   local original_status=$?
   local cleanup_status=1
+  local runtime_cleanup_failed=0
+  if (( RUNTIME_MOUNTS_READY == 1 )); then
+    if "${GUARD[@]}" cleanup-runtime-mounts \
+      --source-sha "$RUNTIME_MOUNT_SOURCE_SHA" \
+      --provider-sha "$RUNTIME_MOUNT_PROVIDER_SHA" \
+      --suffix "$RUNTIME_MOUNT_SUFFIX" \
+      --suite-identity "$RUNTIME_MOUNT_SUITE_IDENTITY" \
+      --engine-identity "$RUNTIME_MOUNT_ENGINE_IDENTITY"; then
+      RUNTIME_MOUNTS_READY=0
+    else
+      cleanup_status=$?
+      runtime_cleanup_failed=1
+      echo "Validated runtime mount targets retained for recovery." >&2
+    fi
+  fi
   local recovered_marker=""
   trap - EXIT INT TERM HUP
   set +e
-  if recovered_marker="$(
+  if (( runtime_cleanup_failed == 0 )) && recovered_marker="$(
     "${GUARD[@]}" validate-recovery \
       --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
       --state-dir "$QA_STATE_DIR"
@@ -264,6 +303,8 @@ cleanup() {
         cleanup_status=0
       fi
     fi
+  elif (( runtime_cleanup_failed == 1 )); then
+    echo "Live-user QA recovery state retained because runtime unit cleanup was not proven." >&2
   else
     echo "Live-user QA exact inventory could not be validated; recovery state is retained." >&2
   fi
@@ -302,6 +343,31 @@ BROWSER_GATE="$(
     --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
     --state-dir "$QA_STATE_DIR"
 )"
+
+if (( TRUSTED_MODE == 1 )); then
+  IFS=$'\t' read -r \
+    RUNTIME_MOUNT_SOURCE_SHA \
+    RUNTIME_MOUNT_PROVIDER_SHA \
+    RUNTIME_MOUNT_SUFFIX \
+    RUNTIME_MOUNT_SUITE_IDENTITY \
+    RUNTIME_MOUNT_ENGINE_IDENTITY \
+    < <("${GUARD[@]}" prepare-runtime-mounts --gate-path "$BROWSER_GATE")
+  RUNTIME_MOUNTS_READY=1
+  [[ "$RUNTIME_MOUNT_SOURCE_SHA" == "$SOURCE_COMMIT" \
+    && "$RUNTIME_MOUNT_PROVIDER_SHA" =~ ^[0-9a-f]{40}$ \
+    && "$RUNTIME_MOUNT_SUFFIX" =~ ^[a-z0-9_]{8}$ \
+    && "$RUNTIME_MOUNT_SUITE_IDENTITY" =~ ^[0-9]+:[0-9]+$ \
+    && "$RUNTIME_MOUNT_ENGINE_IDENTITY" =~ ^[0-9]+:[0-9]+$ ]] \
+    || { echo "Validated live-QA runtime mapping identity is invalid." >&2; exit 1; }
+  RUNTIME_SUITE="/var/lib/oldsparky-liveqa/runtime-suite-${RUNTIME_MOUNT_SOURCE_SHA}-${RUNTIME_MOUNT_SUFFIX}"
+  RUNTIME_ENGINE="/var/lib/oldsparky-liveqa/runtime-engine-${RUNTIME_MOUNT_PROVIDER_SHA}-${RUNTIME_MOUNT_SUFFIX}"
+  SYSTEMD_BIND_ARGS+=(
+    "--property=BindReadOnlyPaths=$RUNTIME_SUITE_SOURCE:$RUNTIME_SUITE"
+    "--property=BindReadOnlyPaths=$RUNTIME_ENGINE_SOURCE:$RUNTIME_ENGINE"
+  )
+  CHROMIUM_SANDBOX="$RUNTIME_ENGINE/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+fi
+RUNTIME_NODE="$RUNTIME_ENGINE/node/bin/node"
 LIVE_QA_RUNNER_SHA="${PLATFORM_LIVE_QA_RUNNER_SHA:-$SOURCE_COMMIT}"
 if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ \
   || ! "$LIVE_QA_RUNNER_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -332,19 +398,21 @@ if browser_diagnostic="$("${GUARD[@]}" capture-qa-browser-child -- \
   --unit=oldsparky-liveqa-browser.service \
   --uid="$LIVE_QA_UID" \
   --gid="$LIVE_QA_GID" \
-  --working-directory="$RUNTIME_CACHE/web" \
+  --working-directory="$RUNTIME_SUITE/web" \
   --property=KillMode=control-group \
   --property=Restart=no \
   --property=RuntimeMaxSec=30min \
   --property=SendSIGKILL=yes \
   --property=TimeoutStopSec=5s \
   --property=UMask=0077 \
+  "${SYSTEMD_BIND_ARGS[@]}" \
   -- \
   /usr/bin/env -i \
     CHROME_DEVEL_SANDBOX="$CHROMIUM_SANDBOX" \
     HOME="$BROWSER_GATE/home" \
     LANG=C.UTF-8 \
-    PATH="$RUNTIME_CACHE/node/bin:/usr/bin:/bin" \
+    NODE_PATH="$RUNTIME_ENGINE/web/node_modules" \
+    PATH="$RUNTIME_ENGINE/node/bin:/usr/bin:/bin" \
     PLATFORM_LIVE_QA_TARGET_SHA="$SOURCE_COMMIT" \
     PLATFORM_LIVE_QA_RUNNER_SHA="$LIVE_QA_RUNNER_SHA" \
     PLATFORM_LIVE_QA_MARKER_SHA256="$LIVE_QA_MARKER_SHA256" \
@@ -355,15 +423,15 @@ if browser_diagnostic="$("${GUARD[@]}" capture-qa-browser-child -- \
     PLATFORM_LIVE_USER_QA_SESSIONS="$BROWSER_GATE/browser-sessions.json" \
     PLATFORM_LIVE_USER_QA_UID="$LIVE_QA_UID" \
     PLATFORM_QA_BROWSER_GATE_DIR="$BROWSER_GATE" \
-    PLAYWRIGHT_BROWSERS_PATH="$RUNTIME_CACHE/browsers" \
+    PLAYWRIGHT_BROWSERS_PATH="$RUNTIME_ENGINE/browsers" \
     PLAYWRIGHT_LIVE_BASE_URL="$EXPECTED_LIVE_ORIGIN" \
     TMPDIR="$BROWSER_GATE/tmp" \
     XDG_CACHE_HOME="$BROWSER_GATE/home/.cache" \
     "$RUNTIME_NODE" \
-      "$RUNTIME_CACHE/web/node_modules/@playwright/test/cli.js" \
+      "$RUNTIME_ENGINE/web/node_modules/@playwright/test/cli.js" \
       test \
-      --config="$RUNTIME_CACHE/web/playwright.live.config.ts" \
-      "$RUNTIME_CACHE/web/tests/smoke/live-user-journey.spec.ts" \
+      --config="$RUNTIME_SUITE/web/playwright.live.config.ts" \
+      "$RUNTIME_SUITE/web/tests/smoke/live-user-journey.spec.ts" \
       --project=live-desktop
 )"; then
   browser_status=0
@@ -380,7 +448,7 @@ browser_counts=""
 if browser_counts="$("${GUARD[@]}" emit-public-browser-counts \
   --gate "$BROWSER_GATE" \
   --source-sha "$LIVE_QA_RUNNER_SHA" \
-  --app-sha "$LIVE_QA_TARGET_SHA" \
+  --app-sha "$SOURCE_COMMIT" \
   --marker-sha256 "$LIVE_QA_MARKER_SHA256")" \
   && [[ "$browser_counts" =~ ^LIVE_BROWSER_COUNTS\ schema=1\ run_status=(passed|failed|timedout|interrupted)\ logical_total=(0|[1-9][0-9]{0,4})\ logical_pass=(0|[1-9][0-9]{0,4})\ logical_fail=(0|[1-9][0-9]{0,4})\ logical_expected_fail=(0|[1-9][0-9]{0,4})\ logical_flaky=(0|[1-9][0-9]{0,4})\ logical_skip=(0|[1-9][0-9]{0,4})\ logical_interrupted=(0|[1-9][0-9]{0,4})\ attempt_total=(0|[1-9][0-9]{0,4})\ attempt_pass=(0|[1-9][0-9]{0,4})\ attempt_fail=(0|[1-9][0-9]{0,4})\ attempt_skip=(0|[1-9][0-9]{0,4})\ attempt_interrupted=(0|[1-9][0-9]{0,4})\ attempt_timedout=(0|[1-9][0-9]{0,4})\ source_sha=[0-9a-f]{40}\ app_sha=[0-9a-f]{40}\ marker_sha256=[0-9a-f]{64}$ ]]; then
   printf '%s\n' "$browser_counts"

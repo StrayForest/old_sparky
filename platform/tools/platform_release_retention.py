@@ -17,6 +17,14 @@ from typing import Iterator
 
 
 SAFE_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+PRODUCTION_APP_DIR = Path("/opt/oldsparky/platform")
+# Shared source of truth for the maintenance unit's permanent release pins.
+# platform_maintenance_qa_evidence builds its exact ExecStart contract from it.
+REQUIRED_PROTECTED_RELEASES = (
+    "gha-38000614899-1-7e5769ba3f85",
+    "gha-37760797674-1-80e457e57081",
+    "gha-38182702358-1-f1154c7dba4f",
+)
 RELEASE_LOCK_PATH = Path("/run/lock/oldsparky-platform-release.lock")
 RETAINED_LOAD_LOCK_PATH = Path("/run/lock/oldsparky-retained-load-matrix.lock")
 
@@ -57,8 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--app-dir",
         type=Path,
-        default=Path("/opt/oldsparky/platform"),
-        help="Platform runtime directory (default: /opt/oldsparky/platform).",
+        default=PRODUCTION_APP_DIR,
+        help=(
+            "Platform runtime directory (default: /opt/oldsparky/platform). "
+            "The canonical production root always protects the maintenance pins."
+        ),
     )
     parser.add_argument(
         "--keep",
@@ -102,7 +113,8 @@ def parse_args() -> argparse.Namespace:
         metavar="SLUG",
         help=(
             "Retain this release even if it is otherwise a deletion candidate. "
-            "Repeat for each release to protect."
+            "Repeat for each additional release to protect; the canonical "
+            "production root also protects the maintenance pins."
         ),
     )
     args = parser.parse_args()
@@ -131,6 +143,45 @@ def parse_args() -> argparse.Namespace:
         ):
             parser.error("--protected-release must be a valid release slug")
     return args
+
+
+def _is_production_app_dir(app_dir: Path) -> bool:
+    """Recognize the canonical production root through ordinary path aliases."""
+
+    candidate = Path(app_dir)
+    if Path(os.path.abspath(candidate)) == PRODUCTION_APP_DIR:
+        return True
+    try:
+        return candidate.resolve(strict=False) == PRODUCTION_APP_DIR
+    except (OSError, RuntimeError):
+        return False
+
+
+def _cli_protected_releases(
+    app_dir: Path, explicit_releases: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Add required service pins only for the canonical production CLI root."""
+
+    if not _is_production_app_dir(app_dir):
+        return explicit_releases
+    return tuple(
+        dict.fromkeys((*explicit_releases, *REQUIRED_PROTECTED_RELEASES))
+    )
+
+
+def _require_production_pins_present(
+    plan: RetentionPlan, *, app_dir: Path
+) -> None:
+    """Refuse production retention if a configured, required release is absent."""
+
+    if not _is_production_app_dir(app_dir):
+        return
+    planned_names = {
+        entry.path.name
+        for entry in (*plan.protected, *plan.retained, *plan.candidates)
+    }
+    if not set(REQUIRED_PROTECTED_RELEASES).issubset(planned_names):
+        raise RuntimeError("A required protected production release is missing")
 
 
 def directory_size(path: Path) -> int:
@@ -549,12 +600,23 @@ def apply_plan(
 
 
 def print_plan(
-    plan: RetentionPlan, *, app_dir: Path, keep: int, min_age_days: int, apply: bool
+    plan: RetentionPlan,
+    *,
+    app_dir: Path,
+    keep: int,
+    min_age_days: int,
+    apply: bool,
+    required_protected_releases: tuple[str, ...] = (),
 ) -> None:
     print("# Platform Release Retention")
     print(f"keep_newest: {keep}")
     print(f"minimum_age_days: {min_age_days}")
     print(f"mode: {'apply' if apply else 'dry-run'}")
+    if required_protected_releases:
+        print(
+            "Required maintenance-protected releases: "
+            + ", ".join(required_protected_releases)
+        )
     print_entries("Protected releases", plan.protected)
     print_entries("Other retained releases", plan.retained)
     print_entries("Deletion candidates", plan.candidates)
@@ -563,31 +625,45 @@ def print_plan(
 
 def main() -> int:
     args = parse_args()
+    explicit_protected_releases = tuple(args.protected_release or ())
     try:
         if not args.apply:
+            protected_releases = _cli_protected_releases(
+                args.app_dir, explicit_protected_releases
+            )
             plan = build_retention_plan(
                 args.app_dir,
                 keep=args.keep,
                 min_age_days=args.min_age_days,
-                protect_releases=tuple(args.protected_release or ()),
+                protect_releases=protected_releases,
             )
+            _require_production_pins_present(plan, app_dir=args.app_dir)
             print_plan(
                 plan,
                 app_dir=args.app_dir,
                 keep=args.keep,
                 min_age_days=args.min_age_days,
                 apply=False,
+                required_protected_releases=(
+                    REQUIRED_PROTECTED_RELEASES
+                    if _is_production_app_dir(args.app_dir)
+                    else ()
+                ),
             )
             print("No files changed. Re-run with --apply to delete candidates.")
             return 0
 
         with retention_operation_locks(args.app_dir) as resolved_app_dir:
+            protected_releases = _cli_protected_releases(
+                resolved_app_dir, explicit_protected_releases
+            )
             plan = build_retention_plan(
                 resolved_app_dir,
                 keep=args.keep,
                 min_age_days=args.min_age_days,
-                protect_releases=tuple(args.protected_release or ()),
+                protect_releases=protected_releases,
             )
+            _require_production_pins_present(plan, app_dir=resolved_app_dir)
             if not args.json_receipt:
                 print_plan(
                     plan,
@@ -595,6 +671,11 @@ def main() -> int:
                     keep=args.keep,
                     min_age_days=args.min_age_days,
                     apply=True,
+                    required_protected_releases=(
+                        REQUIRED_PROTECTED_RELEASES
+                        if _is_production_app_dir(resolved_app_dir)
+                        else ()
+                    ),
                 )
             apply_plan(
                 plan,

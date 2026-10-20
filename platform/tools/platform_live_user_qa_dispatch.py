@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S /usr/bin/python3.12 -I -B
 """Run the installed live-user QA helper without a source checkout.
 
 The workflow's secret-bearing runner invokes this file through the fixed

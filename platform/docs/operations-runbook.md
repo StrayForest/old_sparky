@@ -104,7 +104,7 @@ Preview storage cleanup without backup or deletion:
 current_release="$(readlink -f /opt/oldsparky/platform/current)"
 systemctl show deadlock-maintenance.service --no-pager \
   --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
-  | /usr/bin/python3 -I "$current_release/tools/platform_maintenance_qa_evidence.py" run-retention-preview \
+  | /usr/bin/python3 -I -B "$current_release/tools/platform_maintenance_qa_evidence.py" run-retention-preview \
     "$current_release/deploy/systemd/deadlock-maintenance.service" \
     /etc/systemd/system/deadlock-maintenance.service
 ```

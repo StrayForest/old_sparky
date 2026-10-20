@@ -506,11 +506,15 @@ jobs:
           diagnostic_pattern = re.compile(
               rb"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(?P<kind>"
               rb"none|playwright_cli_usage|node_module_missing|browser_executable_missing|"
-              rb"browser_launch_error|child_timeout|cleanup_failure|unclassified|dispatch_failure)"
+              rb"browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|"
+              rb"unclassified|"
+              rb"dispatch_failure|protocol_failure)"
               rb"(?: stage=(?P<stage>validation|identity|trusted_generation|dispatch) "
               rb"check=(?P<check>input_shape|source_binding|source_binding_io|source_binding_schema|"
               rb"source_binding_recheck|root_uid|generation_manifest|trusted_entry|"
-              rb"active_manifest|bundle_mailbox|wrapper|release_lock|dispatch))? "
+              rb"active_manifest|bundle_mailbox|wrapper|release_lock|dispatch|child_spawn|"
+              rb"qa_preflight|runtime_setup|root_state|session_setup|browser_gate|"
+              rb"live_identity|marker_digest|child_protocol|cleanup))? "
               rb"stdout_bytes=(?P<stdout_bytes>[0-9]{1,16}) "
               rb"stderr_bytes=(?P<stderr_bytes>[0-9]{1,16}) "
               rb"truncated=(?P<truncated>true|false) child_exit=(?P<child_exit>[0-9]{1,3})"
@@ -519,13 +523,18 @@ jobs:
               "validation": {"input_shape", "source_binding", "source_binding_io", "source_binding_schema", "source_binding_recheck"},
               "identity": {"root_uid"},
               "trusted_generation": {"generation_manifest", "trusted_entry", "active_manifest", "bundle_mailbox", "wrapper"},
-              "dispatch": {"release_lock", "dispatch"},
+              "dispatch": {
+                  "release_lock", "dispatch", "child_spawn", "qa_preflight", "runtime_setup",
+                  "root_state", "session_setup", "browser_gate", "live_identity",
+                  "marker_digest", "child_protocol", "cleanup",
+              },
           }
           diagnostic_lines = [line for line in lines if line.startswith(b"LIVE_QA_CHILD_DIAGNOSTIC ")]
           child_diagnostic = None
           if len(diagnostic_lines) == 1:
               match = diagnostic_pattern.fullmatch(diagnostic_lines[0])
               dispatch_marker = match is not None and match.group("kind") == b"dispatch_failure"
+              protocol_marker = match is not None and match.group("kind") == b"protocol_failure"
               dispatch_stage = match.group("stage") if match is not None else None
               dispatch_check = match.group("check") if match is not None else None
               dispatch_shape_valid = (
@@ -539,16 +548,36 @@ jobs:
                   and match.group("truncated") == b"false"
                   and int(match.group("child_exit")) in {1, 2}
               ) if dispatch_marker and match is not None else False
+              report_unavailable_shape_valid = (
+                  match is not None
+                  and match.group("kind") == b"failure_report_unavailable"
+                  and match.group("stage") is None
+                  and match.group("check") is None
+                  and int(match.group("child_exit")) == 0
+                  and exit_code == 1
+              )
+              protocol_shape_valid = (
+                  match is not None
+                  and dispatch_stage == b"dispatch"
+                  and dispatch_check == b"child_protocol"
+                  and int(match.group("child_exit")) == 0
+                  and exit_code == 2
+              ) if protocol_marker else False
               ordinary_shape_valid = (
                   match is not None
                   and match.group("stage") is None
                   and match.group("check") is None
                   and not dispatch_marker
+                  and not protocol_marker
               )
               if (
                   match is not None
-                  and int(match.group("child_exit")) == exit_code
-                  and (dispatch_shape_valid or ordinary_shape_valid)
+                  and (
+                      (int(match.group("child_exit")) == exit_code and dispatch_shape_valid)
+                  or report_unavailable_shape_valid
+                      or protocol_shape_valid
+                      or (int(match.group("child_exit")) == exit_code and ordinary_shape_valid)
+                  )
               ):
                   child_diagnostic = {
                       "kind": match.group("kind").decode("ascii"),
@@ -657,7 +686,9 @@ jobs:
           else:
               status = "unavailable"
           failure_origin = (
-              "dispatcher" if child_diagnostic is not None and child_diagnostic["kind"] == "dispatch_failure"
+              "dispatcher" if child_diagnostic is not None and child_diagnostic["kind"] in {"dispatch_failure", "protocol_failure"}
+              else "unclassified" if child_diagnostic is not None and child_diagnostic["kind"] == "unclassified"
+              else "unclassified" if exit_code != 0 and child_diagnostic is None and exit_code != 255
               else "browser_child" if child_diagnostic is not None and child_diagnostic["kind"] != "none"
               else "browser_child" if browser_counts is not None and not passed
               else "ssh_exit_255_unclassified" if exit_code == 255 and child_diagnostic is None
@@ -685,9 +716,14 @@ jobs:
               "browser_counts": browser_counts,
               "error_class_counts": {} if passed else (
                   {"live_user_dispatch_failure": 1}
-                  if child_diagnostic is not None and child_diagnostic["kind"] == "dispatch_failure"
+                  if child_diagnostic is not None and child_diagnostic["kind"] in {"dispatch_failure", "protocol_failure"}
                   else {"ssh_exit_255_unclassified": 1}
                   if exit_code == 255 and child_diagnostic is None
+                  else {"unclassified_child_or_dispatch_failure": 1}
+                  if exit_code != 0 and child_diagnostic is None
+                  else
+                  {"unclassified_child_or_dispatch_failure": 1}
+                  if child_diagnostic is not None and child_diagnostic["kind"] == "unclassified"
                   else
                   {"browser_child_" + child_diagnostic["kind"]: 1}
                   if child_diagnostic is not None and child_diagnostic["kind"] != "none"

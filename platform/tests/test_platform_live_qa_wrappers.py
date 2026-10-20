@@ -3670,11 +3670,65 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         arbitrary[23] = "/bin/sh"
         self.assertFalse(platform_live_qa_guard._is_fixed_live_browser_command(arbitrary))
 
-        browser_command = list(command)
-        browser_command[-1] = f"{runtime}/web/tests/smoke/live-user-journey.spec.ts"
-        browser_command.append("--project=live-desktop")
+        suite_root = (
+            "/var/lib/oldsparky-liveqa/runtime-suite-"
+            + "a" * 40
+            + "-fixture1"
+        )
+        engine_root = (
+            "/var/lib/oldsparky-liveqa/runtime-engine-"
+            + "b" * 40
+            + "-fixture1"
+        )
+        browser_command = [
+            "/usr/bin/systemd-run",
+            "--no-ask-password",
+            "--quiet",
+            "--wait",
+            "--collect",
+            "--pipe",
+            "--service-type=exec",
+            "--expand-environment=no",
+            "--unit=oldsparky-liveqa-browser.service",
+            "--uid=1001",
+            "--gid=1001",
+            f"--working-directory={suite_root}/web",
+            "--property=KillMode=control-group",
+            "--property=Restart=no",
+            "--property=RuntimeMaxSec=30min",
+            "--property=SendSIGKILL=yes",
+            "--property=TimeoutStopSec=5s",
+            "--property=UMask=0077",
+            f"--property=BindReadOnlyPaths={suite_root}:{suite_root}",
+            f"--property=BindReadOnlyPaths={engine_root}:{engine_root}",
+            "--",
+            "/usr/bin/env",
+            "-i",
+            (
+                "CHROME_DEVEL_SANDBOX="
+                f"{engine_root}/{platform_live_qa_guard.CHROMIUM_SANDBOX_RELATIVE.as_posix()}"
+            ),
+            "LANG=C.UTF-8",
+            f"NODE_PATH={engine_root}/web/node_modules",
+            f"PATH={engine_root}/node/bin:/usr/bin:/bin",
+            f"PLAYWRIGHT_BROWSERS_PATH={engine_root}/browsers",
+            f"{engine_root}/node/bin/node",
+            f"{engine_root}/web/node_modules/@playwright/test/cli.js",
+            "test",
+            f"--config={suite_root}/web/playwright.live.config.ts",
+            f"{suite_root}/web/tests/smoke/live-user-journey.spec.ts",
+            "--project=live-desktop",
+        ]
         self.assertTrue(
             platform_live_qa_guard._is_fixed_live_user_browser_command(browser_command)
+        )
+        mismatched_engine = list(browser_command)
+        node_position = mismatched_engine.index(f"{engine_root}/node/bin/node")
+        mismatched_engine[node_position] = f"{suite_root}/node/bin/node"
+        self.assertFalse(
+            platform_live_qa_guard._is_fixed_live_user_browser_command(
+                mismatched_engine
+            )
         )
         with self.assertRaises(platform_live_qa_guard.GuardError):
             platform_live_qa_guard._capture_qa_child(
@@ -4565,6 +4619,53 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("platform_live_user_qa_trusted.sh", dispatcher)
         self.assertIn("platform_live_qa_mailbox_helper.py", dispatcher)
         self.assertIn("PLATFORM_LIVE_QA_TARGET_SHA", dispatcher)
+        self.assertEqual(
+            dispatcher.splitlines()[0],
+            "#!/usr/bin/env -S /usr/bin/python3.12 -I -B",
+        )
+
+        with tempfile.TemporaryDirectory(prefix="live-user-shebang-") as directory:
+            root = Path(directory)
+            ambient = root / "ambient"
+            ambient.mkdir()
+            site_sentinel = root / "sitecustomize-imported"
+            (ambient / "sitecustomize.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({str(site_sentinel)!r}).write_text('unexpected')\n",
+                encoding="utf-8",
+            )
+            (ambient / "ambient_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+            helper = root / "direct-entry.py"
+            helper.write_text(
+                dispatcher.splitlines()[0]
+                + "\nimport os, pathlib, sys\n"
+                + "if not sys.flags.isolated or not sys.dont_write_bytecode: raise SystemExit(31)\n"
+                + "if pathlib.Path(os.environ['SITE_SENTINEL']).exists(): raise SystemExit(32)\n"
+                + "if str(pathlib.Path(os.environ['AMBIENT_ROOT'])) in sys.path: raise SystemExit(33)\n"
+                + "sys.path.insert(0, os.environ['AMBIENT_ROOT'])\n"
+                + "import ambient_probe\n"
+                + "print('isolated-bytecode-disabled')\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            direct_env = {
+                **os.environ,
+                "PYTHONPATH": str(ambient),
+                "SITE_SENTINEL": str(site_sentinel),
+                "AMBIENT_ROOT": str(ambient),
+            }
+            direct = subprocess.run(
+                [str(helper)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=direct_env,
+                timeout=5,
+            )
+            self.assertEqual(direct.returncode, 0, direct.stderr)
+            self.assertEqual(direct.stdout, "isolated-bytecode-disabled\n")
+            self.assertFalse(site_sentinel.exists())
+            self.assertFalse((ambient / "__pycache__").exists())
 
     def test_live_user_dispatch_forwards_only_one_bound_playwright_count_record(self) -> None:
         dispatch = platform_workflow_remote_dispatch
@@ -4642,7 +4743,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         ):
             invalid_status, invalid_output = invoke(invalid_diagnostic, child_exit=1)
             self.assertEqual(invalid_status, 1)
-            self.assertEqual(invalid_output, b"")
+            self.assertIn(b"kind=unclassified", invalid_output)
+            self.assertIn(b"child_exit=1\n", invalid_output)
+            self.assertNotIn(b"secret-sentinel", invalid_output)
 
         for invalid_output in (
             diagnostic,
@@ -4652,8 +4755,135 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             with self.subTest(invalid_output=invalid_output[:40]):
                 invalid_status, invalid_forwarded = invoke(invalid_output)
                 self.assertEqual(invalid_status, 2)
+                self.assertIn(b"kind=protocol_failure stage=dispatch check=child_protocol", invalid_forwarded)
                 self.assertNotIn(b"LIVE_USER_QA_SUCCESS", invalid_forwarded)
                 self.assertNotIn(b"secret-sentinel", invalid_forwarded)
+
+        private_child_text = b"private child output that must not escape\n"
+        unclassified_status, unclassified_output = invoke(
+            private_child_text,
+            child_exit=7,
+        )
+        self.assertEqual(unclassified_status, 7)
+        expected_unclassified = dispatch._live_qa_diagnostic_line(
+            kind="unclassified",
+            stdout_bytes=len(private_child_text),
+            stderr_bytes=len(b"secret-sentinel\n"),
+            child_exit=7,
+        )
+        self.assertEqual(unclassified_output, expected_unclassified)
+        self.assertNotIn(private_child_text, unclassified_output)
+        self.assertNotIn(b"secret-sentinel", unclassified_output)
+
+        empty_child_status, empty_child_output = invoke(b"")
+        self.assertEqual(empty_child_status, 2)
+        self.assertIn(
+            b"kind=protocol_failure stage=dispatch check=child_protocol "
+            b"stdout_bytes=0 stderr_bytes=16 truncated=false child_exit=0\n",
+            empty_child_output,
+        )
+        self.assertNotIn(b"LIVE_USER_QA_SUCCESS", empty_child_output)
+
+        counted_child_status, counted_child_output = invoke(count)
+        self.assertEqual(counted_child_status, 2)
+        self.assertIn(count, counted_child_output)
+        self.assertIn(
+            b"kind=protocol_failure stage=dispatch check=child_protocol",
+            counted_child_output,
+        )
+        self.assertNotIn(b"LIVE_USER_QA_SUCCESS", counted_child_output)
+
+        for stage, checks in dispatch.LIVE_QA_DISPATCH_FAILURE_CHECKS.items():
+            for check in checks:
+                candidate = dispatch._live_qa_diagnostic_line(
+                    kind="dispatch_failure",
+                    stage=stage,
+                    check=check,
+                    child_exit=2,
+                )
+                with self.subTest(stage=stage, check=check):
+                    self.assertTrue(dispatch._valid_live_qa_diagnostic(candidate, 2), candidate)
+
+        self.assertTrue(
+            dispatch.LIVE_QA_DISPATCH_FAILURE_CHECKS["dispatch"]
+            >= platform_live_user_qa_dispatch.LIVE_USER_QA_FAILURE_CHECKS["dispatch"]
+        )
+
+        failed_helper_capture = Capture()
+        with (
+            patch.object(dispatch, "_trusted_helper", return_value=False),
+            patch.object(dispatch.sys, "stdout", failed_helper_capture),
+        ):
+            missing_helper_status = dispatch._run_live_user_qa_sudo(
+                [source_sha], expected_sha=source_sha, expected_app_sha=app_sha
+            )
+        self.assertEqual(missing_helper_status, 2)
+        self.assertEqual(
+            failed_helper_capture.output(),
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "
+            b"stage=trusted_generation check=trusted_entry "
+            b"stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=2\n",
+        )
+
+        spawn_failure_capture = Capture()
+        with (
+            patch.object(dispatch, "_trusted_helper", return_value=True),
+            patch.object(dispatch.subprocess, "Popen", side_effect=OSError("private")),
+            patch.object(dispatch.sys, "stdout", spawn_failure_capture),
+        ):
+            spawn_failure_status = dispatch._run_live_user_qa_sudo(
+                [source_sha], expected_sha=source_sha, expected_app_sha=app_sha
+            )
+        self.assertEqual(spawn_failure_status, 2)
+        self.assertEqual(
+            spawn_failure_capture.output(),
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "
+            b"stage=dispatch check=child_spawn stdout_bytes=0 stderr_bytes=0 "
+            b"truncated=false child_exit=2\n",
+        )
+
+        input_failure_capture = Capture()
+        with (
+            patch.object(dispatch, "load_stdin_payload", side_effect=ValueError("private")),
+            patch.object(dispatch.sys, "stdout", input_failure_capture),
+        ):
+            input_failure_status = dispatch.main(["live-user-qa"])
+        self.assertEqual(input_failure_status, 2)
+        self.assertEqual(
+            input_failure_capture.output(),
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "
+            b"stage=validation check=input_shape stdout_bytes=0 stderr_bytes=0 "
+            b"truncated=false child_exit=2\n",
+        )
+
+        source_binding_capture = Capture()
+        with (
+            patch.object(
+                dispatch,
+                "load_stdin_payload",
+                return_value={
+                    "base_url": "https://old-sparky.com",
+                    "provision": "false",
+                    "marker": "",
+                    "target_sha": source_sha,
+                },
+            ),
+            patch.object(
+                dispatch,
+                "_source_binding_context",
+                side_effect=ValueError("private-source-binding-detail"),
+            ),
+            patch.object(dispatch.sys, "stdout", source_binding_capture),
+        ):
+            source_binding_status = dispatch.main(["live-user-qa"])
+        self.assertEqual(source_binding_status, 2)
+        self.assertEqual(
+            source_binding_capture.output(),
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "
+            b"stage=validation check=source_binding stdout_bytes=0 stderr_bytes=0 "
+            b"truncated=false child_exit=2\n",
+        )
+        self.assertNotIn(b"private-source-binding-detail", source_binding_capture.output())
 
         all_skipped = count.replace(
             b"logical_total=1 logical_pass=1", b"logical_total=1 logical_pass=0"
@@ -4694,6 +4924,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         terminate_group.assert_called_once()
         self.assertEqual(len(timed_processes), 1)
         self.assertIsNotNone(timed_processes[0].poll())
+        self.assertEqual(
+            timeout_capture.output(),
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=child_timeout "
+            b"stdout_bytes=0 stderr_bytes=0 truncated=true child_exit=124\n",
+        )
 
     def test_live_user_dispatch_reports_only_fixed_early_preflight_boundary(self) -> None:
         dispatch = platform_live_user_qa_dispatch
@@ -5188,6 +5423,138 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 no_cause_report["error_class_counts"],
                 {"unclassified_child_or_dispatch_failure": 1},
             )
+            self.assertEqual(no_cause_report["failure_origin"], "unclassified")
+
+            failed_counts = (
+                counts.replace("run_status=passed", "run_status=failed")
+                .replace("logical_pass=1", "logical_pass=0")
+                .replace("logical_fail=0", "logical_fail=1")
+                .replace("attempt_pass=1", "attempt_pass=0")
+                .replace("attempt_fail=0", "attempt_fail=1")
+            )
+            unavailable = (
+                "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=failure_report_unavailable "
+                "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0\n"
+            )
+            raw.write_text(unavailable + failed_counts, encoding="ascii")
+            unavailable_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "1", runner_sha, app_sha, binding_digest],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unavailable_run.returncode, 0, unavailable_run.stderr)
+            unavailable_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(unavailable_report["status"], "failed")
+            self.assertFalse(unavailable_report["success"])
+            self.assertEqual(unavailable_report["failure_origin"], "browser_child")
+            self.assertEqual(unavailable_report["coverage_status"], "complete")
+            self.assertEqual(unavailable_report["test_count"], 1)
+            self.assertEqual(
+                unavailable_report["error_class_counts"],
+                {"browser_child_failure_report_unavailable": 1},
+            )
+            self.assertEqual(
+                unavailable_report["child_diagnostic"]["kind"],
+                "failure_report_unavailable",
+            )
+            self.assertNotIn("private", json.dumps(unavailable_report))
+            raw.write_text(unavailable, encoding="ascii")
+            invalid_unavailable = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "2", runner_sha, app_sha, binding_digest],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(invalid_unavailable.returncode, 0, invalid_unavailable.stderr)
+            invalid_unavailable_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(invalid_unavailable_report["status"], "error")
+            self.assertIsNone(invalid_unavailable_report["child_diagnostic"])
+
+            for stage, checks in platform_workflow_remote_dispatch.LIVE_QA_DISPATCH_FAILURE_CHECKS.items():
+                for check in checks:
+                    marker = platform_workflow_remote_dispatch._live_qa_diagnostic_line(
+                        kind="dispatch_failure",
+                        stage=stage,
+                        check=check,
+                        child_exit=2,
+                    )
+                    raw.write_bytes(marker)
+                    accepted_stage = subprocess.run(
+                        [sys.executable, "-c", sanitizer, str(raw), str(report), "2", runner_sha, app_sha, binding_digest],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(accepted_stage.returncode, 0, accepted_stage.stderr)
+                    stage_report = json.loads(report.read_text(encoding="utf-8"))
+                    self.assertEqual(stage_report["status"], "failed")
+                    self.assertEqual(stage_report["failure_origin"], "dispatcher")
+                    self.assertEqual(stage_report["child_diagnostic"]["stage"], stage)
+                    self.assertEqual(stage_report["child_diagnostic"]["check"], check)
+
+            protocol_failure = platform_workflow_remote_dispatch._live_qa_diagnostic_line(
+                kind="protocol_failure",
+                stage="dispatch",
+                check="child_protocol",
+                child_exit=0,
+            )
+            self.assertTrue(
+                platform_workflow_remote_dispatch._valid_live_qa_diagnostic(
+                    protocol_failure, 2
+                )
+            )
+            raw.write_bytes(protocol_failure)
+            protocol_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "2", runner_sha, app_sha, binding_digest],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(protocol_run.returncode, 0, protocol_run.stderr)
+            protocol_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(protocol_report["status"], "failed")
+            self.assertFalse(protocol_report["success"])
+            self.assertEqual(protocol_report["failure_origin"], "dispatcher")
+            self.assertEqual(protocol_report["child_diagnostic"]["kind"], "protocol_failure")
+            for invalid_protocol, ssh_status in (
+                (protocol_failure.replace(b"child_exit=0", b"child_exit=1"), 2),
+                (protocol_failure, 1),
+                (
+                    protocol_failure.replace(b"check=child_protocol", b"check=child_spawn"),
+                    2,
+                ),
+            ):
+                raw.write_bytes(invalid_protocol)
+                invalid_protocol_run = subprocess.run(
+                    [sys.executable, "-c", sanitizer, str(raw), str(report), str(ssh_status), runner_sha, app_sha, binding_digest],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(invalid_protocol_run.returncode, 0, invalid_protocol_run.stderr)
+                invalid_protocol_report = json.loads(report.read_text(encoding="utf-8"))
+                self.assertEqual(invalid_protocol_report["status"], "error")
+                self.assertIsNone(invalid_protocol_report["child_diagnostic"])
+
+            unclassified_marker = platform_workflow_remote_dispatch._live_qa_diagnostic_line(
+                kind="unclassified",
+                stdout_bytes=37,
+                stderr_bytes=19,
+                child_exit=7,
+            )
+            raw.write_bytes(unclassified_marker)
+            unclassified_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "7", runner_sha, app_sha, binding_digest],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unclassified_run.returncode, 0, unclassified_run.stderr)
+            unclassified_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(unclassified_report["failure_origin"], "unclassified")
+            self.assertEqual(unclassified_report["child_diagnostic"]["kind"], "unclassified")
+            self.assertNotIn("private", json.dumps(unclassified_report))
 
             dispatch_failure = (
                 "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=dispatch_failure "

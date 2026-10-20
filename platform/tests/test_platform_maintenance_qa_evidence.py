@@ -822,6 +822,15 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             'run-retention-preview "$maintenance_unit_source"',
             diagnostics_workflow,
         )
+        normalized_workflow = diagnostics_workflow.replace("\\\n", " ")
+        self.assertRegex(
+            normalized_workflow,
+            r'timeout --foreground 180s /usr/bin/python3 -I -B "\$maintenance_unit_validator"',
+        )
+        self.assertNotRegex(
+            normalized_workflow,
+            r'/usr/bin/python3\s+-I\s+(?!-B\b)"\$maintenance_unit_validator"',
+        )
         self.assertIn(
             "--property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec",
             diagnostics_workflow,
@@ -834,6 +843,19 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                 "--property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec",
                 operator_example.read_text(encoding="utf-8"),
             )
+        self.assertIn(
+            '| /usr/bin/python3 -I -B "$current_release/tools/platform_maintenance_qa_evidence.py"',
+            (
+                REPO_ROOT
+                / ".agents/skills/platform-storage-retention/SKILL.md"
+            ).read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            '| /usr/bin/python3 -I -B "$current_release/tools/platform_maintenance_qa_evidence.py" run-retention-preview',
+            (REPO_ROOT / "platform/docs/operations-runbook.md").read_text(
+                encoding="utf-8"
+            ),
+        )
         self.assertNotIn(
             'maintenance_unit_source="$current/deploy/systemd/deadlock-maintenance.service"',
             diagnostics_workflow,
@@ -902,11 +924,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
         self.assertIn("/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json", preview_argv)
         self.assertIn("--backup-keep", preview_argv)
         self.assertIn("15", preview_argv)
-        for slug in (
-            "gha-38000614899-1-7e5769ba3f85",
-            "gha-37760797674-1-80e457e57081",
-            "gha-38182702358-1-f1154c7dba4f",
-        ):
+        for slug in evidence.REQUIRED_PROTECTED_RELEASES:
             self.assertIn(slug, preview_argv)
         properties = _loaded_unit_properties()
         with patch.object(
@@ -937,11 +955,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             sys.argv = previous_argv
         self.assertEqual(
             tuple(args.protected_release),
-            (
-                "gha-38000614899-1-7e5769ba3f85",
-                "gha-37760797674-1-80e457e57081",
-                "gha-38182702358-1-f1154c7dba4f",
-            ),
+            evidence.REQUIRED_PROTECTED_RELEASES,
         )
         invalid = properties.replace("NeedDaemonReload=no", "NeedDaemonReload=yes")
         with patch.object(evidence.subprocess, "run") as run, patch.object(
