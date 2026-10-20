@@ -919,12 +919,20 @@ def _cache_body_matches_source(
     return completed.returncode == 0 and completed.stdout == b"match\n"
 
 
-def _expected_tree_digest(installer: Any, files: dict[str, str], directories: set[str]) -> str:
+def _expected_tree_digest(
+    installer: Any,
+    files: dict[str, str],
+    directories: set[str],
+    links: dict[str, str] | None = None,
+) -> str:
+    declared_links = links or {}
     digest = hashlib.sha256()
-    for relative in sorted(files.keys() | directories, key=installer._runtime_path_order_key):
+    for relative in sorted(files.keys() | directories | declared_links.keys(), key=installer._runtime_path_order_key):
         digest.update(relative.encode("utf-8") + b"\0")
         if relative in directories:
             digest.update(b"d\0")
+        elif relative in declared_links:
+            digest.update(b"l\0" + declared_links[relative].encode("utf-8") + b"\0")
         else:
             digest.update(b"f\0" + bytes.fromhex(files[relative]))
     return digest.hexdigest()
@@ -937,7 +945,9 @@ def _add_generated_payload(
     *,
     source_sha: str,
     runtime_provider: dict[str, object] | None,
-) -> None:
+    runtime_provider_source: Path | None = None,
+) -> dict[str, str]:
+    payload_links: dict[str, str] = {}
     source_raw = (source_sha + "\n").encode("ascii")
     files["source-sha"] = hashlib.sha256(source_raw).hexdigest()
     if runtime_provider is not None:
@@ -951,12 +961,51 @@ def _add_generated_payload(
             + "\n"
         ).encode("ascii")
         files["runtime-provider.json"] = hashlib.sha256(provider_raw).hexdigest()
+        if runtime_provider.get("version") == 2:
+            engine_files = runtime_provider.get("engine_files")
+            engine_links = runtime_provider.get("engine_links")
+            provider_sha = runtime_provider.get("provider_sha")
+            if not isinstance(engine_files, dict) or not isinstance(engine_links, dict):
+                _fail("active_payload_mismatch")
+            if provider_sha == source_sha:
+                provider_root = runtime_provider_source
+                if provider_root is None:
+                    provider_root = installer.PAYLOAD_ROOT / source_sha / "provider-runtime"
+                for relative, _digest in sorted(engine_files.items()):
+                    if relative in engine_links:
+                        continue
+                    source = provider_root / relative
+                    installer._regular(
+                        source,
+                        allow_sandbox=relative == installer.RUNTIME_SANDBOX_RELATIVE.as_posix(),
+                    )
+                    files[f"provider-runtime/{relative}"] = (
+                        installer._sandbox_digest(source)
+                        if relative == installer.RUNTIME_SANDBOX_RELATIVE.as_posix()
+                        else installer._digest_regular(source)
+                    )
+                    if files[f"provider-runtime/{relative}"] != _digest:
+                        _fail("active_payload_mismatch")
+                    parent = PurePosixPath(f"provider-runtime/{relative}").parent
+                    while str(parent) != ".":
+                        directories.add(parent.as_posix())
+                        parent = parent.parent
+                lock_source = provider_root / "web/package-lock.json"
+                installer._regular(lock_source)
+                files["provider-runtime/web/package-lock.json"] = installer._digest_regular(lock_source)
+                for relative, target in engine_links.items():
+                    payload_links[f"provider-runtime/{relative}"] = target
+                    parent = PurePosixPath(f"provider-runtime/{relative}").parent
+                    while str(parent) != ".":
+                        directories.add(parent.as_posix())
+                        parent = parent.parent
     directories.update({"platform", "platform/tools", "runtime"})
     for relative in files:
         parent = PurePosixPath(relative).parent
         while str(parent) != ".":
             directories.add(parent.as_posix())
             parent = parent.parent
+    return payload_links
 
 
 def _load_capture_probe(*, deadline: float) -> Any:
@@ -1170,22 +1219,31 @@ def verify_active_release_artifact(
                 expected / "liveqa-runtime", source_sha=SOURCE_SHA
             )
             runtime_provider = None
+            runtime_provider_source = None
             if runtime_manifest.get("version") == 2:
                 runtime_provider = installer_module._runtime_provider_payload(
                     APP_DIR,
                     expected_manifest=runtime_manifest,
                 )
-            _add_generated_payload(
+            elif runtime_manifest.get("version") == 3:
+                runtime_provider, runtime_provider_source = installer_module._runtime_provider_plan(
+                    APP_DIR,
+                    candidate_source_sha=SOURCE_SHA,
+                    expected_manifest=runtime_manifest,
+                )
+            expected_links = _add_generated_payload(
                 installer_module,
                 expected_files,
                 expected_directories,
                 source_sha=SOURCE_SHA,
                 runtime_provider=runtime_provider,
+                runtime_provider_source=runtime_provider_source,
             )
             expected_digest = _expected_tree_digest(
                 installer_module,
                 expected_files,
                 expected_directories,
+                expected_links,
             )
             matches, _evidence = probe._compare_expected_payload(
                 expected_digest,

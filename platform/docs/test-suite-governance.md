@@ -509,14 +509,8 @@ that the exact SHA started and critical interfaces are alive. Live public and
 destructive user QA are separate operator contours with their own identities,
 confirmation and cleanup rules.
 
-The tracked browser journey
-`apps/platform_web/tests/smoke/live-user-journey.spec.ts` is owned by the
-`platform-live-user-qa.yml` workflow. Run it only against the exact deployed
-`dev` SHA through that workflow; its dedicated server supervisor refreshes the
-reviewed mailbox helper under the release lock, runs the browser scenario, and
-performs exact fixture cleanup. The dispatch and recovery procedure is defined
-in [the CSP live-QA runbook](csp-live-qa-runbook.md).
-The `test_platform_live_qa_wrappers` module belongs to `backend-privileged`. Its fixed-enum diagnostic case owns the early Live User QA stage/check contract; existing forwarding and source-binding cases cover bridge/report validation. Only enumerated stages/checks are exposed. Failures before the trusted Python dispatcher starts remain unclassified, and markers do not change workflow failure or cleanup behavior.
+The tracked browser journeys `apps/platform_web/tests/smoke/live-launch.spec.ts` and `apps/platform_web/tests/smoke/live-user-journey.spec.ts` belong to their respective production launch and Live User QA workflows; run only against the exact deployed `dev` SHA through those workflows, whose supervisors own fixture cleanup. The objective-patch case checks the current index/detail and two durable PNG URLs; its exact two-source UI-icon checks are hermetic, and the public case IDs/schema remain unchanged. Dispatch and recovery procedures are in [the CSP live-QA runbook](csp-live-qa-runbook.md).
+The `test_platform_live_qa_wrappers` module belongs to `backend-privileged`. It owns fixed-enum early-stage diagnostics and the `engine_preflight` ordering/mode contract; `test_platform_live_qa_guard` owns the exact installed wrapper and locked child command. Preflight runs after `identity_report` and before account installation/provisioning under the existing QA UID, locks and read-only mounts; it has no account or database fixture. Only enumerated stages/checks are exposed. Failures before the trusted Python dispatcher starts remain unclassified, and markers do not change workflow failure or cleanup behavior.
 The same module owns public browser failure-report validation, private root-store publication/retention, exact gate/source/marker binding, cleanup survival and closed `failure_report_unavailable` propagation; workflow tests prove it cannot make passing or missing counts successful, while `web-hermetic` covers the CommonJS reporter's closed projection, safe locations and byte/mode limits. These tests use no browser, server, database or production QA fixture.
 The same module owns the nested Live User QA timeout route: the fixed desktop journey gets its browser-child budget, other captured browser actions retain the default, and dispatcher timeout tests verify process-group termination. `test_platform_release_audit_hardening` also owns the fixed dispatcher-budget and unchanged-operation-limit assertions.
 The `workflow_dispatch` `control_email` and live `marker` values cross the

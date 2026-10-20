@@ -157,26 +157,7 @@ each release. Do not run the contours concurrently or start the manual contour
 until the automated inventory, users, sessions, tournament and media have all
 been confirmed absent.
 
-The credential-bearing automated journey never runs a candidate checkout or an
-unverified mailbox helper. New release artifacts carry a source-only
-`liveqa-runtime` member: the reviewed journey/configuration, package lock and a
-closed manifest containing the exact file map and digest of the required Node,
-Playwright and browser engine. The engine bytes are supplied by a previously
-verified immutable runtime provider; the manifest fixes Node 26.3.1, the
-package-lock digest, required Playwright packages, browser roots and the
-Chromium sandbox digest. During activation, the installer validates the
-candidate suite and its engine map against the protected provider under the
-canonical release lock, then records the provider generation in the new
-digest-bound payload at `/root/.oldsparky/liveqa/releases/<source-sha>` before
-atomically switching the active pointer. A missing, stale or incompatible
-provider fails closed; it is not replaced by a path from the environment or
-candidate checkout. Existing complete v1 generations remain immutable and may
-serve as the provider only when their exact engine file map and package-lock
-digest match the candidate manifest. Provider members are hashed in bounded
-chunks under the signed archive's per-member size limit; small trusted helper
-hashes retain their tighter default bound. Release bootstrap validates the
-complete archive and source SHA before omitting only the wheelhouse and
-standalone web bundle from its temporary control tree; full release contents remain intact. For missing-provider recovery, see the [provider recovery runbook](liveqa-provider-recovery.md).
+The credential-bearing journey never runs a candidate checkout or unverified mailbox helper. The source-only `liveqa-runtime` manifest v3 adds confined declared `engine_links` to the v2 keys (no `source_sha`); its engine-tree digest uses the typed, domain-separated `oldsparky-liveqa-engine-v2` encoding for regular-file digests and exact symlink targets. The provider manifest v2 binds `source_sha`, carries the same link map and installs candidate-owned bytes under `provider-runtime`; prior complete v1 generations remain immutable at `runtime` and may serve only when their exact engine map and package-lock digest match. Activation checks Node 26.3.1, package lock, required Playwright packages, browser roots, Chromium sandbox and the exact file/link maps under the release lock, then records the provider generation in the digest-bound payload before switching active. Missing, stale or incompatible providers fail closed; no environment or candidate-checkout path is trusted. Provider hashing stays bounded by signed member limits; release bootstrap validates the full archive before omitting only the wheelhouse and standalone web bundle from its temporary control tree. For missing-provider recovery, see the [provider recovery runbook](liveqa-provider-recovery.md).
 
 The fixed root-owned supervisor at
 `/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh` (mode `0755`) then
@@ -196,10 +177,7 @@ generation ownership do not change. The browser's preseeded input, home,
 temporary files and test results remain in its dedicated writable
 `/run/oldsparky-liveqa` gate.
 
-The generation manifest includes the launch supervisor's direct script and
-data dependencies, including the provisioning shell wrapper, its Python
-implementation and the reviewed AppArmor profile. Reconciliation rejects a
-payload whose required-member set is incomplete.
+The generation manifest includes the launch supervisor's direct script and data dependencies, including the provisioning shell wrapper, its Python implementation and reviewed AppArmor profile. Reconciliation rejects an incomplete required-member set. Before any account installation or provisioning, the supervisor runs the fixed `web/tests/support/live-engine-preflight.cjs` through the existing `engine-preflight` wrapper mode after identity checks. It opens and closes an `about:blank` page in Chromium and WebKit under the normal QA UID, locks and read-only mounts; it navigates no app route and needs no account or database. Failure is an early `engine_preflight` stage/check, not a Live QA pass.
 
 ```bash
 cd /root/old_sparky

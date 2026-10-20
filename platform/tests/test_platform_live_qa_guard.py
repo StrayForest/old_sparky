@@ -426,7 +426,7 @@ class LiveQaGuardTests(unittest.TestCase):
             (app_dir / pointer_name).symlink_to(release)
 
     def make_installed_payload_fixture(
-        self, root: Path, *, file_count: int
+        self, root: Path, *, file_count: int, typed_provider_links: bool = False
     ) -> tuple[Path, Path, Path, str]:
         """Create a valid active payload with a deterministically sized manifest."""
 
@@ -449,6 +449,52 @@ class LiveQaGuardTests(unittest.TestCase):
             path.write_bytes(b"x")
             os.chown(path, 0, 0)
             os.chmod(path, 0o444)
+        if typed_provider_links:
+            provider_root = payload / "provider-runtime"
+            engine_root = provider_root / "browsers/webkit-2311/lib"
+            engine_root.mkdir(mode=0o755, parents=True)
+            terminal = engine_root / "libengine.so.1"
+            terminal.write_bytes(b"engine")
+            os.chown(terminal, 0, 0)
+            os.chmod(terminal, 0o444)
+            alias = engine_root / "libengine.so"
+            alias.symlink_to("libengine.so.1")
+            os.chown(alias, 0, 0, follow_symlinks=False)
+            package_lock = provider_root / "web/package-lock.json"
+            package_lock.parent.mkdir(mode=0o755, parents=True)
+            package_lock.write_bytes(b"{}\n")
+            os.chown(package_lock, 0, 0)
+            os.chmod(package_lock, 0o444)
+            provider = {
+                "version": 2,
+                "source_sha": source_sha,
+                "provider_sha": source_sha,
+                "engine_tree_sha256": "b" * 64,
+                "node_version": guard.NODE_VERSION,
+                "package_lock_sha256": hashlib.sha256(b"{}\n").hexdigest(),
+                "engine_files": {
+                    "browsers/webkit-2311/lib/libengine.so.1": hashlib.sha256(
+                        b"engine"
+                    ).hexdigest()
+                },
+                "engine_links": {
+                    "browsers/webkit-2311/lib/libengine.so": "libengine.so.1"
+                },
+            }
+            provider_path = payload / "runtime-provider.json"
+            provider_path.write_text(
+                json.dumps(provider, sort_keys=True, separators=(",", ":")),
+                encoding="ascii",
+            )
+            os.chown(provider_path, 0, 0)
+            os.chmod(provider_path, 0o444)
+            for directory in sorted(
+                (path for path in payload.rglob("*") if path.is_dir()),
+                key=lambda path: len(path.parts),
+                reverse=True,
+            ):
+                os.chown(directory, 0, 0)
+                os.chmod(directory, 0o555)
         active = trusted / "active"
         active.symlink_to(payload)
 
@@ -456,8 +502,12 @@ class LiveQaGuardTests(unittest.TestCase):
         files: dict[str, str] = {}
         for path in sorted(payload.rglob("*")):
             relative = path.relative_to(payload).as_posix()
+            metadata = path.lstat()
             digest.update(relative.encode("utf-8") + b"\0")
-            if path.is_dir():
+            if stat.S_ISLNK(metadata.st_mode):
+                digest.update(b"l\0" + os.readlink(path).encode("utf-8") + b"\0")
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
                 digest.update(b"d\0")
                 continue
             file_digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -552,6 +602,106 @@ class LiveQaGuardTests(unittest.TestCase):
                 ["/opt/oldsparky/platform/current/tools/platform_live_user_qa.sh"],
                 recovery=False,
             )
+
+    def test_engine_preflight_locked_exec_requires_exact_installed_wrapper(self) -> None:
+        source_sha = "a" * 40
+        install_root = f"/root/.oldsparky/liveqa/releases/{source_sha}"
+        wrapper = f"{install_root}/platform/tools/platform_live_browser_qa.sh"
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PLATFORM_LIVE_QA_INSTALL_ROOT": install_root,
+                    "PLATFORM_LIVE_QA_TARGET_SHA": source_sha,
+                },
+                clear=True,
+            ),
+            mock.patch.object(
+                guard,
+                "_validate_installed_payload_root",
+                return_value=source_sha,
+            ),
+            mock.patch.object(guard, "_assert_root_controlled_path"),
+        ):
+            guard._validate_trusted_wrapper(
+                [wrapper, "engine-preflight"], recovery=False
+            )
+            with self.assertRaisesRegex(guard.GuardError, "one installed wrapper argument"):
+                guard._validate_trusted_wrapper(
+                    [wrapper, "engine-preflight", "extra"], recovery=False
+                )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(guard, "_assert_root_controlled_path"),
+        ):
+            with self.assertRaisesRegex(guard.GuardError, "one installed wrapper argument"):
+                guard._validate_trusted_wrapper(
+                    ["/root/old_sparky/platform/tools/platform_live_browser_qa.sh", "engine-preflight"],
+                    recovery=False,
+                )
+
+    def test_engine_preflight_child_command_is_exact_and_runtime_bound(self) -> None:
+        source_sha = "a" * 40
+        suffix = "a1b2c3d4"
+        suite = (
+            f"/var/lib/oldsparky-liveqa/runtime-suite-{source_sha}-{suffix}"
+        )
+        engine = "/var/lib/oldsparky-liveqa/runtime-engine-" + "b" * 40 + "-" + suffix
+        command = [
+            "/usr/bin/systemd-run",
+            "--no-ask-password",
+            "--quiet",
+            "--wait",
+            "--collect",
+            "--pipe",
+            "--service-type=exec",
+            "--expand-environment=no",
+            "--unit=oldsparky-liveqa-browser.service",
+            "--uid=1001",
+            "--gid=1001",
+            f"--working-directory={suite}/web",
+            "--property=KillMode=control-group",
+            "--property=Restart=no",
+            "--property=RuntimeMaxSec=30min",
+            "--property=SendSIGKILL=yes",
+            "--property=TimeoutStopSec=5s",
+            "--property=UMask=0077",
+            f"--property=BindReadOnlyPaths={suite}:{suite}",
+            f"--property=BindReadOnlyPaths={engine}:{engine}",
+            "--",
+            "/usr/bin/env",
+            "-i",
+            "HOME=/run/oldsparky-liveqa/public-live-qa.a1b2c3d4/home",
+            "LANG=C.UTF-8",
+            f"NODE_PATH={engine}/web/node_modules",
+            f"PATH={engine}/node/bin:/usr/bin:/bin",
+            "PLATFORM_LIVE_EXPECTED_ORIGIN=https://old-sparky.com",
+            "PLATFORM_LIVE_USER_QA_UID=1001",
+            "PLATFORM_QA_BROWSER_GATE_DIR=/run/oldsparky-liveqa/public-live-qa.a1b2c3d4",
+            f"PLATFORM_LIVE_QA_RUNNER_SHA={source_sha}",
+            f"PLATFORM_LIVE_QA_TARGET_SHA={source_sha}",
+            f"PLATFORM_LIVE_QA_MARKER_SHA256={'c' * 64}",
+            f"PLAYWRIGHT_BROWSERS_PATH={engine}/browsers",
+            "PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com",
+            "TMPDIR=/run/oldsparky-liveqa/public-live-qa.a1b2c3d4/tmp",
+            "XDG_CACHE_HOME=/run/oldsparky-liveqa/public-live-qa.a1b2c3d4/home/.cache",
+            f"{engine}/node/bin/node",
+            f"{suite}/web/tests/support/live-engine-preflight.cjs",
+        ]
+        self.assertTrue(guard._is_fixed_live_browser_command(command))
+        for invalid in (
+            command + ["extra"],
+            [
+                (
+                    f"{suite}/web/tests/support/../support/live-engine-preflight.cjs"
+                    if item == f"{suite}/web/tests/support/live-engine-preflight.cjs"
+                    else item
+                )
+                for item in command
+            ],
+            ["NODE_OPTIONS=--require=/tmp/untrusted" if item.startswith("NODE_PATH=") else item for item in command],
+        ):
+            self.assertFalse(guard._is_fixed_live_browser_command(invalid))
 
     def test_locked_exec_preserves_only_validated_payload_identity(self) -> None:
         source_sha = "a" * 40
@@ -1076,6 +1226,34 @@ class LiveQaGuardTests(unittest.TestCase):
                     ),
                     source_sha,
                 )
+
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned payload contract")
+    def test_active_payload_accepts_only_provider_declared_browser_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            trusted, releases, payload, source_sha = self.make_installed_payload_fixture(
+                Path(temporary), file_count=1, typed_provider_links=True
+            )
+            manifest = trusted / "active-manifest.json"
+            with (
+                mock.patch.object(guard, "TRUSTED_SECRET_ROOT", trusted),
+                mock.patch.object(guard, "TRUSTED_PAYLOAD_ROOT", releases),
+                mock.patch.object(guard, "TRUSTED_ACTIVE_MANIFEST", manifest),
+                mock.patch.object(guard, "TRUSTED_ACTIVE_POINTER", trusted / "active"),
+                mock.patch.object(
+                    guard, "_active_release_commit", return_value=source_sha
+                ),
+            ):
+                self.assertEqual(
+                    guard._validate_installed_payload_root(payload, target_sha=source_sha),
+                    source_sha,
+                )
+                alias = payload / "provider-runtime/browsers/webkit-2311/lib/libengine.so"
+                alias.unlink()
+                alias.symlink_to("../../../../outside")
+                with self.assertRaisesRegex(
+                    guard.GuardError, "installed live-QA payload contains an undeclared symlink"
+                ):
+                    guard._validate_installed_payload_root(payload, target_sha=source_sha)
 
     def test_active_manifest_over_active_bound_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2119,6 +2297,29 @@ class LiveQaGuardTests(unittest.TestCase):
         self.assertEqual(guard._parser().parse_args(["runtime-root"]).command, "runtime-root")
         with self.assertRaises(SystemExit):
             guard._parser().parse_args(["runtime-root", "/tmp/untrusted-runtime"])
+        files = {
+            "browsers/webkit-2311/lib/libengine.so.1": "a" * 64,
+        }
+        self.assertEqual(
+            guard._provider_link_map(
+                {
+                    "engine_files": files,
+                    "engine_links": {
+                        "browsers/webkit-2311/lib/libengine.so": "libengine.so.1"
+                    },
+                }
+            ),
+            {"browsers/webkit-2311/lib/libengine.so": "libengine.so.1"},
+        )
+        for bad_links in (
+            {"browsers/webkit-2311/lib/escape": "../../../../outside"},
+            {"browsers/webkit-2311/lib/cycle-a": "cycle-b", "browsers/webkit-2311/lib/cycle-b": "cycle-a"},
+            {"browsers/chromium-1228/lib/alias": "../webkit-2311/lib/libengine.so.1"},
+        ):
+            with self.subTest(bad_links=bad_links), self.assertRaises(guard.GuardError):
+                guard._provider_link_map(
+                    {"engine_files": files, "engine_links": bad_links}
+                )
 
     @unittest.skipUnless(os.geteuid() == 0, "root-owned runtime provider contract")
     def test_trusted_runtime_root_hashes_bounded_large_provider_member(self) -> None:
@@ -2138,6 +2339,11 @@ class LiveQaGuardTests(unittest.TestCase):
             omit_source_marker: bool = False,
             source_marker_value: str | None = None,
             extra_provider_entry: bool = False,
+            provider_version: int = 1,
+            link_alias: bool = False,
+            extra_provider_suite_file: bool = False,
+            nested_package_files: bool = False,
+            nested_node_modules: bool = False,
         ) -> tuple[Path, Path]:
             payloads = base / "trusted" / "releases"
             active_payload = payloads / source_sha
@@ -2151,7 +2357,9 @@ class LiveQaGuardTests(unittest.TestCase):
                 "{}\n", encoding="ascii"
             )
             os.chmod(active_payload / "runtime" / "runtime-manifest.json", 0o444)
-            runtime_root = provider_payload / "runtime"
+            runtime_root = provider_payload / (
+                "provider-runtime" if provider_version == 2 else "runtime"
+            )
             node_path = runtime_root / "node" / "bin" / "node"
             node_path.parent.mkdir(mode=0o555, parents=True)
             with node_path.open("wb") as stream:
@@ -2195,30 +2403,65 @@ class LiveQaGuardTests(unittest.TestCase):
             (web_root / "package-lock.json").write_bytes(package_lock)
             os.chmod(web_root / "package-lock.json", 0o444)
             package_lock_sha = hashlib.sha256(package_lock).hexdigest()
+            if nested_package_files:
+                package_files = {
+                    "web/node_modules/@playwright/test/lib/index.js": b"test package\n",
+                    "web/node_modules/playwright/lib/runner/index.js": b"playwright package\n",
+                    "web/node_modules/playwright-core/lib/server/index.js": b"core package\n",
+                }
+                if nested_node_modules:
+                    package_files[
+                        "web/node_modules/playwright-core/lib/server/node_modules/escape/index.js"
+                    ] = b"nested dependency\n"
+                for relative, content in package_files.items():
+                    path = runtime_root / relative
+                    path.parent.mkdir(mode=0o555, parents=True, exist_ok=True)
+                    path.write_bytes(content)
+                    os.chmod(path, 0o444)
+                    engine_files[relative] = hashlib.sha256(content).hexdigest()
+            engine_links: dict[str, str] = {}
+            if link_alias:
+                alias = "browsers/webkit-2311/engine.alias"
+                engine_links[alias] = "engine.bin"
+                (runtime_root / alias).symlink_to(engine_links[alias])
             engine_digest = hashlib.sha256(
-                b"oldsparky-liveqa-engine-v1\0"
+                (
+                    b"oldsparky-liveqa-engine-v2\0"
+                    if provider_version == 2
+                    else b"oldsparky-liveqa-engine-v1\0"
+                )
                 + guard.NODE_VERSION.encode("ascii")
                 + b"\0"
                 + package_lock_sha.encode("ascii")
                 + b"\0"
             )
-            for relative, file_digest in sorted(engine_files.items()):
-                engine_digest.update(relative.encode("utf-8") + b"\0f\0")
-                engine_digest.update(bytes.fromhex(file_digest))
+            for relative in sorted(
+                engine_files.keys() | engine_links.keys(),
+                key=lambda value: PurePosixPath(value).parts,
+            ):
+                engine_digest.update(relative.encode("utf-8") + b"\0")
+                if relative in engine_links:
+                    engine_digest.update(
+                        b"l\0" + engine_links[relative].encode("utf-8") + b"\0"
+                    )
+                else:
+                    engine_digest.update(b"f\0" + bytes.fromhex(engine_files[relative]))
             suite_manifest = {
-                "version": 2,
+                "version": provider_version + 1,
                 "node_version": guard.NODE_VERSION,
                 "package_lock_sha256": package_lock_sha,
                 "engine_tree_sha256": engine_digest.hexdigest(),
                 "engine_files": engine_files,
             }
+            if provider_version == 2:
+                suite_manifest["engine_links"] = engine_links
             (active_payload / "runtime" / "runtime-manifest.json").write_text(
                 json.dumps(suite_manifest, sort_keys=True, separators=(",", ":")),
                 encoding="ascii",
             )
             os.chmod(active_payload / "runtime" / "runtime-manifest.json", 0o444)
             provider = {
-                "version": 1,
+                "version": provider_version,
                 "source_sha": source_sha,
                 "provider_sha": actual_provider_sha,
                 "engine_tree_sha256": engine_digest.hexdigest(),
@@ -2226,6 +2469,8 @@ class LiveQaGuardTests(unittest.TestCase):
                 "package_lock_sha256": package_lock_sha,
                 "engine_files": engine_files,
             }
+            if provider_version == 2:
+                provider["engine_links"] = engine_links
             provider_path = active_payload / "runtime-provider.json"
             provider_path.write_text(
                 json.dumps(provider, sort_keys=True, separators=(",", ":")),
@@ -2245,6 +2490,11 @@ class LiveQaGuardTests(unittest.TestCase):
                 unexpected = provider_payload / "unexpected"
                 unexpected.write_text("x\n", encoding="ascii")
                 os.chmod(unexpected, 0o444)
+            if extra_provider_suite_file:
+                forbidden = runtime_root / "web/tests/support/extra.ts"
+                forbidden.parent.mkdir(mode=0o555, parents=True, exist_ok=True)
+                forbidden.write_text("export {};\n", encoding="ascii")
+                os.chmod(forbidden, 0o444)
 
             for directory in sorted(
                 (path for path in payloads.rglob("*") if path.is_dir()),
@@ -2277,6 +2527,47 @@ class LiveQaGuardTests(unittest.TestCase):
                 guard.GuardError, "helper file metadata is unsafe"
             ):
                 guard._sha256_regular(node, expected_uid=0)
+
+        with self.subTest("provider v2 preserves declared aliases but rejects suite files"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(
+                    base,
+                    provider_version=2,
+                    link_alias=True,
+                    nested_package_files=True,
+                )
+                self.assertEqual(
+                    resolve(pointer, base / "trusted" / "releases"),
+                    base
+                    / "trusted"
+                    / "releases"
+                    / provider_sha
+                    / "provider-runtime",
+                )
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(
+                    base,
+                    provider_version=2,
+                    link_alias=True,
+                    nested_package_files=True,
+                    nested_node_modules=True,
+                )
+                with self.assertRaisesRegex(guard.GuardError, "file map is invalid"):
+                    resolve(pointer, base / "trusted" / "releases")
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(
+                    base,
+                    provider_version=2,
+                    link_alias=True,
+                    extra_provider_suite_file=True,
+                )
+                with self.assertRaisesRegex(
+                    guard.GuardError, "unreviewed directory|unreviewed file"
+                ):
+                    resolve(pointer, base / "trusted" / "releases")
 
         self.assertEqual(
             guard.PROVIDER_RECOVERY_SOURCE_SHA,

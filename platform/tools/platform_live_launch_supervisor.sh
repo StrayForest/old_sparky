@@ -50,7 +50,7 @@ emit_launch_status() {
       none|root_uid|source_identity|install_root_format|origin|install_root_target|\
       source_binding|provision_mode|provision_marker|marker_absent|marker_digest|\
       generation_members|generation_supervisor_path|generation_supervisor_metadata|\
-      generation_manifest|identity|account_install|provision|browser_qa) ;;
+      generation_manifest|identity|engine_preflight|account_install|provision|browser_qa) ;;
       *) check="none" ;;
     esac
     printf 'LIVE_LAUNCH_STATUS schema=2 status=%s stage=%s check=%s child_exit=%s source_sha=%s\n' \
@@ -239,6 +239,21 @@ PY
 launch_stage="identity"
 launch_check="identity"
 identity_report
+
+# Exercise both installed browser engines before creating or rotating the live
+# QA roster. This uses the same immutable runtime and locked browser contour as
+# the public suite, but opens only about:blank and never reads the roster.
+launch_stage="engine_preflight"
+launch_check="engine_preflight"
+env -i \
+  HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  PLATFORM_APP_DIR=/opt/oldsparky/platform \
+  PLATFORM_LIVE_CSP_QA_BUNDLE="$BUNDLE" \
+  PLATFORM_LIVE_QA_INSTALL_ROOT="$INSTALL_ROOT" \
+  PLATFORM_LIVE_QA_TARGET_SHA="$app_target_sha" \
+  PLATFORM_LIVE_QA_RUNNER_SHA="$runner_sha" \
+  PLATFORM_LIVE_QA_MARKER_SHA256="$marker_sha256" \
+  "$TOOLS_DIR/platform_live_browser_qa.sh" engine-preflight
 
 if [[ "$provision" == "true" ]]; then
   launch_stage="account_install"

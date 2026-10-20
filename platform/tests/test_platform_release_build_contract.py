@@ -493,12 +493,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "tests/support/live-qa-origin.ts",
             "tests/support/live-qa-sandbox.ts",
             "tests/support/live-count-reporter.cjs",
+            "tests/support/live-engine-preflight.cjs",
             "package-lock.json",
         ):
             source = REPO_ROOT / "platform/apps/platform_web" / relative
             payload = (
                 source.read_bytes()
-                if relative == "tests/support/live-count-reporter.cjs"
+                if relative.startswith("tests/support/live-")
                 else relative.encode("ascii")
             )
             cls._write_fixture_file(web / relative, payload)
@@ -635,14 +636,17 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             manifest = json.loads((output / "runtime-manifest.json").read_text())
-            self.assertEqual(manifest["version"], 2)
+            self.assertEqual(manifest["version"], 3)
             self.assertFalse((output / "node").exists())
             self.assertFalse((output / "browsers").exists())
             self.assertFalse((output / "web/node_modules").exists())
             self.assertIn("web/tests/smoke/live-launch.spec.ts", manifest["suite_files"])
+            self.assertIn(
+                "web/tests/support/live-engine-preflight.cjs", manifest["suite_files"]
+            )
             self.assertEqual(
                 platform_live_qa_runtime_install._validate_runtime_source(output)["version"],
-                2,
+                3,
             )
             self.assertIn("node/bin/node", manifest["engine_files"])
             self.assertIn(
@@ -650,8 +654,62 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             )
             for browser in ("chromium-1228", "chromium_headless_shell-1228", "webkit-2311", "ffmpeg-1011"):
                 self.assertTrue(
-                    any(path.startswith(f"browsers/{browser}/") for path in manifest["engine_files"])
+                    any(
+                        path.startswith(f"browsers/{browser}/")
+                        for path in manifest["engine_files"] | manifest["engine_links"]
+                    )
                 )
+            self.assertEqual(
+                manifest["engine_links"],
+                {
+                    "browsers/webkit-2311/lib/alias": "real",
+                    "browsers/webkit-2311/lib/chain": "alias",
+                },
+            )
+            self.assertNotIn("browsers/webkit-2311/lib/alias", manifest["engine_files"])
+            self.assertNotIn("browsers/webkit-2311/lib/chain", manifest["engine_files"])
+
+            # Exercise the matching installer projection against the actual
+            # pinned-ZIP builder output. The source-only archive preserves the
+            # validated alias map; the full build supplies the legacy
+            # flattened bytes from which the immutable typed provider is
+            # reconstructed.
+            full_build_root = root / "full-build"
+            full_build_root.mkdir(mode=0o700)
+            flattened_output = root / "flattened-liveqa-runtime"
+            completed = self._run_staged_live_qa_build(
+                builder,
+                platform_root,
+                node_home,
+                flattened_output,
+                full_build_root,
+                source_only=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            provider_root = root / "provider-runtime"
+            provider_files = platform_live_qa_runtime_install._copy_typed_engine_provider(
+                flattened_output,
+                output,
+                provider_root,
+                engine_files=manifest["engine_files"],
+                engine_links=manifest["engine_links"],
+                package_lock_sha256=manifest["package_lock_sha256"],
+            )
+            self.assertIn(
+                "provider-runtime/web/package-lock.json",
+                provider_files,
+            )
+            platform_live_qa_runtime_install._validate_engine_root(
+                provider_root,
+                expected_files=manifest["engine_files"],
+                expected_links=manifest["engine_links"],
+                engine_sha256=manifest["engine_tree_sha256"],
+                node_version=manifest["node_version"],
+                package_lock_sha256=manifest["package_lock_sha256"],
+            )
+            self.assertTrue(
+                (provider_root / "browsers/webkit-2311/lib/chain").is_symlink()
+            )
 
     @staticmethod
     def _manifest_padding_entries(count: int) -> list[tuple[str, bytes, str]]:

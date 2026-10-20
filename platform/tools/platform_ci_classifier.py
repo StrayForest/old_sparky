@@ -69,6 +69,9 @@ RUNTIME_SENSITIVE_FILES = frozenset(
         "platform/tools/platform_live_qa_guard.py",
         "platform/tools/platform_live_qa_machine_lock.py",
         "platform/tools/platform_live_qa_runtime_install.py",
+        # The live browser wrapper invokes this immutable runtime helper;
+        # changing it must install through the runtime-sensitive release path.
+        "platform/apps/platform_web/tests/support/live-engine-preflight.cjs",
         # Settings selects the dotenv source for every active app process. A
         # change must be exercised by the existing release runtime fixture.
         "platform/python_packages/platform_infra/config.py",

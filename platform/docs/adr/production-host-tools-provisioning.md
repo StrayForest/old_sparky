@@ -318,20 +318,19 @@ approved host-image/configuration-management authority performs provisioning
 for a reviewed `HOST_TOOLS_SHA`; the GitHub workflow must not be used as the
 installer:
 
-1. Record the successful exact-`TARGET_SHA` `Platform security and build`
-   run/attempt. Use a successful `build-host-tools` job and its attested bundle
-   from either a read-only `mode=preflight` run at that same merged `dev` SHA,
-   or the exact normal automatic production run for that SHA when the
-   host-capability gate failed solely because this pinned generation was
-   missing. For the automatic run, also verify the successful automatic
-   dispatch, its exact production child attempt, all preceding provenance and
-   host-contract checks, and that the child did not begin the release build,
-   create pending release state or perform a production write. Any other
-   failure is not provisioning evidence. Bind the successful builder job and
-   artifact ID/name/outer digest, application `TARGET_SHA`, pinned
-   `HOST_TOOLS_SHA`, and attestation to their exact run/attempts. Download the
-   ZIP through the approved artifact channel and verify its SHA-256 before
-   opening it. The pull-request candidate artifact is not an acceptable
+1. Record the successful exact-`TARGET_SHA` Security run. A successful `build-host-tools` job
+   and attested bundle qualify from (a) read-only `mode=preflight` at that same merged `dev`
+   SHA; (b) the exact automatic parent in its active 1,800-second pre-child readiness window,
+   only if `TARGET_SHA` is current `dev`, its source-bound restore-verified backup and bundle
+   build/attestation/upload succeeded, and no child, app write, pending release transaction or
+   competing production operation exists; or (c) the exact automatic child whose only failure
+   was the missing pinned generation, with prior checks passed and no build, pending state or
+   production write. For (b), provision before the deadline; the parent verifies the generation
+   before dispatching its child. No other failure qualifies. Bind `TARGET_SHA`, `HOST_TOOLS_SHA`,
+   builder job and full Sigstore signature/chain/subject/signer/source/invocation to exact runs.
+   The parent artifact ID/name/digest must bind its exact parent run/attempt, independent of the
+   source Security attempt; use its emitted name. Download through the approved channel and
+   verify the outer SHA-256 before opening. A pull-request candidate artifact is never a
    substitute.
 2. Run the offline `platform_host_tools_bundle.py verify` command from the
    pinned reviewed checkout with the expected `HOST_TOOLS_SHA`. Retain the

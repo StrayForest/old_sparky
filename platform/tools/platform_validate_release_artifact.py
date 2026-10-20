@@ -438,6 +438,135 @@ def _runtime_path_order_key(relative: str) -> tuple[str, ...]:
     return PurePosixPath(relative).parts
 
 
+def _engine_link_target(relative: str, target: str) -> str:
+    """Validate and resolve one declared browser alias without filesystem access."""
+
+    try:
+        relative_bytes = relative.encode("utf-8")
+        target_bytes = target.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ArtifactError("source-only liveqa-runtime engine link is invalid") from exc
+    parts = relative.split("/")
+    raw_target = target.split("/")
+    if (
+        len(relative_bytes) > MAX_PATH_BYTES
+        or len(target_bytes) > MAX_PATH_BYTES
+        or len(parts) < 3
+        or parts[0] != "browsers"
+        or parts[1] not in LIVE_QA_BROWSER_ROOTS
+        or any(part in {"", ".", ".."} for part in parts)
+        or not target
+        or target.startswith("/")
+        or "\\" in target
+        or any(ord(character) < 32 or ord(character) == 127 for character in target)
+        or any(part in {"", "."} for part in raw_target)
+    ):
+        raise ArtifactError("source-only liveqa-runtime engine link is invalid")
+    resolved = list(parts[:-1])
+    for component in raw_target:
+        if component == "..":
+            if len(resolved) <= 2:
+                raise ArtifactError("source-only liveqa-runtime engine link escapes browser root")
+            resolved.pop()
+        else:
+            resolved.append(component)
+    if resolved[:2] != parts[:2] or len(resolved) < 3:
+        raise ArtifactError("source-only liveqa-runtime engine link escapes browser root")
+    return "/".join(resolved)
+
+
+def _valid_engine_file_path(path: object) -> bool:
+    if not isinstance(path, str):
+        return False
+    try:
+        if len(path.encode("utf-8")) > MAX_PATH_BYTES:
+            return False
+    except UnicodeEncodeError:
+        return False
+    parts = path.split("/")
+    if (
+        path.startswith("/")
+        or "\\" in path
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        or "node_modules" in parts[3:]
+    ):
+        return False
+    return (
+        path == "node/bin/node"
+        or any(
+            len(parts) >= 3 and parts[0] == "browsers" and parts[1] == browser_root
+            for browser_root in LIVE_QA_BROWSER_ROOTS
+        )
+        or any(
+            path == package_root or path.startswith(package_root + "/")
+            for package_root in (
+                "web/node_modules/@playwright/test",
+                "web/node_modules/playwright",
+                "web/node_modules/playwright-core",
+            )
+        )
+    )
+
+
+def _validate_engine_links(
+    engine_files: dict[str, object], engine_links: dict[str, object]
+) -> None:
+    targets: dict[str, str] = {}
+    for relative, target in engine_links.items():
+        if (
+            not isinstance(relative, str)
+            or not isinstance(target, str)
+            or relative in engine_files
+        ):
+            raise ArtifactError("source-only liveqa-runtime engine links are invalid")
+        targets[relative] = _engine_link_target(relative, target)
+    paths = set(engine_files) | set(engine_links)
+    if any(
+        "/".join(parts[:index]) in paths
+        for path in paths
+        for parts in (path.split("/"),)
+        for index in range(1, len(parts))
+    ):
+        raise ArtifactError("source-only liveqa-runtime engine paths conflict")
+    for alias in targets:
+        seen = {alias}
+        terminal = targets[alias]
+        while terminal in targets:
+            if terminal in seen:
+                raise ArtifactError("source-only liveqa-runtime engine link cycle")
+            seen.add(terminal)
+            terminal = targets[terminal]
+        if terminal not in engine_files:
+            raise ArtifactError("source-only liveqa-runtime engine link is dangling")
+
+
+def _engine_reference_digest(
+    engine_files: dict[str, str],
+    engine_links: dict[str, str],
+    *,
+    node_version: str,
+    package_lock_sha256: str,
+) -> str:
+    digest = hashlib.sha256(
+        b"oldsparky-liveqa-engine-v2\0"
+        + node_version.encode("ascii")
+        + b"\0"
+        + package_lock_sha256.encode("ascii")
+        + b"\0"
+    )
+    for relative in sorted(
+        engine_files.keys() | engine_links.keys(),
+        key=_runtime_path_order_key,
+    ):
+        digest.update(relative.encode("utf-8") + b"\0")
+        if relative in engine_links:
+            digest.update(b"l\0" + engine_links[relative].encode("utf-8") + b"\0")
+        else:
+            digest.update(b"f\0" + bytes.fromhex(engine_files[relative]))
+    return digest.hexdigest()
+
+
 def _runtime_digest(
     archive: tarfile.TarFile,
     by_name: dict[str, tarfile.TarInfo],
@@ -514,6 +643,7 @@ def _validate_liveqa_runtime(
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
         "web/tests/support/live-count-reporter.cjs",
+        "web/tests/support/live-engine-preflight.cjs",
     }
     allowed_package_roots = {
         "web/node_modules/@playwright/test",
@@ -593,6 +723,18 @@ def _validate_liveqa_runtime(
         raise ArtifactError("liveqa-runtime manifest is invalid") from exc
     if not isinstance(manifest, dict):
         raise ArtifactError("liveqa-runtime manifest schema is invalid")
+    version = manifest.get("version")
+    if type(version) is not int or version not in {1, 2, 3}:
+        raise ArtifactError("liveqa-runtime manifest schema is invalid")
+    if version == 3:
+        helper = by_name.get(
+            f"{prefix}/web/tests/support/live-engine-preflight.cjs"
+        )
+        if helper is None or not helper.isfile():
+            raise ArtifactError(
+                "liveqa-runtime is missing required file: "
+                "web/tests/support/live-engine-preflight.cjs"
+            )
     lock_member = archive.extractfile(by_name[f"{prefix}/web/package-lock.json"])
     if lock_member is None:
         raise ArtifactError("liveqa-runtime package lock is unavailable")
@@ -601,12 +743,15 @@ def _validate_liveqa_runtime(
     if manifest.get("package_lock_sha256") != lock_digest:
         raise ArtifactError("liveqa-runtime package lock digest is invalid")
     tree_digest, files = _runtime_digest(archive, by_name, release_slug=release_slug)
-    if manifest.get("version") == 2:
+    if version in {2, 3}:
         expected_keys = {
             "version", "node_version", "package_lock_sha256", "engine_tree_sha256",
             "engine_files", "suite_tree_sha256", "suite_files",
         }
+        if version == 3:
+            expected_keys.add("engine_links")
         engine_files = manifest.get("engine_files")
+        engine_links = manifest.get("engine_links", {})
         suite_digest = hashlib.sha256(b"oldsparky-liveqa-suite-v1\0")
         for relative, file_digest in sorted(files.items()):
             suite_digest.update(relative.encode("utf-8") + b"\0f\0")
@@ -616,23 +761,29 @@ def _validate_liveqa_runtime(
             or manifest.get("node_version") != PINNED_NODE_VERSION
             or manifest.get("suite_files") != files
             or not isinstance(engine_files, dict)
+            or not isinstance(engine_links, dict)
             or not isinstance(manifest.get("engine_tree_sha256"), str)
             or re.fullmatch(r"[0-9a-f]{64}", manifest["engine_tree_sha256"]) is None
             or not isinstance(manifest.get("suite_tree_sha256"), str)
             or manifest["suite_tree_sha256"] != suite_digest.hexdigest()
             or any(
-                not isinstance(path, str)
-                or path.startswith("/")
-                or "\\" in path
-                or any(part in {"", ".", ".."} for part in path.split("/"))
-                or not (path == "node/bin/node" or path.startswith("browsers/") or path.startswith("web/node_modules/"))
+                not _valid_engine_file_path(path)
                 or not isinstance(file_digest, str)
                 or re.fullmatch(r"[0-9a-f]{64}", file_digest) is None
                 for path, file_digest in engine_files.items()
             )
+            or any(
+                not isinstance(path, str)
+                or not isinstance(target, str)
+                or not _valid_engine_file_path(path)
+                for path, target in engine_links.items()
+            )
             or "node/bin/node" not in engine_files
             or any(
-                not any(path.startswith(f"browsers/{browser_root}/") for path in engine_files)
+                not any(
+                    path.startswith(f"browsers/{browser_root}/")
+                    for path in engine_files.keys() | engine_links.keys()
+                )
                 for browser_root in LIVE_QA_BROWSER_ROOTS
             )
             or not {
@@ -645,21 +796,32 @@ def _validate_liveqa_runtime(
             or any(path.startswith(("node/", "browsers/", "web/node_modules/")) for path in files)
         ):
             raise ArtifactError("source-only liveqa-runtime manifest is invalid")
-        engine_digest = hashlib.sha256(
-            b"oldsparky-liveqa-engine-v1\0"
-            + PINNED_NODE_VERSION.encode("ascii")
-            + b"\0"
-            + lock_digest.encode("ascii")
-            + b"\0"
-        )
-        for relative, file_digest in sorted(engine_files.items()):
-            engine_digest.update(relative.encode("utf-8") + b"\0f\0")
-            engine_digest.update(bytes.fromhex(file_digest))
-        if manifest.get("engine_tree_sha256") != engine_digest.hexdigest():
-            raise ArtifactError("source-only liveqa-runtime engine reference digest is invalid")
+        if version == 2:
+            engine_digest = hashlib.sha256(
+                b"oldsparky-liveqa-engine-v1\0"
+                + PINNED_NODE_VERSION.encode("ascii")
+                + b"\0"
+                + lock_digest.encode("ascii")
+                + b"\0"
+            )
+            for relative, file_digest in sorted(engine_files.items()):
+                engine_digest.update(relative.encode("utf-8") + b"\0f\0")
+                engine_digest.update(bytes.fromhex(file_digest))
+            if manifest.get("engine_tree_sha256") != engine_digest.hexdigest():
+                raise ArtifactError("source-only liveqa-runtime engine reference digest is invalid")
+        else:
+            _validate_engine_links(engine_files, engine_links)
+            engine_digest = _engine_reference_digest(
+                engine_files,
+                engine_links,
+                node_version=PINNED_NODE_VERSION,
+                package_lock_sha256=lock_digest,
+            )
+            if manifest.get("engine_tree_sha256") != engine_digest:
+                raise ArtifactError("source-only liveqa-runtime engine reference digest is invalid")
     elif (
         set(manifest) != {"version", "node_version", "package_lock_sha256", "tree_sha256", "files"}
-        or manifest.get("version") != 1
+        or version != 1
         or manifest.get("node_version") != PINNED_NODE_VERSION
         or not isinstance(manifest.get("tree_sha256"), str)
         or re.fullmatch(r"[0-9a-f]{64}", manifest["tree_sha256"]) is None

@@ -1973,6 +1973,40 @@ test("patch detail keeps objective sections, the upper cover crop, and no source
   await expectNoHorizontalOverflow(page);
 });
 
+test("patch detail renders source icons for both objective sections", async ({ page }) => {
+  const urnIconUrl = "https://assets-bucket.deadlock-api.com/assets-api-res/icons/minimap/soul_jar_marker_psd.png";
+  const unstableRiftIconUrl = "https://assets-bucket.deadlock-api.com/assets-api-res/icons/minimap/minimap_icon_koth.png";
+  await page.route("https://assets-bucket.deadlock-api.com/**", async (route) => {
+    await route.fulfill({
+      body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+      contentType: "image/png",
+      status: 200
+    });
+  });
+  await page.route("**/api/v1/content/patches/1836506165584438", async (route) => {
+    const response = await route.fetch();
+    const payload: { sections: Array<Record<string, unknown>> } = await response.json();
+    const sections = payload.sections.map((section) => (
+      section.objective_key === "unstable_rift"
+        ? { ...section, objective_icon_url: unstableRiftIconUrl }
+        : section
+    ));
+    await route.fulfill({ response, json: { ...payload, sections } });
+  });
+  await page.goto("/patches/1836506165584438");
+
+  const objectives = page.locator(".objective-patch-section");
+  await expect(objectives).toHaveCount(2);
+  const sourceIcons = objectives.locator('.patch-objective-image[data-objective-icon="source"]');
+  await expect(sourceIcons).toHaveCount(2);
+  await expect(sourceIcons.nth(0)).toHaveAttribute("src", urnIconUrl);
+  await expect(sourceIcons.nth(1)).toHaveAttribute("src", unstableRiftIconUrl);
+  await expect(objectives.locator('.patch-objective-fallback[data-objective-icon="fallback"]')).toHaveCount(0);
+  await expect.poll(async () => sourceIcons.evaluateAll((images) => images.every(
+    (image) => (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
+  ))).toBe(true);
+});
+
 test("featured patch shows NEW only during its first three days", async ({ page }, testInfo) => {
   let publishedAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
   await page.route("**/api/v1/content/home", async (route) => {

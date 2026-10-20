@@ -872,6 +872,153 @@ def _active_release_commit(app_dir: Path = APP_DIR) -> str:
     return _release_pointer_commit("current", app_dir)
 
 
+def _provider_link_map(provider: object) -> dict[str, str]:
+    """Validate the closed browser-link namespace shared by runtime v3."""
+
+    if not isinstance(provider, dict):
+        raise GuardError("active live-QA engine provider identity is invalid")
+    links = provider.get("engine_links", {})
+    files = provider.get("engine_files")
+    if not isinstance(links, dict) or not isinstance(files, dict):
+        raise GuardError("active live-QA engine provider link map is invalid")
+    if (
+        any(not isinstance(path, str) for path in files)
+        or set(files) & set(links)
+        or len(links) > MAX_ZIP_ENTRIES
+    ):
+        raise GuardError("active live-QA engine provider link map is invalid")
+    paths = set(files) | set(links)
+    if any(
+        "/".join(parts[:index]) in paths
+        for path in paths
+        for parts in (path.split("/"),)
+        for index in range(1, len(parts))
+    ):
+        raise GuardError("active live-QA engine provider link map has a path conflict")
+    terminals: dict[str, str] = {}
+    for alias, target in links.items():
+        if (
+            not isinstance(alias, str)
+            or not isinstance(target, str)
+            or "\\" in alias
+            or "\\" in target
+            or alias.startswith("/")
+            or target.startswith("/")
+            or "\x00" in alias
+            or "\x00" in target
+        ):
+            raise GuardError("active live-QA engine provider link map is invalid")
+        alias_parts = alias.split("/")
+        if (
+            len(alias_parts) < 3
+            or alias_parts[0] != "browsers"
+            or alias_parts[1] not in LIVE_QA_BROWSER_ROOTS
+            or any(part in {"", ".", ".."} for part in alias_parts)
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in alias)
+        ):
+            raise GuardError("active live-QA engine provider link map is invalid")
+        target_parts = target.split("/")
+        if (
+            not target_parts
+            or any(part in {"", "."} for part in target_parts)
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in target)
+        ):
+            raise GuardError("active live-QA engine provider link target is invalid")
+        resolved = alias_parts[:-1]
+        for part in target_parts:
+            if part == "..":
+                if len(resolved) <= 2:
+                    raise GuardError("active live-QA engine provider link escapes its browser root")
+                resolved.pop()
+            else:
+                resolved.append(part)
+        terminal = "/".join(resolved)
+        if resolved[:2] != alias_parts[:2] or len(resolved) < 3:
+            raise GuardError("active live-QA engine provider link escapes its browser root")
+        terminals[alias] = terminal
+    for alias in links:
+        current = alias
+        visited: set[str] = set()
+        while current in terminals:
+            if current in visited:
+                raise GuardError("active live-QA engine provider link map contains a cycle")
+            visited.add(current)
+            current = terminals[current]
+        if current not in files:
+            raise GuardError("active live-QA engine provider link target is not a regular file")
+    return links
+
+
+def _active_payload_provider_files(
+    payload_root: Path,
+    source_sha: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return only source-owned v2 provider aliases materialized in a payload."""
+
+    provider_path = payload_root / "runtime-provider.json"
+    try:
+        metadata = provider_path.lstat()
+    except FileNotFoundError:
+        return {}, {}
+    except OSError as exc:
+        raise GuardError("active live-QA engine provider is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o444
+        or metadata.st_size > MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES
+    ):
+        raise GuardError("active live-QA engine provider metadata is unsafe")
+    try:
+        provider = json.loads(provider_path.read_text(encoding="ascii"), object_pairs_hook=_strict_object)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise GuardError("active live-QA engine provider is unavailable") from exc
+    version = provider.get("version") if isinstance(provider, dict) else None
+    if version == 1:
+        return {}, {}
+    if version != 2:
+        raise GuardError("active live-QA engine provider identity is invalid")
+    expected = {
+        "version", "source_sha", "provider_sha", "engine_tree_sha256",
+        "node_version", "package_lock_sha256", "engine_files", "engine_links",
+    }
+    if (
+        set(provider) != expected
+        or provider.get("source_sha") != source_sha
+        or not isinstance(provider.get("provider_sha"), str)
+        or not COMMIT_PATTERN.fullmatch(provider["provider_sha"])
+    ):
+        raise GuardError("active live-QA engine provider identity is invalid")
+    links = _provider_link_map(provider)
+    if provider.get("provider_sha") != source_sha:
+        return {}, {}
+    engine_files = provider["engine_files"]
+    if any(
+        not isinstance(relative, str)
+        or relative.startswith("/")
+        or "\\" in relative
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+        or not isinstance(digest, str)
+        or not DIGEST_PATTERN.fullmatch(digest)
+        for relative, digest in engine_files.items()
+    ):
+        raise GuardError("active live-QA engine provider file map is invalid")
+    if not isinstance(provider.get("package_lock_sha256"), str) or not DIGEST_PATTERN.fullmatch(
+        provider["package_lock_sha256"]
+    ):
+        raise GuardError("active live-QA engine provider package lock identity is invalid")
+    expected_files = {
+        relative: digest
+        for relative, digest in engine_files.items()
+        if relative not in links
+    }
+    expected_files["web/package-lock.json"] = provider["package_lock_sha256"]
+    return links, expected_files
+
+
 def _validate_installed_payload_root(
     payload_root: Path,
     *,
@@ -987,14 +1134,44 @@ def _validate_installed_payload_root(
         raise GuardError("installed live-QA payload root metadata is unsafe")
     digest = hashlib.sha256()
     files: dict[str, str] = {}
+    payload_links, payload_provider_files = _active_payload_provider_files(
+        payload_root, source_sha
+    )
+    expected_links = {
+        f"provider-runtime/{relative}": target
+        for relative, target in payload_links.items()
+    }
+    seen_links: dict[str, str] = {}
     total = 0
     for path in sorted(payload_root.rglob("*")):
         relative = path.relative_to(payload_root).as_posix()
         item = path.lstat()
         if stat.S_ISLNK(item.st_mode):
-            raise GuardError("installed live-QA payload contains a symlink")
+            target = os.readlink(path)
+            if (
+                relative not in expected_links
+                or target != expected_links[relative]
+                or item.st_uid != 0
+                or item.st_gid != 0
+                or item.st_nlink != 1
+                or item.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+                or not relative.startswith("provider-runtime/browsers/")
+            ):
+                raise GuardError("installed live-QA payload contains an undeclared symlink")
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to((payload_root / "provider-runtime").resolve(strict=True))
+                if not stat.S_ISREG(resolved.lstat().st_mode):
+                    raise ValueError("link target is not a regular file")
+            except (OSError, ValueError) as exc:
+                raise GuardError("installed live-QA payload symlink target is unsafe") from exc
+            seen_links[relative] = target
+            digest.update(relative.encode("utf-8") + b"\0l\0" + target.encode("utf-8") + b"\0")
+            continue
         digest.update(relative.encode("utf-8") + b"\0")
         if stat.S_ISDIR(item.st_mode):
+            if relative.startswith("provider-runtime/") and not payload_provider_files:
+                raise GuardError("installed live-QA payload has an unbound provider tree")
             if (
                 item.st_uid != 0
                 or item.st_gid != 0
@@ -1033,8 +1210,22 @@ def _validate_installed_payload_root(
         ):
             raise GuardError("installed Chromium sandbox checksum is invalid")
         files[relative] = file_digest
+        if relative.startswith("provider-runtime/"):
+            provider_relative = relative.removeprefix("provider-runtime/")
+            if payload_provider_files.get(provider_relative) != file_digest:
+                raise GuardError("installed live-QA payload provider file map is invalid")
         digest.update(b"f\0" + bytes.fromhex(file_digest))
-    if digest.hexdigest() != manifest["payload_tree_sha256"] or files != manifest["files"]:
+    if (
+        seen_links != expected_links
+        or {
+            path.removeprefix("provider-runtime/"): digest
+            for path, digest in files.items()
+            if path.startswith("provider-runtime/")
+        }
+        != payload_provider_files
+        or digest.hexdigest() != manifest["payload_tree_sha256"]
+        or files != manifest["files"]
+    ):
         raise GuardError("installed live-QA payload digest does not match manifest")
     return source_sha
 
@@ -1289,6 +1480,11 @@ def _validate_trusted_wrapper(argv: list[str], *, recovery: bool) -> None:
     if executable != expected or executable.name not in allowed:
         raise GuardError("locked exec target is not a reviewed live QA wrapper")
     _assert_root_controlled_path(executable, directory=False)
+    if executable.name == "platform_live_browser_qa.sh" and argv[1:2] == [
+        "engine-preflight"
+    ]:
+        if argv[1:] != ["engine-preflight"] or installed_root is None:
+            raise GuardError("engine preflight requires one installed wrapper argument")
     if recovery:
         if (
             executable.name == "platform_live_user_qa.sh"
@@ -3859,10 +4055,13 @@ def _trusted_runtime_root() -> Path:
         provider = json.loads(provider_raw.decode("ascii"), object_pairs_hook=_strict_object)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise GuardError("active live-QA engine provider is unavailable") from exc
+    provider_version = provider.get("version") if isinstance(provider, dict) else None
     required = {
         "version", "source_sha", "provider_sha", "engine_tree_sha256",
         "node_version", "package_lock_sha256", "engine_files",
     }
+    if provider_version == 2:
+        required.add("engine_links")
     if (
         stat.S_ISLNK(provider_meta.st_mode)
         or not stat.S_ISREG(provider_meta.st_mode)
@@ -3870,9 +4069,9 @@ def _trusted_runtime_root() -> Path:
         or provider_meta.st_gid != 0
         or provider_meta.st_nlink != 1
         or stat.S_IMODE(provider_meta.st_mode) != 0o444
-        or not isinstance(provider, dict)
+        or type(provider_version) is not int
+        or provider_version not in {1, 2}
         or set(provider) != required
-        or provider.get("version") != 1
         or provider.get("source_sha") != source_sha
         or not isinstance(provider.get("provider_sha"), str)
         or not COMMIT_PATTERN.fullmatch(provider["provider_sha"])
@@ -3884,6 +4083,7 @@ def _trusted_runtime_root() -> Path:
         or not isinstance(provider.get("engine_files"), dict)
     ):
         raise GuardError("active live-QA engine provider identity is invalid")
+    engine_links = _provider_link_map(provider) if provider_version == 2 else {}
     try:
         suite_manifest = json.loads(
             (payload_root / "runtime/runtime-manifest.json").read_text(encoding="ascii"),
@@ -3893,16 +4093,17 @@ def _trusted_runtime_root() -> Path:
         raise GuardError("active live-QA suite manifest is unavailable") from exc
     if (
         not isinstance(suite_manifest, dict)
-        or suite_manifest.get("version") != 2
+        or suite_manifest.get("version") != provider_version + 1
         or suite_manifest.get("node_version") != provider.get("node_version")
         or suite_manifest.get("package_lock_sha256") != provider.get("package_lock_sha256")
         or suite_manifest.get("engine_tree_sha256") != provider.get("engine_tree_sha256")
         or suite_manifest.get("engine_files") != provider.get("engine_files")
+        or suite_manifest.get("engine_links", {}) != engine_links
     ):
         raise GuardError("active live-QA suite and engine provider disagree")
     provider_sha = provider["provider_sha"]
     provider_payload = TRUSTED_PAYLOAD_ROOT / provider_sha
-    provider_root = provider_payload / "runtime"
+    provider_root = provider_payload / ("provider-runtime" if provider_version == 2 else "runtime")
     source_marker = provider_payload / "source-sha"
     recovered_provider = False
     try:
@@ -3928,7 +4129,7 @@ def _trusted_runtime_root() -> Path:
             provider_entries = {entry.name for entry in provider_payload.iterdir()}
         except OSError as entry_exc:
             raise GuardError("referenced live-QA engine provider is unavailable") from entry_exc
-        if provider_sha != PROVIDER_RECOVERY_SOURCE_SHA or provider_entries != {"runtime"}:
+        if provider_version != 1 or provider_sha != PROVIDER_RECOVERY_SOURCE_SHA or provider_entries != {"runtime"}:
             raise GuardError("referenced live-QA engine provider is unavailable") from exc
         recorded_source = None
         recovered_provider = True
@@ -3957,40 +4158,99 @@ def _trusted_runtime_root() -> Path:
         )
     ):
         raise GuardError("referenced live-QA engine provider metadata is unsafe")
+    try:
+        provider_entries = {entry.name for entry in provider_payload.iterdir()}
+    except OSError as exc:
+        raise GuardError("referenced live-QA engine provider is unavailable") from exc
+    expected_provider_entries = {
+        "provider-runtime" if provider_version == 2 else "runtime",
+        "source-sha",
+    }
+    if recovered_provider:
+        expected_provider_entries = {"runtime"}
+    if provider_entries != expected_provider_entries:
+        raise GuardError("referenced live-QA engine provider has unexpected entries")
     expected_files = provider["engine_files"]
     if any(
         not isinstance(path, str)
         or path.startswith("/")
         or "\\" in path
         or any(part in {"", ".", ".."} for part in path.split("/"))
-        or not (path == "node/bin/node" or path.startswith("browsers/") or path.startswith("web/node_modules/"))
+        or not (
+            path == "node/bin/node"
+            or any(path.startswith(f"browsers/{browser}/") for browser in LIVE_QA_BROWSER_ROOTS)
+            or any(
+                path == package_root or path.startswith(package_root + "/")
+                for package_root in (
+                    "web/node_modules/@playwright/test",
+                    "web/node_modules/playwright",
+                    "web/node_modules/playwright-core",
+                )
+            )
+        )
+        or "node_modules" in path.split("/")[3:]
         or not isinstance(digest, str)
         or not DIGEST_PATTERN.fullmatch(digest)
         for path, digest in expected_files.items()
     ):
         raise GuardError("active live-QA engine file map is invalid")
     actual_files: dict[str, str] = {}
+    actual_links: dict[str, str] = {}
     for path in sorted(provider_root.rglob("*")):
         relative = path.relative_to(provider_root).as_posix()
         metadata = path.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+        if metadata.st_uid != 0 or metadata.st_gid != 0:
             raise GuardError("referenced live-QA engine provider contains unsafe metadata")
+        if stat.S_ISLNK(metadata.st_mode):
+            target = os.readlink(path)
+            if provider_version != 2:
+                raise GuardError("referenced live-QA engine provider contains unsafe metadata")
+            if (
+                relative not in engine_links
+                or target != engine_links[relative]
+                or metadata.st_nlink != 1
+                or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+                or not relative.startswith("browsers/")
+            ):
+                raise GuardError("referenced live-QA engine provider contains an undeclared link")
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(provider_root.resolve(strict=True))
+                if not stat.S_ISREG(resolved.lstat().st_mode):
+                    raise ValueError("link target is not a regular file")
+            except (OSError, ValueError) as exc:
+                raise GuardError("referenced live-QA engine provider link target is unsafe") from exc
+            actual_links[relative] = target
+            continue
         if stat.S_ISDIR(metadata.st_mode):
             if stat.S_IMODE(metadata.st_mode) != 0o555 or metadata.st_nlink < 2:
                 raise GuardError("referenced live-QA engine provider directory is unsafe")
             if relative.split("/", 1)[0] not in {"node", "browsers", "web"}:
                 raise GuardError("referenced live-QA engine provider has an unreviewed directory")
-            if relative.startswith("web/") and relative not in {
-                "web/tests", "web/tests/smoke", "web/tests/support",
-                "web/node_modules", "web/node_modules/@playwright",
-                "web/node_modules/@playwright/test", "web/node_modules/playwright",
-                "web/node_modules/playwright-core",
-            } and not any(relative.startswith(prefix) for prefix in (
-                "web/node_modules/@playwright/test/",
-                "web/node_modules/playwright/",
-                "web/node_modules/playwright-core/",
-            )):
-                raise GuardError("referenced live-QA engine provider has an unreviewed directory")
+            if relative.startswith("web/"):
+                allowed_web_directories = {
+                    "web/node_modules",
+                    "web/node_modules/@playwright",
+                    "web/node_modules/@playwright/test",
+                    "web/node_modules/playwright",
+                    "web/node_modules/playwright-core",
+                }
+                if provider_version == 1:
+                    allowed_web_directories.update(
+                        {"web/tests", "web/tests/smoke", "web/tests/support"}
+                    )
+                package_subtree = any(
+                    relative.startswith(prefix)
+                    for prefix in (
+                        "web/node_modules/@playwright/test/",
+                        "web/node_modules/playwright/",
+                        "web/node_modules/playwright-core/",
+                    )
+                )
+                if relative not in allowed_web_directories and not package_subtree:
+                    raise GuardError(
+                        "referenced live-QA engine provider has an unreviewed directory"
+                    )
             continue
         allowed_modes = {0o4755} if relative == CHROMIUM_SANDBOX_RELATIVE.as_posix() else {0o444, 0o555}
         if (
@@ -4005,20 +4265,33 @@ def _trusted_runtime_root() -> Path:
                 expected_uid=0,
                 maximum=MAX_ZIP_MEMBER_BYTES,
             )
-        elif relative not in {
-            "web/package-lock.json", "web/playwright.live.config.ts",
+        elif relative == "web/package-lock.json":
+            pass
+        elif provider_version == 1 and relative in {
+            "web/playwright.live.config.ts",
             "web/tests/smoke/live-launch.spec.ts",
             "web/tests/smoke/live-user-journey.spec.ts",
-            "web/tests/support/live-qa-origin.ts", "web/tests/support/live-qa-sandbox.ts",
+            "web/tests/support/live-qa-origin.ts",
+            "web/tests/support/live-qa-sandbox.ts",
+            "web/tests/support/live-count-reporter.cjs",
+            "web/tests/support/live-engine-preflight.cjs",
             "runtime-manifest.json",
-        } and not any(relative.startswith(prefix) for prefix in (
+        }:
+            pass
+        elif provider_version == 1 and any(
+            relative.startswith(prefix)
+            for prefix in (
                 "web/node_modules/@playwright/test/",
                 "web/node_modules/playwright/",
                 "web/node_modules/playwright-core/",
-        )):
+            )
+        ):
+            pass
+        else:
             raise GuardError("referenced live-QA engine provider contains an unreviewed file")
     if (
         actual_files != expected_files
+        or actual_links != engine_links
         or expected_files.get(CHROMIUM_SANDBOX_RELATIVE.as_posix()) != CHROMIUM_SANDBOX_SHA256
         or not {"node/bin/node"}.issubset(expected_files)
         or not all(any(path.startswith(f"browsers/{browser}/") for path in expected_files) for browser in LIVE_QA_BROWSER_ROOTS)
@@ -4027,12 +4300,18 @@ def _trusted_runtime_root() -> Path:
     ):
         raise GuardError("referenced live-QA engine provider digest does not match")
     digest = hashlib.sha256(
-        b"oldsparky-liveqa-engine-v1\0" + NODE_VERSION.encode("ascii") + b"\0"
+        (b"oldsparky-liveqa-engine-v2\0" if provider_version == 2 else b"oldsparky-liveqa-engine-v1\0") + NODE_VERSION.encode("ascii") + b"\0"
         + provider["package_lock_sha256"].encode("ascii") + b"\0"
     )
-    for relative, file_digest in sorted(actual_files.items()):
-        digest.update(relative.encode("utf-8") + b"\0f\0")
-        digest.update(bytes.fromhex(file_digest))
+    for relative in sorted(
+        actual_files.keys() | actual_links.keys(),
+        key=lambda value: PurePosixPath(value).parts,
+    ):
+        digest.update(relative.encode("utf-8") + b"\0")
+        if relative in actual_files:
+            digest.update(b"f\0" + bytes.fromhex(actual_files[relative]))
+        else:
+            digest.update(b"l\0" + actual_links[relative].encode("utf-8") + b"\0")
     if digest.hexdigest() != provider["engine_tree_sha256"]:
         raise GuardError("referenced live-QA engine provider digest does not match")
     return provider_root
@@ -6525,7 +6804,7 @@ def _is_fixed_live_browser_command(command: list[str]) -> bool:
     ):
         return False
     tail = command[separator + 3 :]
-    if len(tail) < 5:
+    if len(tail) < 2:
         return False
     env_keys = {
         "CHROME_DEVEL_SANDBOX",
@@ -6554,7 +6833,7 @@ def _is_fixed_live_browser_command(command: list[str]) -> bool:
         if key not in env_keys or not re.fullmatch(r"[A-Z0-9_]+", key):
             return False
         env_end += 1
-    if env_end == 0 or env_end + 5 > len(tail):
+    if env_end == 0 or env_end + 2 > len(tail):
         return False
     def runtime_root_ok(value: str) -> bool:
         return value.startswith(
@@ -6564,11 +6843,30 @@ def _is_fixed_live_browser_command(command: list[str]) -> bool:
                 "/root/.oldsparky/liveqa/releases/",
             )
         )
-    node, cli, subcommand, config, spec, *extra = tail[env_end:]
+    node, executable, *arguments = tail[env_end:]
+    if not runtime_root_ok(node) or not node.endswith("/node/bin/node"):
+        return False
     if (
-        not runtime_root_ok(node)
-        or not node.endswith("/node/bin/node")
-        or not runtime_root_ok(cli)
+        not arguments
+        and (
+            re.fullmatch(
+                r"/var/lib/oldsparky-liveqa/runtime-suite-[0-9a-f]{40}-[a-z0-9_]{8}"
+                r"/web/tests/support/live-engine-preflight\.cjs",
+                executable,
+            )
+            or re.fullmatch(
+                r"/root/\.oldsparky/liveqa/releases/[0-9a-f]{40}/runtime"
+                r"/web/tests/support/live-engine-preflight\.cjs",
+                executable,
+            )
+        )
+    ):
+        return True
+    if len(arguments) < 3:
+        return False
+    cli, subcommand, config, spec, *extra = [executable, *arguments]
+    if (
+        not runtime_root_ok(cli)
         or not cli.endswith("/web/node_modules/@playwright/test/cli.js")
         or subcommand != "test"
         or not config.startswith("--config=")

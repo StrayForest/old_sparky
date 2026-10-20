@@ -287,6 +287,7 @@ LIVE_LAUNCH_CHECK_IDS = frozenset(
         "generation_supervisor_metadata",
         "generation_manifest",
         "identity",
+        "engine_preflight",
         "account_install",
         "provision",
         "browser_qa",
@@ -321,6 +322,7 @@ LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES = frozenset(
         "validation",
         "trusted_generation",
         "identity",
+        "engine_preflight",
         "account_install",
         "provision",
         "browser_qa",
@@ -336,14 +338,14 @@ LIVE_LAUNCH_FAILURE_STAGES = LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES | frozenset(
 )
 LIVE_LAUNCH_STATUS_RE = re.compile(
     rb"LIVE_LAUNCH_STATUS schema=2 status=(?P<status>passed|failed) "
-    rb"stage=(?P<stage>validation|trusted_generation|identity|account_install|"
+    rb"stage=(?P<stage>validation|trusted_generation|identity|engine_preflight|account_install|"
     rb"provision|browser_qa|dispatch|trusted_entry|timeout|complete) "
     rb"check=(?P<check>none|input_shape|input_validation|source_binding|"
     rb"source_binding_io|source_binding_schema|source_binding_recheck|root_uid|"
     rb"source_identity|install_root_format|origin|install_root_target|"
     rb"provision_mode|provision_marker|marker_absent|marker_digest|"
     rb"generation_members|generation_supervisor_path|"
-    rb"generation_supervisor_metadata|generation_manifest|identity|"
+    rb"generation_supervisor_metadata|generation_manifest|identity|engine_preflight|"
     rb"account_install|provision|browser_qa|release_lock|trusted_entry|"
     rb"supervisor_exec|dispatch|timeout|stream_limit|protocol) "
     rb"child_exit=(?P<child_exit>0|[1-9][0-9]{0,2}) "

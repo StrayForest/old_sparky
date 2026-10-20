@@ -20,8 +20,9 @@ SCRIPT_PATH="$TOOLS_DIR/platform_live_browser_qa.sh"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 
 if ! { (( $# == 1 )) && [[ "$1" == "public" ]]; } \
+  && ! { (( $# == 1 )) && [[ "$1" == "engine-preflight" && "$TRUSTED_MODE" == "1" ]]; } \
   && ! { (( $# == 2 )) && [[ "$1" == "recover" && "$2" == /* ]]; }; then
-  echo "Usage: $0 public | $0 recover /run/oldsparky-liveqa/public-live-qa.<suffix>" >&2
+  echo "Usage: $0 public | $0 engine-preflight | $0 recover /run/oldsparky-liveqa/public-live-qa.<suffix>" >&2
   exit 2
 fi
 if [[ "$EUID" -ne 0 ]]; then
@@ -79,9 +80,12 @@ if (( $# == 2 )); then
   echo "Interrupted public browser gate was removed exactly."
   exit 0
 fi
-"${GUARD[@]}" preflight \
-  --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
-  --mode automated
+QA_MODE="$1"
+if [[ "$QA_MODE" == "public" ]]; then
+  "${GUARD[@]}" preflight \
+    --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
+    --mode automated
+fi
 if (( TRUSTED_MODE == 1 )); then
   "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
 fi
@@ -95,7 +99,7 @@ EXPECTED_ENVIRONMENT="$(
 )"
 if [[ "$EXPECTED_ENVIRONMENT" != "production" \
   || "$EXPECTED_LIVE_ORIGIN" != "https://old-sparky.com" \
-  || -n "${PLAYWRIGHT_LIVE_BASE_URL:-}" \
+  || "$QA_MODE" == "public" && -n "${PLAYWRIGHT_LIVE_BASE_URL:-}" \
   && "$PLAYWRIGHT_LIVE_BASE_URL" != "$EXPECTED_LIVE_ORIGIN" ]]; then
   echo "Production browser QA requires the canonical production origin." >&2
   exit 1
@@ -163,7 +167,7 @@ cleanup_gate() {
 }
 trap cleanup_gate EXIT INT TERM HUP
 
-if (( TRUSTED_MODE == 1 )); then
+if (( TRUSTED_MODE == 1 )) && [[ "$QA_MODE" == "public" ]]; then
   # Private diagnostics are auxiliary: a store problem must not skip the
   # browser suite or turn a passing suite into a failure. Failed counts below
   # still require successful publication and emit the fixed unavailable kind.
@@ -206,6 +210,35 @@ fi
 
 browser_status=0
 browser_diagnostic=""
+CHILD_COMMAND=(
+  /usr/bin/env -i
+  "CHROME_DEVEL_SANDBOX=$CHROMIUM_SANDBOX"
+  "HOME=$BROWSER_GATE/home"
+  LANG=C.UTF-8
+  "NODE_PATH=$RUNTIME_CACHE/web/node_modules"
+  "PATH=$RUNTIME_CACHE/node/bin:/usr/bin:/bin"
+  "PLATFORM_LIVE_EXPECTED_ORIGIN=$EXPECTED_LIVE_ORIGIN"
+  "PLATFORM_LIVE_USER_QA_UID=$LIVE_QA_UID"
+  "PLATFORM_QA_BROWSER_GATE_DIR=$BROWSER_GATE"
+  "PLATFORM_LIVE_QA_RUNNER_SHA=$LIVE_QA_RUNNER_SHA"
+  "PLATFORM_LIVE_QA_TARGET_SHA=$LIVE_QA_TARGET_SHA"
+  "PLATFORM_LIVE_QA_MARKER_SHA256=$LIVE_QA_MARKER_SHA256"
+  "PLAYWRIGHT_BROWSERS_PATH=$RUNTIME_CACHE/browsers"
+  "PLAYWRIGHT_LIVE_BASE_URL=$EXPECTED_LIVE_ORIGIN"
+  "TMPDIR=$BROWSER_GATE/tmp"
+  "XDG_CACHE_HOME=$BROWSER_GATE/home/.cache"
+  "$RUNTIME_NODE"
+)
+if [[ "$QA_MODE" == "engine-preflight" ]]; then
+  CHILD_COMMAND+=("$RUNTIME_SUITE/web/tests/support/live-engine-preflight.cjs")
+else
+  CHILD_COMMAND+=(
+    "$RUNTIME_CACHE/web/node_modules/@playwright/test/cli.js"
+    test
+    "--config=$RUNTIME_SUITE/web/playwright.live.config.ts"
+    "$RUNTIME_SUITE/web/tests/smoke/live-launch.spec.ts"
+  )
+fi
 if browser_diagnostic="$("${GUARD[@]}" capture-qa-browser-child -- \
   /usr/bin/systemd-run \
   --no-ask-password \
@@ -227,27 +260,7 @@ if browser_diagnostic="$("${GUARD[@]}" capture-qa-browser-child -- \
   --property=UMask=0077 \
   "${SYSTEMD_BIND_ARGS[@]}" \
   -- \
-  /usr/bin/env -i \
-    CHROME_DEVEL_SANDBOX="$CHROMIUM_SANDBOX" \
-    HOME="$BROWSER_GATE/home" \
-    LANG=C.UTF-8 \
-    NODE_PATH="$RUNTIME_CACHE/web/node_modules" \
-    PATH="$RUNTIME_CACHE/node/bin:/usr/bin:/bin" \
-    PLATFORM_LIVE_EXPECTED_ORIGIN="$EXPECTED_LIVE_ORIGIN" \
-    PLATFORM_LIVE_USER_QA_UID="$LIVE_QA_UID" \
-    PLATFORM_QA_BROWSER_GATE_DIR="$BROWSER_GATE" \
-    PLATFORM_LIVE_QA_RUNNER_SHA="$LIVE_QA_RUNNER_SHA" \
-    PLATFORM_LIVE_QA_TARGET_SHA="$LIVE_QA_TARGET_SHA" \
-    PLATFORM_LIVE_QA_MARKER_SHA256="$LIVE_QA_MARKER_SHA256" \
-    PLAYWRIGHT_BROWSERS_PATH="$RUNTIME_CACHE/browsers" \
-    PLAYWRIGHT_LIVE_BASE_URL="$EXPECTED_LIVE_ORIGIN" \
-    TMPDIR="$BROWSER_GATE/tmp" \
-    XDG_CACHE_HOME="$BROWSER_GATE/home/.cache" \
-    "$RUNTIME_NODE" \
-      "$RUNTIME_CACHE/web/node_modules/@playwright/test/cli.js" \
-      test \
-      --config="$RUNTIME_SUITE/web/playwright.live.config.ts" \
-      "$RUNTIME_SUITE/web/tests/smoke/live-launch.spec.ts"
+  "${CHILD_COMMAND[@]}"
 )"; then
   browser_status=0
 else
@@ -269,6 +282,14 @@ if [[ "$browser_diagnostic" =~ ^LIVE_QA_CHILD_DIAGNOSTIC\ schema=1\ kind=(none|p
 else
   browser_status=2
   diagnostic_child_exit=2
+fi
+if [[ "$QA_MODE" == "engine-preflight" ]]; then
+  if (( browser_status == 0 && diagnostic_valid == 1 )) \
+    && [[ "$diagnostic_kind" == "none" && "$diagnostic_child_exit" == "0" ]]; then
+    exit 0
+  fi
+  (( browser_status != 0 )) || browser_status=1
+  exit "$browser_status"
 fi
 
 count_status=0

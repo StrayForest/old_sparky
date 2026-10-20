@@ -100,6 +100,7 @@ RUNTIME_SOURCE_FILES = (
     "tests/support/live-qa-origin.ts",
     "tests/support/live-qa-sandbox.ts",
     "tests/support/live-count-reporter.cjs",
+    "tests/support/live-engine-preflight.cjs",
     "package-lock.json",
 )
 PLAYWRIGHT_PACKAGES = (
@@ -558,11 +559,16 @@ def _copy_materialized_file(
         raise
 
 
-def _materialize_browser_tree(root: Path, *, total_before: int) -> None:
-    """Turn only validated browser symlink files into immutable regular files."""
+def _materialize_browser_tree(
+    root: Path,
+    *,
+    total_before: int,
+    preserve_links: bool = False,
+) -> dict[str, str]:
+    """Validate browser aliases, optionally retaining their exact link targets."""
 
     _validate_browser_directory(root)
-    links: list[tuple[Path, Path, tuple[int, int]]] = []
+    links: list[tuple[Path, Path, tuple[int, int], str]] = []
     regular_total = total_before
     regular_count = 0
     link_count = 0
@@ -578,7 +584,16 @@ def _materialize_browser_tree(root: Path, *, total_before: int) -> None:
                 reason = "link-hardlink" if metadata.st_nlink != 1 else "link-ownership"
                 raise RuntimeBuildError("browser link metadata is unsafe", reason=reason)
             terminal = _resolve_browser_terminal(root, path)
-            links.append((path, terminal, (metadata.st_dev, metadata.st_ino)))
+            try:
+                link_target = os.readlink(path)
+            except OSError as exc:
+                raise RuntimeBuildError(
+                    "browser link target is unavailable",
+                    reason="unsafe-link",
+                ) from exc
+            links.append(
+                (path, terminal, (metadata.st_dev, metadata.st_ino), link_target)
+            )
             regular_total += terminal.stat().st_size
             link_count += 1
         elif stat.S_ISREG(metadata.st_mode):
@@ -602,8 +617,14 @@ def _materialize_browser_tree(root: Path, *, total_before: int) -> None:
             "live-QA runtime exceeds its duplicated-size bound",
             reason="size-limit",
         )
-    for path, terminal, identity in links:
-        _copy_materialized_file(path, terminal, identity)
+    alias_map = {
+        path.relative_to(root).as_posix(): link_target
+        for path, _terminal, _identity, link_target in links
+    }
+    if not preserve_links:
+        for path, terminal, identity, _link_target in links:
+            _copy_materialized_file(path, terminal, identity)
+    return alias_map
 
 
 def _regular_usage(root: Path, *, exclude: Path | None = None) -> int:
@@ -704,18 +725,27 @@ def _runtime_file_map(
     *,
     prefixes: tuple[str, ...],
     excluded_prefixes: tuple[str, ...] = (),
+    links: dict[str, str] | None = None,
 ) -> dict[str, str]:
+    declared_links = links or {}
     files: dict[str, str] = {}
+    seen_links: set[str] = set()
     for path in sorted(output.rglob("*")):
         relative = path.relative_to(output).as_posix()
         if (
-            path.is_dir()
-            or not any(relative.startswith(prefix) for prefix in prefixes)
+            not any(relative.startswith(prefix) for prefix in prefixes)
             or any(relative.startswith(prefix) for prefix in excluded_prefixes)
         ):
             continue
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            if relative not in declared_links or os.readlink(path) != declared_links[relative]:
+                raise RuntimeBuildError("live-QA runtime contains an undeclared browser link")
+            seen_links.add(relative)
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
         if relative == SANDBOX_RELATIVE.as_posix():
-            metadata = path.lstat()
             if (
                 not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_uid != 0
@@ -732,7 +762,32 @@ def _runtime_file_map(
         else:
             _metadata(path)
             files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if seen_links != set(declared_links):
+        raise RuntimeBuildError("live-QA runtime browser link map is invalid")
     return files
+
+
+def _engine_map_digest(
+    files: dict[str, str],
+    links: dict[str, str],
+    *,
+    node_version: str,
+    package_lock_sha256: str,
+) -> str:
+    digest = hashlib.sha256(
+        b"oldsparky-liveqa-engine-v2\0"
+        + node_version.encode("ascii")
+        + b"\0"
+        + package_lock_sha256.encode("ascii")
+        + b"\0"
+    )
+    for relative in sorted(files.keys() | links.keys(), key=_runtime_path_order_key):
+        digest.update(relative.encode("utf-8") + b"\0")
+        if relative in links:
+            digest.update(b"l\0" + links[relative].encode("utf-8") + b"\0")
+        else:
+            digest.update(b"f\0" + bytes.fromhex(files[relative]))
+    return digest.hexdigest()
 
 
 def _remove_tree(root: Path) -> None:
@@ -787,6 +842,7 @@ def build(
         browsers = output / "browsers"
         browsers.mkdir(mode=0o700)
         phase = "download-browser"
+        engine_links: dict[str, str] = {}
         for directory_name, url, checksum, byte_size in guard.PLAYWRIGHT_ARCHIVES:
             browser_root = browsers / directory_name
             guard._download_pinned_zip(
@@ -798,10 +854,19 @@ def build(
             for marker in browser_root.rglob("INSTALLATION_COMPLETE"):
                 marker.unlink()
             phase = "materialize-browser-links"
-            _materialize_browser_tree(
+            browser_links = _materialize_browser_tree(
                 browser_root,
                 total_before=_regular_usage(output, exclude=browser_root),
+                preserve_links=source_only,
             )
+            if source_only:
+                prefix = browser_root.relative_to(output).as_posix()
+                engine_links.update(
+                    {
+                        f"{prefix}/{relative}": target
+                        for relative, target in browser_links.items()
+                    }
+                )
         sandbox = output / SANDBOX_RELATIVE
         sandbox_metadata = sandbox.lstat()
         if (
@@ -818,12 +883,23 @@ def build(
         # Normalize all directories/files before the manifest is computed.
         phase = "normalize"
         for path in sorted(output.rglob("*"), reverse=True):
-            if path.is_symlink():
-                raise RuntimeBuildError(
-                    "live-QA runtime contains a symlink",
-                    reason="unsafe-link",
-                )
-            if path.is_dir():
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                relative = path.relative_to(output).as_posix()
+                if (
+                    not source_only
+                    or relative not in engine_links
+                    or os.readlink(path) != engine_links[relative]
+                    or metadata.st_uid != 0
+                    or metadata.st_gid != 0
+                    or metadata.st_nlink != 1
+                ):
+                    raise RuntimeBuildError(
+                        "live-QA runtime contains an undeclared symlink",
+                        reason="unsafe-link",
+                    )
+                os.chown(path, 0, 0, follow_symlinks=False)
+            elif stat.S_ISDIR(metadata.st_mode):
                 os.chown(path, 0, 0)
                 os.chmod(path, 0o555)
             else:
@@ -836,42 +912,46 @@ def build(
         os.chmod(output, 0o555)
         for directory in [
             output,
-            *sorted((path for path in output.rglob("*") if path.is_dir()), reverse=True),
+            *sorted(
+                (
+                    path
+                    for path in output.rglob("*")
+                    if stat.S_ISDIR(path.lstat().st_mode)
+                ),
+                reverse=True,
+            ),
         ]:
             _fsync_directory(directory)
         phase = "manifest"
-        tree_sha256, files = _tree_digest(output)
         lock_sha256 = hashlib.sha256((web / "package-lock.json").read_bytes()).hexdigest()
         if source_only:
             engine_files = _runtime_file_map(
                 output,
                 prefixes=("node/", "browsers/", "web/node_modules/"),
+                links=engine_links,
             )
             suite_files = _runtime_file_map(
                 output,
                 prefixes=("web/",),
                 excluded_prefixes=("web/node_modules/",),
             )
-            engine_sha256 = _file_map_digest(
+            engine_sha256 = _engine_map_digest(
                 engine_files,
-                domain=(
-                    b"oldsparky-liveqa-engine-v1\0"
-                    + guard.NODE_VERSION.encode("ascii")
-                    + b"\0"
-                    + lock_sha256.encode("ascii")
-                    + b"\0"
-                ),
+                engine_links,
+                node_version=guard.NODE_VERSION,
+                package_lock_sha256=lock_sha256,
             )
             suite_sha256 = _file_map_digest(
                 suite_files,
                 domain=b"oldsparky-liveqa-suite-v1\0",
             )
             manifest = {
-                "version": 2,
+                "version": 3,
                 "node_version": guard.NODE_VERSION,
                 "package_lock_sha256": lock_sha256,
                 "engine_tree_sha256": engine_sha256,
                 "engine_files": engine_files,
+                "engine_links": engine_links,
                 "suite_tree_sha256": suite_sha256,
                 "suite_files": suite_files,
             }
@@ -879,6 +959,7 @@ def build(
                 _remove_tree(component)
             tree_sha256, files = _tree_digest(output)
         else:
+            tree_sha256, files = _tree_digest(output)
             manifest = {
                 "version": 1,
                 "node_version": guard.NODE_VERSION,

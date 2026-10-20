@@ -156,6 +156,10 @@ class ArchiveBuilder:
                 REPO_ROOT
                 / "platform/apps/platform_web/tests/support/live-count-reporter.cjs"
             ).read_bytes(),
+            "web/tests/support/live-engine-preflight.cjs": (
+                REPO_ROOT
+                / "platform/apps/platform_web/tests/support/live-engine-preflight.cjs"
+            ).read_bytes(),
             "web/node_modules/@playwright/test/package.json": b'{"name":"@playwright/test"}\n',
             "web/node_modules/playwright/package.json": b'{"name":"playwright"}\n',
             "web/node_modules/playwright-core/package.json": b'{"name":"playwright-core"}\n',
@@ -669,6 +673,101 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         builder.write(regenerate_runtime_manifest=False)
         validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
 
+        # v3 preserves upstream browser alias topology in the source reference
+        # while the source-only archive itself contains only the reviewed suite.
+        engine_links = {
+            "browsers/webkit-2311/alias": "browser",
+            "browsers/webkit-2311/alias-chain": "alias",
+        }
+        manifest_v3 = {
+            **manifest,
+            "version": 3,
+            "engine_links": engine_links,
+            "engine_tree_sha256": validator._engine_reference_digest(
+                engine_files,
+                engine_links,
+                node_version=node_version,
+                package_lock_sha256=lock_sha,
+            ),
+        }
+        v3_artifact = self.root / "source-only-v3.tar.gz"
+        self._rewrite_archive(
+            artifact,
+            v3_artifact,
+            {
+                f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json": json.dumps(
+                    manifest_v3, sort_keys=True, separators=(",", ":")
+                ).encode()
+                + b"\n"
+            },
+        )
+        validator.validate_archive(v3_artifact, release_slug=RELEASE_SLUG)
+
+        float_version_v3 = {**manifest_v3, "version": 3.0}
+        float_version_artifact = self.root / "source-only-v3-float-version.tar.gz"
+        self._rewrite_archive(
+            v3_artifact,
+            float_version_artifact,
+            {
+                f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json": json.dumps(
+                    float_version_v3, sort_keys=True, separators=(",", ":")
+                ).encode()
+                + b"\n"
+            },
+        )
+        with self.assertRaisesRegex(
+            validator.ArtifactError, "liveqa-runtime manifest schema is invalid"
+        ):
+            validator.validate_archive(float_version_artifact, release_slug=RELEASE_SLUG)
+
+        bad_v3 = dict(manifest_v3)
+        bad_links = dict(engine_links)
+        bad_links["browsers/webkit-2311/alias"] = "../../node/bin/node"
+        bad_v3["engine_links"] = bad_links
+        bad_v3["engine_tree_sha256"] = validator._engine_reference_digest(
+            engine_files,
+            bad_links,
+            node_version=node_version,
+            package_lock_sha256=lock_sha,
+        )
+        bad_v3_artifact = self.root / "source-only-v3-escape.tar.gz"
+        self._rewrite_archive(
+            v3_artifact,
+            bad_v3_artifact,
+            {
+                f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json": json.dumps(
+                    bad_v3, sort_keys=True, separators=(",", ":")
+                ).encode()
+                + b"\n"
+            },
+        )
+        with self.assertRaisesRegex(validator.ArtifactError, "engine link escapes"):
+            validator.validate_archive(bad_v3_artifact, release_slug=RELEASE_SLUG)
+
+        conflict_v3 = dict(manifest_v3)
+        conflict_links = dict(engine_links)
+        conflict_links["browsers/webkit-2311/browser/child"] = "browser"
+        conflict_v3["engine_links"] = conflict_links
+        conflict_v3["engine_tree_sha256"] = validator._engine_reference_digest(
+            engine_files,
+            conflict_links,
+            node_version=node_version,
+            package_lock_sha256=lock_sha,
+        )
+        conflict_artifact = self.root / "source-only-v3-conflict.tar.gz"
+        self._rewrite_archive(
+            v3_artifact,
+            conflict_artifact,
+            {
+                f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json": json.dumps(
+                    conflict_v3, sort_keys=True, separators=(",", ":")
+                ).encode()
+                + b"\n"
+            },
+        )
+        with self.assertRaisesRegex(validator.ArtifactError, "engine paths conflict"):
+            validator.validate_archive(conflict_artifact, release_slug=RELEASE_SLUG)
+
         tampered = self.root / "source-only-bad-provider.tar.gz"
         manifest["engine_files"]["web/node_modules/playwright-core/package.json"] = "0" * 64
         self._rewrite_archive(
@@ -704,6 +803,31 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
                     )
                 source = Path(consumer.__file__).read_text(encoding="utf-8")
                 self.assertIn("PurePosixPath(relative).parts", source)
+
+        engine_files = {
+            "browsers/webkit-2311/resources/accessibility": "a" * 64,
+            "browsers/webkit-2311/resources.pak": "b" * 64,
+        }
+        engine_links = {"browsers/webkit-2311/resources/alias": "../resources.pak"}
+        digest_args = {
+            "node_version": validator.PINNED_NODE_VERSION,
+            "package_lock_sha256": "c" * 64,
+        }
+        expected_digest = platform_build_live_qa_runtime._engine_map_digest(
+            engine_files, engine_links, **digest_args
+        )
+        self.assertEqual(
+            platform_live_qa_runtime_install._engine_map_digest(
+                engine_files, engine_links, **digest_args
+            ),
+            expected_digest,
+        )
+        self.assertEqual(
+            validator._engine_reference_digest(
+                engine_files, engine_links, **digest_args
+            ),
+            expected_digest,
+        )
 
     def test_runtime_manifest_digest_rejects_content_or_digest_tampering(self) -> None:
         artifact = ArchiveBuilder(self.root / "untampered.tar.gz").write()

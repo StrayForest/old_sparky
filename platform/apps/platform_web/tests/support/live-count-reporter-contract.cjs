@@ -3,6 +3,7 @@
 /* eslint @typescript-eslint/no-require-imports: "off" -- This contract runs as CommonJS. */
 
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -86,7 +87,7 @@ const publicTitles = [
   "live admin route is protected for anonymous users",
   "live home uses text-only tournament steps without overflow",
   "live public contact surfaces do not publish the support recipient",
-  "live patch renders separate Urn and Rift objectives with source icons",
+  "live current patch route and objective source icons remain available",
   "live Cloudflare Analytics is conditionally observed without widening CSP",
   "live image currentSrc inventory stays inside the exact CSP hosts",
 ];
@@ -579,6 +580,138 @@ try {
   assert.ok(fs.statSync(path.join(sizeFixture.results, "live-failures-v1.json")).size <= 16 * 1024);
 } finally {
   fs.rmSync(failureRoot, { recursive: true, force: true });
+}
+
+const enginePreflightRoot = fs.mkdtempSync(
+  path.join(os.tmpdir(), "live-engine-preflight-contract-"),
+);
+try {
+  const fakePackage = path.join(
+    enginePreflightRoot,
+    "node_modules",
+    "@playwright",
+    "test",
+  );
+  fs.mkdirSync(fakePackage, { recursive: true });
+  fs.writeFileSync(path.join(fakePackage, "index.js"), `
+    const fs = require("node:fs");
+    function record(event) {
+      fs.appendFileSync(process.env.PREFLIGHT_EVENTS, JSON.stringify(event) + "\\n");
+    }
+    function engine(name) {
+      return {
+        launch: async (options) => {
+          record([name, "launch", options]);
+          return {
+            newContext: async (options) => {
+              record([name, "context", options]);
+              return {
+                newPage: async () => {
+                  record([name, "newPage"]);
+                  if (process.env.FAIL_ENGINE === name) throw new Error("private engine failure");
+                  return {
+                    goto: async (url) => record([name, "goto", url]),
+                    url: () => "about:blank",
+                  };
+                },
+                close: async () => {
+                  record([name, "context-close"]);
+                  if (process.env.FAIL_CONTEXT_CLOSE === name) {
+                    throw new Error("private context close failure");
+                  }
+                },
+              };
+            },
+            close: async () => record([name, "browser-close"]),
+          };
+        },
+      };
+    }
+    module.exports = {
+      chromium: engine("chromium"),
+      webkit: engine("webkit"),
+      devices: {
+        "Desktop Chrome": { deviceScaleFactor: 1, userAgent: "desktop" },
+        "iPhone 13": { deviceScaleFactor: 3, isMobile: true, hasTouch: true, userAgent: "iphone" },
+      },
+    };
+  `, "utf8");
+  const preflightScript = path.resolve(
+    __dirname,
+    "live-engine-preflight.cjs",
+  );
+  const eventsPath = path.join(enginePreflightRoot, "events.jsonl");
+  const runPreflight = (failEngine = "", failContextClose = "") => spawnSync(
+    process.execPath,
+    [preflightScript],
+    {
+      encoding: "utf8",
+      env: {
+        NODE_PATH: path.join(enginePreflightRoot, "node_modules"),
+        PREFLIGHT_EVENTS: eventsPath,
+        ...(failEngine ? { FAIL_ENGINE: failEngine } : {}),
+        ...(failContextClose ? { FAIL_CONTEXT_CLOSE: failContextClose } : {}),
+      },
+      timeout: 5_000,
+    },
+  );
+
+  const passingPreflight = runPreflight();
+  assert.equal(passingPreflight.status, 0, passingPreflight.stderr);
+  assert.equal(
+    passingPreflight.stdout,
+    "LIVE_QA_ENGINE_PREFLIGHT_READY schema=1\n",
+  );
+  const passingEvents = fs.readFileSync(eventsPath, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(passingEvents.map(([engineName, action]) => [engineName, action]), [
+    ["chromium", "launch"], ["chromium", "context"], ["chromium", "newPage"],
+    ["chromium", "goto"], ["chromium", "context-close"], ["chromium", "browser-close"],
+    ["webkit", "launch"], ["webkit", "context"], ["webkit", "newPage"],
+    ["webkit", "goto"], ["webkit", "context-close"], ["webkit", "browser-close"],
+  ]);
+  assert.deepEqual(passingEvents[0][2], { headless: true, chromiumSandbox: true });
+  assert.deepEqual(passingEvents[1][2], {
+    deviceScaleFactor: 1,
+    userAgent: "desktop",
+    viewport: { width: 1440, height: 1000 },
+  });
+  assert.deepEqual(passingEvents[6][2], { headless: true, chromiumSandbox: true });
+  assert.equal(passingEvents[7][2].isMobile, true);
+  assert.equal(passingEvents[7][2].hasTouch, true);
+  assert.ok(passingEvents.filter((event) => event[1] === "goto").every(
+    (event) => event[2] === "about:blank",
+  ));
+
+  fs.writeFileSync(eventsPath, "", "utf8");
+  const failedPreflight = runPreflight("webkit");
+  assert.equal(failedPreflight.status, 1);
+  assert.equal(failedPreflight.stdout, "");
+  const failedEvents = fs.readFileSync(eventsPath, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.ok(failedEvents.some((event) => event[0] === "webkit" && event[1] === "context-close"));
+  assert.ok(failedEvents.some((event) => event[0] === "webkit" && event[1] === "browser-close"));
+
+  fs.writeFileSync(eventsPath, "", "utf8");
+  const failedContextClose = runPreflight("", "chromium");
+  assert.equal(failedContextClose.status, 1);
+  assert.equal(failedContextClose.stdout, "");
+  const closeFailureEvents = fs.readFileSync(eventsPath, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.ok(closeFailureEvents.some(
+    (event) => event[0] === "chromium" && event[1] === "context-close",
+  ));
+  assert.ok(closeFailureEvents.some(
+    (event) => event[0] === "chromium" && event[1] === "browser-close",
+  ));
+} finally {
+  fs.rmSync(enginePreflightRoot, { recursive: true, force: true });
 }
 
 process.stdout.write("live-count-reporter-contract: PASS\n");
