@@ -6754,6 +6754,15 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             REPO_ROOT
             / ".github/workflows/platform-production-storage-maintenance.yml"
         ).read_text(encoding="utf-8")
+        normalized_workflow = workflow.replace("\\\n", " ")
+        self.assertRegex(
+            normalized_workflow,
+            r'/usr/bin/python3\s+-I\s+-B\s+"\$maintenance_unit_validator"',
+        )
+        self.assertNotRegex(
+            normalized_workflow,
+            r'/usr/bin/python3\s+-I\s+(?!-B\b)"\$maintenance_unit_validator"',
+        )
         workflow_payload = yaml.safe_load(workflow)
         jobs = workflow_payload["jobs"]
         self.assertNotRegex(

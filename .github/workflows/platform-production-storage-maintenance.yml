@@ -307,7 +307,7 @@ jobs:
             --no-pager 2>/dev/null)" \
             || fail_with_status maintenance_unit_contract_unavailable 2
           if ! printf '%s\n' "$loaded_maintenance_unit" \
-            | /usr/bin/python3 -I "$maintenance_unit_validator" \
+            | /usr/bin/python3 -I -B "$maintenance_unit_validator" \
               validate-maintenance-unit \
               "$maintenance_unit_source" \
               /etc/systemd/system/deadlock-maintenance.service; then
@@ -315,7 +315,7 @@ jobs:
           fi
           test "$(readlink -f "$current")" = "$current_before" \
             || fail_with_status maintenance_unit_contract_unavailable 2
-          if ! protected_manifest_before_digest="$(/usr/bin/python3 -I \
+          if ! protected_manifest_before_digest="$(/usr/bin/python3 -I -B \
             "$maintenance_unit_validator" snapshot-protected-backup-manifest \
             2>/dev/null)"; then
             fail_with_status protected_manifest_snapshot_unavailable 2
@@ -674,7 +674,7 @@ jobs:
             || fail "Bound maintenance report name is invalid."
           latest_report="$report_dir/$report_name"
           CURRENT_STAGE=retention_proof
-          if ! /usr/bin/python3 -I "$maintenance_unit_validator" \
+          if ! /usr/bin/python3 -I -B "$maintenance_unit_validator" \
             validate-protected-retention-report "$latest_report" \
             "$protected_manifest_before_digest" >/dev/null 2>&1; then
             fail_with_status protected_retention_proof_unavailable 2

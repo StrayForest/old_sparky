@@ -1283,7 +1283,7 @@ jobs:
             --no-pager 2>/dev/null)" \
             || report_failure retention_dry_run maintenance_unit_unavailable 2
           if printf '%s\n' "$loaded_maintenance_unit" \
-            | timeout --foreground 180s /usr/bin/python3 -I "$maintenance_unit_validator" \
+            | timeout --foreground 180s /usr/bin/python3 -I -B "$maintenance_unit_validator" \
               run-retention-preview "$maintenance_unit_source" \
               /etc/systemd/system/deadlock-maintenance.service \
               >"$retention_file" 2>/dev/null; then

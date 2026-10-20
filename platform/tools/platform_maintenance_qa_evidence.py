@@ -29,6 +29,7 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import platform_backup_restore_drill as backup_restore_drill
+from platform_release_retention import REQUIRED_PROTECTED_RELEASES
 
 from platform_workflow_provenance import (
     ProvenanceError,
@@ -91,12 +92,11 @@ EXPECTED_MAINTENANCE_ARGV = (
     "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json",
     "--backup-keep",
     "15",
-    "--protected-release",
-    "gha-38000614899-1-7e5769ba3f85",
-    "--protected-release",
-    "gha-37760797674-1-80e457e57081",
-    "--protected-release",
-    "gha-38182702358-1-f1154c7dba4f",
+    *(
+        argument
+        for slug in REQUIRED_PROTECTED_RELEASES
+        for argument in ("--protected-release", slug)
+    ),
     "--release-keep",
     "5",
     "--test-artifact-max-age-days",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -376,6 +377,115 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         self.assertTrue(candidate_two.is_dir())
         self.assertTrue(current.is_dir())
         self.assertTrue(previous.is_dir())
+
+        required = retention.REQUIRED_PROTECTED_RELEASES
+        for index, slug in enumerate(required):
+            self.add_release(slug, age_days=40 + index)
+        alias = Path(self.temp_dir.name) / "platform-alias"
+        alias.symlink_to(self.app_dir, target_is_directory=True)
+
+        preview_argv = [
+            "platform_release_retention.py",
+            "--app-dir",
+            str(alias),
+            "--keep",
+            "0",
+            "--min-age-days",
+            "0",
+        ]
+        preview_stdout = io.StringIO()
+        preview_stderr = io.StringIO()
+        with (
+            mock.patch.object(retention, "PRODUCTION_APP_DIR", self.app_dir),
+            mock.patch.object(retention.sys, "argv", preview_argv),
+            redirect_stdout(preview_stdout),
+            redirect_stderr(preview_stderr),
+        ):
+            self.assertTrue(retention._is_production_app_dir(alias))
+            self.assertEqual(retention.main(), 0)
+
+        self.assertEqual(preview_stderr.getvalue(), "")
+        self.assertIn(
+            "Required maintenance-protected releases: " + ", ".join(required),
+            preview_stdout.getvalue(),
+        )
+        self.assertIn(candidate_one.name, preview_stdout.getvalue())
+        self.assertIn(candidate_two.name, preview_stdout.getvalue())
+
+        apply_argv = [
+            *preview_argv,
+            "--apply",
+            "--json-receipt",
+            "--expected-candidate",
+            candidate_one.name,
+            "--expected-candidate",
+            candidate_two.name,
+        ]
+        apply_stdout = io.StringIO()
+        apply_stderr = io.StringIO()
+        with (
+            mock.patch.object(retention, "PRODUCTION_APP_DIR", self.app_dir),
+            mock.patch.object(retention.sys, "argv", apply_argv),
+            redirect_stdout(apply_stdout),
+            redirect_stderr(apply_stderr),
+        ):
+            self.assertEqual(retention.main(), 0)
+
+        receipt = json.loads(apply_stdout.getvalue())
+        self.assertEqual(
+            set(receipt),
+            {"schema", "status", "candidate_count", "deleted_count", "reclaimed_bytes"},
+        )
+        self.assertEqual(receipt["candidate_count"], 2)
+        self.assertEqual(receipt["deleted_count"], 2)
+        self.assertFalse(candidate_one.exists())
+        self.assertFalse(candidate_two.exists())
+        self.assertTrue(current.is_dir())
+        self.assertTrue(previous.is_dir())
+        for slug in required:
+            self.assertTrue((self.releases_dir / slug).is_dir())
+
+        missing_pin = self.releases_dir / required[-1]
+        (missing_pin / "payload.bin").unlink()
+        missing_pin.rmdir()
+        late_candidate = self.add_release("release-late-candidate", age_days=100)
+        missing_preview_stdout = io.StringIO()
+        missing_preview_stderr = io.StringIO()
+        with (
+            mock.patch.object(retention, "PRODUCTION_APP_DIR", self.app_dir),
+            mock.patch.object(retention.sys, "argv", preview_argv),
+            redirect_stdout(missing_preview_stdout),
+            redirect_stderr(missing_preview_stderr),
+        ):
+            self.assertEqual(retention.main(), 1)
+
+        self.assertEqual(missing_preview_stdout.getvalue(), "")
+        self.assertIn(
+            "Release retention failed (configuration)",
+            missing_preview_stderr.getvalue(),
+        )
+        self.assertTrue(late_candidate.is_dir())
+
+        missing_pin_argv = [
+            *preview_argv,
+            "--apply",
+            "--json-receipt",
+            "--expected-candidate",
+            late_candidate.name,
+        ]
+        missing_stdout = io.StringIO()
+        missing_stderr = io.StringIO()
+        with (
+            mock.patch.object(retention, "PRODUCTION_APP_DIR", self.app_dir),
+            mock.patch.object(retention.sys, "argv", missing_pin_argv),
+            redirect_stdout(missing_stdout),
+            redirect_stderr(missing_stderr),
+        ):
+            self.assertEqual(retention.main(), 1)
+
+        self.assertEqual(missing_stdout.getvalue(), "")
+        self.assertIn("Release retention failed (configuration)", missing_stderr.getvalue())
+        self.assertTrue(late_candidate.is_dir())
 
     def test_zero_retention_keeps_only_current_and_previous(self) -> None:
         current = self.add_release("release-current", age_days=0)

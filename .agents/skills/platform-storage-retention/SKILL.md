@@ -52,7 +52,7 @@ calling the task complete.
    systemctl show deadlock-maintenance.service \
      --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
      --no-pager \
-     | /usr/bin/python3 -I "$current_release/tools/platform_maintenance_qa_evidence.py" \
+     | /usr/bin/python3 -I -B "$current_release/tools/platform_maintenance_qa_evidence.py" \
        run-retention-preview \
        "$current_release/deploy/systemd/deadlock-maintenance.service" \
        /etc/systemd/system/deadlock-maintenance.service
