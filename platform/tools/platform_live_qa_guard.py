@@ -131,10 +131,10 @@ STATE_NAME_PATTERN = re.compile(r"^live-user-qa\.[A-Za-z0-9]{6}$")
 SETUP_NAME_PATTERN = re.compile(r"^\.live-user-qa\.setup-[0-9a-f]{32}$")
 PUBLIC_GATE_NAME_PATTERN = re.compile(r"^public-live-qa\.[a-z0-9_]{8}$")
 LIVE_BROWSER_FAILURE_REPORT_NAME_PATTERN = re.compile(
-    r"^public-live-qa\.[a-z0-9_]{8}\.failure-v1\.json$"
+    r"^public-live-qa\.[a-z0-9_]{8}\.failure-v[12]\.json$"
 )
 LIVE_BROWSER_FAILURE_TEMP_NAME_PATTERN = re.compile(
-    r"^\.public-live-qa\.[a-z0-9_]{8}\.failure-v1\.json\.[0-9a-f]{32}\.tmp$"
+    r"^\.public-live-qa\.[a-z0-9_]{8}\.failure-v[12]\.json\.[0-9a-f]{32}\.tmp$"
 )
 PUBLICATION_TEMP_PATTERN = re.compile(r"^\.(?:inventory|phase)\.json\.[a-z0-9_]{8}$")
 MARKER_PATTERN = re.compile(r"^liveqa-[a-z0-9-]{6,56}$")
@@ -227,10 +227,22 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 LIVE_BROWSER_COUNTS_FILE = "live-counts-v1.json"
 LIVE_BROWSER_COUNTS_MAX_BYTES = 1024
-LIVE_BROWSER_FAILURES_FILE = "live-failures-v1.json"
+LIVE_BROWSER_FAILURES_FILE = "live-failures-v2.json"
 LIVE_BROWSER_FAILURES_MAX_BYTES = 16 * 1024
 LIVE_BROWSER_FAILURES_STORE_MAX_FILES = 10
 LIVE_BROWSER_FAILURES_RETENTION_SECONDS = 7 * 24 * 60 * 60
+LIVE_BROWSER_PAGE_ERROR_CLASSES = frozenset(
+    {
+        "Error", "TypeError", "ReferenceError", "SyntaxError", "RangeError",
+        "URIError", "EvalError", "AggregateError", "DOMException", "unknown",
+    }
+)
+LIVE_BROWSER_PAGE_ERROR_ROUTES = frozenset(
+    {"home", "patch", "tournaments", "other", "unknown"}
+)
+LIVE_BROWSER_PAGE_ERROR_ASSET_BASENAME = re.compile(
+    r"^(?:[a-z0-9][a-z0-9_-]{12}|turbopack-[a-z0-9_-]{13})\.js$"
+)
 LIVE_BROWSER_FAILURE_REPORT_EXIT = 42
 LIVE_BROWSER_FAILURE_COUNTS_EXIT = 43
 LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES = frozenset(
@@ -2565,6 +2577,52 @@ def _validate_failure_location(
         raise GuardError("private browser declaration location is not a test declaration")
 
 
+def _validate_page_error_evidence(record: Mapping[str, object]) -> None:
+    state = record.get("page_error_state")
+    truncated = record.get("page_errors_truncated")
+    events = record.get("page_errors")
+    if (
+        not isinstance(state, str)
+        or state not in {"captured", "absent", "unavailable"}
+        or type(truncated) is not bool
+        or not isinstance(events, list)
+        or len(events) > 4
+    ):
+        raise GuardError("private browser page-error evidence is malformed")
+    if state == "absent":
+        if truncated or events:
+            raise GuardError("private browser absent page-error evidence is malformed")
+        return
+    if state == "unavailable":
+        if events:
+            raise GuardError("private browser unavailable page-error evidence is malformed")
+        return
+    if state == "captured" and not events:
+        raise GuardError("private browser captured page-error evidence is empty")
+    for event in events:
+        if (
+            not isinstance(event, list)
+            or len(event) != 5
+            or not isinstance(event[0], str)
+            or event[0] not in LIVE_BROWSER_PAGE_ERROR_CLASSES
+            or not isinstance(event[1], str)
+            or event[1] not in LIVE_BROWSER_PAGE_ERROR_ROUTES
+        ):
+            raise GuardError("private browser page-error event is malformed")
+        basename, line, column = event[2:]
+        no_location = basename is None and line is None and column is None
+        bounded_location = (
+            isinstance(basename, str)
+            and LIVE_BROWSER_PAGE_ERROR_ASSET_BASENAME.fullmatch(basename) is not None
+            and type(line) is int
+            and 1 <= line <= 1_000_000
+            and type(column) is int
+            and 1 <= column <= 1_000_000
+        )
+        if not no_location and not bounded_location:
+            raise GuardError("private browser page-error location is malformed")
+
+
 def _failure_report_store_directory(*, create: bool) -> int:
     _validate_root_secret_parent(TRUSTED_FAILURE_DIAGNOSTICS_ROOT)
     if create:
@@ -2601,14 +2659,15 @@ def _failure_report_store_directory(*, create: bool) -> int:
 def _assert_failure_report_name_unused(gate: Path) -> None:
     descriptor = _failure_report_store_directory(create=False)
     try:
-        name = f"{gate.name}.failure-v1.json"
-        try:
-            os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            raise GuardError("private browser diagnostics gate identity cannot be checked") from exc
-        raise GuardError("private browser diagnostics gate identity was already used")
+        for version in (1, 2):
+            name = f"{gate.name}.failure-v{version}.json"
+            try:
+                os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise GuardError("private browser diagnostics gate identity cannot be checked") from exc
+            raise GuardError("private browser diagnostics gate identity was already used")
     finally:
         os.close(descriptor)
 
@@ -2654,7 +2713,14 @@ def _read_failure_store_file(directory_fd: int, name: str) -> tuple[os.stat_resu
 
 
 def _validate_retained_failure_report(name: str, raw: bytes) -> None:
-    gate = name.removesuffix(".failure-v1.json")
+    if name.endswith(".failure-v1.json"):
+        schema = 1
+        gate = name.removesuffix(".failure-v1.json")
+    elif name.endswith(".failure-v2.json"):
+        schema = 2
+        gate = name.removesuffix(".failure-v2.json")
+    else:
+        raise GuardError("retained private browser diagnostics name is invalid")
     try:
         payload = json.loads(
             raw.decode("ascii"),
@@ -2673,7 +2739,7 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             "run_status", "failures",
         }
         or type(payload.get("schema")) is not int
-        or payload.get("schema") != 1
+        or payload.get("schema") != schema
         or payload.get("gate") != gate
         or not PUBLIC_GATE_NAME_PATTERN.fullmatch(gate)
         or not isinstance(payload.get("source_sha"), str)
@@ -2696,12 +2762,17 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         raise GuardError("retained private browser diagnostics schema is invalid")
     seen: set[tuple[str, str, int]] = set()
     for failure in payload["failures"]:
+        expected_failure_keys = {
+            "id", "project", "status", "attempt", "source_file",
+            "source_line", "source_column", "source_kind",
+        }
+        if schema == 2:
+            expected_failure_keys.update(
+                {"page_error_state", "page_errors_truncated", "page_errors"}
+            )
         if (
             not isinstance(failure, dict)
-            or set(failure) != {
-                "id", "project", "status", "attempt", "source_file",
-                "source_line", "source_column", "source_kind",
-            }
+            or set(failure) != expected_failure_keys
             or not isinstance(failure.get("id"), str)
             or failure["id"] not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
             or not isinstance(failure.get("project"), str)
@@ -2718,6 +2789,8 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         if key in seen:
             raise GuardError("retained private browser diagnostics record is duplicated")
         seen.add(key)
+        if schema == 2:
+            _validate_page_error_evidence(failure)
         source_file = failure.get("source_file")
         source_line = failure.get("source_line")
         source_column = failure.get("source_column")
@@ -2930,7 +3003,7 @@ def _read_ephemeral_failure_report(
             "schema", "gate", "source_sha", "app_sha", "marker_sha256", "run_status", "failures",
         }
         or type(payload.get("schema")) is not int
-        or payload.get("schema") != 1
+        or payload.get("schema") != 2
         or payload.get("gate") != gate.name
         or payload.get("source_sha") != source_sha
         or payload.get("app_sha") != app_sha
@@ -2949,12 +3022,14 @@ def _read_ephemeral_failure_report(
     seen: set[tuple[str, str, int]] = set()
     failure_status_counts = {"failed": 0, "interrupted": 0, "timedOut": 0}
     for record in failures:
+        expected_record_keys = {
+            "id", "project", "status", "attempt", "source_file", "source_line",
+            "source_column", "source_kind", "page_error_state",
+            "page_errors_truncated", "page_errors",
+        }
         if (
             not isinstance(record, dict)
-            or set(record) != {
-                "id", "project", "status", "attempt", "source_file", "source_line",
-                "source_column", "source_kind",
-            }
+            or set(record) != expected_record_keys
             or record.get("id") not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
             or record.get("project") not in {"live-desktop", "live-mobile", "live-webkit-mobile"}
             or record.get("status") not in {"failed", "timedOut", "interrupted"}
@@ -2967,6 +3042,7 @@ def _read_ephemeral_failure_report(
             raise GuardError("ephemeral browser failure record is duplicated")
         seen.add(key)
         failure_status_counts[record["status"]] += 1
+        _validate_page_error_evidence(record)
         _validate_failure_location(record, manifest)
     if failure_status_counts != {
         "failed": counts["attempt_fail"],
@@ -2998,7 +3074,7 @@ def _publish_private_browser_failure_report(
     )
     observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     payload = {
-        "schema": 1,
+        "schema": 2,
         "gate": gate.name,
         "source_sha": source_sha,
         "app_sha": app_sha,
@@ -3015,7 +3091,7 @@ def _publish_private_browser_failure_report(
     _assert_failure_report_name_unused(gate)
     _prune_browser_failure_diagnostics(reserve_slots=1)
     directory_fd = _failure_report_store_directory(create=False)
-    final_name = f"{gate.name}.failure-v1.json"
+    final_name = f"{gate.name}.failure-v2.json"
     temporary_name = f".{final_name}.{uuid4().hex}.tmp"
     descriptor: int | None = None
     try:

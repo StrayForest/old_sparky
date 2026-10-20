@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import LiveCountReporter from "../support/live-count-reporter.cjs";
 import { assertLiveQaChromiumSandbox } from "../support/live-qa-sandbox";
 
 type BrowserEvidence = {
@@ -13,6 +14,11 @@ type BrowserEvidence = {
     columnNumber: number;
   }>;
   pageErrors: string[];
+  pageErrorObjects: Error[];
+  pageErrorsTruncated: boolean;
+  pageErrorCollectorReady: boolean;
+  nextScriptResponses: Array<{ url: string; status: number; resourceType: string }>;
+  nextScriptPaths: Set<string>;
   requestFailures: string[];
   unexpectedAuthAutomationRequests: string[];
 };
@@ -33,6 +39,28 @@ const expectedWebKitPrefetchCancellationPaths = new Set([
   "/terms",
   "/profile/me",
 ]);
+async function attachPageErrorEvidence(
+  page: import("@playwright/test").Page,
+  testInfo: import("@playwright/test").TestInfo,
+  evidence: BrowserEvidence,
+): Promise<void> {
+  if (!evidence.pageErrorCollectorReady) return;
+  try {
+    const attachment = LiveCountReporter.createPageErrorAttachment({
+      pageUrl: page.url(),
+      errors: evidence.pageErrorObjects,
+      successfulScriptResponses: evidence.nextScriptResponses,
+      truncated: evidence.pageErrorsTruncated,
+    });
+    if (!attachment) return;
+    await testInfo.attach(attachment.name, {
+      body: attachment.body,
+      contentType: attachment.contentType,
+    });
+  } catch {
+    // Diagnostic attachment failure must not change the browser QA result.
+  }
+}
 
 async function currentIndexedPatchId(
   request: import("@playwright/test").APIRequestContext,
@@ -63,6 +91,11 @@ test.beforeEach(async ({ page, browserName }) => {
     consoleCspErrors: [],
     cspViolations: [],
     pageErrors: [],
+    pageErrorObjects: [],
+    pageErrorsTruncated: false,
+    pageErrorCollectorReady: false,
+    nextScriptResponses: [],
+    nextScriptPaths: new Set(),
     requestFailures: [],
     unexpectedAuthAutomationRequests: [],
   };
@@ -90,9 +123,34 @@ test.beforeEach(async ({ page, browserName }) => {
       }
     }
   });
-  page.on("pageerror", (error) => {
-    evidence.pageErrors.push(error.name || "page error");
+  page.on("response", (response) => {
+    const scriptResponse = {
+      url: response.url(),
+      status: response.status(),
+      resourceType: response.request().resourceType(),
+    };
+    const scriptPath = LiveCountReporter.trustedSuccessfulNextScriptPath(scriptResponse);
+    if (
+      !scriptPath
+      || evidence.nextScriptPaths.has(scriptPath)
+      || evidence.nextScriptResponses.length >= LiveCountReporter.MAX_TRACKED_NEXT_SCRIPTS
+    ) return;
+    evidence.nextScriptPaths.add(scriptPath);
+    evidence.nextScriptResponses.push(scriptResponse);
   });
+  page.on("pageerror", (error) => {
+    const pageErrorClass = LiveCountReporter.pageErrorClass(error);
+    if (evidence.pageErrors.length < LiveCountReporter.MAX_PAGE_ERROR_EVENTS) {
+      evidence.pageErrors.push(pageErrorClass);
+    } else {
+      evidence.pageErrorsTruncated = true;
+    }
+    if (evidence.pageErrorObjects.length < LiveCountReporter.MAX_PAGE_ERROR_EVENTS) {
+      evidence.pageErrorObjects.push(error);
+    }
+    else evidence.pageErrorsTruncated = true;
+  });
+  evidence.pageErrorCollectorReady = true;
   page.on("requestfailed", (request) => {
     const parsed = new URL(request.url());
     const errorText = request.failure()?.errorText ?? "failed";
@@ -202,10 +260,11 @@ test.beforeEach(async ({ page, browserName }) => {
 });
 
 test.afterEach(async ({ page }, testInfo) => {
+  const evidence = browserEvidence.get(page);
+  if (evidence) await attachPageErrorEvidence(page, testInfo, evidence);
   if (testInfo.annotations.some((annotation) => annotation.type === "expected-csp-violations")) {
     return;
   }
-  const evidence = browserEvidence.get(page);
   expect(evidence?.cspViolations ?? [], "SecurityPolicyViolationEvent entries").toEqual([]);
   expect(evidence?.consoleCspErrors ?? [], "CSP console errors").toEqual([]);
   expect(evidence?.pageErrors ?? [], "uncaught page errors").toEqual([]);

@@ -233,6 +233,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 const path = require("node:path");
                 const Reporter = require(process.argv[1]);
                 const [gateRoot, sourceRoot] = process.argv.slice(2);
+                const stress = process.argv[4] === "stress";
                 const projects = ["live-desktop", "live-mobile", "live-webkit-mobile"];
                 const titles = [
                   ...["/", "/info", "/tournaments", "/tournaments/new", "/profile/me", "/profile/lisalexy"]
@@ -262,12 +263,24 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                   ]),
                 ]);
                 const tests = [];
+                const maxError = new AggregateError([], "private max-size error");
+                maxError.stack = "AggregateError: private max-size error\\n"
+                  + "    at render (https://old-sparky.com/_next/static/chunks/turbopack-abcdefghijklm.js:1000000:1000000)";
+                const maxAttachment = Reporter.createPageErrorAttachment({
+                  pageUrl: "https://old-sparky.com/tournaments",
+                  errors: [maxError, maxError, maxError, maxError],
+                  successfulScriptResponses: [{
+                    url: "https://old-sparky.com/_next/static/chunks/turbopack-abcdefghijklm.js",
+                    status: 200,
+                    resourceType: "script",
+                  }],
+                });
                 for (const project of projects) {
                   for (const title of titles) {
                     const key = `${title}|${project}`;
                     const skipDescription = skips.get(key);
-                    const failed = title === "production Chromium live QA keeps its process sandbox enabled"
-                      && project === "live-desktop";
+                    const failed = title === "live image currentSrc inventory stays inside the exact CSP hosts"
+                      && project === "live-webkit-mobile";
                     const status = skipDescription ? "skipped" : failed ? "failed" : "passed";
                     const result = {
                       status,
@@ -284,7 +297,34 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                           column: 3,
                         },
                       }];
+                      const error = new TypeError("private pageerror text and token");
+                      error.stack = "TypeError: private pageerror text and token\\n"
+                        + "    at render (https://old-sparky.com/_next/static/chunks/abcdefghijklm.js:12:34)";
+                      result.attachments = [Reporter.createPageErrorAttachment({
+                        pageUrl: "https://old-sparky.com/patches/12345?token=private",
+                        errors: [error],
+                        successfulScriptResponses: [{
+                          url: "https://old-sparky.com/_next/static/chunks/abcdefghijklm.js",
+                          status: 200,
+                          resourceType: "script",
+                        }],
+                      })];
                     }
+                    const failureResult = {
+                      status: "interrupted",
+                      errors: [{
+                        message: "private max-size assertion text",
+                        location: {
+                          file: path.join(sourceRoot, "tests/support/live-qa-sandbox.ts"),
+                          line: 2,
+                          column: 3,
+                        },
+                      }],
+                      attachments: [maxAttachment],
+                    };
+                    const results = stress
+                      ? (skipDescription ? [failureResult, result] : [failureResult])
+                      : [result];
                     tests.push({
                       title,
                       expectedStatus: skipDescription ? "skipped" : "passed",
@@ -294,8 +334,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         column: 1,
                       },
                       parent: { project: () => ({ name: project }) },
-                      results: [result],
-                      outcome: () => skipDescription ? "skipped" : failed ? "unexpected" : "expected",
+                      results,
+                      outcome: () => skipDescription ? "skipped" : failed || stress ? "unexpected" : "expected",
                     });
                   }
                 }
@@ -321,7 +361,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 check=False,
             )
             if result.returncode != 0 or result.stdout or result.stderr:
-                self.fail("the immutable reporter failed its disposable onEnd integration")
+                self.fail(
+                    "the immutable reporter failed its disposable onEnd integration: "
+                    f"exit={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+                )
             self.assertEqual(counts_path.lstat().st_mode & 0o777, 0o600)
             self.assertEqual(failures_path.lstat().st_mode & 0o777, 0o600)
             count_payload = json.loads(counts_path.read_text(encoding="ascii"))
@@ -333,6 +376,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertEqual(failure_payload["failures"][0]["source_file"], "tests/support/live-qa-sandbox.ts")
             self.assertEqual(failure_payload["failures"][0]["source_line"], 2)
             self.assertEqual(failure_payload["failures"][0]["source_kind"], "assertion")
+            self.assertEqual(
+                failure_payload["failures"][0]["page_errors"],
+                [["TypeError", "patch", "abcdefghijklm.js", 12, 34]],
+            )
+            self.assertNotIn("private pageerror text", failures_path.read_text(encoding="ascii"))
 
             env = {
                 "PLATFORM_LIVE_QA_INSTALL_ROOT": str(payload),
@@ -361,7 +409,104 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     app_sha=app_sha,
                     marker_sha256=marker_sha,
                 )
-                private_report = secret / "diagnostics" / f"{gate.name}.failure-v1.json"
+                max_gate = run_root / "public-live-qa.b1a2b3c4"
+                max_gate.mkdir(mode=0o700)
+                (max_gate / "test-results").mkdir(mode=0o700)
+                max_counts_path = (
+                    max_gate / "test-results" / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE
+                )
+                max_failures_path = (
+                    max_gate / "test-results" / platform_live_qa_guard.LIVE_BROWSER_FAILURES_FILE
+                )
+                stress_env = {
+                    **reporter_env,
+                    "PLATFORM_QA_BROWSER_GATE_DIR": str(max_gate),
+                }
+                stress_result = subprocess.run(
+                    [
+                        node,
+                        "-e",
+                        node_script,
+                        str(reporter_path),
+                        str(run_root),
+                        str(payload / "runtime/web"),
+                        "stress",
+                    ],
+                    cwd=payload / "runtime/web",
+                    env=stress_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(
+                    (stress_result.returncode, stress_result.stdout, stress_result.stderr),
+                    (0, "", ""),
+                    "the reporter emits a bounded all-54 interrupted-attempt report; "
+                    f"counts_exists={max_counts_path.exists()} "
+                    f"failure_report_exists={max_failures_path.exists()}",
+                )
+                max_ephemeral = json.loads(max_failures_path.read_text(encoding="ascii"))
+                self.assertEqual(len(max_ephemeral["failures"]), 54)
+                self.assertLessEqual(max_failures_path.stat().st_size, 16 * 1024 - 256)
+                self.assertEqual(
+                    json.loads(max_counts_path.read_text(encoding="ascii"))["attempt_interrupted"],
+                    54,
+                )
+                platform_live_qa_guard.prepare_public_browser_failure_diagnostics(
+                    max_gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha,
+                )
+                max_public_line = platform_live_qa_guard.public_browser_counts_line(
+                    max_gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha,
+                    persist_failure_report=True,
+                )
+                self.assertIn("run_status=failed", max_public_line)
+                max_private_report = secret / "diagnostics" / f"{max_gate.name}.failure-v2.json"
+                max_private_bytes = max_private_report.read_bytes()
+                max_private_payload = json.loads(max_private_bytes)
+                self.assertLessEqual(len(max_private_bytes), 16 * 1024)
+                self.assertEqual(len(max_private_payload["failures"]), 54)
+                self.assertTrue(all(
+                    item["status"] == "interrupted"
+                    and item["source_file"] == "tests/support/live-qa-sandbox.ts"
+                    for item in max_private_payload["failures"]
+                ))
+                self.assertEqual(
+                    len({(item["id"], item["project"], item["attempt"])
+                         for item in max_private_payload["failures"]}),
+                    54,
+                )
+                durable_events = [
+                    event
+                    for item in max_private_payload["failures"]
+                    for event in item["page_errors"]
+                ]
+                self.assertTrue(durable_events)
+                self.assertTrue(any(
+                    event == [
+                        "AggregateError",
+                        "tournaments",
+                        "turbopack-abcdefghijklm.js",
+                        1_000_000,
+                        1_000_000,
+                    ]
+                    for event in durable_events
+                ))
+                self.assertNotIn(b"private max-size assertion text", max_private_bytes)
+                self.assertNotIn(b"https://old-sparky.com", max_private_bytes)
+                with patch.object(platform_live_qa_guard, "assert_liveqa_idle"):
+                    platform_live_qa_guard.remove_public_browser_gate(max_gate)
+                self.assertFalse(max_gate.exists())
+                self.assertEqual(max_private_report.read_bytes(), max_private_bytes)
+                platform_live_qa_guard._prune_browser_failure_diagnostics(reserve_slots=0)
+                self.assertEqual(max_private_report.read_bytes(), max_private_bytes)
+                private_report = secret / "diagnostics" / f"{gate.name}.failure-v2.json"
                 success_counts = dict(count_payload)
                 success_counts.update(
                     run_status="passed",
@@ -417,7 +562,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         persist_failure_report=True,
                     )
                 self.assertFalse(private_report.exists())
-                failure_payload["schema"] = 1
+                failure_payload["schema"] = 2
                 failure_payload["marker_sha256"] = "e" * 64
                 failures_path.write_text(json.dumps(failure_payload) + "\n", encoding="ascii")
                 failures_path.chmod(0o600)
@@ -431,6 +576,78 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     )
                 self.assertFalse(private_report.exists())
                 failure_payload["marker_sha256"] = marker_sha
+                for valid_evidence in (
+                    {
+                        "page_error_state": "absent",
+                        "page_errors_truncated": False,
+                        "page_errors": [],
+                    },
+                    {
+                        "page_error_state": "unavailable",
+                        "page_errors_truncated": True,
+                        "page_errors": [],
+                    },
+                    {
+                        "page_error_state": "captured",
+                        "page_errors_truncated": True,
+                        "page_errors": [[
+                                "AggregateError",
+                                "tournaments",
+                                "turbopack-abcdefghijklm.js",
+                                1_000_000,
+                                1_000_000,
+                            ]] * 4,
+                    },
+                ):
+                    platform_live_qa_guard._validate_page_error_evidence(valid_evidence)
+                for invalid_evidence in (
+                    {
+                        "page_error_state": "captured",
+                        "page_errors_truncated": False,
+                        "page_errors": [],
+                    },
+                    {
+                        "page_error_state": "absent",
+                        "page_errors_truncated": True,
+                        "page_errors": [],
+                    },
+                    {
+                        "page_error_state": "captured",
+                        "page_errors_truncated": False,
+                        "page_errors": [["TypeError", "patch", "abcdefghijklm.js", True, 1]],
+                    },
+                    {
+                        "page_error_state": "captured",
+                        "page_errors_truncated": False,
+                        "page_errors": [["TypeError", "patch", "abcdefghijklm.js", 1, 1]] * 5,
+                    },
+                ):
+                    with self.assertRaises(platform_live_qa_guard.GuardError):
+                        platform_live_qa_guard._validate_page_error_evidence(invalid_evidence)
+                failures_path.write_text(json.dumps(failure_payload) + "\n", encoding="ascii")
+                failures_path.chmod(0o600)
+                page_error_record = failure_payload["failures"][0]
+                for field, invalid_value in (
+                    ("page_error_state", []),
+                    ("page_errors", [[{}, "patch", None, None, None]]),
+                ):
+                    original_value = page_error_record[field]
+                    page_error_record[field] = invalid_value
+                    failures_path.write_text(
+                        json.dumps(failure_payload) + "\n", encoding="ascii"
+                    )
+                    failures_path.chmod(0o600)
+                    with self.assertRaises(
+                        platform_live_qa_guard.BrowserFailureReportUnavailable
+                    ):
+                        platform_live_qa_guard.public_browser_counts_line(
+                            gate,
+                            source_sha=source_sha,
+                            app_sha=app_sha,
+                            marker_sha256=marker_sha,
+                            persist_failure_report=True,
+                        )
+                    page_error_record[field] = original_value
                 failures_path.write_text(json.dumps(failure_payload) + "\n", encoding="ascii")
                 failures_path.chmod(0o600)
                 with patch.object(
@@ -450,7 +667,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         )
                 self.assertIn("run_status=failed", write_failure.exception.count_line)
                 self.assertFalse(private_report.exists())
-                self.assertEqual(os.listdir(secret / "diagnostics"), [])
+                self.assertEqual(
+                    os.listdir(secret / "diagnostics"),
+                    [max_private_report.name],
+                    "a failed second publication leaves the earlier valid record intact",
+                )
                 failure_payload["failures"][0]["status"] = "interrupted"
                 failures_path.write_text(json.dumps(failure_payload) + "\n", encoding="ascii")
                 failures_path.chmod(0o600)
@@ -483,10 +704,15 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertEqual(private_metadata.st_nlink, 1)
                 self.assertLessEqual(private_metadata.st_size, 16 * 1024)
                 private_payload = json.loads(private_bytes)
+                self.assertEqual(private_payload["schema"], 2)
                 self.assertEqual(private_payload["gate"], gate.name)
                 self.assertEqual(private_payload["source_sha"], source_sha)
                 self.assertEqual(private_payload["app_sha"], app_sha)
                 self.assertEqual(private_payload["marker_sha256"], marker_sha)
+                self.assertEqual(
+                    private_payload["failures"][0]["page_errors"],
+                    [["TypeError", "patch", "abcdefghijklm.js", 12, 34]],
+                )
                 self.assertEqual(
                     private_payload["failures"][0]["source_file"],
                     "tests/support/live-qa-sandbox.ts",
@@ -494,6 +720,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertEqual(private_payload["failures"][0]["source_line"], 2)
                 self.assertEqual(private_payload["failures"][0]["source_kind"], "assertion")
                 self.assertNotIn(b"assertion text", private_bytes)
+                for sensitive_value in (
+                    b"private pageerror text",
+                    b"token=private",
+                    b"12345",
+                    b"https://old-sparky.com",
+                    b"abcdefghijklm.js:12:34",
+                ):
+                    self.assertNotIn(sensitive_value, private_bytes)
 
                 with self.assertRaises(platform_live_qa_guard.BrowserFailureReportUnavailable) as repeated:
                     platform_live_qa_guard.public_browser_counts_line(
@@ -1545,6 +1779,46 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         browser_spec = (
             REPO_ROOT / "platform/apps/platform_web/tests/smoke/live-launch.spec.ts"
         ).read_text(encoding="utf-8")
+        self.assertIn("pageErrorCollectorReady: boolean", browser_spec)
+        self.assertIn("pageErrorCollectorReady: false", browser_spec)
+        attachment_guard = browser_spec.index(
+            "if (!evidence.pageErrorCollectorReady) return;"
+        )
+        self.assertLess(
+            browser_spec.index("async function attachPageErrorEvidence("),
+            attachment_guard,
+        )
+        attach_function_end = browser_spec.index(
+            "async function currentIndexedPatchId(", attachment_guard
+        )
+        attach_function = browser_spec[
+            browser_spec.index("async function attachPageErrorEvidence("):
+            attach_function_end
+        ]
+        attachment_guard_in_function = attach_function.index(
+            "if (!evidence.pageErrorCollectorReady) return;"
+        )
+        self.assertLess(
+            attachment_guard_in_function,
+            attach_function.index("LiveCountReporter.createPageErrorAttachment({"),
+        )
+        self.assertLess(
+            attachment_guard_in_function,
+            attach_function.index("testInfo.attach(attachment.name, {"),
+        )
+        pageerror_listener = browser_spec.index('page.on("pageerror", (error) => {')
+        collector_ready = browser_spec.index(
+            "evidence.pageErrorCollectorReady = true;", pageerror_listener
+        )
+        next_listener = browser_spec.index('page.on("requestfailed", (request) => {', pageerror_listener)
+        self.assertLess(pageerror_listener, collector_ready)
+        self.assertLess(collector_ready, next_listener)
+        after_each_start = browser_spec.index("test.afterEach(async ({ page }, testInfo) => {")
+        after_each_end = browser_spec.index("\n});", after_each_start)
+        self.assertIn(
+            "if (evidence) await attachPageErrorEvidence(page, testInfo, evidence);",
+            browser_spec[after_each_start:after_each_end],
+        )
         browser_config = (
             REPO_ROOT / "platform/apps/platform_web/playwright.live.config.ts"
         ).read_text(encoding="utf-8")
