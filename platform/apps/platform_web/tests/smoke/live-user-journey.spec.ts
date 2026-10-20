@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import LiveCountReporter from "../support/live-count-reporter.cjs";
 import { validateLiveQaOrigin } from "../support/live-qa-origin";
 import { assertLiveQaChromiumSandbox } from "../support/live-qa-sandbox";
 
@@ -17,11 +18,58 @@ const origin = enabled
   : (process.env.PLAYWRIGHT_LIVE_BASE_URL ?? "http://127.0.0.1").replace(/\/$/, "");
 const csrfTokens = new WeakMap<import("@playwright/test").BrowserContext, string>();
 const cspViolationConsolePrefix = "__platform_liveqa_csp_violation__:";
+type UserApiOperation = keyof typeof LiveCountReporter.USER_API_OPERATION_CONTRACTS;
+type UserApiFailureKind = "unexpected_status" | "invalid_json" | "request_error";
+type UserApiFailureCandidate = {
+  kind: UserApiFailureKind;
+  operation: UserApiOperation;
+  method: "GET" | "POST" | "PATCH";
+  expected_status: number;
+  actual_status: number | null;
+  source_file: string | null;
+  source_line: number | null;
+  source_column: number | null;
+};
+let latestApiFailure: UserApiFailureCandidate | null = null;
 const reportOnlyFrameAncestorsWarning =
   "The Content Security Policy directive 'frame-ancestors' is ignored when delivered in a report-only policy.";
 
 test.skip(!enabled, "PLATFORM_LIVE_USER_QA=1 is required.");
 test.setTimeout(600_000);
+test.beforeEach(() => {
+  latestApiFailure = null;
+});
+test.afterEach(async ({}, testInfo) => {
+  const candidate = latestApiFailure;
+  latestApiFailure = null;
+  const sourceFile = candidate?.source_file;
+  const sourceLine = candidate?.source_line;
+  const sourceColumn = candidate?.source_column;
+  if (
+    !candidate
+    || testInfo.status === testInfo.expectedStatus
+    || sourceFile !== "tests/smoke/live-user-journey.spec.ts"
+    || sourceLine === null
+    || sourceLine === undefined
+    || sourceColumn === null
+    || sourceColumn === undefined
+  ) return;
+  const attachment = LiveCountReporter.createLiveUserApiFailureAttachment({
+    ...candidate,
+    source_file: sourceFile,
+    source_line: sourceLine,
+    source_column: sourceColumn,
+  });
+  if (!attachment) return;
+  try {
+    await testInfo.attach(attachment.name, {
+      body: attachment.body,
+      contentType: attachment.contentType,
+    });
+  } catch {
+    // A failed optional attachment must not replace the original QA failure.
+  }
+});
 
 test("live player completes the accelerated tournament journey through visible controls", async ({ browser }, testInfo) => {
   const sessions = loadQaSessions();
@@ -125,8 +173,8 @@ test("live player completes the accelerated tournament journey through visible c
 
     const created = await apiJson<{ id: string; slug: string }>(
       organizerContext,
+      "tournament_create",
       "/tournaments",
-      "POST",
       {
         name: tournamentName,
         description: `Accelerated live browser acceptance ${marker}.`,
@@ -138,28 +186,25 @@ test("live player completes the accelerated tournament journey through visible c
         final_format: "bo1",
         teams_count: 2
       },
-      201
     );
     recordInventoryId(inventory, "tournament_ids", created.id);
     tournamentSlug = created.slug;
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/status`, "PATCH", { status: "registration_open" }, 200);
+    await apiJson(organizerContext, "tournament_status", `/tournaments/${tournamentSlug}/status`, { status: "registration_open" });
     const invite = await apiJson<{ code: string }>(
       organizerContext,
+      "invite_create",
       `/tournaments/${tournamentSlug}/invites`,
-      "POST",
       { note: marker, max_uses: 20, expires_at: null },
-      201
     );
 
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/join`, "POST", { entry_type: "solo" }, 201);
+    await apiJson(organizerContext, "tournament_join", `/tournaments/${tournamentSlug}/join`, { entry_type: "solo" });
     for (const context of helpers) {
-      await apiJson(context, "/tournaments/invites/claim", "POST", { code: invite.code, entry_type: "solo", team_name: null }, 201);
+      await apiJson(context, "invite_claim", "/tournaments/invites/claim", { code: invite.code, entry_type: "solo", team_name: null });
       await apiJson(
         context,
+        "tournament_join",
         `/tournaments/${tournamentSlug}/join`,
-        "POST",
         { entry_type: "solo", invite_code: invite.code },
-        201,
       );
     }
 
@@ -171,37 +216,36 @@ test("live player completes the accelerated tournament journey through visible c
     await expect(playerPage.getByText("Регистрация завершена", { exact: true })).toBeVisible();
     await screenshot(playerPage, testInfo, "03-registered");
 
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/status`, "PATCH", { status: "registration_closed" }, 200);
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/ready-check/start`, "POST", undefined, 201);
+    await apiJson(organizerContext, "tournament_status", `/tournaments/${tournamentSlug}/status`, { status: "registration_closed" });
+    await apiJson(organizerContext, "ready_check_start", `/tournaments/${tournamentSlug}/deadlock/ready-check/start`, undefined);
     await playerPage.reload();
     await playerPage.getByRole("button", { name: "Подтвердить участие" }).click();
     await expect(playerPage.getByRole("button", { name: "Отменить подтверждение" })).toBeVisible();
     await screenshot(playerPage, testInfo, "04-ready-confirmed");
 
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/ready-check/vote`, "POST", { choice: "yes" }, 200);
+    await apiJson(organizerContext, "ready_check_vote", `/tournaments/${tournamentSlug}/deadlock/ready-check/vote`, { choice: "yes" });
     for (const context of helpers) {
-      await apiJson(context, `/tournaments/${tournamentSlug}/deadlock/ready-check/vote`, "POST", { choice: "yes" }, 200);
+      await apiJson(context, "ready_check_vote", `/tournaments/${tournamentSlug}/deadlock/ready-check/vote`, { choice: "yes" });
     }
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/ready-check/close`, "POST", undefined, 200);
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/captain-round/start`, "POST", { teams_count: 2 }, 201);
+    await apiJson(organizerContext, "ready_check_close", `/tournaments/${tournamentSlug}/deadlock/ready-check/close`, undefined);
+    await apiJson(organizerContext, "captain_round_start", `/tournaments/${tournamentSlug}/deadlock/captain-round/start`, { teams_count: 2 });
 
     // Assignment, publish, and lock are intentionally exercised through the
     // API control-plane in this MVP. This journey covers the player bracket
     // and report surfaces; it makes no promise of an organizer console for
     // those lifecycle controls.
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/auto-assignment/run-async`, "POST", undefined, 202);
+    await apiJson(organizerContext, "assignment_start", `/tournaments/${tournamentSlug}/deadlock/auto-assignment/run-async`, undefined);
     const run = await pollAssignment(organizerContext, tournamentSlug);
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/auto-assignment/${run.id}/publish`, "POST", undefined, 200);
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/auto-assignment/${run.id}/lock`, "POST", undefined, 200);
+    await apiJson(organizerContext, "assignment_publish", `/tournaments/${tournamentSlug}/deadlock/auto-assignment/${run.id}/publish`, undefined);
+    await apiJson(organizerContext, "assignment_lock", `/tournaments/${tournamentSlug}/deadlock/auto-assignment/${run.id}/lock`, undefined);
     const bracketAfterLock = await apiJson<{
       revision: number;
       matches: Array<{ id: string; round_number: number }>;
     }>(
       organizerContext,
+      "bracket_read",
       `/tournaments/${tournamentSlug}/bracket?teams_view=summary`,
-      "GET",
       undefined,
-      200,
     );
     expect(bracketAfterLock.revision).toBe(1);
     expect(bracketAfterLock.matches.length).toBeGreaterThan(0);
@@ -250,7 +294,7 @@ test("live player completes the accelerated tournament journey through visible c
     await screenshot(organizerPage, testInfo, "06-final-score");
 
     await expect.poll(async () => {
-      const tournament = await apiJson<{ status: string }>(organizerContext, `/tournaments/${tournamentSlug}`, "GET", undefined, 200);
+      const tournament = await apiJson<{ status: string }>(organizerContext, "tournament_read", `/tournaments/${tournamentSlug}`, undefined);
       return tournament.status;
     }, { timeout: 10_000 }).toBe("completed");
   } finally {
@@ -740,7 +784,7 @@ async function assertManualBracketRefresh(
   const bracket = await apiJson<{
     revision: number;
     matches: Array<{ id: string; round_number: number }>;
-  }>(organizerContext, `/tournaments/${slug}/bracket?teams_view=summary`, "GET", undefined, 200);
+  }>(organizerContext, "bracket_read", `/tournaments/${slug}/bracket?teams_view=summary`, undefined);
   const openingMatch = bracket.matches.find((match) => match.round_number === 1);
   expect(openingMatch).toBeTruthy();
   const scheduledAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
@@ -759,13 +803,12 @@ async function assertManualBracketRefresh(
   try {
     await apiJson(
       organizerContext,
+      "match_schedule",
       `/tournaments/${slug}/matches/${openingMatch!.id}/schedule`,
-      "PATCH",
       {
         scheduled_at: scheduledAt,
         expected_revision: bracket.revision,
       },
-      200,
     );
     // Keep the live contract's two-second no-refresh window while advancing
     // browser timers deterministically; any interval-based refresh still runs.
@@ -810,11 +853,19 @@ async function csrfToken(context: import("@playwright/test").BrowserContext) {
 
 async function apiJson<T = Record<string, unknown>>(
   context: import("@playwright/test").BrowserContext,
+  operation: UserApiOperation,
   path: string,
-  method: string,
   data: unknown,
-  expected: number
 ): Promise<T> {
+  latestApiFailure = null;
+  const contract = LiveCountReporter.USER_API_OPERATION_CONTRACTS[operation];
+  if (!contract) throw new Error("Live-user QA API operation is not allowlisted.");
+  const { method, expected_status: expected } = contract;
+  const captureAllowed = LiveCountReporter.matchesLiveUserApiOperation(
+    operation,
+    method,
+    path,
+  );
   const headers: Record<string, string> = {
     "X-Platform-QA-Phase": `live_user_${marker}`,
   };
@@ -822,17 +873,81 @@ async function apiJson<T = Record<string, unknown>>(
     headers.Origin = origin;
     headers["X-CSRF-Token"] = await csrfToken(context);
   }
-  const response = await context.request.fetch(`${origin}/api/v1${path}`, {
-    method,
-    data,
-    headers,
-  });
+  let response: Awaited<ReturnType<typeof context.request.fetch>>;
+  try {
+    response = await context.request.fetch(`${origin}/api/v1${path}`, {
+      method,
+      data,
+      headers,
+    });
+  } catch {
+    throw liveUserApiFailure("request_error", operation, method, expected, null, captureAllowed);
+  }
   if (response.status() !== expected) {
-    throw new Error(
-      `Live-user QA API status mismatch: ${method.toUpperCase()} ${path} expected ${expected}, got ${response.status()}.`
+    throw liveUserApiFailure(
+      "unexpected_status",
+      operation,
+      method,
+      expected,
+      response.status(),
+      captureAllowed,
     );
   }
-  return response.status() === 204 ? ({} as T) : await response.json() as T;
+  if (response.status() === 204) return {} as T;
+  try {
+    return await response.json() as T;
+  } catch {
+    throw liveUserApiFailure(
+      "invalid_json",
+      operation,
+      method,
+      expected,
+      response.status(),
+      captureAllowed,
+    );
+  }
+}
+
+function liveUserApiFailure(
+  kind: UserApiFailureKind,
+  operation: UserApiOperation,
+  method: "GET" | "POST" | "PATCH",
+  expectedStatus: number,
+  actualStatus: number | null,
+  captureAllowed: boolean,
+): Error {
+  const error = new Error(LiveCountReporter.userApiFailureMessage(kind));
+  if (!captureAllowed) {
+    latestApiFailure = null;
+    return error;
+  }
+  const sourceLocation = userApiHelperLocation(error.stack);
+  latestApiFailure = {
+    kind,
+    operation,
+    method,
+    expected_status: expectedStatus,
+    actual_status: actualStatus,
+    source_file: sourceLocation?.file ?? null,
+    source_line: sourceLocation?.line ?? null,
+    source_column: sourceLocation?.column ?? null,
+  };
+  return error;
+}
+
+function userApiHelperLocation(stack: string | undefined) {
+  if (typeof stack !== "string" || stack.length > 16_384) return null;
+  for (const line of stack.split(/\r?\n/u).slice(0, 32)) {
+    const match = line.match(/\((.+\/tests\/smoke\/live-user-journey\.spec\.ts):([1-9][0-9]{0,4}):([1-9][0-9]{0,4})\)$/u);
+    if (!match) continue;
+    const relative = path.relative(process.cwd(), path.resolve(match[1])).split(path.sep).join("/");
+    if (relative !== "tests/smoke/live-user-journey.spec.ts") return null;
+    const sourceLine = Number(match[2]);
+    const sourceColumn = Number(match[3]);
+    if (sourceLine > 10_000 || sourceColumn > 10_000) return null;
+    return { file: relative, line: sourceLine, column: sourceColumn };
+  }
+  return null;
 }
 
 async function pollAssignment(context: import("@playwright/test").BrowserContext, slug: string) {
@@ -840,10 +955,9 @@ async function pollAssignment(context: import("@playwright/test").BrowserContext
   while (Date.now() < deadline) {
     const state = await apiJson<{ latest_run: { id: string; status: string; teams: unknown[] } | null }>(
       context,
+      "assignment_state",
       `/tournaments/${slug}/deadlock/auto-assignment`,
-      "GET",
       undefined,
-      200
     );
     if (
       state.latest_run

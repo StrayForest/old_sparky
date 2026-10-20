@@ -24,7 +24,9 @@ const MAX_TRACKED_NEXT_SCRIPTS = 256;
 const MAX_ATTEMPTS = 32768;
 const GATE_ROOT = "/run/oldsparky-liveqa";
 const FAILURE_REPORT_FILE = "live-failures-v2.json";
+const LIVE_USER_FAILURE_REPORT_FILE = "live-user-failures-v3.json";
 const PAGE_ERROR_ATTACHMENT_NAME = "live-pageerror-evidence-v1";
+const LIVE_USER_API_FAILURE_ATTACHMENT_NAME = "live-user-api-failure-v1";
 const RUN_STATUSES = new Set(["passed", "failed", "timedout", "interrupted"]);
 const ATTEMPT_STATUSES = new Set([
   "passed",
@@ -68,6 +70,87 @@ const FAILURE_SOURCE_FILES = new Set([
   "tests/smoke/live-launch.spec.ts",
   "tests/support/live-qa-sandbox.ts",
 ]);
+const LIVE_USER_FAILURE_SOURCE_FILES = new Set([
+  "tests/smoke/live-user-journey.spec.ts",
+]);
+const LIVE_USER_TEST_TITLE = "live player completes the accelerated tournament journey through visible controls";
+const LIVE_USER_TEST_ID = "live_user_journey";
+const LIVE_USER_PATH_SEGMENT = "[A-Za-z0-9_-]+";
+const LIVE_USER_API_OPERATIONS = Object.freeze({
+  tournament_create: Object.freeze({
+    method: "POST", expected_status: 201, path_pattern: /^\/tournaments$/u,
+  }),
+  tournament_status: Object.freeze({
+    method: "PATCH", expected_status: 200,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/status$`, "u"),
+  }),
+  invite_create: Object.freeze({
+    method: "POST", expected_status: 201,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/invites$`, "u"),
+  }),
+  invite_claim: Object.freeze({
+    method: "POST", expected_status: 201, path_pattern: /^\/tournaments\/invites\/claim$/u,
+  }),
+  tournament_join: Object.freeze({
+    method: "POST", expected_status: 201,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/join$`, "u"),
+  }),
+  ready_check_start: Object.freeze({
+    method: "POST", expected_status: 201,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/deadlock/ready-check/start$`, "u"),
+  }),
+  ready_check_vote: Object.freeze({
+    method: "POST", expected_status: 200,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/deadlock/ready-check/vote$`, "u"),
+  }),
+  ready_check_close: Object.freeze({
+    method: "POST", expected_status: 200,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/deadlock/ready-check/close$`, "u"),
+  }),
+  captain_round_start: Object.freeze({
+    method: "POST", expected_status: 201,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/deadlock/captain-round/start$`, "u"),
+  }),
+  assignment_start: Object.freeze({
+    method: "POST", expected_status: 202,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/deadlock/auto-assignment/run-async$`, "u"),
+  }),
+  assignment_state: Object.freeze({
+    method: "GET", expected_status: 200,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/deadlock/auto-assignment$`, "u"),
+  }),
+  assignment_publish: Object.freeze({
+    method: "POST", expected_status: 200,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/deadlock/auto-assignment/${LIVE_USER_PATH_SEGMENT}/publish$`, "u"),
+  }),
+  assignment_lock: Object.freeze({
+    method: "POST", expected_status: 200,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/deadlock/auto-assignment/${LIVE_USER_PATH_SEGMENT}/lock$`, "u"),
+  }),
+  bracket_read: Object.freeze({
+    method: "GET", expected_status: 200,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/bracket\\?teams_view=summary$`, "u"),
+  }),
+  match_schedule: Object.freeze({
+    method: "PATCH", expected_status: 200,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}/matches/${LIVE_USER_PATH_SEGMENT}/schedule$`, "u"),
+  }),
+  tournament_read: Object.freeze({
+    method: "GET", expected_status: 200,
+    path_pattern: new RegExp(`^/tournaments/${LIVE_USER_PATH_SEGMENT}$`, "u"),
+  }),
+});
+const LIVE_USER_API_FAILURE_KINDS = new Set([
+  "unexpected_status",
+  "invalid_json",
+  "request_error",
+]);
+const LIVE_USER_API_FAILURE_MESSAGES = Object.freeze({
+  unexpected_status: "LiveUserApiUnexpectedStatus: API response status did not match.",
+  invalid_json: "LiveUserApiInvalidJson: API response body was invalid.",
+  request_error: "LiveUserApiRequestError: API request failed.",
+});
+const LIVE_USER_API_FAILURE_MAX_BYTES = 1024;
 const FAILURE_ATTEMPT_STATUSES = new Set(["failed", "timedOut", "interrupted"]);
 const PAGE_ERROR_CLASSES = new Set([
   "Error",
@@ -385,7 +468,12 @@ function writeBoundedSummary(binding, summary, { gateRoot = GATE_ROOT } = {}) {
   }
 }
 
-function normalizedFailureLocation(location, sourceRoot, fallbackKind) {
+function normalizedFailureLocation(
+  location,
+  sourceRoot,
+  fallbackKind,
+  sourceFiles = FAILURE_SOURCE_FILES,
+) {
   if (
     !location
     || typeof location.file !== "string"
@@ -413,7 +501,7 @@ function normalizedFailureLocation(location, sourceRoot, fallbackKind) {
       || relative.startsWith("../")
       || relative === ".."
       || relative !== path.posix.normalize(relative)
-      || !FAILURE_SOURCE_FILES.has(relative)
+      || !sourceFiles.has(relative)
     ) return null;
     rootMetadata = fs.lstatSync(root);
     fileMetadata = fs.lstatSync(candidate);
@@ -676,6 +764,299 @@ function pageErrorEvidenceForAttempt(result) {
   };
 }
 
+function normalizedUserApiFailure(input) {
+  const keys = input && typeof input === "object" && !Array.isArray(input)
+    ? Object.keys(input).sort().join(",")
+    : "";
+  if (
+    !input
+    || typeof input !== "object"
+    || Array.isArray(input)
+    || ![
+      "actual_status,expected_status,kind,method,operation,source_column,source_file,source_line",
+      "actual_status,expected_status,kind,method,operation,schema,source_column,source_file,source_line",
+    ].includes(keys)
+    || (input.schema !== undefined && (typeOfSafeInteger(input.schema) !== 1))
+    || !LIVE_USER_API_FAILURE_KINDS.has(input.kind)
+    || typeof input.operation !== "string"
+    || !Object.prototype.hasOwnProperty.call(LIVE_USER_API_OPERATIONS, input.operation)
+  ) return null;
+  const operation = LIVE_USER_API_OPERATIONS[input.operation];
+  if (
+    input.method !== operation.method
+    || typeOfSafeInteger(input.expected_status) !== operation.expected_status
+    || typeof input.source_file !== "string"
+    || input.source_file !== "tests/smoke/live-user-journey.spec.ts"
+    || !Number.isSafeInteger(input.source_line)
+    || input.source_line < 1
+    || input.source_line > 10000
+    || !Number.isSafeInteger(input.source_column)
+    || input.source_column < 1
+    || input.source_column > 10000
+  ) return null;
+  if (input.kind === "request_error") {
+    if (input.actual_status !== null) return null;
+  } else if (
+    !Number.isSafeInteger(input.actual_status)
+    || input.actual_status < 100
+    || input.actual_status > 599
+    || (input.kind === "unexpected_status" && input.actual_status === operation.expected_status)
+    || (input.kind === "invalid_json" && input.actual_status !== operation.expected_status)
+  ) return null;
+  return {
+    kind: input.kind,
+    operation: input.operation,
+    method: operation.method,
+    expected_status: operation.expected_status,
+    actual_status: input.actual_status,
+    source_file: input.source_file,
+    source_line: input.source_line,
+    source_column: input.source_column,
+  };
+}
+
+function typeOfSafeInteger(value) {
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+function createLiveUserApiFailureAttachment(input) {
+  const failure = normalizedUserApiFailure(input);
+  if (!failure) return null;
+  const payload = { schema: 1, ...failure };
+  const body = Buffer.from(JSON.stringify(payload), "ascii");
+  if (body.length > LIVE_USER_API_FAILURE_MAX_BYTES) return null;
+  return {
+    name: LIVE_USER_API_FAILURE_ATTACHMENT_NAME,
+    contentType: "application/json",
+    body,
+  };
+}
+
+function userApiFailureMessage(kind) {
+  return LIVE_USER_API_FAILURE_MESSAGES[kind] ?? null;
+}
+
+function matchesLiveUserApiOperation(operation, method, requestPath) {
+  const contract = LIVE_USER_API_OPERATIONS[operation];
+  return Boolean(
+    contract
+    && method === contract.method
+    && typeof requestPath === "string"
+    && requestPath.length <= 512
+    && contract.path_pattern.test(requestPath)
+  );
+}
+
+function liveUserApiFailureForAttempt(result, sourceRoot, failureLocation) {
+  const unavailable = { state: "unavailable", failure: null };
+  if (!Array.isArray(result?.attachments) || !failureLocation) return unavailable;
+  const attachments = result.attachments.filter(
+    (attachment) => attachment?.name === LIVE_USER_API_FAILURE_ATTACHMENT_NAME,
+  );
+  if (attachments.length !== 1) return unavailable;
+  const attachment = attachments[0];
+  if (
+    attachment?.contentType !== "application/json"
+    || attachment.path !== undefined
+    || !Buffer.isBuffer(attachment.body)
+    || attachment.body.length > LIVE_USER_API_FAILURE_MAX_BYTES
+    || attachment.body.some((byte) => byte > 0x7f)
+  ) return unavailable;
+  let payload;
+  try {
+    payload = JSON.parse(attachment.body.toString("ascii"));
+  } catch {
+    return unavailable;
+  }
+  if (
+    !payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+    || Object.keys(payload).sort().join(",")
+      !== "actual_status,expected_status,kind,method,operation,schema,source_column,source_file,source_line"
+    || payload.schema !== 1
+    || attachment.body.toString("ascii") !== JSON.stringify(payload)
+  ) return unavailable;
+  const failure = normalizedUserApiFailure(payload);
+  if (
+    !failure
+    || failure.source_file !== failureLocation.file
+    || failure.source_line !== failureLocation.line
+    || failure.source_column !== failureLocation.column
+  ) return unavailable;
+  const matchingErrors = Array.isArray(result.errors)
+    ? result.errors.filter((error) => {
+      const location = normalizedFailureLocation(
+        error?.location,
+        sourceRoot,
+        "failure",
+        LIVE_USER_FAILURE_SOURCE_FILES,
+      );
+      return location
+        && location.file === failure.source_file
+        && location.line === failure.source_line
+        && location.column === failure.source_column;
+    })
+    : [];
+  if (matchingErrors.length !== 1) return unavailable;
+  return { state: "captured", failure: {
+    kind: failure.kind,
+    operation: failure.operation,
+    method: failure.method,
+    expected_status: failure.expected_status,
+    actual_status: failure.actual_status,
+  } };
+}
+
+function liveUserFailureRecordForAttempt(test, result, attempt, sourceRoot) {
+  const project = typeof test?.parent?.project === "function"
+    ? test.parent.project()?.name
+    : undefined;
+  if (
+    test?.title !== LIVE_USER_TEST_TITLE
+    || project !== "live-desktop"
+    || !FAILURE_ATTEMPT_STATUSES.has(result?.status)
+  ) return null;
+  let location = null;
+  if (Array.isArray(result.errors)) {
+    for (const error of result.errors) {
+      location = normalizedFailureLocation(
+        error?.location,
+        sourceRoot,
+        "failure",
+        LIVE_USER_FAILURE_SOURCE_FILES,
+      );
+      if (location) break;
+    }
+  }
+  const sourceFrame = location
+    ? { file: location.file, line: location.line, column: location.column }
+    : null;
+  const apiFailure = liveUserApiFailureForAttempt(result, sourceRoot, sourceFrame);
+  return {
+    id: LIVE_USER_TEST_ID,
+    project,
+    status: result.status,
+    attempt,
+    source_file: location?.file ?? null,
+    source_line: location?.line ?? null,
+    source_column: location?.column ?? null,
+    source_kind: location ? "test_error_location" : "unavailable",
+    api_failure_state: apiFailure.state,
+    api_failure: apiFailure.failure,
+  };
+}
+
+function writeBoundedLiveUserFailureSummary(
+  binding,
+  suite,
+  summary,
+  { gateRoot = GATE_ROOT, sourceRoot = process.cwd() } = {},
+) {
+  if (!binding || !summary || !suite || typeof suite.allTests !== "function") return false;
+  const gateName = path.basename(binding.gate);
+  if (
+    path.dirname(binding.gate) !== gateRoot
+    || !LIVE_USER_GATE_NAME.test(gateName)
+    || !RUN_STATUSES.has(summary.run_status)
+  ) return false;
+  const tests = suite.allTests();
+  if (!Array.isArray(tests) || tests.length !== 1) return false;
+  const test = tests[0];
+  if (
+    !test
+    || test.title !== LIVE_USER_TEST_TITLE
+    || typeof test.outcome !== "function"
+    || !Array.isArray(test.results)
+  ) return false;
+  const project = typeof test.parent?.project === "function"
+    ? test.parent.project()?.name
+    : undefined;
+  if (project !== "live-desktop") return false;
+  const failures = [];
+  for (const result of test.results) {
+    if (!FAILURE_ATTEMPT_STATUSES.has(result?.status)) continue;
+    const failure = liveUserFailureRecordForAttempt(
+      test,
+      result,
+      attemptsForTest(test, result),
+      sourceRoot,
+    );
+    if (!failure) return false;
+    failures.push(failure);
+  }
+  const failureExpected = summary.run_status !== "passed"
+    || summary.logical?.fail > 0
+    || summary.logical?.flaky > 0
+    || summary.logical?.interrupted > 0
+    || summary.attempts?.fail > 0
+    || summary.attempts?.interrupted > 0
+    || summary.attempts?.timedout > 0;
+  if (!failureExpected || failures.length === 0) return false;
+
+  let gateMetadata;
+  let resultsMetadata;
+  let rootMetadata;
+  try {
+    rootMetadata = fs.lstatSync(gateRoot);
+    gateMetadata = fs.lstatSync(binding.gate);
+    resultsMetadata = fs.lstatSync(path.join(binding.gate, "test-results"));
+  } catch {
+    return false;
+  }
+  if (
+    !rootMetadata.isDirectory()
+    || rootMetadata.isSymbolicLink()
+    || rootMetadata.uid !== 0
+    || (rootMetadata.mode & 0o777) !== 0o711
+    || fs.realpathSync(gateRoot) !== gateRoot
+    || !gateMetadata.isDirectory()
+    || gateMetadata.isSymbolicLink()
+    || gateMetadata.uid !== process.geteuid()
+    || (gateMetadata.mode & 0o777) !== 0o700
+    || !resultsMetadata.isDirectory()
+    || resultsMetadata.isSymbolicLink()
+    || resultsMetadata.uid !== process.geteuid()
+    || (resultsMetadata.mode & 0o777) !== 0o700
+  ) return false;
+
+  const payload = {
+    schema: 3,
+    gate: gateName,
+    source_sha: binding.source_sha,
+    app_sha: binding.app_sha,
+    marker_sha256: binding.marker_sha256,
+    run_status: summary.run_status,
+    failures,
+  };
+  const bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+  if (bytes.length > MAX_EPHEMERAL_FAILURE_REPORT_BYTES) return false;
+  const output = path.join(binding.gate, "test-results", LIVE_USER_FAILURE_REPORT_FILE);
+  let fd;
+  try {
+    fd = fs.openSync(
+      output,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+        | (fs.constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    const metadata = fs.fstatSync(fd);
+    if (
+      !metadata.isFile()
+      || metadata.nlink !== 1
+      || metadata.uid !== process.geteuid()
+      || (metadata.mode & 0o777) !== 0o600
+    ) return false;
+    fs.writeFileSync(fd, bytes);
+    fs.fsyncSync(fd);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 function failureRecordForAttempt(test, result, attempt, sourceRoot) {
   const project = typeof test?.parent?.project === "function"
     ? test.parent.project()?.name
@@ -862,6 +1243,7 @@ class LiveCountReporter {
   onEnd(result) {
     const binding = bindingsFromEnvironment(process.env, { gateRoot: this.gateRoot });
     const publicGate = binding !== null && PUBLIC_GATE_NAME.test(path.basename(binding.gate));
+    const liveUserGate = binding !== null && LIVE_USER_GATE_NAME.test(path.basename(binding.gate));
     const summary = summarizeRun(this.suite, result?.status, { publicGate });
     if (publicGate && summary) {
       try {
@@ -872,6 +1254,17 @@ class LiveCountReporter {
       } catch {
         // The guard emits a closed failure_report_unavailable marker if the
         // optional private record cannot be consumed or persisted.
+      }
+    }
+    if (liveUserGate && summary) {
+      try {
+        writeBoundedLiveUserFailureSummary(binding, this.suite, summary, {
+          gateRoot: this.gateRoot,
+          sourceRoot: this.sourceRoot,
+        });
+      } catch {
+        // The guard reports a closed unavailable status if the record cannot
+        // be consumed or persisted; the original Playwright result remains.
       }
     }
     if (!writeBoundedSummary(binding, summary, { gateRoot: this.gateRoot })) {
@@ -890,7 +1283,12 @@ module.exports.summarizeRun = summarizeRun;
 module.exports.bindingsFromEnvironment = bindingsFromEnvironment;
 module.exports.writeBoundedSummary = writeBoundedSummary;
 module.exports.writeBoundedFailureSummary = writeBoundedFailureSummary;
+module.exports.writeBoundedLiveUserFailureSummary = writeBoundedLiveUserFailureSummary;
 module.exports.createPageErrorAttachment = createPageErrorAttachment;
+module.exports.createLiveUserApiFailureAttachment = createLiveUserApiFailureAttachment;
+module.exports.userApiFailureMessage = userApiFailureMessage;
+module.exports.USER_API_OPERATION_CONTRACTS = LIVE_USER_API_OPERATIONS;
+module.exports.matchesLiveUserApiOperation = matchesLiveUserApiOperation;
 module.exports.trustedSuccessfulNextScriptPath = trustedSuccessfulNextScriptPath;
 module.exports.pageErrorClass = pageErrorClass;
 module.exports.MAX_PAGE_ERROR_EVENTS = MAX_PAGE_ERROR_EVENTS;

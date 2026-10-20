@@ -165,11 +165,18 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             payload = releases / app_sha
             payload.mkdir(mode=0o755)
             spec_path = payload / "runtime/web/tests/smoke/live-launch.spec.ts"
+            user_spec_path = payload / "runtime/web/tests/smoke/live-user-journey.spec.ts"
             helper_path = payload / "runtime/web/tests/support/live-qa-sandbox.ts"
             reporter_path = payload / "runtime/web/tests/support/live-count-reporter.cjs"
             spec_bytes = (
                 'import { test, expect } from "@playwright/test";\n'
                 'test("public case", async () => {\n'
+                '  expect(true).toBe(false);\n'
+                '});\n'
+            ).encode("ascii")
+            user_spec_bytes = (
+                'import { test, expect } from "@playwright/test";\n'
+                'test("live player completes the accelerated tournament journey through visible controls", async () => {\n'
                 '  expect(true).toBe(false);\n'
                 '});\n'
             ).encode("ascii")
@@ -183,6 +190,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             ).read_bytes()
             for path, content in (
                 (spec_path, spec_bytes),
+                (user_spec_path, user_spec_bytes),
                 (helper_path, helper_bytes),
                 (reporter_path, reporter_bytes),
             ):
@@ -200,6 +208,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 directory.chmod(0o555)
             file_map = {
                 "runtime/web/tests/smoke/live-launch.spec.ts": hashlib.sha256(spec_bytes).hexdigest(),
+                "runtime/web/tests/smoke/live-user-journey.spec.ts": hashlib.sha256(user_spec_bytes).hexdigest(),
                 "runtime/web/tests/support/live-qa-sandbox.ts": hashlib.sha256(helper_bytes).hexdigest(),
                 "runtime/web/tests/support/live-count-reporter.cjs": hashlib.sha256(reporter_bytes).hexdigest(),
             }
@@ -409,6 +418,211 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     app_sha=app_sha,
                     marker_sha256=marker_sha,
                 )
+                user_gate = run_root / "live-user-qa.Abc123"
+                user_gate.mkdir(mode=0o700)
+                user_results = user_gate / "test-results"
+                user_results.mkdir(mode=0o700)
+                user_counts = dict(count_payload)
+                user_counts.update(
+                    logical_total=1,
+                    logical_pass=0,
+                    logical_fail=1,
+                    logical_expected_fail=0,
+                    logical_flaky=0,
+                    logical_skip=0,
+                    logical_interrupted=0,
+                    attempt_total=1,
+                    attempt_pass=0,
+                    attempt_fail=1,
+                    attempt_skip=0,
+                    attempt_interrupted=0,
+                    attempt_timedout=0,
+                    run_status="failed",
+                )
+                (user_results / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE).write_text(
+                    json.dumps(user_counts) + "\n", encoding="ascii"
+                )
+                (user_results / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE).chmod(0o600)
+                user_ephemeral = {
+                    "schema": 3,
+                    "gate": user_gate.name,
+                    "source_sha": source_sha,
+                    "app_sha": app_sha,
+                    "marker_sha256": marker_sha,
+                    "run_status": "failed",
+                    "failures": [{
+                        "id": "live_user_journey",
+                        "project": "live-desktop",
+                        "status": "failed",
+                        "attempt": 1,
+                        "source_file": "tests/smoke/live-user-journey.spec.ts",
+                        "source_line": 3,
+                        "source_column": 3,
+                        "source_kind": "test_error_location",
+                        "api_failure_state": "captured",
+                        "api_failure": {
+                            "kind": "unexpected_status",
+                            "operation": "tournament_read",
+                            "method": "GET",
+                            "expected_status": 200,
+                            "actual_status": 503,
+                        },
+                    }],
+                }
+                user_ephemeral_path = user_results / platform_live_qa_guard.LIVE_USER_FAILURES_FILE
+                user_ephemeral_path.write_text(json.dumps(user_ephemeral) + "\n", encoding="ascii")
+                user_ephemeral_path.chmod(0o600)
+                platform_live_qa_guard.prepare_live_user_failure_diagnostics(
+                    user_gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha,
+                )
+                with self.assertRaises(platform_live_qa_guard.BrowserFailureCounts) as user_failed:
+                    platform_live_qa_guard.public_browser_counts_line(
+                        user_gate,
+                        source_sha=source_sha,
+                        app_sha=app_sha,
+                        marker_sha256=marker_sha,
+                        persist_failure_report=True,
+                        fail_on_failure_counts=True,
+                    )
+                self.assertIn("run_status=failed", user_failed.exception.count_line)
+                user_private_report = secret / "diagnostics" / f"{user_gate.name}.failure-v3.json"
+                user_private_bytes = user_private_report.read_bytes()
+                user_private = json.loads(user_private_bytes)
+                self.assertEqual(user_private["schema"], 3)
+                self.assertEqual(user_private["payload_manifest_sha256"], hashlib.sha256(manifest_path.read_bytes()).hexdigest())
+                self.assertEqual(user_private["failures"][0]["api_failure"]["actual_status"], 503)
+                self.assertNotIn(b"private assertion text", user_private_bytes)
+                mismatched_retained = dict(user_private)
+                mismatched_retained["run_status"] = "timedout"
+                with self.assertRaises(platform_live_qa_guard.GuardError):
+                    platform_live_qa_guard._validate_retained_failure_report(
+                        user_private_report.name,
+                        (json.dumps(mismatched_retained) + "\n").encode("ascii"),
+                    )
+                unlocated_retained = dict(user_private)
+                unlocated_failure = dict(unlocated_retained["failures"][0])
+                unlocated_failure.update(
+                    source_kind="unavailable",
+                    source_file=None,
+                    source_line=None,
+                    source_column=None,
+                )
+                unlocated_retained["failures"] = [unlocated_failure]
+                with self.assertRaises(platform_live_qa_guard.GuardError):
+                    platform_live_qa_guard._validate_retained_failure_report(
+                        user_private_report.name,
+                        (json.dumps(unlocated_retained) + "\n").encode("ascii"),
+                    )
+                with patch.object(platform_live_qa_guard, "assert_liveqa_idle"):
+                    platform_live_qa_guard.reclaim_browser_gate(user_gate)
+                    platform_live_qa_guard.remove_browser_gate(user_gate)
+                self.assertFalse(user_gate.exists())
+                self.assertEqual(user_private_report.read_bytes(), user_private_bytes)
+
+                malformed_gate = run_root / "live-user-qa.Def456"
+                malformed_gate.mkdir(mode=0o700)
+                malformed_results = malformed_gate / "test-results"
+                malformed_results.mkdir(mode=0o700)
+                (malformed_results / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE).write_text(
+                    json.dumps(user_counts) + "\n", encoding="ascii"
+                )
+                (malformed_results / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE).chmod(0o600)
+                malformed_ephemeral = dict(user_ephemeral)
+                malformed_ephemeral["gate"] = malformed_gate.name
+                malformed_ephemeral["failures"] = [dict(user_ephemeral["failures"][0])]
+                malformed_ephemeral["failures"][0]["api_failure"] = dict(
+                    malformed_ephemeral["failures"][0]["api_failure"], method="DELETE"
+                )
+                malformed_path = malformed_results / platform_live_qa_guard.LIVE_USER_FAILURES_FILE
+                malformed_path.write_text(json.dumps(malformed_ephemeral) + "\n", encoding="ascii")
+                malformed_path.chmod(0o600)
+                platform_live_qa_guard.prepare_live_user_failure_diagnostics(
+                    malformed_gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha,
+                )
+                with self.assertRaises(platform_live_qa_guard.BrowserFailureReportUnavailable):
+                    platform_live_qa_guard.public_browser_counts_line(
+                        malformed_gate,
+                        source_sha=source_sha,
+                        app_sha=app_sha,
+                        marker_sha256=marker_sha,
+                        persist_failure_report=True,
+                    )
+                self.assertFalse((secret / "diagnostics" / f"{malformed_gate.name}.failure-v3.json").exists())
+                unlocated_ephemeral = dict(user_ephemeral)
+                unlocated_ephemeral["gate"] = malformed_gate.name
+                unlocated_failure = dict(unlocated_ephemeral["failures"][0])
+                unlocated_failure.update(
+                    source_kind="unavailable",
+                    source_file=None,
+                    source_line=None,
+                    source_column=None,
+                )
+                unlocated_ephemeral["failures"] = [unlocated_failure]
+                malformed_path.write_text(
+                    json.dumps(unlocated_ephemeral) + "\n", encoding="ascii"
+                )
+                malformed_path.chmod(0o600)
+                with self.assertRaises(platform_live_qa_guard.BrowserFailureReportUnavailable):
+                    platform_live_qa_guard.public_browser_counts_line(
+                        malformed_gate,
+                        source_sha=source_sha,
+                        app_sha=app_sha,
+                        marker_sha256=marker_sha,
+                        persist_failure_report=True,
+                    )
+                self.assertFalse((secret / "diagnostics" / f"{malformed_gate.name}.failure-v3.json").exists())
+                with patch.object(platform_live_qa_guard, "assert_liveqa_idle"):
+                    platform_live_qa_guard.reclaim_browser_gate(malformed_gate)
+                    platform_live_qa_guard.remove_browser_gate(malformed_gate)
+
+                multipletest_gate = run_root / "live-user-qa.Ghi789"
+                multipletest_gate.mkdir(mode=0o700)
+                multipletest_results = multipletest_gate / "test-results"
+                multipletest_results.mkdir(mode=0o700)
+                multipletest_counts = dict(user_counts)
+                multipletest_counts.update(
+                    logical_total=2,
+                    logical_pass=1,
+                    attempt_total=2,
+                    attempt_pass=1,
+                )
+                (multipletest_results / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE).write_text(
+                    json.dumps(multipletest_counts) + "\n", encoding="ascii"
+                )
+                (multipletest_results / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE).chmod(0o600)
+                multipletest_ephemeral = dict(user_ephemeral)
+                multipletest_ephemeral["gate"] = multipletest_gate.name
+                multipletest_path = multipletest_results / platform_live_qa_guard.LIVE_USER_FAILURES_FILE
+                multipletest_path.write_text(
+                    json.dumps(multipletest_ephemeral) + "\n", encoding="ascii"
+                )
+                multipletest_path.chmod(0o600)
+                platform_live_qa_guard.prepare_live_user_failure_diagnostics(
+                    multipletest_gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha,
+                )
+                with self.assertRaises(platform_live_qa_guard.BrowserFailureReportUnavailable):
+                    platform_live_qa_guard.public_browser_counts_line(
+                        multipletest_gate,
+                        source_sha=source_sha,
+                        app_sha=app_sha,
+                        marker_sha256=marker_sha,
+                        persist_failure_report=True,
+                    )
+                self.assertFalse(
+                    (secret / "diagnostics" / f"{multipletest_gate.name}.failure-v3.json").exists()
+                )
+                with patch.object(platform_live_qa_guard, "assert_liveqa_idle"):
+                    platform_live_qa_guard.reclaim_browser_gate(multipletest_gate)
+                    platform_live_qa_guard.remove_browser_gate(multipletest_gate)
                 max_gate = run_root / "public-live-qa.b1a2b3c4"
                 max_gate.mkdir(mode=0o700)
                 (max_gate / "test-results").mkdir(mode=0o700)
@@ -668,9 +882,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertIn("run_status=failed", write_failure.exception.count_line)
                 self.assertFalse(private_report.exists())
                 self.assertEqual(
-                    os.listdir(secret / "diagnostics"),
-                    [max_private_report.name],
-                    "a failed second publication leaves the earlier valid record intact",
+                    sorted(os.listdir(secret / "diagnostics")),
+                    sorted([max_private_report.name, user_private_report.name]),
+                    "a failed second publication leaves prior valid records intact",
                 )
                 failure_payload["failures"][0]["status"] = "interrupted"
                 failures_path.write_text(json.dumps(failure_payload) + "\n", encoding="ascii")
@@ -2028,7 +2242,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 ), count_output
 
             persisted_failure, persisted_counts = run_count_tail(43, failed_counts_line)
-            self.assertEqual(persisted_failure.returncode, 1)
+            self.assertEqual(
+                persisted_failure.returncode, 1,
+                f"stdout={persisted_failure.stdout!r} stderr={persisted_failure.stderr!r}",
+            )
             self.assertNotIn("LIVE_BROWSER_QA_SUCCESS", persisted_failure.stdout)
             self.assertNotIn("failure_report_unavailable", persisted_failure.stdout)
             self.assertEqual(persisted_counts.read_text(encoding="ascii"), failed_counts_line + "\n")
@@ -4893,6 +5110,120 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("platform_live_user_qa_trusted.sh", dispatcher)
         self.assertIn("platform_live_qa_mailbox_helper.py", dispatcher)
         self.assertIn("PLATFORM_LIVE_QA_TARGET_SHA", dispatcher)
+        user_wrapper = (TOOLS_ROOT / "platform_live_user_qa.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("prepare-live-user-failure-diagnostics", user_wrapper)
+        self.assertIn("--persist-failure-report --fail-on-failure-counts", user_wrapper)
+        self.assertLess(
+            user_wrapper.index("prepare-live-user-failure-diagnostics"),
+            user_wrapper.index("capture-qa-browser-child"),
+        )
+        self.assertGreater(
+            user_wrapper.index("printf 'LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=%s"),
+            user_wrapper.index("emit-public-browser-counts"),
+        )
+        preflight_comment = user_wrapper.index(
+            "# Retention is best-effort and must not prevent the authorized QA journey."
+        )
+        preflight_start = user_wrapper.rfind(
+            "if (( TRUSTED_MODE == 1 ))", 0, preflight_comment
+        )
+        preflight_end = user_wrapper.index("\nfi", preflight_start) + len("\nfi")
+        preflight = user_wrapper[preflight_start:preflight_end]
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            fixture = Path(temporary)
+            rejected = fixture / "guard"
+            rejected.write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+            rejected.chmod(0o700)
+            result = subprocess.run(
+                [
+                    "/bin/bash", "-c",
+                    "set -euo pipefail\nTRUSTED_MODE=1\n"
+                    "BROWSER_GATE=live-user-qa.Abc123\n"
+                    f"LIVE_QA_RUNNER_SHA={'a' * 40}\n"
+                    f"LIVE_QA_MARKER_SHA256={'c' * 64}\n"
+                    f"SOURCE_COMMIT={'b' * 40}\n"
+                    f"GUARD=({shlex.quote(str(rejected))})\n"
+                    + preflight + "\nprintf 'browser-started\\n'\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "browser-started\n", ""))
+
+            count_start = user_wrapper.index("diagnostic_valid=0\ndiagnostic_kind=")
+            count_end_marker = 'exit "$browser_status"'
+            count_end = user_wrapper.rindex(count_end_marker, count_start) + len(count_end_marker)
+            count_tail = user_wrapper[count_start:count_end]
+            line = (
+                "LIVE_BROWSER_COUNTS schema=1 run_status=failed logical_total=1 logical_pass=0 "
+                "logical_fail=1 logical_expected_fail=0 logical_flaky=0 logical_skip=0 "
+                "logical_interrupted=0 attempt_total=1 attempt_pass=0 attempt_fail=1 "
+                "attempt_skip=0 attempt_interrupted=0 attempt_timedout=0 "
+                f"source_sha={'a' * 40} app_sha={'b' * 40} marker_sha256={'c' * 64}"
+            )
+
+            def run_user_count_tail(count_status: int, child_status: int) -> tuple[subprocess.CompletedProcess[str], str]:
+                fake_guard = fixture / f"count-guard-{count_status}-{child_status}"
+                trace = fixture / f"count-args-{count_status}-{child_status}"
+                fake_guard.write_text(
+                    "#!/bin/sh\n"
+                    'if [ "$1" = emit-public-browser-counts ]; then\n'
+                    '  printf "%s\\n" "$FAKE_COUNT_LINE"\n'
+                    '  printf "%s\\n" "$*" > "$FAKE_COUNT_TRACE"\n'
+                    '  exit "$FAKE_COUNT_STATUS"\n'
+                    "fi\nexit 2\n",
+                    encoding="ascii",
+                )
+                fake_guard.chmod(0o700)
+                marker = (
+                    "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=browser_launch_error "
+                    f"stdout_bytes=0 stderr_bytes=0 truncated=false child_exit={child_status}"
+                    if child_status
+                    else "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none "
+                    "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0"
+                )
+                result = subprocess.run(
+                    [
+                        "/bin/bash", "-c",
+                        "set -euo pipefail\nTRUSTED_MODE=1\n"
+                        "BROWSER_GATE=live-user-qa.Abc123\n"
+                        f"LIVE_QA_RUNNER_SHA={'a' * 40}\n"
+                        f"LIVE_QA_MARKER_SHA256={'c' * 64}\n"
+                        f"SOURCE_COMMIT={'b' * 40}\n"
+                        f"browser_status={child_status}\n"
+                        f"browser_diagnostic={shlex.quote(marker)}\n"
+                        f"GUARD=({shlex.quote(str(fake_guard))})\n"
+                        + count_tail,
+                    ],
+                    env={
+                        **os.environ,
+                        "FAKE_COUNT_LINE": line,
+                        "FAKE_COUNT_STATUS": str(count_status),
+                        "FAKE_COUNT_TRACE": str(trace),
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=3,
+                )
+                return result, trace.read_text(encoding="ascii")
+
+            persisted_failure, count_args = run_user_count_tail(43, 0)
+            self.assertEqual(
+                persisted_failure.returncode, 1,
+                f"stdout={persisted_failure.stdout!r} stderr={persisted_failure.stderr!r}",
+            )
+            self.assertIn("LIVE_BROWSER_COUNTS schema=1", persisted_failure.stdout)
+            self.assertNotIn("LIVE_QA_CHILD_DIAGNOSTIC", persisted_failure.stdout)
+            self.assertIn("--persist-failure-report --fail-on-failure-counts", count_args)
+            unavailable, _count_args = run_user_count_tail(42, 7)
+            self.assertEqual(unavailable.returncode, 7)
+            self.assertIn("kind=failure_report_unavailable", unavailable.stdout)
+            self.assertIn("child_exit=7", unavailable.stdout)
         self.assertEqual(
             dispatcher.splitlines()[0],
             "#!/usr/bin/env -S /usr/bin/python3.12 -I -B",
