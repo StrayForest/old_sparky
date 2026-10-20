@@ -46,7 +46,7 @@ const PUBLIC_TEST_IDS = new Map([
   ["live admin route is protected for anonymous users", "admin_anonymous_protection"],
   ["live home uses text-only tournament steps without overflow", "home_steps_overflow"],
   ["live public contact surfaces do not publish the support recipient", "contact_recipient_privacy"],
-  ["live patch renders separate Urn and Rift objectives with source icons", "objective_icons"],
+  ["live current patch route and objective source icons remain available", "objective_icons"],
   ["live Cloudflare Analytics is conditionally observed without widening CSP", "analytics_csp"],
   ["live image currentSrc inventory stays inside the exact CSP hosts", "image_csp_hosts"],
 ]);
@@ -68,7 +68,7 @@ const PUBLIC_TEST_TITLES = new Set([
   "live admin route is protected for anonymous users",
   "live home uses text-only tournament steps without overflow",
   "live public contact surfaces do not publish the support recipient",
-  "live patch renders separate Urn and Rift objectives with source icons",
+  "live current patch route and objective source icons remain available",
   "live Cloudflare Analytics is conditionally observed without widening CSP",
   "live image currentSrc inventory stays inside the exact CSP hosts",
 ]);

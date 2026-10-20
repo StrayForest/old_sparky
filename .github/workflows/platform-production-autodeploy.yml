@@ -856,7 +856,7 @@ jobs:
         if: ${{ steps.gate.outputs.deploy == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-host-tools-bootstrap-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          name: platform-host-tools-bootstrap-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/platform-host-tools-artifact
           if-no-files-found: error
           retention-days: 14
@@ -932,7 +932,7 @@ jobs:
       - name: Download exact uploaded host-tools bundle and contract
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-host-tools-bootstrap-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          name: platform-host-tools-bootstrap-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/host-tools-bootstrap
 
       - name: Revalidate bundle bytes against exact host-tools pin

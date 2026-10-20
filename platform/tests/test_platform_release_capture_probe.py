@@ -1398,7 +1398,7 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
         )
 
         source_sha = "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
-        for runtime_version in (1, 2):
+        for runtime_version in (1, 2, 3):
             with self.subTest(runtime_version=runtime_version), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 release = root / "release"
@@ -1425,7 +1425,7 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 if runtime_version == 1:
                     sandbox_path.write_bytes(sandbox_bytes)
                     sandbox_path.chmod(0o4755)
-                if runtime_version == 2:
+                if runtime_version in {2, 3}:
                     (runtime_source / "node/bin/node").write_bytes(b"node\n")
                 for path in release.rglob("*"):
                     if path.is_dir():
@@ -1463,7 +1463,7 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                             patch.object(runtime_installer, "CHROMIUM_SANDBOX_SHA256", hashlib.sha256(sandbox_bytes).hexdigest()),
                         ]
                     )
-                else:
+                elif runtime_version == 2:
                     provider = {
                         "version": 1,
                         "provider_sha": "a" * 40,
@@ -1471,6 +1471,16 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                         "node_version": "26.3.1",
                         "package_lock_sha256": "c" * 64,
                         "engine_files": {"node/bin/node": "d" * 64},
+                    }
+                else:
+                    provider = {
+                        "version": 2,
+                        "provider_sha": "a" * 40,
+                        "engine_tree_sha256": "b" * 64,
+                        "node_version": "26.3.1",
+                        "package_lock_sha256": "c" * 64,
+                        "engine_files": {"node/bin/node": "d" * 64},
+                        "engine_links": {},
                     }
                 with patchers[0], patchers[1], patchers[2], patchers[3]:
                     extra = patchers[4:] if len(patchers) > 4 else []
@@ -1611,7 +1621,10 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                 self.assertTrue(matches, evidence)
                 self.assertEqual(expected_digest, tree_digest)
                 self.assertIn("source-sha", expected_files)
-                self.assertEqual("runtime-provider.json" in expected_files, runtime_version == 2)
+                self.assertEqual(
+                    "runtime-provider.json" in expected_files,
+                    runtime_version in {2, 3},
+                )
                 self.assertEqual("runtime/" + sandbox_rel.as_posix() in expected_files, runtime_version == 1)
                 self.assertNotIn("platform/apps/platform_api/empty/nested", expected_files)
                 self.assertNotIn("runtime/web/tests/empty", expected_files)

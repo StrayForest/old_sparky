@@ -218,6 +218,324 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         package_lock_sha256=lock_sha,
                     )
 
+    def test_typed_browser_alias_provider_rebuilds_and_validates_exact_links(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            old_engine, old_files, lock_sha = self._engine_provider_fixture(root / "old")
+            webkit_root = old_engine / "browsers/webkit-2311"
+            for path in old_engine.rglob("*"):
+                if path.is_dir():
+                    os.chmod(path, 0o755)
+            os.chmod(old_engine, 0o755)
+            alias_bytes = b"shared WPE provider bytes\n"
+            (webkit_root / "lib").mkdir(mode=0o755)
+            (webkit_root / "lib/real.so.1.9.5").write_bytes(alias_bytes)
+            (webkit_root / "lib/alias.so.1").write_bytes(alias_bytes)
+            (webkit_root / "lib/alias.so").write_bytes(alias_bytes)
+            for path in webkit_root.rglob("*"):
+                if path.is_file():
+                    os.chown(path, 0, 0)
+                    os.chmod(path, 0o555 if path.stat().st_mode & 0o111 else 0o444)
+                elif path.is_dir():
+                    os.chown(path, 0, 0)
+                    os.chmod(path, 0o555)
+            for path in sorted(old_engine.rglob("*"), reverse=True):
+                if path.is_dir():
+                    os.chmod(path, 0o555)
+            os.chmod(old_engine, 0o555)
+
+            engine_links = {
+                "browsers/webkit-2311/lib/alias.so": "alias.so.1",
+                "browsers/webkit-2311/lib/alias.so.1": "real.so.1.9.5",
+            }
+            with mock.patch.multiple(
+                runtime,
+                CHROMIUM_SANDBOX_SIZE=(old_engine / runtime.RUNTIME_SANDBOX_RELATIVE).stat().st_size,
+                CHROMIUM_SANDBOX_SHA256=hashlib.sha256(
+                    (old_engine / runtime.RUNTIME_SANDBOX_RELATIVE).read_bytes()
+                ).hexdigest(),
+            ):
+                flattened_files = runtime._runtime_file_map(
+                    old_engine,
+                    prefixes=("node/", "browsers/", "web/node_modules/"),
+                )
+                engine_files = {
+                    relative: digest
+                    for relative, digest in flattened_files.items()
+                    if relative not in engine_links
+                }
+                engine_sha = runtime._engine_map_digest(
+                    engine_files,
+                    engine_links,
+                    node_version="26.3.1",
+                    package_lock_sha256=lock_sha,
+                )
+                suite_root = root / "suite"
+                (suite_root / "web").mkdir(mode=0o700, parents=True)
+                lock = suite_root / "web/package-lock.json"
+                lock.write_bytes(b"lock\n")
+                os.chown(lock, 0, 0)
+                os.chmod(lock, 0o444)
+                repaired = root / "provider-runtime"
+                provider_files = runtime._copy_typed_engine_provider(
+                    old_engine,
+                    suite_root,
+                    repaired,
+                    engine_files=engine_files,
+                    engine_links=engine_links,
+                    package_lock_sha256=lock_sha,
+                )
+                runtime._validate_engine_root(
+                    repaired,
+                    expected_files=engine_files,
+                    expected_links=engine_links,
+                    engine_sha256=engine_sha,
+                    node_version="26.3.1",
+                    package_lock_sha256=lock_sha,
+                )
+                first_alias = repaired / "browsers/webkit-2311/lib/alias.so"
+                chained_alias = repaired / "browsers/webkit-2311/lib/alias.so.1"
+                self.assertTrue(first_alias.is_symlink())
+                self.assertTrue(chained_alias.is_symlink())
+                self.assertEqual(os.readlink(first_alias), "alias.so.1")
+                self.assertEqual(os.readlink(chained_alias), "real.so.1.9.5")
+                self.assertEqual(provider_files["provider-runtime/web/package-lock.json"], lock_sha)
+                self.assertTrue((old_engine / "browsers/webkit-2311/lib/alias.so").is_file())
+                self.assertFalse((old_engine / "browsers/webkit-2311/lib/alias.so").is_symlink())
+
+                # Typed provider roots are engine-only projections; accepting
+                # a v1 runtime manifest or suite source here would let an
+                # undeclared runtime tree hitchhike beside the engine map.
+                extra_manifest = repaired / "runtime-manifest.json"
+                os.chmod(repaired, 0o755)
+                extra_manifest.write_text("{}\n", encoding="ascii")
+                os.chown(extra_manifest, 0, 0)
+                os.chmod(extra_manifest, 0o444)
+                os.chmod(repaired, 0o555)
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_engine_root(
+                        repaired,
+                        expected_files=engine_files,
+                        expected_links=engine_links,
+                        engine_sha256=engine_sha,
+                        node_version="26.3.1",
+                        package_lock_sha256=lock_sha,
+                    )
+                os.chmod(repaired, 0o755)
+                extra_manifest.unlink()
+                os.chmod(repaired, 0o555)
+
+                web_root = repaired / "web"
+                tests_root = web_root / "tests/support"
+                os.chmod(web_root, 0o755)
+                tests_root.mkdir(mode=0o700, parents=True)
+                extra_suite = tests_root / "live-engine-preflight.cjs"
+                extra_suite.write_text("// suite source is not provider state\n", encoding="ascii")
+                os.chown(extra_suite, 0, 0)
+                os.chmod(extra_suite, 0o444)
+                for directory in (web_root / "tests", tests_root):
+                    os.chown(directory, 0, 0)
+                    os.chmod(directory, 0o555)
+                os.chmod(web_root, 0o555)
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_engine_root(
+                        repaired,
+                        expected_files=engine_files,
+                        expected_links=engine_links,
+                        engine_sha256=engine_sha,
+                        node_version="26.3.1",
+                        package_lock_sha256=lock_sha,
+                    )
+                os.chmod(web_root, 0o755)
+                shutil.rmtree(web_root / "tests")
+                os.chmod(web_root, 0o555)
+
+                flattened = root / "flattened-provider"
+                shutil.copytree(repaired, flattened, symlinks=True)
+                flattened_alias = flattened / "browsers/webkit-2311/lib/alias.so"
+                flattened_alias.unlink()
+                flattened_alias.write_bytes(alias_bytes)
+                os.chown(flattened_alias, 0, 0)
+                os.chmod(flattened_alias, 0o444)
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_engine_root(
+                        flattened,
+                        expected_files=engine_files,
+                        expected_links=engine_links,
+                        engine_sha256=engine_sha,
+                        node_version="26.3.1",
+                        package_lock_sha256=lock_sha,
+                    )
+
+                first_alias.unlink()
+                first_alias.symlink_to("../../../../outside.so")
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_engine_root(
+                        repaired,
+                        expected_files=engine_files,
+                        expected_links=engine_links,
+                        engine_sha256=engine_sha,
+                        node_version="26.3.1",
+                        package_lock_sha256=lock_sha,
+                    )
+
+    def test_engine_alias_manifest_rejects_escape_cycles_and_missing_targets(self) -> None:
+        files = {"browsers/webkit-2311/lib/real.so": "a" * 64}
+        rejected = (
+            {"browsers/webkit-2311/lib/link.so": "../../../../etc/passwd"},
+            {
+                "browsers/webkit-2311/lib/first.so": "second.so",
+                "browsers/webkit-2311/lib/second.so": "first.so",
+            },
+            {"browsers/webkit-2311/lib/link.so": "missing.so"},
+            {"browsers/not-pinned/lib/link.so": "real.so"},
+            {"browsers/webkit-2311/lib/link.so": "/absolute/path"},
+            {
+                "browsers/webkit-2311/lib/parent.so": "real.so",
+                "browsers/webkit-2311/lib/parent.so/child": "real.so",
+            },
+        )
+        for links in rejected:
+            with self.subTest(links=links), self.assertRaises(runtime.InstallerError):
+                runtime._validate_engine_links(files, links)
+        with self.assertRaises(runtime.InstallerError):
+            runtime._validate_engine_links(
+                {
+                    **files,
+                    "browsers/webkit-2311/lib/file.so": "b" * 64,
+                    "browsers/webkit-2311/lib/file.so/child": "c" * 64,
+                },
+                {},
+            )
+
+    def test_typed_provider_payload_digest_binds_aliases_and_cleanup_is_closed(self) -> None:
+        source_sha = "d" * 40
+        engine_files = {
+            "node/bin/node": hashlib.sha256(b"node\n").hexdigest(),
+            "browsers/webkit-2311/lib/real.so": hashlib.sha256(b"engine\n").hexdigest(),
+        }
+        engine_links = {
+            "browsers/webkit-2311/lib/alias.so": "real.so",
+        }
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            payload = root / source_sha
+            provider_root = payload / "provider-runtime"
+            node = provider_root / "node/bin/node"
+            terminal = provider_root / "browsers/webkit-2311/lib/real.so"
+            node.parent.mkdir(mode=0o700, parents=True)
+            terminal.parent.mkdir(mode=0o700, parents=True)
+            (provider_root / "web").mkdir(mode=0o700, parents=True)
+            node.write_bytes(b"node\n")
+            terminal.write_bytes(b"engine\n")
+            lock = provider_root / "web/package-lock.json"
+            lock.write_bytes(b"lock\n")
+            for path in (node, terminal, lock):
+                os.chown(path, 0, 0)
+                os.chmod(path, 0o444)
+            alias = provider_root / "browsers/webkit-2311/lib/alias.so"
+            alias.symlink_to("real.so")
+            os.chown(alias, 0, 0, follow_symlinks=False)
+            record = {
+                "version": 2,
+                "source_sha": source_sha,
+                "provider_sha": source_sha,
+                "engine_tree_sha256": "e" * 64,
+                "node_version": "26.3.1",
+                "package_lock_sha256": hashlib.sha256(b"lock\n").hexdigest(),
+                "engine_files": engine_files,
+                "engine_links": engine_links,
+            }
+            provider_manifest = payload / "runtime-provider.json"
+            provider_manifest.write_text(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="ascii",
+            )
+            (payload / "source-sha").write_text(source_sha + "\n", encoding="ascii")
+            for path in (provider_manifest, payload / "source-sha"):
+                os.chown(path, 0, 0)
+                os.chmod(path, 0o444)
+
+            payload_links = runtime._payload_link_map(payload)
+            self.assertEqual(
+                payload_links,
+                {f"provider-runtime/{path}": target for path, target in engine_links.items()},
+            )
+            tree_digest, payload_files = runtime._tree_digest(
+                payload,
+                allowed_links=payload_links,
+            )
+            self.assertEqual(len(tree_digest), 64)
+            self.assertNotIn("provider-runtime/browsers/webkit-2311/lib/alias.so", payload_files)
+            alias.unlink()
+            alias.write_bytes(b"engine\n")
+            os.chown(alias, 0, 0)
+            os.chmod(alias, 0o444)
+            with self.assertRaises(runtime.InstallerError):
+                runtime._tree_digest(payload, allowed_links=payload_links)
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            payload_root = root / "payloads"
+            payload_root.mkdir(mode=0o755)
+            source_sha = "c" * 40
+            stage = payload_root / f".{source_sha}.install-{'f' * 32}"
+            provider_root = stage / "provider-runtime/browsers/webkit-2311/lib"
+            provider_root.mkdir(mode=0o700, parents=True)
+            (provider_root / "real.so").write_bytes(b"engine\n")
+            (provider_root / "real.so").chmod(0o444)
+            alias = provider_root / "alias.so"
+            alias.symlink_to("real.so")
+            os.chown(alias, 0, 0, follow_symlinks=False)
+            stage_record = {
+                "version": 2,
+                "source_sha": source_sha,
+                "provider_sha": source_sha,
+                "engine_files": {
+                    "browsers/webkit-2311/lib/real.so": hashlib.sha256(
+                        b"engine\n"
+                    ).hexdigest()
+                },
+                "engine_links": {
+                    "browsers/webkit-2311/lib/alias.so": "real.so",
+                },
+            }
+            (stage / "runtime-provider.json").write_text(
+                json.dumps(stage_record, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="ascii",
+            )
+            (stage / "runtime-provider.json").chmod(0o444)
+            keep = root / "keep.txt"
+            keep.write_text("outside owned payload namespace\n", encoding="ascii")
+            with mock.patch.object(runtime, "PAYLOAD_ROOT", payload_root):
+                self.assertEqual(runtime._cleanup_staging(apply=True), 1)
+                self.assertFalse(stage.exists())
+                self.assertEqual(keep.read_text(encoding="ascii"), "outside owned payload namespace\n")
+
+                unsafe = payload_root / f".{source_sha}.install-{'a' * 32}"
+                unsafe_alias = unsafe / "provider-runtime/browsers/webkit-2311/lib/alias.so"
+                unsafe_alias.parent.mkdir(mode=0o700, parents=True)
+                unsafe_alias.symlink_to("../../../../outside.so")
+                (unsafe / "runtime-provider.json").write_text(
+                    json.dumps(
+                        {
+                            **stage_record,
+                            "engine_links": {
+                                "browsers/webkit-2311/lib/alias.so": "../../../../outside.so",
+                            },
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="ascii",
+                )
+                (unsafe / "runtime-provider.json").chmod(0o444)
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._cleanup_staging(apply=True)
+                self.assertTrue(unsafe.exists())
+                self.assertTrue(keep.exists())
+
     def _provider_recovery_fixture(self, root: Path):
         source_sha = runtime.PROVIDER_RECOVERY_SOURCE_SHA
         app_dir = root / "platform"

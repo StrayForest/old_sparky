@@ -246,7 +246,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                   "live admin route is protected for anonymous users",
                   "live home uses text-only tournament steps without overflow",
                   "live public contact surfaces do not publish the support recipient",
-                  "live patch renders separate Urn and Rift objectives with source icons",
+                  "live current patch route and objective source icons remain available",
                   "live Cloudflare Analytics is conditionally observed without widening CSP",
                   "live image currentSrc inventory stays inside the exact CSP hosts",
                 ];
@@ -1554,6 +1554,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         browser_wrapper = (TOOLS_ROOT / "platform_live_browser_qa.sh").read_text(
             encoding="utf-8"
         )
+        engine_preflight = (
+            REPO_ROOT
+            / "platform/apps/platform_web/tests/support/live-engine-preflight.cjs"
+        ).read_text(encoding="utf-8")
         user_wrapper = (TOOLS_ROOT / "platform_live_user_qa.sh").read_text(
             encoding="utf-8"
         )
@@ -1571,6 +1575,28 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         )
         self.assertIn("live-launch < \"$input_path\"", source)
         self.assertIn("platform_live_browser_qa.sh\" public", supervisor)
+        self.assertIn('launch_stage="engine_preflight"', supervisor)
+        self.assertIn('launch_check="engine_preflight"', supervisor)
+        self.assertLess(
+            supervisor.index('launch_stage="engine_preflight"'),
+            supervisor.index('launch_stage="account_install"'),
+        )
+        self.assertLess(
+            supervisor.index('launch_stage="engine_preflight"'),
+            supervisor.index('launch_stage="provision"'),
+        )
+        self.assertIn('"$TOOLS_DIR/platform_live_browser_qa.sh" engine-preflight', supervisor)
+        self.assertIn('[[ "$QA_MODE" == "public" ]]', browser_wrapper)
+        self.assertIn('"$QA_MODE" == "engine-preflight"', browser_wrapper)
+        self.assertIn('if [[ "$QA_MODE" == "public" ]]; then', browser_wrapper)
+        self.assertIn('live-engine-preflight.cjs', browser_wrapper)
+        self.assertIn('browser.newContext(contextOptions)', engine_preflight)
+        self.assertIn('context.newPage()', engine_preflight)
+        self.assertEqual(engine_preflight.count('await page.goto("about:blank")'), 1)
+        self.assertIn('checkEngine(chromium, {', engine_preflight)
+        self.assertIn('checkEngine(webkit, devices["iPhone 13"])', engine_preflight)
+        self.assertNotIn("csp-live-qa.json", engine_preflight)
+        self.assertNotIn("provision_live_csp_qa", engine_preflight)
         self.assertIn("failure_report_unavailable", source)
         self.assertIn("failure_report_unavailable", supervisor)
         self.assertIn("failure_report_unavailable", browser_wrapper)
@@ -1578,7 +1604,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("--fail-on-failure-counts", browser_wrapper)
         self.assertIn("if (( count_status != 0 )); then", browser_wrapper)
         preflight_start = browser_wrapper.index(
-            "if (( TRUSTED_MODE == 1 )); then\n  # Private diagnostics are auxiliary:"
+            "if (( TRUSTED_MODE == 1 )) && [[ \"$QA_MODE\" == \"public\" ]]; then\n"
+            "  # Private diagnostics are auxiliary:"
         )
         preflight_end = browser_wrapper.index("\nSYSTEMD_BIND_ARGS=()", preflight_start)
         preflight_block = browser_wrapper[preflight_start:preflight_end]
@@ -1592,6 +1619,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 (
                     "set -euo pipefail",
                     "TRUSTED_MODE=1",
+                    'QA_MODE="public"',
                     "BROWSER_GATE=public-live-qa.a1b2c3d4",
                     f"LIVE_QA_RUNNER_SHA={'a' * 40}",
                     f"LIVE_QA_TARGET_SHA={'b' * 40}",
@@ -1640,6 +1668,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     (
                         "set -euo pipefail",
                         "TRUSTED_MODE=1",
+                        'QA_MODE="public"',
                         "BROWSER_GATE=public-live-qa.a1b2c3d4",
                         f"LIVE_QA_RUNNER_SHA={'a' * 40}",
                         f"LIVE_QA_TARGET_SHA={'b' * 40}",
@@ -3324,6 +3353,32 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 expected_marker_sha256=marker_sha,
             ),
             (("failed", "browser_qa", "browser_qa", 1), None),
+        )
+        preflight_status_line = (
+            "LIVE_LAUNCH_STATUS schema=2 status=failed "
+            "stage=engine_preflight check=engine_preflight child_exit=1 "
+            f"source_sha={source_sha}\n"
+        ).encode("ascii")
+        self.assertEqual(
+            platform_workflow_remote_dispatch._parse_live_launch_protocol(
+                preflight_status_line,
+                child_status=1,
+                expected_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256=marker_sha,
+            ),
+            (("failed", "engine_preflight", "engine_preflight", 1), None),
+        )
+        self.assertIsNone(
+            platform_workflow_remote_dispatch._parse_live_launch_protocol(
+                preflight_status_line.replace(
+                    b"check=engine_preflight", b"check=unknown"
+                ),
+                child_status=1,
+                expected_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256=marker_sha,
+            )
         )
         unavailable_child = (
             f"import os; os.write(1, bytes.fromhex({(unavailable_diagnostic + failed_status_line).hex()!r})); "

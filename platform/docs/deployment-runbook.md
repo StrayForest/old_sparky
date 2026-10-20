@@ -267,15 +267,11 @@ See the [recovery-bootstrap ADR](adr/recovery-bootstrap-retained-abort.md#operat
 for the exact evidence and tuple contract.
 
 Deploy/preflight require immutable host-tools and exact full CI on pin-bearing **P** descended from **C**.
-Normally preflight at **P** builds and attests **C**. A natural artifact qualifies only if source CI,
-auto caller and host contract passed, and capability failed solely because **C** was absent before
-app build/attestation, pending status, transfer or protected writes. Bind attempts, builder job,
-artifact, attestation and SHAs before root-only provisioning; retain and verify the prior generation.
-
-After self-testing **C**, rerun all jobs on its exact auto-deploy run only while **P** remains `dev`,
-source proof and host tuple are unchanged, and no operation is pending. This creates a fresh child;
-verify its run IDs/attempts and success markers. Otherwise use the automatic chain; never manually
-deploy/reconcile or rerun a failed child.
+Normally, read-only preflight at **P** builds and attests **C**. A natural bundle may also be
+provisioned from the exact auto-parent during its active 1,800-second pre-child window, only for
+current-`dev` **P** after the source-bound restore-verified backup, parent build/attestation/upload
+and preceding host-contract checks succeed. No child, app write, pending state or competing operation may exist; provision before the deadline and bind the artifact to the exact parent run/attempt independently of the source Security attempt. The parent verifies **C** before child dispatch; see the [host-tools ADR](adr/production-host-tools-provisioning.md) for trust checks.
+The separate child-failure path remains limited to capability failure solely because **C** was missing before build, pending state, transfer or protected writes. For that path only, after self-testing **C**, rerun all jobs on the exact auto-deploy run only while **P** remains `dev`, source proof and host tuple are unchanged, and no operation is pending. This creates a fresh child; verify its run IDs/attempts and success markers. Never manually deploy/reconcile or rerun a failed child.
 
 After a verified pre-install failure, allow one all-jobs rerun only if the exact auto target remains
 current `dev`, source CI succeeds, baseline is unchanged, no transaction is pending, locks are free,

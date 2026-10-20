@@ -833,6 +833,7 @@ def _expected_liveqa_payload_tree(
     release: Path,
     source_sha: str,
     runtime_provider: dict[str, object] | None,
+    runtime_provider_source: Path | None = None,
     deadline: float,
     runtime_manifest: dict[str, object] | None = None,
 ) -> tuple[str, dict[str, str]]:
@@ -916,7 +917,7 @@ def _expected_liveqa_payload_tree(
             source_sha=source_sha,
         )
     runtime_version = runtime_manifest.get("version")
-    if runtime_version not in {1, 2}:
+    if runtime_version not in {1, 2, 3}:
         raise ProbeFailure("runtime_expected_tree", "manifest")
     for path in runtime_source.rglob("*"):
         check_deadline()
@@ -935,7 +936,8 @@ def _expected_liveqa_payload_tree(
             ),
         )
 
-    if runtime_version == 2:
+    payload_links: dict[str, str] = {}
+    if runtime_version in {2, 3}:
         if runtime_provider is None:
             raise ProbeFailure("runtime_expected_tree", "provider")
         provider_record = {**runtime_provider, "source_sha": source_sha}
@@ -950,6 +952,49 @@ def _expected_liveqa_payload_tree(
         ).encode("ascii")
         files["runtime-provider.json"] = hashlib.sha256(provider_raw).hexdigest()
         total_bytes += len(provider_raw)
+        if runtime_version == 3:
+            engine_files = runtime_provider.get("engine_files")
+            engine_links = runtime_provider.get("engine_links")
+            provider_sha = runtime_provider.get("provider_sha")
+            if not isinstance(engine_files, dict) or not isinstance(engine_links, dict):
+                raise ProbeFailure("runtime_expected_tree", "provider")
+            if provider_sha == source_sha:
+                provider_source = runtime_provider_source
+                if provider_source is None:
+                    provider_source = module.PAYLOAD_ROOT / source_sha / "provider-runtime"
+                if not provider_source.is_dir():
+                    raise ProbeFailure("runtime_expected_tree", "provider")
+                for relative, expected_sha in sorted(engine_files.items()):
+                    source = provider_source / relative
+                    if relative not in engine_links:
+                        target_relative = f"provider-runtime/{relative}"
+                        add_file(
+                            target_relative,
+                            source,
+                            sandbox=relative == module.RUNTIME_SANDBOX_RELATIVE.as_posix(),
+                        )
+                        if files[target_relative] != expected_sha:
+                            raise ProbeFailure("runtime_expected_tree", "provider")
+                add_file("provider-runtime/web/package-lock.json", provider_source / "web/package-lock.json")
+                for relative, target in sorted(engine_links.items()):
+                    payload_links[f"provider-runtime/{relative}"] = target
+                    parent = PurePosixPath(f"provider-runtime/{relative}").parent
+                    while str(parent) != ".":
+                        directories.add(parent.as_posix())
+                        parent = parent.parent
+                    link_path = provider_source / relative
+                    if os.path.lexists(link_path) and stat.S_ISLNK(module._metadata(link_path).st_mode):
+                        if os.readlink(link_path) != target:
+                            raise ProbeFailure("runtime_expected_tree", "provider")
+                    elif relative in engine_files:
+                        # A validated legacy provider may contain the historical flattened
+                        # regular copy. It is intentionally omitted from the new typed tree.
+                        pass
+                    elif not os.path.lexists(link_path):
+                        # The plan may return the old provider root before aliases are
+                        # reconstructed; its exact target was already validated by the
+                        # pinned installer.
+                        pass
     elif runtime_provider is not None:
         raise ProbeFailure("runtime_expected_tree", "provider")
 
@@ -960,11 +1005,13 @@ def _expected_liveqa_payload_tree(
         raise ProbeFailure("runtime_expected_tree", "bound")
 
     digest = hashlib.sha256()
-    for relative in sorted(files.keys() | directories, key=module._runtime_path_order_key):
+    for relative in sorted(files.keys() | directories | payload_links.keys(), key=module._runtime_path_order_key):
         check_deadline()
         digest.update(relative.encode("utf-8") + b"\0")
         if relative in directories:
             digest.update(b"d\0")
+        elif relative in payload_links:
+            digest.update(b"l\0" + payload_links[relative].encode("utf-8") + b"\0")
         else:
             digest.update(b"f\0" + bytes.fromhex(files[relative]))
     return digest.hexdigest(), files
@@ -1162,9 +1209,16 @@ def _runtime_payload_integrity(
         source_sha=source_sha,
     )
     provider: dict[str, object] | None = None
+    runtime_provider_source = None
     if runtime_manifest.get("version") == 2:
         provider = installer._runtime_provider_payload(
             APP_DIR,
+            expected_manifest=runtime_manifest,
+        )
+    elif runtime_manifest.get("version") == 3:
+        provider, runtime_provider_source = installer._runtime_provider_plan(
+            APP_DIR,
+            candidate_source_sha=source_sha,
             expected_manifest=runtime_manifest,
         )
     else:
@@ -1178,6 +1232,7 @@ def _runtime_payload_integrity(
         release=target,
         source_sha=source_sha,
         runtime_provider=provider,
+        runtime_provider_source=runtime_provider_source,
         runtime_manifest=runtime_manifest,
         deadline=deadline,
     )

@@ -1391,6 +1391,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_live_qa_runtime_installer_change_is_deployable_and_runtime_sensitive(self) -> None:
         installer = "platform/tools/platform_live_qa_runtime_install.py"
+        live_engine_preflight = (
+            "platform/apps/platform_web/tests/support/live-engine-preflight.cjs"
+        )
         live_qa_guard = "platform/tools/platform_live_qa_guard.py"
         live_qa_runtime_builder = "platform/tools/platform_build_live_qa_runtime.py"
         live_qa_guard_test = "platform/tests/test_platform_live_qa_guard.py"
@@ -1404,6 +1407,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertNotIn(dispatcher, RECOVERY_BOOTSTRAP_FILES)
         self.assertIn(live_qa_guard, RUNTIME_SENSITIVE_FILES)
         self.assertIn(live_qa_runtime_builder, RUNTIME_SENSITIVE_FILES)
+        self.assertIn(live_engine_preflight, RUNTIME_SENSITIVE_FILES)
         self.assertIn(launch_helper, RUNTIME_SENSITIVE_FILES)
         self.assertIn(dispatcher, RUNTIME_SENSITIVE_FILES)
 
@@ -1418,6 +1422,30 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertTrue(manifest["deployable"])
         self.assertFalse(manifest["fallback"])
         self.assertTrue(manifest["runtime_sensitive"])
+
+        helper_manifest = classify(
+            [live_engine_preflight],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(helper_manifest["class"], "full")
+        self.assertEqual(helper_manifest["expected_gates"], list(FULL_GATE_IDS))
+        self.assertFalse(helper_manifest["fallback"])
+        self.assertTrue(helper_manifest["runtime_sensitive"])
+        self.assertTrue(helper_manifest["deployable"])
+
+        helper_pr = classify(
+            [live_engine_preflight],
+            event="pull_request",
+            target_sha=self.TARGET_SHA,
+            branch=None,
+        )
+        self.assertEqual(helper_pr["class"], "full")
+        self.assertEqual(helper_pr["expected_gates"], list(FULL_GATE_IDS))
+        self.assertFalse(helper_pr["fallback"])
+        self.assertTrue(helper_pr["runtime_sensitive"])
+        self.assertFalse(helper_pr["deployable"])
 
         current_fix_paths = [
             live_qa_guard,

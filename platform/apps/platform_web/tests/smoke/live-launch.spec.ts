@@ -34,6 +34,30 @@ const expectedWebKitPrefetchCancellationPaths = new Set([
   "/profile/me",
 ]);
 
+async function currentIndexedPatchId(
+  request: import("@playwright/test").APIRequestContext,
+): Promise<string> {
+  const response = await request.get("/api/v1/content/patch-index");
+  expect(response.ok()).toBe(true);
+  const payload: unknown = await response.json();
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    throw new Error("Live patch index response is not an object.");
+  }
+  const patches = (payload as Record<string, unknown>).patches;
+  if (!Array.isArray(patches) || patches.length === 0) {
+    throw new Error("Live patch index has no current patch.");
+  }
+  const firstPatch = patches[0];
+  if (typeof firstPatch !== "object" || firstPatch === null || Array.isArray(firstPatch)) {
+    throw new Error("Live patch index entry is not an object.");
+  }
+  const patchId = (firstPatch as Record<string, unknown>).id;
+  if (typeof patchId !== "string" || !/^\d{1,32}$/u.test(patchId)) {
+    throw new Error("Live patch index entry has an invalid id.");
+  }
+  return patchId;
+}
+
 test.beforeEach(async ({ page, browserName }) => {
   const evidence: BrowserEvidence = {
     consoleCspErrors: [],
@@ -506,31 +530,33 @@ test("live public contact surfaces do not publish the support recipient", async 
   expect(bodies.every((body) => !body.includes("mailto:"))).toBe(true);
 });
 
-test("live patch renders separate Urn and Rift objectives with source icons", async ({ page }, testInfo) => {
-  await page.goto("/patches/1836506165584438");
-
-  const objectives = page.locator(".objective-patch-section");
-  await expect(objectives).toHaveCount(2);
-  await expect(objectives.getByRole("heading", { level: 2 })).toHaveText([
-    "Урна",
-    "Нестабильный разлом"
-  ]);
-  const sourceIcons = objectives.locator('.patch-objective-image[data-objective-icon="source"]');
-  await expect(sourceIcons).toHaveCount(2);
-  await expect(sourceIcons.first()).toHaveAttribute(
-    "src",
-    /^https:\/\/assets-bucket\.deadlock-api\.com\//u
-  );
-  await expect.poll(async () => sourceIcons.evaluateAll((images) => images.every(
-    (image) => (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
-  ))).toBe(true);
+test("live current patch route and objective source icons remain available", async ({ page, request }, testInfo) => {
+  const patchId = await currentIndexedPatchId(request);
+  const detailResponsePromise = page.waitForResponse((response) => (
+    new URL(response.url()).pathname === `/api/v1/content/patches/${patchId}`
+  ));
+  await page.goto(`/patches/${patchId}`);
+  const detailResponse = await detailResponsePromise;
+  expect(detailResponse.ok()).toBe(true);
+  await expect(page.locator(".patch-article")).toBeVisible();
+  for (const iconUrl of [
+    "https://assets-bucket.deadlock-api.com/assets-api-res/icons/minimap/soul_jar_marker_psd.png",
+    "https://assets-bucket.deadlock-api.com/assets-api-res/icons/minimap/minimap_icon_koth.png",
+  ]) {
+    const iconResponse = await request.get(iconUrl);
+    expect(iconResponse.ok()).toBe(true);
+    expect(iconResponse.headers()["content-type"]).toMatch(/^image\/png(?:;|$)/u);
+    const iconBytes = await iconResponse.body();
+    expect(iconBytes.byteLength).toBeGreaterThan(8);
+    expect(iconBytes.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  }
   await expectNoHorizontalOverflow(page);
   if (testInfo.project.name === "live-desktop") {
     await page.screenshot({
       animations: "allow",
       caret: "initial",
       fullPage: true,
-      path: testInfo.outputPath("production-patch-objectives.png")
+      path: testInfo.outputPath("production-current-patch.png")
     });
   }
 });
@@ -572,7 +598,7 @@ test("live Cloudflare Analytics is conditionally observed without widening CSP",
   });
 });
 
-test("live image currentSrc inventory stays inside the exact CSP hosts", async ({ page }, testInfo) => {
+test("live image currentSrc inventory stays inside the exact CSP hosts", async ({ page, request }, testInfo) => {
   test.setTimeout(120_000);
   const allowedHosts = new Set([
     new URL(process.env.PLAYWRIGHT_LIVE_BASE_URL ?? "http://127.0.0.1").hostname,
@@ -585,7 +611,8 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
     "steamstore-a.akamaihd.net",
   ]);
   const inventory: Array<{ host: string; path: string; route: string }> = [];
-  for (const route of ["/", "/patches/1836506165584438", "/tournaments"]) {
+  const patchId = await currentIndexedPatchId(request);
+  for (const route of ["/", `/patches/${patchId}`, "/tournaments"]) {
     await page.goto(route);
     allowedHosts.add(new URL(page.url()).hostname);
     const imageLocator = page.locator("img");

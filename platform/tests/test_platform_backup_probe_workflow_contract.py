@@ -1148,10 +1148,36 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertIn('if: ${{ success() && inputs.operation == \'create\' && steps.cleanup_ssh.outcome == \'success\' }}', self.source)
         self.assertNotIn("platform-authorization-probe-success", self.source)
         autodeploy = (REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml").read_text(encoding="utf-8")
+        bootstrap_artifact_name = (
+            "platform-host-tools-bootstrap-${{ github.event.workflow_run.id }}-"
+            "${{ github.event.workflow_run.run_attempt }}-${{ github.run_attempt }}"
+        )
+        artifact_producer_start = autodeploy.index(
+            "      - name: Publish exact root-provisioning host-tools artifact"
+        )
+        artifact_producer_end = autodeploy.index(
+            "\n      - name:", artifact_producer_start + 1
+        )
+        artifact_consumer_start = autodeploy.index(
+            "      - name: Download exact uploaded host-tools bundle and contract"
+        )
+        artifact_consumer_end = autodeploy.index(
+            "\n      - name:", artifact_consumer_start + 1
+        )
+        self.assertIn(
+            f"name: {bootstrap_artifact_name}",
+            autodeploy[artifact_producer_start:artifact_producer_end],
+        )
+        self.assertIn(
+            f"name: {bootstrap_artifact_name}",
+            autodeploy[artifact_consumer_start:artifact_consumer_end],
+        )
         self.assertIn(
             "group: platform-production-auto-deploy-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
             autodeploy,
         )
+        self.assertIn("AUTODEPLOY_RUN_ID: ${{ github.run_id }}", autodeploy)
+        self.assertIn("AUTODEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}", autodeploy)
         self.assertIn("cancel-in-progress: false", autodeploy)
         backup_guard = autodeploy.index("- name: Verify exact source-bound restore-verified backup")
         child_dispatch = autodeploy.index("- name: Dispatch production deployment or baseline reconciliation")

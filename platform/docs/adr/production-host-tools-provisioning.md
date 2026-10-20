@@ -11,8 +11,9 @@ generation.  The immutable path is:
 
 The application release SHA (`TARGET_SHA`) and host-control generation SHA (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
-is the only source for `HOST_TOOLS_SHA` and selects `fcbfe3dc41c999ae298a8b1f958a07f9c1fd0ff1`; pin-only commit `43783b31699d498776a70b2a644b081d828cd41b` records source A's exact 15-member closure, but does not prove installation.
-The active installed generation remains recorded in [`CURRENT.md`](../CURRENT.md); this differs from installed host generation **C1** and application source **G** (`TARGET_SHA`).
+is the only source for `HOST_TOOLS_SHA`. Historical pin P
+`43783b31699d498776a70b2a644b081d828cd41b` selected
+`fcbfe3dc41c999ae298a8b1f958a07f9c1fd0ff1` for source A's exact 15-member closure. Current source C2 `995f46f9b522b3446375346ce71d8c7cc57eb280` adds typed browser-link preservation and a bounded two-engine QA preflight; pin-only P2 `e562024a9b55c5aec60d333ee8e31542ac779adf` records the exact 15-member closure, with only the dispatcher and release-artifact validator changed. Exact-P2 CI, signed provenance, approved provisioning and the installed-generation self-test remain required; these commits do not prove installation. The active installed generation remains recorded in [`CURRENT.md`](../CURRENT.md), separate from `HOST_TOOLS_SHA` and application `TARGET_SHA`.
 S11 source A is `138128c99025069143f5c234f6cb58545ed8ab1c` and is
 installed with provisioning receipt SHA-256
 `2f182be1aaf90ee56ed83f7c755e4f38ec860d6f7f20e2ae003084c1a0a7c3f7`. Its
@@ -318,20 +319,19 @@ approved host-image/configuration-management authority performs provisioning
 for a reviewed `HOST_TOOLS_SHA`; the GitHub workflow must not be used as the
 installer:
 
-1. Record the successful exact-`TARGET_SHA` `Platform security and build`
-   run/attempt. Use a successful `build-host-tools` job and its attested bundle
-   from either a read-only `mode=preflight` run at that same merged `dev` SHA,
-   or the exact normal automatic production run for that SHA when the
-   host-capability gate failed solely because this pinned generation was
-   missing. For the automatic run, also verify the successful automatic
-   dispatch, its exact production child attempt, all preceding provenance and
-   host-contract checks, and that the child did not begin the release build,
-   create pending release state or perform a production write. Any other
-   failure is not provisioning evidence. Bind the successful builder job and
-   artifact ID/name/outer digest, application `TARGET_SHA`, pinned
-   `HOST_TOOLS_SHA`, and attestation to their exact run/attempts. Download the
-   ZIP through the approved artifact channel and verify its SHA-256 before
-   opening it. The pull-request candidate artifact is not an acceptable
+1. Record the successful exact-`TARGET_SHA` Security run. A successful `build-host-tools` job
+   and attested bundle qualify from (a) read-only `mode=preflight` at that same merged `dev`
+   SHA; (b) the exact automatic parent in its active 1,800-second pre-child readiness window,
+   only if `TARGET_SHA` is current `dev`, its source-bound restore-verified backup and bundle
+   build/attestation/upload succeeded, and no child, app write, pending release transaction or
+   competing production operation exists; or (c) the exact automatic child whose only failure
+   was the missing pinned generation, with prior checks passed and no build, pending state or
+   production write. For (b), provision before the deadline; the parent verifies the generation
+   before dispatching its child. No other failure qualifies. Bind `TARGET_SHA`, `HOST_TOOLS_SHA`,
+   builder job and full Sigstore signature/chain/subject/signer/source/invocation to exact runs.
+   The parent artifact ID/name/digest must bind its exact parent run/attempt, independent of the
+   source Security attempt; use its emitted name. Download through the approved channel and
+   verify the outer SHA-256 before opening. A pull-request candidate artifact is never a
    substitute.
 2. Run the offline `platform_host_tools_bundle.py verify` command from the
    pinned reviewed checkout with the expected `HOST_TOOLS_SHA`. Retain the
