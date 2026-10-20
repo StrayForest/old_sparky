@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AsyncExitStack
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import httpx
@@ -430,13 +430,47 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             ),
             201,
         )
+
+        scheduled = self._payload(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/matches/{opening[0]['id']}/schedule",
+                json={
+                    "scheduled_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+                    "expected_revision": 1,
+                },
+                headers=same_origin_request_headers(organizer["client"]),
+            ),
+            200,
+        )
+        self.assertEqual(scheduled["status"], "scheduled")
+
+        current_bracket = self._payload(
+            await organizer["client"].get(f"/api/v1/tournaments/{slug}/bracket"),
+            200,
+        )
+        self.assertEqual(current_bracket["revision"], 2)
+
+        stale_report = await organizer["client"].post(
+            f"/api/v1/tournaments/{slug}/matches/{opening[0]['id']}/report",
+            json={
+                "home_score": 2,
+                "away_score": 0,
+                "expected_revision": 1,
+            },
+            headers=same_origin_request_headers(organizer["client"]),
+        )
+        self.assertEqual(stale_report.status_code, 409, stale_report.text)
+        self.assertIn(
+            "Bracket changed in another session", stale_report.json()["detail"]
+        )
+
         reported = self._payload(
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{opening[0]['id']}/report",
                 json={
                     "home_score": 2,
                     "away_score": 0,
-                    "expected_revision": 1,
+                    "expected_revision": current_bracket["revision"],
                 },
                 headers=same_origin_request_headers(organizer["client"]),
             ),
@@ -450,7 +484,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             200,
         )
         self.assertEqual(bracket["status"], "ready")
-        self.assertEqual(bracket["revision"], 2)
+        self.assertEqual(bracket["revision"], 3)
         semifinal = next(
             match
             for match in bracket["matches"]

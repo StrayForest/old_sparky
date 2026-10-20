@@ -278,6 +278,12 @@ test("live player completes the accelerated tournament journey through visible c
     );
     await screenshot(playerPage, testInfo, "05-player-bracket");
 
+    // The schedule mutation advances the bracket revision. The player-page
+    // refresh above intentionally checks manual refresh behavior, so reload
+    // the organizer page before reporting against its revision-bound snapshot.
+    await organizerPage.reload();
+    await expect(organizerPage.getByTestId("bracket-shell")).toBeVisible();
+
     const match = organizerPage.getByTestId("bracket-match").filter({ has: organizerPage.getByRole("button", { name: "ОК" }) }).first();
     await match.getByLabel("Счет хозяев").fill("1");
     await match.getByLabel("Счет гостей").fill("0");
