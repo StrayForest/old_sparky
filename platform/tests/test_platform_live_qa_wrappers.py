@@ -10,6 +10,7 @@ from pathlib import Path
 import pwd
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -4465,6 +4466,138 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     "recovery-locked-exec",
                     wrapper.read_text(encoding="utf-8"),
                 )
+        live_user = (TOOLS_ROOT / "platform_live_user_qa.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"$1" == "recover-bundle"', live_user)
+        self.assertIn('prepare-stale-bundle-cleanup-state', live_user)
+        self.assertIn('recover_exact_state "$QA_STATE_DIR"', live_user)
+        self.assertIn('trap stale_bundle_cleanup_exit EXIT', live_user)
+        start = live_user.index(
+            'if (( $# == 1 )) && [[ "$1" == "recover-bundle" ]]; then\n  if'
+        )
+        end = live_user.index(
+            '\nif (( $# == 2 )) && [[ "$1" == "recover-setup" ]]; then', start
+        )
+        stale_mode = live_user[start:end]
+        self.assertIn("--mode provision", stale_mode)
+        self.assertNotIn("prepare-browser-gate", stale_mode)
+
+        recovery_start = live_user.index("recover_exact_state() {")
+        recovery_end = live_user.index("\n}\n", recovery_start) + len("\n}\n")
+        recovery_function = live_user[recovery_start:recovery_end]
+        with tempfile.TemporaryDirectory(prefix="live-qa-recovery-retention-") as temporary:
+            root = Path(temporary)
+            stub = root / "guard-stub.sh"
+            state = root / "live-user-qa.fixture"
+            state.mkdir()
+            (state / "inventory.json").write_text("synthetic inventory\n", encoding="ascii")
+            removed_marker = root / "state-removed"
+            stub.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  validate-recovery) printf 'liveqa-test-marker\\n' ;;\n"
+                "  merge-browser-inventory|remove-browser-gate) exit 0 ;;\n"
+                "  remove-root-state) : > \"$REMOVED_MARKER\" ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+                encoding="ascii",
+            )
+            stub.chmod(0o700)
+            shell_fixture = "\n".join(
+                (
+                    "set -Eeuo pipefail",
+                    f"GUARD=({shlex.quote(str(stub))})",
+                    f"PLATFORM_LIVE_CSP_QA_BUNDLE={shlex.quote(str(root / 'bundle.json'))}",
+                    recovery_function,
+                    "reconcile_and_cleanup() { return 31; }",
+                    f"recover_exact_state {shlex.quote(str(state))}",
+                )
+            )
+            result = subprocess.run(
+                ["/usr/bin/bash", "--noprofile", "--norc", "-c", shell_fixture],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"LANG": "C", "PATH": "/usr/bin:/bin", "REMOVED_MARKER": str(removed_marker)},
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 31)
+            self.assertTrue(state.is_dir())
+            self.assertTrue((state / "inventory.json").is_file())
+            self.assertFalse(removed_marker.exists())
+
+        with tempfile.TemporaryDirectory(prefix="live-qa-stale-bundle-recovery-") as temporary:
+            root = Path(temporary)
+            stub = root / "guard-stub.sh"
+            state = root / "live-user-qa.stale"
+            state.mkdir()
+            retained_message = f"Live QA recovery state retained at {state}"
+            stub.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  preflight) exit \"${PRE_FAIL:-0}\" ;;\n"
+                "  prepare-stale-bundle-cleanup-state) printf '%s\\n' \"$STATE_PATH\" ;;\n"
+                "  validate-recovery) printf 'liveqa-stale-marker\\n' ;;\n"
+                "  merge-browser-inventory|remove-browser-gate) exit 0 ;;\n"
+                "  remove-root-state) : > \"$REMOVED_MARKER\" ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+                encoding="ascii",
+            )
+            stub.chmod(0o700)
+            shell_fixture = "\n".join(
+                (
+                    "set -Eeuo pipefail",
+                    f"GUARD=({shlex.quote(str(stub))})",
+                    "TRUSTED_MODE=1",
+                    "PLATFORM_RELEASE_LOCK_SUPERVISED=1",
+                    "PLATFORM_LIVE_QA_LOCK_FD=9",
+                    "SOURCE_COMMIT=" + "'" + "a" * 40 + "'",
+                    "PLATFORM_ROOT=/fixed/payload/platform",
+                    f"PLATFORM_LIVE_CSP_QA_BUNDLE={shlex.quote(str(root / 'bundle.json'))}",
+                    f"STATE_PATH={shlex.quote(str(state))}",
+                    recovery_function,
+                    "reconcile_and_cleanup() { return 31; }",
+                    "set -- recover-bundle",
+                    stale_mode,
+                )
+            )
+            env = {
+                "LANG": "C",
+                "PATH": "/usr/bin:/bin",
+                "STATE_PATH": str(state),
+                "REMOVED_MARKER": str(root / "removed"),
+            }
+            failed_cleanup = subprocess.run(
+                ["/usr/bin/bash", "--noprofile", "--norc", "-c", shell_fixture],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(failed_cleanup.returncode, 31)
+            self.assertIn(retained_message.encode("utf-8"), failed_cleanup.stderr)
+            self.assertTrue(state.is_dir())
+            self.assertFalse((root / "removed").exists())
+
+            shutil.rmtree(state)
+            refused_before_state = subprocess.run(
+                ["/usr/bin/bash", "--noprofile", "--norc", "-c", shell_fixture],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={**env, "PRE_FAIL": "22"},
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(refused_before_state.returncode, 22)
+            self.assertNotIn(b"recovery state retained", refused_before_state.stderr)
+            self.assertFalse(state.exists())
+            self.assertFalse((root / "removed").exists())
 
     def test_browser_wrappers_use_the_fixed_nonroot_systemd_cgroup(self) -> None:
         for wrapper in BROWSER_WRAPPERS:

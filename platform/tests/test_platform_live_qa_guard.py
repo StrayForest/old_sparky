@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from datetime import datetime, timedelta, timezone
 import grp
 import hashlib
 import importlib.util
@@ -170,6 +171,55 @@ class LiveQaGuardTests(unittest.TestCase):
         bundle.write_text(json.dumps(payload), encoding="utf-8")
         os.chmod(bundle, 0o600)
         return bundle
+
+    def make_stale_cleanup_bundle_fixture(
+        self,
+        root: Path,
+        *,
+        created_at: str = "2020-01-01T00:00:00Z",
+        source_sha: str = "a" * 40,
+    ) -> tuple[Path, Path, Path, tuple[str, ...]]:
+        private = root / "private"
+        private.mkdir(mode=0o700)
+        install_root = root / "payload" / "releases" / source_sha
+        payload_platform = install_root / "platform"
+        payload_tools = payload_platform / "tools"
+        payload_tools.mkdir(parents=True)
+        helper_bytes = b"synthetic active mailbox helper\n"
+        (payload_tools / "platform_live_qa_mailbox_helper.py").write_bytes(
+            helper_bytes
+        )
+        os.chmod(payload_tools / "platform_live_qa_mailbox_helper.py", 0o755)
+        helper = private / "platform_live_qa_mailbox_helper.py"
+        helper.write_bytes(helper_bytes)
+        os.chmod(helper, 0o500)
+        marker = "liveqa-stale-guard-fixture"
+        roster = [
+            {
+                "id": str(uuid4()),
+                "email": f"player-{index:02d}-{marker}@auth.old-sparky.com",
+                "password": "synthetic-roster-password",
+            }
+            for index in range(13)
+        ]
+        payload = {
+            "version": 1,
+            "marker": marker,
+            "created_at": created_at,
+            "email": "liveqa-operator@auth.old-sparky.com",
+            "password": "synthetic-top-password",
+            "mailbox_helper": str(helper),
+            "roster_accounts": roster,
+        }
+        bundle = private / "csp-live-qa.json"
+        bundle.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(bundle, 0o600)
+        return (
+            bundle,
+            install_root,
+            payload_platform,
+            tuple(item["id"] for item in roster),
+        )
 
     def make_zip(self, root: Path, entries: list[tuple[str, bytes]]) -> Path:
         source = root / "source.zip"
@@ -535,6 +585,16 @@ class LiveQaGuardTests(unittest.TestCase):
                     guard.GuardError, "arguments are invalid"
                 ):
                     guard._validate_trusted_wrapper([str(wrapper)], recovery=True)
+                guard._validate_trusted_wrapper(
+                    [str(wrapper), "recover-bundle"], recovery=True
+                )
+                with self.assertRaisesRegex(
+                    guard.GuardError, "arguments are invalid"
+                ):
+                    guard._validate_trusted_wrapper(
+                        [str(wrapper), "recover-bundle", "/tmp/roster.json"],
+                        recovery=True,
+                    )
 
     def test_checkout_provenance_rejects_any_other_checkout(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
@@ -745,6 +805,30 @@ class LiveQaGuardTests(unittest.TestCase):
                     Path("/root/.oldsparky/liveqa/bundle.json"), ["wrapper"]
                 )
         recover.assert_not_called()
+
+        with (
+            mock.patch.object(guard, "_validate_trusted_wrapper"),
+            mock.patch.object(
+                guard,
+                "_assert_release_lock_supervisor",
+                side_effect=guard.GuardError("canonical release lock is missing"),
+            ) as release_lock,
+            mock.patch.object(guard, "_open_bundle_lock") as open_machine_lock,
+            mock.patch.object(guard, "_recover_stale_liveqa") as recover_stale,
+            self.assertRaisesRegex(guard.GuardError, "canonical release lock"),
+        ):
+            guard.recovery_locked_exec(
+                Path("/root/.oldsparky/liveqa/csp-live-qa.json"),
+                [
+                    "/root/.oldsparky/liveqa/releases/"
+                    + "a" * 40
+                    + "/platform/tools/platform_live_user_qa.sh",
+                    "recover-bundle",
+                ],
+            )
+        release_lock.assert_called_once_with()
+        open_machine_lock.assert_not_called()
+        recover_stale.assert_not_called()
 
     def test_uid_recovery_escalates_to_sigkill(self) -> None:
         with (
@@ -1029,6 +1113,234 @@ class LiveQaGuardTests(unittest.TestCase):
                     )
                 finally:
                     guard.remove_root_state(bundle, state)
+
+        with self.subTest("post-rename validation failure reports retained state"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                bundle = self.make_bundle(Path(temporary) / "private")
+                original_failure = guard.GuardError("injected state validation failure")
+                error_output = io.StringIO()
+                with (
+                    mock.patch.object(
+                        guard,
+                        "validate_root_state",
+                        side_effect=original_failure,
+                    ),
+                    mock.patch.object(guard, "TRUSTED_SECRET_ROOT", bundle.parent),
+                    mock.patch.object(guard.sys, "stderr", error_output),
+                    self.assertRaises(guard.GuardError) as raised,
+                ):
+                    guard.prepare_root_state(bundle)
+                self.assertIs(raised.exception, original_failure)
+                self.assertEqual(len(list(bundle.parent.glob("live-user-qa.*"))), 1)
+                reported = error_output.getvalue().strip().split(" at: ", 1)
+                self.assertEqual(len(reported), 2)
+                retained_state = Path(reported[1])
+                self.assertEqual(retained_state.parent, bundle.parent)
+                self.assertTrue(retained_state.is_dir())
+                self.assertFalse(retained_state.is_symlink())
+                self.assertTrue((retained_state / "inventory.json").is_file())
+
+        source_sha = "a" * 40
+        for scenario in (
+            "success",
+            "wrong_source",
+            "fresh_bundle",
+            "future_bundle",
+            "malformed_timestamp",
+            "wrong_helper",
+            "symlink_bundle",
+            "other_state",
+            "setup_state",
+            "run_gate",
+            "lock",
+        ):
+            with self.subTest(stale_bundle_scenario=scenario):
+                with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                    root = Path(temporary)
+                    created_at = (
+                        datetime.now(timezone.utc)
+                        .replace(microsecond=0)
+                        .strftime("%Y-%m-%dT%H:%M:%SZ")
+                        if scenario == "fresh_bundle"
+                        else (
+                            (datetime.now(timezone.utc) + timedelta(minutes=2))
+                            .replace(microsecond=0)
+                            .strftime("%Y-%m-%dT%H:%M:%SZ")
+                            if scenario == "future_bundle"
+                            else (
+                                "2020-01-01T00:00:00+00:00"
+                                if scenario == "malformed_timestamp"
+                                else "2020-01-01T00:00:00Z"
+                            )
+                        )
+                    )
+                    target_sha = "b" * 40 if scenario == "wrong_source" else source_sha
+                    bundle, install_root, payload_platform, expected_ids = (
+                        self.make_stale_cleanup_bundle_fixture(
+                            root, created_at=created_at, source_sha=target_sha
+                        )
+                    )
+                    secret_root = bundle.parent
+                    gate_root = root / "run-gates"
+                    env = {
+                        "PLATFORM_LIVE_QA_INSTALL_ROOT": str(install_root),
+                        "PLATFORM_LIVE_QA_TARGET_SHA": target_sha,
+                        "PLATFORM_APP_DIR": str(guard.APP_DIR),
+                        "PLATFORM_LIVE_CSP_QA_BUNDLE": str(bundle),
+                    }
+                    if scenario == "wrong_helper":
+                        payload = json.loads(bundle.read_text(encoding="utf-8"))
+                        payload["mailbox_helper"] = str(secret_root / "other-helper")
+                        bundle.write_text(json.dumps(payload), encoding="utf-8")
+                        os.chmod(bundle, 0o600)
+                    if scenario == "symlink_bundle":
+                        real_bundle = secret_root / "bundle-data.json"
+                        bundle.rename(real_bundle)
+                        bundle.symlink_to(real_bundle)
+                    if scenario == "other_state":
+                        (secret_root / "live-user-qa.unexpected").mkdir(mode=0o700)
+                    if scenario == "setup_state":
+                        (secret_root / f".live-user-qa.setup-{'c' * 32}").mkdir(
+                            mode=0o700
+                        )
+                    if scenario == "run_gate":
+                        gate_root.mkdir(mode=0o711)
+                        os.chmod(gate_root, 0o711)
+                        (gate_root / "live-user-qa.unexpected").mkdir(mode=0o700)
+                    if scenario == "lock":
+                        lock_context = self.assertRaisesRegex(
+                            guard.GuardError, "canonical release lock"
+                        )
+                    elif scenario in {
+                        "wrong_source",
+                        "wrong_helper",
+                        "symlink_bundle",
+                        "other_state",
+                        "setup_state",
+                        "run_gate",
+                        "fresh_bundle",
+                        "future_bundle",
+                        "malformed_timestamp",
+                    }:
+                        lock_context = self.assertRaises(guard.GuardError)
+                    else:
+                        lock_context = self.subTest("prepared exact stale inventory")
+                    source_validation = (
+                        mock.patch.object(
+                            guard,
+                            "_validate_installed_payload_root",
+                            side_effect=(
+                                guard.GuardError("wrong active source")
+                                if scenario == "wrong_source"
+                                else lambda *_args, **_kwargs: target_sha
+                            ),
+                        ),
+                        mock.patch.object(guard, "_active_release_commit", return_value=source_sha),
+                        mock.patch.object(guard, "_assert_release_lock_supervisor"),
+                        mock.patch.object(guard, "assert_bundle_lock"),
+                        mock.patch.object(guard, "assert_liveqa_idle"),
+                        mock.patch.object(guard, "TRUSTED_SECRET_ROOT", secret_root),
+                        mock.patch.object(
+                            guard, "TRUSTED_PAYLOAD_ROOT", install_root.parent
+                        ),
+                        mock.patch.object(guard, "RUN_GATE_ROOT", gate_root),
+                        mock.patch.dict(os.environ, env, clear=True),
+                    )
+                    with ExitStack() as stack:
+                        for manager in source_validation:
+                            stack.enter_context(manager)
+                        stale_cleanup = mock.Mock(
+                            side_effect=RuntimeError("stop before wrapper exec")
+                        )
+                        machine_lock_fd = os.open(os.devnull, os.O_RDONLY)
+                        with (
+                            mock.patch.object(guard, "_validate_trusted_wrapper"),
+                            mock.patch.object(guard, "_open_bundle_lock", return_value=machine_lock_fd),
+                            mock.patch.object(guard, "_recover_stale_liveqa", stale_cleanup),
+                        ):
+                            argv = [
+                                str(install_root / "platform/tools/platform_live_user_qa.sh"),
+                                "recover-bundle",
+                            ]
+                            if scenario == "success":
+                                with self.assertRaisesRegex(
+                                    RuntimeError, "stop before wrapper exec"
+                                ):
+                                    guard.recovery_locked_exec(bundle, argv)
+                                stale_cleanup.assert_called_once_with()
+                            elif scenario == "lock":
+                                # The first release-lock proof fails before opening
+                                # the machine lock or reaching stale-runner cleanup.
+                                with mock.patch.object(
+                                    guard,
+                                    "_assert_release_lock_supervisor",
+                                    side_effect=guard.GuardError(
+                                        "canonical release lock missing"
+                                    ),
+                                ):
+                                    with self.assertRaisesRegex(
+                                        guard.GuardError, "canonical release lock"
+                                    ):
+                                        guard.recovery_locked_exec(bundle, argv)
+                                stale_cleanup.assert_not_called()
+                            else:
+                                with self.assertRaises(guard.GuardError):
+                                    guard.recovery_locked_exec(bundle, argv)
+                                stale_cleanup.assert_not_called()
+                        if scenario == "success":
+                            state = guard.prepare_stale_bundle_cleanup_state(
+                                bundle,
+                                platform_root=payload_platform,
+                                target_sha=source_sha,
+                                lock_fd=42,
+                            )
+                            try:
+                                _marker, inventory_path, sessions_path = guard.validate_root_state(
+                                    bundle, state
+                                )
+                                self.assertIsNone(sessions_path)
+                                inventory = guard._read_private_json(inventory_path)
+                                self.assertEqual(inventory["user_ids"], list(expected_ids))
+                                self.assertEqual(inventory["tournament_ids"], [])
+                                self.assertEqual(inventory["media_ids"], [])
+                            finally:
+                                guard.remove_root_state(bundle, state)
+                        else:
+                            if scenario == "lock":
+                                stack.enter_context(
+                                    mock.patch.object(
+                                        guard,
+                                        "_assert_release_lock_supervisor",
+                                        side_effect=guard.GuardError(
+                                            "canonical release lock missing"
+                                        ),
+                                    )
+                                )
+                            with lock_context:
+                                guard.prepare_stale_bundle_cleanup_state(
+                                    bundle,
+                                    platform_root=payload_platform,
+                                    target_sha=target_sha,
+                                    lock_fd=42,
+                                )
+                            generated = [
+                                path
+                                for path in secret_root.iterdir()
+                                if path.name.startswith("live-user-qa.")
+                                or path.name.startswith(".live-user-qa.setup-")
+                            ]
+                            if scenario == "other_state":
+                                self.assertEqual(
+                                    [path.name for path in generated],
+                                    ["live-user-qa.unexpected"],
+                                )
+                            elif scenario == "setup_state":
+                                self.assertEqual(
+                                    [path.name for path in generated],
+                                    [f".live-user-qa.setup-{'c' * 32}"],
+                                )
+                            else:
+                                self.assertEqual(generated, [])
 
     @unittest.skipUnless(os.geteuid() == 0, "root-owned state contract")
     def test_setup_recovery_accepts_only_an_exact_empty_stage(self) -> None:

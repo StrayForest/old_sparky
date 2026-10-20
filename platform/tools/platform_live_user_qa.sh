@@ -25,7 +25,7 @@ if [[ -n "$TRUSTED_INSTALL_ROOT" ]]; then
 fi
 
 usage() {
-  echo "Usage: $0 | $0 recover /absolute/path/to/live-user-qa.XXXXXX | $0 recover-setup /absolute/path/to/.live-user-qa.setup-<id>" >&2
+  echo "Usage: $0 | $0 recover /absolute/path/to/live-user-qa.XXXXXX | $0 recover-setup /absolute/path/to/.live-user-qa.setup-<id> | $0 recover-bundle" >&2
 }
 
 if [[ "$EUID" -ne 0 ]]; then
@@ -53,17 +53,25 @@ if [[ -n "${PLATFORM_LIVE_CSP_ALLOW_LOOPBACK:-}" ]]; then
   echo "The production live-user QA wrapper does not permit loopback mode." >&2
   exit 1
 fi
-if (( $# != 0 )) && ! { (( $# == 2 )) \
+if (( $# != 0 )) && ! { (( $# == 1 )) \
+  && [[ "$1" == "recover-bundle" ]] \
+  || (( $# == 2 )) \
   && [[ "$1" == "recover" || "$1" == "recover-setup" ]] \
   && [[ "$2" == /* ]]; }; then
   usage
   exit 2
 fi
+if (( $# == 1 )) && [[ "$1" == "recover-bundle" && $TRUSTED_MODE != 1 ]]; then
+  echo "Stale-bundle cleanup is available only from the active immutable live-QA payload." >&2
+  exit 1
+fi
 
 GUARD=("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_live_qa_guard.py")
 if [[ -z "${PLATFORM_LIVE_QA_LOCK_FD:-}" ]]; then
   LOCK_COMMAND="locked-exec"
-  if (( $# == 2 )) && [[ "$1" == "recover" || "$1" == "recover-setup" ]]; then
+  if (( $# == 1 )) && [[ "$1" == "recover-bundle" ]]; then
+    LOCK_COMMAND="recovery-locked-exec"
+  elif (( $# == 2 )) && [[ "$1" == "recover" || "$1" == "recover-setup" ]]; then
     LOCK_COMMAND="recovery-locked-exec"
   fi
   exec "${GUARD[@]}" "$LOCK_COMMAND" \
@@ -126,6 +134,57 @@ reconcile_and_cleanup() {
     --confirm cleanup-live-user-qa
 }
 
+recover_exact_state() {
+  local recovery_state="$1"
+  local recovery_marker
+  recovery_marker="$(
+    "${GUARD[@]}" validate-recovery \
+      --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
+      --state-dir "$recovery_state"
+  )"
+  "${GUARD[@]}" merge-browser-inventory \
+    --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
+    --state-dir "$recovery_state"
+  "${GUARD[@]}" remove-browser-gate --state-dir "$recovery_state"
+  reconcile_and_cleanup "$recovery_marker" "$recovery_state/inventory.json"
+  "${GUARD[@]}" remove-root-state \
+    --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
+    --state-dir "$recovery_state"
+  echo "Automated live-user QA recovery completed with exact cleanup and absence proof."
+}
+
+if (( $# == 1 )) && [[ "$1" == "recover-bundle" ]]; then
+  if (( TRUSTED_MODE != 1 )) \
+    || [[ "${PLATFORM_RELEASE_LOCK_SUPERVISED:-}" != "1" ]] \
+    || [[ ! "${PLATFORM_LIVE_QA_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
+    echo "Stale-bundle cleanup requires the immutable active payload and both canonical locks." >&2
+    exit 1
+  fi
+  "${GUARD[@]}" preflight \
+    --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
+    --mode provision
+  QA_STATE_DIR="$(
+    "${GUARD[@]}" prepare-stale-bundle-cleanup-state \
+      --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
+      --platform-root "$PLATFORM_ROOT" \
+      --target-sha "$SOURCE_COMMIT" \
+      --fd "$PLATFORM_LIVE_QA_LOCK_FD"
+  )"
+  STALE_BUNDLE_STATE_PATH="$QA_STATE_DIR"
+  stale_bundle_cleanup_exit() {
+    local recovery_status=$?
+    if (( recovery_status != 0 )) && [[ -d "$STALE_BUNDLE_STATE_PATH" ]]; then
+      printf 'Live QA recovery state retained at %s\n' \
+        "$STALE_BUNDLE_STATE_PATH" >&2
+    fi
+    exit "$recovery_status"
+  }
+  trap stale_bundle_cleanup_exit EXIT
+  recover_exact_state "$QA_STATE_DIR"
+  trap - EXIT
+  exit 0
+fi
+
 if (( $# == 2 )) && [[ "$1" == "recover-setup" ]]; then
   "${GUARD[@]}" remove-setup-state \
     --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
@@ -135,21 +194,7 @@ if (( $# == 2 )) && [[ "$1" == "recover-setup" ]]; then
 fi
 
 if (( $# == 2 )); then
-  RECOVERY_STATE="$2"
-  MARKER="$(
-    "${GUARD[@]}" validate-recovery \
-      --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
-      --state-dir "$RECOVERY_STATE"
-  )"
-  "${GUARD[@]}" merge-browser-inventory \
-    --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
-    --state-dir "$RECOVERY_STATE"
-  "${GUARD[@]}" remove-browser-gate --state-dir "$RECOVERY_STATE"
-  reconcile_and_cleanup "$MARKER" "$RECOVERY_STATE/inventory.json"
-  "${GUARD[@]}" remove-root-state \
-    --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
-    --state-dir "$RECOVERY_STATE"
-  echo "Automated live-user QA recovery completed with exact cleanup and absence proof."
+  recover_exact_state "$2"
   exit 0
 fi
 
