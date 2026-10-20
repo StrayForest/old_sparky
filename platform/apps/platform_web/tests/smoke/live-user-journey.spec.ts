@@ -210,7 +210,10 @@ test("live player completes the accelerated tournament journey through visible c
 
     await playerPage.goto(`${origin}/tournaments`);
     await playerPage.getByLabel("Код приглашения").fill(invite.code);
-    await expect(playerPage).toHaveURL(new RegExp(`/tournaments/${tournamentSlug}$`));
+    const normalizedInviteCode = invite.code.trim().toUpperCase();
+    await expect(playerPage).toHaveURL(
+      `${origin}/tournaments/${encodeURIComponent(tournamentSlug)}?invite_code=${encodeURIComponent(normalizedInviteCode)}`,
+    );
     await playerPage.getByRole("button", { name: "Зарегистрироваться" }).click();
     await expect(playerPage.getByRole("button", { name: "Отменить регистрацию" })).toBeVisible();
     await expect(playerPage.getByText("Регистрация завершена", { exact: true })).toBeVisible();
