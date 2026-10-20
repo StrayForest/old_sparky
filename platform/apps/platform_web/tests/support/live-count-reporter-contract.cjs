@@ -13,7 +13,12 @@ const {
   summarizeRun,
   writeBoundedSummary,
   writeBoundedFailureSummary,
+  writeBoundedLiveUserFailureSummary,
   createPageErrorAttachment,
+  createLiveUserApiFailureAttachment,
+  userApiFailureMessage,
+  USER_API_OPERATION_CONTRACTS,
+  matchesLiveUserApiOperation,
   trustedSuccessfulNextScriptPath,
   pageErrorClass,
 } = require("./live-count-reporter.cjs");
@@ -187,6 +192,139 @@ assert.deepEqual(liveUserSummary, {
   logical: { total: 1, pass: 1, fail: 0, expected_fail: 0, flaky: 0, skip: 0, interrupted: 0 },
   attempts: { total: 1, pass: 1, fail: 0, skip: 0, interrupted: 0, timedout: 0 },
 });
+assert.deepEqual(Object.fromEntries(Object.entries(USER_API_OPERATION_CONTRACTS).map(
+  ([operation, contract]) => [operation, {
+    method: contract.method,
+    expected_status: contract.expected_status,
+  }],
+)), {
+  tournament_create: { method: "POST", expected_status: 201 },
+  tournament_status: { method: "PATCH", expected_status: 200 },
+  invite_create: { method: "POST", expected_status: 201 },
+  invite_claim: { method: "POST", expected_status: 201 },
+  tournament_join: { method: "POST", expected_status: 201 },
+  ready_check_start: { method: "POST", expected_status: 201 },
+  ready_check_vote: { method: "POST", expected_status: 200 },
+  ready_check_close: { method: "POST", expected_status: 200 },
+  captain_round_start: { method: "POST", expected_status: 201 },
+  assignment_start: { method: "POST", expected_status: 202 },
+  assignment_state: { method: "GET", expected_status: 200 },
+  assignment_publish: { method: "POST", expected_status: 200 },
+  assignment_lock: { method: "POST", expected_status: 200 },
+  bracket_read: { method: "GET", expected_status: 200 },
+  match_schedule: { method: "PATCH", expected_status: 200 },
+  tournament_read: { method: "GET", expected_status: 200 },
+});
+const liveUserOperationExamples = {
+  tournament_create: "/tournaments",
+  tournament_status: "/tournaments/qa-123/status",
+  invite_create: "/tournaments/qa-123/invites",
+  invite_claim: "/tournaments/invites/claim",
+  tournament_join: "/tournaments/qa-123/join",
+  ready_check_start: "/tournaments/qa-123/deadlock/ready-check/start",
+  ready_check_vote: "/tournaments/qa-123/deadlock/ready-check/vote",
+  ready_check_close: "/tournaments/qa-123/deadlock/ready-check/close",
+  captain_round_start: "/tournaments/qa-123/deadlock/captain-round/start",
+  assignment_start: "/tournaments/qa-123/deadlock/auto-assignment/run-async",
+  assignment_state: "/tournaments/qa-123/deadlock/auto-assignment",
+  assignment_publish: "/tournaments/qa-123/deadlock/auto-assignment/run-456/publish",
+  assignment_lock: "/tournaments/qa-123/deadlock/auto-assignment/run-456/lock",
+  bracket_read: "/tournaments/qa-123/bracket?teams_view=summary",
+  match_schedule: "/tournaments/qa-123/matches/match-789/schedule",
+  tournament_read: "/tournaments/qa-123",
+};
+for (const [operation, examplePath] of Object.entries(liveUserOperationExamples)) {
+  const contract = USER_API_OPERATION_CONTRACTS[operation];
+  assert.equal(
+    matchesLiveUserApiOperation(operation, contract.method, examplePath),
+    true,
+    `${operation} accepts its exact closed route shape`,
+  );
+}
+for (const [operation, method, requestPath] of [
+  ["tournament_create", "POST", "/tournaments/qa-123"],
+  ["tournament_create", "POST", "/tournaments?token=private"],
+  ["bracket_read", "GET", "/tournaments/qa-123/bracket?teams_view=summary&marker=private"],
+  ["assignment_state", "POST", "/tournaments/qa-123/deadlock/auto-assignment"],
+  ["assignment_state", "GET", "/tournaments/../private"],
+  ["unknown_operation", "GET", "/tournaments/qa-123"],
+]) {
+  assert.equal(
+    matchesLiveUserApiOperation(operation, method, requestPath),
+    false,
+    "unmapped method/path/query combinations cannot be attributed to an operation",
+  );
+}
+const userApiFailureInput = {
+  kind: "unexpected_status",
+  operation: "assignment_state",
+  method: "GET",
+  expected_status: 200,
+  actual_status: 503,
+  source_file: "tests/smoke/live-user-journey.spec.ts",
+  source_line: 812,
+  source_column: 17,
+};
+const userApiFailureAttachment = createLiveUserApiFailureAttachment(userApiFailureInput);
+assert.equal(userApiFailureAttachment?.name, "live-user-api-failure-v1");
+assert.equal(userApiFailureAttachment?.contentType, "application/json");
+assert.deepEqual(JSON.parse(userApiFailureAttachment.body.toString("ascii")), {
+  schema: 1,
+  ...userApiFailureInput,
+});
+assert.equal(
+  userApiFailureMessage("unexpected_status"),
+  "LiveUserApiUnexpectedStatus: API response status did not match.",
+);
+assert.equal(
+  createLiveUserApiFailureAttachment({
+    ...userApiFailureInput,
+    method: "POST",
+  }),
+  null,
+  "an operation cannot claim a different HTTP method",
+);
+assert.equal(
+  createLiveUserApiFailureAttachment({
+    ...userApiFailureInput,
+    expected_status: 201,
+  }),
+  null,
+  "an operation cannot claim a different expected status",
+);
+assert.equal(
+  createLiveUserApiFailureAttachment({
+    ...userApiFailureInput,
+    actual_status: 200,
+  }),
+  null,
+  "unexpected_status requires a status different from the expected status",
+);
+assert.equal(
+  createLiveUserApiFailureAttachment({
+    ...userApiFailureInput,
+    operation: "unknown_route_with_secret",
+  }),
+  null,
+  "dynamic routes and unrecognized operation names are rejected",
+);
+assert.equal(
+  createLiveUserApiFailureAttachment({
+    ...userApiFailureInput,
+    source_file: "/tmp/private/tests/smoke/live-user-journey.spec.ts",
+  }),
+  null,
+  "only the normalized repository-relative spec source is accepted",
+);
+assert.equal(
+  createLiveUserApiFailureAttachment({
+    ...userApiFailureInput,
+    kind: "request_error",
+    actual_status: 503,
+  }),
+  null,
+  "request_error has no HTTP status",
+);
 let cappedResultReads = 0;
 const cappedResults = Array.from({ length: 32769 }, () => ({
   get status() {
@@ -493,6 +631,49 @@ function diagnosticFixture(root, suffix = "d1a2b3c4") {
   };
 }
 
+function liveUserDiagnosticFixture(root, suffix) {
+  const gateRoot = path.join(root, `live-user-gate-root-${suffix}`);
+  const gate = path.join(gateRoot, "live-user-qa.Abc123");
+  const results = path.join(gate, "test-results");
+  const sourceRoot = path.join(root, `live-user-source-${suffix}`);
+  const spec = path.join(sourceRoot, "tests", "smoke", "live-user-journey.spec.ts");
+  fs.mkdirSync(results, { recursive: true, mode: 0o700 });
+  fs.chmodSync(gateRoot, 0o711);
+  fs.mkdirSync(path.dirname(spec), { recursive: true, mode: 0o755 });
+  fs.writeFileSync(spec, 'test("the fixed journey", async () => {\n  expect(true).toBe(true);\n});\n');
+  return {
+    gateRoot,
+    gate,
+    results,
+    sourceRoot,
+    spec,
+    binding: {
+      gate,
+      source_sha: "b".repeat(40),
+      app_sha: "a".repeat(40),
+      marker_sha256: "c".repeat(64),
+    },
+  };
+}
+
+function liveUserFailureTest(fixture, { status = "failed", attachments } = {}) {
+  return {
+    title: "live player completes the accelerated tournament journey through visible controls",
+    id: "private-playwright-id",
+    expectedStatus: "passed",
+    parent: { project: () => ({ name: "live-desktop" }) },
+    results: [{
+      status,
+      errors: [{
+        message: "private response body and marker must never be serialized",
+        location: { file: fixture.spec, line: 2, column: 3 },
+      }],
+      attachments,
+    }],
+    outcome: () => "unexpected",
+  };
+}
+
 function withRootOwnedGate(gateRoot, run) {
   const originalLstat = fs.lstatSync;
   try {
@@ -511,6 +692,263 @@ function withRootOwnedGate(gateRoot, run) {
   } finally {
     fs.lstatSync = originalLstat;
   }
+}
+
+const liveUserFailureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "live-user-failure-contract-"));
+try {
+  const fixture = liveUserDiagnosticFixture(liveUserFailureRoot, "captured");
+  const candidate = createLiveUserApiFailureAttachment({
+    kind: "unexpected_status",
+    operation: "assignment_state",
+    method: "GET",
+    expected_status: 200,
+    actual_status: 503,
+    source_file: "tests/smoke/live-user-journey.spec.ts",
+    source_line: 2,
+    source_column: 3,
+  });
+  assert.ok(candidate);
+  const failedTest = liveUserFailureTest(fixture, { attachments: [candidate] });
+  const suite = { allTests: () => [failedTest] };
+  const summary = summarizeRun(suite, "failed");
+  assert.equal(summary.run_status, "failed");
+  assert.equal(summary.logical.fail, 1);
+  assert.equal(summary.attempts.fail, 1);
+  assert.equal(withRootOwnedGate(fixture.gateRoot, () => writeBoundedLiveUserFailureSummary(
+    fixture.binding,
+    suite,
+    summary,
+    { gateRoot: fixture.gateRoot, sourceRoot: fixture.sourceRoot },
+  )), true, "a terminal failed UserQA API assertion produces its closed private report");
+  const reportPath = path.join(fixture.results, "live-user-failures-v3.json");
+  const reportBytes = fs.readFileSync(reportPath);
+  const reportMetadata = fs.lstatSync(reportPath);
+  const report = JSON.parse(reportBytes.toString("ascii"));
+  assert.equal(reportMetadata.isFile(), true);
+  assert.equal(reportMetadata.nlink, 1);
+  assert.equal(reportMetadata.mode & 0o777, 0o600);
+  assert.ok(reportBytes.length <= 16 * 1024 - 256);
+  assert.deepEqual(Object.keys(report).sort(), [
+    "app_sha", "failures", "gate", "marker_sha256", "run_status", "schema", "source_sha",
+  ]);
+  assert.equal(report.schema, 3);
+  assert.deepEqual(report.failures, [{
+    id: "live_user_journey",
+    project: "live-desktop",
+    status: "failed",
+    attempt: 1,
+    source_file: "tests/smoke/live-user-journey.spec.ts",
+    source_line: 2,
+    source_column: 3,
+    source_kind: "test_error_location",
+    api_failure_state: "captured",
+    api_failure: {
+      kind: "unexpected_status",
+      operation: "assignment_state",
+      method: "GET",
+      expected_status: 200,
+      actual_status: 503,
+    },
+  }]);
+  for (const privateValue of [
+    "private response body",
+    "private marker",
+    "private-playwright-id",
+    "/tournaments/",
+    "live-user-api-failure-v1",
+    fixture.sourceRoot,
+  ]) {
+    assert.equal(reportBytes.includes(Buffer.from(privateValue)), false);
+  }
+
+  const nonmatchingFixture = liveUserDiagnosticFixture(liveUserFailureRoot, "nonmatching");
+  const nonmatchingCandidate = createLiveUserApiFailureAttachment({
+    kind: "unexpected_status",
+    operation: "assignment_state",
+    method: "GET",
+    expected_status: 200,
+    actual_status: 503,
+    source_file: "tests/smoke/live-user-journey.spec.ts",
+    source_line: 2,
+    source_column: 3,
+  });
+  const unrelatedTerminalFailure = liveUserFailureTest(nonmatchingFixture, {
+    attachments: [nonmatchingCandidate],
+  });
+  unrelatedTerminalFailure.results[0].errors[0].location.line = 1;
+  const unrelatedSuite = { allTests: () => [unrelatedTerminalFailure] };
+  const unrelatedSummary = summarizeRun(unrelatedSuite, "failed");
+  assert.equal(withRootOwnedGate(nonmatchingFixture.gateRoot, () => writeBoundedLiveUserFailureSummary(
+    nonmatchingFixture.binding,
+    unrelatedSuite,
+    unrelatedSummary,
+    { gateRoot: nonmatchingFixture.gateRoot, sourceRoot: nonmatchingFixture.sourceRoot },
+  )), true, "a terminal failure is retained even when an earlier helper candidate does not match");
+  const unrelatedReport = JSON.parse(fs.readFileSync(
+    path.join(nonmatchingFixture.results, "live-user-failures-v3.json"),
+    "ascii",
+  ));
+  assert.deepEqual([
+    unrelatedReport.failures[0].source_line,
+    unrelatedReport.failures[0].api_failure_state,
+    unrelatedReport.failures[0].api_failure,
+  ], [1, "unavailable", null]);
+
+  const ambiguousFixture = liveUserDiagnosticFixture(liveUserFailureRoot, "ambiguous");
+  const ambiguousTest = liveUserFailureTest(ambiguousFixture, { attachments: [candidate] });
+  ambiguousTest.results[0].errors.push({
+    message: "another private terminal error",
+    location: { file: ambiguousFixture.spec, line: 2, column: 3 },
+  });
+  const ambiguousSuite = { allTests: () => [ambiguousTest] };
+  const ambiguousSummary = summarizeRun(ambiguousSuite, "failed");
+  assert.equal(withRootOwnedGate(ambiguousFixture.gateRoot, () => writeBoundedLiveUserFailureSummary(
+    ambiguousFixture.binding,
+    ambiguousSuite,
+    ambiguousSummary,
+    { gateRoot: ambiguousFixture.gateRoot, sourceRoot: ambiguousFixture.sourceRoot },
+  )), true);
+  const ambiguousReport = JSON.parse(fs.readFileSync(
+    path.join(ambiguousFixture.results, "live-user-failures-v3.json"),
+    "ascii",
+  ));
+  assert.deepEqual([
+    ambiguousReport.failures[0].source_kind,
+    ambiguousReport.failures[0].api_failure_state,
+    ambiguousReport.failures[0].api_failure,
+  ], ["test_error_location", "unavailable", null]);
+
+  const unavailableCases = [
+    ["missing attachment", undefined],
+    ["wrong content type", [{ ...candidate, contentType: "text/plain" }]],
+    ["path-backed attachment", [{ name: candidate.name, contentType: candidate.contentType, path: "/private/path" }]],
+    ["body and path", [{ ...candidate, path: "/private/path" }]],
+    ["duplicate attachment", [candidate, candidate]],
+    ["malformed JSON", [{ ...candidate, body: Buffer.from("{", "ascii") }]],
+    ["noncanonical schema boolean", [{
+      ...candidate,
+      body: Buffer.from(JSON.stringify({
+        schema: true,
+        kind: "unexpected_status",
+        operation: "assignment_state",
+        method: "GET",
+        expected_status: 200,
+        actual_status: 503,
+        source_file: "tests/smoke/live-user-journey.spec.ts",
+        source_line: 2,
+        source_column: 3,
+      }), "ascii"),
+    }]],
+    ["unknown attachment field", [{
+      ...candidate,
+      body: Buffer.from(JSON.stringify({
+        schema: 1,
+        kind: "unexpected_status",
+        operation: "assignment_state",
+        method: "GET",
+        expected_status: 200,
+        actual_status: 503,
+        source_file: "tests/smoke/live-user-journey.spec.ts",
+        source_line: 2,
+        source_column: 3,
+        private_value: "must-not-survive",
+      }), "ascii"),
+    }]],
+  ];
+  for (const [index, [label, attachments]] of unavailableCases.entries()) {
+    const unsafeFixture = liveUserDiagnosticFixture(
+      liveUserFailureRoot,
+      `invalid-${index}`,
+    );
+    const unsafeTest = liveUserFailureTest(unsafeFixture, { attachments });
+    const unsafeSuite = { allTests: () => [unsafeTest] };
+    const unsafeSummary = summarizeRun(unsafeSuite, "failed");
+    assert.equal(withRootOwnedGate(unsafeFixture.gateRoot, () => writeBoundedLiveUserFailureSummary(
+      unsafeFixture.binding,
+      unsafeSuite,
+      unsafeSummary,
+      { gateRoot: unsafeFixture.gateRoot, sourceRoot: unsafeFixture.sourceRoot },
+    )), true, `${label} leaves the original failed result reportable`);
+    const unsafeReportBytes = fs.readFileSync(
+      path.join(unsafeFixture.results, "live-user-failures-v3.json"),
+    );
+    const unsafeReport = JSON.parse(unsafeReportBytes.toString("ascii"));
+    assert.deepEqual([
+      unsafeReport.failures[0].status,
+      unsafeReport.failures[0].source_file,
+      unsafeReport.failures[0].api_failure_state,
+      unsafeReport.failures[0].api_failure,
+    ], ["failed", "tests/smoke/live-user-journey.spec.ts", "unavailable", null]);
+    for (const privateValue of ["/private/path", "must-not-survive", "private_value"]) {
+      assert.equal(unsafeReportBytes.includes(Buffer.from(privateValue)), false);
+    }
+  }
+
+  const missingLocationFixture = liveUserDiagnosticFixture(liveUserFailureRoot, "no-location");
+  const missingLocationTest = liveUserFailureTest(missingLocationFixture, { attachments: [candidate] });
+  missingLocationTest.results[0].errors[0].location = {
+    file: "/tmp/untrusted/live-user-journey.spec.ts",
+    line: 2,
+    column: 3,
+  };
+  const missingLocationSuite = { allTests: () => [missingLocationTest] };
+  const missingLocationSummary = summarizeRun(missingLocationSuite, "failed");
+  assert.equal(withRootOwnedGate(missingLocationFixture.gateRoot, () => writeBoundedLiveUserFailureSummary(
+    missingLocationFixture.binding,
+    missingLocationSuite,
+    missingLocationSummary,
+    { gateRoot: missingLocationFixture.gateRoot, sourceRoot: missingLocationFixture.sourceRoot },
+  )), true);
+  const missingLocationReport = JSON.parse(fs.readFileSync(
+    path.join(missingLocationFixture.results, "live-user-failures-v3.json"),
+    "ascii",
+  ));
+  assert.deepEqual([
+    missingLocationReport.failures[0].source_file,
+    missingLocationReport.failures[0].source_line,
+    missingLocationReport.failures[0].source_column,
+    missingLocationReport.failures[0].source_kind,
+    missingLocationReport.failures[0].api_failure_state,
+  ], [null, null, null, "unavailable", "unavailable"]);
+
+  const successfulFixture = liveUserDiagnosticFixture(liveUserFailureRoot, "success");
+  const successfulTest = {
+    ...liveUserFailureTest(successfulFixture),
+    results: [{ status: "passed", errors: [], attachments: [] }],
+    outcome: () => "expected",
+  };
+  const successfulSuite = { allTests: () => [successfulTest] };
+  const successfulLiveUserSummary = summarizeRun(successfulSuite, "passed");
+  assert.equal(withRootOwnedGate(successfulFixture.gateRoot, () => writeBoundedLiveUserFailureSummary(
+    successfulFixture.binding,
+    successfulSuite,
+    successfulLiveUserSummary,
+    { gateRoot: successfulFixture.gateRoot, sourceRoot: successfulFixture.sourceRoot },
+  )), false, "a passing run does not create a failure-only UserQA report");
+  assert.equal(fs.existsSync(path.join(successfulFixture.results, "live-user-failures-v3.json")), false);
+
+  for (const [suffix, mutate] of [
+    ["wrong-title", (testCase) => { testCase.title = "unmapped private title"; }],
+    ["wrong-project", (testCase) => { testCase.parent = { project: () => ({ name: "live-mobile" }) }; }],
+  ]) {
+    const rejectedFixture = liveUserDiagnosticFixture(liveUserFailureRoot, suffix);
+    const rejectedTest = liveUserFailureTest(rejectedFixture, { attachments: [candidate] });
+    mutate(rejectedTest);
+    const rejectedSuite = { allTests: () => [rejectedTest] };
+    const rejectedSummary = summarizeRun(rejectedSuite, "failed");
+    assert.equal(withRootOwnedGate(rejectedFixture.gateRoot, () => writeBoundedLiveUserFailureSummary(
+      rejectedFixture.binding,
+      rejectedSuite,
+      rejectedSummary,
+      { gateRoot: rejectedFixture.gateRoot, sourceRoot: rejectedFixture.sourceRoot },
+    )), false, "only the fixed UserQA test and project can produce this private report");
+    assert.equal(
+      fs.existsSync(path.join(rejectedFixture.results, "live-user-failures-v3.json")),
+      false,
+    );
+  }
+} finally {
+  fs.rmSync(liveUserFailureRoot, { recursive: true, force: true });
 }
 
 function failureTest(

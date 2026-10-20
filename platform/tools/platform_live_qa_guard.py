@@ -136,6 +136,12 @@ LIVE_BROWSER_FAILURE_REPORT_NAME_PATTERN = re.compile(
 LIVE_BROWSER_FAILURE_TEMP_NAME_PATTERN = re.compile(
     r"^\.public-live-qa\.[a-z0-9_]{8}\.failure-v[12]\.json\.[0-9a-f]{32}\.tmp$"
 )
+LIVE_USER_FAILURE_REPORT_NAME_PATTERN = re.compile(
+    r"^live-user-qa\.[A-Za-z0-9]{6}\.failure-v3\.json$"
+)
+LIVE_USER_FAILURE_TEMP_NAME_PATTERN = re.compile(
+    r"^\.live-user-qa\.[A-Za-z0-9]{6}\.failure-v3\.json\.[0-9a-f]{32}\.tmp$"
+)
 PUBLICATION_TEMP_PATTERN = re.compile(r"^\.(?:inventory|phase)\.json\.[a-z0-9_]{8}$")
 MARKER_PATTERN = re.compile(r"^liveqa-[a-z0-9-]{6,56}$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -228,6 +234,7 @@ SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 LIVE_BROWSER_COUNTS_FILE = "live-counts-v1.json"
 LIVE_BROWSER_COUNTS_MAX_BYTES = 1024
 LIVE_BROWSER_FAILURES_FILE = "live-failures-v2.json"
+LIVE_USER_FAILURES_FILE = "live-user-failures-v3.json"
 LIVE_BROWSER_FAILURES_MAX_BYTES = 16 * 1024
 LIVE_BROWSER_FAILURES_STORE_MAX_FILES = 10
 LIVE_BROWSER_FAILURES_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -270,6 +277,28 @@ LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES = frozenset(
 LIVE_BROWSER_FAILURE_SOURCE_FILES = {
     "tests/smoke/live-launch.spec.ts": "runtime/web/tests/smoke/live-launch.spec.ts",
     "tests/support/live-qa-sandbox.ts": "runtime/web/tests/support/live-qa-sandbox.ts",
+}
+LIVE_USER_FAILURE_SOURCE_FILES = {
+    "tests/smoke/live-user-journey.spec.ts":
+        "runtime/web/tests/smoke/live-user-journey.spec.ts",
+}
+LIVE_USER_FAILURE_OPERATIONS = {
+    "tournament_create": ("POST", 201),
+    "tournament_status": ("PATCH", 200),
+    "invite_create": ("POST", 201),
+    "invite_claim": ("POST", 201),
+    "tournament_join": ("POST", 201),
+    "ready_check_start": ("POST", 201),
+    "ready_check_vote": ("POST", 200),
+    "ready_check_close": ("POST", 200),
+    "captain_round_start": ("POST", 201),
+    "assignment_start": ("POST", 202),
+    "assignment_state": ("GET", 200),
+    "assignment_publish": ("POST", 200),
+    "assignment_lock": ("POST", 200),
+    "bracket_read": ("GET", 200),
+    "match_schedule": ("PATCH", 200),
+    "tournament_read": ("GET", 200),
 }
 LIVE_BROWSER_COUNTS_RUN_STATUSES = frozenset(
     {"passed", "failed", "timedout", "interrupted"}
@@ -2490,12 +2519,15 @@ def _read_active_failure_manifest(app_sha: str) -> dict[str, object]:
 def _read_bound_failure_source(
     manifest: Mapping[str, object],
     relative: str,
+    *,
+    allowed_sources: Mapping[str, str] | None = None,
 ) -> bytes:
-    if relative not in LIVE_BROWSER_FAILURE_SOURCE_FILES:
+    source_map = allowed_sources or LIVE_BROWSER_FAILURE_SOURCE_FILES
+    if relative not in source_map:
         raise GuardError("private browser failure source is outside its fixed manifest")
     payload_root = manifest.get("payload_root")
     files = manifest.get("files")
-    manifest_path = LIVE_BROWSER_FAILURE_SOURCE_FILES[relative]
+    manifest_path = source_map[relative]
     if not isinstance(payload_root, Path) or not isinstance(files, dict):
         raise GuardError("private browser failure source manifest is invalid")
     expected_digest = files.get(manifest_path)
@@ -2623,6 +2655,78 @@ def _validate_page_error_evidence(record: Mapping[str, object]) -> None:
             raise GuardError("private browser page-error location is malformed")
 
 
+def _validate_live_user_api_failure(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "kind", "operation", "method", "expected_status", "actual_status",
+    }:
+        raise GuardError("private UserQA API failure evidence is malformed")
+    kind = value.get("kind")
+    operation = value.get("operation")
+    method = value.get("method")
+    expected_status = value.get("expected_status")
+    actual_status = value.get("actual_status")
+    expected = LIVE_USER_FAILURE_OPERATIONS.get(operation) if isinstance(operation, str) else None
+    if (
+        not isinstance(kind, str)
+        or kind not in {"unexpected_status", "invalid_json", "request_error"}
+        or expected is None
+        or not isinstance(method, str)
+        or method != expected[0]
+        or type(expected_status) is not int
+        or expected_status != expected[1]
+        or (
+            kind == "request_error"
+            and actual_status is not None
+        )
+        or (
+            kind != "request_error"
+            and (type(actual_status) is not int or not 100 <= actual_status <= 599)
+        )
+        or (
+            kind == "unexpected_status"
+            and actual_status == expected_status
+        )
+        or (
+            kind == "invalid_json"
+            and actual_status != expected_status
+        )
+    ):
+        raise GuardError("private UserQA API failure evidence is malformed")
+
+
+def _validate_live_user_failure_location(
+    record: Mapping[str, object],
+    manifest: Mapping[str, object] | None = None,
+) -> None:
+    source_file = record.get("source_file")
+    source_line = record.get("source_line")
+    source_column = record.get("source_column")
+    source_kind = record.get("source_kind")
+    if source_kind == "unavailable":
+        if source_file is not None or source_line is not None or source_column is not None:
+            raise GuardError("private UserQA failure location is malformed")
+        return
+    if (
+        source_kind != "test_error_location"
+        or not isinstance(source_file, str)
+        or source_file not in LIVE_USER_FAILURE_SOURCE_FILES
+        or type(source_line) is not int
+        or not 1 <= source_line <= 10000
+        or type(source_column) is not int
+        or not 1 <= source_column <= 10000
+    ):
+        raise GuardError("private UserQA failure location is malformed")
+    if manifest is not None:
+        source = _read_bound_failure_source(
+            manifest,
+            source_file,
+            allowed_sources=LIVE_USER_FAILURE_SOURCE_FILES,
+        )
+        lines = source.splitlines()
+        if source_line > len(lines) or source_column > len(lines[source_line - 1]) + 1:
+            raise GuardError("private UserQA failure location is outside its source")
+
+
 def _failure_report_store_directory(*, create: bool) -> int:
     _validate_root_secret_parent(TRUSTED_FAILURE_DIAGNOSTICS_ROOT)
     if create:
@@ -2659,8 +2763,12 @@ def _failure_report_store_directory(*, create: bool) -> int:
 def _assert_failure_report_name_unused(gate: Path) -> None:
     descriptor = _failure_report_store_directory(create=False)
     try:
-        for version in (1, 2):
-            name = f"{gate.name}.failure-v{version}.json"
+        names = (
+            [f"{gate.name}.failure-v3.json"]
+            if STATE_NAME_PATTERN.fullmatch(gate.name)
+            else [f"{gate.name}.failure-v{version}.json" for version in (1, 2)]
+        )
+        for name in names:
             try:
                 os.stat(name, dir_fd=descriptor, follow_symlinks=False)
             except FileNotFoundError:
@@ -2713,7 +2821,10 @@ def _read_failure_store_file(directory_fd: int, name: str) -> tuple[os.stat_resu
 
 
 def _validate_retained_failure_report(name: str, raw: bytes) -> None:
-    if name.endswith(".failure-v1.json"):
+    if name.endswith(".failure-v3.json"):
+        schema = 3
+        gate = name.removesuffix(".failure-v3.json")
+    elif name.endswith(".failure-v1.json"):
         schema = 1
         gate = name.removesuffix(".failure-v1.json")
     elif name.endswith(".failure-v2.json"):
@@ -2731,6 +2842,11 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise GuardError("retained private browser diagnostics record is invalid") from exc
+    valid_gate = (
+        bool(STATE_NAME_PATTERN.fullmatch(gate))
+        if schema == 3
+        else bool(PUBLIC_GATE_NAME_PATTERN.fullmatch(gate))
+    )
     if (
         not isinstance(payload, dict)
         or set(payload) != {
@@ -2741,7 +2857,7 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         or type(payload.get("schema")) is not int
         or payload.get("schema") != schema
         or payload.get("gate") != gate
-        or not PUBLIC_GATE_NAME_PATTERN.fullmatch(gate)
+        or not valid_gate
         or not isinstance(payload.get("source_sha"), str)
         or COMMIT_PATTERN.fullmatch(payload["source_sha"]) is None
         or not isinstance(payload.get("app_sha"), str)
@@ -2757,7 +2873,11 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         or not isinstance(payload.get("run_status"), str)
         or payload.get("run_status") not in {"failed", "timedout", "interrupted"}
         or not isinstance(payload.get("failures"), list)
-        or len(payload["failures"]) > 32768
+        or (
+            len(payload["failures"]) != 1
+            if schema == 3
+            else len(payload["failures"]) > 32768
+        )
     ):
         raise GuardError("retained private browser diagnostics schema is invalid")
     seen: set[tuple[str, str, int]] = set()
@@ -2770,19 +2890,23 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             expected_failure_keys.update(
                 {"page_error_state", "page_errors_truncated", "page_errors"}
             )
+        elif schema == 3:
+            expected_failure_keys.update(
+                {"api_failure_state", "api_failure"}
+            )
         if (
             not isinstance(failure, dict)
             or set(failure) != expected_failure_keys
             or not isinstance(failure.get("id"), str)
-            or failure["id"] not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
+            or failure["id"] not in ({"live_user_journey"} if schema == 3 else LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES)
             or not isinstance(failure.get("project"), str)
-            or failure["project"] not in {
+            or failure["project"] not in ({"live-desktop"} if schema == 3 else {
                 "live-desktop", "live-mobile", "live-webkit-mobile",
-            }
+            })
             or not isinstance(failure.get("status"), str)
             or failure["status"] not in {"failed", "timedOut", "interrupted"}
             or type(failure.get("attempt")) is not int
-            or not 1 <= failure["attempt"] <= 32768
+            or (failure["attempt"] != 1 if schema == 3 else not 1 <= failure["attempt"] <= 32768)
         ):
             raise GuardError("retained private browser diagnostics record is invalid")
         key = (failure["id"], failure["project"], failure["attempt"])
@@ -2791,6 +2915,27 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         seen.add(key)
         if schema == 2:
             _validate_page_error_evidence(failure)
+        if schema == 3:
+            expected_run_status = {
+                "failed": "failed",
+                "timedOut": "timedout",
+                "interrupted": "interrupted",
+            }.get(failure["status"])
+            if payload["run_status"] != expected_run_status:
+                raise GuardError("retained UserQA failure status does not match run status")
+            _validate_live_user_failure_location(failure)
+            api_state = failure.get("api_failure_state")
+            api_failure = failure.get("api_failure")
+            if api_state == "unavailable":
+                if api_failure is not None:
+                    raise GuardError("retained UserQA API evidence is invalid")
+            elif api_state == "captured":
+                if failure.get("source_kind") != "test_error_location":
+                    raise GuardError("retained UserQA API evidence lacks a terminal error location")
+                _validate_live_user_api_failure(api_failure)
+            else:
+                raise GuardError("retained UserQA API evidence is invalid")
+            continue
         source_file = failure.get("source_file")
         source_line = failure.get("source_line")
         source_column = failure.get("source_column")
@@ -2799,15 +2944,25 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             if source_file is not None or source_line is not None or source_column is not None:
                 raise GuardError("retained private browser diagnostics location is invalid")
             continue
+        allowed_source_files = (
+            LIVE_USER_FAILURE_SOURCE_FILES
+            if schema == 3
+            else LIVE_BROWSER_FAILURE_SOURCE_FILES
+        )
+        allowed_source_kinds = (
+            {"test_error_location"}
+            if schema == 3
+            else {"assertion", "test_source", "declaration"}
+        )
         if (
             not isinstance(source_file, str)
-            or source_file not in LIVE_BROWSER_FAILURE_SOURCE_FILES
+            or source_file not in allowed_source_files
             or type(source_line) is not int
             or not 1 <= source_line <= 10000
             or type(source_column) is not int
             or not 1 <= source_column <= 10000
             or not isinstance(source_kind, str)
-            or source_kind not in {"assertion", "test_source", "declaration"}
+            or source_kind not in allowed_source_kinds
         ):
             raise GuardError("retained private browser diagnostics location is invalid")
 
@@ -2820,11 +2975,17 @@ def _prune_browser_failure_diagnostics(*, reserve_slots: int) -> None:
         if len(names) > LIVE_BROWSER_FAILURES_STORE_MAX_FILES + 22:
             raise GuardError("private browser diagnostics store exceeds its entry bound")
         for name in names:
-            if LIVE_BROWSER_FAILURE_REPORT_NAME_PATTERN.fullmatch(name):
+            if (
+                LIVE_BROWSER_FAILURE_REPORT_NAME_PATTERN.fullmatch(name)
+                or LIVE_USER_FAILURE_REPORT_NAME_PATTERN.fullmatch(name)
+            ):
                 metadata, raw = _read_failure_store_file(directory_fd, name)
                 _validate_retained_failure_report(name, raw)
                 reports.append((name, metadata, raw))
-            elif LIVE_BROWSER_FAILURE_TEMP_NAME_PATTERN.fullmatch(name):
+            elif (
+                LIVE_BROWSER_FAILURE_TEMP_NAME_PATTERN.fullmatch(name)
+                or LIVE_USER_FAILURE_TEMP_NAME_PATTERN.fullmatch(name)
+            ):
                 metadata, _raw = _read_failure_store_file(directory_fd, name)
                 _unlink_failure_store_entry(directory_fd, name, metadata)
             else:
@@ -2856,6 +3017,8 @@ def _unlink_failure_store_entry(
     if not (
         LIVE_BROWSER_FAILURE_REPORT_NAME_PATTERN.fullmatch(name)
         or LIVE_BROWSER_FAILURE_TEMP_NAME_PATTERN.fullmatch(name)
+        or LIVE_USER_FAILURE_REPORT_NAME_PATTERN.fullmatch(name)
+        or LIVE_USER_FAILURE_TEMP_NAME_PATTERN.fullmatch(name)
     ):
         raise GuardError("private browser diagnostics retention name is invalid")
     try:
@@ -2901,6 +3064,77 @@ def prepare_public_browser_failure_diagnostics(
     _prune_browser_failure_diagnostics(reserve_slots=1)
 
 
+def _validate_live_user_failure_gate(
+    gate: Path,
+    *,
+    source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+) -> None:
+    if (
+        gate.parent != RUN_GATE_ROOT
+        or STATE_NAME_PATTERN.fullmatch(gate.name) is None
+        or COMMIT_PATTERN.fullmatch(source_sha) is None
+        or COMMIT_PATTERN.fullmatch(app_sha) is None
+        or DIGEST_PATTERN.fullmatch(marker_sha256) is None
+    ):
+        raise GuardError("UserQA failure diagnostics binding is invalid")
+    try:
+        root_metadata = RUN_GATE_ROOT.lstat()
+        gate_metadata = gate.lstat()
+        results_metadata = (gate / "test-results").lstat()
+        resolved_root = RUN_GATE_ROOT.resolve(strict=True)
+    except OSError as exc:
+        raise GuardError("UserQA failure diagnostics gate is unavailable") from exc
+    uid, gid = liveqa_identity()
+    if (
+        resolved_root != RUN_GATE_ROOT
+        or stat.S_ISLNK(root_metadata.st_mode)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != 0
+        or root_metadata.st_gid != 0
+        or stat.S_IMODE(root_metadata.st_mode) != 0o711
+        or stat.S_ISLNK(gate_metadata.st_mode)
+        or not stat.S_ISDIR(gate_metadata.st_mode)
+        or gate_metadata.st_uid != uid
+        or gate_metadata.st_gid != gid
+        or stat.S_IMODE(gate_metadata.st_mode) != 0o700
+        or stat.S_ISLNK(results_metadata.st_mode)
+        or not stat.S_ISDIR(results_metadata.st_mode)
+        or results_metadata.st_uid != uid
+        or results_metadata.st_gid != gid
+        or stat.S_IMODE(results_metadata.st_mode) != 0o700
+    ):
+        raise GuardError("UserQA failure diagnostics gate metadata is unsafe")
+
+
+def prepare_live_user_failure_diagnostics(
+    gate: Path,
+    *,
+    source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+) -> None:
+    """Best-effort preparation for one exact provisioned UserQA gate."""
+
+    _validate_live_user_failure_gate(
+        gate,
+        source_sha=source_sha,
+        app_sha=app_sha,
+        marker_sha256=marker_sha256,
+    )
+    manifest = _read_active_failure_manifest(app_sha)
+    _read_bound_failure_source(
+        manifest,
+        "tests/smoke/live-user-journey.spec.ts",
+        allowed_sources=LIVE_USER_FAILURE_SOURCE_FILES,
+    )
+    descriptor = _failure_report_store_directory(create=True)
+    os.close(descriptor)
+    _assert_failure_report_name_unused(gate)
+    _prune_browser_failure_diagnostics(reserve_slots=1)
+
+
 def _failure_report_required(counts: Mapping[str, object]) -> bool:
     return (
         counts.get("run_status") != "passed"
@@ -2913,6 +3147,274 @@ def _failure_report_required(counts: Mapping[str, object]) -> bool:
             )
         )
     )
+
+
+def _read_ephemeral_live_user_failure_report(
+    gate: Path,
+    *,
+    source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+    counts: Mapping[str, object],
+    manifest: Mapping[str, object],
+) -> list[dict[str, object]]:
+    uid, gid = liveqa_identity()
+    results_path = gate / "test-results"
+    try:
+        results_metadata = results_path.lstat()
+        results_fd = os.open(
+            results_path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened_results = os.fstat(results_fd)
+            path_metadata = os.stat(
+                LIVE_USER_FAILURES_FILE, dir_fd=results_fd, follow_symlinks=False
+            )
+            descriptor = os.open(
+                LIVE_USER_FAILURES_FILE,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=results_fd,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                raw = os.read(descriptor, LIVE_BROWSER_FAILURES_MAX_BYTES + 1)
+                after = os.fstat(descriptor)
+                current = os.stat(
+                    LIVE_USER_FAILURES_FILE, dir_fd=results_fd, follow_symlinks=False
+                )
+                results_after = results_path.lstat()
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(results_fd)
+    except OSError as exc:
+        raise GuardError("ephemeral UserQA failure report is unavailable") from exc
+    if (
+        stat.S_ISLNK(results_metadata.st_mode)
+        or not stat.S_ISDIR(results_metadata.st_mode)
+        or results_metadata.st_uid != uid
+        or results_metadata.st_gid != gid
+        or stat.S_IMODE(results_metadata.st_mode) != 0o700
+        or _fingerprint(results_metadata) != _fingerprint(opened_results)
+        or _fingerprint(results_after) != _fingerprint(opened_results)
+        or stat.S_ISLNK(path_metadata.st_mode)
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_uid != uid
+        or path_metadata.st_gid != gid
+        or path_metadata.st_nlink != 1
+        or stat.S_IMODE(path_metadata.st_mode) != 0o600
+        or path_metadata.st_size > LIVE_BROWSER_FAILURES_MAX_BYTES
+        or len(raw) != path_metadata.st_size
+        or len(raw) > LIVE_BROWSER_FAILURES_MAX_BYTES
+        or _fingerprint(opened) != _fingerprint(path_metadata)
+        or _fingerprint(after) != _fingerprint(opened)
+        or _fingerprint(current) != _fingerprint(opened)
+        or not raw.endswith(b"\n")
+        or raw.endswith(b"\n\n")
+    ):
+        raise GuardError("ephemeral UserQA failure report metadata is unsafe")
+    try:
+        payload = json.loads(
+            raw.decode("ascii"),
+            object_pairs_hook=_strict_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                GuardError("ephemeral UserQA failure JSON is invalid")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise GuardError("ephemeral UserQA failure report is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {
+            "schema", "gate", "source_sha", "app_sha", "marker_sha256",
+            "run_status", "failures",
+        }
+        or type(payload.get("schema")) is not int
+        or payload.get("schema") != 3
+        or payload.get("gate") != gate.name
+        or payload.get("source_sha") != source_sha
+        or payload.get("app_sha") != app_sha
+        or payload.get("marker_sha256") != marker_sha256
+        or payload.get("run_status") != counts.get("run_status")
+        or not isinstance(payload.get("failures"), list)
+        or len(payload["failures"]) != 1
+    ):
+        raise GuardError("ephemeral UserQA failure report binding is invalid")
+    record = payload["failures"][0]
+    expected_record_keys = {
+        "id", "project", "status", "attempt", "source_file", "source_line",
+        "source_column", "source_kind", "api_failure_state", "api_failure",
+    }
+    if (
+        not isinstance(record, dict)
+        or set(record) != expected_record_keys
+        or record.get("id") != "live_user_journey"
+        or record.get("project") != "live-desktop"
+        or not isinstance(record.get("status"), str)
+        or record.get("status") not in {"failed", "timedOut", "interrupted"}
+        or type(record.get("attempt")) is not int
+        or record.get("attempt") != 1
+    ):
+        raise GuardError("ephemeral UserQA failure record is invalid")
+    status_to_run_status = {
+        "failed": "failed",
+        "timedOut": "timedout",
+        "interrupted": "interrupted",
+    }
+    if status_to_run_status[record["status"]] != counts.get("run_status"):
+        raise GuardError("ephemeral UserQA failure status does not match counts")
+    status_count_fields = {
+        "failed": "attempt_fail",
+        "timedOut": "attempt_timedout",
+        "interrupted": "attempt_interrupted",
+    }
+    status_logical_count_fields = {
+        "failed": "logical_fail",
+        "timedOut": "logical_fail",
+        "interrupted": "logical_interrupted",
+    }
+    nonzero_logical_field = status_logical_count_fields[record["status"]]
+    nonzero_attempt_field = status_count_fields[record["status"]]
+    if (
+        counts.get("logical_total") != 1
+        or counts.get("attempt_total") != 1
+        or counts.get(nonzero_logical_field) != 1
+        or counts.get(nonzero_attempt_field) != 1
+        or any(
+            counts.get(field) != (1 if field == nonzero_logical_field else 0)
+            for field in (
+                "logical_pass", "logical_fail", "logical_expected_fail",
+                "logical_flaky", "logical_skip", "logical_interrupted",
+            )
+        )
+        or any(
+            counts.get(field) != (1 if field == nonzero_attempt_field else 0)
+            for field in (
+                "attempt_pass", "attempt_fail", "attempt_skip",
+                "attempt_interrupted", "attempt_timedout",
+            )
+        )
+    ):
+        raise GuardError("ephemeral UserQA failure count is not one terminal test attempt")
+    _validate_live_user_failure_location(record, manifest)
+    api_state = record.get("api_failure_state")
+    api_failure = record.get("api_failure")
+    if api_state == "unavailable":
+        if api_failure is not None:
+            raise GuardError("ephemeral UserQA API evidence is malformed")
+    elif api_state == "captured":
+        if record.get("source_kind") != "test_error_location":
+            raise GuardError("ephemeral UserQA API evidence lacks a terminal error location")
+        _validate_live_user_api_failure(api_failure)
+    else:
+        raise GuardError("ephemeral UserQA API evidence is malformed")
+    return [record]
+
+
+def _publish_private_live_user_failure_report(
+    gate: Path,
+    *,
+    source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+    counts: Mapping[str, object],
+) -> None:
+    if not _failure_report_required(counts):
+        return
+    _validate_live_user_failure_gate(
+        gate,
+        source_sha=source_sha,
+        app_sha=app_sha,
+        marker_sha256=marker_sha256,
+    )
+    manifest = _read_active_failure_manifest(app_sha)
+    failures = _read_ephemeral_live_user_failure_report(
+        gate,
+        source_sha=source_sha,
+        app_sha=app_sha,
+        marker_sha256=marker_sha256,
+        counts=counts,
+        manifest=manifest,
+    )
+    payload = {
+        "schema": 3,
+        "gate": gate.name,
+        "source_sha": source_sha,
+        "app_sha": app_sha,
+        "marker_sha256": marker_sha256,
+        "payload_manifest_sha256": manifest["manifest_sha256"],
+        "payload_tree_sha256": manifest["payload_tree_sha256"],
+        "observed_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "run_status": counts["run_status"],
+        "failures": failures,
+    }
+    encoded = (json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+    if len(encoded) > LIVE_BROWSER_FAILURES_MAX_BYTES:
+        raise GuardError("private UserQA failure report exceeds its size limit")
+    _assert_failure_report_name_unused(gate)
+    _prune_browser_failure_diagnostics(reserve_slots=1)
+    directory_fd = _failure_report_store_directory(create=False)
+    final_name = f"{gate.name}.failure-v3.json"
+    temporary_name = f".{final_name}.{uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, encoded, failure="private UserQA failure report could not be written")
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size != len(encoded)
+        ):
+            raise GuardError("private UserQA failure report temp metadata is unsafe")
+        os.close(descriptor)
+        descriptor = None
+        os.link(
+            temporary_name,
+            final_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        published = os.stat(final_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(published.st_mode)
+            or published.st_uid != 0
+            or published.st_gid != 0
+            or published.st_nlink != 1
+            or stat.S_IMODE(published.st_mode) != 0o600
+            or published.st_size != len(encoded)
+        ):
+            raise GuardError("private UserQA failure report publication metadata is unsafe")
+    except OSError as exc:
+        raise GuardError("private UserQA failure report could not be published") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(directory_fd)
 
 
 def _read_ephemeral_failure_report(
@@ -3331,13 +3833,22 @@ def public_browser_counts_line(
     line = "LIVE_BROWSER_COUNTS schema=1 " + " ".join(ordered) + "\n"
     if persist_failure_report:
         try:
-            _publish_private_browser_failure_report(
-                gate,
-                source_sha=source_sha,
-                app_sha=app_sha,
-                marker_sha256=marker_sha256,
-                counts=payload,
-            )
+            if STATE_NAME_PATTERN.fullmatch(gate.name):
+                _publish_private_live_user_failure_report(
+                    gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha256,
+                    counts=payload,
+                )
+            else:
+                _publish_private_browser_failure_report(
+                    gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha256,
+                    counts=payload,
+                )
         except Exception as exc:
             # Preserve the public counts record and original browser exit. The
             # wrapper converts this fixed status into its closed marker kind.
@@ -7120,6 +7631,11 @@ def _parser() -> argparse.ArgumentParser:
     failure_diagnostics.add_argument("--source-sha", required=True)
     failure_diagnostics.add_argument("--app-sha", required=True)
     failure_diagnostics.add_argument("--marker-sha256", required=True)
+    user_failure_diagnostics = commands.add_parser("prepare-live-user-failure-diagnostics")
+    user_failure_diagnostics.add_argument("--gate", type=Path, required=True)
+    user_failure_diagnostics.add_argument("--source-sha", required=True)
+    user_failure_diagnostics.add_argument("--app-sha", required=True)
+    user_failure_diagnostics.add_argument("--marker-sha256", required=True)
     browser_counts = commands.add_parser("emit-public-browser-counts")
     browser_counts.add_argument("--gate", type=Path, required=True)
     browser_counts.add_argument("--source-sha", required=True)
@@ -7265,6 +7781,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "prepare-public-failure-diagnostics":
             _assert_public_browser_failure_lock()
             prepare_public_browser_failure_diagnostics(
+                args.gate,
+                source_sha=args.source_sha,
+                app_sha=args.app_sha,
+                marker_sha256=args.marker_sha256,
+            )
+        elif args.command == "prepare-live-user-failure-diagnostics":
+            _assert_public_browser_failure_lock()
+            prepare_live_user_failure_diagnostics(
                 args.gate,
                 source_sha=args.source_sha,
                 app_sha=args.app_sha,
