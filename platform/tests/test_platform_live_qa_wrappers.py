@@ -882,7 +882,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertIn("run_status=failed", write_failure.exception.count_line)
                 self.assertFalse(private_report.exists())
                 self.assertEqual(
-                    os.listdir(secret / "diagnostics"),
+                    sorted(os.listdir(secret / "diagnostics")),
                     sorted([max_private_report.name, user_private_report.name]),
                     "a failed second publication leaves prior valid records intact",
                 )
