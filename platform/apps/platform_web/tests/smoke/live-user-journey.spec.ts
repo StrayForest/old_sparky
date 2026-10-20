@@ -42,14 +42,24 @@ test.beforeEach(() => {
 test.afterEach(async ({}, testInfo) => {
   const candidate = latestApiFailure;
   latestApiFailure = null;
+  const sourceFile = candidate?.source_file;
+  const sourceLine = candidate?.source_line;
+  const sourceColumn = candidate?.source_column;
   if (
     !candidate
     || testInfo.status === testInfo.expectedStatus
-    || candidate.source_file !== "tests/smoke/live-user-journey.spec.ts"
-    || candidate.source_line === null
-    || candidate.source_column === null
+    || sourceFile !== "tests/smoke/live-user-journey.spec.ts"
+    || sourceLine === null
+    || sourceLine === undefined
+    || sourceColumn === null
+    || sourceColumn === undefined
   ) return;
-  const attachment = LiveCountReporter.createLiveUserApiFailureAttachment(candidate);
+  const attachment = LiveCountReporter.createLiveUserApiFailureAttachment({
+    ...candidate,
+    source_file: sourceFile,
+    source_line: sourceLine,
+    source_column: sourceColumn,
+  });
   if (!attachment) return;
   try {
     await testInfo.attach(attachment.name, {
@@ -901,7 +911,7 @@ async function apiJson<T = Record<string, unknown>>(
 function liveUserApiFailure(
   kind: UserApiFailureKind,
   operation: UserApiOperation,
-  method: string,
+  method: "GET" | "POST" | "PATCH",
   expectedStatus: number,
   actualStatus: number | null,
   captureAllowed: boolean,
