@@ -4473,15 +4473,66 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn('prepare-stale-bundle-cleanup-state', live_user)
         self.assertIn('recover_exact_state "$QA_STATE_DIR"', live_user)
         self.assertIn('trap stale_bundle_cleanup_exit EXIT', live_user)
-        start = live_user.index(
-            'if (( $# == 1 )) && [[ "$1" == "recover-bundle" ]]; then\n  if'
-        )
-        end = live_user.index(
-            '\nif (( $# == 2 )) && [[ "$1" == "recover-setup" ]]; then', start
-        )
-        stale_mode = live_user[start:end]
+        stale_mode = live_user[
+            live_user.index('if (( $# == 1 )) && [[ "$1" == "recover-bundle" ]]; then\n  if'):
+            live_user.index(
+                '\nif (( $# == 2 )) && [[ "$1" == "recover-setup" ]]; then'
+            )
+        ]
         self.assertIn("--mode provision", stale_mode)
         self.assertNotIn("prepare-browser-gate", stale_mode)
+
+        usage_start = live_user.index("usage() {")
+        usage_end = live_user.index("\n}", usage_start) + len("\n}")
+        parser_start = live_user.index('case "$#" in')
+        parser_end = live_user.index("\nesac", parser_start) + len("\nesac")
+        argv_probe = "\n".join(
+            (
+                "set -euo pipefail",
+                live_user[usage_start:usage_end],
+                live_user[parser_start:parser_end],
+                'printf "ARGV_VALIDATION_REACHED_NEXT_GUARD\\n"',
+            )
+        )
+        argv_cases = (
+            ((), True),
+            (("recover-bundle",), True),
+            (("recover", "/tmp/live-user-qa.fixture"), True),
+            (("recover-setup", "/tmp/.live-user-qa.setup-fixture"), True),
+            (("recover",), False),
+            (("recover-setup",), False),
+            (("recover", "relative/path"), False),
+            (("recover-setup", "relative/path"), False),
+            (("unknown",), False),
+            (("recover-bundle", "/tmp/inventory.json"), False),
+            (("recover", "/tmp/live-user-qa.fixture", "extra"), False),
+        )
+        for argv, accepted in argv_cases:
+            with self.subTest(argv=argv):
+                result = subprocess.run(
+                    [
+                        "/usr/bin/bash",
+                        "--noprofile",
+                        "--norc",
+                        "-c",
+                        argv_probe,
+                        "live-qa-argv-probe",
+                        *argv,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={"LANG": "C", "PATH": "/usr/bin:/bin"},
+                    timeout=5,
+                    check=False,
+                )
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(b"ARGV_VALIDATION_REACHED_NEXT_GUARD\n", result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertNotIn(b"ARGV_VALIDATION_REACHED_NEXT_GUARD", result.stdout)
+                    self.assertIn(b"Usage:", result.stderr)
 
         recovery_start = live_user.index("recover_exact_state() {")
         recovery_end = live_user.index("\n}\n", recovery_start) + len("\n}\n")

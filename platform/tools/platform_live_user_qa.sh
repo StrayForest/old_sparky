@@ -53,14 +53,27 @@ if [[ -n "${PLATFORM_LIVE_CSP_ALLOW_LOOPBACK:-}" ]]; then
   echo "The production live-user QA wrapper does not permit loopback mode." >&2
   exit 1
 fi
-if (( $# != 0 )) && ! { (( $# == 1 )) \
-  && [[ "$1" == "recover-bundle" ]] \
-  || (( $# == 2 )) \
-  && [[ "$1" == "recover" || "$1" == "recover-setup" ]] \
-  && [[ "$2" == /* ]]; }; then
-  usage
-  exit 2
-fi
+case "$#" in
+  0)
+    ;;
+  1)
+    if [[ "$1" != "recover-bundle" ]]; then
+      usage
+      exit 2
+    fi
+    ;;
+  2)
+    if [[ "$1" != "recover" && "$1" != "recover-setup" ]] \
+      || [[ "$2" != /* ]]; then
+      usage
+      exit 2
+    fi
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
 if (( $# == 1 )) && [[ "$1" == "recover-bundle" && $TRUSTED_MODE != 1 ]]; then
   echo "Stale-bundle cleanup is available only from the active immutable live-QA payload." >&2
   exit 1
