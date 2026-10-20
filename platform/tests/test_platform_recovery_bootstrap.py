@@ -5464,6 +5464,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         pure_bootstrap_paths = sorted(
             RECOVERY_BOOTSTRAP_PATCH_FILES
             - {
+                "platform/tools/platform_live_qa_guard.py",
+                "platform/tools/platform_build_live_qa_runtime.py",
                 "platform/tools/platform_live_qa_runtime_install.py",
                 "platform/tools/platform_workflow_remote_dispatch.py",
                 "platform/tools/platform_production_deploy_supervisor.sh",
@@ -5570,6 +5572,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         derived_patch_files = (
             canonical - RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES
         ) | RECOVERY_BOOTSTRAP_PATCH_DOCS | {
+            "platform/tools/platform_live_qa_guard.py",
+            "platform/tools/platform_build_live_qa_runtime.py",
             "platform/tools/platform_production_deploy_supervisor.sh",
             "platform/tools/platform_live_qa_runtime_install.py",
             "platform/tools/platform_workflow_remote_dispatch.py",

@@ -231,7 +231,7 @@ trusted-push authority. The exact candidate allowlist is owned by the
 | Route/provenance | Expected gates | `fallback` | Production authority |
 | --- | --- | --- | --- |
 | known `docs-only` | `docs`, `verification-contract` | `false` | never deployable; auto-deploy is a successful no-op |
-| exact production host-tools provisioning ADR and recovery-bootstrap-only family | all first eight gates | `false` | non-deployable baseline reconcile; only a cumulative range with trusted application/runtime changes can enter the ordinary deploy route |
+| exact production host-tools provisioning ADR and recovery-bootstrap-only family, excluding the active LiveQA guard and runtime builder | all first eight gates | `false` | non-deployable baseline reconcile; active payload/runtime-builder fixes use the runtime-sensitive ordinary full route so a reviewed `dev` push builds and installs them |
 | known `out-of-scope` | `verification-contract` | `false` | never deployable; auto-deploy is a successful no-op |
 | known full candidate-packaging-only path set (candidate workflow/helper, contract test/catalog/verification updates and platform docs) | all first eight gates | `false` | never deployable; trusted pushes are successful CI-only no-ops |
 | exact storage-operations family (diagnostics/maintenance workflow or exact storage-retention skill, plus only its closed classifier/AUTO/recovery-workflow/tests/catalog set and docs) | all first eight gates plus runtime-sensitive gates | `false` | full verification, non-deployable; AUTO takes no-deploy; producer uploads an attested skip receipt; publisher checks exact producer/parent CI evidence and performs no host-bundle or marker action |
@@ -241,6 +241,11 @@ trusted-push authority. The exact candidate allowlist is owned by the
 Host-tools lifecycle files use full-route verification. The exact host-tools
 provisioning ADR is part of the recovery-bootstrap-only family so its enforced
 pin contract receives the full gate set; it remains non-deployable by itself.
+The active payload helper `platform/tools/platform_live_qa_guard.py` and the
+release artifact builder `platform/tools/platform_build_live_qa_runtime.py`
+are excluded from that family because their changes must reach a new immutable
+app release; their runtime-sensitive full routes require the exact runtime
+gates.
 Candidate-packaging-only changes remain non-deployable; a mixed application
 change follows its app path and may deploy on a trusted push. Host-only
 pin/bundle/bootstrap remain no-op.

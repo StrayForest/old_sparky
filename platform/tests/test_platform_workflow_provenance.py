@@ -906,13 +906,22 @@ class WorkflowProvenanceTests(unittest.TestCase):
             target_sha=self.SHA,
         )
         self.assertTrue(runtime_overlap_incremental["runtime_sensitive"])
-        runtime_overlap_no_op = classify_cumulative_baseline(
-            runtime_overlap_incremental,
-            [runtime_overlap_path],
+        self.assertTrue(runtime_overlap_incremental["deployable"])
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                runtime_overlap_incremental,
+                [runtime_overlap_path],
+                expected_target_sha=self.SHA,
+            )
+
+        runtime_overlap_promotion = classify_cumulative_baseline(
+            incremental,
+            [incremental_path, runtime_overlap_path],
             expected_target_sha=self.SHA,
         )
-        self.assertTrue(runtime_overlap_no_op["no_op"])
-        self.assertTrue(runtime_overlap_no_op["manifest"]["runtime_sensitive"])
+        self.assertFalse(runtime_overlap_promotion["no_op"])
+        self.assertTrue(runtime_overlap_promotion["manifest"]["deployable"])
+        self.assertTrue(runtime_overlap_promotion["manifest"]["runtime_sensitive"])
 
         candidate_installer = "platform/tools/platform_live_qa_runtime_install.py"
         installer_route = classify_cumulative_baseline(
