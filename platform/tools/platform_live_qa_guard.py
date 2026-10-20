@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import fcntl
 import grp
 import hashlib
@@ -141,6 +142,13 @@ MAX_JSON_BYTES = 64 * 1024
 MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES = 256 * 1024
 PROVIDER_RECOVERY_SOURCE_SHA = "19603dfff122386726313c86b0350812ebbe8cca"
 MAX_ACTIVE_MANIFEST_BYTES = 256 * 1024
+MAX_LIVE_QA_BUNDLE_AGE_SECONDS = 4 * 60 * 60
+MAX_LIVE_QA_BUNDLE_FUTURE_SKEW_SECONDS = 60
+LIVE_QA_EMAIL_RE = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9]"
+    r"(?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
 MAX_ZIP_ENTRIES = 20_000
 MAX_ZIP_MEMBER_BYTES = 768 * 1024 * 1024
 MAX_ZIP_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
@@ -204,6 +212,7 @@ PASSTHROUGH_ENV = frozenset(
         "PLATFORM_LIVE_QA_RUNNER_SHA",
         "PLATFORM_LIVE_QA_MARKER_SHA256",
         "PLATFORM_LIVE_USER_QA_MARKER",
+        "PLATFORM_RELEASE_LOCK_SUPERVISED",
         "PLAYWRIGHT_LIVE_BASE_URL",
     }
 )
@@ -495,7 +504,9 @@ def _read_private_json(
     finally:
         os.close(descriptor)
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        payload = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_strict_object
+        )
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise GuardError("private JSON is invalid") from exc
     if not isinstance(payload, dict):
@@ -971,6 +982,59 @@ def _validate_installed_payload_root(
     return source_sha
 
 
+def _assert_release_lock_supervisor() -> None:
+    """Require the actual canonical release-lock supervisor, not its env hint."""
+
+    install_root = os.environ.get("PLATFORM_LIVE_QA_INSTALL_ROOT", "")
+    target_sha = os.environ.get("PLATFORM_LIVE_QA_TARGET_SHA", "")
+    if (
+        not re.fullmatch(r"/root/\.oldsparky/liveqa/releases/[0-9a-f]{40}", install_root)
+        or target_sha != Path(install_root).name
+        or os.environ.get("PLATFORM_RELEASE_LOCK_SUPERVISED") != "1"
+    ):
+        raise GuardError("stale-bundle cleanup requires the canonical release lock")
+    helper = Path(install_root) / "platform/tools/platform_release_lock.sh"
+    _assert_root_controlled_path(helper, directory=False)
+    script = 'source "$1" && platform_release_lock_supervisor_holds'
+    try:
+        result = subprocess.run(  # nosec B603
+            ["/usr/bin/bash", "-c", script, "platform-release-lock-check", str(helper)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={
+                "HOME": "/root",
+                "LANG": "C.UTF-8",
+                "PATH": SAFE_PATH,
+                "PLATFORM_RELEASE_LOCK_SUPERVISED": "1",
+            },
+            close_fds=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GuardError("canonical release lock supervisor could not be checked") from exc
+    if result.returncode != 0:
+        raise GuardError("canonical release lock is not held by its supervisor")
+
+
+def _preflight_stale_bundle_recovery(
+    bundle_path: Path, *, lock_fd: int
+) -> None:
+    """Check stale-bundle eligibility under both locks before stale-runner cleanup."""
+
+    _assert_release_lock_supervisor()
+    assert_bundle_lock(bundle_path, lock_fd)
+    install_root = Path(os.environ.get("PLATFORM_LIVE_QA_INSTALL_ROOT", ""))
+    target_sha = os.environ.get("PLATFORM_LIVE_QA_TARGET_SHA", "")
+    _validated_stale_bundle_roster(
+        bundle_path,
+        platform_root=install_root / "platform",
+        target_sha=target_sha,
+    )
+    assert_no_recovery_state(bundle_path, include_manual=True)
+
+
 def _protected_release_commits(app_dir: Path = APP_DIR) -> frozenset[str]:
     commits = frozenset(
         {
@@ -1137,6 +1201,11 @@ def _validate_trusted_wrapper(argv: list[str], *, recovery: bool) -> None:
         raise GuardError("locked exec target is not a reviewed live QA wrapper")
     _assert_root_controlled_path(executable, directory=False)
     if recovery:
+        if (
+            executable.name == "platform_live_user_qa.sh"
+            and argv == [str(executable), "recover-bundle"]
+        ):
+            return
         if len(argv) != 3 or argv[1] not in {"recover", "recover-setup"}:
             raise GuardError("recovery locked exec arguments are invalid")
         if executable.name == "platform_live_browser_qa.sh" and argv[1] != "recover":
@@ -1366,9 +1435,21 @@ def recovery_locked_exec(bundle_path: Path, argv: list[str]) -> None:
     """Acquire the global lock before bounded stale-runner termination."""
 
     _validate_trusted_wrapper(argv, recovery=True)
+    stale_bundle_recovery = (
+        Path(argv[0]).name == "platform_live_user_qa.sh"
+        and argv == [argv[0], "recover-bundle"]
+    )
+    if stale_bundle_recovery:
+        # Do not let the recovery executor terminate a live QA child unless
+        # the caller is already inside the canonical app-release lock.
+        _assert_release_lock_supervisor()
     _validate_root_secret_parent(bundle_path)
     descriptor = _open_bundle_lock(bundle_path)
     try:
+        if stale_bundle_recovery:
+            _preflight_stale_bundle_recovery(
+                bundle_path, lock_fd=descriptor
+            )
         # Lock contention proves another reviewed operation is active. Never
         # terminate the dedicated cgroup/UID until this process owns the
         # machine-wide lock protecting that operation.
@@ -1563,11 +1644,108 @@ def _bundle_roster_ids(bundle_path: Path) -> tuple[str, tuple[str, ...]]:
     return marker, tuple(ids)
 
 
-def prepare_root_state(bundle_path: Path) -> Path:
-    marker, roster_ids = _bundle_roster_ids(bundle_path)
+def _validated_stale_bundle_roster(
+    bundle_path: Path, *, platform_root: Path, target_sha: str
+) -> tuple[str, tuple[str, ...]]:
+    """Validate the fixed expired bundle for exact roster-only cleanup."""
+
+    install_root = Path(os.environ.get("PLATFORM_LIVE_QA_INSTALL_ROOT", ""))
+    if (
+        bundle_path != TRUSTED_SECRET_ROOT / "csp-live-qa.json"
+        or platform_root != install_root / "platform"
+        or install_root != TRUSTED_PAYLOAD_ROOT / target_sha
+        or target_sha != install_root.name
+        or os.environ.get("PLATFORM_LIVE_QA_TARGET_SHA") != target_sha
+        or os.environ.get("PLATFORM_APP_DIR") != str(APP_DIR)
+        or os.environ.get("PLATFORM_LIVE_CSP_QA_BUNDLE") != str(bundle_path)
+    ):
+        raise GuardError("stale-bundle cleanup target is not the fixed active payload")
+    _validate_installed_payload_root(install_root, target_sha=target_sha)
+    if _active_release_commit() != target_sha:
+        raise GuardError("stale-bundle cleanup target is not the active app release")
+
+    marker, helper = _bundle_marker_and_helper(bundle_path)
+    expected_helper = TRUSTED_SECRET_ROOT / "platform_live_qa_mailbox_helper.py"
+    if helper != expected_helper:
+        raise GuardError("stale bundle mailbox helper is not the active fixed helper")
+    verify_helper_binding(platform_root=platform_root, installed_helper=helper)
+
+    payload = _read_private_json(bundle_path)
+    created_at = payload.get("created_at")
+    if (
+        not isinstance(created_at, str)
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", created_at) is None
+    ):
+        raise GuardError("stale bundle timestamp is invalid")
+    try:
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise GuardError("stale bundle timestamp is invalid") from exc
+    if created.tzinfo is None:
+        raise GuardError("stale bundle timestamp is invalid")
+    age_seconds = (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds()
+    if age_seconds < -MAX_LIVE_QA_BUNDLE_FUTURE_SKEW_SECONDS:
+        raise GuardError("stale bundle timestamp is in the future")
+    if age_seconds <= MAX_LIVE_QA_BUNDLE_AGE_SECONDS:
+        raise GuardError("live QA bundle is still within its normal freshness window")
+
+    def validate_password(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and 10 <= len(value) <= 128
+            and all(ord(character) >= 32 and ord(character) != 127 for character in value)
+        )
+
+    top_email = payload.get("email")
+    if (
+        not isinstance(top_email, str)
+        or not top_email.isascii()
+        or len(top_email) > 254
+        or LIVE_QA_EMAIL_RE.fullmatch(top_email) is None
+        or top_email.rsplit("@", 1)[1].lower() != "auth.old-sparky.com"
+        or marker in top_email.lower()
+        or not validate_password(payload.get("password"))
+    ):
+        raise GuardError("stale bundle credential schema is invalid")
+
+    accounts = payload.get("roster_accounts")
+    if not isinstance(accounts, list) or len(accounts) != 13:
+        raise GuardError("stale bundle roster schema is invalid")
+    ids: list[str] = []
+    emails: set[str] = set()
+    for account in accounts:
+        if not isinstance(account, dict) or set(account) != {"id", "email", "password"}:
+            raise GuardError("stale bundle roster account schema is invalid")
+        account_id = account.get("id")
+        account_email = account.get("email")
+        if (
+            not isinstance(account_id, str)
+            or UUID_PATTERN.fullmatch(account_id) is None
+            or str(UUID(account_id)) != account_id
+            or not isinstance(account_email, str)
+            or not account_email.isascii()
+            or len(account_email) > 254
+            or LIVE_QA_EMAIL_RE.fullmatch(account_email) is None
+            or account_email.rsplit("@", 1)[1].lower() != "auth.old-sparky.com"
+            or account_email.lower().count(marker) != 1
+            or account_email in emails
+            or not validate_password(account.get("password"))
+        ):
+            raise GuardError("stale bundle roster account is invalid")
+        ids.append(account_id)
+        emails.add(account_email)
+    if len(set(ids)) != 13:
+        raise GuardError("stale bundle roster IDs are not unique")
+    return marker, tuple(ids)
+
+
+def _publish_root_state(
+    bundle_path: Path, *, marker: str, roster_ids: tuple[str, ...]
+) -> Path:
     parent = bundle_path.parent
     stage = parent / f".live-user-qa.setup-{uuid4().hex}"
     final: Path | None = None
+    stage_identity: tuple[int, int] | None = None
     try:
         stage.mkdir(mode=0o700)
         os.chown(stage, 0, 0)
@@ -1603,6 +1781,8 @@ def prepare_root_state(bundle_path: Path) -> Path:
             phase_path,
             _phase_payload(marker=marker, phase=STATE_PHASE_ROOT),
         )
+        stage_stat = stage.lstat()
+        stage_identity = (stage_stat.st_dev, stage_stat.st_ino)
         os.rename(stage, final)
         _sync_directory(parent)
         validate_root_state(bundle_path, final)
@@ -1618,7 +1798,46 @@ def prepare_root_state(bundle_path: Path) -> Path:
                 # An interrupted publication is intentionally retained for the
                 # explicit setup-recovery command.
                 pass
+        if final is not None and stage_identity is not None:
+            try:
+                retained = final.lstat()
+                if (
+                    stat.S_ISDIR(retained.st_mode)
+                    and (retained.st_dev, retained.st_ino) == stage_identity
+                ):
+                    print(
+                        f"Live QA root state retained at: {final}",
+                        file=sys.stderr,
+                    )
+            except OSError:
+                # Do not replace the original publication failure with a
+                # secondary diagnostic error or claim an unverified path.
+                pass
         raise
+
+
+def prepare_root_state(bundle_path: Path) -> Path:
+    marker, roster_ids = _bundle_roster_ids(bundle_path)
+    return _publish_root_state(bundle_path, marker=marker, roster_ids=roster_ids)
+
+
+def prepare_stale_bundle_cleanup_state(
+    bundle_path: Path,
+    *,
+    platform_root: Path,
+    target_sha: str,
+    lock_fd: int,
+) -> Path:
+    """Create only the exact bundle-derived inventory for stale roster cleanup."""
+
+    _assert_release_lock_supervisor()
+    assert_bundle_lock(bundle_path, lock_fd)
+    marker, roster_ids = _validated_stale_bundle_roster(
+        bundle_path, platform_root=platform_root, target_sha=target_sha
+    )
+    assert_no_recovery_state(bundle_path, include_manual=True)
+    assert_liveqa_idle()
+    return _publish_root_state(bundle_path, marker=marker, roster_ids=roster_ids)
 
 
 def remove_setup_state(bundle_path: Path, setup_dir: Path) -> None:
@@ -5497,6 +5716,13 @@ def _parser() -> argparse.ArgumentParser:
     recovery_locked = commands.add_parser("recovery-locked-exec")
     recovery_locked.add_argument("--bundle-path", type=Path, required=True)
     recovery_locked.add_argument("argv", nargs=argparse.REMAINDER)
+    prepare_stale_cleanup = commands.add_parser(
+        "prepare-stale-bundle-cleanup-state"
+    )
+    prepare_stale_cleanup.add_argument("--bundle-path", type=Path, required=True)
+    prepare_stale_cleanup.add_argument("--platform-root", type=Path, required=True)
+    prepare_stale_cleanup.add_argument("--target-sha", required=True)
+    prepare_stale_cleanup.add_argument("--fd", type=int, required=True)
     asserted = commands.add_parser("assert-lock")
     asserted.add_argument("--bundle-path", type=Path, required=True)
     asserted.add_argument("--fd", type=int, required=True)
@@ -5607,6 +5833,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             if command and command[0] == "--":
                 command = command[1:]
             recovery_locked_exec(args.bundle_path, command)
+        if args.command == "prepare-stale-bundle-cleanup-state":
+            print(
+                prepare_stale_bundle_cleanup_state(
+                    args.bundle_path,
+                    platform_root=args.platform_root,
+                    target_sha=args.target_sha,
+                    lock_fd=args.fd,
+                )
+            )
+            return 0
         if args.command == "assert-lock":
             assert_bundle_lock(args.bundle_path, args.fd)
         elif args.command == "verify-provenance":

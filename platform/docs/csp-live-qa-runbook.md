@@ -404,16 +404,16 @@ platform/tools/platform_live_user_qa.sh recover \
   /root/.oldsparky/liveqa/live-user-qa.<exact-suffix>
 ```
 
-Recovery takes the same per-bundle lock, validates the root-owned `0700`
-directory and `0600` inventory/session files, and creates no replacement
-state. If the browser committed its one marker-description tournament before
-recording the ID, recovery resolves at most that one exact row, validates its
-owner and complete graph, atomically appends the exact ID, then invokes normal
-exact cleanup. It unlinks retained files only after the cleanup absence proof.
+Recovery uses the same per-bundle lock and validates its exact root-owned state.
+If the browser committed one marker tournament without recording its ID,
+recovery resolves only that row after owner/graph validation; exact cleanup must
+prove absence before retained state is removed. For a stale bundle with its
+13-account roster still present, use the separate [stale-bundle recovery
+procedure](liveqa-stale-bundle-recovery.md); it runs only from the active
+immutable QA payload under both canonical locks.
 
-All provision, public-browser, automated, manual and recovery commands share
-one machine-wide nonblocking lock. If SIGKILL interrupts the atomic state setup
-before publication, remove only the retained path after validation:
+All QA commands share one machine-wide nonblocking lock. If SIGKILL interrupts
+setup, remove only the retained path after validation:
 
 ```bash
 platform/tools/platform_live_user_qa.sh recover-setup \

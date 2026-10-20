@@ -31,6 +31,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Report-only failed-deployment recovery | [Recovery bootstrap ADR](adr/recovery-bootstrap-retained-abort.md#operator-recovery-deployment-for-a-report-only-invalid-marker) and [deployment runbook](deployment-runbook.md#manual-workflow-fallback) |
 | Test-suite ownership and CI/live runners | [Test-suite governance](test-suite-governance.md) |
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
+| Cleanup of an expired exact LiveQA bundle roster | [Stale LiveQA bundle recovery](liveqa-stale-bundle-recovery.md) |
 | Missing immutable LiveQA engine provider | [Provider recovery runbook](liveqa-provider-recovery.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |
 | Named backup-pair rotation and rollback | [Named backup retention](backup-retention-protection.md) |
