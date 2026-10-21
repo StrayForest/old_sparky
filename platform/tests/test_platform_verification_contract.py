@@ -2826,8 +2826,51 @@ except lock.VerificationLockError as exc:
         self.assertNotIn("RUNNER_TEMP/platform-verification-runtime", workflow)
         self.assertNotIn("PLATFORM_VERIFICATION_RUNTIME_DIR", workflow)
         self.assertNotIn("sudo install -d", workflow)
-        self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 3)
+        self.assertNotIn("sudo -EH env XDG_RUNTIME_DIR= bash -lc", workflow)
         workflow_data = yaml.safe_load(workflow)
+        self.assertEqual(workflow_data["jobs"]["backend-static"]["runs-on"], "ubuntu-24.04")
+        self.assertEqual(workflow_data["jobs"]["backend-integration"]["runs-on"], "ubuntu-24.04")
+        self.assertEqual(workflow_data["jobs"]["release-runtime"]["runs-on"], "ubuntu-24.04")
+        self.assertEqual(workflow_data["jobs"]["release-runtime-real"]["runs-on"], "ubuntu-24.04")
+        integration_steps = workflow_data["jobs"]["backend-integration"]["steps"]
+        for step_name in (
+            "Migrate isolated CI database",
+            "Run serial backend integration contour exactly once",
+        ):
+            step = next(item for item in integration_steps if item.get("name") == step_name)
+            command = step["run"]
+            self.assertIn("sudo -n env -i", command)
+            self.assertNotIn("sudo -E", command)
+            self.assertNotIn("bash -lc", command)
+            for fixed_value in (
+                "PLATFORM_ENVIRONMENT=test",
+                "PLATFORM_DB_SCHEMA=platform",
+                "PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
+                "PLATFORM_SECRET_KEY=ci-only-secret-key-with-at-least-32-characters",
+                "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15",
+                "PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13",
+                "PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14",
+            ):
+                self.assertIn(fixed_value, command)
+        release_runtime_step = next(
+            item
+            for item in workflow_data["jobs"]["release-runtime"]["steps"]
+            if item.get("name") == "Run conditional canonical release runtime gate"
+        )
+        release_runtime_command = release_runtime_step["run"]
+        self.assertIn("sudo -n env -i", release_runtime_command)
+        self.assertNotIn("sudo -E", release_runtime_command)
+        self.assertNotIn("bash -lc", release_runtime_command)
+        for fixed_value in (
+            "PLATFORM_ENVIRONMENT=test",
+            "PLATFORM_DB_SCHEMA=platform",
+            "PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
+            "PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials",
+            "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15",
+            "PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13",
+            "PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14",
+        ):
+            self.assertIn(fixed_value, release_runtime_command)
         privileged_job = workflow_data["jobs"]["backend-privileged"]
         for step_name in (
             "Run serial privileged catalog contour exactly once as root",

@@ -573,7 +573,7 @@ jobs:
     name: Backend DB-free contours
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
     if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
       PLATFORM_ENVIRONMENT: test
@@ -623,7 +623,7 @@ jobs:
     name: Backend PostgreSQL and Redis integration
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
     if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       postgres:
@@ -674,12 +674,34 @@ jobs:
             "$GITHUB_WORKSPACE/platform/tools/platform_verification_lock.py" --provision
       - name: Migrate isolated CI database
         run: >-
-          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          sudo -n env -i
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
+          GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" CI=true
+          PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
+          PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+          PLATFORM_SECRET_KEY=ci-only-secret-key-with-at-least-32-characters
+          PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
+          PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
+          PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+          /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' &&
           /usr/bin/timeout --foreground --signal=TERM --kill-after=10s 180s
           .venv_platform/bin/python -m alembic upgrade head"
       - name: Run serial backend integration contour exactly once
         run: >-
-          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          sudo -n env -i
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
+          GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" CI=true
+          PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
+          PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+          PLATFORM_SECRET_KEY=ci-only-secret-key-with-at-least-32-characters
+          PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
+          PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
+          PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+          /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' &&
           .venv_platform/bin/python tools/platform_verify.py backend-integration
           --manifest ci-backend/backend-integration/manifest.json
           --summary ci-backend/backend-integration/summary.json --quiet"
@@ -794,7 +816,7 @@ jobs:
           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
           HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
           GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
-          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" CI=true
           PLATFORM_SCRATCH_BACKEND="$PLATFORM_SCRATCH_BACKEND"
           PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
           PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
@@ -1278,7 +1300,7 @@ jobs:
         inputs.proof_mode != 'baseline-runtime' ||
         needs.baseline-runtime-guard.result == 'success'
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       redis:
@@ -1320,8 +1342,19 @@ jobs:
             "$GITHUB_WORKSPACE/platform/tools/platform_verification_lock.py" --provision
       - name: Run conditional canonical release runtime gate
         run: >-
-          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
-          .venv_platform/bin/python tools/platform_verify.py release-runtime"
+          sudo -n env -i
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
+          GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
+          PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+          PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials
+          PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
+          PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
+          PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+          "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python"
+          "${GITHUB_WORKSPACE}"/platform/tools/platform_verify.py release-runtime
 
   release-runtime-real:
     name: Trusted dev immutable release runtime
@@ -1348,7 +1381,7 @@ jobs:
       needs.classifier.outputs.class == 'full' &&
       needs.classifier.outputs.deployable == 'true') ||
       (inputs.proof_mode == 'baseline-runtime' && needs.baseline-runtime-guard.result == 'success'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read

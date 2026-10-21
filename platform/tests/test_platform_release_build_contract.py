@@ -6095,7 +6095,7 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn("runtime_sensitive", workflow)
         self.assertIn("platform_verify.py release-runtime", workflow)
         self.assertIn("runs-on: ubuntu-24.04", privileged)
-        self.assertIn("runs-on: ubuntu-latest", integration)
+        self.assertIn("runs-on: ubuntu-24.04", integration)
         self.assertIn("Check isolated synthetic PostgreSQL 16 prerequisites", privileged)
         self.assertIn('pg_config_path="$(command -v pg_config)"', privileged)
         self.assertIn('pg_config_version="$("$pg_config_path" --version)"', privileged)
