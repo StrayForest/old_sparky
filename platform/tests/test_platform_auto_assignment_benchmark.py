@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
+from python_packages.platform_domain.deadlock import constants
 from tools.platform_auto_assignment_benchmark import (
     DEFAULT_TEAM_COUNTS,
     EXPECTED_SNAPSHOT_DIGESTS,
@@ -58,6 +60,17 @@ class PlatformAutoAssignmentBenchmarkTests(unittest.TestCase):
 
     def test_default_team_counts_avoid_expensive_capacity_scenarios(self) -> None:
         self.assertEqual(DEFAULT_TEAM_COUNTS, (2, 4, 8, 16))
+
+    def test_benchmark_fixture_does_not_follow_live_hero_roster_edits(self) -> None:
+        expected = build_fixture(4)
+        changed_roster = ["Future Hero", *constants.POOL_LIST, "Another Future Hero"]
+
+        with patch(
+            "tools.platform_auto_assignment_benchmark.POOL_LIST",
+            changed_roster,
+            create=True,
+        ):
+            self.assertEqual(build_fixture(4), expected)
 
     def test_memory_measurement_can_be_skipped(self) -> None:
         result = benchmark_fixture(

@@ -14,13 +14,54 @@ from python_packages.platform_domain.deadlock import AutoAssignmentEngine
 from python_packages.platform_domain.deadlock.captain_round import TEAM_COUNT_CHOICES
 from python_packages.platform_domain.deadlock.constants import (
     PLAYTIME_OPTIONS,
-    POOL_LIST,
     RANKS,
     ROLE_OPTIONS,
 )
 
 READY_PLAYERS_PER_TEAM = 6
 DEFAULT_TEAM_COUNTS = (2, 4, 8, 16)
+# Keep generated benchmark input stable when the live hero roster changes.
+# Updating this fixture requires an intentional golden snapshot review.
+BENCHMARK_POOL_LIST = (
+    "Abrams",
+    "Apollo",
+    "Bebop",
+    "Billy",
+    "Calico",
+    "Celeste",
+    "The Doorman",
+    "Drifter",
+    "Dynamo",
+    "Graves",
+    "Grey Talon",
+    "Haze",
+    "Holliday",
+    "Infernus",
+    "Ivy",
+    "Kelvin",
+    "Lady Geist",
+    "Lash",
+    "McGinnis",
+    "Mina",
+    "Mirage",
+    "Mo & Krill",
+    "Paradox",
+    "Paige",
+    "Pocket",
+    "Rem",
+    "Seven",
+    "Shiv",
+    "Silver",
+    "Sinclair",
+    "Venator",
+    "Victor",
+    "Vindicta",
+    "Viscous",
+    "Vyper",
+    "Warden",
+    "Wraith",
+    "Yamato",
+)
 EXPECTED_SNAPSHOT_DIGESTS = {
     2: "aac8e48cc451a749362191d6d846f9e97a8fedc149312dfa236b200d53ea5005",
     4: "f3ea4c8428eee173683a8b84f985219507d17d1e9d711c1654f2927578b1273a",
@@ -122,15 +163,19 @@ def build_fixture(teams_count: int) -> BenchmarkFixture:
         )
         for slot_number in range(1, READY_PLAYERS_PER_TEAM + 1):
             role_index = (team_index + slot_number - 1) % len(ROLE_OPTIONS)
-            hero_index = (team_index * READY_PLAYERS_PER_TEAM + slot_number) % len(POOL_LIST)
+            hero_index = (
+                team_index * READY_PLAYERS_PER_TEAM + slot_number
+            ) % len(BENCHMARK_POOL_LIST)
             dream_slot_rows.append(
                 {
                     "team_id": team_id,
                     "slot_number": slot_number,
                     "allowed_roles": [ROLE_OPTIONS[role_index]],
                     "desired_heroes": [
-                        POOL_LIST[hero_index],
-                        POOL_LIST[(hero_index + teams_count + 1) % len(POOL_LIST)],
+                        BENCHMARK_POOL_LIST[hero_index],
+                        BENCHMARK_POOL_LIST[
+                            (hero_index + teams_count + 1) % len(BENCHMARK_POOL_LIST)
+                        ],
                     ],
                 }
             )
@@ -158,7 +203,7 @@ def _player_row(
     team_id: str | None = None,
 ) -> dict[str, Any]:
     role_index = player_index % len(ROLE_OPTIONS)
-    hero_index = (player_index * 3) % len(POOL_LIST)
+    hero_index = (player_index * 3) % len(BENCHMARK_POOL_LIST)
     row: dict[str, Any] = {
         "user_id": user_id,
         "username": user_id,
@@ -166,9 +211,9 @@ def _player_row(
         "subrank": (player_index % 6) + 1,
         "playtime": PLAYTIME_OPTIONS[player_index % len(PLAYTIME_OPTIONS)],
         "pool": [
-            POOL_LIST[hero_index],
-            POOL_LIST[(hero_index + 7) % len(POOL_LIST)],
-            POOL_LIST[(hero_index + 17) % len(POOL_LIST)],
+            BENCHMARK_POOL_LIST[hero_index],
+            BENCHMARK_POOL_LIST[(hero_index + 7) % len(BENCHMARK_POOL_LIST)],
+            BENCHMARK_POOL_LIST[(hero_index + 17) % len(BENCHMARK_POOL_LIST)],
         ],
         "roles": [
             ROLE_OPTIONS[role_index],

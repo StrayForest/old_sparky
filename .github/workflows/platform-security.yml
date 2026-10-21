@@ -679,12 +679,12 @@ jobs:
           HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
           GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" CI=true
-          PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
-          PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
-          PLATFORM_SECRET_KEY=ci-only-secret-key-with-at-least-32-characters
-          PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
-          PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
-          PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+          PLATFORM_ENVIRONMENT="$PLATFORM_ENVIRONMENT" PLATFORM_DB_SCHEMA="$PLATFORM_DB_SCHEMA"
+          PLATFORM_DATABASE_URL="${PLATFORM_DATABASE_URL}"
+          PLATFORM_SECRET_KEY="${PLATFORM_SECRET_KEY}"
+          PLATFORM_REDIS_URL="$PLATFORM_REDIS_URL"
+          PLATFORM_CELERY_BROKER_URL="$PLATFORM_CELERY_BROKER_URL"
+          PLATFORM_CELERY_RESULT_BACKEND="$PLATFORM_CELERY_RESULT_BACKEND"
           /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' &&
           /usr/bin/timeout --foreground --signal=TERM --kill-after=10s 180s
           .venv_platform/bin/python -m alembic upgrade head"
@@ -695,12 +695,12 @@ jobs:
           HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
           GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" CI=true
-          PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
-          PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
-          PLATFORM_SECRET_KEY=ci-only-secret-key-with-at-least-32-characters
-          PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
-          PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
-          PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+          PLATFORM_ENVIRONMENT="$PLATFORM_ENVIRONMENT" PLATFORM_DB_SCHEMA="$PLATFORM_DB_SCHEMA"
+          PLATFORM_DATABASE_URL="${PLATFORM_DATABASE_URL}"
+          PLATFORM_SECRET_KEY="${PLATFORM_SECRET_KEY}"
+          PLATFORM_REDIS_URL="$PLATFORM_REDIS_URL"
+          PLATFORM_CELERY_BROKER_URL="$PLATFORM_CELERY_BROKER_URL"
+          PLATFORM_CELERY_RESULT_BACKEND="$PLATFORM_CELERY_RESULT_BACKEND"
           /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' &&
           .venv_platform/bin/python tools/platform_verify.py backend-integration
           --manifest ci-backend/backend-integration/manifest.json
@@ -818,12 +818,11 @@ jobs:
           GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" CI=true
           PLATFORM_SCRATCH_BACKEND="$PLATFORM_SCRATCH_BACKEND"
-          PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
-          PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
-          PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials
-          PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
-          PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
-          PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+          PLATFORM_ENVIRONMENT="$PLATFORM_ENVIRONMENT" PLATFORM_DB_SCHEMA="$PLATFORM_DB_SCHEMA"
+          PLATFORM_DATABASE_URL="${PLATFORM_DATABASE_URL}" PLATFORM_SECRET_KEY="${PLATFORM_SECRET_KEY}"
+          PLATFORM_REDIS_URL="$PLATFORM_REDIS_URL"
+          PLATFORM_CELERY_BROKER_URL="$PLATFORM_CELERY_BROKER_URL"
+          PLATFORM_CELERY_RESULT_BACKEND="$PLATFORM_CELERY_RESULT_BACKEND"
           /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' &&
           .venv_platform/bin/python tools/platform_test_runner.py --contour backend-privileged
           --focused tests.test_platform_backup_restore_drill.PlatformBackupRestoreDrillTests.test_synthetic_pg16_restore_diagnostic_under_root"
@@ -845,12 +844,11 @@ jobs:
           GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
           PLATFORM_SCRATCH_BACKEND="$PLATFORM_SCRATCH_BACKEND"
-          PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
-          PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
-          PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials
-          PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
-          PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
-          PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+          PLATFORM_ENVIRONMENT="$PLATFORM_ENVIRONMENT" PLATFORM_DB_SCHEMA="$PLATFORM_DB_SCHEMA"
+          PLATFORM_DATABASE_URL="${PLATFORM_DATABASE_URL}" PLATFORM_SECRET_KEY="${PLATFORM_SECRET_KEY}"
+          PLATFORM_REDIS_URL="$PLATFORM_REDIS_URL"
+          PLATFORM_CELERY_BROKER_URL="$PLATFORM_CELERY_BROKER_URL"
+          PLATFORM_CELERY_RESULT_BACKEND="$PLATFORM_CELERY_RESULT_BACKEND"
           /bin/bash -c "cd '$GITHUB_WORKSPACE/platform' &&
           .venv_platform/bin/python tools/platform_verify.py backend-privileged
           --manifest ci-backend/backend-privileged/manifest.json
@@ -1347,12 +1345,11 @@ jobs:
           HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR= PYTHONDONTWRITEBYTECODE=1
           GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" RUNNER_OS="$RUNNER_OS"
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
-          PLATFORM_ENVIRONMENT=test PLATFORM_DB_SCHEMA=platform
-          PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
-          PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials
-          PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15
-          PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13
-          PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
+          PLATFORM_ENVIRONMENT="$PLATFORM_ENVIRONMENT" PLATFORM_DB_SCHEMA="$PLATFORM_DB_SCHEMA"
+          PLATFORM_DATABASE_URL="${PLATFORM_DATABASE_URL}" PLATFORM_SECRET_KEY="${PLATFORM_SECRET_KEY}"
+          PLATFORM_REDIS_URL="$PLATFORM_REDIS_URL"
+          PLATFORM_CELERY_BROKER_URL="$PLATFORM_CELERY_BROKER_URL"
+          PLATFORM_CELERY_RESULT_BACKEND="$PLATFORM_CELERY_RESULT_BACKEND"
           "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python"
           "${GITHUB_WORKSPACE}"/platform/tools/platform_verify.py release-runtime
 

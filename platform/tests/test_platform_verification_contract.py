@@ -2833,6 +2833,18 @@ except lock.VerificationLockError as exc:
         self.assertEqual(workflow_data["jobs"]["release-runtime"]["runs-on"], "ubuntu-24.04")
         self.assertEqual(workflow_data["jobs"]["release-runtime-real"]["runs-on"], "ubuntu-24.04")
         integration_steps = workflow_data["jobs"]["backend-integration"]["steps"]
+        self.assertEqual(
+            workflow_data["jobs"]["backend-integration"]["env"],
+            {
+                "PLATFORM_ENVIRONMENT": "test",
+                "PLATFORM_DATABASE_URL": "postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
+                "PLATFORM_DB_SCHEMA": "platform",
+                "PLATFORM_SECRET_KEY": "ci-only-secret-key-with-at-least-32-characters",
+                "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+                "PLATFORM_CELERY_BROKER_URL": "redis://127.0.0.1:6379/13",
+                "PLATFORM_CELERY_RESULT_BACKEND": "redis://127.0.0.1:6379/14",
+            },
+        )
         for step_name in (
             "Migrate isolated CI database",
             "Run serial backend integration contour exactly once",
@@ -2842,16 +2854,28 @@ except lock.VerificationLockError as exc:
             self.assertIn("sudo -n env -i", command)
             self.assertNotIn("sudo -E", command)
             self.assertNotIn("bash -lc", command)
-            for fixed_value in (
-                "PLATFORM_ENVIRONMENT=test",
-                "PLATFORM_DB_SCHEMA=platform",
-                "PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
-                "PLATFORM_SECRET_KEY=ci-only-secret-key-with-at-least-32-characters",
-                "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15",
-                "PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13",
-                "PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14",
+            for env_reference in (
+                'PLATFORM_ENVIRONMENT="$PLATFORM_ENVIRONMENT"',
+                'PLATFORM_DB_SCHEMA="$PLATFORM_DB_SCHEMA"',
+                'PLATFORM_DATABASE_URL="${PLATFORM_DATABASE_URL}"',
+                'PLATFORM_SECRET_KEY="${PLATFORM_SECRET_KEY}"',
+                'PLATFORM_REDIS_URL="$PLATFORM_REDIS_URL"',
+                'PLATFORM_CELERY_BROKER_URL="$PLATFORM_CELERY_BROKER_URL"',
+                'PLATFORM_CELERY_RESULT_BACKEND="$PLATFORM_CELERY_RESULT_BACKEND"',
             ):
-                self.assertIn(fixed_value, command)
+                self.assertIn(env_reference, command)
+        self.assertEqual(
+            workflow_data["jobs"]["release-runtime"]["env"],
+            {
+                "PLATFORM_ENVIRONMENT": "test",
+                "PLATFORM_DATABASE_URL": "postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
+                "PLATFORM_DB_SCHEMA": "platform",
+                "PLATFORM_SECRET_KEY": "ci-only-release-runtime-test-secret",
+                "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+                "PLATFORM_CELERY_BROKER_URL": "redis://127.0.0.1:6379/13",
+                "PLATFORM_CELERY_RESULT_BACKEND": "redis://127.0.0.1:6379/14",
+            },
+        )
         release_runtime_step = next(
             item
             for item in workflow_data["jobs"]["release-runtime"]["steps"]
@@ -2861,17 +2885,29 @@ except lock.VerificationLockError as exc:
         self.assertIn("sudo -n env -i", release_runtime_command)
         self.assertNotIn("sudo -E", release_runtime_command)
         self.assertNotIn("bash -lc", release_runtime_command)
-        for fixed_value in (
-            "PLATFORM_ENVIRONMENT=test",
-            "PLATFORM_DB_SCHEMA=platform",
-            "PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
-            "PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials",
-            "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15",
-            "PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13",
-            "PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14",
+        for env_reference in (
+            'PLATFORM_ENVIRONMENT="$PLATFORM_ENVIRONMENT"',
+            'PLATFORM_DB_SCHEMA="$PLATFORM_DB_SCHEMA"',
+            'PLATFORM_DATABASE_URL="${PLATFORM_DATABASE_URL}"',
+            'PLATFORM_SECRET_KEY="${PLATFORM_SECRET_KEY}"',
+            'PLATFORM_REDIS_URL="$PLATFORM_REDIS_URL"',
+            'PLATFORM_CELERY_BROKER_URL="$PLATFORM_CELERY_BROKER_URL"',
+            'PLATFORM_CELERY_RESULT_BACKEND="$PLATFORM_CELERY_RESULT_BACKEND"',
         ):
-            self.assertIn(fixed_value, release_runtime_command)
+            self.assertIn(env_reference, release_runtime_command)
         privileged_job = workflow_data["jobs"]["backend-privileged"]
+        self.assertEqual(
+            privileged_job["env"],
+            {
+                "PLATFORM_ENVIRONMENT": "test",
+                "PLATFORM_DATABASE_URL": "postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
+                "PLATFORM_DB_SCHEMA": "platform",
+                "PLATFORM_SECRET_KEY": "example-ci-privileged-test-secret-no-production-credentials",
+                "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+                "PLATFORM_CELERY_BROKER_URL": "redis://127.0.0.1:6379/13",
+                "PLATFORM_CELERY_RESULT_BACKEND": "redis://127.0.0.1:6379/14",
+            },
+        )
         for step_name in (
             "Run serial privileged catalog contour exactly once as root",
         ):
@@ -2891,16 +2927,16 @@ except lock.VerificationLockError as exc:
                 'RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"',
             ):
                 self.assertIn(identity, command)
-            for fixed_value in (
-                "PLATFORM_ENVIRONMENT=test",
-                "PLATFORM_DB_SCHEMA=platform",
-                "PLATFORM_DATABASE_URL=postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
-                "PLATFORM_SECRET_KEY=example-ci-privileged-test-secret-no-production-credentials",
-                "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15",
-                "PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13",
-                "PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14",
+            for env_reference in (
+                'PLATFORM_ENVIRONMENT="$PLATFORM_ENVIRONMENT"',
+                'PLATFORM_DB_SCHEMA="$PLATFORM_DB_SCHEMA"',
+                'PLATFORM_DATABASE_URL="${PLATFORM_DATABASE_URL}"',
+                'PLATFORM_SECRET_KEY="${PLATFORM_SECRET_KEY}"',
+                'PLATFORM_REDIS_URL="$PLATFORM_REDIS_URL"',
+                'PLATFORM_CELERY_BROKER_URL="$PLATFORM_CELERY_BROKER_URL"',
+                'PLATFORM_CELERY_RESULT_BACKEND="$PLATFORM_CELERY_RESULT_BACKEND"',
             ):
-                self.assertIn(fixed_value, command)
+                self.assertIn(env_reference, command)
         verification_block = re.search(
             r"^  verification-contract:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
             workflow,
