@@ -166,9 +166,11 @@ jobs:
           platform/.venv_draft_assets/bin/python -m pip install \
             --require-hashes \
             -r platform/apps/platform_draft/requirements-assets.lock.txt
-          cd platform
-          .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
-            --output-dir "$bundle/heroes"
+          (
+            cd platform
+            .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
+              --output-dir "$bundle/heroes"
+          )
           /usr/bin/python3 - "$bundle" "$TARGET_SHA" <<'PY'
           import hashlib
           import json
