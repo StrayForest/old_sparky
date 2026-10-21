@@ -2842,6 +2842,28 @@ jobs:
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)"
 
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Resolve trusted setup-python 3.12 for the release builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          selected_python="$(command -v python)"
+          resolved_python="$(readlink -f -- "$selected_python")"
+          tool_cache="$(readlink -f -- "$RUNNER_TOOL_CACHE")"
+          case "$resolved_python" in
+            "$tool_cache"/Python/3.12.*/*/bin/python3.12) ;;
+            *) echo "setup-python did not resolve to the trusted Python 3.12 tool cache" >&2; exit 1 ;;
+          esac
+          python_contract="$("$resolved_python" -I -c 'import platform,sys; print(f"{sys.version_info[0]}.{sys.version_info[1]} {sys.platform} {platform.machine()}")')"
+          [[ "$python_contract" == "3.12 linux x86_64" ]] || {
+            echo "setup-python release builder target is unsupported" >&2
+            exit 1
+          }
+          printf 'PLATFORM_RELEASE_PYTHON=%s\n' "$resolved_python" >>"$GITHUB_ENV"
+
       - name: Build immutable release artifact in CI
         shell: bash
         run: |
@@ -2851,12 +2873,70 @@ jobs:
           sudo install -d -o root -g root -m 0755 "$ci_build_root"
           sudo cp -a "$GITHUB_WORKSPACE/." "$ci_build_root/"
           sudo chown -R root:root "$ci_build_root"
+          runtime_tool_cache="$(readlink -f -- "$RUNNER_TOOL_CACHE")"
+          source_python="${PLATFORM_RELEASE_PYTHON:-}"
+          source_python_real="$(readlink -f -- "$source_python")"
+          case "$source_python_real" in
+            "$runtime_tool_cache"/Python/3.12.*/*/bin/python3.12) ;;
+            *) echo "Release builder Python source is invalid." >&2; exit 1 ;;
+          esac
+          source_python_contract="$("$source_python_real" -I -c 'import platform,sys; print(f"{sys.version_info[0]}.{sys.version_info[1]} {sys.platform} {platform.machine()}")')"
+          [[ "$source_python_contract" == "3.12 linux x86_64" ]] || {
+            echo "Release builder Python source is unsupported." >&2
+            exit 1
+          }
+          source_python_prefix="${source_python_real%/bin/python3.12}"
+          root_python_prefix="$ci_build_root/python-runtime"
+          sudo install -d -o root -g root -m 0700 "$root_python_prefix"
+          sudo cp -a "$source_python_prefix/." "$root_python_prefix/"
+          sudo chown -R root:root "$root_python_prefix"
+          root_runtime_python="$root_python_prefix/bin/python3.12"
+          root_runtime_python_real="$(sudo readlink -f -- "$root_runtime_python")"
+          case "$root_runtime_python_real" in
+            "$root_python_prefix"/*) ;;
+            *) echo "Release builder Python copy is not contained." >&2; exit 1 ;;
+          esac
+          runtime_symlink_targets="$(sudo find "$root_python_prefix" -type l -print0 \
+            | sudo xargs -0 -r -n1 readlink -f)"
+          if [[ -n "$runtime_symlink_targets" ]]; then
+            while IFS= read -r symlink_target; do
+              case "$symlink_target" in
+                "$root_python_prefix"/*) ;;
+                *) echo "Release builder Python symlink escapes its private copy." >&2; exit 1 ;;
+              esac
+            done <<<"$runtime_symlink_targets"
+          fi
+          sudo chmod 0700 "$root_python_prefix"
+          sudo find "$root_python_prefix" ! -type l -perm /022 -exec chmod go-w -- {} +
+          [[ "$(sudo stat -c '%u:%g:%a:%F' -- "$root_python_prefix")" == "0:0:700:directory" ]]
+          [[ "$(sudo stat -c '%u:%g:%F' -- "$root_runtime_python_real")" == "0:0:regular file" ]]
+          [[ -z "$(sudo find "$root_python_prefix" ! -type l -perm /022 -print -quit)" ]]
+          root_python_ldd="$(sudo env -i HOME=/root PATH=/usr/bin:/bin \
+            LD_LIBRARY_PATH="$root_python_prefix/lib" /usr/bin/ldd "$root_runtime_python_real")"
+          grep -Fq "libpython3.12.so.1.0 => $root_python_prefix/lib/libpython3.12.so.1.0" <<<"$root_python_ldd"
+          ! grep -Fq "not found" <<<"$root_python_ldd"
+          root_python_contract="$(sudo env -i HOME=/root PATH=/usr/bin:/bin \
+            LD_LIBRARY_PATH="$root_python_prefix/lib" "$root_runtime_python" -I \
+            -c 'import platform,sys; print(f"{sys.version_info[0]}.{sys.version_info[1]} {sys.platform} {platform.machine()}")')"
+          [[ "$root_python_contract" == "3.12 linux x86_64" ]]
+          root_python_layout="$(sudo env -i HOME=/root PATH=/usr/bin:/bin \
+            LD_LIBRARY_PATH="$root_python_prefix/lib" "$root_runtime_python" -I \
+            -c 'import sys,sysconfig; paths=sysconfig.get_paths(); print("\n".join((sys.prefix,sys.base_prefix,paths["stdlib"],paths["platstdlib"])))')"
+          while IFS= read -r runtime_path; do
+            case "$runtime_path" in
+              "$root_python_prefix"|"$root_python_prefix"/*) ;;
+              *) echo "Release builder Python layout escapes its private copy." >&2; exit 1 ;;
+            esac
+          done <<<"$root_python_layout"
+          sudo env -i HOME=/root PATH=/usr/bin:/bin LD_LIBRARY_PATH="$root_python_prefix/lib" \
+            "$root_runtime_python" -I -c 'import ctypes,sqlite3,ssl'
           sudo env -i \
             HOME=/root \
             LANG=C.UTF-8 \
             LC_ALL=C.UTF-8 \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            /usr/bin/python3 -m venv "$ci_build_root/platform/.venv_platform"
+            LD_LIBRARY_PATH="$root_python_prefix/lib" \
+            "$root_runtime_python" -m venv "$ci_build_root/platform/.venv_platform"
           sudo install -d -o root -g root -m 0755 "$ci_build_root/platform/dist/releases"
           release_slug="$(/usr/bin/python3 - "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$TARGET_SHA" <<'PY'
           import json
@@ -2881,6 +2961,8 @@ jobs:
             LANG=C.UTF-8 \
             LC_ALL=C.UTF-8 \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            LD_LIBRARY_PATH="$root_python_prefix/lib" \
+            PLATFORM_RELEASE_PYTHON="$root_runtime_python" \
             PLATFORM_RELEASE_OUTPUT_DIR="$ci_build_root/platform/dist/releases" \
             PLATFORM_WEB_NEXT_COMPRESSION="$PLATFORM_WEB_NEXT_COMPRESSION" \
             "$ci_build_root/platform/tools/platform_build_release.sh" --release-slug "$release_slug"

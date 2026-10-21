@@ -936,6 +936,36 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
                 issues.append("candidate build must use an allowlisted env -i")
             if re.search(r"\bsudo\s+-[^\n]*E", build_step):
                 issues.append("candidate build must not use sudo -E")
+            trusted_python_contract = (
+                "actions/setup-python@",
+                'python-version: "3.12"',
+                "Resolve trusted setup-python 3.12 for the release builder",
+                'PLATFORM_RELEASE_PYTHON=%s',
+                'root_python_prefix="$ci_build_root/python-runtime"',
+                'sudo chown -R root:root "$root_python_prefix"',
+                'sudo chmod 0700 "$root_python_prefix"',
+                'sudo find "$root_python_prefix" ! -type l -perm /022 -exec chmod go-w',
+                'runtime_symlink_targets="$(sudo find "$root_python_prefix" -type l -print0',
+                '"$root_python_prefix"/*)',
+                'libpython3.12.so.1.0 => $root_python_prefix/lib/libpython3.12.so.1.0',
+                'root_python_contract=',
+                'import platform,sys; print',
+                'root_python_layout=',
+                'import sys,sysconfig;',
+                "import ctypes,sqlite3,ssl",
+                'LD_LIBRARY_PATH="$root_python_prefix/lib"',
+                '"$root_runtime_python" -m venv "$ci_build_root/platform/.venv_platform"',
+                'PLATFORM_RELEASE_PYTHON="$root_runtime_python"',
+            )
+            if any(marker not in build for marker in trusted_python_contract):
+                issues.append(
+                    "candidate build must select, copy, validate and use a protected setup-python 3.12 runtime"
+                )
+            builder_source = (PLATFORM_ROOT / "tools" / "platform_build_release.sh").read_text(
+                encoding="utf-8"
+            )
+            if '"$venv_base_python" != "$expected_python"' not in builder_source:
+                issues.append("candidate release builder must bind its venv to the selected Python runtime")
         if "id: publish-release-artifact" not in build:
             issues.append("candidate build job must identify the published release artifact")
         if "platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}" not in build:

@@ -162,19 +162,18 @@ failure status for that exact SHA with `gh api
 repos/StrayForest/old_sparky/statuses/<sha> -f state=failure -f
 context=platform-security-build`; never post success manually.
 
-The dispatch `mode`, runtime profile, release slug, target SHA and artifact
-directory are checked by the bounded ASCII input guard before production host
-access or secret-file setup. A deployment release slug is exactly
-`gha-<run_id>-<run_attempt>-<first 12 lowercase characters of target SHA>`;
-the CI builder receives that slug explicitly and does not append a build-time
-timestamp. The artifact filename, archive metadata and host supervisor must
-all retain that same slug. They cross SSH only as a mode-600 JSON handoff to
-the fixed remote dispatcher; the host revalidates them before invoking the
-deployment supervisor. Deploy handoffs also require canonical positive decimal
-`classifier_run_id`/`classifier_run_attempt` values and the exact
-`web_compression=enabled|disabled` choice. Load-cleanup evidence is projected into its closed
-public schema before the private export inventory is removed, and an unknown,
-symlinked, special or leftover export entry fails the workflow.
+The bounded ASCII input guard validates dispatch mode/profile, target SHA,
+artifact directory, exact `gha-<run_id>-<run_attempt>-<first 12 lowercase
+target-SHA characters>` slug, positive decimal classifier IDs/attempts and
+`web_compression=enabled|disabled` before host access or secret setup. The
+builder adds no timestamp; filename, archive metadata and supervisor retain the
+slug. SSH carries it only in a mode-600 JSON handoff revalidated by the fixed
+dispatcher. Cleanup evidence uses a closed public schema; unknown, symlinked,
+special or leftover export entries fail the workflow.
+
+On `ubuntu-latest`, the candidate builder uses setup-python 3.12 from a
+validated private root-owned copy for its venv and canonical build, not runner
+system Python.
 
 Every production SSH boundary validates fresh scanner output and pre-existing
 `known_hosts` files with the same parser. Fresh scans get two visible attempts;

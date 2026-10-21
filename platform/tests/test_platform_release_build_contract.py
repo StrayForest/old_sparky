@@ -3229,6 +3229,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("RELEASE.provenance.json", workflow)
         self.assertIn("artifact_sha256", workflow)
         self.assertIn('ci_build_root=/root/old_sparky', workflow)
+        self.assertEqual(build_job.count("      - uses: actions/setup-python@"), 1)
+        self.assertIn('with:\n          python-version: "3.12"', build_job)
+        self.assertIn("Resolve trusted setup-python 3.12 for the release builder", build_job)
+        self.assertIn('PLATFORM_RELEASE_PYTHON=%s', build_job)
         build_step_start = workflow.index(
             "      - name: Build immutable release artifact in CI"
         )
@@ -3237,6 +3241,33 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             build_step_start,
         )
         build_step = workflow[build_step_start:build_step_end]
+        for runtime_contract in (
+            'source_python_real="$(readlink -f -- "$source_python")"',
+            '"$runtime_tool_cache"/Python/3.12.*/*/bin/python3.12',
+            'root_python_prefix="$ci_build_root/python-runtime"',
+            'sudo chown -R root:root "$root_python_prefix"',
+            'sudo chmod 0700 "$root_python_prefix"',
+            'sudo find "$root_python_prefix" ! -type l -perm /022 -exec chmod go-w',
+            'runtime_symlink_targets="$(sudo find "$root_python_prefix" -type l -print0',
+            '"$root_python_prefix"/*)',
+            'libpython3.12.so.1.0 => $root_python_prefix/lib/libpython3.12.so.1.0',
+            'root_python_contract=',
+            'import platform,sys; print',
+            'root_python_layout=',
+            'import sys,sysconfig;',
+            "import ctypes,sqlite3,ssl",
+            'LD_LIBRARY_PATH="$root_python_prefix/lib"',
+            '"$root_runtime_python" -m venv "$ci_build_root/platform/.venv_platform"',
+            'PLATFORM_RELEASE_PYTHON="$root_runtime_python"',
+        ):
+            self.assertIn(runtime_contract, build_step)
+        builder_start = build_step.index('"$ci_build_root/platform/tools/platform_build_release.sh"')
+        builder_env_start = build_step.rfind("sudo env -i", 0, builder_start)
+        self.assertGreaterEqual(builder_env_start, 0)
+        self.assertIn('LD_LIBRARY_PATH="$root_python_prefix/lib"', build_step[builder_env_start:builder_start])
+        self.assertIn('PLATFORM_RELEASE_PYTHON="$root_runtime_python"', build_step[builder_env_start:builder_start])
+        builder_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"$venv_base_python" != "$expected_python"', builder_script)
         secure_env_allowlist = (
             "          sudo env -i \\\n"
             "            HOME=/root \\\n"
