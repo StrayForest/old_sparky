@@ -27,6 +27,7 @@ CHECKSUM_TEMP=""
 RELEASE_ID=""
 ARTIFACT_ID=""
 CHECKSUM_ID=""
+VENV_INSTALL_EVIDENCE=""
 BUILD_COMPLETE=0
 SOURCE_GIT_COMMIT=""
 ARTIFACT_SHA256=""
@@ -639,7 +640,6 @@ fi
   "$VERIFY_VENV/bin/python" -I -m pip freeze --all \
   | /usr/bin/sort >"$STAGING_DIR/requirements-platform.freeze.txt"
 chmod 0444 "$STAGING_DIR/requirements-platform.freeze.txt"
-rm -rf "$VERIFY_VENV"
 if ! /usr/bin/python3 -I - \
   "$STAGING_DIR/requirements-platform.lock.txt" \
   "$STAGING_DIR/requirements-platform.freeze.txt" <<'PY'
@@ -678,6 +678,14 @@ fi
   --requirements "$STAGING_DIR/requirements-platform.txt" \
   --lock "$STAGING_DIR/requirements-platform.lock.txt" \
   --freeze "$STAGING_DIR/requirements-platform.freeze.txt"
+VENV_INSTALL_EVIDENCE="$(/usr/bin/python3 -I \
+  "$STAGING_DIR/tools/platform_release_venv_capacity.py" measure \
+  --release "$STAGING_DIR" --venv "$VERIFY_VENV")"
+if [[ -z "$VENV_INSTALL_EVIDENCE" || ${#VENV_INSTALL_EVIDENCE} -gt 1024 ]]; then
+  echo "Release build could not produce bounded fresh-venv capacity evidence." >&2
+  exit 1
+fi
+rm -rf "$VERIFY_VENV"
 mark_phase_passed
 CURRENT_PHASE="dependency-baseline"
 
@@ -768,13 +776,14 @@ CURRENT_PHASE="release-metadata"
   "$SOURCE_GIT_COMMIT" \
   "$WEB_BUILD_ID" \
   "$NODE_VERSION" \
-  "$PINNED_NPM_VERSION" <<'PY'
+  "$PINNED_NPM_VERSION" \
+  "$VENV_INSTALL_EVIDENCE" <<'PY'
 import json
 from pathlib import Path
 import re
 import sys
 
-output, slug, built_at, release_ref, commit, web_build_id, node_version, npm_version = (
+output, slug, built_at, release_ref, commit, web_build_id, node_version, npm_version, venv_evidence_raw = (
     sys.argv[1:]
 )
 if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", web_build_id) is None:
@@ -794,6 +803,7 @@ payload = {
     "web_build_id": web_build_id,
     "node_version": node_version,
     "npm_version": npm_version,
+    "python_venv_install_evidence": json.loads(venv_evidence_raw),
 }
 Path(output).write_text(
     json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n",

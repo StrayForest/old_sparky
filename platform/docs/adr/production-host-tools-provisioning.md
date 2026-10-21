@@ -4,7 +4,7 @@ Status: accepted for the host-capability gate
 
 ## Decision
 
-Candidate C `0150268ba93eaeb1358bb9c8399c643c7cda021c` adds backward-compatible optional fresh-venv evidence validation; pin P `cfde473dd2d5192b7845623e81ec46877890d6ae` records its exact 15-member closure. Signed exact-target preflight, approved provisioning and installed self-test remain required before use; this pin does not prove installation.
+Reviewed C `0150268ba93eaeb1358bb9c8399c643c7cda021c` adds backward-compatible optional fresh-venv evidence validation; pin P `cfde473dd2d5192b7845623e81ec46877890d6ae` records its exact 15-member closure. Exact-P2 `b0538937fde0029a854d2ab65d67b4a42354ad26` Security `39567825253/1` passed; preflight `39569921744/1` published the signed bundle before its expected missing-generation refusal. Approved root-console provisioning verified its provenance, atomically published all 17 immutable members and passed installed self-test; receipt SHA-256 is `654f5a4c1d7f7b7ed951ec0bf8802e78cc033dc05cdf824af5232acf9eff4eb4`. Repeat exact-P2 preflight `39570359528/1` passed immutable capabilities and production preflight. C4 remains preserved; application activation requires the subsequent exact-source release chain.
 
 Production deployment control is a release-independent, host-provisioned
 generation.  The immutable path is:

@@ -24,6 +24,7 @@ from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
 from tests import platform_test_lock_support as lock_support
 from tools import platform_release_transaction
 from tools import platform_release_systemd_state
+from tools import platform_release_venv_capacity
 from tools import platform_validate_release_artifact
 from tools import platform_validate_wheelhouse
 from tools import platform_verify_venv_reuse
@@ -141,7 +142,9 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         (self.app_dir / "current").symlink_to(previous_release)
         (self.app_dir / "previous").symlink_to(protected_release)
         self.add_fake_shared_venv(marker="old")
-        artifact = self.build_artifact("new-release", pip_result="new")
+        artifact = self.build_artifact(
+            "new-release", pip_result="new", require_fresh_venv=True
+        )
         hostile_cwd = self.root / "hostile-cwd"
         hostile_cwd.mkdir()
         hostile_marker = hostile_cwd / "imported-hostile-module"
@@ -272,7 +275,9 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         (self.app_dir / "current").symlink_to(current_release)
         (self.app_dir / "previous").symlink_to(protected_release)
         self.add_fake_shared_venv(marker="old")
-        artifact = self.build_artifact("broken-release", pip_result="fail")
+        artifact = self.build_artifact(
+            "broken-release", pip_result="fail", require_fresh_venv=True
+        )
 
         result = self.run_script(
             INSTALL_SCRIPT, str(artifact), str(self.app_dir), check=False
@@ -285,6 +290,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         self.assertEqual(
             (self.shared_dir / "venv" / "deps-version").read_text(), "old\n"
         )
+        self.assertFalse(any(self.shared_dir.glob(".venv-install-*")))
 
     def test_relocation_cache_cleanup_is_source_bound_and_fail_closed(self) -> None:
         def install_case(case: str, *, expect_success: bool) -> tuple[Path, Path, subprocess.CompletedProcess[str]]:
@@ -1650,7 +1656,9 @@ else:
         (self.app_dir / "current").symlink_to(current_release)
         (self.app_dir / "previous").symlink_to(protected_release)
         self.add_fake_shared_venv(marker="old")
-        artifact = self.build_artifact("pointer-failure", pip_result="new")
+        artifact = self.build_artifact(
+            "pointer-failure", pip_result="new", require_fresh_venv=True
+        )
         injected_installer = self.write_injected_script(
             INSTALL_SCRIPT,
             "platform_release_install_fail_current.sh",
@@ -1744,7 +1752,9 @@ else:
                     (self.app_dir / "previous").symlink_to(protected_release)
                 self.add_fake_shared_venv(marker=f"old-{index}")
                 release_ref = f"kill-{index}"
-                artifact = self.build_artifact(release_ref, pip_result=f"new-{index}")
+                artifact = self.build_artifact(
+                    release_ref, pip_result=f"new-{index}", require_fresh_venv=True
+                )
                 injected = self.write_injected_script(
                     INSTALL_SCRIPT,
                     f"platform_release_install_{label}.sh",
@@ -2046,6 +2056,135 @@ else:
         self.assertEqual(
             (self.shared_dir / "venv" / "deps-version").read_text(), "old\n"
         )
+
+    def test_fresh_policy_performs_cold_install_in_stage_only_mode(self) -> None:
+        app = self.root / "fresh-policy-app"
+        shared = app / "shared"
+        releases = app / "releases"
+        shared.mkdir(parents=True)
+        releases.mkdir()
+        self.add_fake_venv(shared / "venv", marker="old")
+        (shared / ".env.platform").write_text("PLATFORM_TESTING=1\n")
+        (shared / ".env.platform").chmod(0o600)
+        artifact = self.build_artifact(
+            "fresh-policy", pip_result="new", require_fresh_venv=True
+        )
+
+        result = self.run_script(
+            INSTALL_SCRIPT, "--stage-only", str(artifact), str(app), check=False
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((shared / "venv" / "deps-version").read_text(), "new\n")
+        self.assertTrue((releases / f"fresh-policy-{BUILT_AT}").is_dir())
+        self.assertFalse((app / "current").exists())
+        self.assertFalse(any(shared.glob(".venv-install-*")))
+
+    def test_fresh_policy_always_installs_for_same_and_changed_dependency_inputs(self) -> None:
+        verifier_marker = self.root / "reuse-verifier-called"
+        verifier = self.tools_dir / "platform_verify_venv_reuse.py"
+        verifier.write_text(
+            "from pathlib import Path\n"
+            f"Path({str(verifier_marker)!r}).touch()\n"
+            "raise SystemExit(97)\n"
+        )
+        for index, same_inputs in enumerate((True, False)):
+            with self.subTest(same_inputs=same_inputs):
+                if index:
+                    self.reset_app_tree()
+                current = self.add_installed_release(f"current-{index}")
+                (self.app_dir / "current").symlink_to(current)
+                self.add_fake_shared_venv(marker="old", matching_freeze=True)
+                release_ref = f"fresh-dependencies-{index}"
+                artifact = self.build_artifact(
+                    release_ref, pip_result="new", require_fresh_venv=True
+                )
+                candidate = self.root / "artifact-src" / f"{release_ref}-{BUILT_AT}"
+                for relative in platform_release_venv_capacity.INPUTS:
+                    target = current / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(candidate / relative, target)
+                if not same_inputs:
+                    (current / "requirements-platform.txt").write_text("pip==26.1.1\n")
+                old_identity = (self.shared_dir / "venv").stat().st_ino
+                result = self.run_script(
+                    INSTALL_SCRIPT, "--stage-only", str(artifact), str(self.app_dir),
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(verifier_marker.exists())
+                self.assertNotEqual((self.shared_dir / "venv").stat().st_ino, old_identity)
+                self.assertEqual((self.shared_dir / "venv" / "deps-version").read_text(), "new\n")
+                self.assertEqual((self.app_dir / "current").resolve(), current)
+
+    def test_fresh_policy_capacity_refusals_preserve_old_runtime_and_environment(self) -> None:
+        cases = ("skip", "preflight-space", "actual-allocation", "postinstall-space", "transaction-stage")
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                if index:
+                    self.reset_app_tree()
+                current = self.add_installed_release(f"current-{index}")
+                previous = self.add_installed_release(f"previous-{index}")
+                (self.app_dir / "current").symlink_to(current)
+                (self.app_dir / "previous").symlink_to(previous)
+                self.add_fake_shared_venv(marker="old")
+                old_identity = (self.shared_dir / "venv").stat().st_ino
+                env = self.shared_dir / ".env.platform"
+                env_before = env.read_bytes(), env.stat()
+                receipt = current / ".rollback" / "venv-origin.json"
+                receipt.parent.mkdir(mode=0o700)
+                receipt.write_bytes(b"retained exact receipt\n")
+                receipt.chmod(0o600)
+                artifact = self.build_artifact(
+                    f"capacity-refusal-{index}", pip_result="new", require_fresh_venv=True
+                )
+                installer = INSTALL_SCRIPT
+                extra = []
+                if case == "skip":
+                    extra = ["--skip-python-deps"]
+                elif case == "preflight-space":
+                    env.unlink()  # A failed initial guard must not seed it.
+                    installer = self.write_replaced_script(
+                        INSTALL_SCRIPT, "insufficient-space.sh",
+                        "available = info.f_bavail * info.f_frsize", "available = 0",
+                    )
+                elif case == "actual-allocation":
+                    installer = self.write_injected_script(
+                        INSTALL_SCRIPT, "oversized-venv.sh",
+                        '  verify_venv "$NEW_VENV_DIR" "$FREEZE_CHECK_FILE"\n',
+                        '  FRESH_VENV_ALLOCATED_BOUND=1\n',
+                    )
+                elif case == "postinstall-space":
+                    installer = self.write_injected_script(
+                        INSTALL_SCRIPT, "postinstall-space.sh",
+                        '  verify_venv "$NEW_VENV_DIR" "$FREEZE_CHECK_FILE"\n',
+                        "    read_install_space() { printf '1 42949672960\\n'; }\n",
+                    )
+                else:
+                    installer = self.write_injected_script(
+                        INSTALL_SCRIPT, "transaction-stage.sh",
+                        '  INSTALL_DIAGNOSTIC_STAGE="transaction_stage"\n',
+                        '  false # test transaction preparation failure\n',
+                    )
+                result = self.run_script(installer, *extra, str(artifact), str(self.app_dir), check=False)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                if case == "transaction-stage":
+                    self.assertIn("stage=transaction_stage", result.stdout + result.stderr)
+                else:
+                    self.assertIn("class=venv_policy", result.stdout + result.stderr)
+                self.assertEqual((self.app_dir / "current").resolve(), current)
+                self.assertEqual((self.app_dir / "previous").resolve(), previous)
+                self.assertEqual((self.shared_dir / "venv").stat().st_ino, old_identity)
+                self.assertEqual((self.shared_dir / "venv" / "deps-version").read_text(), "old\n")
+                self.assertEqual(receipt.read_bytes(), b"retained exact receipt\n")
+                if case == "preflight-space":
+                    self.assertFalse(env.exists())
+                else:
+                    self.assertEqual(env.read_bytes(), env_before[0])
+                    self.assertEqual(env.stat().st_ino, env_before[1].st_ino)
+                    self.assertEqual(stat.S_IMODE(env.stat().st_mode), 0o600)
+                self.assertFalse(any(self.shared_dir.glob(".venv-install-*")))
+                self.assertFalse((self.shared_dir / TRANSACTION_STATE_NAME).exists())
 
     def reset_app_tree(self) -> None:
         shutil.rmtree(self.app_dir)
@@ -2459,6 +2598,7 @@ else:
         *,
         pip_result: str,
         require_proven_reuse: bool = False,
+        require_fresh_venv: bool = False,
     ) -> Path:
         slug = f"{release_ref}-{BUILT_AT}"
         release = self.root / "artifact-src" / slug
@@ -2477,12 +2617,17 @@ else:
         ).write_text("console.log('ok');\n")
         (release / "apps" / "platform_web" / "package-lock.json").write_text("{}\n")
         (release / ".env.platform.example").write_text("PLATFORM_TESTING=1\n")
-        if require_proven_reuse:
+        if require_proven_reuse and require_fresh_venv:
+            raise AssertionError("release fixture cannot select two venv policies")
+        if require_proven_reuse or require_fresh_venv:
             deploy = release / "deploy"
             deploy.mkdir()
             policy = deploy / "python-venv-policy.json"
+            transition = (
+                "require_fresh_venv" if require_fresh_venv else "require_proven_reuse"
+            )
             policy.write_text(
-                '{"schema":1,"transition":"require_proven_reuse"}\n',
+                json.dumps({"schema": 1, "transition": transition}) + "\n",
                 encoding="ascii",
             )
             policy.chmod(0o644)
@@ -2538,6 +2683,16 @@ else:
             "node_version": "26.3.1",
             "npm_version": "11.16.0",
         }
+        if require_fresh_venv:
+            payload["python_venv_install_evidence"] = {
+                "schema": 1,
+                "builder_allocated_bytes": 1024 * 1024,
+                "wheelhouse_expanded_bytes": platform_release_venv_capacity.wheelhouse_expanded_bytes(
+                    release
+                ),
+                "host_overhead_bytes": platform_release_venv_capacity.OVERHEAD_BYTES,
+                "inputs_sha256": platform_release_venv_capacity.input_digest(release),
+            }
         release_json = release / "RELEASE.json"
         release_json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         release_json.chmod(0o444)
@@ -2699,6 +2854,13 @@ import sys
 import zipfile
 
 arguments = sys.argv[1:]
+if arguments and arguments[0] == "install":
+    temporary = Path(os.environ.get("TMPDIR", "/nonexistent"))
+    if (temporary != Path(sys.prefix) / ".pip-tmp" or not temporary.is_dir()
+            or os.environ.get("PIP_NO_CACHE_DIR") != "1"
+            or os.environ.get("PIP_CONFIG_FILE") != "/dev/null"
+            or os.environ.get("PIP_NO_INDEX") != "1"):
+        raise SystemExit("installer did not confine pip temporary/cache files")
 install_result = {result!r}
 if arguments and arguments[0] == "install":
     Path(sys.prefix, "deps-version").write_text({result!r} + "\\n")

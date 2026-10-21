@@ -1,4 +1,4 @@
 {
   "schema": 1,
-  "transition": "require_proven_reuse"
+  "transition": "require_fresh_venv"
 }

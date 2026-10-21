@@ -31,6 +31,7 @@ from tests.test_platform_validate_release_artifact import (
     ArchiveBuilder as ReleaseArtifactFixtureBuilder,
     RELEASE_SLUG,
     VALIDATOR_SCRIPT,
+    release_payload,
 )
 from tools import platform_workflow_remote_dispatch
 from tools import platform_live_qa_runtime_install
@@ -40,6 +41,8 @@ from tools import platform_configure_shared_env
 from tools import platform_build_node_cache
 from tools import platform_live_qa_guard
 from tools import platform_test_catalog
+from tools import platform_release_venv_capacity as venv_capacity
+from tools import platform_validate_release_artifact as artifact_validator
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from platform_render_service_envs import render_service_env  # noqa: E402
@@ -73,6 +76,145 @@ def workflow_job(source: str, name: str) -> str:
 
 
 class PlatformReleaseBuildContractTests(unittest.TestCase):
+    def test_fresh_venv_capacity_binds_exact_inputs_and_expanded_wheels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory) / "release"
+            wheelhouse = release / "wheelhouse"
+            wheelhouse.mkdir(parents=True)
+            venv = Path(directory) / "venv"
+            venv.mkdir()
+            (venv / "runtime").write_bytes(b"measured allocation\n")
+            wheel = wheelhouse / "pip-26.1.2-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("pip/__init__.py", b"runtime\n")
+            wheel.chmod(0o444)
+            for relative in venv_capacity.INPUTS:
+                path = release / relative
+                raw = (
+                    hashlib.sha256(wheel.read_bytes()).hexdigest().encode()
+                    + b"  " + wheel.name.encode() + b"\n"
+                    if relative.endswith("WHEELHOUSE.sha256") else b"pip==26.1.2\n"
+                )
+                path.write_bytes(raw)
+                path.chmod(0o444)
+            evidence = venv_capacity.measure(release, venv)
+            self.assertEqual(evidence["wheelhouse_expanded_bytes"], len(b"runtime\n"))
+            self.assertEqual(
+                evidence["builder_allocated_bytes"],
+                (venv.stat().st_blocks + (venv / "runtime").stat().st_blocks) * 512,
+            )
+            metadata = release / "RELEASE.json"
+            # Execute the builder's actual metadata writer with measured
+            # evidence, so its argument wiring and JSON schema are covered.
+            writer = BUILD_SCRIPT.read_text().split(
+                '  "$VENV_INSTALL_EVIDENCE" <<\'PY\'\n', 1
+            )[1].split("\nPY\n", 1)[0]
+            payload = release_payload()
+            subprocess.run(
+                [sys.executable, "-I", "-c", writer, str(metadata),
+                 *[str(payload[key]) for key in (
+                     "release_slug", "built_at_utc", "release_ref", "source_git_commit",
+                     "web_build_id", "node_version", "npm_version",
+                 )], json.dumps(evidence)],
+                check=True, capture_output=True, text=True,
+            )
+            metadata.chmod(0o444)
+            parsed = artifact_validator._parse_release_json(
+                metadata.read_bytes(), release_slug=RELEASE_SLUG
+            )
+            self.assertEqual(parsed["python_venv_install_evidence"], evidence)
+            self.assertEqual(venv_capacity.verify_evidence(release), evidence)
+            for malformed in (
+                None, [], {}, {**evidence, "extra": 1},
+                {**evidence, "schema": True},
+                {**evidence, "builder_allocated_bytes": True},
+                {**evidence, "builder_allocated_bytes": -1},
+                {**evidence, "wheelhouse_expanded_bytes": 4 * 1024**3 + 1},
+                {**evidence, "host_overhead_bytes": 1},
+                {**evidence, "inputs_sha256": "A" * 64},
+            ):
+                with self.subTest(malformed=malformed):
+                    metadata.write_text(json.dumps({"python_venv_install_evidence": malformed}))
+                    with self.assertRaisesRegex(venv_capacity.CapacityError, "evidence_schema"):
+                        venv_capacity.verify_evidence(release)
+            metadata.write_text('{"python_venv_install_evidence":{},"python_venv_install_evidence":{}}')
+            with self.assertRaisesRegex(venv_capacity.CapacityError, "release_metadata"):
+                venv_capacity.verify_evidence(release)
+            metadata.write_text(json.dumps({"python_venv_install_evidence": evidence}))
+            for relative in venv_capacity.INPUTS:
+                with self.subTest(input=relative):
+                    path = release / relative
+                    original = path.read_bytes()
+                    path.write_bytes(original + b"changed\n")
+                    with self.assertRaisesRegex(venv_capacity.CapacityError, "evidence_binding"):
+                        venv_capacity.verify_evidence(release)
+                    path.write_bytes(original)
+            bad_expansion = {**evidence, "wheelhouse_expanded_bytes": 1}
+            metadata.write_text(json.dumps({"python_venv_install_evidence": bad_expansion}))
+            with self.assertRaisesRegex(venv_capacity.CapacityError, "evidence_binding"):
+                venv_capacity.verify_evidence(release)
+            metadata.write_text(json.dumps({"python_venv_install_evidence": evidence}))
+            # Changing wheel bytes alone preserves the input digest but must
+            # fail the independently verified manifest before expansion.
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("pip/__init__.py", b"changed\n")
+            with self.assertRaisesRegex(venv_capacity.CapacityError, "wheelhouse_binding"):
+                venv_capacity.verify_evidence(release)
+
+    def test_fresh_venv_capacity_rejects_unsafe_paths_and_bounded_zip_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory)
+            wheelhouse = release / "wheelhouse"
+            wheelhouse.mkdir()
+            wheel = wheelhouse / "pip-26.1.2-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("pip/a", b"one")
+                archive.writestr("pip/b", b"two")
+            wheel.chmod(0o444)
+            manifest = wheelhouse / "WHEELHOUSE.sha256"
+            manifest.write_text(hashlib.sha256(wheel.read_bytes()).hexdigest() + "  " + wheel.name + "\n")
+            manifest.chmod(0o444)
+            with patch.object(venv_capacity, "MAX_ENTRIES", 1):
+                with self.assertRaisesRegex(venv_capacity.CapacityError, "wheelhouse_entries"):
+                    venv_capacity.wheelhouse_expanded_bytes(release)
+            with patch.object(venv_capacity, "MAX_EXPANDED_BYTES", 5):
+                with self.assertRaisesRegex(venv_capacity.CapacityError, "wheelhouse_size"):
+                    venv_capacity.wheelhouse_expanded_bytes(release)
+            original = release / "original.whl"
+            wheel.rename(original)
+            wheel.symlink_to(original)
+            with self.assertRaisesRegex(venv_capacity.CapacityError, "wheelhouse_metadata"):
+                venv_capacity.wheelhouse_expanded_bytes(release)
+            wheel.unlink()
+            os.link(original, wheel)
+            with self.assertRaisesRegex(venv_capacity.CapacityError, "wheelhouse_metadata"):
+                venv_capacity.wheelhouse_expanded_bytes(release)
+            wheel.unlink()
+            original.rename(wheel)
+            moved = release / "moved-wheelhouse"
+            wheelhouse.rename(moved)
+            wheelhouse.symlink_to(moved, target_is_directory=True)
+            with self.assertRaisesRegex(venv_capacity.CapacityError, "wheelhouse_metadata"):
+                venv_capacity.wheelhouse_expanded_bytes(release)
+            wheelhouse.unlink()
+            moved.rename(wheelhouse)
+            venv = release / "venv"
+            venv.mkdir()
+            (venv / "safe").write_bytes(b"allocated")
+            (venv / "external-link").symlink_to("/nonexistent-unfollowed-target")
+            self.assertGreater(venv_capacity.allocated_bytes(venv), 0)
+            allocated = venv_capacity.allocated_bytes(venv)
+            self.assertEqual(venv_capacity.allocated_bytes(venv, maximum=allocated), allocated)
+            with self.assertRaisesRegex(venv_capacity.CapacityError, "venv_size"):
+                venv_capacity.allocated_bytes(venv, maximum=allocated - 1)
+            venv_link = release / "venv-link"
+            venv_link.symlink_to(venv, target_is_directory=True)
+            with self.assertRaisesRegex(venv_capacity.CapacityError, "venv_metadata"):
+                venv_capacity.allocated_bytes(venv_link)
+            os.link(venv / "safe", venv / "hardlink")
+            with self.assertRaisesRegex(venv_capacity.CapacityError, "venv_metadata"):
+                venv_capacity.allocated_bytes(venv)
+
     @staticmethod
     def _autodeploy_dispatch_payload(mode: str = "deploy") -> dict[str, object]:
         workflow = (
@@ -8350,6 +8492,9 @@ cleanup
         self.assertIn('platform_validate_wheelhouse.py" create', script)
         self.assertIn('platform_validate_wheelhouse.py" verify', script)
         self.assertIn('platform_validate_release_artifact.py"', script)
+        self.assertIn('platform_release_venv_capacity.py" measure', script)
+        self.assertIn('python_venv_install_evidence', script)
+        self.assertIn('"$VERIFY_VENV"', script)
 
     def test_build_derives_pip_wheel_from_tracked_lock(self) -> None:
         script = BUILD_SCRIPT.read_text()
@@ -8402,7 +8547,7 @@ cleanup
         policy = (REPO_ROOT / "platform/deploy/python-venv-policy.json").read_text()
         self.assertEqual(
             json.loads(policy),
-            {"schema": 1, "transition": "require_proven_reuse"},
+            {"schema": 1, "transition": "require_fresh_venv"},
         )
 
         # Exercise the production parser and reuse guard in isolation. The
@@ -8506,6 +8651,14 @@ cleanup
                 "print(os.environ['VERIFIER_PROOF'])\n"
             )
             verifier.chmod(0o644)
+            capacity_helper = tools / "platform_release_venv_capacity.py"
+            capacity_helper.write_text(
+                "import os, sys\n"
+                "if int(os.environ.get('CAPACITY_RC', '0')):\n"
+                "    raise SystemExit(int(os.environ['CAPACITY_RC']))\n"
+                "print(os.environ.get('CAPACITY_OUTPUT', '1048576 2097152 134217728'))\n"
+            )
+            capacity_helper.chmod(0o644)
 
             # The production disk reader is checked against a real directory;
             # guard threshold cases below use deterministic capacity tuples.
@@ -8540,7 +8693,9 @@ cleanup
                 verifier_rc: int = 0,
                 verifier_output: str = verifier_proof,
                 skip: int = 0,
-                space: str = "6576668672 42949672960",
+                space: str = "7516192768 42949672960",
+                capacity_rc: int = 0,
+                capacity_output: str = "1048576 2097152 134217728",
                 policy_shape: str = "regular",
             ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
                 policy_path = deploy / "python-venv-policy.json"
@@ -8583,6 +8738,8 @@ cleanup
                         "VERIFIER_MARKER": str(marker),
                         "VERIFIER_RC": str(verifier_rc),
                         "VERIFIER_PROOF": verifier_output,
+                        "CAPACITY_RC": str(capacity_rc),
+                        "CAPACITY_OUTPUT": capacity_output,
                         "TEST_SPACE": space,
                         "NEW_VENV_SENTINEL": str(sentinel),
                         "SKIP_PYTHON_DEPS": str(skip),
@@ -8673,6 +8830,50 @@ cleanup
             self.assertFalse(marker.exists())
             self.assertTrue(sentinel.is_file())
 
+            fresh_policy = '{"schema":1,"transition":"require_fresh_venv"}\n'
+            cold_install, marker, sentinel = run_guard(fresh_policy)
+            self.assertEqual(cold_install.returncode, 0, cold_install.stderr)
+            self.assertEqual(cold_install.stdout.strip(), "accepted:0")
+            self.assertFalse(marker.exists(), "fresh policy must bypass reuse proof")
+            self.assertTrue(sentinel.is_file())
+
+            fresh_skip, marker, sentinel = run_guard(fresh_policy, skip=1)
+            self.assertEqual(fresh_skip.returncode, 0, fresh_skip.stderr)
+            self.assertEqual(fresh_skip.stdout.strip(), "rejected:1")
+            self.assertIn("stage=venv_policy_preconditions", fresh_skip.stderr)
+            self.assertFalse(marker.exists())
+            self.assertFalse(sentinel.exists())
+
+            fresh_bad_evidence, marker, sentinel = run_guard(
+                fresh_policy, capacity_rc=1
+            )
+            self.assertEqual(fresh_bad_evidence.returncode, 0, fresh_bad_evidence.stderr)
+            self.assertEqual(fresh_bad_evidence.stdout.strip(), "rejected:0")
+            self.assertIn("stage=venv_policy_proof", fresh_bad_evidence.stderr)
+            self.assertFalse(marker.exists())
+            self.assertFalse(sentinel.exists())
+
+            fresh_low_space, marker, sentinel = run_guard(
+                fresh_policy,
+                space="6714032127 42949672960",
+            )
+            self.assertEqual(fresh_low_space.returncode, 0, fresh_low_space.stderr)
+            self.assertEqual(fresh_low_space.stdout.strip(), "rejected:0")
+            self.assertIn("stage=venv_policy_space", fresh_low_space.stderr)
+            self.assertFalse(marker.exists())
+            self.assertFalse(sentinel.exists())
+
+            fresh_malformed_evidence, marker, sentinel = run_guard(
+                fresh_policy, capacity_output="1048576 2097152"
+            )
+            self.assertEqual(
+                fresh_malformed_evidence.returncode, 0, fresh_malformed_evidence.stderr
+            )
+            self.assertEqual(fresh_malformed_evidence.stdout.strip(), "rejected:0")
+            self.assertIn("stage=venv_policy_proof", fresh_malformed_evidence.stderr)
+            self.assertFalse(marker.exists())
+            self.assertFalse(sentinel.exists())
+
         floor_function = production_functions + "\ninstall_space_floor_ok \"$1\" \"$2\"\n"
         threshold_cases = (
             (5 * 1024**3 + 128 * 1024**2, 10 * 1024**3, True),
@@ -8683,6 +8884,36 @@ cleanup
         for available, total, expected in threshold_cases:
             result = subprocess.run(
                 ["/bin/bash", "-c", floor_function, "bash", str(available), str(total)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode == 0, expected, result.stderr)
+
+        fresh_threshold_function = (
+            production_functions
+            + "\ninstall_space_fresh_ok \"$1\" \"$2\" \"$3\"\n"
+        )
+        additional = 256 * 1024 * 1024
+        fresh_threshold_cases = (
+            (5 * 1024**3 + 128 * 1024**2 + additional, 10 * 1024**3, additional, True),
+            (5 * 1024**3 + 128 * 1024**2 + additional - 1, 10 * 1024**3, additional, False),
+            (6 * 1024**3 + 128 * 1024**2 + additional, 40 * 1024**3, additional, True),
+            (6 * 1024**3 + 128 * 1024**2 + additional - 1, 40 * 1024**3, additional, False),
+            (10 * 1024**3, 40 * 1024**3, 0, False),
+        )
+        for available, total, required, expected in fresh_threshold_cases:
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    fresh_threshold_function,
+                    "bash",
+                    str(available),
+                    str(total),
+                    str(required),
+                ],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

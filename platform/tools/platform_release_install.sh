@@ -6,6 +6,9 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ORIGINAL_ARGS=("$@")
 SKIP_PYTHON_DEPS=0
 VENV_REUSE_PROOF=""
+FRESH_VENV_ALLOCATED_BOUND=0
+FRESH_VENV_PEAK_BOUND=0
+PIP_TEMP_DIR=""
 SEED_ENV_FROM=""
 STAGE_ONLY=0
 
@@ -220,12 +223,14 @@ try:
     payload = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
     if (not isinstance(payload, dict) or set(payload) != {"schema", "transition"}
             or type(payload.get("schema")) is not int or payload["schema"] != 1
-            or payload.get("transition") != "require_proven_reuse"):
+            or payload.get("transition") not in {
+                "require_proven_reuse", "require_fresh_venv"
+            }):
         raise SystemExit(1)
 except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
     raise SystemExit(1) from None
 else:
-    print("require_proven_reuse")
+    print(payload["transition"])
 finally:
     for descriptor in (policy_fd, deploy_fd, release_fd):
         if descriptor >= 0:
@@ -235,7 +240,7 @@ PY
     return 1
   fi
   case "$policy" in
-    legacy|require_proven_reuse) VENV_INSTALL_POLICY="$policy" ;;
+    legacy|require_proven_reuse|require_fresh_venv) VENV_INSTALL_POLICY="$policy" ;;
     *) return 1 ;;
   esac
 }
@@ -249,6 +254,21 @@ install_space_floor_ok() {
   local margin=$((128 * 1024 * 1024))
   (( filesystem_floor > hard_floor )) || filesystem_floor="$hard_floor"
   (( available >= filesystem_floor + margin ))
+}
+
+install_space_fresh_ok() {
+  local available="$1"
+  local total="$2"
+  local additional="$3"
+  [[ "$available" =~ ^[0-9]+$ && "$total" =~ ^[1-9][0-9]*$ \
+    && "$additional" =~ ^[1-9][0-9]*$ ]] || return 1
+  local filesystem_floor=$(((total * 15 + 99) / 100))
+  local hard_floor=$((5 * 1024 * 1024 * 1024))
+  local margin=$((128 * 1024 * 1024))
+  (( filesystem_floor > hard_floor )) || filesystem_floor="$hard_floor"
+  # Artifact and old venv already occupy this filesystem. `additional` covers
+  # the new venv, worst-case expanded wheelhouse temp, and explicit overhead.
+  (( available >= filesystem_floor + margin + additional ))
 }
 
 read_install_space() {
@@ -298,6 +318,28 @@ enforce_required_venv_reuse() {
     return 1
   fi
   INSTALL_DIAGNOSTIC_STAGE="venv_policy_preconditions"
+  if [[ "$VENV_INSTALL_POLICY" == "require_fresh_venv" ]]; then
+    # This explicit artifact policy selects a wheelhouse install directly. It
+    # never converts a refusal from the strict reuse proof into a cold install.
+    (( SKIP_PYTHON_DEPS == 0 )) || return 1
+    INSTALL_DIAGNOSTIC_STAGE="venv_policy_proof"
+    local evidence measured expanded overhead space available total
+    evidence="$(/usr/bin/python3 -I "$TOOLS_DIR/platform_release_venv_capacity.py" \
+      verify --release "$RELEASE_DIR" 2>/dev/null)" || return 1
+    read -r measured expanded overhead <<<"$evidence"
+    [[ "$measured" =~ ^[1-9][0-9]{0,9}$ \
+      && "$expanded" =~ ^[1-9][0-9]{0,9}$ \
+      && "$overhead" == "134217728" ]] || return 1
+    (( measured <= 1073741824 && expanded <= 4294967296 )) || return 1
+    FRESH_VENV_ALLOCATED_BOUND=$((measured + overhead))
+    FRESH_VENV_PEAK_BOUND=$((measured + expanded + overhead))
+    INSTALL_DIAGNOSTIC_STAGE="venv_policy_space"
+    space="$(read_install_space)" || return 1
+    read -r available total <<<"$space"
+    install_space_fresh_ok "$available" "$total" "$FRESH_VENV_PEAK_BOUND" || return 1
+    INSTALL_DIAGNOSTIC_STAGE="artifact_validation"
+    return 0
+  fi
   if [[ "$VENV_INSTALL_POLICY" != "require_proven_reuse" ]]; then
     INSTALL_DIAGNOSTIC_STAGE="artifact_validation"
     return 0
@@ -811,11 +853,36 @@ if [[ "$VENV_INSTALL_POLICY" == "require_proven_reuse" ]]; then
     public_status failed venv_policy
     exit 1
   fi
+elif [[ "$VENV_INSTALL_POLICY" == "require_fresh_venv" ]]; then
+  INSTALL_SPACE="$(read_install_space)" || {
+    public_status failed venv_policy
+    exit 1
+  }
+  read -r INSTALL_AVAILABLE INSTALL_TOTAL <<<"$INSTALL_SPACE"
+  if ! install_space_fresh_ok \
+    "$INSTALL_AVAILABLE" "$INSTALL_TOTAL" "$FRESH_VENV_PEAK_BOUND"; then
+    public_status failed venv_policy
+    exit 1
+  fi
 fi
 
 run_isolated_python() {
   local python_bin="$1"
   shift
+  if [[ -n "$PIP_TEMP_DIR" ]]; then
+    /usr/bin/env -i \
+      HOME=/nonexistent \
+      LANG=C.UTF-8 \
+      LC_ALL=C.UTF-8 \
+      PATH=/usr/bin:/bin \
+      PIP_CONFIG_FILE=/dev/null \
+      PIP_DISABLE_PIP_VERSION_CHECK=1 \
+      PIP_NO_CACHE_DIR=1 \
+      PIP_NO_INDEX=1 \
+      TMPDIR="$PIP_TEMP_DIR" \
+      "$python_bin" "$@"
+    return
+  fi
   /usr/bin/env -i \
     HOME=/nonexistent \
     LANG=C.UTF-8 \
@@ -1113,7 +1180,8 @@ INSTALL_DIAGNOSTIC_STAGE="venv_setup"
 # A prior successful transaction can prove the shared venv already contains
 # the exact immutable dependencies and runtime required by this candidate.
 # A proof miss deliberately follows the normal fresh-venv + full-snapshot path.
-if [[ "$SKIP_PYTHON_DEPS" -eq 0 && -n "$PREVIOUS_TARGET" \
+if [[ "$VENV_INSTALL_POLICY" != "require_fresh_venv" \
+  && "$SKIP_PYTHON_DEPS" -eq 0 && -n "$PREVIOUS_TARGET" \
   && -x /usr/bin/python3.12 \
   && -f "$TOOLS_DIR/platform_verify_venv_reuse.py" \
   && ! -L "$TOOLS_DIR/platform_verify_venv_reuse.py" ]]; then
@@ -1155,13 +1223,15 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
   verify_venv "$SHARED_VENV_DIR" "$FREEZE_CHECK_FILE"
 else
   NEW_VENV_DIR="$(mktemp -d "$SHARED_DIR/.venv-install-$RELEASE_SLUG.XXXXXX")"
+  PIP_TEMP_DIR="$NEW_VENV_DIR/.pip-tmp"
   # API/worker import this root-owned environment as non-root service users.
   # The installer itself keeps umask 077 for receipts, temporary files and
   # secret environment data; apply a readable-code umask only while creating
   # the new venv and installing its artifact-bound packages.
   (
     umask 022
-    /usr/bin/python3 -I -m venv "$NEW_VENV_DIR" >/dev/null 2>/dev/null
+    mkdir -m 0700 "$PIP_TEMP_DIR"
+    run_isolated_python /usr/bin/python3 -I -m venv "$NEW_VENV_DIR" >/dev/null 2>/dev/null
     shopt -s nullglob
     PIP_WHEELS=("$RELEASE_DIR"/wheelhouse/pip-*.whl)
     shopt -u nullglob
@@ -1183,8 +1253,32 @@ else
       --require-hashes \
       --requirement "$RELEASE_DIR/requirements-platform.lock.txt" >/dev/null 2>/dev/null
   )
+  remove_tree "$PIP_TEMP_DIR"
+  PIP_TEMP_DIR=""
   relocate_venv_paths "$NEW_VENV_DIR" "$SHARED_VENV_DIR" "$RELEASE_DIR/wheelhouse" >/dev/null 2>/dev/null
   verify_venv "$NEW_VENV_DIR" "$FREEZE_CHECK_FILE"
+  if [[ "$VENV_INSTALL_POLICY" == "require_fresh_venv" ]]; then
+    ACTUAL_VENV_BYTES="$(/usr/bin/python3 -I \
+      "$TOOLS_DIR/platform_release_venv_capacity.py" size \
+      --venv "$NEW_VENV_DIR" 2>/dev/null)" || {
+      public_status failed venv_policy
+      exit 1
+    }
+    if [[ ! "$ACTUAL_VENV_BYTES" =~ ^[0-9]+$ ]] \
+      || (( ACTUAL_VENV_BYTES > FRESH_VENV_ALLOCATED_BOUND )); then
+      public_status failed venv_policy
+      exit 1
+    fi
+    INSTALL_SPACE="$(read_install_space)" || {
+      public_status failed venv_policy
+      exit 1
+    }
+    read -r INSTALL_AVAILABLE INSTALL_TOTAL <<<"$INSTALL_SPACE"
+    install_space_floor_ok "$INSTALL_AVAILABLE" "$INSTALL_TOTAL" || {
+      public_status failed venv_policy
+      exit 1
+    }
+  fi
   chmod 0755 "$NEW_VENV_DIR"
   rm -f -- "$FREEZE_CHECK_FILE"
   FREEZE_CHECK_FILE=""
