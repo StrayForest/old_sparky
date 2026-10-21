@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: platform-draft-cloudflare-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
+  group: platform-draft-cloudflare-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'dev' }}
   cancel-in-progress: true
 
 jobs:
@@ -68,7 +68,7 @@ jobs:
     name: Detect Draft release
     if: >-
       ${{
-        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev') ||
         (github.event_name == 'workflow_run' &&
          github.event.workflow_run.conclusion == 'success' &&
          github.event.workflow_run.event == 'push' &&
@@ -82,35 +82,50 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'dev' }}
-          fetch-depth: 2
+          fetch-depth: 1
           persist-credentials: false
-      - name: Detect Draft-related changes
+      - name: Validate current Draft release source
         id: paths
         shell: bash
         env:
           WORKFLOW_TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}
+          SOURCE_RUN_STATUS: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.status || '' }}
+          SOURCE_RUN_CONCLUSION: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion || '' }}
+          SOURCE_RUN_EVENT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.event || '' }}
+          SOURCE_RUN_BRANCH: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || '' }}
+          SOURCE_RUN_REPOSITORY: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_repository.full_name || '' }}
+          SOURCE_RUN_EVENT_REPOSITORY: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.repository.full_name || '' }}
+          SOURCE_RUN_NAME: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.name || '' }}
+          SOURCE_RUN_WORKFLOW: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.path || '' }}
         run: |
           set -euo pipefail
-          target_sha="${WORKFLOW_TARGET_SHA:-$(git rev-parse HEAD)}"
+          [[ "$GITHUB_REPOSITORY" == "StrayForest/old_sparky" ]]
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
+            [[ "$SOURCE_RUN_STATUS" == "completed" && "$SOURCE_RUN_CONCLUSION" == "success" ]]
+            [[ "$SOURCE_RUN_EVENT" == "push" && "$SOURCE_RUN_BRANCH" == "dev" ]]
+            [[ "$SOURCE_RUN_REPOSITORY" == "$GITHUB_REPOSITORY" ]]
+            [[ "$SOURCE_RUN_EVENT_REPOSITORY" == "$GITHUB_REPOSITORY" ]]
+            [[ "$SOURCE_RUN_NAME" == "Platform security and build" ]]
+            [[ "$SOURCE_RUN_WORKFLOW" == ".github/workflows/platform-security.yml" ]]
+            target_sha="$WORKFLOW_TARGET_SHA"
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/dev" ]]
+            target_sha="$(git rev-parse HEAD)"
+          else
+            echo "Unsupported Draft release event" >&2
+            exit 1
+          fi
+
+          [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$target_sha" ]]
+          read -r current_sha current_ref <<< "$(git ls-remote --exit-code origin refs/heads/dev)"
+          [[ "$current_ref" == "refs/heads/dev" && "$current_sha" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$target_sha" != "$current_sha" ]]; then
+            echo "Draft release source is no longer current dev" >&2
+            exit 1
+          fi
           echo "target_sha=${target_sha}" >> "$GITHUB_OUTPUT"
-
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if git rev-parse "${target_sha}^1" >/dev/null 2>&1; then
-            changed_files="$(git diff --name-only "${target_sha}^1" "${target_sha}")"
-          else
-            changed_files="$(git show --pretty='' --name-only "${target_sha}")"
-          fi
-          printf '%s\n' "$changed_files"
-
-          if grep -Eq '^(platform/apps/platform_draft/|platform/apps/platform_web/components/layout/site-header\.tsx$|platform/apps/platform_web/lib/routes\.ts$|platform/apps/platform_web/public/assets/heroes/|platform/tools/sync_draft_hero_assets\.py$|platform/docs/adr/public-draft-edge-boundary\.md$|\.github/workflows/platform-draft-cloudflare\.yml$)' <<<"$changed_files"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
 
   build-release:
     name: Build digest-bound Draft bundle without Cloudflare credentials
@@ -166,9 +181,11 @@ jobs:
           platform/.venv_draft_assets/bin/python -m pip install \
             --require-hashes \
             -r platform/apps/platform_draft/requirements-assets.lock.txt
-          cd platform
-          .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
-            --output-dir "$bundle/heroes"
+          (
+            cd platform
+            .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
+              --output-dir "$bundle/heroes"
+          )
           /usr/bin/python3 - "$bundle" "$TARGET_SHA" <<'PY'
           import hashlib
           import json
@@ -226,7 +243,10 @@ jobs:
                       raise SystemExit("Wrangler runtime member name is unsafe")
                   size = path.stat().st_size
                   total_bytes += size
-                  if size > 64 * 1024 * 1024 or total_bytes > 300 * 1024 * 1024:
+                  # The exact pinned workerd binary is 153,742,840 bytes.
+                  # Its path and bytes remain bound by the reviewed manifest digest.
+                  member_limit = 160 * 1024 * 1024 if relative == "node_modules/@cloudflare/workerd-linux-64/bin/workerd" else 64 * 1024 * 1024
+                  if size > member_limit or total_bytes > 300 * 1024 * 1024:
                       raise SystemExit("Wrangler runtime exceeds its size bound")
                   files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
           if len(files) < 100 or len(files) > 4096:
@@ -400,7 +420,8 @@ jobs:
               if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1:
                   raise SystemExit("Wrangler runtime member is not a regular file")
               total_bytes += metadata.st_size
-              if metadata.st_size > 64 * 1024 * 1024 or total_bytes > 300 * 1024 * 1024:
+              member_limit = 160 * 1024 * 1024 if name == "node_modules/@cloudflare/workerd-linux-64/bin/workerd" else 64 * 1024 * 1024
+              if metadata.st_size > member_limit or total_bytes > 300 * 1024 * 1024:
                   raise SystemExit("Wrangler runtime member exceeds its size bound")
               if hashlib.sha256(path.read_bytes()).hexdigest() != expected_digest:
                   raise SystemExit("Wrangler runtime member digest mismatch")
@@ -409,6 +430,16 @@ jobs:
               raise SystemExit("validated Wrangler CLI is missing")
           print("immutable Wrangler runtime accepted")
           PY
+
+      - name: Refuse a stale Draft release before Cloudflare writes
+        shell: bash
+        env:
+          TARGET_SHA: ${{ needs.detect-release.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          read -r current_sha current_ref <<< "$(git ls-remote --exit-code https://github.com/StrayForest/old_sparky.git refs/heads/dev)"
+          [[ "$current_ref" == "refs/heads/dev" && "$current_sha" == "$TARGET_SHA" ]]
 
       - name: Require Cloudflare deployment credentials
         shell: bash
@@ -451,11 +482,14 @@ jobs:
 
       - name: Deploy Worker, Static Assets and Durable Object
         env:
+          TARGET_SHA: ${{ needs.detect-release.outputs.target_sha }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           WRANGLER_CLI: ${{ runner.temp }}/draft-wrangler-runtime/node_modules/wrangler/wrangler-dist/cli.js
         run: |
           set -euo pipefail
+          read -r current_sha current_ref <<< "$(git ls-remote --exit-code https://github.com/StrayForest/old_sparky.git refs/heads/dev)"
+          [[ "$current_ref" == "refs/heads/dev" && "$current_sha" == "$TARGET_SHA" ]]
           cd "$RUNNER_TEMP/draft-release-bundle"
           test -f "$WRANGLER_CLI" && test ! -L "$WRANGLER_CLI"
           node "$WRANGLER_CLI" deploy --config "$RUNNER_TEMP/draft-release-bundle/wrangler.jsonc"
