@@ -179,18 +179,36 @@ class HostToolsBundleTests(unittest.TestCase):
             runner_temp = root / "runner-temp"
             runner_temp.mkdir()
             contract = self._installed_checker_contract(root)
+            private_key = self._temporary_ed25519_private_key(root)
             generation = f"{installed_check.GENERATION_ROOT}/{SOURCE_SHA}"
             digests, _modes, manifest_hash, capabilities_hash = installed_check._contract_rows(contract)
             expected_names = {"manifest.json", "capabilities.txt", *(path for _digest, path in digests)}
             payloads = {path: digest for digest, path in digests}
             payloads.update({"manifest.json": manifest_hash, "capabilities.txt": capabilities_hash})
+            ssh_dir = runner_temp / "platform-host-capability-ssh"
+            expected_host_key = "production.example.test ssh-ed25519 AAAA"
             capability = (
                 f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} dispatcher=4 artifact_prepare=2 "
                 "supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 "
                 "retained_load_source_binding=1 cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1\n"
             ).encode("ascii")
 
+            def local_command(argv: list[str], **_kwargs: object) -> bytes:
+                if argv[0] == "/usr/bin/timeout":
+                    self.assertEqual(
+                        argv,
+                        ["/usr/bin/timeout", "--foreground", "4s", "/usr/bin/ssh-keyscan", "-T", "3", "-t", "ed25519", "production.example.test"],
+                    )
+                    return f"# SSH-2.0-OpenSSH_10.2\n\n{expected_host_key}\n".encode("ascii")
+                if argv[:2] == ["/usr/bin/ssh-keygen", "-lf"]:
+                    self.assertEqual(argv[2:], [str(ssh_dir / "known_hosts.scan"), "-E", "sha256"])
+                    return f"256 {installed_check.HOST_KEY_FINGERPRINT} production.example.test (ED25519)\n".encode("ascii")
+                raise AssertionError(f"unexpected local SSH helper command: {argv!r}")
+
             def remote(_argv: list[str], *args: str, **kwargs: object) -> bytes:
+                self.assertEqual(_argv[:4], ["/usr/bin/ssh", "-n", "-T", "-o"])
+                self.assertIn("StrictHostKeyChecking yes", (ssh_dir / "config").read_text(encoding="ascii"))
+                self.assertEqual((ssh_dir / "known_hosts").read_text(encoding="ascii"), expected_host_key + "\n")
                 if args == ("/usr/bin/id", "-u"):
                     return b"0\n"
                 if args == ("/usr/bin/test", "-d", generation):
@@ -219,16 +237,63 @@ class HostToolsBundleTests(unittest.TestCase):
                     return capability
                 raise AssertionError(f"unexpected fixed remote command: {args!r}")
 
-            ssh_dir = runner_temp / "platform-host-capability-ssh"
-            with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}), patch.object(
-                installed_check, "_safe_host_ssh", return_value=(ssh_dir, ["ssh", "fixed"], True)
-            ), patch.object(installed_check, "_remote", side_effect=remote):
+            with patch.dict(
+                os.environ,
+                {
+                    "RUNNER_TEMP": str(runner_temp),
+                    "PROD_SSH_HOST": "production.example.test",
+                    "PROD_SSH_USER": "operator",
+                    "PROD_SSH_KEY": private_key,
+                },
+            ), patch.object(installed_check, "_run", side_effect=local_command), patch.object(
+                installed_check, "_remote", side_effect=remote
+            ):
                 checked_dir, checked_generation, created = installed_check.verify_installed_generation(
                     SOURCE_SHA, "production-host-tools-v4", contract
                 )
             self.assertEqual(checked_dir, ssh_dir)
             self.assertEqual(str(checked_generation), generation)
             self.assertTrue(created)
+            self.assertFalse(ssh_dir.exists())
+            valid = "production.example.test ssh-ed25519 AAAA"
+        invalid_outputs = (
+            b"",
+            b"# SSH-2.0-OpenSSH_10.2\n",
+            f"{valid}\n{valid}\n".encode("ascii"),
+            b"other.example.test ssh-ed25519 AAAA\n",
+            b"production.example.test ssh-rsa AAAA\n",
+            b"production.example.test ssh-ed25519\n",
+            b"production.example.test ssh-ed25519 AAAA extra\n",
+            b"production.example.test ssh-ed25519 AA!A\n",
+            b"production.example.test ssh-ed25519 AAAA\xff\n",
+        )
+        for output in invalid_outputs:
+            with self.subTest(output=output):
+                with self.assertRaises(installed_check.VerificationError):
+                    installed_check._parse_scanned_host_key(output, "production.example.test")
+        self.assertEqual(
+            installed_check._parse_scanned_host_key(
+                f"\n# SSH-2.0-OpenSSH_10.2\n{valid}\n".encode("ascii"),
+                "production.example.test",
+            ),
+            valid,
+        )
+        def wrong_fingerprint(argv: list[str], **_kwargs: object) -> bytes:
+            if argv[0] == "/usr/bin/timeout":
+                return f"# SSH-2.0-OpenSSH_10.2\n{valid}\n".encode("ascii")
+            if argv[:2] == ["/usr/bin/ssh-keygen", "-lf"]:
+                return b"256 SHA256:wrong production.example.test (ED25519)\n"
+            raise AssertionError(f"unexpected local SSH helper command: {argv!r}")
+
+        with tempfile.TemporaryDirectory() as mismatch_root:
+            mismatched_temp = Path(mismatch_root)
+            mismatched_temp.chmod(0o700)
+            with patch.object(installed_check, "_run", side_effect=wrong_fingerprint):
+                with self.assertRaisesRegex(installed_check.VerificationError, "does not match the pinned fingerprint"):
+                    installed_check._safe_host_ssh(
+                        "production.example.test", "operator", private_key, mismatched_temp
+                    )
+            self.assertFalse((mismatched_temp / "platform-host-capability-ssh").exists())
 
     def test_host_generation_checker_retries_only_missing_generation_and_cleans_after_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

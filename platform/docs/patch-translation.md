@@ -2,7 +2,7 @@
 
 - Status: Active / DB-first implementation deployed
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-10-21
 
 This document owns the contract for automatic Russian translation of Deadlock patch-note changes.
 
@@ -129,6 +129,15 @@ For prose, prefer Valve terminology and natural constructions. The model may inf
 10. Numeric values and tiers are compared against the English source.
 11. Successful translations are committed to PostgreSQL first, then written to Redis under `PATCH_TRANSLATION_VERSION` and served by the patch API.
 12. A Redis miss falls back to PostgreSQL; a missing database translation does not invoke OpenAI from the user request.
+
+## Parser and catalog cache changes
+
+When patch parsing or the game-asset catalog changes extracted segments, bump the relevant detail/catalog cache
+namespace so new reads cannot reuse stale structure. Preserve an exact-ID repair path for already-cached raw patch
+details: on a new-namespace miss, reparse that cached source with the current parser/catalog and publish under the
+new key, including a translation record keyed by the new source hash. A cold catalog may defer one bounded refresh
+for that exact patch ID; it must not fan out a full-history reprocess. A parser fix for future refreshes alone does
+not repair existing cached details, and existing translation rows are not automatically valid for changed segments.
 
 A translation-version bump intentionally invalidates previous translation result cache entries when the translation contract or canonical glossary changes.
 

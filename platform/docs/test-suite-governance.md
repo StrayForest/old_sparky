@@ -2,13 +2,14 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-20
+- Last reviewed: 2026-10-21
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
 requirements and CI membership. Use `list --json` when tooling needs the
 machine-readable registry. This document explains the architecture and
-placement rules; it does not repeat tool arguments. This checkout shares the production filesystem, so avoid duplicate local CI virtual environments and heavy local suites; hosted CI is authoritative, and focused local selectors require a disk-space and current-resource check.
+placement rules; it does not repeat tool arguments. This checkout shares production storage: inventory exact task-temp paths, sizes and open users; preserve small sanitized evidence.
+Coordinate exact-path cleanup with the release lead; never use broad globs. Avoid duplicate local environments/heavy suites; hosted CI is authoritative, and selectors require disk/resource checks.
 
 For a local change-impact plan, run from `platform/`:
 
@@ -477,15 +478,14 @@ The installer and generator sanitize ambient pip configuration through
 [`tools/platform_ci_pip_env.sh`](../tools/platform_ci_pip_env.sh), use only
 the canonical PyPI index, and never forward extra indexes, trusted hosts,
 find-links, certificate paths or proxy variables.
-The security dependency-audit gate also audits this complete lock, so the
-runtime, quality and security tool dependency sets are covered by one report.
-Each job's setup-python cache follows its lock; local bootstrap stays separate from
-the hash-locked CI gate. `backend-static`, `backend-integration`, `release-runtime`
-and `release-runtime-real` use `ubuntu-latest`; `backend-privileged` and
-`verification-contract` retain `ubuntu-24.04`. The release builder validates the
-setup-python 3.12 tool-cache path and ABI, copies it to root-owned mode-0700 storage,
-and restricts `LD_LIBRARY_PATH` to that copy. Both venvs use this copy; the
-git-archive artifact contains neither runtime copy nor venv.
+The dependency audit covers runtime, quality and security tool dependencies in the complete CI lock; setup-python caches follow their lock, and local bootstrap stays separate from hash-locked CI.
+`backend-static`, `backend-integration`, `release-runtime` and `release-runtime-real` use `ubuntu-latest`; `backend-privileged` and `verification-contract` remain on
+`ubuntu-24.04`. Keep jobs current and adapt fixtures/tooling to their contract. The privileged builder validates
+setup-python 3.12 source/ABI, copies to private root-owned storage, then restores prefix mode 0700 after `cp -a`.
+Check symlink containment, strip group/other write from copied non-symlinks and assert the predicate. Restrict
+`LD_LIBRARY_PATH` to the copy; both venv bases resolve inside it. Full smoke checks each command, ABI/layout,
+clean-env imports and both venvs; early-exit output is not a pass. Git archive excludes the copy/venv. Privileged
+tests set `PLATFORM_RELEASE_PYTHON` to their actual interpreter; fake venv probes answer metadata queries.
 
 GitHub Actions owns runner images, service containers, dependency bootstrap,
 parallelism, caches, artifacts, permissions, environment authorization and

@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-17
+- Last reviewed: 2026-10-21
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -180,9 +180,9 @@ Every production SSH boundary acquires the pinned Ed25519 host key with two
 visible attempts. Each attempt is a fresh mode-600 file, bounded by an outer
 four-second timeout and `ssh-keyscan -T 3`, and accepts exactly one nonblank,
 noncomment record with the exact host token, `ssh-ed25519` type and pinned
-SHA-256 fingerprint. This ignores only OpenSSH banner comments on stdout;
-malformed, multiple or mismatched key records fail closed. The 0.5-second
-backoff keeps the total acquisition budget at most 8.5 seconds. On failure,
+SHA-256 fingerprint. OpenSSH 10.2 emits its version banner as a stdout comment (9.6 emitted it on stderr);
+parsing ignores only blank/comment lines. Malformed, multiple or mismatched key records fail closed.
+The 0.5-second backoff keeps the total acquisition budget at most 8.5 seconds. On failure,
 diagnostics report only the scanner status, line/record counts and validation
 booleans; they never print the host token or key material. Strict host-key
 checking remains enabled and no TOFU or fallback path is permitted.

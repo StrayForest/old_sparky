@@ -104,6 +104,25 @@ def _contract_rows(contract_dir: Path) -> tuple[list[tuple[str, str]], list[tupl
     return digest_rows, mode_rows, manifest_hash, capabilities_hash
 
 
+def _parse_scanned_host_key(output: bytes, host: str) -> str:
+    try:
+        text = output.decode("ascii", "strict")
+    except UnicodeDecodeError as exc:
+        raise VerificationError("production SSH host-key response is malformed") from exc
+    records = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if len(records) != 1:
+        raise VerificationError("production SSH host-key response is malformed")
+    fields = records[0].split()
+    if (
+        len(fields) != 3
+        or fields[0] != host
+        or fields[1] != "ssh-ed25519"
+        or re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", fields[2]) is None
+    ):
+        raise VerificationError("production SSH host-key response is malformed")
+    return " ".join(fields)
+
+
 def _run(argv: list[str], *, timeout: int, max_output: int = MAX_REMOTE_OUTPUT) -> bytes:
     if type(timeout) is not int or timeout <= 0 or type(max_output) is not int or max_output <= 0:
         raise VerificationError("bounded host-tools verification command failed")
@@ -226,10 +245,7 @@ def _safe_host_ssh(host: str, user: str, key: str, temp_root: Path) -> tuple[Pat
 
         if created:
             scanned = _run(["/usr/bin/timeout", "--foreground", "4s", "/usr/bin/ssh-keyscan", "-T", "3", "-t", "ed25519", host], timeout=6)
-            lines = scanned.decode("ascii", "strict").splitlines()
-            if len(lines) != 1 or not lines[0].startswith(host + " ssh-ed25519 "):
-                raise VerificationError("production SSH host-key response is malformed")
-            scan_path.write_text(lines[0] + "\n", encoding="ascii")
+            scan_path.write_text(_parse_scanned_host_key(scanned, host) + "\n", encoding="ascii")
             scan_path.chmod(0o600)
             fingerprint_path = scan_path
         else:

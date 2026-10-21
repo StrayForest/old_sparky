@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-18
+- Last reviewed: 2026-10-21
 
 ## Ephemeral synthetic restore diagnostic
 
@@ -481,9 +481,10 @@ measurement and threshold, temporary-database creation and drop outcome. It reco
 after checking the exact drill database through the scratch admin connection. Missing evidence stays unknown; the
 receipt excludes database names, raw command output, exception text and credentials.
 
-A failed backup creation can stop at the disk-floor guard before or during `pg_dump`. Its root-private receipt records
-only the fixed phase/reason and available/required bytes (null when unavailable); it never records raw output or
-changes the disk floor, restore lead or backup-preservation behavior.
+A failed create can stop at the disk guard before/during `pg_dump`; its private receipt records fixed phase/reason and available/required bytes, never raw output.
+It does not change the guard or preservation policy. Compare receipt bytes; retry only after headroom and health checks pass.
+Use storage-retention preview/exact-candidate cleanup; preserve `current`, `previous`, protected releases and backups. Never use broad globs or lower the guard.
+Start one source-bound create during exact-SHA Security; it may wait. If either fails, fix the cause, start fresh Security, then bind one new create; never duplicate/rebind a completed attempt.
 
 For a failed create, run the read-only storage diagnostics workflow with that backup's exact run ID, attempt and
 source SHA plus the SHA currently deployed. It reads only the fixed `backup-failure-<run-id>-<attempt>.json` after
