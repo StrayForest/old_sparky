@@ -3,6 +3,7 @@ import type { PlatformDeadlockDreamSlot } from "./platform-types";
 export const deadlockHeroes = [
   "Abrams",
   "Apollo",
+  "Baba",
   "Bebop",
   "Billy",
   "Calico",

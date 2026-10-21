@@ -1,5 +1,5 @@
 import { buildRules, DEFAULT_CUSTOM_RULES, MAX_BANS_PER_TEAM, MAX_TEAM_NAME_LENGTH, validateSequence } from "./public/draft-core.js";
-import { HERO_BY_ID } from "./public/heroes.js";
+import { HEROES, HERO_BY_ID } from "./public/heroes.js";
 
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
 const COMPLETED_TTL_MS = 15 * 60 * 1000;
@@ -11,6 +11,9 @@ const MESSAGE_WINDOW_MS = 10_000;
 const MUTABLE_ASSETS = new Set(["/draft/app.js", "/draft/styles.css", "/draft/draft-core.js", "/draft/heroes.js"]);
 const KNOWN_PRESET_IDS = new Set(["standard", "community-6v6", "6v6-no-bans", "custom"]);
 const VALID_TIMER_SECONDS = new Set([30, 45, 60, 90]);
+const HERO_CATALOG_CACHE_MS = 5 * 60 * 1000;
+const MAX_HEROES = 100;
+const heroCatalogCache = new Map();
 
 export default {
   async fetch(request, env) {
@@ -20,6 +23,10 @@ export default {
     if (path === "/draft/api/rooms" && request.method === "POST") {
       if (!originAllowed(request, env)) return json({ error: "Недопустимый источник запроса" }, 403);
       return createRoom(request, env);
+    }
+    if (path === "/draft/api/heroes" && request.method === "GET") {
+      const heroes = await getHeroRoster(env);
+      return json({ heroes }, 200, { "cache-control": "no-store" });
     }
 
     const wsMatch = path.match(/^\/draft\/ws\/([A-Za-z0-9_-]{6,32})$/u);
@@ -67,7 +74,7 @@ export class DraftRoom {
     const payload = await request.json();
     const now = Date.now();
     const room = {
-      schema: 2,
+      schema: 3,
       status: "waiting",
       version: 1,
       rules: validateRules(payload.rules),
@@ -78,6 +85,7 @@ export class DraftRoom {
       currentStep: 0,
       picks: { A: [], B: [] },
       bans: { A: [], B: [] },
+      heroRoster: normalizeHeroRoster(payload.heroRoster) || fallbackHeroRoster(),
       ready: { A: false, B: false },
       turnStartedAt: null,
       turnDeadlineAt: null,
@@ -272,7 +280,7 @@ export class DraftRoom {
       this.sendError(ws, "Сейчас ход другой команды", room);
       return;
     }
-    if (typeof message.heroId !== "string" || !HERO_BY_ID.has(message.heroId)) {
+    if (typeof message.heroId !== "string" || !roomHeroIds(room).has(message.heroId)) {
       this.sendError(ws, "Неизвестный герой", room);
       return;
     }
@@ -438,6 +446,7 @@ async function createRoom(request, env) {
     A: cleanTeamName(payload?.teamNames?.A, "А"),
     B: cleanTeamName(payload?.teamNames?.B, "Б")
   };
+  const heroRoster = await getHeroRoster(env);
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const roomCode = randomToken(9).replaceAll("-", "").replaceAll("_", "").slice(0, 12);
@@ -447,7 +456,7 @@ async function createRoom(request, env) {
     const createResponse = await stub.fetch("https://draft-room.internal/create", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ rules, teamNames, hostToken, guestToken })
+      body: JSON.stringify({ rules, teamNames, hostToken, guestToken, heroRoster })
     });
     if (createResponse.status === 409) continue;
     if (!createResponse.ok) return json({ error: "Не удалось создать комнату" }, 503);
@@ -556,6 +565,7 @@ function publicRoom(room, presence = { A: false, B: false }) {
     currentStep: room.currentStep,
     picks: room.picks,
     bans: room.bans,
+    heroes: normalizeHeroRoster(room.heroRoster) || fallbackHeroRoster(),
     turnStartedAt: room.turnStartedAt,
     turnDeadlineAt: room.turnDeadlineAt,
   };
@@ -586,10 +596,197 @@ function maybeStartDraft(room, presence) {
 function advanceRoomWithAutoAction(room, now) {
   const step = room.rules.sequence[room.currentStep];
   if (!step) return false;
-  const heroId = [...HERO_BY_ID.keys()].find((candidate) => !heroUsed(room, candidate));
+  const heroId = (normalizeHeroRoster(room.heroRoster) || fallbackHeroRoster())
+    .map((hero) => hero.id)
+    .find((candidate) => !heroUsed(room, candidate));
   if (!heroId) return false;
   applyRoomAction(room, step, heroId, now);
   return true;
+}
+
+async function getHeroRoster(env) {
+  const endpoint = allowedGameAssetsUrl(env.GAME_ASSETS_URL);
+  if (!endpoint) return fallbackHeroRoster();
+  const cached = heroCatalogCache.get(endpoint);
+  if (cached && Date.now() - cached.checkedAt < HERO_CATALOG_CACHE_MS) {
+    return structuredClone(cached.heroes);
+  }
+  if (cached?.request) return cached.request;
+
+  const entry = { checkedAt: 0, heroes: cached?.heroes || fallbackHeroRoster(), request: null };
+  const request = (async () => {
+    try {
+      const response = await fetch(endpoint, {
+        headers: { accept: "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(2500),
+      });
+      if (!response.ok) throw new Error("hero catalog unavailable");
+      const payload = await readBoundedJson(response, 1_048_576);
+      const heroes = normalizeGameAssetRoster(payload?.heroes);
+      if (!heroes.length) throw new Error("hero catalog empty");
+      entry.checkedAt = Date.now();
+      entry.heroes = heroes;
+      return structuredClone(heroes);
+    } catch {
+      entry.checkedAt = Date.now();
+      entry.heroes = cached?.heroes || fallbackHeroRoster();
+      return structuredClone(entry.heroes);
+    } finally {
+      entry.request = null;
+    }
+  })();
+  entry.request = request;
+  heroCatalogCache.set(endpoint, entry);
+  return request;
+}
+
+function allowedGameAssetsUrl(value) {
+  if (typeof value !== "string" || value.length > 300) return "";
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== "old-sparky.com" ||
+      url.port ||
+      url.username ||
+      url.password ||
+      url.pathname !== "/api/v1/content/game-assets" ||
+      url.search ||
+      url.hash
+    ) return "";
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+async function readBoundedJson(response, maxBytes) {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new Error("hero catalog too large");
+  }
+  if (!response.body) throw new Error("hero catalog body missing");
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    totalBytes += value.byteLength;
+    if (totalBytes > maxBytes) {
+      await reader.cancel();
+      throw new Error("hero catalog too large");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function normalizeGameAssetRoster(value) {
+  if (!Array.isArray(value) || value.length > 200) return [];
+  const heroes = [];
+  const seenIds = new Set();
+  const seenNames = new Set();
+  for (const candidate of value) {
+    if (!candidate || typeof candidate.name !== "string") continue;
+    const name = candidate.name.trim();
+    if (!name || name.length > 120) continue;
+    const id = sourceHeroId(candidate, name);
+    const nameKey = name.toLocaleLowerCase("en-US");
+    if (!id || seenIds.has(id) || seenNames.has(nameKey)) continue;
+    seenIds.add(id);
+    seenNames.add(nameKey);
+    const fallback = HERO_BY_ID.get(id);
+    heroes.push({
+      id,
+      name,
+      image: safeHeroImage(candidate.image_url, fallback?.image, name),
+    });
+    if (heroes.length >= MAX_HEROES) break;
+  }
+  return heroes;
+}
+
+function normalizeHeroRoster(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_HEROES) return null;
+  const heroes = [];
+  const seenIds = new Set();
+  for (const candidate of value) {
+    if (!candidate || typeof candidate.name !== "string") return null;
+    const name = candidate.name.trim();
+    if (!name || name.length > 120) return null;
+    const id = sourceHeroId(candidate, name);
+    if (!id || candidate.id !== id || seenIds.has(id)) return null;
+    seenIds.add(id);
+    const fallback = HERO_BY_ID.get(id);
+    heroes.push({
+      id,
+      name,
+      image: safeHeroImage(candidate.image, fallback?.image, name),
+    });
+  }
+  return heroes;
+}
+
+function sourceHeroId(candidate, name) {
+  const sourceId = typeof candidate?.draft_id === "string"
+    ? candidate.draft_id
+    : typeof candidate?.slug === "string"
+    ? candidate.slug
+    : typeof candidate?.id === "string" || Number.isSafeInteger(candidate?.id)
+      ? String(candidate.id)
+      : heroIdFromName(name);
+  const id = sourceId.trim().toLocaleLowerCase("en-US");
+  return /^[a-z0-9]+(?:[_-][a-z0-9]+)*$/u.test(id) && id.length <= 80 ? id : null;
+}
+
+function safeHeroImage(value, fallback, name) {
+  if (typeof value === "string") {
+    try {
+      const url = new URL(value, "https://old-sparky.com");
+      const allowedLocal = url.origin === "https://old-sparky.com"
+        && url.pathname.startsWith("/api/v1/content/game-assets/heroes/")
+        && !url.search && !url.hash;
+      const allowedCdn = url.origin === "https://cdn.old-sparky.com"
+        && url.pathname.startsWith("/draft/heroes/v1/")
+        && !url.search && !url.hash;
+      if (allowedLocal || allowedCdn) return url.href === `https://old-sparky.com${url.pathname}`
+        ? url.pathname
+        : url.href;
+    } catch {
+      // Ignore invalid source image URLs and use the same-origin fallback.
+    }
+  }
+  if (typeof fallback === "string" && fallback) return fallback;
+  return `/api/v1/content/game-assets/heroes/${encodeURIComponent(name)}.png`;
+}
+
+function fallbackHeroRoster() {
+  return HEROES.map(({ id, name, image }) => ({ id, name, image }));
+}
+
+function roomHeroIds(room) {
+  return new Set((normalizeHeroRoster(room.heroRoster) || fallbackHeroRoster()).map(({ id }) => id));
+}
+
+function heroIdFromName(value) {
+  const name = typeof value === "string" ? value.trim() : "";
+  if (!name || name.length > 120) return null;
+  const id = name
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .replaceAll("&", " and ")
+    .toLocaleLowerCase("en-US")
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "");
+  return /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(id) && id.length <= 64 ? id : null;
 }
 
 function heroUsed(room, heroId) {

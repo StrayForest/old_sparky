@@ -19,11 +19,15 @@ import hashlib
 import os
 from pathlib import Path
 import sys
+import threading
 from typing import Callable, Iterable, Mapping
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 TESTS_ROOT = PLATFORM_ROOT / "tests"
+
+_DISCOVERY_CACHE_LOCK = threading.Lock()
+_DISCOVERY_CACHE: tuple[Path, bytes, tuple["TestCase", ...]] | None = None
 
 BACKEND_CONTOURS: tuple[str, ...] = (
     "backend-unit",
@@ -631,10 +635,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 171,
     "module_digest": "c0f368cefc4f365a817e2ec2b61e64f4f733a5a56568242c8236cdc3094ce21c",
-    "test_count": 2134,
-    "test_id_digest": "22aef42c4b76824fe6e775c92c513f2a0a3743e5fd48e75b24bbcc3e8e944501",
-    "backend_test_count": 2057,
-    "backend_test_id_digest": "075547db2f50403c1d63214c040b7e909fc83510e9c09539034a7f67315200c1",
+    "test_count": 2146,
+    "test_id_digest": "e9d45ef6609c3329c1f5afc4561f0b5b54ba7cc81cea92f613021054c895454b",
+    "backend_test_count": 2069,
+    "backend_test_id_digest": "61d907e1e3f6f2863eb9b217835caa578ce6cd1024512d3a5024b58d2d1fcd25",
     "verification_test_count": 77,
     "verification_test_id_digest": "b8fdeb78a3ac6733a0a47fc6b671bde197fda652a7064a6296c9b7ad36f0cea7",
     "verification_classifier_test_count": 41,
@@ -657,8 +661,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-unit": {
         "module_count": 48,
         "module_digest": "97da81814d431484c5023f96dab71a84df718c6a84c13b548142621d599335f6",
-        "test_count": 304,
-        "test_id_digest": "352037af9727673f603088d4e996f0e8d67f1682abbf24ddf5eb6ed225968517",
+        "test_count": 314,
+        "test_id_digest": "45936172568eeaacb907ba21a872d4222e1a42d4ef9375a62517165a051b9f27",
     },
     "backend-tool-contract": {
         "module_count": 52,
@@ -669,8 +673,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-integration": {
         "module_count": 41,
         "module_digest": "c5547c1d61ed9824ad5d58b11a7f5b08a409c50e1cfd47a2a44107c22ee0e6ee",
-        "test_count": 260,
-        "test_id_digest": "baef477986dbda481ca0c79a19694015fdc1cc6ea5b2ee0a32723fc5e310eaf6",
+        "test_count": 262,
+        "test_id_digest": "d6058717285a42ff732a43c18b4a181b01f487bd82e2691a87b1703aa8cf6066",
     },
     "backend-privileged": {
         "module_count": 27,
@@ -721,11 +725,52 @@ def _source_module(path: Path) -> str:
 def discover_test_cases(tests_root: Path = TESTS_ROOT) -> tuple[TestCase, ...]:
     """Discover test IDs without importing application modules."""
 
+    global _DISCOVERY_CACHE
+    root = Path(tests_root).resolve()
+    sources = tuple(
+        (path.name, path.read_bytes())
+        for path in sorted(root.glob("test_*.py"))
+    )
+    fingerprint = hashlib.sha256()
+    for name, source in sources:
+        fingerprint.update(name.encode("utf-8"))
+        fingerprint.update(b"\0")
+        fingerprint.update(source)
+        fingerprint.update(b"\0")
+    fingerprint.update(
+        repr(
+            (
+                tuple(sorted(EXTERNAL_MODULE_OWNERS.items())),
+                tuple(sorted(PERFORMANCE_MODULES)),
+                tuple(sorted(CLASS_CONTOUR_OVERRIDES.items())),
+                tuple(sorted(TEST_CONTOUR_OVERRIDES.items())),
+                tuple(sorted(PRIVILEGED_MODULES)),
+                tuple(sorted(TOOL_MODULES)),
+                tuple(sorted(UNIT_MODULES)),
+                tuple(sorted(KNOWN_TEST_MODULES)),
+            )
+        ).encode("utf-8")
+    )
+    digest = fingerprint.digest()
+
+    # Dispatch validates the inventory before every command and may also
+    # validate it again while rendering timeout diagnostics. Hash the current
+    # source bytes on each call so edits are never hidden, but avoid reparsing
+    # the same hundreds of modules into ASTs repeatedly in one process.
+    with _DISCOVERY_CACHE_LOCK:
+        if (
+            _DISCOVERY_CACHE is not None
+            and _DISCOVERY_CACHE[0] == root
+            and _DISCOVERY_CACHE[1] == digest
+        ):
+            return _DISCOVERY_CACHE[2]
+
     cases: list[TestCase] = []
-    for path in sorted(tests_root.glob("test_*.py")):
+    for name, source in sources:
+        path = root / name
         source_module = _source_module(path)
         module = _module_name(path)
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = ast.parse(source.decode("utf-8"), filename=str(path))
         for node in tree.body:
             if not isinstance(node, ast.ClassDef):
                 continue
@@ -746,7 +791,10 @@ def discover_test_cases(tests_root: Path = TESTS_ROOT) -> tuple[TestCase, ...]:
                         contour=_contour_for(source_module, node, method),
                     )
                 )
-    return tuple(cases)
+    result = tuple(cases)
+    with _DISCOVERY_CACHE_LOCK:
+        _DISCOVERY_CACHE = (root, digest, result)
+    return result
 
 
 def _contour_for(module: str, class_node: ast.ClassDef, method: ast.AST) -> str:

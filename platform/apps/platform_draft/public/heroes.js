@@ -3,6 +3,7 @@ export const HERO_CDN_BASE = "https://cdn.old-sparky.com/draft/heroes/v1";
 const entries = [
   ["abrams", "Abrams"],
   ["apollo", "Apollo"],
+  ["baba", "Baba"],
   ["bebop", "Bebop"],
   ["billy", "Billy"],
   ["calico", "Calico"],
@@ -44,7 +45,7 @@ const entries = [
 export const HEROES = entries.map(([id, name]) => ({
   id,
   name,
-  image: `${HERO_CDN_BASE}/${id}.webp`
+  image: id === "baba" ? "/api/v1/content/game-assets/heroes/Baba.png" : `${HERO_CDN_BASE}/${id}.webp`
 }));
 
 export const HERO_BY_ID = new Map(HEROES.map((hero) => [hero.id, hero]));

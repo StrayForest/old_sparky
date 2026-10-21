@@ -726,6 +726,8 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                 _Response(json_payload={"heroes": []}),
                 _Response(json_payload={"items": []}),
                 _Response(json_payload=[]),
+                _Response(json_payload=[]),
+                _Response(json_payload=[]),
                 RuntimeError("icon source unavailable"),
             ]
         )
@@ -736,16 +738,279 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         )
 
         self.assertEqual(catalog["objectives"], previous_catalog["objectives"])
-        self.assertEqual(client.get.await_count, 4)
+        self.assertEqual(client.get.await_count, 6)
 
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v6:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v7:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
-            "platform:home-content:patch-assets:v4",
+            "platform:home-content:patch-assets:v5",
         )
+        self.assertEqual(
+            home_content.PATCH_ASSET_CATALOG_STALE_KEY,
+            "platform:home-content:patch-assets-stale:v1",
+        )
+
+    def test_supplemental_asset_catalog_adds_baba_once_with_its_four_abilities(self) -> None:
+        baba_hero = {
+            "id": 88,
+            "class_name": "hero_baba",
+            "name": "Baba",
+            "player_selectable": True,
+            "development_state": "release",
+            "disabled": False,
+            "in_development": True,
+            "items": {
+                "signature1": "ability_baba_bubbling_brew",
+                "signature2": "ability_baba_bench_run",
+                "signature3": "ability_baba_hexing_brew",
+                "signature4": "ability_baba_ultimate_2",
+            },
+            "images": {
+                "icon_hero_card_webp": (
+                    "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.webp"
+                ),
+            },
+        }
+        baba_abilities = [
+            {
+                "id": ability_id,
+                "class_name": class_name,
+                "name": ability_name,
+                "type": "ability",
+                "hero": 88,
+                "image": (
+                    "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/baba/"
+                    f"{slug}.png"
+                ),
+            }
+            for ability_id, class_name, ability_name, slug in (
+                (1282689113, "ability_baba_bubbling_brew", "Threadsap", "threadsap"),
+                (3122124161, "ability_baba_bench_run", "Granny Long Legs", "strafing_run"),
+                (2003165630, "ability_baba_hexing_brew", "Baba's Brew", "teapot_brew"),
+                (299875845, "ability_baba_ultimate_2", "Feed The Birds", "pigeon_launcher"),
+            )
+        ]
+
+        catalog = home_content._build_asset_catalog(
+            {"heroes": []},
+            {"items": []},
+            supplemental_hero_payload=[baba_hero],
+            supplemental_item_payload=baba_abilities,
+        )
+        public_assets = home_content.public_deadlock_game_assets(catalog)
+
+        self.assertEqual([hero["name"] for hero in public_assets["heroes"]], ["Baba"])
+        self.assertEqual(public_assets["heroes"][0]["draft_id"], "baba")
+        self.assertEqual(catalog["heroes"]["baba"]["id"], 88)
+        self.assertEqual(catalog["heroes"]["baba"]["slug"], "baba")
+        self.assertEqual(
+            set(catalog["heroes"]["baba"]["abilities"]),
+            {"threadsap", "granny long legs", "baba's brew", "feed the birds"},
+        )
+        self.assertEqual(
+            catalog["heroes"]["baba"]["abilities"]["baba's brew"]["slug"],
+            "ability_baba_hexing_brew",
+        )
+
+        merged_primary = home_content._build_asset_catalog(
+            {"heroes": [{"displayName": {"english": "Baba"}, "slug": "baba", "abilities": []}]},
+            {"items": []},
+            supplemental_hero_payload=[baba_hero],
+            supplemental_item_payload=baba_abilities,
+        )
+        self.assertEqual(list(merged_primary["heroes"]), ["baba"])
+        self.assertEqual(merged_primary["heroes"]["baba"]["slug"], "baba")
+
+        renamed_primary = home_content._build_asset_catalog(
+            {
+                "heroes": [
+                    {
+                        "id": 88,
+                        "displayName": {"english": "Baba the Brave"},
+                        "slug": "hero_baba_alias",
+                        "abilities": [],
+                    }
+                ]
+            },
+            {"items": []},
+            supplemental_hero_payload=[baba_hero],
+            supplemental_item_payload=baba_abilities,
+        )
+        self.assertEqual(
+            len({
+                id(hero)
+                for hero in renamed_primary["heroes"].values()
+                if isinstance(hero, dict)
+            }),
+            1,
+        )
+
+    def test_supplemental_catalog_ignores_not_playable_or_not_released_heroes(self) -> None:
+        catalog = home_content._build_asset_catalog(
+            {"heroes": []},
+            {"items": []},
+            supplemental_hero_payload=[
+                {
+                    "id": 88,
+                    "class_name": "hero_baba",
+                    "name": "Baba",
+                    "player_selectable": True,
+                    "development_state": "release",
+                    "disabled": False,
+                },
+                {
+                    "id": 89,
+                    "class_name": "hero_unreleased",
+                    "name": "Unreleased",
+                    "player_selectable": True,
+                    "development_state": "development",
+                    "disabled": False,
+                },
+                {
+                    "id": 90,
+                    "class_name": "hero_disabled",
+                    "name": "Disabled",
+                    "player_selectable": True,
+                    "development_state": "release",
+                    "disabled": True,
+                },
+            ],
+            supplemental_item_payload=[],
+        )
+
+        self.assertEqual(list(catalog["heroes"]), ["baba"])
+
+    def test_supplemental_catalog_adds_new_abilities_to_primary_heroes_without_id_drift(self) -> None:
+        primary_hero = {
+            "displayName": {"english": "Apollo"},
+            "slug": "apollo",
+            "abilities": [
+                {
+                    "displayName": {"english": "Old Skill"},
+                    "slug": "ability_apollo_new_skill",
+                    "assets": {"icon": {"publicPath": "/assets/game/abilities/old_skill.png"}},
+                }
+            ],
+        }
+        supplemental_hero = {
+            "id": 2,
+            "class_name": "hero_apollo",
+            "name": "Apollo",
+            "player_selectable": True,
+            "development_state": "release",
+            "disabled": False,
+            "items": {"signature1": "ability_apollo_new_skill"},
+        }
+        supplemental_item = {
+            "id": 777,
+            "class_name": "ability_apollo_new_skill",
+            "name": "New Skill",
+            "type": "ability",
+            "hero": 2,
+            "image": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/new_skill.png",
+        }
+        catalog = home_content._build_asset_catalog(
+            {"heroes": [primary_hero]},
+            {"items": []},
+            supplemental_hero_payload=[supplemental_hero],
+            supplemental_item_payload=[supplemental_item],
+        )
+
+        self.assertEqual(list(catalog["heroes"]), ["apollo"])
+        self.assertEqual(catalog["heroes"]["apollo"]["id"], 2)
+        self.assertEqual(catalog["heroes"]["apollo"]["slug"], "apollo")
+        self.assertEqual(set(catalog["heroes"]["apollo"]["abilities"]), {"new skill"})
+        self.assertEqual(
+            catalog["heroes"]["apollo"]["abilities"]["new skill"]["slug"],
+            "ability_apollo_new_skill",
+        )
+        self.assertEqual(catalog["heroes"]["apollo"]["abilities"]["new skill"]["id"], 777)
+        self.assertEqual(
+            catalog["heroes"]["apollo"]["abilities"]["new skill"]["aliases"],
+            ["Old Skill"],
+        )
+
+    def test_supplemental_source_outage_keeps_last_good_hero_but_valid_removal_drops_it(self) -> None:
+        previous = home_content._build_asset_catalog(
+            {"heroes": []},
+            {"items": []},
+            supplemental_hero_payload=[
+                {
+                    "id": 88,
+                    "class_name": "hero_baba",
+                    "name": "Baba",
+                    "player_selectable": True,
+                    "development_state": "release",
+                    "disabled": False,
+                }
+            ],
+            supplemental_item_payload=[],
+        )
+        outage = home_content._build_asset_catalog(
+            {"heroes": []},
+            {"items": []},
+            supplemental_hero_payload=None,
+            supplemental_item_payload=[],
+            previous_catalog=previous,
+        )
+        removed = home_content._build_asset_catalog(
+            {"heroes": []},
+            {"items": []},
+            supplemental_hero_payload=[
+                {
+                    "id": 88,
+                    "class_name": "hero_baba",
+                    "name": "Baba",
+                    "player_selectable": False,
+                    "development_state": "release",
+                    "disabled": True,
+                }
+            ],
+            supplemental_item_payload=[],
+            previous_catalog=previous,
+        )
+
+        self.assertEqual(list(outage["heroes"]), ["baba"])
+        self.assertEqual(outage["heroes"]["baba"]["id"], 88)
+        self.assertEqual(removed["heroes"], {})
+
+    async def test_empty_supplemental_api_payload_is_treated_as_outage(self) -> None:
+        previous = {
+            "heroes": {
+                "baba": {
+                    "id": 88,
+                    "class_name": "hero_baba",
+                    "name": "Baba",
+                    "slug": "baba",
+                    "source": "deadlock-api",
+                    "abilities": {},
+                }
+            },
+            "items": {},
+            "ranks": {},
+            "objectives": {},
+        }
+        client = Mock()
+        client.get = AsyncMock(
+            side_effect=[
+                _Response(json_payload={"heroes": []}),
+                _Response(json_payload={"items": []}),
+                _Response(json_payload=[]),
+                _Response(json_payload=[]),
+                _Response(json_payload=[]),
+                _Response(json_payload={}),
+            ]
+        )
+
+        catalog = await home_content._fetch_deadlock_asset_catalog(
+            client,
+            previous_catalog=previous,
+        )
+
+        self.assertEqual(catalog["heroes"]["baba"]["id"], 88)
 
     def test_asset_catalog_supports_both_doorman_names(self) -> None:
         catalog = home_content._build_asset_catalog(

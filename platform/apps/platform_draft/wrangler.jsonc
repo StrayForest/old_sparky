@@ -31,6 +31,7 @@
   ],
   "vars": {
     "ALLOWED_ORIGIN": "https://old-sparky.com",
-    "HERO_CDN_BASE": "https://cdn.old-sparky.com/draft/heroes/v1"
+    "HERO_CDN_BASE": "https://cdn.old-sparky.com/draft/heroes/v1",
+    "GAME_ASSETS_URL": "https://old-sparky.com/api/v1/content/game-assets"
   }
 }

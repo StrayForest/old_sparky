@@ -11,7 +11,7 @@
     },
     {
       "path": "requirements-platform.txt",
-      "sha256": "3c68a7506e3aeddf89f8478e3fc7bb6cbb4eb5cf48788d0e384e077b475a4d74"
+      "sha256": "3538dd122319da493d8ae3a5f5a2955ed857af3987ef8bfe809a92161568a18b"
     },
     {
       "path": "requirements-quality.txt",
@@ -19,7 +19,7 @@
     }
   ],
   "lock_file": "requirements-ci.lock.txt",
-  "lock_sha256": "87e8d9c9019c79b8278e1056d98be801b0fd04414a03e180ad57f93464858a6f",
+  "lock_sha256": "36659e8229a9ce96786781c36ab962421a8fb537186b0e00487f5074f2290c33",
   "schema": 1,
   "target": {
     "architecture": "x86_64",

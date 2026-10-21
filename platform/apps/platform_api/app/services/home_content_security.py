@@ -54,6 +54,11 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
             )
 
         asset_catalog = await base._read_json(cache, base.PATCH_ASSET_CATALOG_KEY)
+        stale_asset_catalog = await base._read_json(
+            cache,
+            base.PATCH_ASSET_CATALOG_STALE_KEY,
+        )
+        previous_asset_catalog = asset_catalog or stale_asset_catalog
         timeout = httpx.Timeout(settings.platform_external_content_timeout_seconds)
         async with BoundedNoRedirectAsyncClient(timeout=timeout) as client:
             steam_result, youtube_result = await asyncio.gather(
@@ -73,11 +78,12 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
                 )
             )
             asset_result = asset_catalog
-            if asset_catalog is None or has_new_patch:
+            refresh_asset_catalog = asset_catalog is None or has_new_patch or force
+            if refresh_asset_catalog:
                 try:
                     asset_result = await base._fetch_deadlock_asset_catalog(
                         client,
-                        previous_catalog=asset_catalog,
+                        previous_catalog=previous_asset_catalog,
                     )
                 except Exception as error:  # noqa: BLE001
                     asset_result = error
@@ -99,7 +105,7 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
             patches = stale_patches
         else:
             patches, raw_patch_details = steam_result
-            resolved_catalog = asset_catalog if isinstance(asset_catalog, dict) else {}
+            resolved_catalog = previous_asset_catalog if isinstance(previous_asset_catalog, dict) else {}
             if not isinstance(asset_result, Exception):
                 resolved_catalog = asset_result
             patch_details = {
@@ -136,17 +142,23 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
                 ex=settings.platform_home_content_stale_seconds,
             )
             if (
-                (asset_catalog is None or has_new_patch)
+                (asset_catalog is None or has_new_patch or force)
                 and not isinstance(asset_result, Exception)
             ):
+                encoded_asset_catalog = json.dumps(
+                    asset_result,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
                 pipeline.set(
                     base.PATCH_ASSET_CATALOG_KEY,
-                    json.dumps(
-                        asset_result,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
+                    encoded_asset_catalog,
                     ex=base.PATCH_ASSET_CATALOG_TTL_SECONDS,
+                )
+                pipeline.set(
+                    base.PATCH_ASSET_CATALOG_STALE_KEY,
+                    encoded_asset_catalog,
+                    ex=base.PATCH_ASSET_CATALOG_STALE_TTL_SECONDS,
                 )
             for patch_id, content in patch_details.items():
                 pipeline.set(

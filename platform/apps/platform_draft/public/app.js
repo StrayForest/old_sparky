@@ -41,6 +41,8 @@ let reconnectHandle = null;
 let timerHandle = null;
 let deadlineSentVersion = null;
 let lastError = "";
+let heroCatalog = [...HEROES];
+let heroCatalogPromise = null;
 
 window.addEventListener("popstate", () => route());
 window.addEventListener("beforeunload", () => closeSocket());
@@ -58,6 +60,7 @@ function route() {
     runtimeMode = null;
     room = null;
     renderCreate();
+    void loadHeroCatalog();
     return;
   }
   if (path === "/draft/solo") {
@@ -70,8 +73,17 @@ function route() {
     }
     room = stored;
     seat = { role: "solo", token: null };
+    if (!Array.isArray(room.heroes) || !room.heroes.length) room.heroes = [...heroCatalog];
     renderRoom();
     startTimer();
+    const currentRoom = room;
+    void loadHeroCatalog().then((heroes) => {
+      if (runtimeMode !== "solo" || room !== currentRoom || !room || stored.heroes?.length) return;
+      room.heroes = heroes;
+      sessionStorage.setItem(SOLO_KEY, JSON.stringify(room));
+      renderRoom();
+      startTimer();
+    });
     return;
   }
   const match = path.match(/^\/draft\/(?!result\/?$)([A-Za-z0-9_-]{6,32})\/?$/u);
@@ -273,11 +285,13 @@ async function createDraft() {
   error.innerHTML = "";
 
   try {
+    const availableHeroes = await loadHeroCatalog();
     const customRules = currentCustomRules();
     const firstMove = resolveLocalFirstSide(selectedFirstMove);
     const rules = buildRules("standard", selectedTimer, { ...customRules, firstSide: firstMove });
     if (createMode === "solo") {
       room = createLocalRoom(rules);
+      room.heroes = availableHeroes;
       sessionStorage.setItem(SOLO_KEY, JSON.stringify(room));
       history.pushState({}, "", "/draft/solo");
       route();
@@ -310,6 +324,72 @@ function resolveLocalFirstSide(value) {
   const bytes = new Uint8Array(1);
   crypto.getRandomValues(bytes);
   return bytes[0] % 2 === 0 ? "A" : "B";
+}
+
+function loadHeroCatalog() {
+  if (heroCatalogPromise) return heroCatalogPromise;
+  heroCatalogPromise = (async () => {
+    try {
+      const response = await fetch("/draft/api/heroes", {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(3500)
+      });
+      if (!response.ok) return heroCatalog;
+      const payload = await safeJson(response);
+      const heroes = normalizeClientHeroRoster(payload?.heroes);
+      if (heroes?.length) heroCatalog = heroes;
+    } catch {
+      // The bundled roster keeps Draft usable when the game-assets API is down.
+    }
+    return heroCatalog;
+  })().finally(() => {
+    heroCatalogPromise = null;
+  });
+  return heroCatalogPromise;
+}
+
+function normalizeClientHeroRoster(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) return null;
+  const heroes = [];
+  const seenIds = new Set();
+  const seenNames = new Set();
+  for (const candidate of value) {
+    if (!candidate || typeof candidate.name !== "string" || typeof candidate.id !== "string") return null;
+    const name = candidate.name.trim();
+    const id = candidate.id.trim().toLocaleLowerCase("en-US");
+    const nameKey = name.toLocaleLowerCase("en-US");
+    if (!name || name.length > 120 || !/^[a-z0-9]+(?:[_-][a-z0-9]+)*$/u.test(id) || id.length > 80) return null;
+    if (seenIds.has(id) || seenNames.has(nameKey)) continue;
+    seenIds.add(id);
+    seenNames.add(nameKey);
+    const fallback = HERO_BY_ID.get(id);
+    heroes.push({
+      id,
+      name,
+      image: safeDraftHeroImage(candidate.image, fallback?.image, name)
+    });
+  }
+  return heroes.length ? heroes : null;
+}
+
+function safeDraftHeroImage(value, fallback, name) {
+  if (typeof value === "string") {
+    try {
+      const url = new URL(value, location.origin);
+      const allowedLocal = url.origin === location.origin
+        && url.pathname.startsWith("/api/v1/content/game-assets/heroes/")
+        && !url.search && !url.hash;
+      const allowedCdn = url.origin === "https://cdn.old-sparky.com"
+        && url.pathname.startsWith("/draft/heroes/v1/")
+        && !url.search && !url.hash;
+      if (allowedLocal || allowedCdn) return url.href.startsWith(location.origin)
+        ? url.pathname
+        : url.href;
+    } catch {
+      // Invalid source URLs fall back to a same-origin game-asset image.
+    }
+  }
+  return fallback || `/api/v1/content/game-assets/heroes/${encodeURIComponent(name)}.png`;
 }
 
 function renderLoadingRoom() {
@@ -388,7 +468,8 @@ function renderRoom() {
 
   const step = currentStep(room);
   const canAct = canCurrentSeatAct(step);
-  const selectedHero = selectedHeroId ? HERO_BY_ID.get(selectedHeroId) : null;
+  const roomHeroes = currentRoomHeroes();
+  const selectedHero = selectedHeroId ? findRoomHero(selectedHeroId) : null;
   const timerText = formatTimer(room);
   const roleLabel = runtimeMode === "solo" ? "Соло" : seat.role === "host" ? teamLabel("A") : seat.role === "guest" ? teamLabel("B") : "Зритель";
   const activeSide = step?.side || null;
@@ -435,7 +516,7 @@ function renderRoom() {
         <section class="draft-center-column">
           <section class="panel hero-panel">
             ${showHeroes ? `<div class="hero-grid">
-              ${HEROES.map((hero) => renderHeroCard(hero, canAct)).join("")}
+              ${roomHeroes.map((hero) => renderHeroCard(hero, canAct)).join("")}
             </div>` : `<div class="hero-complete-state"><span class="hero-complete-state__mark">✓</span><strong>Драфт завершён</strong><span>Пики и баны показаны по сторонам</span></div>`}
             ${room.status === "completed" ? renderCompletedActions("mobile-side") : renderActionBar(selectedHero, step, canAct, "mobile-side")}
           </section>
@@ -481,15 +562,15 @@ function renderTeamPanel(side) {
 }
 
 function renderMobileTeam(side) {
-  const picks = room.picks[side].map((id) => HERO_BY_ID.get(id)?.name || id).join(", ") || "пиков нет";
-  const bans = room.bans[side].map((id) => HERO_BY_ID.get(id)?.name || id).join(", ") || "банов нет";
+  const picks = room.picks[side].map((id) => findRoomHero(id)?.name || id).join(", ") || "пиков нет";
+  const bans = room.bans[side].map((id) => findRoomHero(id)?.name || id).join(", ") || "банов нет";
   return `<div class="mobile-team-summary"><strong>${escapeHtml(room.teamNames[side])}</strong><span>${escapeHtml(picks)} · ${escapeHtml(bans)}</span></div>`;
 }
 
 function renderMiniHero(heroId, kind = "pick") {
-  const hero = HERO_BY_ID.get(heroId);
+  const hero = findRoomHero(heroId);
   if (!hero) return "";
-  return `<div class="mini-hero mini-hero--${kind}" title="${escapeAttr(hero.name)}"><img src="${hero.image}" alt="" width="54" height="54" loading="lazy" /><span class="sr-only">${escapeHtml(hero.name)}</span></div>`;
+  return `<div class="mini-hero mini-hero--${kind}" title="${escapeAttr(hero.name)}"><img src="${escapeAttr(hero.image)}" alt="" width="54" height="54" loading="lazy" /><span class="sr-only">${escapeHtml(hero.name)}</span></div>`;
 }
 
 function renderEmptySlot(kind = "pick") {
@@ -508,11 +589,11 @@ function renderHeroCard(hero, canAct) {
     <button
       class="hero-card ${selected ? "selected" : ""} ${used ? "used" : ""}"
       type="button"
-      data-hero="${hero.id}"
+      data-hero="${escapeAttr(hero.id)}"
       ${disabled ? "disabled" : ""}
       aria-label="${escapeAttr(hero.name)}${stateLabel ? ` — ${stateLabel}` : ""}"
     >
-      <img src="${hero.image}" alt="" width="192" height="224" loading="lazy" decoding="async" />
+      <img src="${escapeAttr(hero.image)}" alt="" width="192" height="224" loading="lazy" decoding="async" />
       ${stateLabel ? `<span class="hero-state ${state}">${stateLabel}</span>` : ""}
       <span class="hero-name">${escapeHtml(hero.name)}</span>
     </button>
@@ -524,6 +605,16 @@ function heroUsageState(heroId) {
   if (room.picks.A.includes(heroId)) return "picked-a";
   if (room.picks.B.includes(heroId)) return "picked-b";
   return "available";
+}
+
+function currentRoomHeroes() {
+  return normalizeClientHeroRoster(room?.heroes) || heroCatalog;
+}
+
+function findRoomHero(heroId) {
+  return currentRoomHeroes().find((hero) => hero.id === heroId)
+    || HERO_BY_ID.get(heroId)
+    || null;
 }
 
 function stepHasCapacity(step) {
@@ -577,7 +668,7 @@ function renderActionBar(selectedHero, step, canAct, variant = "default") {
   return `
     <div class="action-bar action-bar--${variant}">
       <div class="selected-summary">
-        ${selectedHero ? `<img src="${selectedHero.image}" alt="" width="46" height="46" /><div><strong>${escapeHtml(selectedHero.name)}</strong><br /><span>${step?.action === "ban" ? "Будет забанен" : "Будет выбран"}</span></div>` : `<span>${escapeHtml(unavailableReason)}</span>`}
+        ${selectedHero ? `<img src="${escapeAttr(selectedHero.image)}" alt="" width="46" height="46" /><div><strong>${escapeHtml(selectedHero.name)}</strong><br /><span>${step?.action === "ban" ? "Будет забанен" : "Будет выбран"}</span></div>` : `<span>${escapeHtml(unavailableReason)}</span>`}
       </div>
       <button id="${variant === "mobile-side" ? "confirm-action-mobile" : "confirm-action"}" data-confirm-action class="confirm-button" type="button" aria-label="${escapeAttr(selectedHero ? `${action} ${selectedHero.name}` : unavailableReason)}" ${!selectedHero || !canAct ? "disabled" : ""}>${buttonLabel}</button>
     </div>
@@ -804,7 +895,7 @@ function updateTimer() {
   if (remaining > 0 || deadlineSentVersion === room.version) return;
   deadlineSentVersion = room.version;
   if (runtimeMode === "solo") {
-    room = applyLocalTimeout(room, HEROES.map((hero) => hero.id));
+    room = applyLocalTimeout(room, currentRoomHeroes().map((hero) => hero.id));
     sessionStorage.setItem(SOLO_KEY, JSON.stringify(room));
     renderRoom();
     startTimer();

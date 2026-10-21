@@ -23,6 +23,7 @@ CAPTAIN_PRIORITY_ELIGIBLE_RANKS = set(RANKS)
 POOL_LIST = [
     "Abrams",
     "Apollo",
+    "Baba",
     "Bebop",
     "Billy",
     "Calico",

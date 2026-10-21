@@ -11,6 +11,11 @@ _ENTITY_DELIMITERS = " \t:-–—"
 _FLATTENED_ENTITY_BULLET_RE = re.compile(
     r"\s+-\s+(?=[A-Z][A-Za-z0-9 '&()./–—-]{0,80}:)"
 )
+_PATCH_ABILITY_ALIASES = {
+    # Rocket Jumping is a named patch-note mechanic of Deadman Danny's
+    # Chimera Mk1 jetpack, not a separate selectable ability in the game data.
+    "deadman danny": {"rocket jumping": "chimera mk1"},
+}
 
 
 def _patch_lines(content: str) -> list[str]:
@@ -92,14 +97,36 @@ def _match_ability(
 ) -> tuple[str, str] | None:
     abilities = hero.get("abilities") or {}
     lowered = line.casefold()
-    for alias in sorted(abilities, key=len, reverse=True):
+    hero_name = str(hero.get("name") or "").casefold()
+    aliases = {
+        str(alias).casefold(): str(alias)
+        for alias in abilities
+    }
+    for alias, ability in abilities.items():
+        if not isinstance(ability, dict):
+            continue
+        display_name = str(ability.get("name") or "").strip()
+        if display_name:
+            aliases.setdefault(display_name.casefold(), str(alias))
+        extra_aliases = ability.get("aliases") or []
+        if isinstance(extra_aliases, str):
+            extra_aliases = [extra_aliases]
+        for extra_alias in extra_aliases:
+            if isinstance(extra_alias, str) and extra_alias.strip():
+                aliases.setdefault(extra_alias.strip().casefold(), str(alias))
+    patch_aliases = _PATCH_ABILITY_ALIASES.get(hero_name, {})
+    for patch_alias, canonical_alias in patch_aliases.items():
+        if canonical_alias in aliases:
+            aliases[patch_alias] = aliases[canonical_alias]
+
+    for alias in sorted(aliases, key=len, reverse=True):
         if lowered == alias:
-            return alias, ""
+            return aliases[alias], ""
         if not lowered.startswith(alias):
             continue
         suffix = line[len(alias):]
         if suffix and suffix[0] in _ENTITY_DELIMITERS:
-            return alias, suffix.lstrip(_ENTITY_DELIMITERS).strip()
+            return aliases[alias], suffix.lstrip(_ENTITY_DELIMITERS).strip()
     return None
 
 
@@ -147,16 +174,20 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
 
     current_scope: str | None = None
     current_hero_key: str | None = None
+    current_hero_alias: str | None = None
     current_item_key: str | None = None
     current_ability_alias: str | None = None
+    current_general_ability_pending = False
 
     for line in _patch_lines(str(raw.get("content") or "")):
         scope_heading = base._patch_scope_heading(line)
         if scope_heading is not None:
             current_scope = scope_heading
             current_hero_key = None
+            current_hero_alias = None
             current_item_key = None
             current_ability_alias = None
+            current_general_ability_pending = False
             continue
 
         if current_scope == "heroes":
@@ -165,8 +196,10 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                 hero_alias, remainder = hero_match
                 hero = hero_catalog[hero_alias]
                 current_hero_key, section = _hero_section(hero_sections, hero, hero_alias)
+                current_hero_alias = hero_alias
                 current_item_key = None
                 current_ability_alias = None
+                current_general_ability_pending = False
                 if remainder:
                     ability_match = _match_ability(remainder, hero)
                     if ability_match is None:
@@ -182,6 +215,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                             ability_section["changes"].extend(
                                 base._change_chunks(ability_change)
                             )
+                        current_general_ability_pending = not ability_change
                 continue
 
             if current_hero_key is not None:
@@ -228,7 +262,9 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                 item = item_catalog[item_alias]
                 current_item_key, section = _item_section(item_sections, item, item_alias)
                 current_hero_key = None
+                current_hero_alias = None
                 current_ability_alias = None
+                current_general_ability_pending = False
                 if remainder:
                     section["changes"].extend(base._change_chunks(remainder))
                 continue
@@ -237,6 +273,64 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                 continue
 
         if current_scope == "general":
+            # Valve sometimes places hero changes in the [General] block. Route
+            # catalogued hero prefixes into their hero section while preserving
+            # unlabelled general changes. A bare follow-up line is consumed only
+            # when the immediately preceding hero line was an ability heading.
+            hero_match = _match_named_line(line, hero_catalog)
+            if hero_match is not None:
+                hero_alias, remainder = hero_match
+                hero = hero_catalog[hero_alias]
+                current_hero_key, section = _hero_section(hero_sections, hero, hero_alias)
+                current_hero_alias = hero_alias
+                current_item_key = None
+                current_ability_alias = None
+                current_general_ability_pending = False
+                if remainder:
+                    ability_match = _match_ability(remainder, hero)
+                    if ability_match is None:
+                        section["changes"].extend(base._change_chunks(remainder))
+                    else:
+                        current_ability_alias, ability_change = ability_match
+                        ability_section = _ability_section(
+                            section,
+                            hero,
+                            current_ability_alias,
+                        )
+                        if ability_change:
+                            ability_section["changes"].extend(
+                                base._change_chunks(ability_change)
+                            )
+                        current_general_ability_pending = not ability_change
+                continue
+
+            if current_hero_alias is not None:
+                hero = hero_catalog.get(current_hero_alias)
+                if isinstance(hero, dict) and current_hero_key is not None:
+                    section = hero_sections[current_hero_key]
+                    if current_general_ability_pending and current_ability_alias is not None:
+                        _ability_section(
+                            section,
+                            hero,
+                            current_ability_alias,
+                        )["changes"].extend(base._change_chunks(line))
+                        current_general_ability_pending = False
+                        continue
+                    ability_match = _match_ability(line, hero)
+                    if ability_match is not None:
+                        current_ability_alias, ability_change = ability_match
+                        ability_section = _ability_section(
+                            section,
+                            hero,
+                            current_ability_alias,
+                        )
+                        if ability_change:
+                            ability_section["changes"].extend(
+                                base._change_chunks(ability_change)
+                            )
+                        current_general_ability_pending = not ability_change
+                        continue
+
             general_changes.extend(base._change_chunks(line))
             continue
 
@@ -254,6 +348,11 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                 # into translation instead of becoming ambiguous fragments.
                 objective_change = line
         if objective_key is not None:
+            current_hero_key = None
+            current_hero_alias = None
+            current_item_key = None
+            current_ability_alias = None
+            current_general_ability_pending = False
             definition = base.OBJECTIVE_DEFINITIONS[objective_key]
             objective = objective_catalog.get(objective_key)
             objective_icon_url = (
@@ -281,6 +380,11 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         if item_match is not None:
             item_alias, remainder = item_match
             _, section = _item_section(item_sections, item_catalog[item_alias], item_alias)
+            current_hero_key = None
+            current_hero_alias = None
+            current_item_key = item_alias
+            current_ability_alias = None
+            current_general_ability_pending = False
             if remainder:
                 section["changes"].extend(base._change_chunks(remainder))
             continue
@@ -289,19 +393,39 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         if hero_match is not None:
             hero_alias, remainder = hero_match
             hero = hero_catalog[hero_alias]
-            _, section = _hero_section(hero_sections, hero, hero_alias)
+            current_hero_key, section = _hero_section(hero_sections, hero, hero_alias)
+            current_hero_alias = hero_alias
+            current_item_key = None
+            current_ability_alias = None
+            current_general_ability_pending = False
             if remainder:
                 ability_match = _match_ability(remainder, hero)
                 if ability_match is None:
                     section["changes"].extend(base._change_chunks(remainder))
                 else:
-                    ability_alias, ability_change = ability_match
-                    ability_section = _ability_section(section, hero, ability_alias)
+                    current_ability_alias, ability_change = ability_match
+                    ability_section = _ability_section(section, hero, current_ability_alias)
                     if ability_change:
                         ability_section["changes"].extend(
                             base._change_chunks(ability_change)
                         )
+                    else:
+                        current_general_ability_pending = True
             continue
+
+        # Older Steam posts often omit [Heroes] and flatten an ability heading
+        # plus its following change into separate dash-delimited lines. Preserve
+        # just the immediately following line for that ability; explicit entity
+        # prefixes above reset this state, so it cannot leak into another hero.
+        if current_general_ability_pending and current_hero_alias is not None:
+            hero = hero_catalog.get(current_hero_alias)
+            if isinstance(hero, dict) and current_hero_key is not None and current_ability_alias is not None:
+                section = hero_sections[current_hero_key]
+                _ability_section(section, hero, current_ability_alias)["changes"].extend(
+                    base._change_chunks(line)
+                )
+                current_general_ability_pending = False
+                continue
 
         general_changes.extend(base._change_chunks(line))
 

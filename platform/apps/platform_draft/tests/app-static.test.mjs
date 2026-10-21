@@ -102,3 +102,12 @@ test("mobile draft has a rotate prompt and a dedicated side action control", () 
   assert.match(stylesSource, /\.room-view \.sequence-editor--live/u);
   assert.match(stylesSource, /max-width: 820px\) and \(orientation: portrait\)[\s\S]*?\.room-view \.sequence-editor--live \{\s*display: none;/u);
 });
+
+test("solo and online screens use the refreshed or room-pinned hero roster", () => {
+  assert.match(appSource, /fetch\("\/draft\/api\/heroes"/u);
+  assert.match(appSource, /room\.heroes = availableHeroes/u);
+  assert.match(appSource, /currentRoomHeroes\(\)/u);
+  assert.match(appSource, /roomHeroes\.map\(\(hero\) => renderHeroCard/u);
+  assert.match(appSource, /applyLocalTimeout\(room, currentRoomHeroes\(\)\.map/u);
+  assert.match(workerSource, /heroes: normalizeHeroRoster\(room\.heroRoster\) \|\| fallbackHeroRoster\(\)/u);
+});

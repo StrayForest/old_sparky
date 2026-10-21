@@ -30,7 +30,9 @@ The site already uses Cloudflare in front of `old-sparky.com` and delivers publi
   automatically applies the first unused hero for the current pick or ban;
   timeout never pauses a room.
 - The Durable Object stores only the small current room snapshot and captain credential hashes needed to resume a hibernated room. It does not keep draft history. Completed and expired rooms delete this state.
-- Draft does not use platform PostgreSQL, Redis, Celery, FastAPI or the VPS runtime.
+- New Solo drafts and online rooms load the current public game-assets roster. An online room pins that roster in its Durable Object snapshot and uses it for pick/ban validation and timeout picks, so reconnecting clients keep the same hero IDs and display names for the room's lifetime. If the game-assets API is unavailable, Draft uses its bundled roster; the Worker caches the last successful API roster for short periods.
+- The API hero catalog combines the primary deadlock.io source with the Deadlock API assets source for selectable released heroes and abilities. The existing forced home-content refresh checks the sources every 30 minutes, retains the last good supplemental records on request or payload failure, and removes heroes when a valid source record marks them unavailable.
+- Draft does not use platform PostgreSQL, Redis, Celery or the VPS for room state and realtime transport. The Worker makes a bounded read-only request to the public FastAPI game-assets endpoint to refresh the hero roster.
 - Hero thumbnails use the existing `cdn.old-sparky.com` R2/CDN boundary under an immutable Draft namespace.
 - Completed drafts remain on their current room or Solo screen; Draft does not expose a `/draft/result` route, encode completed state into URL fragments or store result history. See [Public Draft completion without result links](public-draft-completion-without-result-links.md).
 - Draft advertising uses the existing Old Sparky AdSense publisher and stays outside the hero grid and irreversible-action controls.

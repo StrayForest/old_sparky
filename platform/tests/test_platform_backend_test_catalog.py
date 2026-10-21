@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import tempfile
 import unittest
 
 from tools import platform_test_catalog as catalog
@@ -125,6 +128,57 @@ class PlatformBackendTestCatalogTests(unittest.TestCase):
             discovered_ids,
             {case.test_id for case in self.cases},
         )
+
+        with tempfile.TemporaryDirectory(prefix="platform-catalog-cache-") as directory:
+            tests_root = Path(directory)
+            source_path = tests_root / "test_sample.py"
+            source_path.write_text(
+                "import unittest\n"
+                "class SampleTests(unittest.TestCase):\n"
+                "    def test_alpha(self): pass\n",
+                encoding="utf-8",
+            )
+            first = catalog.discover_test_cases(tests_root)
+            self.assertEqual([case.method_name for case in first], ["test_alpha"])
+            self.assertIs(first, catalog.discover_test_cases(tests_root))
+
+            original_stat = source_path.stat()
+            source_path.write_text(
+                "import unittest\n"
+                "class SampleTests(unittest.TestCase):\n"
+                "    def test_bravo(self): pass\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(source_path.stat().st_size, original_stat.st_size)
+            os.utime(
+                source_path,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+            second = catalog.discover_test_cases(tests_root)
+            self.assertEqual([case.method_name for case in second], ["test_bravo"])
+            self.assertIsNot(first, second)
+
+            extra_path = tests_root / "test_extra.py"
+            extra_path.write_text(
+                "import unittest\n"
+                "class ExtraTests(unittest.TestCase):\n"
+                "    def test_gamma(self): pass\n",
+                encoding="utf-8",
+            )
+            with_extra = catalog.discover_test_cases(tests_root)
+            self.assertEqual(
+                {case.test_id for case in with_extra},
+                {
+                    "tests.test_sample.SampleTests.test_bravo",
+                    "tests.test_extra.ExtraTests.test_gamma",
+                },
+            )
+            self.assertIsNot(second, with_extra)
+
+            extra_path.unlink()
+            without_extra = catalog.discover_test_cases(tests_root)
+            self.assertEqual(without_extra, second)
+            self.assertIsNot(with_extra, without_extra)
 
 
 if __name__ == "__main__":

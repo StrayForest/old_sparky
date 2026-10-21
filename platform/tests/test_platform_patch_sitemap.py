@@ -159,6 +159,32 @@ class PatchSitemapProjectionTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(payload["patches"], patches)
         self.assertEqual(events, ["translation", "sitemap"])
 
+    async def test_forced_refresh_rechecks_asset_sources_with_warm_catalog(self) -> None:
+        warm_catalog = {"heroes": {"baba": {"name": "Baba"}}, "items": {}, "ranks": {}, "objectives": {}}
+        cache = _Cache({
+            home_content.PATCH_ASSET_CATALOG_KEY: json.dumps(warm_catalog),
+            home_content.PATCH_ASSET_CATALOG_STALE_KEY: json.dumps(warm_catalog),
+        })
+        settings = PlatformSettings(_env_file=None)
+        fetch_assets = AsyncMock(return_value=warm_catalog)
+        with (
+            patch.object(home_content_security, "redis_client", return_value=cache),
+            patch.object(home_content_security, "get_settings", return_value=settings),
+            patch.object(home_content_security, "BoundedNoRedirectAsyncClient", return_value=_ClientContext()),
+            patch.object(home_content, "_fetch_steam_patches", new=AsyncMock(return_value=([], {}))),
+            patch.object(home_content, "_fetch_youtube_videos", new=AsyncMock(return_value=[])),
+            patch.object(home_content, "_fetch_deadlock_asset_catalog", new=fetch_assets),
+            patch.object(
+                home_content_security,
+                "ensure_patch_translation_records",
+                new=AsyncMock(return_value={"registered": 0, "enqueued": 0, "enqueue_failures": 0}),
+            ),
+            patch.object(home_content, "publish_patch_sitemap_index", new=AsyncMock()),
+        ):
+            await home_content_security.refresh_home_content(force=True)
+
+        fetch_assets.assert_awaited_once()
+
     async def test_failed_steam_refresh_keeps_known_good_index(self) -> None:
         previous = [{"id": "999", "published_at": "2026-08-31T12:00:00+00:00"}]
         cache = _Cache({home_content.PATCH_SITEMAP_INDEX_KEY: json.dumps(previous)})

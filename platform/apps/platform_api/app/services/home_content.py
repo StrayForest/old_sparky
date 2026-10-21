@@ -28,17 +28,21 @@ YOUTUBE_FEED_URL = (
 YOUTUBE_VIDEOS_URL = "https://www.youtube.com/@deadlockOldSparky/videos"
 DEADLOCK_HERO_INDEX_URL = "https://deadlock.io/api/v1/heroes.json"
 DEADLOCK_ITEM_INDEX_URL = "https://deadlock.io/api/v1/items.json"
+DEADLOCK_ASSET_HERO_INDEX_URL = "https://api.deadlock-api.com/v1/assets/heroes"
+DEADLOCK_ASSET_ITEM_INDEX_URL = "https://api.deadlock-api.com/v1/assets/items"
 DEADLOCK_RANK_INDEX_URL = "https://api.deadlock-api.com/v1/assets/ranks"
 DEADLOCK_ICON_INDEX_URL = "https://api.deadlock-api.com/v1/assets/icons"
 DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v6:"
-PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v4"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v7:"
+PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v5"
+PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v1"
 PATCH_SITEMAP_INDEX_KEY = "platform:seo:patch-index:v1"
 PATCH_DETAIL_TTL_SECONDS = 30 * 24 * 60 * 60
 PATCH_ASSET_CATALOG_TTL_SECONDS = 6 * 60 * 60
+PATCH_ASSET_CATALOG_STALE_TTL_SECONDS = 30 * 24 * 60 * 60
 REFRESH_LOCK_SECONDS = 30
 HOME_PATCH_LIMIT = 4
 HOME_VIDEO_LIMIT = 4
@@ -332,10 +336,14 @@ def _build_asset_catalog(
     item_payload: dict[str, Any],
     rank_payload: list[dict[str, Any]] | None = None,
     *,
+    supplemental_hero_payload: list[dict[str, Any]] | None = None,
+    supplemental_item_payload: list[dict[str, Any]] | None = None,
     icon_payload: dict[str, Any] | None = None,
     previous_catalog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     heroes: dict[str, Any] = {}
+    primary_heroes_by_slug: dict[str, dict[str, Any]] = {}
+    primary_heroes_by_id: dict[str, dict[str, Any]] = {}
     for hero in hero_payload.get("heroes") or []:
         display_name = str((hero.get("displayName") or {}).get("english") or "").strip()
         if not display_name:
@@ -347,7 +355,12 @@ def _build_asset_catalog(
             if not ability_name or ability_name.startswith("ability_"):
                 continue
             icon = _asset_url(((ability.get("assets") or {}).get("icon") or {}).get("publicPath"))
-            abilities[ability_name.lower()] = {"name": ability_name, "icon_url": icon}
+            abilities[ability_name.lower()] = {
+                "id": ability.get("id"),
+                "slug": str(ability.get("slug") or ability.get("class_name") or "").strip().casefold() or None,
+                "name": ability_name,
+                "icon_url": icon,
+            }
         hero_value = {
             "name": canonical_name,
             "slug": str(hero.get("slug") or "").strip(),
@@ -359,9 +372,117 @@ def _build_asset_catalog(
             "abilities": abilities,
         }
         heroes[display_name.lower()] = hero_value
+        source_slug = _normalize_hero_slug(hero.get("slug"))
+        if source_slug:
+            primary_heroes_by_slug[source_slug] = hero_value
+        source_id = hero.get("id")
+        if isinstance(source_id, (int, str)) and str(source_id).strip():
+            primary_heroes_by_id[str(source_id).strip()] = hero_value
         if display_name.casefold() in {"doorman", "the doorman"}:
             heroes["doorman"] = hero_value
             heroes["the doorman"] = hero_value
+
+    supplemental_sources_available = (
+        supplemental_hero_payload is not None and supplemental_item_payload is not None
+    )
+    supplemental_heroes = {
+        str(hero.get("name") or "").strip().casefold(): hero
+        for hero in supplemental_hero_payload or []
+        if isinstance(hero, dict)
+        and str(hero.get("name") or "").strip()
+        and hero.get("player_selectable") is True
+        and hero.get("disabled") is False
+        and str(hero.get("development_state") or "").casefold() == "release"
+    }
+    supplemental_items = {
+        str(item.get("class_name") or "").strip().casefold(): item
+        for item in supplemental_item_payload or []
+        if isinstance(item, dict) and str(item.get("class_name") or "").strip()
+    }
+    for source_name, hero in (
+        supplemental_heroes.items() if supplemental_sources_available else ()
+    ):
+        canonical_name = "The Doorman" if source_name in {"doorman", "the doorman"} else str(hero["name"]).strip()
+        canonical_key = canonical_name.casefold()
+        class_name = str(hero.get("class_name") or "").strip()
+        source_slug = _normalize_hero_slug(class_name)
+        source_id = hero.get("id")
+        existing = (
+            heroes.get(canonical_key)
+            or primary_heroes_by_slug.get(source_slug)
+            or (
+                primary_heroes_by_id.get(str(source_id).strip())
+                if isinstance(source_id, (int, str)) and str(source_id).strip()
+                else None
+            )
+        )
+        if existing is not None:
+            if isinstance(hero.get("id"), int) and hero["id"] > 0:
+                existing.setdefault("id", hero["id"])
+            if class_name:
+                existing.setdefault("class_name", class_name)
+                existing.setdefault("source", "deadlock-api")
+            _merge_hero_abilities(existing, _supplemental_hero_abilities(hero, supplemental_items))
+            continue
+        hero_id = hero.get("id")
+        if not class_name or not isinstance(hero_id, int) or hero_id <= 0:
+            continue
+        abilities = _supplemental_hero_abilities(hero, supplemental_items)
+        images = hero.get("images") if isinstance(hero.get("images"), dict) else {}
+        icon_url = None
+        for image_key in ("icon_hero_card_webp", "icon_hero_card", "icon_image_small_webp", "icon_image_small"):
+            try:
+                icon_url = _https_url(
+                    images.get(image_key),
+                    host_suffixes=DEADLOCK_API_ASSET_HOST_SUFFIXES,
+                )
+            except ValueError:
+                continue
+            if icon_url:
+                break
+        hero_value = {
+            "id": hero_id,
+            "class_name": class_name,
+            "name": canonical_name,
+            "slug": source_slug,
+            "source": "deadlock-api",
+            "icon_url": icon_url,
+            "abilities": abilities,
+        }
+        heroes[canonical_key] = hero_value
+        if canonical_key in {"doorman", "the doorman"}:
+            heroes["doorman"] = hero_value
+            heroes["the doorman"] = hero_value
+
+    previous_heroes = (
+        previous_catalog.get("heroes")
+        if isinstance(previous_catalog, dict) and isinstance(previous_catalog.get("heroes"), dict)
+        else {}
+    )
+    for previous_key, previous_hero in (
+        previous_heroes.items() if not supplemental_sources_available else ()
+    ):
+        if not isinstance(previous_hero, dict) or previous_hero.get("source") != "deadlock-api":
+            continue
+        canonical_name = str(previous_hero.get("name") or "").strip()
+        if not canonical_name:
+            continue
+        canonical_key = canonical_name.casefold()
+        previous_slug = _normalize_hero_slug(previous_hero.get("slug"))
+        previous_id = previous_hero.get("id")
+        existing = (
+            heroes.get(canonical_key)
+            or primary_heroes_by_slug.get(previous_slug)
+            or (
+                primary_heroes_by_id.get(str(previous_id).strip())
+                if isinstance(previous_id, (int, str)) and str(previous_id).strip()
+                else None
+            )
+        )
+        if existing is not None:
+            _merge_hero_abilities(existing, previous_hero.get("abilities") or {})
+        elif canonical_key not in heroes:
+            heroes[canonical_key] = previous_hero
 
     items: dict[str, Any] = {}
     for item in item_payload.get("items") or []:
@@ -411,15 +532,105 @@ def _build_asset_catalog(
     }
 
 
+def _normalize_hero_slug(value: Any) -> str:
+    slug = str(value or "").strip().casefold()
+    return slug.removeprefix("hero_")
+
+
+def _supplemental_hero_abilities(
+    hero: dict[str, Any],
+    supplemental_items: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    slot_items = hero.get("items") if isinstance(hero.get("items"), dict) else {}
+    abilities: dict[str, Any] = {}
+    for slot in ("signature1", "signature2", "signature3", "signature4"):
+        ability_class = str(slot_items.get(slot) or "").strip().casefold()
+        ability = supplemental_items.get(ability_class)
+        if not isinstance(ability, dict) or str(ability.get("type") or "").casefold() != "ability":
+            continue
+        ability_name = str(ability.get("name") or "").strip()
+        if not ability_name:
+            continue
+        icon_url: str | None = None
+        try:
+            icon_url = _https_url(
+                ability.get("image"),
+                host_suffixes=DEADLOCK_API_ASSET_HOST_SUFFIXES,
+            )
+        except ValueError:
+            pass
+        abilities[ability_name.casefold()] = {
+            "id": ability.get("id"),
+            "slug": ability_class,
+            "name": ability_name,
+            "icon_url": icon_url,
+        }
+    return abilities
+
+
+def _merge_hero_abilities(target: dict[str, Any], abilities: Any) -> None:
+    current = target.setdefault("abilities", {})
+    if not isinstance(current, dict) or not isinstance(abilities, dict):
+        return
+    for alias, ability in abilities.items():
+        if not isinstance(ability, dict):
+            continue
+        prior = current.get(alias)
+        prior_alias = alias if isinstance(prior, dict) else None
+        if prior is None:
+            ability_slug = str(ability.get("slug") or "").strip().casefold()
+            if ability_slug:
+                prior_alias = next(
+                    (
+                        str(key)
+                        for key, value in current.items()
+                        if isinstance(value, dict)
+                        and str(value.get("slug") or "").strip().casefold() == ability_slug
+                    ),
+                    None,
+                )
+                prior = current.get(prior_alias) if prior_alias is not None else None
+        merged = dict(prior) if isinstance(prior, dict) else {}
+        legacy_aliases = merged.get("aliases") or []
+        if isinstance(legacy_aliases, str):
+            legacy_aliases = [legacy_aliases]
+        if prior_alias and prior_alias != alias:
+            previous_name = str(merged.get("name") or prior_alias).strip()
+            if previous_name and previous_name.casefold() != str(ability.get("name") or "").strip().casefold():
+                legacy_aliases = [*legacy_aliases, previous_name]
+        for field in ("id", "slug", "name"):
+            if ability.get(field) not in (None, ""):
+                merged[field] = ability[field]
+        if legacy_aliases:
+            merged["aliases"] = list(dict.fromkeys(
+                value for value in legacy_aliases if isinstance(value, str) and value.strip()
+            ))
+        merged["icon_url"] = merged.get("icon_url") or ability.get("icon_url")
+        if prior_alias and prior_alias != alias:
+            current.pop(prior_alias, None)
+        current[alias] = merged
+
+
 async def _fetch_deadlock_asset_catalog(
     client: httpx.AsyncClient,
     *,
     previous_catalog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    hero_response, item_response = await asyncio.gather(
+    hero_response, item_response, supplemental_heroes_result, supplemental_items_result = await asyncio.gather(
         client.get(DEADLOCK_HERO_INDEX_URL),
         client.get(DEADLOCK_ITEM_INDEX_URL),
+        client.get(
+            DEADLOCK_ASSET_HERO_INDEX_URL,
+            headers={"User-Agent": "OldSparky/1.0 (https://old-sparky.com)"},
+        ),
+        client.get(
+            DEADLOCK_ASSET_ITEM_INDEX_URL,
+            headers={"User-Agent": "OldSparky/1.0 (https://old-sparky.com)"},
+        ),
+        return_exceptions=True,
     )
+    if isinstance(hero_response, Exception) or isinstance(item_response, Exception):
+        raise hero_response if isinstance(hero_response, Exception) else item_response
     hero_response.raise_for_status()
     item_response.raise_for_status()
     rank_result, icon_result = await asyncio.gather(
@@ -449,10 +660,38 @@ async def _fetch_deadlock_asset_catalog(
                 icon_payload = decoded_icon_payload
         except Exception:  # noqa: BLE001
             logger.warning("deadlock_asset_refresh_failed source=icons")
+    supplemental_heroes: list[dict[str, Any]] | None = None
+    supplemental_items: list[dict[str, Any]] | None = None
+    if isinstance(supplemental_heroes_result, Exception):
+        logger.warning("deadlock_asset_refresh_failed source=asset-heroes")
+    else:
+        try:
+            supplemental_heroes_result.raise_for_status()
+            decoded_heroes = supplemental_heroes_result.json()
+            if isinstance(decoded_heroes, list) and decoded_heroes:
+                supplemental_heroes = decoded_heroes
+            else:
+                logger.warning("deadlock_asset_refresh_failed source=asset-heroes invalid-payload")
+        except Exception:  # noqa: BLE001
+            logger.warning("deadlock_asset_refresh_failed source=asset-heroes")
+    if isinstance(supplemental_items_result, Exception):
+        logger.warning("deadlock_asset_refresh_failed source=asset-items")
+    else:
+        try:
+            supplemental_items_result.raise_for_status()
+            decoded_items = supplemental_items_result.json()
+            if isinstance(decoded_items, list) and decoded_items:
+                supplemental_items = decoded_items
+            else:
+                logger.warning("deadlock_asset_refresh_failed source=asset-items invalid-payload")
+        except Exception:  # noqa: BLE001
+            logger.warning("deadlock_asset_refresh_failed source=asset-items")
     return _build_asset_catalog(
         hero_response.json(),
         item_response.json(),
         rank_payload,
+        supplemental_hero_payload=supplemental_heroes,
+        supplemental_item_payload=supplemental_items,
         icon_payload=icon_payload,
         previous_catalog=previous_catalog,
     )
@@ -462,6 +701,8 @@ async def _cached_deadlock_asset_catalog() -> dict[str, Any] | None:
     cache = redis_client()
     try:
         catalog = await _read_json(cache, PATCH_ASSET_CATALOG_KEY)
+        if catalog is None:
+            catalog = await _read_json(cache, PATCH_ASSET_CATALOG_STALE_KEY)
     except Exception:  # noqa: BLE001
         return None
     finally:
@@ -501,6 +742,7 @@ def public_deadlock_game_assets(catalog: dict[str, Any]) -> dict[str, Any]:
         "heroes": [
             {
                 "name": name,
+                "draft_id": _public_draft_hero_id(name, catalog),
                 "image_url": f"/api/v1/content/game-assets/heroes/{quote(name, safe='')}.png",
                 "source_available": name.casefold() in unique_heroes,
             }
@@ -515,6 +757,29 @@ def public_deadlock_game_assets(catalog: dict[str, Any]) -> dict[str, Any]:
             for name in RANKS
         ],
     }
+
+
+def _public_draft_hero_id(name: str, catalog: dict[str, Any]) -> str:
+    normalized_name = name.casefold().strip()
+    legacy_names = {hero.casefold(): hero for hero in POOL_LIST}
+    legacy_name = legacy_names.get(normalized_name)
+    source_hero = next(
+        (
+            hero
+            for hero in (catalog.get("heroes") or {}).values()
+            if isinstance(hero, dict) and str(hero.get("name") or "").casefold() == normalized_name
+        ),
+        {},
+    )
+    source_slug = str(source_hero.get("slug") or "").strip().casefold()
+    if source_slug.startswith("hero_"):
+        source_slug = source_slug.removeprefix("hero_")
+    candidate = source_slug if not legacy_name else legacy_name.casefold()
+    if not candidate:
+        candidate = normalized_name
+    candidate = candidate.replace("&", " and ")
+    candidate = re.sub(r"[^a-z0-9]+", "-", candidate).strip("-")
+    return candidate[:64] if candidate else "hero"
 
 
 def resolve_deadlock_hero_image(catalog: dict[str, Any], hero_name: str) -> str | None:

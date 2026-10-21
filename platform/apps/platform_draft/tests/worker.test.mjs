@@ -120,6 +120,140 @@ test("same-origin room creation works without an Origin header", async () => {
   assert.equal(environment.created.length, 1);
 });
 
+test("game-assets roster is cached, falls back to the last source, and is pinned to new rooms", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  const startedAt = originalNow();
+  let fetchCount = 0;
+  globalThis.fetch = async (input) => {
+    fetchCount += 1;
+    assert.equal(new URL(input).href, "https://old-sparky.com/api/v1/content/game-assets");
+    return new Response(JSON.stringify({
+      heroes: [
+        {
+          draft_id: "baba",
+          name: "Baba",
+          image_url: "/api/v1/content/game-assets/heroes/Baba.png"
+        },
+        {
+          draft_id: "hero_future",
+          name: "Future Hero",
+          image_url: "/api/v1/content/game-assets/heroes/Future%20Hero.png"
+        },
+        {
+          draft_id: "hero_future",
+          name: "Future Hero Alias",
+          image_url: "/api/v1/content/game-assets/heroes/Future%20Hero.png"
+        },
+        {
+          draft_id: "blank_name",
+          name: "   "
+        },
+        {
+          draft_id: "long_name",
+          name: "x".repeat(121)
+        }
+      ]
+    }), { headers: { "content-type": "application/json" } });
+  };
+  try {
+    const environment = makeEnvironment();
+    environment.env.GAME_ASSETS_URL = "https://old-sparky.com/api/v1/content/game-assets";
+    const rosterResponse = await worker.fetch(
+      new Request("https://old-sparky.com/draft/api/heroes"),
+      environment.env
+    );
+    const roster = await rosterResponse.json();
+    assert.equal(rosterResponse.status, 200);
+    assert.deepEqual(roster.heroes.map(({ id, name }) => ({ id, name })), [
+      { id: "baba", name: "Baba" },
+      { id: "hero_future", name: "Future Hero" }
+    ]);
+    assert.equal(fetchCount, 1);
+
+    const created = await createRoom(
+      { presetId: "standard", timerSeconds: 30 },
+      environment
+    );
+    assert.equal(created.response.status, 201);
+    assert.deepEqual(environment.created[0].heroRoster, roster.heroes);
+    assert.equal(fetchCount, 1);
+
+    Date.now = () => startedAt + 5 * 60 * 1000 + 1;
+    globalThis.fetch = async () => {
+      throw new Error("game-assets API unavailable");
+    };
+    const staleResponse = await worker.fetch(
+      new Request("https://old-sparky.com/draft/api/heroes"),
+      environment.env
+    );
+    const staleRoster = await staleResponse.json();
+    assert.deepEqual(staleRoster.heroes, roster.heroes);
+
+    const nextRoom = await createRoom(
+      { presetId: "standard", timerSeconds: 30 },
+      environment
+    );
+    assert.equal(nextRoom.response.status, 201);
+    assert.deepEqual(environment.created[1].heroRoster, roster.heroes);
+  } finally {
+    globalThis.fetch = originalFetch;
+    Date.now = originalNow;
+  }
+});
+
+test("room snapshot validates actions and timeout picks against its pinned roster", async () => {
+  const environment = makeDraftRoomContext();
+  const draft = new DraftRoom(environment.ctx, {});
+  const heroes = [
+    { id: "baba", name: "Baba", image: "/api/v1/content/game-assets/heroes/Baba.png" },
+    { id: "hero_future", name: "Future Hero", image: "/api/v1/content/game-assets/heroes/Future%20Hero.png" }
+  ];
+  await draft.create(new Request("https://draft-room.internal/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      rules: buildRules("standard", 30, {
+        teamSize: 2,
+        banCount: 0,
+        sequence: [
+          { action: "pick", side: "A" },
+          { action: "pick", side: "B" },
+          { action: "pick", side: "B" },
+          { action: "pick", side: "A" }
+        ]
+      }),
+      teamNames: { A: "Команда A", B: "Команда B" },
+      hostToken: "host-token-12345678901234567890",
+      guestToken: "guest-token-12345678901234567890",
+      heroRoster: heroes
+    })
+  }));
+
+  let room = await environment.storage.get("room");
+  room.status = "drafting";
+  room.turnDeadlineAt = Date.now() + 30_000;
+  await environment.storage.put("room", room);
+  const host = new FakeSocket({ role: "host", authenticated: true, count: 0, windowStartedAt: Date.now() });
+  environment.sockets.push(host);
+
+  await draft.webSocketMessage(host, JSON.stringify({ type: "action", expectedVersion: room.version, heroId: "abrams" }));
+  assert.equal(host.messages.at(-1).error, "Неизвестный герой");
+  assert.deepEqual(host.messages.at(-1).room.heroes, heroes);
+
+  await draft.webSocketMessage(host, JSON.stringify({ type: "action", expectedVersion: room.version, heroId: "baba" }));
+  room = await environment.storage.get("room");
+  assert.deepEqual(room.picks.A, ["baba"]);
+  assert.deepEqual(host.messages.at(-1).room.heroes, heroes);
+
+  room.turnDeadlineAt = Date.now() - 1;
+  await environment.storage.put("room", room);
+  await draft.webSocketMessage(host, JSON.stringify({ type: "deadline", expectedVersion: room.version }));
+  room = await environment.storage.get("room");
+  assert.deepEqual(room.picks.B, ["hero_future"]);
+  assert.deepEqual(host.messages.at(-1).room.heroes, heroes);
+});
+
 test("room creation rejects an indefinite timer", async () => {
   const { response, environment } = await createRoom({ presetId: "standard", timerSeconds: 0 });
   assert.equal(response.status, 400);

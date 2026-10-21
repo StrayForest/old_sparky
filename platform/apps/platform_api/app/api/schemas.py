@@ -52,6 +52,7 @@ class PatchSitemapIndexResponse(BaseModel):
 
 class DeadlockGameAssetResponse(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+    draft_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
     image_url: str = Field(min_length=1, max_length=1000)
     source_available: bool = True
 

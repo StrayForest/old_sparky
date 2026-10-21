@@ -107,6 +107,7 @@ export type PlatformHomeContent = {
 
 export type PlatformDeadlockGameAsset = {
   name: string;
+  draft_id?: string | null;
   image_url: string;
   source_available: boolean;
 };
