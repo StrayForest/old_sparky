@@ -79,6 +79,7 @@ RELEASE_KEYS = {
     "node_version",
     "npm_version",
 }
+RELEASE_OPTIONAL_KEYS = {"python_venv_install_evidence"}
 LEGACY_RUNTIME_LAYOUT = {
     "app_dir": "/opt/oldsparky/platform",
     "current_symlink": "/opt/oldsparky/platform/current",
@@ -268,14 +269,16 @@ def _parse_release_json(
     if not isinstance(parsed, dict):
         raise ArtifactError("RELEASE.json schema is invalid")
     keys = set(parsed)
-    if keys != RELEASE_KEYS:
-        legacy_keys = RELEASE_KEYS | {"runtime_layout"}
-        if (
-            not allow_legacy_runtime_layout
-            or keys != legacy_keys
-            or parsed.get("runtime_layout") != LEGACY_RUNTIME_LAYOUT
-        ):
-            raise ArtifactError("RELEASE.json schema is invalid")
+    accepted = {frozenset(RELEASE_KEYS), frozenset(RELEASE_KEYS | RELEASE_OPTIONAL_KEYS)}
+    if allow_legacy_runtime_layout:
+        accepted.add(frozenset(RELEASE_KEYS | {"runtime_layout"}))
+        accepted.add(frozenset(RELEASE_KEYS | RELEASE_OPTIONAL_KEYS | {"runtime_layout"}))
+    if frozenset(keys) not in accepted:
+        raise ArtifactError("RELEASE.json schema is invalid")
+    if "runtime_layout" in parsed and (
+        not allow_legacy_runtime_layout or parsed.get("runtime_layout") != LEGACY_RUNTIME_LAYOUT
+    ):
+        raise ArtifactError("RELEASE.json schema is invalid")
     if (
         type(parsed["artifact_format_version"]) is not int
         or parsed["artifact_format_version"] != 1
@@ -328,8 +331,65 @@ def _parse_release_json(
         raise ArtifactError("RELEASE.json Node runtime version is invalid")
     if parsed["npm_version"] != PINNED_NPM_VERSION:
         raise ArtifactError("RELEASE.json npm runtime version is invalid")
+    if "python_venv_install_evidence" in parsed:
+        evidence = parsed["python_venv_install_evidence"]
+        evidence_keys = {
+            "schema", "builder_allocated_bytes", "wheelhouse_expanded_bytes",
+            "host_overhead_bytes", "inputs_sha256",
+        }
+        if (
+            not isinstance(evidence, dict)
+            or set(evidence) != evidence_keys
+            or type(evidence.get("schema")) is not int
+            or evidence["schema"] != 1
+            or type(evidence.get("builder_allocated_bytes")) is not int
+            or not 1 <= evidence["builder_allocated_bytes"] <= 1024 * 1024 * 1024
+            or type(evidence.get("wheelhouse_expanded_bytes")) is not int
+            or not 1 <= evidence["wheelhouse_expanded_bytes"] <= MAX_EXPANDED_BYTES
+            or type(evidence.get("host_overhead_bytes")) is not int
+            or evidence["host_overhead_bytes"] != 128 * 1024 * 1024
+            or not isinstance(evidence.get("inputs_sha256"), str)
+            or SHA_PATTERN.fullmatch(evidence["inputs_sha256"]) is None
+        ):
+            raise ArtifactError("RELEASE.json fresh-venv evidence is invalid")
     return parsed
 
+
+def _validate_venv_install_evidence(
+    archive: tarfile.TarFile,
+    by_name: dict[str, tarfile.TarInfo],
+    *,
+    release_slug: str,
+    payload: dict[str, object],
+) -> None:
+    evidence = payload.get("python_venv_install_evidence")
+    if evidence is None:
+        return
+    digest = hashlib.sha256(b"oldsparky-python-venv-inputs-v1\0")
+    input_names = (
+        "requirements-platform.txt",
+        "requirements-platform.lock.txt",
+        "requirements-platform.freeze.txt",
+        "wheelhouse/WHEELHOUSE.sha256",
+    )
+    for relative in input_names:
+        member = by_name.get(f"{release_slug}/{relative}")
+        if member is None or not member.isfile() or member.size > 64 * 1024 * 1024:
+            raise ArtifactError("fresh-venv evidence input is unavailable")
+        source = archive.extractfile(member)
+        if source is None:
+            raise ArtifactError("fresh-venv evidence input is unavailable")
+        raw = source.read(member.size + 1)
+        source.close()
+        if len(raw) != member.size:
+            raise ArtifactError("fresh-venv evidence input is invalid")
+        name = relative.encode("ascii")
+        digest.update(len(name).to_bytes(2, "big"))
+        digest.update(name)
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    if evidence["inputs_sha256"] != digest.hexdigest():
+        raise ArtifactError("fresh-venv evidence is not bound to dependency inputs")
 
 def _validate_member_mode(
     member: tarfile.TarInfo,
@@ -1057,6 +1117,9 @@ def validate_archive(
             if len(raw) > MAX_RELEASE_JSON_BYTES:
                 raise ArtifactError("RELEASE.json is too large")
             release_payload = _parse_release_json(raw, release_slug=release_slug)
+            _validate_venv_install_evidence(
+                archive, by_name, release_slug=release_slug, payload=release_payload
+            )
             if expected_source_commit is not None:
                 if COMMIT_PATTERN.fullmatch(expected_source_commit) is None:
                     raise ArtifactError("expected source commit is invalid")

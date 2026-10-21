@@ -1294,6 +1294,26 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
                 validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
 
     def test_release_json_has_an_exact_structural_contract(self) -> None:
+        valid_evidence = {
+            "schema": 1,
+            "builder_allocated_bytes": 1024,
+            "wheelhouse_expanded_bytes": 2048,
+            "host_overhead_bytes": 128 * 1024 * 1024,
+            "inputs_sha256": "a" * 64,
+        }
+        parsed = validator._parse_release_json(
+            json.dumps(
+                release_payload(python_venv_install_evidence=valid_evidence)
+            ).encode(),
+            release_slug=RELEASE_SLUG,
+        )
+        self.assertEqual(parsed["python_venv_install_evidence"], valid_evidence)
+        self.assertNotIn(
+            "python_venv_install_evidence",
+            validator._parse_release_json(
+                json.dumps(release_payload()).encode(), release_slug=RELEASE_SLUG
+            ),
+        )
         invalid_payloads = (
             {**release_payload(), "unexpected": True},
             release_payload(release_ref='bad"ref'),
@@ -1304,6 +1324,42 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
             release_payload(node_version="26.3.0"),
             release_payload(npm_version="11.15.0"),
             release_payload(artifact_format_version=True),
+            release_payload(python_venv_install_evidence=None),
+            release_payload(python_venv_install_evidence=[]),
+            release_payload(python_venv_install_evidence={**valid_evidence, "builder_allocated_bytes": True}),
+            release_payload(python_venv_install_evidence={**valid_evidence, "wheelhouse_expanded_bytes": True}),
+            release_payload(python_venv_install_evidence={**valid_evidence, "host_overhead_bytes": True}),
+            release_payload(python_venv_install_evidence={**valid_evidence, "builder_allocated_bytes": -1}),
+            release_payload(python_venv_install_evidence={**valid_evidence, "wheelhouse_expanded_bytes": 0}),
+            release_payload(python_venv_install_evidence={**valid_evidence, "inputs_sha256": "A" * 64}),
+            release_payload(python_venv_install_evidence={**valid_evidence, "inputs_sha256": "a" * 63}),
+            release_payload(python_venv_install_evidence={**valid_evidence, "schema": True}),
+            release_payload(
+                python_venv_install_evidence={**valid_evidence, "inputs_sha256": "z" * 64}
+            ),
+            release_payload(
+                python_venv_install_evidence={**valid_evidence, "host_overhead_bytes": 1}
+            ),
+            release_payload(
+                python_venv_install_evidence={
+                    key: value for key, value in valid_evidence.items() if key != "inputs_sha256"
+                }
+            ),
+            release_payload(
+                python_venv_install_evidence={**valid_evidence, "unexpected": 0}
+            ),
+            release_payload(
+                python_venv_install_evidence={
+                    **valid_evidence,
+                    "builder_allocated_bytes": 1024 * 1024 * 1024 + 1,
+                }
+            ),
+            release_payload(
+                python_venv_install_evidence={
+                    **valid_evidence,
+                    "wheelhouse_expanded_bytes": 4 * 1024 * 1024 * 1024 + 1,
+                }
+            ),
         )
         for index, payload in enumerate(invalid_payloads):
             with self.subTest(index=index):
@@ -1325,6 +1381,48 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         builder.write()
         with self.assertRaisesRegex(validator.ArtifactError, "duplicate keys"):
             validator.validate_archive(duplicate_keys, release_slug=RELEASE_SLUG)
+
+        # The optional field is deployable only when bound to the exact archive
+        # inputs. Historical archives continue to validate without it.
+        input_names = (
+            "requirements-platform.txt", "requirements-platform.lock.txt",
+            "requirements-platform.freeze.txt", "wheelhouse/WHEELHOUSE.sha256",
+        )
+        artifact = self.root / "metadata-evidence-bound.tar.gz"
+        builder = ArchiveBuilder(artifact)
+        archive_inputs = {
+            member.name: content for member, content in builder.entries
+        }
+        digest = hashlib.sha256(b"oldsparky-python-venv-inputs-v1\0")
+        for relative in input_names:
+            name = relative.encode("ascii")
+            raw = archive_inputs[f"{RELEASE_SLUG}/{relative}"]
+            assert raw is not None
+            digest.update(len(name).to_bytes(2, "big"))
+            digest.update(name)
+            digest.update(len(raw).to_bytes(8, "big"))
+            digest.update(raw)
+        evidence = {**valid_evidence, "inputs_sha256": digest.hexdigest()}
+        payload = release_payload(python_venv_install_evidence=evidence)
+        ArchiveBuilder(artifact, payload).write()
+        self.assertEqual(
+            validator.validate_archive(artifact, release_slug=RELEASE_SLUG)[
+                "python_venv_install_evidence"
+            ], evidence,
+        )
+        for relative in input_names:
+            with self.subTest(changed_input=relative):
+                builder = ArchiveBuilder(artifact, payload)
+                for index, (member, content) in enumerate(builder.entries):
+                    if member.name == f"{RELEASE_SLUG}/{relative}":
+                        assert content is not None
+                        changed = content + b"# changed\n"
+                        member.size = len(changed)
+                        builder.entries[index] = (member, changed)
+                        break
+                builder.write()
+                with self.assertRaisesRegex(validator.ArtifactError, "not bound"):
+                    validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
 
     def test_canonical_dispatch_slug_is_source_bound_without_timestamp_suffix(self) -> None:
         canonical_slug = "gha-123456-2-aaaaaaaaaaaa"
