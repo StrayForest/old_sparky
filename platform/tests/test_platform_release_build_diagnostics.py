@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -551,7 +552,10 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
             bootstrap.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="ascii")
             os.chmod(bootstrap, 0o755)
             python = venv_bin / "python"
-            python.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="ascii")
+            python.write_text(
+                "#!/usr/bin/env bash\nexec \"$PLATFORM_RELEASE_PYTHON\" \"$@\"\n",
+                encoding="ascii",
+            )
             os.chmod(python, 0o755)
 
             subprocess.run(["git", "init", "--quiet", str(root)], check=True)
@@ -589,6 +593,7 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                         **os.environ,
                         "PLATFORM_RELEASE_OUTPUT_DIR": str(output),
                         "PLATFORM_RELEASE_PHASE_LOG": str(phase_log),
+                        "PLATFORM_RELEASE_PYTHON": sys._base_executable,
                     },
                     check=False,
                     capture_output=True,
@@ -605,6 +610,7 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                     **os.environ,
                     "PLATFORM_RELEASE_OUTPUT_DIR": str(output),
                     "PLATFORM_RELEASE_PHASE_LOG": str(phase_root / "missing.log"),
+                    "PLATFORM_RELEASE_PYTHON": sys._base_executable,
                 },
                 check=False,
                 capture_output=True,
@@ -623,6 +629,7 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                     env={
                         **os.environ,
                         "PLATFORM_RELEASE_OUTPUT_DIR": str(output),
+                        "PLATFORM_RELEASE_PYTHON": sys._base_executable,
                     },
                     check=False,
                     capture_output=True,

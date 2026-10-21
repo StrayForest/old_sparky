@@ -6095,7 +6095,7 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn("runtime_sensitive", workflow)
         self.assertIn("platform_verify.py release-runtime", workflow)
         self.assertIn("runs-on: ubuntu-24.04", privileged)
-        self.assertIn("runs-on: ubuntu-24.04", integration)
+        self.assertIn("runs-on: ubuntu-latest", integration)
         self.assertIn("Check isolated synthetic PostgreSQL 16 prerequisites", privileged)
         self.assertIn('pg_config_path="$(command -v pg_config)"', privileged)
         self.assertIn('pg_config_version="$("$pg_config_path" --version)"', privileged)
@@ -6499,7 +6499,7 @@ cleanup
             )
         self.assertEqual(prebuilder.returncode, 1, prebuilder.stderr)
         self.assertIn(
-            "RELEASE_RUNTIME_BUILD schema=1 status=failed reason=python_environment_failed",
+            "RELEASE_RUNTIME_BUILD_DIAGNOSTIC schema=1 canonical_builder_rc=unknown parser_rc=127 phase=unknown status=failed reason=build_failed",
             prebuilder.stdout,
         )
         self.assertNotIn("diagnostic_parser", prebuilder.stdout)
@@ -8629,7 +8629,11 @@ cleanup
                 result = subprocess.run(
                     [str(BUILD_SCRIPT), "contention"],
                     cwd=REPO_ROOT,
-                    env={**os.environ, "PLATFORM_RELEASE_OUTPUT_DIR": str(output)},
+                    env={
+                        **os.environ,
+                        "PLATFORM_RELEASE_OUTPUT_DIR": str(output),
+                        "PLATFORM_RELEASE_PYTHON": sys._base_executable,
+                    },
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -8673,7 +8677,11 @@ cleanup
                     "enforce",
                 ],
                 cwd=REPO_ROOT,
-                env={**os.environ, "PLATFORM_RELEASE_OUTPUT_DIR": str(output)},
+                env={
+                    **os.environ,
+                    "PLATFORM_RELEASE_OUTPUT_DIR": str(output),
+                    "PLATFORM_RELEASE_PYTHON": sys._base_executable,
+                },
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -8711,7 +8719,11 @@ cleanup
                     "enforce",
                 ],
                 cwd=REPO_ROOT,
-                env={**os.environ, "PLATFORM_RELEASE_OUTPUT_DIR": str(output)},
+                env={
+                    **os.environ,
+                    "PLATFORM_RELEASE_OUTPUT_DIR": str(output),
+                    "PLATFORM_RELEASE_PYTHON": sys._base_executable,
+                },
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
