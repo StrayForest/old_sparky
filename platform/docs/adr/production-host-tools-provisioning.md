@@ -4,6 +4,8 @@ Status: accepted for the host-capability gate
 
 ## Decision
 
+Candidate C `0150268ba93eaeb1358bb9c8399c643c7cda021c` adds backward-compatible optional fresh-venv evidence validation; pin P `cfde473dd2d5192b7845623e81ec46877890d6ae` records its exact 15-member closure. Signed exact-target preflight, approved provisioning and installed self-test remain required before use; this pin does not prove installation.
+
 Production deployment control is a release-independent, host-provisioned
 generation.  The immutable path is:
 
@@ -492,7 +494,7 @@ The CPU-diagnostic first-fault and exact abort-evidence follow-up uses source **
    blocked.
 2. Commit **P**, descended from **C** in the same reviewed change, updates only
    the pin with respect to host control: `host_tools_sha` becomes **C** and the
-   exact closure baseline records **C**'s paths, modes and digests. The
+   exact closure baseline records **C**'s paths, modes and digests; record C/P provenance in this ADR and run `tests.test_platform_host_tools_bundle.HostToolsBundleTests.test_host_tools_provisioning_adr_matches_enforced_generation_pin` against the committed target. The
    application target may contain tests or documentation alongside this pin
    update; the host-control closure itself must match **C** byte for byte.
 3. Require full CI success for exact merged **P**, then use the documented
