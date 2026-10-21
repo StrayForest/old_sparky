@@ -1903,10 +1903,6 @@ jobs:
             failure_reason=python_runtime_copy_failed
             exit 1
           }
-          sudo -n /usr/bin/chmod 0700 "$root_python_prefix" 2>/dev/null || {
-            failure_reason=python_runtime_copy_failed
-            exit 1
-          }
           root_runtime_python="$root_python_prefix/bin/python3.12"
           root_runtime_python_real="$(sudo -n /usr/bin/readlink -f -- "$root_runtime_python" 2>/dev/null)" || {
             failure_reason=python_runtime_copy_failed
@@ -1930,6 +1926,15 @@ jobs:
               esac
             done <<<"$runtime_symlink_targets"
           fi
+          sudo -n /usr/bin/chmod 0700 "$root_python_prefix" 2>/dev/null || {
+            failure_reason=python_runtime_copy_failed
+            exit 1
+          }
+          sudo -n /usr/bin/find "$root_python_prefix" ! -type l -perm /022 \
+            -exec /usr/bin/chmod go-w -- {} + 2>/dev/null || {
+            failure_reason=python_runtime_copy_failed
+            exit 1
+          }
           [[ "$(sudo -n /usr/bin/stat -c '%u:%g:%a:%F' -- "$root_python_prefix" 2>/dev/null)" == "0:0:700:directory" ]] || {
             failure_reason=python_runtime_trust_failed
             failure_trust_check=prefix_owner_group_mode_type
@@ -1940,7 +1945,7 @@ jobs:
             failure_trust_check=interpreter_owner_type
             exit 1
           }
-          [[ -z "$(sudo -n /usr/bin/find "$root_python_prefix" -perm /022 -print -quit 2>/dev/null)" ]] || {
+          [[ -z "$(sudo -n /usr/bin/find "$root_python_prefix" ! -type l -perm /022 -print -quit 2>/dev/null)" ]] || {
             failure_reason=python_runtime_trust_failed
             failure_trust_check=runtime_group_other_write_mode
             exit 1

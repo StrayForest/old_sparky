@@ -297,6 +297,8 @@ class PlatformPipPinContractTests(unittest.TestCase):
                 self.assertIn('runtime_python_prefix="${PLATFORM_RELEASE_PYTHON%/bin/python3.12}"', block)
                 self.assertIn('sudo -n /bin/chown -R root:root "$root_python_prefix"', block)
                 self.assertIn('sudo -n /usr/bin/chmod 0700 "$root_python_prefix"', block)
+                self.assertIn('-exec /usr/bin/chmod go-w -- {} +', block)
+                self.assertIn('! -type l -perm /022 -print -quit', block)
                 self.assertIn("failure_trust_check=python_realpath_containment", block)
                 self.assertIn("failure_trust_check=prefix_owner_group_mode_type", block)
                 self.assertIn("failure_trust_check=interpreter_owner_type", block)

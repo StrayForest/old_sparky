@@ -2922,7 +2922,60 @@ except lock.VerificationLockError as exc:
         self.assertIn('root_python_prefix="$release_root/python-runtime"', builder_step["run"])
         self.assertIn('sudo -n /bin/cp -a "$runtime_python_prefix/."', builder_step["run"])
         self.assertIn('sudo -n /bin/chown -R root:root "$root_python_prefix"', builder_step["run"])
-        self.assertIn('find "$root_python_prefix" -perm /022', builder_step["run"])
+        self.assertIn('sudo -n /usr/bin/find "$root_python_prefix" ! -type l -perm /022', builder_step["run"])
+        self.assertIn('-exec /usr/bin/chmod go-w -- {} +', builder_step["run"])
+        self.assertIn('! -type l -perm /022 -print -quit', builder_step["run"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            source_prefix = fixture_root / "setup-python"
+            copied_prefix = fixture_root / "protected-python"
+            (source_prefix / "bin").mkdir(parents=True)
+            (source_prefix / "lib").mkdir(mode=0o777)
+            (source_prefix / "bin" / "python3.12").write_text("fixture interpreter\n")
+            (source_prefix / "bin" / "python3.12").chmod(0o777)
+            (source_prefix / "bin" / "python3").symlink_to("python3.12")
+            (source_prefix / "lib" / "module.pyc").write_bytes(b"fixture bytecode")
+            (source_prefix / "lib" / "module.pyc").chmod(0o666)
+            (source_prefix / "share").mkdir(mode=0o777)
+            (source_prefix / "share" / "external-link").symlink_to(fixture_root / "outside")
+            (fixture_root / "outside").write_text("outside target\n")
+            copied_prefix.mkdir(mode=0o700)
+            subprocess.run(
+                ["cp", "-a", f"{source_prefix}/.", str(copied_prefix)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            containment_check = "\n".join(
+                (
+                    "set -euo pipefail",
+                    'prefix="$1"',
+                    'targets="$(find "$prefix" -type l -print0 | xargs -0 -r -n1 readlink -f --)"',
+                    "while IFS= read -r target; do",
+                    '  case "$target" in "$prefix"/*) ;; *) exit 31 ;; esac',
+                    'done <<<"$targets"',
+                    'chmod 0700 "$prefix"',
+                    'find "$prefix" ! -type l -perm /022 -exec chmod go-w -- {} +',
+                    '[[ -z "$(find "$prefix" ! -type l -perm /022 -print -quit)" ]] ',
+                )
+            )
+            rejected_external_link = subprocess.run(
+                ["bash", "-c", containment_check, "runtime-trust-fixture", str(copied_prefix)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(rejected_external_link.returncode, 31)
+            (copied_prefix / "share" / "external-link").unlink()
+            accepted_internal_links = subprocess.run(
+                ["bash", "-c", containment_check, "runtime-trust-fixture", str(copied_prefix)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(accepted_internal_links.stdout, "")
+            self.assertEqual(stat.S_IMODE((copied_prefix / "bin" / "python3.12").stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE((copied_prefix / "lib" / "module.pyc").stat().st_mode), 0o644)
+            self.assertEqual(os.readlink(copied_prefix / "bin" / "python3"), "python3.12")
         self.assertIn('LD_LIBRARY_PATH="$root_python_prefix/lib"', builder_step["run"])
         self.assertIn('libpython3.12.so.1.0', builder_step["run"])
         self.assertIn('import ctypes, sqlite3, ssl', builder_step["run"])
