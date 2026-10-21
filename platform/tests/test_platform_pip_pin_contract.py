@@ -261,6 +261,7 @@ class PlatformPipPinContractTests(unittest.TestCase):
             )
         }
         self.assertIn("release-runtime", setup_jobs)
+        self.assertIn("release-runtime-real", setup_jobs)
         self.assertGreater(len(setup_jobs), 1)
         for job_id, block in sorted(setup_jobs.items()):
             steps = _workflow_step_blocks(block)
@@ -283,13 +284,26 @@ class PlatformPipPinContractTests(unittest.TestCase):
                 )
             )
             self.assertEqual(len(setup_steps), 1, job_id)
-            self.assertEqual(len(installer_steps), 1, job_id)
             setup_step = setup_steps[0]
             self.assertEqual(
                 len(re.findall(r'^\s+python-version:\s*"3\.12"\s*$', setup_step, re.MULTILINE)),
                 1,
                 job_id,
             )
+            if job_id == "release-runtime-real":
+                self.assertEqual(len(installer_steps), 0, job_id)
+                self.assertIn("Resolve trusted setup-python 3.12 for the root runtime build", block)
+                self.assertIn('PLATFORM_RELEASE_PYTHON=%s', block)
+                self.assertIn('runtime_python_prefix="${PLATFORM_RELEASE_PYTHON%/bin/python3.12}"', block)
+                self.assertIn('sudo -n /bin/chown -R root:root "$root_python_prefix"', block)
+                self.assertIn('sudo -n /usr/bin/chmod 0700 "$root_python_prefix"', block)
+                self.assertIn("failure_trust_check=python_realpath_containment", block)
+                self.assertIn("failure_trust_check=prefix_owner_group_mode_type", block)
+                self.assertIn("failure_trust_check=interpreter_owner_type", block)
+                self.assertIn("failure_trust_check=runtime_group_other_write_mode", block)
+                self.assertIn("trust_check=%s", block)
+                continue
+            self.assertEqual(len(installer_steps), 1, job_id)
             self.assertEqual(
                 len(re.findall(r"^\s+cache:\s*pip\s*$", setup_step, re.MULTILINE)),
                 1,

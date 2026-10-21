@@ -2060,6 +2060,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         temporary_root, same_device_as_root=False
                     ),
                 ),
+                mock.patch.object(pathlib.Path, "lstat", root_owned_lstat),
                 self.assertRaisesRegex(
                     RuntimeError, "verified disk-backed ext4 filesystem"
                 ),

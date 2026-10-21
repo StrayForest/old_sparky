@@ -1501,6 +1501,7 @@ jobs:
 
           min_free_bytes=$((5 * 1024 * 1024 * 1024))
           failure_reason=step_failed
+          failure_trust_check=not_applicable
           release_root=""
           release_root_id=""
           artifact_sha256=""
@@ -1776,7 +1777,8 @@ jobs:
               exit 1
             fi
             if (( workflow_rc != 0 )); then
-              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=%s\n' "$failure_reason"
+              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=%s trust_check=%s\n' \
+                "$failure_reason" "$failure_trust_check"
               exit "$workflow_rc"
             fi
             if (( builder_run_ready == 0 )); then
@@ -1901,6 +1903,10 @@ jobs:
             failure_reason=python_runtime_copy_failed
             exit 1
           }
+          sudo -n /usr/bin/chmod 0700 "$root_python_prefix" 2>/dev/null || {
+            failure_reason=python_runtime_copy_failed
+            exit 1
+          }
           root_runtime_python="$root_python_prefix/bin/python3.12"
           root_runtime_python_real="$(sudo -n /usr/bin/readlink -f -- "$root_runtime_python" 2>/dev/null)" || {
             failure_reason=python_runtime_copy_failed
@@ -1908,25 +1914,35 @@ jobs:
           }
           case "$root_runtime_python_real" in
             "$root_python_prefix"/*) ;;
-            *) failure_reason=python_runtime_trust_failed; exit 1 ;;
+            *) failure_reason=python_runtime_trust_failed; failure_trust_check=python_realpath_containment; exit 1 ;;
           esac
           runtime_symlink_targets="$(sudo -n /usr/bin/find "$root_python_prefix" -type l -print0 2>/dev/null \
             | sudo -n /usr/bin/xargs -0 -r -n1 /usr/bin/readlink -f -- 2>/dev/null)" || {
             failure_reason=python_runtime_trust_failed
+            failure_trust_check=symlink_target_resolution
             exit 1
           }
           if [[ -n "$runtime_symlink_targets" ]]; then
             while IFS= read -r symlink_target; do
               case "$symlink_target" in
                 "$root_python_prefix"/*) ;;
-                *) failure_reason=python_runtime_trust_failed; exit 1 ;;
+                *) failure_reason=python_runtime_trust_failed; failure_trust_check=symlink_containment; exit 1 ;;
               esac
             done <<<"$runtime_symlink_targets"
           fi
-          [[ "$(sudo -n /usr/bin/stat -c '%u:%g:%a:%F' -- "$root_python_prefix" 2>/dev/null)" == "0:0:700:directory" \
-            && "$(sudo -n /usr/bin/stat -c '%u:%g:%F' -- "$root_runtime_python_real" 2>/dev/null)" == "0:0:regular file" \
-            && -z "$(sudo -n /usr/bin/find "$root_python_prefix" -perm /022 -print -quit 2>/dev/null)" ]] || {
+          [[ "$(sudo -n /usr/bin/stat -c '%u:%g:%a:%F' -- "$root_python_prefix" 2>/dev/null)" == "0:0:700:directory" ]] || {
             failure_reason=python_runtime_trust_failed
+            failure_trust_check=prefix_owner_group_mode_type
+            exit 1
+          }
+          [[ "$(sudo -n /usr/bin/stat -c '%u:%g:%F' -- "$root_runtime_python_real" 2>/dev/null)" == "0:0:regular file" ]] || {
+            failure_reason=python_runtime_trust_failed
+            failure_trust_check=interpreter_owner_type
+            exit 1
+          }
+          [[ -z "$(sudo -n /usr/bin/find "$root_python_prefix" -perm /022 -print -quit 2>/dev/null)" ]] || {
+            failure_reason=python_runtime_trust_failed
+            failure_trust_check=runtime_group_other_write_mode
             exit 1
           }
           root_python_ldd="$(sudo -n /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
@@ -1937,6 +1953,7 @@ jobs:
           if ! grep -Fq "libpython3.12.so.1.0 => $root_python_prefix/lib/libpython3.12.so.1.0" <<<"$root_python_ldd" \
             || grep -Fq "not found" <<<"$root_python_ldd"; then
             failure_reason=python_runtime_trust_failed
+            failure_trust_check=copied_libpython_resolution
             exit 1
           fi
           root_python_contract="$(sudo -n /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
@@ -1958,7 +1975,7 @@ jobs:
           while IFS= read -r runtime_path; do
             case "$runtime_path" in
               "$root_python_prefix"|"$root_python_prefix"/*) ;;
-              *) failure_reason=python_runtime_trust_failed; exit 1 ;;
+              *) failure_reason=python_runtime_trust_failed; failure_trust_check=sysconfig_prefix_containment; exit 1 ;;
             esac
           done <<<"$root_python_layout"
           sudo -n /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \

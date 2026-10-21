@@ -479,27 +479,13 @@ the canonical PyPI index, and never forward extra indexes, trusted hosts,
 find-links, certificate paths or proxy variables.
 The security dependency-audit gate also audits this complete lock, so the
 runtime, quality and security tool dependency sets are covered by one report.
-
-Each job's setup-python cache is keyed by the lock path, so lock changes
-invalidate dependency artifacts without sharing a mutable virtualenv between
-contours. The local bootstrap remains intentionally separate: it installs the
-runtime input for developer iteration and does not substitute for the
-hash-locked CI gate.
-
-The `backend-static`, `backend-integration`, `release-runtime` and
-`release-runtime-real` jobs in the Security workflow use the current
-`ubuntu-latest` image. The `backend-privileged` restore-drill and
-`verification-contract` jobs retain their documented `ubuntu-24.04`
-baselines. The trusted immutable release-builder job selects
-Python 3.12 from the setup-python tool cache, validates its resolved path and
-ABI, then copies the interpreter tree into a root-owned, mode-0700 temporary
-directory before root executes it. Its isolated environment points
-`LD_LIBRARY_PATH` only at that protected copy's `lib` directory and smoke-tests
-the interpreter and extension modules without ambient variables. Both build
-and wheelhouse verification environments use that protected copy. The job
-does not use the runner image's changing default `python3` to resolve a Python
-3.12 release lock; the release artifact contains no tool-cache path or
-virtualenv.
+Each job's setup-python cache follows its lock; local bootstrap stays separate from
+the hash-locked CI gate. `backend-static`, `backend-integration`, `release-runtime`
+and `release-runtime-real` use `ubuntu-latest`; `backend-privileged` and
+`verification-contract` retain `ubuntu-24.04`. The release builder validates the
+setup-python 3.12 tool-cache path and ABI, copies it to root-owned mode-0700 storage,
+and restricts `LD_LIBRARY_PATH` to that copy. Both venvs use this copy; the
+git-archive artifact contains neither runtime copy nor venv.
 
 GitHub Actions owns runner images, service containers, dependency bootstrap,
 parallelism, caches, artifacts, permissions, environment authorization and
@@ -582,12 +568,10 @@ workflows that materialize credentials use a literal, per-workflow `$RUNNER_TEMP
 directory symlink. An `always()` cleanup removes only the named key, `known_hosts`, config and control-socket paths, verifies each
 path and the directory are absent, clears `SSH_DIR` through `GITHUB_ENV`, and gates any later artifact action on cleanup success.
 Cleanup is never `continue-on-error`, so a cleanup failure keeps the job failed without replacing the primary operation result.
-Their host-key setup uses the same bounded two-attempt contract: each fresh mode-600 scan file is limited by `timeout --foreground
-4s` around `ssh-keyscan -T 3`, with a visible 0.5-second backoff. Validation ignores blank lines and comment-only OpenSSH
-banner lines but requires exactly one remaining record with the exact host token, Ed25519 type and pinned fingerprint; safe
-failure diagnostics expose only status/counts/booleans. The SSH contract test discovers every workflow site dynamically and
-exercises clean and OpenSSH-banner output, first-attempt recovery, persistent failure, wrong/multiple/malformed records,
-attempt bounds, diagnostic privacy and candidate cleanup.
+Their host-key setup uses two fresh mode-600 scans, each bounded by `timeout --foreground 4s ssh-keyscan -T 3`, with a
+0.5-second backoff. It ignores blank/comment lines but requires exactly one exact-host Ed25519 record matching the pinned
+fingerprint; SSH host checking stays strict. Failure diagnostics expose only status, counts and validation booleans. Dynamic
+contract tests cover all workflow sites, OpenSSH banners, retries, malformed/multiple/mismatched keys and cleanup.
 
 Every retained result identifies its source SHA, profile ID/version/digest,
 runner, fixture shape, offered logical actions, HTTP attempts and acceptance
