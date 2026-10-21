@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -33,7 +34,7 @@ class PlatformWebHermeticBrowserProvisioningTests(unittest.TestCase):
             target.mkdir(parents=True)
             if target.name == fail_on:
                 (target / "partial-download").write_bytes(b"partial")
-                raise provisioner.guard.GuardError("injected archive failure")
+                raise provisioner.guard.PinnedArchiveError(target.name, "download")
             executable = target / expected_executables[target.name]
             executable.parent.mkdir(parents=True, exist_ok=True)
             executable.write_bytes(b"pinned executable")
@@ -70,6 +71,26 @@ class PlatformWebHermeticBrowserProvisioningTests(unittest.TestCase):
                 for name, url, checksum, byte_size in provisioner._selected_archives()
             ]
             self.assertEqual(calls, expected)
+            archive_by_id = {
+                name: (url, checksum, byte_size)
+                for name, url, checksum, byte_size in provisioner.guard.PLAYWRIGHT_ARCHIVES
+            }
+            self.assertEqual(
+                archive_by_id["webkit-2311"],
+                (
+                    "https://cdn.playwright.dev/builds/webkit/2311/webkit-ubuntu-24.04.zip",
+                    "b15753f528e990ca941cbd6d0c61a5dac09abcf04cbd8969ea077f1901aeac92",
+                    105_839_953,
+                ),
+            )
+            self.assertEqual(
+                archive_by_id["ffmpeg-1011"],
+                (
+                    "https://cdn.playwright.dev/builds/ffmpeg/1011/ffmpeg-linux.zip",
+                    "ebc74fc5b94830176a3c2914ae96bd8bc7f6a91f4f33890230f84a172ee61ccc",
+                    2_376_500,
+                ),
+            )
             self.assertEqual(
                 {entry.name for entry in output.iterdir()},
                 set(provisioner.HERMETIC_ARCHIVE_NAMES),
@@ -103,7 +124,8 @@ class PlatformWebHermeticBrowserProvisioningTests(unittest.TestCase):
                     ),
                 ),
                 self.assertRaisesRegex(
-                    provisioner.guard.GuardError, "injected archive failure"
+                    provisioner.guard.PinnedArchiveError,
+                    "pinned browser archive validation failed",
                 ),
             ):
                 provisioner.provision(web_root, output)
@@ -111,6 +133,26 @@ class PlatformWebHermeticBrowserProvisioningTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertFalse(output.is_symlink())
             self.assertEqual(tuple(output.parent.iterdir()), ())
+
+            diagnostic = io.StringIO()
+            with mock.patch.object(
+                provisioner,
+                "provision",
+                side_effect=provisioner.guard.PinnedArchiveError(
+                    "ffmpeg-1011", "download"
+                ),
+            ), mock.patch("sys.stderr", diagnostic):
+                self.assertEqual(
+                    provisioner.main(
+                        ["--web-root", str(web_root), "--output", str(output)]
+                    ),
+                    1,
+                )
+            self.assertEqual(
+                diagnostic.getvalue().strip(),
+                "WEB_HERMETIC_BROWSERS status=failed stage=archive-download "
+                "archive=ffmpeg-1011 failure=download",
+            )
 
     def test_concurrent_parent_promotion_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

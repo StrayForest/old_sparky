@@ -1069,8 +1069,9 @@ class LiveQaGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = self.make_zip(root, [("../escape", b"owned")])
-            with self.assertRaisesRegex(guard.GuardError, "layout is unsafe"):
+            with self.assertRaises(guard.PinnedArchiveError) as raised:
                 self.extract_test_zip(source, root / "browser")
+            self.assertEqual(raised.exception.failure_class, "archive-validation")
             self.assertFalse((root / "escape").exists())
 
             helper = platform_chromium_sandbox_fixture.read_bytes()
@@ -1109,12 +1110,13 @@ class LiveQaGuardTests(unittest.TestCase):
             )
 
             source = self.make_zip(root, [("chrome-linux64/chrome", b"binary")])
-            with self.assertRaisesRegex(guard.GuardError, "retained member"):
+            with self.assertRaises(guard.PinnedArchiveError) as raised:
                 self.extract_test_zip(
                     source,
                     root / "missing",
                     retained_paths=guard.CHROMIUM_ARCHIVE_RETAINED_PATHS,
                 )
+            self.assertEqual(raised.exception.failure_class, "archive-validation")
 
             linked = root / "linked-source.zip"
             info = zipfile.ZipInfo("chrome-linux64/chrome_sandbox")
@@ -1122,12 +1124,13 @@ class LiveQaGuardTests(unittest.TestCase):
             info.external_attr = (stat.S_IFLNK | 0o777) << 16
             with zipfile.ZipFile(linked, "w") as archive:
                 archive.writestr(info, "../../escape")
-            with self.assertRaisesRegex(guard.GuardError, "escapes"):
+            with self.assertRaises(guard.PinnedArchiveError) as raised:
                 self.extract_test_zip(
                     linked,
                     root / "linked",
                     retained_paths=guard.CHROMIUM_ARCHIVE_RETAINED_PATHS,
                 )
+            self.assertEqual(raised.exception.failure_class, "archive-validation")
 
     def test_zip_extraction_rejects_uncompressed_size_over_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1135,9 +1138,10 @@ class LiveQaGuardTests(unittest.TestCase):
             source = self.make_zip(root, [("browser/file", b"1234")])
             with (
                 mock.patch.object(guard, "MAX_ZIP_UNCOMPRESSED_BYTES", 3),
-                self.assertRaisesRegex(guard.GuardError, "extraction limit"),
+                self.assertRaises(guard.PinnedArchiveError) as raised,
             ):
                 self.extract_test_zip(source, root / "browser")
+            self.assertEqual(raised.exception.failure_class, "size")
 
     def test_download_rejects_checksum_mismatch_and_removes_archive(self) -> None:
         url = "https://downloads.example.invalid/archive.zip"

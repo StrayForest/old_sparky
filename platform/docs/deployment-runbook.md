@@ -593,7 +593,8 @@ Failed or missing gates stop the chain before production side effects.
 Open only when applicable:
 
 - CSP candidate/enforcement changes, live browser QA, Turnstile/auth contour, AppArmor Chromium sandbox and CSP observation gates: [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md).
-- The live public browser workflow is owned by [`test-suite-governance.md`](test-suite-governance.md) and must invoke the dedicated server wrapper over SSH. Do not run production Playwright on the GitHub runner.
+- Live public browser workflows follow [`test-suite-governance.md`](test-suite-governance.md). Use the dedicated server wrapper over SSH; never run production Playwright on GitHub.
+  CI hermetic and live-QA builders share pinned browser archives; update mirrors only after exact size/SHA-256 match, preserving redirect/hash checks.
 - Backup/restore: [`backup-restore-runbook.md`](backup-restore-runbook.md).
 - Security policy and CSP ownership: [`security-runbook.md`](security-runbook.md).
 - Incident response: [`incident-response.md`](incident-response.md).

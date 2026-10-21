@@ -135,11 +135,15 @@ class RuntimeBuildError(RuntimeError):
         *,
         reason: str = "build-failed",
         phase: str | None = None,
+        archive_id: str | None = None,
+        failure_class: str | None = None,
     ) -> None:
         super().__init__(message)
         self.reason = reason
         self.phase = phase
         self.cleanup = "not-needed"
+        self.archive_id = archive_id
+        self.failure_class = failure_class
 
 
 DIAGNOSTIC_PHASES = frozenset(
@@ -173,6 +177,7 @@ DIAGNOSTIC_REASONS = frozenset(
         "size-limit",
         "count-limit",
         "checksum",
+        "archive-download",
         "io",
         "manifest",
         "cleanup",
@@ -188,6 +193,8 @@ def _print_diagnostic(
     reason: str,
     cleanup: str,
     tree_sha256: str | None = None,
+    archive_id: str | None = None,
+    failure_class: str | None = None,
     stream: object | None = None,
 ) -> None:
     payload: dict[str, object] = {
@@ -199,6 +206,10 @@ def _print_diagnostic(
     }
     if tree_sha256 is not None:
         payload["tree_sha256"] = tree_sha256
+    if archive_id is not None and archive_id in guard.PINNED_ARCHIVE_IDS:
+        payload["archive_id"] = archive_id
+    if failure_class is not None and failure_class in guard.PINNED_ARCHIVE_FAILURE_CLASSES:
+        payload["failure_class"] = failure_class
     print(
         json.dumps(payload, sort_keys=True, separators=(",", ":")),
         file=sys.stdout if stream is None else stream,
@@ -845,12 +856,21 @@ def build(
         engine_links: dict[str, str] = {}
         for directory_name, url, checksum, byte_size in guard.PLAYWRIGHT_ARCHIVES:
             browser_root = browsers / directory_name
-            guard._download_pinned_zip(
-                url,
-                checksum,
-                byte_size,
-                browser_root,
-            )
+            try:
+                guard._download_pinned_zip(
+                    url,
+                    checksum,
+                    byte_size,
+                    browser_root,
+                )
+            except guard.PinnedArchiveError as exc:
+                raise RuntimeBuildError(
+                    "pinned browser archive validation failed",
+                    reason="archive-download",
+                    phase="download-browser",
+                    archive_id=exc.archive_id,
+                    failure_class=exc.failure_class,
+                ) from None
             for marker in browser_root.rglob("INSTALLATION_COMPLETE"):
                 marker.unlink()
             phase = "materialize-browser-links"
@@ -1079,6 +1099,8 @@ def main(argv: list[str] | None = None) -> int:
             status="failed",
             reason=reason,
             cleanup=cleanup,
+            archive_id=getattr(exc, "archive_id", None),
+            failure_class=getattr(exc, "failure_class", None),
             stream=sys.stderr,
         )
         return 1

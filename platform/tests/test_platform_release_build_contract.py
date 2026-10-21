@@ -548,7 +548,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         guard_source = guard.read_text(encoding="utf-8")
         archives_start = guard_source.index("PLAYWRIGHT_ARCHIVES = (")
         archives_end = guard_source.index(
-            "\n)\nCHROMIUM_SANDBOX_RELATIVE", archives_start
+            "\n)\nPINNED_ARCHIVE_IDS", archives_start
         ) + 2
         archive_literal = "PLAYWRIGHT_ARCHIVES = (\n" + "".join(
             f"    {row!r},\n" for row in archives
@@ -930,9 +930,21 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 )
                 self.assertNotEqual(completed.returncode, 0, completed.stdout)
                 diagnostic = json.loads(completed.stderr)
-                self.assertEqual(
+                self.assertTrue(
+                    {"schema", "phase", "status", "reason", "cleanup"}
+                    <= set(diagnostic)
+                )
+                self.assertLessEqual(
                     set(diagnostic),
-                    {"schema", "phase", "status", "reason", "cleanup"},
+                    {
+                        "schema",
+                        "phase",
+                        "status",
+                        "reason",
+                        "cleanup",
+                        "archive_id",
+                        "failure_class",
+                    },
                 )
                 self.assertEqual(diagnostic["status"], "failed")
                 self.assertEqual(diagnostic["cleanup"], "passed")
@@ -940,6 +952,34 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 self.assertNotIn("file://", completed.stderr)
                 self.assertNotIn("Traceback", completed.stderr)
                 self.assertFalse(output.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builder, platform_root, node_home, output, _sandbox = (
+                self._prepare_local_runtime_fixture(root)
+            )
+            archive = root / "ffmpeg-1011.zip"
+            guard_path = builder.parent / "platform_live_qa_guard.py"
+            guard_source = guard_path.read_text(encoding="utf-8")
+            actual_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            self.assertIn(actual_digest, guard_source)
+            guard_path.write_text(
+                guard_source.replace(actual_digest, "0" * 64, 1),
+                encoding="utf-8",
+            )
+            completed = self._run_staged_live_qa_build(
+                builder, platform_root, node_home, output, root
+            )
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            diagnostic = json.loads(completed.stderr)
+            self.assertEqual(diagnostic["phase"], "download-browser")
+            self.assertEqual(diagnostic["reason"], "archive-download")
+            self.assertEqual(diagnostic["archive_id"], "ffmpeg-1011")
+            self.assertEqual(diagnostic["failure_class"], "checksum")
+            self.assertEqual(diagnostic["cleanup"], "passed")
+            self.assertNotIn(str(root), completed.stderr)
+            self.assertNotIn("file://", completed.stderr)
+            self.assertFalse(output.exists())
 
     def test_browser_materializer_rejects_filesystem_metadata_and_specials(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

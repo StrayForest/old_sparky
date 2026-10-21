@@ -175,6 +175,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         provision(args.web_root, args.output)
+    except guard.PinnedArchiveError as exc:
+        print(
+            "WEB_HERMETIC_BROWSERS status=failed stage=archive-download "
+            f"archive={exc.archive_id} failure={exc.failure_class}",
+            file=sys.stderr,
+        )
+        return 1
     except (OSError, guard.GuardError, ValueError) as exc:
         print(
             f"WEB_HERMETIC_BROWSERS status=failed reason={type(exc).__name__}",

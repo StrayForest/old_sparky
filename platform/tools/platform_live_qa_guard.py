@@ -90,16 +90,28 @@ PLAYWRIGHT_ARCHIVES = (
     ),
     (
         "webkit-2311",
-        "https://playwright.download.prss.microsoft.com/dbazure/download/playwright/builds/webkit/2311/webkit-ubuntu-24.04.zip",
+        "https://cdn.playwright.dev/builds/webkit/2311/webkit-ubuntu-24.04.zip",
         "b15753f528e990ca941cbd6d0c61a5dac09abcf04cbd8969ea077f1901aeac92",
         105_839_953,
     ),
     (
         "ffmpeg-1011",
-        "https://playwright.download.prss.microsoft.com/dbazure/download/playwright/builds/ffmpeg/1011/ffmpeg-linux.zip",
+        "https://cdn.playwright.dev/builds/ffmpeg/1011/ffmpeg-linux.zip",
         "ebc74fc5b94830176a3c2914ae96bd8bc7f6a91f4f33890230f84a172ee61ccc",
         2_376_500,
     ),
+)
+PINNED_ARCHIVE_IDS = frozenset(archive[0] for archive in PLAYWRIGHT_ARCHIVES)
+PINNED_ARCHIVE_FAILURE_CLASSES = frozenset(
+    {
+        "download",
+        "redirect",
+        "size",
+        "checksum",
+        "extraction",
+        "archive-validation",
+        "io",
+    }
 )
 CHROMIUM_SANDBOX_RELATIVE = Path("browsers/chromium-1228/chrome-linux64/chrome_sandbox")
 CHROMIUM_SANDBOX_SIZE = 15232
@@ -338,6 +350,42 @@ except ModuleNotFoundError as exc:
     sys.modules[_machine_lock_name] = _machine_lock_module
     _machine_lock_spec.loader.exec_module(_machine_lock_module)
 GuardError = _machine_lock_module.GuardError
+
+
+def pinned_archive_failure_class(error: BaseException) -> str:
+    """Project a pinned archive failure onto a closed, non-sensitive enum."""
+
+    if not isinstance(error, GuardError):
+        return "archive-validation"
+    message = str(error)
+    if message.endswith(" download failed"):
+        return "download"
+    if "redirected unexpectedly" in message:
+        return "redirect"
+    if (
+        "size" in message
+        or "exceeds its bound" in message
+        or "extraction limit" in message
+    ):
+        return "size"
+    if "checksum" in message or "digest" in message:
+        return "checksum"
+    if "extraction failed" in message:
+        return "extraction"
+    return "archive-validation"
+
+
+class PinnedArchiveError(GuardError):
+    """A safe, bounded classification for one pinned browser archive failure."""
+
+    def __init__(self, archive_id: str, failure_class: str) -> None:
+        if archive_id not in PINNED_ARCHIVE_IDS:
+            archive_id = "unknown"
+        if failure_class not in PINNED_ARCHIVE_FAILURE_CLASSES:
+            failure_class = "archive-validation"
+        self.archive_id = archive_id
+        self.failure_class = failure_class
+        super().__init__("pinned browser archive validation failed")
 
 
 class BrowserFailureReportUnavailable(GuardError):
@@ -4410,7 +4458,7 @@ def _validated_zip_members(
     return result
 
 
-def _download_pinned_zip(
+def _download_pinned_zip_impl(
     url: str,
     expected_sha256: str,
     expected_size: int,
@@ -4515,6 +4563,37 @@ def _download_pinned_zip(
         raise GuardError("pinned Playwright archive extraction failed") from exc
     finally:
         archive.unlink(missing_ok=True)
+
+
+def _download_pinned_zip(
+    url: str,
+    expected_sha256: str,
+    expected_size: int,
+    target: Path,
+    *,
+    retained_paths: frozenset[PurePosixPath] | None = None,
+) -> None:
+    """Download one pinned archive and expose only bounded failure metadata."""
+
+    try:
+        _download_pinned_zip_impl(
+            url,
+            expected_sha256,
+            expected_size,
+            target,
+            retained_paths=retained_paths,
+        )
+    except PinnedArchiveError:
+        raise
+    except GuardError as exc:
+        archive_id = target.name if target.name in PINNED_ARCHIVE_IDS else "unknown"
+        raise PinnedArchiveError(
+            archive_id,
+            pinned_archive_failure_class(exc),
+        ) from None
+    except OSError:
+        archive_id = target.name if target.name in PINNED_ARCHIVE_IDS else "unknown"
+        raise PinnedArchiveError(archive_id, "io") from None
 
 
 def _assert_playwright_revision(web: Path) -> None:
