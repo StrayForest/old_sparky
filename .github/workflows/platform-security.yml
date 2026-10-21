@@ -573,7 +573,7 @@ jobs:
     name: Backend DB-free contours
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
     if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
       PLATFORM_ENVIRONMENT: test
@@ -623,7 +623,7 @@ jobs:
     name: Backend PostgreSQL and Redis integration
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
     if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
       postgres:
@@ -1298,7 +1298,7 @@ jobs:
         inputs.proof_mode != 'baseline-runtime' ||
         needs.baseline-runtime-guard.result == 'success'
       )
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
       redis:
@@ -1378,7 +1378,7 @@ jobs:
       needs.classifier.outputs.class == 'full' &&
       needs.classifier.outputs.deployable == 'true') ||
       (inputs.proof_mode == 'baseline-runtime' && needs.baseline-runtime-guard.result == 'success'))
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
@@ -1390,6 +1390,26 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Resolve trusted setup-python 3.12 for the root runtime build
+        shell: bash
+        run: |
+          set -euo pipefail
+          selected_python="$(command -v python)"
+          resolved_python="$(readlink -f -- "$selected_python")"
+          tool_cache="$(readlink -f -- "$RUNNER_TOOL_CACHE")"
+          case "$resolved_python" in
+            "$tool_cache"/Python/3.12.*/*/bin/python3.12) ;;
+            *) echo "setup-python did not resolve to the trusted Python 3.12 tool cache" >&2; exit 1 ;;
+          esac
+          python_contract="$("$resolved_python" -I -c 'import platform,sys; print(f"{sys.version_info[0]}.{sys.version_info[1]} {sys.platform} {platform.machine()}")')"
+          [[ "$python_contract" == "3.12 linux x86_64" ]] || {
+            echo "setup-python runtime builder target is unsupported" >&2
+            exit 1
+          }
+          printf 'PLATFORM_RELEASE_PYTHON=%s\n' "$resolved_python" >>"$GITHUB_ENV"
       - name: Recheck exact current dev SHA immediately before runtime build
         if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
         shell: bash
@@ -1859,12 +1879,102 @@ jobs:
             failure_reason=copied_sha_mismatch
             exit 1
           }
+          runtime_python_prefix="${PLATFORM_RELEASE_PYTHON%/bin/python3.12}"
+          runtime_tool_cache="$(readlink -f -- "$RUNNER_TOOL_CACHE")" || {
+            failure_reason=python_runtime_source_invalid
+            exit 1
+          }
+          [[ "$runtime_python_prefix" == "$runtime_tool_cache"/Python/3.12.*/* ]] || {
+            failure_reason=python_runtime_source_invalid
+            exit 1
+          }
+          root_python_prefix="$release_root/python-runtime"
+          sudo -n /usr/bin/install -d -o root -g root -m 0700 "$root_python_prefix" 2>/dev/null || {
+            failure_reason=python_runtime_copy_failed
+            exit 1
+          }
+          sudo -n /bin/cp -a "$runtime_python_prefix/." "$root_python_prefix/" 2>/dev/null || {
+            failure_reason=python_runtime_copy_failed
+            exit 1
+          }
+          sudo -n /bin/chown -R root:root "$root_python_prefix" 2>/dev/null || {
+            failure_reason=python_runtime_copy_failed
+            exit 1
+          }
+          root_runtime_python="$root_python_prefix/bin/python3.12"
+          root_runtime_python_real="$(sudo -n /usr/bin/readlink -f -- "$root_runtime_python" 2>/dev/null)" || {
+            failure_reason=python_runtime_copy_failed
+            exit 1
+          }
+          case "$root_runtime_python_real" in
+            "$root_python_prefix"/*) ;;
+            *) failure_reason=python_runtime_trust_failed; exit 1 ;;
+          esac
+          runtime_symlink_targets="$(sudo -n /usr/bin/find "$root_python_prefix" -type l -print0 2>/dev/null \
+            | sudo -n /usr/bin/xargs -0 -r -n1 /usr/bin/readlink -f -- 2>/dev/null)" || {
+            failure_reason=python_runtime_trust_failed
+            exit 1
+          }
+          if [[ -n "$runtime_symlink_targets" ]]; then
+            while IFS= read -r symlink_target; do
+              case "$symlink_target" in
+                "$root_python_prefix"/*) ;;
+                *) failure_reason=python_runtime_trust_failed; exit 1 ;;
+              esac
+            done <<<"$runtime_symlink_targets"
+          fi
+          [[ "$(sudo -n /usr/bin/stat -c '%u:%g:%a:%F' -- "$root_python_prefix" 2>/dev/null)" == "0:0:700:directory" \
+            && "$(sudo -n /usr/bin/stat -c '%u:%g:%F' -- "$root_runtime_python_real" 2>/dev/null)" == "0:0:regular file" \
+            && -z "$(sudo -n /usr/bin/find "$root_python_prefix" -perm /022 -print -quit 2>/dev/null)" ]] || {
+            failure_reason=python_runtime_trust_failed
+            exit 1
+          }
+          root_python_ldd="$(sudo -n /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
+            LD_LIBRARY_PATH="$root_python_prefix/lib" /usr/bin/ldd "$root_runtime_python_real" 2>/dev/null)" || {
+            failure_reason=python_runtime_copy_failed
+            exit 1
+          }
+          if ! grep -Fq "libpython3.12.so.1.0 => $root_python_prefix/lib/libpython3.12.so.1.0" <<<"$root_python_ldd" \
+            || grep -Fq "not found" <<<"$root_python_ldd"; then
+            failure_reason=python_runtime_trust_failed
+            exit 1
+          fi
+          root_python_contract="$(sudo -n /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
+            LD_LIBRARY_PATH="$root_python_prefix/lib" "$root_runtime_python" -I \
+            -c 'import platform,sys; print(f"{sys.version_info[0]}.{sys.version_info[1]} {sys.platform} {platform.machine()}")' 2>/dev/null)" || {
+            failure_reason=python_runtime_copy_failed
+            exit 1
+          }
+          [[ "$root_python_contract" == "3.12 linux x86_64" ]] || {
+            failure_reason=python_runtime_contract_mismatch
+            exit 1
+          }
+          root_python_layout="$(sudo -n /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
+            LD_LIBRARY_PATH="$root_python_prefix/lib" "$root_runtime_python" -I \
+            -c 'import sys,sysconfig; paths = sysconfig.get_paths(); print("\n".join((sys.prefix, sys.base_prefix, paths["stdlib"], paths["platstdlib"])))' 2>/dev/null)" || {
+            failure_reason=python_runtime_copy_failed
+            exit 1
+          }
+          while IFS= read -r runtime_path; do
+            case "$runtime_path" in
+              "$root_python_prefix"|"$root_python_prefix"/*) ;;
+              *) failure_reason=python_runtime_trust_failed; exit 1 ;;
+            esac
+          done <<<"$root_python_layout"
+          sudo -n /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
+            LD_LIBRARY_PATH="$root_python_prefix/lib" "$root_runtime_python" -I \
+            -c 'import ctypes, sqlite3, ssl' >/dev/null 2>&1 || {
+            failure_reason=python_runtime_smoke_failed
+            exit 1
+          }
           sudo -n /usr/bin/env -i \
             HOME=/root \
             LANG=C.UTF-8 \
             LC_ALL=C.UTF-8 \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            /usr/bin/python3 -m venv "$build_root/platform/.venv_platform" 2>/dev/null || {
+            LD_LIBRARY_PATH="$root_python_prefix/lib" \
+            PLATFORM_RELEASE_PYTHON="$root_runtime_python" \
+            "$root_runtime_python" -m venv "$build_root/platform/.venv_platform" 2>/dev/null || {
             failure_reason=python_environment_failed
             exit 1
           }
@@ -1894,18 +2004,22 @@ jobs:
              builder="$3"
              release_ref="$4"
              marker_log="$5"
+             runtime_python="$6"
              exec >"$build_log" 2>&1
              exec /usr/bin/env -i \
                HOME=/root \
                LANG=C.UTF-8 \
                LC_ALL=C.UTF-8 \
                PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+               LD_LIBRARY_PATH="${runtime_python%/bin/python3.12}/lib" \
+               PLATFORM_RELEASE_PYTHON="$runtime_python" \
                PLATFORM_RELEASE_OUTPUT_DIR="$release_output" \
                PLATFORM_RELEASE_PHASE_LOG="$marker_log" \
                PLATFORM_WEB_NEXT_COMPRESSION=true \
                "$builder" "$release_ref"' \
             _ "$build_log" "$release_output" \
-            "$build_root/platform/tools/platform_build_release.sh" "$release_ref" "$marker_log"
+            "$build_root/platform/tools/platform_build_release.sh" "$release_ref" "$marker_log" \
+            "$root_runtime_python"
           canonical_builder_rc=$?
           set -e
           [[ "$canonical_builder_rc" -eq 0 ]] || { failure_reason=canonical_builder_failed; exit "$canonical_builder_rc"; }

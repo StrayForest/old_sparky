@@ -8259,11 +8259,17 @@ cleanup
         script = BUILD_SCRIPT.read_text()
 
         self.assertIn(
+            'PLATFORM_RELEASE_PYTHON="${PLATFORM_RELEASE_PYTHON:-/usr/bin/python3.12}"',
+            script,
+        )
+        self.assertIn('"$PLATFORM_RELEASE_PYTHON" -I -m venv "$VERIFY_VENV"', script)
+        self.assertIn('"$venv_base_python" != "$expected_python"', script)
+        self.assertIn('"$python_contract" != "3.12 linux x86_64"', script)
+        self.assertIn(
             '"$ROOT_DIR/.venv_platform/bin/python" -I -m pip download', script
         )
         self.assertIn("--only-binary=:all:", script)
         self.assertIn("--require-hashes", script)
-        self.assertIn('/usr/bin/python3 -I -m venv "$VERIFY_VENV"', script)
         self.assertIn('"$VERIFY_VENV/bin/python" -I -m pip check', script)
         self.assertNotIn('bin/python" -m pip', script)
         self.assertNotIn("/usr/bin/python3 -m venv", script)

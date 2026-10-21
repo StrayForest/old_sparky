@@ -178,10 +178,13 @@ symlinked, special or leftover export entry fails the workflow.
 
 Every production SSH boundary acquires the pinned Ed25519 host key with two
 visible attempts. Each attempt is a fresh mode-600 file, bounded by an outer
-four-second timeout and `ssh-keyscan -T 3`, and accepts only one exact-host
-`ssh-ed25519` line whose parsed SHA-256 fingerprint matches the pinned value.
-The 0.5-second backoff keeps the total acquisition budget at most 8.5 seconds;
-empty, malformed, multiple or mismatched output fails closed. Strict host-key
+four-second timeout and `ssh-keyscan -T 3`, and accepts exactly one nonblank,
+noncomment record with the exact host token, `ssh-ed25519` type and pinned
+SHA-256 fingerprint. This ignores only OpenSSH banner comments on stdout;
+malformed, multiple or mismatched key records fail closed. The 0.5-second
+backoff keeps the total acquisition budget at most 8.5 seconds. On failure,
+diagnostics report only the scanner status, line/record counts and validation
+booleans; they never print the host token or key material. Strict host-key
 checking remains enabled and no TOFU or fallback path is permitted.
 
 Do not manually dispatch the deploy workflow for a normal `dev` push. Observe

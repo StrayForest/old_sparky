@@ -115,7 +115,13 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                     block,
                     path.name,
                 )
-                self.assertIn("NR == 1", block, path.name)
+                self.assertIn("/^[[:space:]]*($|#)/ { next }", block, path.name)
+                self.assertIn("records == 1 && valid == 1 && !invalid", block, path.name)
+                self.assertIn(
+                    "SSH_KEYSCAN_DIAGNOSTIC rc=%s lines=%s records=%s host_token_valid=%s key_type_valid=%s fingerprint_match=%s",
+                    block,
+                    path.name,
+                )
                 self.assertIn(
                     'ssh-keygen -lf "$ssh_scan_attempt" -E sha256 2>/dev/null',
                     block,
@@ -169,20 +175,29 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                 fi
                 printf '%s\n' "$SCAN_KEY"
                 ;;
+              banner-before-key)
+                printf '%s\n%s\n' '# prod.example.test:22 SSH-2.0-OpenSSH_10.2' "$SCAN_KEY"
+                ;;
+              clean-key)
+                printf '%s\n' "$SCAN_KEY"
+                ;;
               persistent-empty)
                 exit 1
                 ;;
               multiple)
-                printf '%s\n%s\n' "$SCAN_KEY" "$SCAN_KEY"
+                printf '%s\n%s\n%s\n' '# prod.example.test:22 SSH-2.0-OpenSSH_10.2' "$SCAN_KEY" "$SCAN_KEY"
+                ;;
+              comment-only)
+                printf '%s\n' '# prod.example.test:22 SSH-2.0-OpenSSH_10.2'
                 ;;
               wrong-host)
-                printf '%s\n' "other.example.test ${SCAN_KEY#* }"
+                printf '%s\n%s\n' '# prod.example.test:22 SSH-2.0-OpenSSH_10.2' "other.example.test ${SCAN_KEY#* }"
                 ;;
               wrong-fingerprint)
-                printf '%s\n' "$WRONG_FINGERPRINT_KEY"
+                printf '%s\n%s\n' '# prod.example.test:22 SSH-2.0-OpenSSH_10.2' "$WRONG_FINGERPRINT_KEY"
                 ;;
               malformed)
-                printf '%s\n' 'prod.example.test ssh-ed25519 not-base64'
+                printf '%s\n%s\n' '# prod.example.test:22 SSH-2.0-OpenSSH_10.2' 'prod.example.test ssh-ed25519 not-base64'
                 ;;
               hang)
                 exec sleep 5
@@ -198,6 +213,7 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
         scenarios = (
             "persistent-empty",
             "multiple",
+            "comment-only",
             "wrong-host",
             "wrong-fingerprint",
             "malformed",
@@ -277,6 +293,17 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
             self.assertFalse((success_dir / "known_hosts.scan.1").exists())
             self.assertFalse((success_dir / "known_hosts.scan.2").exists())
 
+            for scenario in ("clean-key", "banner-before-key"):
+                with self.subTest(scenario=scenario):
+                    result = run(scenario)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        (root / f"ssh-{scenario}" / "known_hosts.scan").read_text(
+                            encoding="utf-8"
+                        ).splitlines()[-1],
+                        FIXTURE_KEY,
+                    )
+
             for scenario in scenarios:
                 started = time.monotonic()
                 result = run(
@@ -285,6 +312,13 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                 )
                 elapsed = time.monotonic() - started
                 self.assertNotEqual(result.returncode, 0, scenario)
+                self.assertRegex(
+                    result.stderr,
+                    r"SSH_KEYSCAN_DIAGNOSTIC rc=\d+ lines=\d+ records=\d+ host_token_valid=[01] key_type_valid=[01] fingerprint_match=[01]",
+                    scenario,
+                )
+                self.assertNotIn("prod.example.test", result.stderr)
+                self.assertNotIn(FIXTURE_KEY.split()[-1], result.stderr)
                 if scenario == "hang":
                     self.assertLess(elapsed, 4)
                 self.assertEqual(

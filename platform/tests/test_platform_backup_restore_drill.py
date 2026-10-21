@@ -51,6 +51,43 @@ _SYNTHETIC_RESTORE_TEST_ID = (
 )
 
 
+def _disk_image_device_stat(
+    backing_path: pathlib.Path, *, same_device_as_root: bool = True
+) -> Any:
+    real_stat = os.stat
+    backing_device = real_stat(backing_path).st_dev
+    root_device = backing_device if same_device_as_root else backing_device + 1
+
+    def stat_for_fixture(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> Any:
+        actual = real_stat(path, *args, **kwargs)
+        try:
+            candidate = os.fspath(path)
+        except TypeError:
+            return actual
+        backing_path_text = os.fspath(backing_path)
+        if candidate != "/" and not (
+            candidate == backing_path_text
+            or candidate.startswith(backing_path_text + os.sep)
+        ):
+            return actual
+        fields = {
+            name: getattr(actual, name)
+            for name in (
+                "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid",
+                "st_size", "st_atime", "st_mtime", "st_ctime", "st_blocks",
+                "st_blksize",
+            )
+            if hasattr(actual, name)
+        }
+        if candidate != "/":
+            fields["st_dev"] = backing_device
+        else:
+            fields["st_dev"] = root_device
+        return types.SimpleNamespace(**fields)
+
+    return stat_for_fixture
+
+
 def _write_synthetic_restore_ci_artifact(
     name: str, artifact: dict[str, Any]
 ) -> pathlib.Path:
@@ -2010,12 +2047,40 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
             with (
                 mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
+                mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
+                ),
+                mock.patch.object(
+                    backup_drill.os,
+                    "stat",
+                    side_effect=_disk_image_device_stat(
+                        temporary_root, same_device_as_root=False
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, "verified disk-backed ext4 filesystem"
+                ),
+            ):
+                backup_drill._scratch_prepare_disk_image(
+                    "0123456789abcdef01234567"
+                )
+
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", image_root),
                 mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_BYTES", 8192),
                 mock.patch.object(backup_drill.os, "geteuid", return_value=0),
                 mock.patch.object(
                     backup_drill,
                     "_scratch_mountinfo_for",
                     return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
+                ),
+                mock.patch.object(
+                    backup_drill.os,
+                    "stat",
+                    side_effect=_disk_image_device_stat(temporary_root),
                 ),
                 mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
                 mock.patch.object(
@@ -2066,6 +2131,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     backup_drill,
                     "_scratch_mountinfo_for",
                     return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
+                ),
+                mock.patch.object(
+                    backup_drill.os,
+                    "stat",
+                    side_effect=_disk_image_device_stat(temporary_root),
                 ),
                 mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
                 mock.patch.object(
@@ -2152,6 +2222,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     "_scratch_mountinfo_for",
                     return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
                 ),
+                mock.patch.object(
+                    backup_drill.os,
+                    "stat",
+                    side_effect=_disk_image_device_stat(temporary_root),
+                ),
                 mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
                 mock.patch.object(pathlib.Path, "lstat", root_owned_parent_lstat),
                 mock.patch.object(backup_drill.os, "open", wraps=os.open) as open_spy,
@@ -2177,6 +2252,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     backup_drill,
                     "_scratch_mountinfo_for",
                     return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
+                ),
+                mock.patch.object(
+                    backup_drill.os,
+                    "stat",
+                    side_effect=_disk_image_device_stat(temporary_root),
                 ),
                 mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
                 mock.patch.object(pathlib.Path, "lstat", unsafe_parent_lstat),
@@ -2267,6 +2347,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     backup_drill,
                     "_scratch_mountinfo_for",
                     return_value=("/", "8:1", "ext4", "/dev/sda1", "/", "rw,relatime"),
+                ),
+                mock.patch.object(
+                    backup_drill.os,
+                    "stat",
+                    side_effect=_disk_image_device_stat(temporary_root),
                 ),
                 mock.patch.object(backup_drill, "snapshot_for_path", return_value=snapshot),
                 mock.patch.object(pathlib.Path, "lstat", root_owned_lstat),

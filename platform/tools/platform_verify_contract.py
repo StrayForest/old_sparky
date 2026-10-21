@@ -1349,7 +1349,7 @@ def _ci_dependency_issues(security_text: str) -> list[str]:
     setup_python_jobs = {
         job_id: block
         for job_id, block in job_blocks.items()
-        if _SETUP_PYTHON_USE_RE.search(block)
+        if _SETUP_PYTHON_USE_RE.search(block) and job_id != "release-runtime-real"
     }
     if not setup_python_jobs:
         issues.append("platform-security.yml must contain a Python setup job")
@@ -1928,10 +1928,27 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
     if "timeout-minutes: 40" not in real_step:
         issues.append("release-runtime-real builder step must have a fixed timeout")
     for marker, message in (
+        ("actions/setup-python@", "trusted setup-python runtime source"),
+        ('python-version: "3.12"', "Python 3.12 lock-target runtime"),
+        ("Resolve trusted setup-python 3.12 for the root runtime build", "validated tool-cache interpreter"),
+    ):
+        if marker not in real:
+            issues.append(f"release-runtime-real is missing {message}")
+    for marker, message in (
+        ('runtime_python_prefix="${PLATFORM_RELEASE_PYTHON%/bin/python3.12}"', "tool-cache source prefix"),
         ("platform_build_release.sh", "canonical release builder"),
         ("PLATFORM_RELEASE_OUTPUT_DIR=\"$release_output\"", "task-owned release output"),
         ("PLATFORM_WEB_NEXT_COMPRESSION=true", "canonical web compression mode"),
-        ("/usr/bin/python3 -m venv", "root-isolated Python environment"),
+        ('root_python_prefix="$release_root/python-runtime"', "private runtime copy"),
+        ('sudo -n /bin/chown -R root:root "$root_python_prefix"', "root-owned runtime copy"),
+        ('find "$root_python_prefix" -perm /022', "non-writable runtime copy"),
+        ('LD_LIBRARY_PATH="$root_python_prefix/lib"', "protected Python shared-library path"),
+        ("libpython3.12.so.1.0", "copied libpython resolution"),
+        ("import ctypes, sqlite3, ssl", "clean-environment interpreter smoke"),
+        ('runtime_symlink_targets="$(sudo -n /usr/bin/find', "contained runtime symlinks"),
+        ('sys.prefix, sys.base_prefix, paths["stdlib"], paths["platstdlib"]', "contained runtime libraries"),
+        ('"$root_runtime_python" -m venv', "root-isolated Python environment"),
+        ('LD_LIBRARY_PATH="${runtime_python%/bin/python3.12}/lib"', "builder protected library path"),
         ("platform_validate_release_artifact.py", "read-only artifact validation"),
         ("sha256sum -c", "checksum validation"),
         ("RELEASE.json", "release provenance validation"),
@@ -1955,8 +1972,6 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
             issues.append(f"release-runtime-real builder is missing {message}")
     if "sudo -n /usr/bin/env -i" not in real_step:
         issues.append("release-runtime-real builder must use root env isolation")
-    if "actions/setup-python@" in real:
-        issues.append("release-runtime-real must use its own clean production-style venv setup")
     if "platform_verify.py release-runtime" in real:
         issues.append("release-runtime-real must not run the fixture gate")
     if "tee" in real or 'cat "$build_log"' in real or '--log "$build_log"' in real or "BASH_COMMAND" in real:

@@ -2196,6 +2196,7 @@ class HostToolsBundleTests(unittest.TestCase):
                     bundle.build_bundle(source, SOURCE_SHA, root / "bundle.zip")
 
     def test_staged_isolated_dispatcher_import_has_no_ambient_dependency(self) -> None:
+        self.assertEqual(sys.version_info[:2], (3, 12))
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             staged = root / "host-tools" / SOURCE_SHA
@@ -2294,7 +2295,7 @@ raise SystemExit(module.main(["host-capabilities"]))
                 environment["PYTHONDONTWRITEBYTECODE"] = "1"
                 return subprocess.run(
                     [
-                        "/usr/bin/python3.12",
+                        sys.executable,
                         *flags,
                         "-c",
                         child,

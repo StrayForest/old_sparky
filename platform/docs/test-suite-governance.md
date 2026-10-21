@@ -486,6 +486,21 @@ contours. The local bootstrap remains intentionally separate: it installs the
 runtime input for developer iteration and does not substitute for the
 hash-locked CI gate.
 
+The `backend-static`, `backend-integration`, `release-runtime` and
+`release-runtime-real` jobs in the Security workflow use the current
+`ubuntu-latest` image. The `backend-privileged` restore-drill and
+`verification-contract` jobs retain their documented `ubuntu-24.04`
+baselines. The trusted immutable release-builder job selects
+Python 3.12 from the setup-python tool cache, validates its resolved path and
+ABI, then copies the interpreter tree into a root-owned, mode-0700 temporary
+directory before root executes it. Its isolated environment points
+`LD_LIBRARY_PATH` only at that protected copy's `lib` directory and smoke-tests
+the interpreter and extension modules without ambient variables. Both build
+and wheelhouse verification environments use that protected copy. The job
+does not use the runner image's changing default `python3` to resolve a Python
+3.12 release lock; the release artifact contains no tool-cache path or
+virtualenv.
+
 GitHub Actions owns runner images, service containers, dependency bootstrap,
 parallelism, caches, artifacts, permissions, environment authorization and
 commit statuses. The security workflow invokes stable gate IDs and retains
@@ -568,9 +583,11 @@ directory symlink. An `always()` cleanup removes only the named key, `known_host
 path and the directory are absent, clears `SSH_DIR` through `GITHUB_ENV`, and gates any later artifact action on cleanup success.
 Cleanup is never `continue-on-error`, so a cleanup failure keeps the job failed without replacing the primary operation result.
 Their host-key setup uses the same bounded two-attempt contract: each fresh mode-600 scan file is limited by `timeout --foreground
-4s` around `ssh-keyscan -T 3`, with a visible 0.5-second backoff and exact pinned Ed25519/fingerprint validation. The SSH contract
-test discovers every workflow site dynamically and exercises first-attempt recovery, persistent failure, wrong/multiple/malformed
-output, attempt bounds and candidate cleanup.
+4s` around `ssh-keyscan -T 3`, with a visible 0.5-second backoff. Validation ignores blank lines and comment-only OpenSSH
+banner lines but requires exactly one remaining record with the exact host token, Ed25519 type and pinned fingerprint; safe
+failure diagnostics expose only status/counts/booleans. The SSH contract test discovers every workflow site dynamically and
+exercises clean and OpenSSH-banner output, first-attempt recovery, persistent failure, wrong/multiple/malformed records,
+attempt bounds, diagnostic privacy and candidate cleanup.
 
 Every retained result identifies its source SHA, profile ID/version/digest,
 runner, fixture shape, offered logical actions, HTTP attempts and acceptance

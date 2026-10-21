@@ -5,6 +5,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 OUTPUT_DIR="${PLATFORM_RELEASE_OUTPUT_DIR:-$ROOT_DIR/dist/releases}"
+PLATFORM_RELEASE_PYTHON="${PLATFORM_RELEASE_PYTHON:-/usr/bin/python3.12}"
 WEB_NEXT_COMPRESSION="${PLATFORM_WEB_NEXT_COMPRESSION:-true}"
 DEPENDENCY_BASELINE=""
 RELEASE_REF_RAW="workspace"
@@ -259,6 +260,22 @@ if [[ ! -f "$BOOTSTRAP_TOOL" || -L "$BOOTSTRAP_TOOL" || ! -x "$BOOTSTRAP_TOOL" ]
 fi
 if [[ ! -x "$ROOT_DIR/.venv_platform/bin/python" ]]; then
   echo "Missing platform/.venv_platform. Run platform/tools/platform_bootstrap.sh first." >&2
+  exit 1
+fi
+if [[ "$PLATFORM_RELEASE_PYTHON" != /* || ! -x "$PLATFORM_RELEASE_PYTHON" ]]; then
+  echo "Release build Python target is unavailable." >&2
+  exit 1
+fi
+python_contract="$("$PLATFORM_RELEASE_PYTHON" -I -c 'import platform,sys; print(f"{sys.version_info[0]}.{sys.version_info[1]} {sys.platform} {platform.machine()}")')"
+venv_python="$ROOT_DIR/.venv_platform/bin/python"
+venv_contract="$("$venv_python" -I -c 'import platform,sys; print(f"{sys.version_info[0]}.{sys.version_info[1]} {sys.platform} {platform.machine()}")')"
+venv_base_python="$("$venv_python" -I -c 'import sys; print(sys._base_executable)')"
+expected_python="$(readlink -f -- "$PLATFORM_RELEASE_PYTHON")"
+venv_base_python="$(readlink -f -- "$venv_base_python")"
+if [[ "$python_contract" != "3.12 linux x86_64" \
+  || "$venv_contract" != "$python_contract" \
+  || "$venv_base_python" != "$expected_python" ]]; then
+  echo "Release build requires the selected Python 3.12 x86_64 runtime for both build environments." >&2
   exit 1
 fi
 BUILD_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -554,7 +571,7 @@ mkdir -m 0700 "$WHEELHOUSE_DIR"
   --require-hashes \
   --requirement "$STAGING_DIR/requirements-platform.lock.txt"
 VERIFY_VENV="$STAGING_DIR/.wheelhouse-verify-venv"
-/usr/bin/python3 -I -m venv "$VERIFY_VENV"
+"$PLATFORM_RELEASE_PYTHON" -I -m venv "$VERIFY_VENV"
 PINNED_PIP_VERSION="$(
   /usr/bin/python3 -I - "$STAGING_DIR/requirements-platform.lock.txt" <<'PY'
 from pathlib import Path

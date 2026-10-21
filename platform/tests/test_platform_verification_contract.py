@@ -2828,10 +2828,11 @@ except lock.VerificationLockError as exc:
         self.assertNotIn("sudo install -d", workflow)
         self.assertNotIn("sudo -EH env XDG_RUNTIME_DIR= bash -lc", workflow)
         workflow_data = yaml.safe_load(workflow)
-        self.assertEqual(workflow_data["jobs"]["backend-static"]["runs-on"], "ubuntu-24.04")
-        self.assertEqual(workflow_data["jobs"]["backend-integration"]["runs-on"], "ubuntu-24.04")
-        self.assertEqual(workflow_data["jobs"]["release-runtime"]["runs-on"], "ubuntu-24.04")
-        self.assertEqual(workflow_data["jobs"]["release-runtime-real"]["runs-on"], "ubuntu-24.04")
+        self.assertEqual(workflow_data["jobs"]["backend-static"]["runs-on"], "ubuntu-latest")
+        self.assertEqual(workflow_data["jobs"]["backend-integration"]["runs-on"], "ubuntu-latest")
+        self.assertEqual(workflow_data["jobs"]["release-runtime"]["runs-on"], "ubuntu-latest")
+        self.assertEqual(workflow_data["jobs"]["release-runtime-real"]["runs-on"], "ubuntu-latest")
+        self.assertEqual(workflow_data["jobs"]["backend-privileged"]["runs-on"], "ubuntu-24.04")
         integration_steps = workflow_data["jobs"]["backend-integration"]["steps"]
         self.assertEqual(
             workflow_data["jobs"]["backend-integration"]["env"],
@@ -2895,6 +2896,43 @@ except lock.VerificationLockError as exc:
             'PLATFORM_CELERY_RESULT_BACKEND="$PLATFORM_CELERY_RESULT_BACKEND"',
         ):
             self.assertIn(env_reference, release_runtime_command)
+        real_runtime_steps = workflow_data["jobs"]["release-runtime-real"]["steps"]
+        setup_python_index = next(
+            index
+            for index, step in enumerate(real_runtime_steps)
+            if step.get("uses", "").startswith("actions/setup-python@")
+        )
+        setup_python_step = real_runtime_steps[setup_python_index]
+        self.assertEqual(setup_python_step["with"]["python-version"], "3.12")
+        resolve_python_index = next(
+            index
+            for index, step in enumerate(real_runtime_steps)
+            if step.get("name") == "Resolve trusted setup-python 3.12 for the root runtime build"
+        )
+        self.assertGreater(resolve_python_index, setup_python_index)
+        resolve_python_run = real_runtime_steps[resolve_python_index]["run"]
+        self.assertIn("$RUNNER_TOOL_CACHE", resolve_python_run)
+        self.assertIn("Python/3.12.*/*/bin/python3.12", resolve_python_run)
+        self.assertIn('python_contract" == "3.12 linux x86_64"', resolve_python_run)
+        self.assertIn('PLATFORM_RELEASE_PYTHON=%s', resolve_python_run)
+        builder_step = next(
+            step for step in real_runtime_steps
+            if step.get("name") == "Run canonical immutable release builder on trusted dev"
+        )
+        self.assertIn('root_python_prefix="$release_root/python-runtime"', builder_step["run"])
+        self.assertIn('sudo -n /bin/cp -a "$runtime_python_prefix/."', builder_step["run"])
+        self.assertIn('sudo -n /bin/chown -R root:root "$root_python_prefix"', builder_step["run"])
+        self.assertIn('find "$root_python_prefix" -perm /022', builder_step["run"])
+        self.assertIn('LD_LIBRARY_PATH="$root_python_prefix/lib"', builder_step["run"])
+        self.assertIn('libpython3.12.so.1.0', builder_step["run"])
+        self.assertIn('import ctypes, sqlite3, ssl', builder_step["run"])
+        self.assertIn('LD_LIBRARY_PATH="${runtime_python%/bin/python3.12}/lib"', builder_step["run"])
+        self.assertIn('root_runtime_python_real="$(sudo -n /usr/bin/readlink -f', builder_step["run"])
+        self.assertIn('runtime_symlink_targets="$(sudo -n /usr/bin/find', builder_step["run"])
+        self.assertIn('sys.prefix, sys.base_prefix, paths["stdlib"], paths["platstdlib"]', builder_step["run"])
+        self.assertIn('"$root_python_prefix"/*)', builder_step["run"])
+        self.assertIn('PLATFORM_RELEASE_PYTHON="$root_runtime_python"', builder_step["run"])
+        self.assertIn('"$root_runtime_python" -m venv', builder_step["run"])
         privileged_job = workflow_data["jobs"]["backend-privileged"]
         self.assertEqual(
             privileged_job["env"],
