@@ -249,16 +249,7 @@ def _safe_host_ssh(host: str, user: str, key: str, temp_root: Path) -> tuple[Pat
             scan_path.chmod(0o600)
             fingerprint_path = scan_path
         else:
-            known_hosts_text = known_hosts_path.read_text(encoding="ascii")
-            known_hosts_rows = known_hosts_text.splitlines()
-            if (
-                len(known_hosts_rows) != 1
-                or len(known_hosts_rows[0].split()) != 3
-                or known_hosts_rows[0].split()[0] != host
-                or known_hosts_rows[0].split()[1] != "ssh-ed25519"
-                or re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", known_hosts_rows[0].split()[2]) is None
-            ):
-                raise VerificationError("existing production known-hosts contract is malformed")
+            _parse_scanned_host_key(known_hosts_path.read_bytes(), host)
             config_text = config_path.read_text(encoding="ascii")
             expected_config = (
                 "Host *\n  StrictHostKeyChecking yes\n"

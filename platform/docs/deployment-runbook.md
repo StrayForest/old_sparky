@@ -176,8 +176,9 @@ deployment supervisor. Deploy handoffs also require canonical positive decimal
 public schema before the private export inventory is removed, and an unknown,
 symlinked, special or leftover export entry fails the workflow.
 
-Every production SSH boundary acquires the pinned Ed25519 host key with two
-visible attempts. Each attempt is a fresh mode-600 file, bounded by an outer
+Every production SSH boundary validates fresh scanner output and pre-existing
+`known_hosts` files with the same parser. Fresh scans get two visible attempts;
+each attempt is a fresh mode-600 file, bounded by an outer
 four-second timeout and `ssh-keyscan -T 3`, and accepts exactly one nonblank,
 noncomment record with the exact host token, `ssh-ed25519` type and pinned
 SHA-256 fingerprint. OpenSSH 10.2 emits its version banner as a stdout comment (9.6 emitted it on stderr);

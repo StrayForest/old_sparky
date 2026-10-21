@@ -180,13 +180,33 @@ class HostToolsBundleTests(unittest.TestCase):
             runner_temp.mkdir()
             contract = self._installed_checker_contract(root)
             private_key = self._temporary_ed25519_private_key(root)
+            private_key_path = root / "fixture-id-ed25519"
+            public_key_fields = subprocess.run(
+                ["/usr/bin/ssh-keygen", "-y", "-P", "", "-f", str(private_key_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=True,
+            ).stdout.decode("ascii").split()
+            self.assertGreaterEqual(len(public_key_fields), 2)
+            expected_host_key = f"production.example.test {public_key_fields[0]} {public_key_fields[1]}"
+            scan_path = root / "host-key.scan"
+            scan_path.write_text(expected_host_key + "\n", encoding="ascii")
+            actual_fingerprint = subprocess.run(
+                ["/usr/bin/ssh-keygen", "-lf", str(scan_path), "-E", "sha256"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=True,
+            ).stdout.decode("ascii").split()[1]
             generation = f"{installed_check.GENERATION_ROOT}/{SOURCE_SHA}"
             digests, _modes, manifest_hash, capabilities_hash = installed_check._contract_rows(contract)
             expected_names = {"manifest.json", "capabilities.txt", *(path for _digest, path in digests)}
             payloads = {path: digest for digest, path in digests}
             payloads.update({"manifest.json": manifest_hash, "capabilities.txt": capabilities_hash})
             ssh_dir = runner_temp / "platform-host-capability-ssh"
-            expected_host_key = "production.example.test ssh-ed25519 AAAA"
             capability = (
                 f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} dispatcher=4 artifact_prepare=2 "
                 "supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 "
@@ -201,14 +221,27 @@ class HostToolsBundleTests(unittest.TestCase):
                     )
                     return f"# SSH-2.0-OpenSSH_10.2\n\n{expected_host_key}\n".encode("ascii")
                 if argv[:2] == ["/usr/bin/ssh-keygen", "-lf"]:
-                    self.assertEqual(argv[2:], [str(ssh_dir / "known_hosts.scan"), "-E", "sha256"])
-                    return f"256 {installed_check.HOST_KEY_FINGERPRINT} production.example.test (ED25519)\n".encode("ascii")
+                    self.assertIn(argv[2], {str(ssh_dir / "known_hosts.scan"), str(ssh_dir / "known_hosts")})
+                    self.assertEqual(argv[3:], ["-E", "sha256"])
+                    return subprocess.run(
+                        argv,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                        check=True,
+                    ).stdout
                 raise AssertionError(f"unexpected local SSH helper command: {argv!r}")
 
             def remote(_argv: list[str], *args: str, **kwargs: object) -> bytes:
                 self.assertEqual(_argv[:4], ["/usr/bin/ssh", "-n", "-T", "-o"])
                 self.assertIn("StrictHostKeyChecking yes", (ssh_dir / "config").read_text(encoding="ascii"))
-                self.assertEqual((ssh_dir / "known_hosts").read_text(encoding="ascii"), expected_host_key + "\n")
+                self.assertEqual(
+                    installed_check._parse_scanned_host_key(
+                        (ssh_dir / "known_hosts").read_bytes(), "production.example.test"
+                    ),
+                    expected_host_key,
+                )
                 if args == ("/usr/bin/id", "-u"):
                     return b"0\n"
                 if args == ("/usr/bin/test", "-d", generation):
@@ -237,7 +270,7 @@ class HostToolsBundleTests(unittest.TestCase):
                     return capability
                 raise AssertionError(f"unexpected fixed remote command: {args!r}")
 
-            with patch.dict(
+            with patch.object(installed_check, "HOST_KEY_FINGERPRINT", actual_fingerprint), patch.dict(
                 os.environ,
                 {
                     "RUNNER_TEMP": str(runner_temp),
@@ -255,6 +288,101 @@ class HostToolsBundleTests(unittest.TestCase):
             self.assertEqual(str(checked_generation), generation)
             self.assertTrue(created)
             self.assertFalse(ssh_dir.exists())
+
+            # The deploy workflow can precreate this directory from its own
+            # banner-tolerant scan before calling the shared verifier. Reuse
+            # that exact persisted-file shape and verify it against ssh-keygen.
+            ssh_dir.mkdir(mode=0o700)
+            (ssh_dir / "id_ed25519").write_text(private_key.rstrip("\n") + "\n", encoding="ascii")
+            (ssh_dir / "id_ed25519").chmod(0o600)
+            (ssh_dir / "known_hosts").write_text(
+                f"# SSH-2.0-OpenSSH_10.2\n\n{expected_host_key}\n", encoding="ascii"
+            )
+            (ssh_dir / "known_hosts").chmod(0o600)
+            (ssh_dir / "config").write_text(
+                "Host *\n  StrictHostKeyChecking yes\n"
+                f"  UserKnownHostsFile {ssh_dir / 'known_hosts'}\n",
+                encoding="ascii",
+            )
+            (ssh_dir / "config").chmod(0o600)
+            with patch.object(installed_check, "HOST_KEY_FINGERPRINT", actual_fingerprint), patch.dict(
+                os.environ,
+                {
+                    "RUNNER_TEMP": str(runner_temp),
+                    "PROD_SSH_HOST": "production.example.test",
+                    "PROD_SSH_USER": "operator",
+                    "PROD_SSH_KEY": private_key,
+                },
+            ), patch.object(installed_check, "_run", side_effect=local_command), patch.object(
+                installed_check, "_remote", side_effect=remote
+            ):
+                checked_dir, checked_generation, created = installed_check.verify_installed_generation(
+                    SOURCE_SHA, "production-host-tools-v4", contract
+                )
+            self.assertEqual(checked_dir, ssh_dir)
+            self.assertEqual(str(checked_generation), generation)
+            self.assertFalse(created)
+            self.assertTrue(ssh_dir.exists())
+            self.assertEqual(
+                (ssh_dir / "known_hosts").read_text(encoding="ascii"),
+                f"# SSH-2.0-OpenSSH_10.2\n\n{expected_host_key}\n",
+            )
+
+            with patch.object(
+                installed_check,
+                "_run",
+                return_value=b"256 SHA256:wrong production.example.test (ED25519)\n",
+            ):
+                with self.assertRaisesRegex(
+                    installed_check.VerificationError, "does not match the pinned fingerprint"
+                ):
+                    installed_check._safe_host_ssh(
+                        "production.example.test", "operator", private_key, runner_temp
+                    )
+
+            known_hosts_path = ssh_dir / "known_hosts"
+            config_path = ssh_dir / "config"
+            original_known_hosts = known_hosts_path.read_bytes()
+            original_config = config_path.read_bytes()
+            for contents in (
+                f"# SSH-2.0-OpenSSH_10.2\n{expected_host_key}\n{expected_host_key}\n".encode("ascii"),
+                b"# SSH-2.0-OpenSSH_10.2\nother.example.test ssh-ed25519 AAAA\n",
+            ):
+                known_hosts_path.write_bytes(contents)
+                known_hosts_path.chmod(0o600)
+                with patch.object(installed_check, "_run") as run:
+                    with self.assertRaises(installed_check.VerificationError):
+                        installed_check._safe_host_ssh(
+                            "production.example.test", "operator", private_key, runner_temp
+                        )
+                run.assert_not_called()
+            known_hosts_path.write_bytes(original_known_hosts)
+            known_hosts_path.chmod(0o600)
+
+            config_path.write_text(
+                "Host *\n  StrictHostKeyChecking no\n"
+                f"  UserKnownHostsFile {known_hosts_path}\n",
+                encoding="ascii",
+            )
+            config_path.chmod(0o600)
+            with patch.object(installed_check, "_run") as run:
+                with self.assertRaisesRegex(
+                    installed_check.VerificationError, "config is not bound to known hosts"
+                ):
+                    installed_check._safe_host_ssh(
+                        "production.example.test", "operator", private_key, runner_temp
+                    )
+            run.assert_not_called()
+            config_path.write_bytes(original_config)
+            config_path.chmod(0o600)
+
+            known_hosts_path.chmod(0o640)
+            with patch.object(installed_check, "_run") as run:
+                with self.assertRaisesRegex(installed_check.VerificationError, "files are unsafe"):
+                    installed_check._safe_host_ssh(
+                        "production.example.test", "operator", private_key, runner_temp
+                    )
+            run.assert_not_called()
             valid = "production.example.test ssh-ed25519 AAAA"
         invalid_outputs = (
             b"",
