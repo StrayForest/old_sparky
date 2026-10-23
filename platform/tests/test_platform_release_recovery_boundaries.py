@@ -8134,6 +8134,14 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         # Preserve the topology-derived flag array while replacing only the
         # host-dependent preflight executable with a no-op.
         script = script.replace(preflight_tool, "/usr/bin/true", 1)
+        bootstrap_preflight_tool = (
+            '/usr/bin/python3 -I "$TOOLS_DIR/platform_live_qa_runtime_install.py"'
+        )
+        self.assertIn(bootstrap_preflight_tool, script)
+        # These tests inject a fault after quiesce and use an intentionally
+        # invalid artifact. Keep that boundary test independent of the
+        # authenticated bootstrap preflight that runs before quiesce.
+        script = script.replace(bootstrap_preflight_tool, "/usr/bin/true", 1)
         self.assertIn(needle, script)
         script = script.replace(needle, replacement, 1)
         script = script.replace("/usr/bin/systemctl", str(systemctl))

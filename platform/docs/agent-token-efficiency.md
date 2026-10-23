@@ -23,7 +23,8 @@ required evidence, review, safety checks and release gates.
   send a focused follow-up to the same Luna agent when available. If a new
   agent is needed, pass only a compact task packet and evidence links. Use a
   short backoff before retrying; never run a rapid retry loop. Retry the
-  requested model when it recovers; do not silently change models.
+  requested model when it recovers; do not switch this task to another model
+  or provider unless the user changes that constraint.
 - Assign one owner/poller to each CI run, production operation and live QA.
   Other agents can review saved evidence; they do not independently poll the
   same run or repeat the same production check.
@@ -53,6 +54,11 @@ required evidence, review, safety checks and release gates.
   inconclusive result, changed environment, or explicit required rerun. Do
   not omit required CI gates, independent review, rollback checks or production
   QA to save tokens.
+- For gates that import runtime dependencies, use the canonical locked
+  environment or defer to CI. Do not rebuild the environment one missing
+  import at a time.
+- After renaming a helper or entrypoint, search all call sites with `rg` and
+  cover the actual shell entry path in regression evidence.
 - Split work by real ownership or risk (implementation, independent review,
   operations); use one agent for a simple bounded task. Do not impose an
   arbitrary task-size cap that hides a real blocker.

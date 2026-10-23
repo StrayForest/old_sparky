@@ -902,9 +902,7 @@ trap '' HUP INT TERM
   --expected pointers-switched \
   --phase rollback-runtime-pending
 
-ROLLBACK_RECONCILE_ARGS=()
-mapfile -t ROLLBACK_RECONCILE_ARGS < <(rollback_reconcile_args_for_target "$PREVIOUS_TARGET")
-ROLLBACK_RUNTIME_INSTALLER="$(runtime_installer_for_target "$PREVIOUS_TARGET")"
+select_rollback_runtime "$PREVIOUS_TARGET" || exit 1
 
 "$RUNTIME_RESTORE_TOOL" \
   --app-dir "$APP_DIR" \
