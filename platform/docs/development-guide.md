@@ -73,7 +73,8 @@ into a separate fresh venv and use that interpreter for registry gates:
 ```bash
 cd /root/old_sparky/platform
 PLATFORM_CI_VENV_DIR=.cache/platform-ci-venv tools/platform_install_ci_python.sh
-.cache/platform-ci-venv/bin/python tools/platform_verify.py ci
+PLATFORM_CI_VENV_DIR=.cache/platform-ci-venv \
+  .cache/platform-ci-venv/bin/python tools/platform_verify.py ci
 ```
 
 The installer requires Python 3.12 on Linux x86_64 and refuses to reuse an

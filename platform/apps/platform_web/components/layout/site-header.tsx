@@ -27,6 +27,8 @@ export function SiteHeader() {
   const [isRetryingSession, setIsRetryingSession] = useState(false);
   const pathname = usePathname();
   const isCreateTournament = pathname === "/tournaments/new";
+  const isOperationsPage = pathname === "/platform-ops";
+  const isProfilePage = pathname === "/profile/me" || pathname.startsWith("/profile/me/");
   const exactActiveHref = navItems.find((item) => item.href === pathname)?.href;
   const canOpenAdmin = Boolean(user?.roles.includes("admin") || user?.roles.includes("superadmin"));
   const authReturnQuery = pathname.startsWith("/auth/")
@@ -104,14 +106,14 @@ export function SiteHeader() {
           ) : user ? (
             <>
               {canOpenAdmin ? (
-                <Link aria-label={t("header.operations")} className="login-button compact-login-button" href="/platform-ops" prefetch={false}>
+                <Link aria-label={t("header.operations")} className={`login-button compact-login-button header-shell-link${isOperationsPage ? " active" : ""}`} href="/platform-ops" prefetch={false}>
                   <Shield size={17} aria-hidden="true" />
                   <span className="header-operations-label">{t("header.operations")}</span>
                 </Link>
               ) : null}
               <Link
                 aria-label={t("header.profileLabel", { name: user.display_name })}
-                className={`login-button ${MOBILE_ACCOUNT_BUTTON}`}
+                className={`login-button header-shell-link${isProfilePage ? " active" : ""} ${MOBILE_ACCOUNT_BUTTON}`}
                 href="/profile/me"
                 prefetch={false}
               >
