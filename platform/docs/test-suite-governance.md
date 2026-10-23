@@ -4,12 +4,12 @@
 - Owner: Platform maintainers
 - Last reviewed: 2026-10-21
 
-The executable registry at `platform/tools/platform_verify.py` is the single
-source of truth for verification ownership, commands, environment
+The executable registry at `platform/tools/platform_verify.py` is the single source of truth for verification ownership, commands, environment
 requirements and CI membership. Use `list --json` when tooling needs the
 machine-readable registry. This document explains the architecture and
 placement rules; it does not repeat tool arguments. This checkout shares production storage: inventory exact task-temp paths, sizes and open users; preserve small sanitized evidence.
 Coordinate exact-path cleanup with the release lead; never use broad globs. Avoid duplicate local environments/heavy suites; hosted CI is authoritative, and selectors require disk/resource checks.
+For a local `web-hermetic` run on the shared production filesystem, budget its isolated browser/build copy alongside the worktree's `node_modules`, `.next` and npm download cache before starting. After the gate exits, prove its task-owned paths have no process references and remove those reproducible artifacts before calculating backup and deploy capacity. Do not treat space used by a local web gate as available for a concurrent release.
 
 For a local change-impact plan, run from `platform/`:
 
