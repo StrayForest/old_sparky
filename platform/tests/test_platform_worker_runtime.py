@@ -85,8 +85,8 @@ class PlatformWorkerRuntimeTests(unittest.TestCase):
             worker.celery_app.conf.beat_schedule["home-content-refresh"],
             {
                 "task": "platform.home_content_refresh",
-                "schedule": 1800.0,
-                "options": {"expires": 1800.0},
+                "schedule": 300.0,
+                "options": {"expires": 300.0},
             },
         )
         self.assertTrue(worker.home_content_refresh.ignore_result)

@@ -78,6 +78,18 @@ def _iter_changes(patch: dict[str, Any]):
     for section_index, section in enumerate(patch.get("sections") or []):
         if not isinstance(section, dict):
             continue
+        hero_description = section.get("hero_description")
+        if (
+            section.get("hero_description_requires_translation")
+            and isinstance(hero_description, str)
+            and hero_description.strip()
+            and not _IMAGE_URL_RE.fullmatch(hero_description.strip())
+        ):
+            yield (
+                f"s{section_index:03d}-hd",
+                hero_description,
+                ("sections", section_index, "hero_description"),
+            )
         changes = section.get("changes")
         if isinstance(changes, list):
             for change_index, change in enumerate(changes):
@@ -97,6 +109,24 @@ def _iter_changes(patch: dict[str, Any]):
         for ability_index, ability in enumerate(abilities):
             if not isinstance(ability, dict):
                 continue
+            ability_description = ability.get("description")
+            if (
+                ability.get("description_requires_translation")
+                and isinstance(ability_description, str)
+                and ability_description.strip()
+                and not _IMAGE_URL_RE.fullmatch(ability_description.strip())
+            ):
+                yield (
+                    f"s{section_index:03d}-a{ability_index:03d}-d",
+                    ability_description,
+                    (
+                        "sections",
+                        section_index,
+                        "abilities",
+                        ability_index,
+                        "description",
+                    ),
+                )
             ability_changes = ability.get("changes")
             if not isinstance(ability_changes, list):
                 continue
@@ -144,6 +174,10 @@ def _segment_contexts(patch: dict[str, Any]) -> dict[str, dict[str, str]]:
             )
             if (value := str(raw_value or "").strip())
         }
+        if section.get("hero_description_requires_translation") and isinstance(
+            section.get("hero_description"), str
+        ):
+            contexts[f"s{section_index:03d}-hd"] = dict(section_context)
         changes = section.get("changes")
         if isinstance(changes, list):
             for change_index, change in enumerate(changes):
@@ -166,6 +200,12 @@ def _segment_contexts(patch: dict[str, Any]) -> dict[str, dict[str, str]]:
             if ability_name:
                 ability_context["ability_name"] = ability_name
             ability_changes = ability.get("changes")
+            if ability.get("description_requires_translation") and isinstance(
+                ability.get("description"), str
+            ):
+                contexts[f"s{section_index:03d}-a{ability_index:03d}-d"] = dict(
+                    ability_context
+                )
             if not isinstance(ability_changes, list):
                 continue
             for change_index, change in enumerate(ability_changes):

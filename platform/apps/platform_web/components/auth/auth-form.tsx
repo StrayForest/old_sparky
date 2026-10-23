@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { FormEvent, useEffect, useState, useTransition } from "react";
+import { FormEvent, useEffect, useRef, useState, useTransition } from "react";
 import { LogIn, UserPlus } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { GoogleAuthAction } from "@/components/auth/google-auth-action";
@@ -30,6 +30,11 @@ type AuthFormProps = {
 };
 
 type AcceptedResponse = { accepted: boolean; retry_after_seconds?: number };
+type CredentialSubmission = {
+  email: string;
+  password: string;
+  displayName: string;
+};
 
 export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthError = false }: AuthFormProps) {
   const { clearUser, setUser } = useAuth();
@@ -56,7 +61,13 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
   const enteringCode = isRegister && registrationStep === "code";
   const turnstileAction: TurnstileAction = mode;
   const [turnstileChallengeRequired, setTurnstileChallengeRequired] = useState(false);
+  const pendingChallengeSubmission = useRef<CredentialSubmission | null>(null);
+  const authFormActive = useRef(true);
+  const lastSubmittedTurnstileToken = useRef<string | null>(null);
+  const rejectedTokenRetryUsed = useRef(false);
   const turnstileRequired = turnstileChallengeRequired;
+  const credentialsLockedForChallenge = turnstileRequired
+    && (Boolean(pendingChallengeSubmission.current) || isPending);
   const canSubmit = (
     (enteringCode || (
       securityConfigReady
@@ -67,9 +78,116 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
   );
 
   useEffect(() => {
+    authFormActive.current = true;
+    return () => {
+      authFormActive.current = false;
+      pendingChallengeSubmission.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     setTurnstileToken(null);
     setTurnstileChallengeRequired(false);
+    pendingChallengeSubmission.current = null;
+    lastSubmittedTurnstileToken.current = null;
+    rejectedTokenRetryUsed.current = false;
   }, [turnstileMode, turnstileSiteKey]);
+
+  useEffect(() => {
+    const pendingSubmission = pendingChallengeSubmission.current;
+    if (
+      !turnstileToken
+    ) {
+      return;
+    }
+    if (lastSubmittedTurnstileToken.current === turnstileToken) {
+      setErrorMessage(t("auth.turnstileRejected"));
+      setTurnstileToken(null);
+      setTurnstileResetSignal((current) => current + 1);
+      return;
+    }
+    if (!pendingSubmission) {
+      return;
+    }
+    lastSubmittedTurnstileToken.current = turnstileToken;
+    pendingChallengeSubmission.current = null;
+    startTransition(async () => {
+      await submitCredentials(pendingSubmission, turnstileToken);
+    });
+  }, [startTransition, submitCredentials, t, turnstileToken]);
+
+  async function submitCredentials(credentials: CredentialSubmission, token: string | null) {
+    try {
+      const authResponse = await platformApiRequest<PlatformAuthSessionResponse | PlatformAuthRegistrationResponse>(isRegister ? "/auth/register" : "/auth/login", {
+        method: "POST",
+        csrfPolicy: "origin-only",
+        body: JSON.stringify(isRegister
+          ? {
+              display_name: credentials.displayName,
+              email: credentials.email,
+              password: credentials.password,
+              turnstile_token: token ?? undefined
+            }
+          : {
+              email: credentials.email,
+              password: credentials.password,
+              turnstile_token: token ?? undefined
+            })
+      });
+      if (!authFormActive.current) {
+        return;
+      }
+      if (isRegister && "verification_required" in authResponse && authResponse.verification_required) {
+        clearUser();
+        resetPlatformCsrfToken();
+        setVerificationEmail(credentials.email.toLowerCase());
+        setVerificationCode("");
+        setTurnstileToken(null);
+        setRegistrationStep("code");
+        resendCooldown.start(authResponse.retry_after_seconds ?? 60);
+        return;
+      }
+      pendingChallengeSubmission.current = null;
+      setTurnstileChallengeRequired(false);
+      setTurnstileToken(null);
+      rejectedTokenRetryUsed.current = false;
+      setUser(authResponse.user);
+      router.push(isRegister ? "/profile/me" : safeAuthReturnPath(returnTo));
+      router.refresh();
+    } catch (error) {
+      if (!authFormActive.current) {
+        return;
+      }
+      const requiresHumanVerification = isHumanVerificationRequired(error);
+      const rejectedTurnstileToken = isHumanVerificationRejected(error);
+      setErrorMessage(requiresHumanVerification ? "" : authErrorMessage(error, false, isRegister, t));
+      if (turnstileSiteKey) {
+        if (requiresHumanVerification) {
+          pendingChallengeSubmission.current = credentials;
+          setTurnstileChallengeRequired(true);
+          rejectedTokenRetryUsed.current = false;
+        } else if (token && rejectedTurnstileToken && !rejectedTokenRetryUsed.current) {
+          // Keep the submitted intent for one fresh, server-validated token.
+          // Repeated rejection stops automatic retries and requires an
+          // explicit user submit after the next challenge succeeds.
+          pendingChallengeSubmission.current = credentials;
+          rejectedTokenRetryUsed.current = true;
+          setTurnstileChallengeRequired(true);
+        } else {
+          pendingChallengeSubmission.current = null;
+          // A failed token is consumed even when the server returns a
+          // credential or policy error. Keep the challenge visible and block
+          // another request until the user obtains a fresh token.
+          setTurnstileChallengeRequired(Boolean(token));
+          if (!rejectedTurnstileToken) {
+            rejectedTokenRetryUsed.current = false;
+          }
+        }
+        setTurnstileToken(null);
+        setTurnstileResetSignal((current) => current + 1);
+      }
+    }
+  }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -78,12 +196,22 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
       return;
     }
 
+    if (turnstileSiteKey && turnstileRequired && turnstileToken) {
+      if (lastSubmittedTurnstileToken.current === turnstileToken) {
+        setErrorMessage(t("auth.turnstileRejected"));
+        setTurnstileToken(null);
+        setTurnstileResetSignal((current) => current + 1);
+        return;
+      }
+      lastSubmittedTurnstileToken.current = turnstileToken;
+    }
+
     const formData = new FormData(event.currentTarget);
-    const submittedEmail = String(formData.get("username") ?? "").trim();
-    const submittedPassword = String(
-      formData.get(isRegister ? "new_password" : "current_password") ?? ""
-    );
-    const submittedDisplayName = String(formData.get("display_name") ?? "").trim();
+    const credentials = {
+      email: String(formData.get("username") ?? "").trim(),
+      password: String(formData.get(isRegister ? "new_password" : "current_password") ?? ""),
+      displayName: String(formData.get("display_name") ?? "").trim()
+    };
 
     startTransition(async () => {
       try {
@@ -102,42 +230,11 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
           return;
         }
 
-        const authResponse = await platformApiRequest<PlatformAuthSessionResponse | PlatformAuthRegistrationResponse>(isRegister ? "/auth/register" : "/auth/login", {
-          method: "POST",
-          csrfPolicy: "origin-only",
-          body: JSON.stringify(isRegister
-            ? {
-                display_name: submittedDisplayName,
-                email: submittedEmail,
-                password: submittedPassword,
-                turnstile_token: turnstileToken ?? undefined
-              }
-            : {
-                email: submittedEmail,
-                password: submittedPassword,
-                turnstile_token: turnstileToken ?? undefined
-              })
-        });
-        if (isRegister && "verification_required" in authResponse && authResponse.verification_required) {
-          clearUser();
-          resetPlatformCsrfToken();
-          setVerificationEmail(submittedEmail.toLowerCase());
-          setVerificationCode("");
-          setTurnstileToken(null);
-          setRegistrationStep("code");
-          resendCooldown.start(authResponse.retry_after_seconds ?? 60);
-          return;
-        }
-        setUser(authResponse.user);
-        router.push(isRegister ? "/profile/me" : safeAuthReturnPath(returnTo));
-        router.refresh();
+        rejectedTokenRetryUsed.current = false;
+        await submitCredentials(credentials, turnstileToken);
       } catch (error) {
-        const requiresHumanVerification = isHumanVerificationRequired(error);
-        setErrorMessage(requiresHumanVerification ? "" : authErrorMessage(error, enteringCode, isRegister, t));
+        setErrorMessage(authErrorMessage(error, enteringCode, isRegister, t));
         if (turnstileSiteKey && !enteringCode) {
-          if (requiresHumanVerification) {
-            setTurnstileChallengeRequired(true);
-          }
           setTurnstileToken(null);
           setTurnstileResetSignal((current) => current + 1);
         }
@@ -215,7 +312,7 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
               <input
                 autoComplete="nickname"
                 className="input"
-                disabled={isPending}
+                disabled={credentialsLockedForChallenge}
                 id="register-display-name"
                 maxLength={15}
                 minLength={2}
@@ -232,6 +329,7 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
                 autoCapitalize="none"
                 autoComplete="username"
                 className="input"
+                disabled={credentialsLockedForChallenge}
                 id={usernameId}
                 maxLength={254}
                 name="username"
@@ -248,6 +346,7 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
               <input
                 autoComplete={isRegister ? "new-password" : "current-password"}
                 className="input"
+                disabled={credentialsLockedForChallenge}
                 id={passwordId}
                 maxLength={128}
                 minLength={isRegister ? 10 : undefined}
@@ -367,6 +466,10 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
 
 function isHumanVerificationRequired(error: unknown): boolean {
   return error instanceof PlatformApiError && error.message === "Human verification is required.";
+}
+
+function isHumanVerificationRejected(error: unknown): boolean {
+  return error instanceof PlatformApiError && error.message === "Human verification failed.";
 }
 
 function authErrorMessage(

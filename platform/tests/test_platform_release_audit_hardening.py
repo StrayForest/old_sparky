@@ -1641,6 +1641,41 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             self.assertIn("platform_release_lock_exec.sh", workflow)
             self.assertIn("--expected-sha", workflow)
 
+        content_refresh_at = content.index("tools/platform_refresh_home_content.sh")
+        content_sample_at = content.index("tools/platform_public_content_diagnostic.py")
+        self.assertLess(content_refresh_at, content_sample_at)
+        self.assertIn('source "$runtime/current/tools/platform_runtime_common.sh"', content)
+        self.assertIn('sample_line_count="$(grep -c \'^PUBLIC_CONTENT_SAMPLE_JSON \'', content)
+        content_diagnostic_tool = (
+            PLATFORM_ROOT / "tools" / "platform_public_content_diagnostic.py"
+        ).read_text(encoding="utf-8")
+        for marker in (
+            "PATCH_READ_CONCURRENCY = 4",
+            "READ_ROUNDS = 3",
+            "PATCH_DETAIL_KEY_PREFIX + patch_id",
+            "coordinated_refreshes",
+            "hero_metadata_pending",
+            "russian_abilities",
+            "response_bytes_total",
+            "trust_env=False",
+            "asyncio.TaskGroup()",
+            "asyncio.run(",
+            "PLATFORM_PUBLIC_CONTENT_EXPECTED_HOME_PATCH_IDS",
+        ):
+            self.assertIn(marker, content_diagnostic_tool)
+        self.assertIn("expected_home_patch_ids", content)
+        self.assertIn("expected_hero_patch_ids", content)
+        self.assertIn("declare -A expected_home_seen=()", content)
+        self.assertIn("duplicate home patch ID", content)
+        self.assertIn("duplicate hero patch ID", content)
+        self.assertIn(
+            '-- /bin/bash -s -- "$expected_home_patch_ids" "$expected_hero_patch_ids"',
+            content,
+        )
+        self.assertNotIn("1846651706696737", content_diagnostic_tool)
+        self.assertNotIn('"content": payload', content_diagnostic_tool)
+        self.assertNotIn("print(payload)", content_diagnostic_tool)
+
         for path in (*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml")):
             workflow = path.read_text(encoding="utf-8")
             if "platform/tools/" in workflow:

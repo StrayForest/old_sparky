@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from apps.platform_api.app.services import home_content as base
+from apps.platform_api.app.services.patch_detail import structure_patch_detail
 from apps.platform_api.app.services.external_content_http import (
     BoundedNoRedirectAsyncClient,
 )
@@ -23,7 +24,36 @@ from python_packages.platform_infra.redis import redis_client
 logger = logging.getLogger(__name__)
 
 
-async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
+async def _cached_home_has_pending_hero_catalog(
+    cache: Any,
+    home_content: dict[str, Any] | None,
+) -> bool:
+    """Read the small cached feed detail set to decide whether catalog retry is useful."""
+
+    for patch in (home_content or {}).get("patches") or []:
+        if not isinstance(patch, dict) or not patch.get("id"):
+            continue
+        detail = await base._read_json(
+            cache,
+            base.PATCH_DETAIL_KEY_PREFIX + str(patch["id"]),
+        )
+        if not isinstance(detail, dict):
+            continue
+        if detail.get("hero_catalog_pending"):
+            return True
+        if any(
+            isinstance(section, dict) and section.get("hero_catalog_pending")
+            for section in detail.get("sections") or []
+        ):
+            return True
+    return False
+
+
+async def refresh_home_content(
+    *,
+    force: bool = False,
+    force_asset_refresh: bool | None = None,
+) -> dict[str, Any]:
     """Refresh public content through bounded, no-redirect upstream I/O."""
 
     settings = get_settings()
@@ -59,6 +89,10 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
             base.PATCH_ASSET_CATALOG_STALE_KEY,
         )
         previous_asset_catalog = asset_catalog or stale_asset_catalog
+        cached_hero_pending = await _cached_home_has_pending_hero_catalog(cache, stale)
+        asset_retry_blocked = bool(
+            await cache.get(base.PATCH_ASSET_PENDING_RETRY_KEY)
+        )
         timeout = httpx.Timeout(settings.platform_external_content_timeout_seconds)
         async with BoundedNoRedirectAsyncClient(timeout=timeout) as client:
             steam_result, youtube_result = await asyncio.gather(
@@ -78,7 +112,13 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
                 )
             )
             asset_result = asset_catalog
-            refresh_asset_catalog = asset_catalog is None or has_new_patch or force
+            explicit_asset_refresh = force if force_asset_refresh is None else force_asset_refresh
+            refresh_asset_catalog = bool(
+                asset_catalog is None
+                or has_new_patch
+                or explicit_asset_refresh
+                or (cached_hero_pending and not asset_retry_blocked)
+            )
             if refresh_asset_catalog:
                 try:
                     asset_result = await base._fetch_deadlock_asset_catalog(
@@ -109,7 +149,7 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
             if not isinstance(asset_result, Exception):
                 resolved_catalog = asset_result
             patch_details = {
-                patch_id: base._structure_patch_detail(detail, resolved_catalog)
+                patch_id: structure_patch_detail(detail, resolved_catalog)
                 for patch_id, detail in raw_patch_details.items()
             }
 
@@ -129,6 +169,14 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
             "patches_available": not isinstance(steam_result, Exception),
             "videos_available": not isinstance(youtube_result, Exception),
         }
+        pending_hero_metadata = any(
+            detail.get("hero_metadata_pending")
+            or any(
+                isinstance(section, dict) and section.get("hero_metadata_pending")
+                for section in detail.get("sections") or []
+            )
+            for detail in patch_details.values()
+        )
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         async with cache.pipeline(transaction=True) as pipeline:
             pipeline.set(
@@ -170,6 +218,15 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
                     ),
                     ex=base.PATCH_DETAIL_TTL_SECONDS,
                 )
+            if refresh_asset_catalog:
+                if pending_hero_metadata:
+                    pipeline.set(
+                        base.PATCH_ASSET_PENDING_RETRY_KEY,
+                        "pending",
+                        ex=base.PATCH_ASSET_PENDING_RETRY_SECONDS,
+                    )
+                else:
+                    pipeline.delete(base.PATCH_ASSET_PENDING_RETRY_KEY)
             await pipeline.execute()
         translation_registration_succeeded = True
         if patch_details:

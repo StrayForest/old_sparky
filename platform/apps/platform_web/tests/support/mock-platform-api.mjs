@@ -571,8 +571,18 @@ const server = createServer((request, response) => {
         kind: "hero",
         title: "The Doorman",
         hero_name: "The Doorman",
+        hero_display_name: "Привратник",
+        hero_image_url: "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/doorman.png",
+        hero_description: "Хозяин дверей и скрытых проходов.",
+        hero_metadata_pending: true,
         changes: ["Doorway duration reduced"],
-        abilities: []
+        abilities: [{
+          name: "Doorway",
+          display_name: "Проход",
+          description: "Создаёт дверь между двумя точками.",
+          icon_url: "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/doorman_doorway.png",
+          changes: ["Cooldown increased"]
+        }]
       }]
     });
     return;

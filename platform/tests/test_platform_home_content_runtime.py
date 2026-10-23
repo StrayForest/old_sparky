@@ -313,6 +313,27 @@ class PlatformHomeContentRuntimeTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(payload, cached_payload)
         recovery.assert_not_awaited()
 
+    async def test_scheduled_refresh_can_skip_asset_bundle_refresh(self) -> None:
+        cached_payload = {
+            "patches": [],
+            "videos": [],
+            "generated_at": "2026-08-18T04:00:00+00:00",
+            "patches_available": True,
+            "videos_available": True,
+        }
+        refresh = AsyncMock(return_value=cached_payload)
+        with (
+            patch.object(home_content_runtime.home_content_security, "refresh_home_content", refresh),
+            patch.object(home_content_runtime, "fetch_youtube_videos", AsyncMock(return_value=[])),
+        ):
+            payload = await home_content_runtime.refresh_home_content(
+                force=True,
+                force_asset_refresh=False,
+            )
+
+        self.assertEqual(payload, cached_payload)
+        refresh.assert_awaited_once_with(force=True, force_asset_refresh=False)
+
     async def test_refresh_preserves_stale_payload_when_recovery_also_fails(self) -> None:
         stale_payload = {
             "patches": [],

@@ -60,6 +60,20 @@ def _hero_section(
             "kind": "hero",
             "title": str(hero.get("name") or alias.title()),
             "hero_name": str(hero.get("name") or alias.title()),
+            "hero_display_name": hero.get("display_name"),
+            "hero_image_url": hero.get("hero_image_url") or hero.get("icon_url"),
+            "hero_description": hero.get("description"),
+            "hero_description_requires_translation": hero.get(
+                "description_requires_translation"
+            ),
+            "_hero_description_source_text": (
+                hero.get("description")
+                if hero.get("description_requires_translation")
+                else None
+            ),
+            "hero_description_russian_metadata_available": hero.get(
+                "russian_metadata_available"
+            ),
             "changes": [],
             "abilities": [],
             "_ability_map": {},
@@ -141,12 +155,173 @@ def _ability_section(
     if ability_section is None:
         ability_section = {
             "name": ability["name"],
+            "display_name": ability.get("display_name"),
+            "description": ability.get("description"),
+            "description_requires_translation": ability.get(
+                "description_requires_translation"
+            ),
+            "russian_metadata_available": ability.get("russian_metadata_available"),
             "icon_url": ability.get("icon_url"),
             "changes": [],
         }
         ability_map[ability_alias] = ability_section
         section["abilities"].append(ability_section)
     return ability_section
+
+
+def _announcement_hero_matches(
+    raw: dict[str, Any],
+    hero_catalog: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Resolve hero spotlight/launch articles whose prose is not patch-structured."""
+    source_text = f"{raw.get('title') or ''}\n{raw.get('content') or ''}"
+    if not re.search(
+        r"\b(?:hero spotlight|new Deadlock hero|introduc\w*|new addition|"
+        r"joins us|available to play|available in.game|[A-Z][\w'’-]{2,}'s release)\b",
+        source_text,
+        flags=re.IGNORECASE,
+    ):
+        return []
+    candidates: list[str] = _unresolved_announcement_hero_names(raw)
+    for line in _patch_lines(str(raw.get("content") or "")):
+        normalized = line.strip()
+        if normalized.casefold().startswith("hero spotlight:"):
+            normalized = normalized.split(":", 1)[1].strip()
+        elif normalized.casefold().endswith(": hero spotlight"):
+            normalized = normalized[: -len(": hero spotlight")].strip()
+        candidates.append(normalized)
+
+    matches: dict[str, tuple[str, dict[str, Any]]] = {}
+    for candidate in candidates:
+        match = _match_named_line(candidate, hero_catalog)
+        if match is None:
+            continue
+        alias, remainder = match
+        if remainder:
+            continue
+        hero = hero_catalog[alias]
+        hero_id = str(
+            hero.get("hero_id") or hero.get("id") or hero.get("slug") or hero.get("name") or alias
+        )
+        matches[hero_id] = (alias, hero)
+    return list(matches.values())
+
+
+def _unresolved_announcement_hero_names(raw: dict[str, Any]) -> list[str]:
+    """Extract names only from explicit new-hero/release announcement phrases."""
+    text = f"{raw.get('title') or ''}\n{raw.get('content') or ''}"
+    name = r"(?P<name>(?-i:[A-Z][A-Za-z'’-]*(?:[ \t]+[A-Z][A-Za-z'’-]*){0,2}))"
+    patterns = (
+        rf"\bnew Deadlock hero[ \t]+{name}[ \t]+(?:is|who|has)\b",
+        rf"\b{name},[ \t]*who now joins us\b",
+        rf"\b(?:introduce|introduces|introducing|introduced)[^:\n]{{0,100}}:[ \t]*{name}\b",
+        rf"\b{name}[ \t]+is available (?:in[- ]game|to play)(?: now)?\b",
+        rf"\b{name}'s release\b",
+    )
+    found: dict[str, str] = {}
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            candidate = " ".join(match.group("name").split())[:80]
+            # Steam prose can capitalize sentence starts; short generic words
+            # are not stable character labels and are discarded.
+            if len(candidate) >= 3 and any(char.isalpha() for char in candidate):
+                found.setdefault(candidate.casefold(), candidate)
+    return list(found.values())
+
+
+def _hero_metadata_is_complete(hero: dict[str, Any]) -> bool:
+    abilities = hero.get("abilities")
+    return bool(
+        hero.get("hero_id")
+        and hero.get("hero_image_url")
+        and hero.get("display_name")
+        and hero.get("description")
+        and hero.get("russian_metadata_available")
+        and isinstance(abilities, dict)
+        and abilities
+        and all(
+            isinstance(ability, dict)
+            and ability.get("display_name")
+            and ability.get("description")
+            and ability.get("icon_url")
+            and ability.get("russian_metadata_available")
+            for ability in abilities.values()
+        )
+    )
+
+
+def _hero_catalog_is_complete(hero: dict[str, Any], section: dict[str, Any]) -> bool:
+    abilities = section.get("abilities")
+    return bool(
+        hero.get("hero_id")
+        and hero.get("hero_image_url")
+        and hero.get("display_name")
+        and hero.get("description")
+        and isinstance(abilities, list)
+        and abilities
+        and all(
+            isinstance(ability, dict)
+            and ability.get("display_name")
+            and ability.get("icon_url")
+            and (
+                ability.get("description")
+                or ability.get("description_requires_translation")
+            )
+            for ability in abilities
+        )
+    )
+
+
+def _announcement_ability_description(
+    raw: dict[str, Any],
+    ability_name: str,
+    sibling_ability_names: list[str],
+) -> str | None:
+    """Use the full Steam ability span, bounded by the next named ability."""
+    content = str(raw.get("content") or "")
+    for line in _patch_lines(content):
+        target = re.search(
+            rf"(?<!\w){re.escape(ability_name)}(?!\w)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if target is None:
+            continue
+        following_starts = [
+            match
+            for sibling_name in sibling_ability_names
+            if sibling_name.casefold() != ability_name.casefold()
+            for match in re.finditer(
+                rf"(?<!\w){re.escape(sibling_name)}(?!\w)",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if match.start() > target.start()
+        ]
+        next_ability = min(following_starts, key=lambda match: match.start()) if following_starts else None
+        end = len(line)
+        if next_ability is not None:
+            end = next_ability.start()
+            for match in re.finditer(
+                r"[.!?](?:[\"'”’)]*)?\s+",
+                line[:next_ability.start()],
+            ):
+                end = match.end()
+        if not following_starts:
+            sentence_endings = [
+                match.end()
+                for match in re.finditer(
+                    r"[.!?](?:[\"'”’)]*)?(?:\s|$)",
+                    line[target.end():],
+                )
+            ]
+            if sentence_endings:
+                end = min(end, target.end() + sentence_endings[0])
+        start = 0
+        for match in re.finditer(r"[.!?](?:[\"'”’)]*)?\s+", line[:target.start()]):
+            start = match.end()
+        return line[start:end].strip()[:2400]
+    return None
 
 
 def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict[str, Any]:
@@ -429,6 +604,68 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
 
         general_changes.extend(base._change_chunks(line))
 
+    # Launch and spotlight announcements are prose, not [Heroes] patch-note
+    # sections. Resolve only exact title/heading mentions, then attach the full
+    # catalog roster so those pages still show hero and ability art/details.
+    announcement_heroes = _announcement_hero_matches(raw, hero_catalog)
+    pending_names = _unresolved_announcement_hero_names(raw)
+    resolved_names = {
+        str(hero.get("name") or alias).casefold()
+        for alias, hero in announcement_heroes
+    }
+    for hero_alias, hero in announcement_heroes:
+        _hero_key, section = _hero_section(hero_sections, hero, hero_alias)
+        section["hero_metadata_pending"] = not _hero_metadata_is_complete(hero)
+        for ability_alias in (hero.get("abilities") or {}):
+            ability_section = _ability_section(section, hero, ability_alias)
+            if not ability_section.get("description"):
+                sentence = _announcement_ability_description(
+                    raw,
+                    str(ability_section.get("name") or ""),
+                    [
+                        str(item.get("name") or "")
+                        for item in (hero.get("abilities") or {}).values()
+                        if isinstance(item, dict) and item.get("name")
+                    ],
+                )
+                if sentence:
+                    ability_section["description"] = sentence
+                    ability_section["description_from_announcement"] = True
+                    ability_section["description_requires_translation"] = True
+                    ability_section["_description_source_text"] = sentence
+        section["hero_catalog_pending"] = not _hero_catalog_is_complete(hero, section)
+    for hero_name in pending_names:
+        if hero_name.casefold() in resolved_names:
+            continue
+        matching_alias = next(
+            (
+                alias
+                for alias, hero in hero_catalog.items()
+                if isinstance(hero, dict)
+                and str(hero.get("name") or "").casefold() == hero_name.casefold()
+            ),
+            None,
+        )
+        if matching_alias is not None:
+            continue
+        hero_key = f"pending:{hero_name.casefold()}"
+        hero_sections.setdefault(
+            hero_key,
+            {
+                "kind": "hero",
+                "title": hero_name,
+                "hero_name": hero_name,
+                "hero_display_name": hero_name,
+                "hero_image_url": None,
+                "hero_description": None,
+                "hero_metadata_pending": True,
+                "hero_catalog_pending": True,
+                "changes": [],
+                "abilities": [],
+                "_ability_map": {},
+            },
+        )
+
     sections: list[dict[str, Any]] = []
     if general_changes:
         sections.append(
@@ -465,7 +702,16 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         section.pop("_ability_map", None)
         sections.append(section)
 
-    return {**raw, "sections": sections}
+    return {
+        **raw,
+        "sections": sections,
+        "hero_metadata_pending": any(
+            section.get("hero_metadata_pending") for section in sections
+        ) or bool(pending_names and not announcement_heroes),
+        "hero_catalog_pending": any(
+            section.get("hero_catalog_pending") for section in sections
+        ) or bool(pending_names and not announcement_heroes),
+    }
 
 
 async def get_patch_detail_source(patch_id: str) -> dict[str, Any] | None:
@@ -480,4 +726,45 @@ async def get_patch_detail(patch_id: str) -> dict[str, Any] | None:
     source = await get_patch_detail_source(patch_id)
     if source is None:
         return None
-    return await apply_cached_patch_translation(source)
+    translated = await apply_cached_patch_translation(source)
+    pending = False
+    for section in translated.get("sections") or []:
+        if not isinstance(section, dict) or section.get("kind") != "hero":
+            continue
+        if section.get("hero_description_requires_translation"):
+            source_text = section.pop("_hero_description_source_text", None)
+            translated_text = str(section.get("hero_description") or "").strip()
+            section["hero_description_russian_metadata_available"] = bool(
+                translated_text and translated_text != source_text
+            )
+            section.pop("hero_description_requires_translation", None)
+        for ability in section.get("abilities") or []:
+            if not isinstance(ability, dict) or not ability.get("description_from_announcement"):
+                continue
+            source_text = ability.pop("_description_source_text", None)
+            translated_text = str(ability.get("description") or "").strip()
+            if translated_text and translated_text != source_text:
+                ability["russian_metadata_available"] = True
+            else:
+                ability["russian_metadata_available"] = False
+            ability.pop("description_from_announcement", None)
+            ability.pop("description_requires_translation", None)
+            ability["changes"] = []
+        abilities_complete = bool(section.get("abilities")) and all(
+            isinstance(ability, dict)
+            and ability.get("display_name")
+            and ability.get("description")
+            and ability.get("icon_url")
+            and ability.get("russian_metadata_available")
+            for ability in section.get("abilities") or []
+        )
+        section["hero_metadata_pending"] = not bool(
+            section.get("hero_display_name")
+            and section.get("hero_image_url")
+            and section.get("hero_description")
+            and section.get("hero_description_russian_metadata_available")
+            and abilities_complete
+        )
+        pending = pending or bool(section["hero_metadata_pending"])
+    translated["hero_metadata_pending"] = pending
+    return translated

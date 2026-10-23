@@ -723,7 +723,7 @@ test("public navigation does not prefetch auth documents or Turnstile", async ({
 });
 
 test("site footer exposes valid navigation and project attribution", async ({ page }) => {
-  await page.goto("/auth/login");
+  await page.goto("/");
 
   const header = page.getByRole("banner");
   await expect(header).toHaveCSS("border-bottom-width", "1px");
@@ -734,6 +734,8 @@ test("site footer exposes valid navigation and project attribution", async ({ pa
   await expect(header.locator(".brand-mark")).toHaveAttribute("src", "/assets/main_logo/old-sparky-arena-logo-v3.webp");
   const footer = page.getByRole("contentinfo");
   await expect(footer).toHaveCount(1);
+  await expect(page.getByText("Турниры, обновления Deadlock, Драфты и новые видео Old Sparky.", { exact: true })).toBeVisible();
+  await expect(footer.getByText("Турнирный сервис для формирования сбалансированных команд и сеток по Deadlock.", { exact: true })).toBeVisible();
   await expect(footer.getByRole("navigation", { name: "Платформа" })).toBeVisible();
   await expect(footer.getByRole("navigation", { name: "Аккаунт" })).toBeVisible();
   await expect(footer.getByRole("navigation", { name: "Deadlock" })).toBeVisible();
@@ -854,6 +856,23 @@ test("authenticated header shows the profile avatar when available", async ({ pa
     "/assets/heroes/Abrams.png"
   );
   await expect(profileLink.locator(".header-profile-avatar svg")).toHaveCount(0);
+});
+
+test("profile and operations header actions mark their own pages active", async ({ page }) => {
+  await authenticateTestUser(page);
+  const header = page.getByRole("banner");
+  const operations = header.getByRole("link", { name: "Operations", exact: true });
+  const profile = header.getByRole("link", { name: "Профиль: lisalexy" });
+
+  await page.goto("/platform-ops");
+  await expect(operations).toHaveClass(/active/u);
+  await expect(profile).not.toHaveClass(/active/u);
+  await expect(operations).toHaveCSS("border-top-width", "0px");
+  await expect(operations).toHaveCSS("box-shadow", "none");
+
+  await page.goto("/profile/me");
+  await expect(profile).toHaveClass(/active/u);
+  await expect(operations).not.toHaveClass(/active/u);
 });
 
 test("information page uses the concise rules title", async ({ page }) => {
@@ -1938,6 +1957,15 @@ test("patch detail keeps objective sections, the upper cover crop, and no source
   ]);
   await expect(patchSections.nth(1)).toHaveClass(/objective-patch-section/u);
   await expect(patchSections.nth(2)).toHaveClass(/objective-patch-section/u);
+  await expect(patchSections.nth(4).getByText("Привратник", { exact: true })).toBeVisible();
+  await expect(patchSections.nth(4).getByText("Хозяин дверей и скрытых проходов.", { exact: true })).toBeVisible();
+  await expect(patchSections.nth(4).getByText("Подробности героя появятся после обновления данных.", { exact: true })).toBeVisible();
+  await expect(patchSections.nth(4).locator(".patch-hero-image")).toHaveAttribute(
+    "src",
+    "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/doorman.png"
+  );
+  await expect(patchSections.nth(4).getByRole("heading", { name: "Проход", level: 3 })).toBeVisible();
+  await expect(patchSections.nth(4).getByText("Создаёт дверь между двумя точками.", { exact: true })).toBeVisible();
   await expect(page.locator('[data-objective-icon="source"], [data-objective-icon="fallback"]')).toHaveCount(2);
   await expect(page.locator(".patch-objective-image")).toHaveCount(1);
   await expect(page.locator(".patch-objective-fallback")).toHaveCount(1);
@@ -3358,7 +3386,10 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
           render(container, options) {
             container.dataset.turnstileAction = options.action;
             container.dataset.turnstileAppearance = options.appearance;
-            setTimeout(() => options.callback("turnstile-login-token"), 250);
+            setTimeout(() => {
+              options.callback("turnstile-login-token");
+              options.callback("turnstile-login-token");
+            }, 250);
             return "auth-widget";
           },
           remove() {},
@@ -3413,16 +3444,235 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
   await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-appearance", "interaction-only");
   await expect(page.getByText("Проверка на Бибопа...", { exact: true })).toBeVisible();
   await expect(submitButton).toBeDisabled();
+  await expect(page.getByLabel("Email")).toBeDisabled();
+  await expect(page.getByLabel("Пароль")).toBeDisabled();
   await expect(page.locator(".auth-error")).toHaveCount(0);
-  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
-  await expect(submitButton).toBeEnabled();
-  await submitButton.click();
   await expect(page).toHaveURL(/\/$/u);
 
   expect(loginPayloads).toHaveLength(2);
   expect(loginPayloads[0]).toEqual({ email: "turnstile@example.test", password: "long-password" });
   expect(loginPayloads[1].turnstile_token).toBe("turnstile-login-token");
   expect(csrfTokenRequests).toEqual([]);
+});
+
+test("automatic Turnstile continuation stops after server rejects the token", async ({ page }) => {
+  const loginPayloads: Array<Record<string, unknown>> = [];
+  await page.route("**/api/v1/auth/security-config", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "cache-control": "no-store" },
+      body: JSON.stringify({
+        public_registration_enabled: true,
+        email_verification_required: true,
+        turnstile_mode: "always",
+        turnstile_site_key: "turnstile-rejection-site-key"
+      })
+    });
+  });
+  await page.route("**/turnstile/v0/api.js*", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: `(() => {
+        let renderCount = 0;
+        window.turnstile = {
+          render(container, options) {
+            window.__deliverFreshTurnstileToken = () => options.callback("fresh-turnstile-token");
+            if (renderCount++ === 0) {
+              setTimeout(() => options.callback("rejected-turnstile-token"), 0);
+            }
+            return "rejected-auth-widget";
+          },
+          remove() {},
+          reset() {}
+        };
+      })();`
+    });
+  });
+  await page.route("**/api/v1/auth/login", async (route) => {
+    expectOriginOnlyAuthRequest(route);
+    loginPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
+    await route.fulfill({
+      status: 403,
+      contentType: "application/json",
+      body: JSON.stringify({
+        detail: loginPayloads.length === 1
+          ? "Human verification is required."
+          : "Human verification failed."
+      })
+    });
+  });
+
+  await page.goto("/auth/login");
+  await page.getByLabel("Email").fill("rejected@example.test");
+  await page.getByLabel("Пароль").fill("long-password");
+  await page.getByRole("button", { name: "Войти", exact: true }).click();
+  await expect(page.locator(".auth-error")).toContainText("Проверка безопасности не пройдена");
+  await expect(page.locator(".auth-turnstile")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeDisabled();
+  await expect(page.getByLabel("Email")).toBeDisabled();
+  await expect(page.getByLabel("Пароль")).toBeDisabled();
+  expect(loginPayloads).toHaveLength(2);
+  expect(loginPayloads[0]).toEqual({ email: "rejected@example.test", password: "long-password" });
+  expect(loginPayloads[1].turnstile_token).toBe("rejected-turnstile-token");
+
+  await page.evaluate(() => {
+    (window as Window & { __deliverFreshTurnstileToken?: () => void }).__deliverFreshTurnstileToken?.();
+  });
+  await expect.poll(() => loginPayloads.length).toBe(3);
+  await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeDisabled();
+  expect(loginPayloads[2]).toEqual({
+    email: "rejected@example.test",
+    password: "long-password",
+    turnstile_token: "fresh-turnstile-token"
+  });
+  await page.evaluate(() => {
+    (window as Window & { __deliverFreshTurnstileToken?: () => void }).__deliverFreshTurnstileToken?.();
+  });
+  await page.waitForTimeout(100);
+  expect(loginPayloads).toHaveLength(3);
+  await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeDisabled();
+});
+
+test("invalid credentials after Turnstile require an explicit retry with a fresh token", async ({ page }) => {
+  const loginPayloads: Array<Record<string, unknown>> = [];
+  await page.route("**/api/v1/auth/security-config", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "cache-control": "no-store" },
+      body: JSON.stringify({
+        public_registration_enabled: true,
+        email_verification_required: true,
+        turnstile_mode: "always",
+        turnstile_site_key: "turnstile-invalid-credentials-site-key"
+      })
+    });
+  });
+  await page.route("**/turnstile/v0/api.js*", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: `(() => {
+        let renderCount = 0;
+        window.turnstile = {
+          render(container, options) {
+            window.__deliverFreshTurnstileToken = () => options.callback("fresh-credentials-token");
+            if (renderCount++ === 0) {
+              setTimeout(() => options.callback("first-credentials-token"), 0);
+            }
+            return "invalid-credentials-widget";
+          },
+          remove() {},
+          reset() {}
+        };
+      })();`
+    });
+  });
+  await page.route("**/api/v1/auth/login", async (route) => {
+    expectOriginOnlyAuthRequest(route);
+    loginPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
+    await route.fulfill({
+      status: loginPayloads.length === 1 ? 403 : 401,
+      contentType: "application/json",
+      body: JSON.stringify({
+        detail: loginPayloads.length === 1
+          ? "Human verification is required."
+          : "Invalid email or password."
+      })
+    });
+  });
+
+  await page.goto("/auth/login");
+  await page.getByLabel("Email").fill("invalid-credentials@example.test");
+  await page.getByLabel("Пароль").fill("wrong-password");
+  await page.getByRole("button", { name: "Войти", exact: true }).click();
+  await expect(page.locator(".auth-error")).toContainText("Не удалось войти");
+  await expect(page.locator(".auth-turnstile")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeDisabled();
+  await expect(page.getByLabel("Email")).toBeEnabled();
+  await expect(page.getByLabel("Пароль")).toBeEnabled();
+  expect(loginPayloads).toHaveLength(2);
+  expect(loginPayloads[1].turnstile_token).toBe("first-credentials-token");
+
+  await page.getByLabel("Пароль").fill("corrected-password");
+  await page.evaluate(() => {
+    (window as Window & { __deliverFreshTurnstileToken?: () => void }).__deliverFreshTurnstileToken?.();
+  });
+  await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeEnabled();
+  await page.waitForTimeout(100);
+  expect(loginPayloads).toHaveLength(2);
+
+  await page.getByRole("button", { name: "Войти", exact: true }).click();
+  await expect(page.locator(".auth-error")).toContainText("Не удалось войти");
+  expect(loginPayloads).toHaveLength(3);
+  expect(loginPayloads[2]).toEqual({
+    email: "invalid-credentials@example.test",
+    password: "corrected-password",
+    turnstile_token: "fresh-credentials-token"
+  });
+  await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeDisabled();
+  await page.evaluate(() => {
+    (window as Window & { __deliverFreshTurnstileToken?: () => void }).__deliverFreshTurnstileToken?.();
+  });
+  await page.waitForTimeout(100);
+  expect(loginPayloads).toHaveLength(3);
+  await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeDisabled();
+});
+
+test("leaving login while Turnstile is pending discards the automatic submission", async ({ page }) => {
+  let loginAttempts = 0;
+  await page.route("**/api/v1/auth/security-config", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "cache-control": "no-store" },
+      body: JSON.stringify({
+        public_registration_enabled: true,
+        email_verification_required: true,
+        turnstile_mode: "always",
+        turnstile_site_key: "turnstile-navigation-site-key"
+      })
+    });
+  });
+  await page.route("**/turnstile/v0/api.js*", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: `(() => {
+        window.turnstile = {
+          render(container, options) {
+            window.__deliverPendingTurnstile = () => options.callback("late-turnstile-token");
+            return "pending-auth-widget";
+          },
+          remove() {},
+          reset() {}
+        };
+      })();`
+    });
+  });
+  await page.route("**/api/v1/auth/login", async (route) => {
+    expectOriginOnlyAuthRequest(route);
+    loginAttempts += 1;
+    await route.fulfill({
+      status: 403,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "Human verification is required." })
+    });
+  });
+
+  await page.goto("/auth/login");
+  await page.getByLabel("Email").fill("pending@example.test");
+  await page.getByLabel("Пароль").fill("long-password");
+  await page.getByRole("button", { name: "Войти", exact: true }).click();
+  await expect(page.locator(".auth-turnstile")).toBeVisible();
+  await page.goto("/info");
+  await page.evaluate(() => {
+    (window as Window & { __deliverPendingTurnstile?: () => void }).__deliverPendingTurnstile?.();
+  });
+  await page.waitForTimeout(50);
+  expect(loginAttempts).toBe(1);
 });
 
 test("an in-flight Turnstile script readies a second auth-route widget", async ({ page }, testInfo) => {
@@ -3486,10 +3736,6 @@ test("an in-flight Turnstile script readies a second auth-route widget", async (
     probeWindow.__turnstileLifecycleProbe?.deliverToken?.();
   });
   await expect(page.locator(".auth-turnstile")).toHaveCount(0);
-
-  const submitButton = page.getByRole("button", { name: "Войти", exact: true });
-  await expect(submitButton).toBeEnabled();
-  await submitButton.click();
   await expect(page).toHaveURL(/\/$/u);
   expect(scenario.resetAttempts).toBe(1);
   expect(scenario.resetPayloads).toEqual([{ email: "inflight@example.test" }]);
@@ -3743,8 +3989,6 @@ test("adaptive Turnstile appears only after the API asks for human verification"
   await page.getByRole("button", { name: "Войти", exact: true }).click();
   await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "login");
   await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-appearance", "interaction-only");
-  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
-  await page.getByRole("button", { name: "Войти", exact: true }).click();
   await expect(page).toHaveURL(/\/$/u);
   expect(loginPayloads).toEqual([
     { email: "adaptive@example.test", password: "long-password" },

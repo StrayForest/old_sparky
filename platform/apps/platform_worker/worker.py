@@ -59,7 +59,7 @@ AUTOMATION_TICK_EXPIRES_SECONDS = AUTOMATION_TICK_INTERVAL_SECONDS
 COMMITMENT_RECONCILIATION_LOCK_KEY = "platform:player-commitments:reconcile-lock"
 COMMITMENT_RECONCILIATION_INTERVAL_SECONDS = 900.0
 COMMITMENT_RECONCILIATION_LOCK_TTL_SECONDS = 600
-HOME_CONTENT_REFRESH_INTERVAL_SECONDS = 1800.0
+HOME_CONTENT_REFRESH_INTERVAL_SECONDS = 300.0
 AUTH_LIFECYCLE_CLEANUP_INTERVAL_SECONDS = 3600.0
 MEDIA_RECONCILIATION_LOCK_KEY = "platform:media:reconciliation-lock"
 MEDIA_RECONCILIATION_INTERVAL_SECONDS = 60.0
@@ -310,7 +310,9 @@ def player_commitment_reconciliation() -> dict[str, int | bool]:
 
 @celery_app.task(name="platform.home_content_refresh", ignore_result=True)
 def home_content_refresh() -> dict[str, Any]:
-    return _run_on_worker_loop(refresh_home_content(force=True))
+    return _run_on_worker_loop(
+        refresh_home_content(force=True, force_asset_refresh=False)
+    )
 
 
 async def _record_patch_translation_failure(
