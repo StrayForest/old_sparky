@@ -58,7 +58,7 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                           event.currentTarget.onerror = null;
                           event.currentTarget.src = deadlockHeroPlaceholderPath;
                         }}
-                        src={deadlockHeroIconPath(section.hero_name)}
+                        src={section.hero_image_url || deadlockHeroIconPath(section.hero_name)}
                         width={88}
                       />
                     ) : section.item_icon_url ? (
@@ -83,6 +83,15 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                         : section.objective_key === "unstable_rift"
                           ? t("patch.objective.unstableRift")
                           : section.title}</h2>
+                      {section.kind === "hero" && section.hero_display_name ? (
+                        <span className="patch-hero-display-name">{section.hero_display_name}</span>
+                      ) : null}
+                      {section.kind === "hero" && section.hero_description ? (
+                        <p className="patch-hero-description">{section.hero_description}</p>
+                      ) : null}
+                      {section.kind === "hero" && section.hero_metadata_pending ? (
+                        <p className="patch-hero-description">{t("patch.heroMetadataPending")}</p>
+                      ) : null}
                     </div>
                   </header>
                   {section.changes.length ? <ChangeList changes={section.changes} /> : null}
@@ -100,8 +109,9 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                                 width={48}
                               />
                             ) : <span><Sparkles aria-hidden="true" size={20} /></span>}
-                            <h3>{ability.name}</h3>
+                            <h3>{ability.display_name || ability.name}</h3>
                           </header>
+                          {ability.description ? <p className="patch-ability-description">{ability.description}</p> : null}
                           <ChangeList changes={ability.changes} />
                         </section>
                       ))}

@@ -64,6 +64,8 @@ class DeadlockGameAssetsResponse(BaseModel):
 
 class PatchAbilityResponse(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+    display_name: str | None = Field(default=None, max_length=120)
+    description: str | None = Field(default=None, max_length=2400)
     icon_url: str | None = Field(default=None, max_length=1000)
     changes: list[str] = Field(default_factory=list, max_length=100)
 
@@ -72,6 +74,10 @@ class PatchSectionResponse(BaseModel):
     kind: Literal["general", "objective", "item", "hero"]
     title: str = Field(min_length=1, max_length=120)
     hero_name: str | None = Field(default=None, max_length=80)
+    hero_display_name: str | None = Field(default=None, max_length=120)
+    hero_image_url: str | None = Field(default=None, max_length=1000)
+    hero_description: str | None = Field(default=None, max_length=8000)
+    hero_metadata_pending: bool = False
     item_name: str | None = Field(default=None, max_length=120)
     item_category: Literal["weapon", "vitality", "spirit"] | None = None
     item_icon_url: str | None = Field(default=None, max_length=1000)
@@ -105,10 +111,13 @@ class PatchSectionResponse(BaseModel):
                 value is not None
                 for value in (
                     self.hero_name,
+                    self.hero_display_name,
+                    self.hero_image_url,
+                    self.hero_description,
                     self.objective_key,
                     self.objective_icon_url,
                 )
-            ) or self.abilities:
+            ) or self.abilities or self.hero_metadata_pending:
                 raise ValueError("Item patch sections cannot include hero or objective metadata.")
             return self
 
@@ -119,11 +128,14 @@ class PatchSectionResponse(BaseModel):
                 value is not None
                 for value in (
                     self.hero_name,
+                    self.hero_display_name,
+                    self.hero_image_url,
+                    self.hero_description,
                     self.item_name,
                     self.item_category,
                     self.item_icon_url,
                 )
-            ) or self.abilities:
+            ) or self.abilities or self.hero_metadata_pending:
                 raise ValueError("Objective patch sections cannot include hero or item metadata.")
             return self
 
@@ -131,13 +143,16 @@ class PatchSectionResponse(BaseModel):
             value is not None
             for value in (
                 self.hero_name,
+                self.hero_display_name,
+                self.hero_image_url,
+                self.hero_description,
                 self.item_name,
                 self.item_category,
                 self.item_icon_url,
                 self.objective_key,
                 self.objective_icon_url,
             )
-        ) or self.abilities:
+        ) or self.abilities or self.hero_metadata_pending:
             raise ValueError("General patch sections cannot include entity metadata.")
         return self
 
@@ -149,6 +164,7 @@ class PatchDetailResponse(BaseModel):
     url: str = Field(max_length=1000)
     content: str = Field(max_length=30000)
     sections: list[PatchSectionResponse] = Field(default_factory=list, max_length=100)
+    hero_metadata_pending: bool = False
 
 
 class SupportStatusResponse(BaseModel):

@@ -4,13 +4,43 @@ set -euo pipefail
 TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEB_ROOT="$(cd "$TOOLS_DIR/../apps/platform_web" && pwd)"
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/oldsparky-web-hermetic.XXXXXX")"
+RUN_ID="oldsparky-web-hermetic-${BASHPID}-$(date +%s%N)"
+export PLATFORM_WEB_HERMETIC_RUN_ID="$RUN_ID"
 
 cleanup() {
-  rm -rf -- "$BUILD_DIR"
+  local status=$?
+  local cleanup_status=0
+  trap - EXIT
+  trap '' INT TERM HUP
+  if "$TOOLS_DIR/platform_node.sh" \
+    "$TOOLS_DIR/platform_web_hermetic_cleanup.cjs" cleanup "$RUN_ID"; then
+    :
+  else
+    cleanup_status=$?
+    if [[ "$status" -eq 0 ]]; then status="$cleanup_status"; fi
+  fi
+  if rm -rf -- "$BUILD_DIR"; then
+    :
+  else
+    cleanup_status=$?
+    if [[ "$status" -eq 0 ]]; then status="$cleanup_status"; fi
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 cd "$WEB_ROOT"
+# Fail before an expensive build when another task owns one of the fixed local
+# ports this contour uses. Cleanup remains scoped to the unique run ID above.
+"$TOOLS_DIR/platform_node.sh" \
+  "$TOOLS_DIR/platform_web_hermetic_cleanup.cjs" preflight \
+  3198 3199 3100 3101
+# Exercise the same process-ownership cleanup used by the signal/EXIT trap.
+"$TOOLS_DIR/platform_node.sh" \
+  "$WEB_ROOT/tests/support/web-hermetic-lifecycle-contract.mjs"
 # The public live-QA count reporter is privacy-sensitive contract code.  Run
 # its pure Node contract in the existing web-hermetic gate without starting a
 # browser, server, API or database.

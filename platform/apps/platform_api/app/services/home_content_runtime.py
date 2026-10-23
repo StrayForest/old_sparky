@@ -549,8 +549,15 @@ async def _publish_recovered_payload(payload: dict[str, Any]) -> None:
         await cache.aclose()
 
 
-async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
-    payload = await home_content_security.refresh_home_content(force=force)
+async def refresh_home_content(
+    *,
+    force: bool = False,
+    force_asset_refresh: bool | None = None,
+) -> dict[str, Any]:
+    payload = await home_content_security.refresh_home_content(
+        force=force,
+        force_asset_refresh=force_asset_refresh,
+    )
     if not force:
         return payload
 

@@ -119,6 +119,8 @@ export type PlatformDeadlockGameAssets = {
 
 export type PlatformPatchAbility = {
   name: string;
+  display_name?: string | null;
+  description?: string | null;
   icon_url: string | null;
   changes: string[];
 };
@@ -127,6 +129,10 @@ export type PlatformPatchSection = {
   kind: "general" | "objective" | "item" | "hero";
   title: string;
   hero_name: string | null;
+  hero_display_name?: string | null;
+  hero_image_url?: string | null;
+  hero_description?: string | null;
+  hero_metadata_pending?: boolean;
   item_name?: string | null;
   item_category?: "weapon" | "vitality" | "spirit" | null;
   item_icon_url?: string | null;
@@ -143,6 +149,7 @@ export type PlatformPatchDetail = {
   url: string;
   content: string;
   sections: PlatformPatchSection[];
+  hero_metadata_pending?: boolean;
 };
 
 export type PlatformProfile = {
