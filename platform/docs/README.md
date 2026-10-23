@@ -14,6 +14,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Prioritized backlog | [Roadmap](platform-roadmap.md) |
 | Components, data flow and trust boundaries | [Production architecture](production-architecture.md) |
 | Local setup, verification, commit and push workflow | [Development guide](development-guide.md) |
+| Compact agent handoffs, reads and work reporting | [Agent token-efficient work protocol](agent-token-efficiency.md) |
 | Maintaining docs, AGENTS and skills | [Documentation governance](documentation-governance.md) |
 | Product and workflow contracts | [Product reference](product-reference.md) |
 | Deadlock patch translation / Valve glossary contract | [Patch translation](patch-translation.md) |

@@ -27,6 +27,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import time
 from uuid import uuid4
 
@@ -569,6 +570,10 @@ def _safe_release(app_dir: Path, release: Path) -> tuple[Path, str, str]:
     if SLUG_PATTERN.fullmatch(resolved.name) is None:
         raise InstallerError("release slug is invalid")
     _directory(resolved)
+    return resolved, _release_source_sha(resolved), resolved.name
+
+
+def _release_source_sha(resolved: Path) -> str:
     release_json = resolved / "RELEASE.json"
     release_json_metadata = _regular(
         release_json,
@@ -589,7 +594,33 @@ def _safe_release(app_dir: Path, release: Path) -> tuple[Path, str, str]:
         raise InstallerError("release source SHA is invalid")
     if payload.get("release_slug") != resolved.name:
         raise InstallerError("release slug does not match release metadata")
-    return resolved, source_sha, resolved.name
+    return source_sha
+
+
+def _safe_bootstrap_release(release: Path, expected_slug: str) -> tuple[Path, str, str]:
+    """Accept only the host validator's private, authenticated bootstrap tree."""
+
+    if (
+        not release.is_absolute()
+        or Path(os.path.abspath(release)) != release
+        or release.resolve(strict=True) != release
+        or SLUG_PATTERN.fullmatch(expected_slug) is None
+        or release.name != expected_slug
+        or release.parent.parent != Path("/tmp")
+        or re.fullmatch(r"old-sparky-release-bootstrap\.[A-Za-z0-9]{6}", release.parent.name) is None
+    ):
+        raise InstallerError("bootstrap release path is invalid")
+    temporary = Path("/tmp").lstat()
+    if (
+        not stat.S_ISDIR(temporary.st_mode)
+        or temporary.st_uid != 0
+        or temporary.st_gid != 0
+        or stat.S_IMODE(temporary.st_mode) != 0o1777
+    ):
+        raise InstallerError("bootstrap temporary root is unsafe")
+    _directory(release.parent, mode=0o700)
+    _directory(release)
+    return release, _release_source_sha(release), release.name
 
 
 def _active_release(app_dir: Path) -> tuple[Path, str, str]:
@@ -1611,6 +1642,62 @@ def _runtime_provider_plan(
         ),
         source_sha=active_source_sha,
     )
+    # A rollback can target an already-published, immutable generation whose
+    # lock predates the active candidate. Validate its own provider binding
+    # and reuse that exact payload identity. Rebuilding an old source against
+    # the candidate's provider would create a different tree and could exceed
+    # the recovery disk floor after the candidate-owned engine was published.
+    target_root = PAYLOAD_ROOT / candidate_source_sha
+    if candidate_source_sha != active_source_sha and os.path.lexists(target_root):
+        _directory(target_root, mode=0o555)
+        target_provider_path = target_root / "runtime-provider.json"
+        target_metadata = _regular(
+            target_provider_path, mode=0o444, maximum=MAX_RUNTIME_MANIFEST_BYTES,
+        )
+        try:
+            target_provider = json.loads(
+                _read_bounded_regular(
+                    target_provider_path,
+                    metadata=target_metadata,
+                    maximum=MAX_RUNTIME_MANIFEST_BYTES,
+                    mode=0o444,
+                ).decode("ascii"),
+                object_pairs_hook=_strict_object,
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise InstallerError("existing typed runtime provider is invalid") from exc
+        target_provider_sha = (
+            target_provider.get("provider_sha")
+            if isinstance(target_provider, dict) else None
+        )
+        if (
+            not isinstance(target_provider, dict)
+            or set(target_provider) != {
+                "version", "source_sha", "provider_sha", "engine_tree_sha256",
+                "node_version", "package_lock_sha256", "engine_files", "engine_links",
+            }
+            or target_provider.get("version") != 2
+            or target_provider.get("source_sha") != candidate_source_sha
+            or not isinstance(target_provider_sha, str)
+            or SHA_PATTERN.fullmatch(target_provider_sha) is None
+            or target_provider.get("engine_tree_sha256") != engine_sha
+            or target_provider.get("node_version") != node_version
+            or target_provider.get("package_lock_sha256") != lock_sha
+            or target_provider.get("engine_files") != engine_files
+            or target_provider.get("engine_links") != engine_links
+        ):
+            raise InstallerError("existing typed runtime provider differs from target source")
+        if target_provider_sha not in _protected_shas(app_dir):
+            raise InstallerError("existing typed runtime provider is outside protected release closure")
+        _validate_engine_root(
+            PAYLOAD_ROOT / target_provider_sha / "provider-runtime",
+            expected_files=engine_files,
+            expected_links=engine_links,
+            engine_sha256=engine_sha,
+            node_version=node_version,
+            package_lock_sha256=lock_sha,
+        )
+        return target_provider, None
     provider_file = active_root / "runtime-provider.json"
     provider: dict[str, object] | None = None
     if os.path.lexists(provider_file):
@@ -1652,9 +1739,15 @@ def _runtime_provider_plan(
             or provider.get("source_sha") != active_source_sha
             or not isinstance(provider_sha, str)
             or SHA_PATTERN.fullmatch(provider_sha) is None
-            or provider.get("engine_tree_sha256") != engine_sha
-            or provider.get("node_version") != node_version
-            or provider.get("package_lock_sha256") != lock_sha
+            or provider.get("engine_tree_sha256") != active_runtime_manifest.get("engine_tree_sha256")
+            or provider.get("node_version") != active_runtime_manifest.get("node_version")
+            or provider.get("package_lock_sha256") != active_runtime_manifest.get("package_lock_sha256")
+            or provider.get("engine_files") != active_runtime_manifest.get("engine_files")
+            or provider.get("engine_links") != active_runtime_manifest.get("engine_links")
+        ):
+            raise InstallerError("active typed runtime provider identity is invalid")
+        if (
+            provider.get("node_version") != node_version
             or provider.get("engine_files") != engine_files
             or provider.get("engine_links") != engine_links
         ):
@@ -1662,14 +1755,35 @@ def _runtime_provider_plan(
         protected = _protected_shas(app_dir)
         if provider_sha not in protected:
             raise InstallerError("typed runtime provider is outside the protected release closure")
+        provider_root = PAYLOAD_ROOT / provider_sha / "provider-runtime"
         _validate_engine_root(
-            PAYLOAD_ROOT / provider_sha / "provider-runtime",
+            provider_root,
             expected_files=engine_files,
             expected_links=engine_links,
-            engine_sha256=engine_sha,
+            engine_sha256=str(provider["engine_tree_sha256"]),
             node_version=node_version,
-            package_lock_sha256=lock_sha,
+            package_lock_sha256=str(provider["package_lock_sha256"]),
         )
+        if provider["package_lock_sha256"] != lock_sha:
+            # An application-only lock change can leave every pinned browser
+            # engine byte unchanged. Rebind those verified bytes to the new
+            # lock in a candidate-owned provider; never alias an old provider
+            # under a different manifest identity.
+            return (
+                {
+                    "version": 2,
+                    "source_sha": candidate_source_sha,
+                    "provider_sha": candidate_source_sha,
+                    "engine_tree_sha256": engine_sha,
+                    "node_version": node_version,
+                    "package_lock_sha256": lock_sha,
+                    "engine_files": engine_files,
+                    "engine_links": engine_links,
+                },
+                provider_root,
+            )
+        if provider["engine_tree_sha256"] != engine_sha:
+            raise InstallerError("active typed runtime provider differs from candidate engine")
         return (
             {
                 **provider,
@@ -1767,6 +1881,169 @@ def _runtime_provider_plan(
     )
 
 
+def _require_provider_copy_capacity(
+    source_root: Path,
+    runtime_source: Path,
+    runtime_manifest: dict[str, object],
+    *,
+    additional_bytes: int = 0,
+) -> None:
+    """Reserve the normal host floor before copying a candidate-owned engine."""
+
+    _directory(PAYLOAD_ROOT)
+    filesystem = os.statvfs(PAYLOAD_ROOT)
+    block = filesystem.f_frsize
+    if block <= 0:
+        raise InstallerError("typed runtime provider filesystem block size is invalid")
+    engine_files = runtime_manifest["engine_files"]
+    engine_links = runtime_manifest["engine_links"]
+    if not isinstance(engine_files, dict) or not isinstance(engine_links, dict):
+        raise InstallerError("typed runtime provider map is invalid")
+    def allocated(size: int) -> int:
+        return ((size + block - 1) // block) * block
+
+    projected = 0
+    for relative in engine_files:
+        projected += allocated(
+            _regular(
+                source_root / relative,
+                allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix(),
+            ).st_size
+        )
+    projected += allocated(_regular(runtime_source / "web/package-lock.json").st_size)
+    # Include all directory entries and filesystem bookkeeping conservatively.
+    projected += (len(engine_files) + len(engine_links) + 64) * block
+    total = filesystem.f_blocks * block
+    available = filesystem.f_bavail * block
+    floor = max(5 * 1024**3, (total * 15 + 99) // 100) + 128 * 1024**2
+    if additional_bytes < 0 or available < floor + projected + additional_bytes + 128 * 1024**2:
+        raise InstallerError("typed runtime provider capacity is insufficient")
+
+
+def _require_provider_write_floor(destination: Path, next_file_bytes: int = 0) -> None:
+    """Fail a concurrent disk drift before each copy and before publication."""
+
+    filesystem = os.statvfs(destination)
+    block = filesystem.f_frsize
+    if block <= 0 or next_file_bytes < 0:
+        raise InstallerError("typed runtime provider filesystem is invalid")
+    total = filesystem.f_blocks * block
+    available = filesystem.f_bavail * block
+    floor = max(5 * 1024**3, (total * 15 + 99) // 100) + 128 * 1024**2
+    next_allocation = ((next_file_bytes + block - 1) // block) * block
+    if available < floor + next_allocation + 16 * 1024**2:
+        raise InstallerError("typed runtime provider write would breach host floor")
+
+
+def _artifact_stage_reserve(artifact: Path, release: Path) -> int:
+    """Bound extraction and fresh-venv bytes while the artifact is still on disk."""
+
+    if (
+        not artifact.is_absolute()
+        or Path(os.path.abspath(artifact)) != artifact
+        or artifact.name != release.name + ".tar.gz"
+    ):
+        raise InstallerError("bootstrap artifact path is invalid")
+    _regular(artifact, maximum=256 * 1024**2)
+    release_json = release / "RELEASE.json"
+    release_metadata = _regular(release_json, maximum=MAX_RELEASE_JSON_BYTES)
+    try:
+        metadata = json.loads(
+            _read_bounded_regular(
+                release_json,
+                metadata=release_metadata,
+                maximum=MAX_RELEASE_JSON_BYTES,
+            ).decode("ascii"),
+            object_pairs_hook=_strict_object,
+        )
+        evidence = metadata["python_venv_install_evidence"]
+        if (
+            not isinstance(evidence, dict)
+            or evidence.get("schema") != 1
+            or any(
+                type(evidence.get(key)) is not int
+                or not 0 < evidence[key] <= 1024**3
+                for key in (
+                    "builder_allocated_bytes",
+                    "wheelhouse_expanded_bytes",
+                    "host_overhead_bytes",
+                )
+            )
+        ):
+            raise InstallerError("bootstrap venv reserve is invalid")
+    except (KeyError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        raise InstallerError("bootstrap venv reserve is invalid") from exc
+    block = os.statvfs(PAYLOAD_ROOT).f_frsize
+    if block <= 0:
+        raise InstallerError("bootstrap filesystem block size is invalid")
+    expanded = 0
+    count = 0
+    try:
+        with tarfile.open(artifact, "r:gz") as archive:
+            for member in archive:
+                count += 1
+                if count > 100_000 or not member.name.startswith(release.name + "/"):
+                    raise InstallerError("bootstrap artifact inventory is invalid")
+                if member.isfile():
+                    expanded += ((member.size + block - 1) // block) * block
+                elif member.isdir() or member.issym():
+                    expanded += block
+                else:
+                    raise InstallerError("bootstrap artifact member type is invalid")
+                if expanded > 4 * 1024**3:
+                    raise InstallerError("bootstrap artifact expansion exceeds its bound")
+    except (OSError, tarfile.TarError) as exc:
+        raise InstallerError("bootstrap artifact could not be inspected") from exc
+    return expanded + sum(
+        evidence[key]
+        for key in (
+            "builder_allocated_bytes",
+            "wheelhouse_expanded_bytes",
+            "host_overhead_bytes",
+        )
+    )
+
+
+def _candidate_source_plan(
+    app_dir: Path,
+    source_platform: Path,
+    source_sha: str,
+    *,
+    allow_legacy_reporter_omission: bool = False,
+) -> tuple[dict[str, object], dict[str, object] | None, Path | None]:
+    """Validate the same source/provider boundary before and after promotion."""
+
+    runtime_source = source_platform / "liveqa-runtime"
+    runtime_manifest = _validate_runtime_source(
+        runtime_source,
+        allow_legacy_reporter_omission=allow_legacy_reporter_omission,
+        source_sha=source_sha,
+    )
+    runtime_provider: dict[str, object] | None = None
+    runtime_provider_source: Path | None = None
+    if runtime_manifest.get("version") == 2:
+        runtime_provider = _runtime_provider_payload(
+            app_dir, expected_manifest=runtime_manifest,
+        )
+    elif runtime_manifest.get("version") == 3:
+        runtime_provider, runtime_provider_source = _runtime_provider_plan(
+            app_dir,
+            candidate_source_sha=source_sha,
+            expected_manifest=runtime_manifest,
+        )
+        if runtime_provider_source is not None:
+            _require_provider_copy_capacity(
+                runtime_provider_source, runtime_source, runtime_manifest,
+            )
+    for relative in TOOL_FILES:
+        _regular(source_platform / "tools" / relative)
+    for relative in SOURCE_TREES:
+        _validate_source_tree(source_platform, relative)
+    for relative in SOURCE_FILES:
+        _regular(source_platform / relative)
+    return runtime_manifest, runtime_provider, runtime_provider_source
+
+
 def _copy_typed_engine_provider(
     source_root: Path,
     suite_root: Path,
@@ -1783,6 +2060,10 @@ def _copy_typed_engine_provider(
     for relative, expected_digest in sorted(engine_files.items()):
         source = source_root / relative
         target = destination / relative
+        _require_provider_write_floor(destination, _regular(
+            source,
+            allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix(),
+        ).st_size)
         digest = _copy_regular(
             source,
             target,
@@ -1800,6 +2081,7 @@ def _copy_typed_engine_provider(
         os.chown(target, 0, 0, follow_symlinks=False)
     lock_source = suite_root / "web/package-lock.json"
     lock_target = destination / "web/package-lock.json"
+    _require_provider_write_floor(destination, _regular(lock_source).st_size)
     if _copy_regular(lock_source, lock_target, executable=False) != package_lock_sha256:
         raise InstallerError("candidate package lock changed while building typed provider")
     _normalize_tree(
@@ -1814,6 +2096,7 @@ def _copy_typed_engine_provider(
     )
     if actual_files != engine_files:
         raise InstallerError("rebuilt typed provider differs from candidate engine map")
+    _require_provider_write_floor(destination)
     provider_files = {
         f"provider-runtime/{relative}": digest
         for relative, digest in engine_files.items()
@@ -2913,13 +3196,11 @@ def _retention(app_dir: Path, *, apply: bool) -> int:
     return len(candidates)
 
 
-def _rollback_reconcile_is_authorized(
+def _rollback_transaction_record(
     app_dir: Path,
     transaction_state: Path,
-    target_release: Path,
-) -> bool:
-    """Authorize only transaction-bound reconciliation of the legacy M8 runtime."""
-
+) -> tuple[dict[str, object], Path]:
+    """Read the canonical, identity-validated release transaction receipt."""
     if transaction_state != app_dir / "shared" / ".release-operation.json":
         raise InstallerError("rollback runtime transaction path is invalid")
     _regular(transaction_state, mode=0o600, maximum=MAX_ACTIVE_MANIFEST_BYTES)
@@ -2955,12 +3236,27 @@ def _rollback_reconcile_is_authorized(
         raise InstallerError("rollback runtime transaction is invalid") from exc
     if not isinstance(record, dict):
         raise InstallerError("rollback runtime transaction is invalid")
+    if record.get("app_dir") != str(app_dir):
+        raise InstallerError("rollback runtime transaction does not authorize reconcile")
+    return record, installer_release
+
+
+def _rollback_reconcile_is_authorized(
+    app_dir: Path,
+    transaction_state: Path,
+    target_release: Path,
+) -> bool:
+    """Authorize a transaction-bound restore, returning legacy-suite status."""
+
+    record, installer_release = _rollback_transaction_record(
+        app_dir, transaction_state,
+    )
     operation = record.get("operation")
     phase = record.get("phase")
     current_before_raw = record.get("current_before")
     previous_before_raw = record.get("previous_before")
     candidate_raw = record.get("candidate_release")
-    if record.get("app_dir") != str(app_dir) or not isinstance(current_before_raw, str):
+    if not isinstance(current_before_raw, str):
         raise InstallerError("rollback runtime transaction does not authorize reconcile")
     current_before = Path(current_before_raw)
     previous_before = Path(previous_before_raw) if isinstance(previous_before_raw, str) else None
@@ -3010,9 +3306,138 @@ def _rollback_reconcile_is_authorized(
         authorized = False
     if not authorized:
         raise InstallerError("rollback runtime transaction release binding is invalid")
+    _installer, _installer_sha, _installer_slug = _safe_release(
+        app_dir, installer_release,
+    )
+    installer_metadata = _regular(
+        installer_release / "tools" / "platform_live_qa_runtime_install.py",
+        maximum=MAX_FILE_BYTES,
+    )
+    if installer_metadata.st_nlink != 1:
+        raise InstallerError("rollback runtime installer is hard-linked")
     _target, target_sha, _target_slug = _safe_release(app_dir, target_release)
-    if target_sha != LEGACY_RUNTIME_REPORTER_SOURCE_SHA:
-        raise InstallerError("rollback runtime target is not the legacy source")
+    if target_sha == LEGACY_RUNTIME_REPORTER_SOURCE_SHA:
+        return True
+    if operation == "install" and phase == "recovery-restored":
+        return False
+    if operation == "rollback":
+        _installer, installer_sha, _installer_slug = _safe_release(
+            app_dir, installer_release,
+        )
+        current_runtime = _validate_runtime_source(
+            installer_release / "liveqa-runtime", source_sha=installer_sha,
+        )
+        target_runtime = _validate_runtime_source(
+            target_release / "liveqa-runtime", source_sha=target_sha,
+        )
+        if (
+            current_runtime.get("version") == 3
+            and target_runtime.get("version") == 3
+            and current_runtime.get("node_version") == target_runtime.get("node_version")
+            and current_runtime.get("engine_files") == target_runtime.get("engine_files")
+            and current_runtime.get("engine_links") == target_runtime.get("engine_links")
+            and current_runtime.get("package_lock_sha256")
+            != target_runtime.get("package_lock_sha256")
+        ):
+            return False
+    raise InstallerError("rollback runtime target is not the legacy source")
+
+
+def rollback_check(
+    app_dir: Path,
+    transaction_state: Path,
+    target_release: Path,
+) -> bool:
+    """Prove that the current installer can safely reactivate a typed target.
+
+    Return False for rollback targets that must keep using their own installer.
+    Invalid receipts, releases, suites, providers, or copy capacity raise.
+    """
+
+    record, installer_release = _rollback_transaction_record(
+        app_dir, transaction_state,
+    )
+    if (
+        record.get("operation") != "rollback"
+        or record.get("phase") not in {
+            "rollback-runtime-pending",
+            "rollback-cache-purged",
+        }
+    ):
+        raise InstallerError("typed rollback check requires a retained rollback phase")
+    try:
+        legacy = _rollback_reconcile_is_authorized(
+            app_dir, transaction_state, target_release,
+        )
+    except InstallerError as exc:
+        if str(exc) == "rollback runtime target is not the legacy source":
+            return False
+        raise
+    if legacy:
+        return False
+    _target, target_sha, _target_slug = _safe_release(app_dir, target_release)
+    target_runtime = _validate_runtime_source(
+        target_release / "liveqa-runtime",
+        source_sha=target_sha,
+    )
+    if target_runtime.get("version") != 3:
+        return False
+    provider, provider_source = _runtime_provider_plan(
+        app_dir,
+        candidate_source_sha=target_sha,
+        expected_manifest=target_runtime,
+    )
+    if provider is None:
+        raise InstallerError("typed rollback target has no provider identity")
+    if provider_source is not None:
+        _require_provider_copy_capacity(
+            provider_source,
+            target_release / "liveqa-runtime",
+            target_runtime,
+        )
+    return True
+
+
+def recovery_check(
+    app_dir: Path,
+    transaction_state: Path,
+    target_release: Path,
+) -> bool:
+    """Prove current-candidate recovery for a retained failed install."""
+
+    record, _installer_release = _rollback_transaction_record(
+        app_dir, transaction_state,
+    )
+    if (
+        record.get("operation") != "install"
+        or record.get("phase") != "recovery-restored"
+    ):
+        raise InstallerError("install recovery check requires a retained restored phase")
+    legacy = _rollback_reconcile_is_authorized(
+        app_dir, transaction_state, target_release,
+    )
+    if legacy:
+        return False
+    _target, target_sha, _target_slug = _safe_release(app_dir, target_release)
+    target_runtime = _validate_runtime_source(
+        target_release / "liveqa-runtime",
+        source_sha=target_sha,
+    )
+    if target_runtime.get("version") != 3:
+        return False
+    provider, provider_source = _runtime_provider_plan(
+        app_dir,
+        candidate_source_sha=target_sha,
+        expected_manifest=target_runtime,
+    )
+    if provider is None:
+        raise InstallerError("install recovery target has no provider identity")
+    if provider_source is not None:
+        _require_provider_copy_capacity(
+            provider_source,
+            target_release / "liveqa-runtime",
+            target_runtime,
+        )
     return True
 
 
@@ -3053,28 +3478,12 @@ def install(
 
     def validate_sources() -> None:
         nonlocal runtime_manifest, runtime_provider, runtime_provider_source
-        runtime_manifest = _validate_runtime_source(
-            runtime_source,
+        runtime_manifest, runtime_provider, runtime_provider_source = _candidate_source_plan(
+            app_dir,
+            source_platform,
+            source_sha,
             allow_legacy_reporter_omission=allow_legacy_reporter_omission,
-            source_sha=source_sha,
         )
-        if runtime_manifest.get("version") == 2:
-            runtime_provider = _runtime_provider_payload(
-                app_dir,
-                expected_manifest=runtime_manifest,
-            )
-        elif runtime_manifest.get("version") == 3:
-            runtime_provider, runtime_provider_source = _runtime_provider_plan(
-                app_dir,
-                candidate_source_sha=source_sha,
-                expected_manifest=runtime_manifest,
-            )
-        for relative in TOOL_FILES:
-            _regular(source_platform / "tools" / relative)
-        for relative in SOURCE_TREES:
-            _validate_source_tree(source_platform, relative)
-        for relative in SOURCE_FILES:
-            _regular(source_platform / relative)
 
     _run_install_stage("trusted_layout", prepare_trusted_layout)
     _run_install_stage("prewrite_cleanup", clear_interrupted_state)
@@ -3159,6 +3568,13 @@ def install(
         (stage / "source-sha").write_text(source_sha + "\n", encoding="ascii")
         os.chmod(stage / "source-sha", 0o444)
         files["source-sha"] = hashlib.sha256((source_sha + "\n").encode("ascii")).hexdigest()
+        target = PAYLOAD_ROOT / source_sha
+        reuse_existing_owned_provider = (
+            runtime_provider is not None
+            and runtime_provider_source is None
+            and runtime_provider.get("provider_sha") == source_sha
+            and os.path.lexists(target)
+        )
         stage_links = (
             {
                 f"provider-runtime/{relative}": target
@@ -3167,6 +3583,7 @@ def install(
             if runtime_provider is not None
             and runtime_provider.get("provider_sha") == source_sha
             and isinstance(runtime_provider.get("engine_links"), dict)
+            and not reuse_existing_owned_provider
             else {}
         )
         _normalize_tree(stage, allowed_links=stage_links)
@@ -3175,10 +3592,35 @@ def install(
         tree_digest, actual_files = _tree_digest(stage, allowed_links=stage_links)
         if actual_files != files:
             raise InstallerError("trusted live-QA staged digest bookkeeping drifted")
+        if reuse_existing_owned_provider:
+            # Rebuild the small source/suite projection, then prove that the
+            # previously published payload has exactly those files plus its
+            # already-validated self-owned engine. No second engine copy is
+            # needed during transaction rollback to this old generation.
+            _directory(target, mode=0o555)
+            existing_links = _payload_link_map(target)
+            expected_links = {
+                f"provider-runtime/{relative}": link_target
+                for relative, link_target in runtime_manifest["engine_links"].items()
+            }
+            if existing_links != expected_links:
+                raise InstallerError("existing typed provider aliases differ from target source")
+            existing_digest, existing_files = _tree_digest(
+                target, allowed_links=existing_links,
+            )
+            provider_files = {
+                f"provider-runtime/{relative}": digest
+                for relative, digest in runtime_manifest["engine_files"].items()
+            }
+            provider_files["provider-runtime/web/package-lock.json"] = str(
+                runtime_manifest["package_lock_sha256"]
+            )
+            if existing_files != {**actual_files, **provider_files}:
+                raise InstallerError("existing typed provider payload differs from target source")
+            tree_digest, actual_files = existing_digest, existing_files
         _install_stage_finish(active_stage, stage_started_ns, "passed")
         active_stage = "payload_publish"
         stage_started_ns = _install_stage_start(active_stage)
-        target = PAYLOAD_ROOT / source_sha
         if os.path.lexists(target):
             _directory(target, mode=0o555)
             existing_links = _payload_link_map(target)
@@ -3346,18 +3788,67 @@ def reconcile(
     )
 
 
+def preflight(
+    app_dir: Path,
+    release: Path,
+    *,
+    bootstrap_slug: str | None = None,
+    artifact: Path | None = None,
+) -> dict[str, object]:
+    """Check the immutable candidate and protected provider before promotion."""
+
+    _require_release_lock()
+    if bootstrap_slug is None:
+        resolved, source_sha, _release_slug = _safe_release(app_dir, release)
+    else:
+        resolved, source_sha, _release_slug = _safe_bootstrap_release(
+            release, bootstrap_slug,
+        )
+    if (bootstrap_slug is None) != (artifact is None):
+        raise InstallerError("bootstrap preflight artifact binding is incomplete")
+    manifest, provider, provider_source = _candidate_source_plan(
+        app_dir, resolved, source_sha,
+    )
+    if provider_source is not None and artifact is not None:
+        _require_provider_copy_capacity(
+            provider_source,
+            resolved / "liveqa-runtime",
+            manifest,
+            additional_bytes=_artifact_stage_reserve(artifact, resolved),
+        )
+    return {
+        "source_sha": source_sha,
+        "runtime_version": manifest["version"],
+        "provider_copy_required": provider_source is not None,
+        "provider_source_sha": provider["provider_sha"] if provider is not None else None,
+    }
+
+
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(description="Install trusted live-QA runtime")
     subparsers = command.add_subparsers(dest="command", required=True)
     install_parser = subparsers.add_parser("install")
     install_parser.add_argument("--app-dir", type=Path, default=APP_DIR)
     install_parser.add_argument("--release", type=Path, required=True)
+    preflight_parser = subparsers.add_parser("preflight")
+    preflight_parser.add_argument("--app-dir", type=Path, default=APP_DIR)
+    preflight_parser.add_argument("--release", type=Path, required=True)
+    preflight_parser.add_argument("--bootstrap-slug")
+    preflight_parser.add_argument("--artifact", type=Path)
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--app-dir", type=Path, default=APP_DIR)
     verify_parser.add_argument("--target-sha", required=True)
     reconcile_parser = subparsers.add_parser("reconcile")
     reconcile_parser.add_argument("--app-dir", type=Path, default=APP_DIR)
     reconcile_parser.add_argument("--rollback-transaction", type=Path)
+    rollback_check_parser = subparsers.add_parser("rollback-check")
+    rollback_check_parser.add_argument("--app-dir", type=Path, default=APP_DIR)
+    rollback_check_parser.add_argument("--target-release", type=Path, required=True)
+    rollback_check_parser.add_argument("--rollback-transaction", type=Path, required=True)
+    recovery_check_parser = subparsers.add_parser("recovery-check")
+    recovery_check_parser.add_argument("--app-dir", type=Path, default=APP_DIR)
+    recovery_check_parser.add_argument("--target-release", type=Path, required=True)
+    recovery_check_parser.add_argument("--transaction", type=Path, required=True)
     retention_parser = subparsers.add_parser("retention")
     retention_parser.add_argument("--app-dir", type=Path, default=APP_DIR)
     retention_parser.add_argument("--apply", action="store_true")
@@ -3385,6 +3876,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "install":
             manifest = install(args.app_dir, args.release)
             print(f"LIVE_QA_RUNTIME_INSTALL status=passed source_sha={manifest['source_sha']}")
+        elif args.command == "preflight":
+            result = preflight(
+                args.app_dir, args.release, bootstrap_slug=args.bootstrap_slug,
+                artifact=args.artifact,
+            )
+            print(
+                "LIVE_QA_RUNTIME_PREFLIGHT status=passed "
+                f"source_sha={result['source_sha']} "
+                f"provider_copy_required={str(result['provider_copy_required']).lower()}"
+            )
         elif args.command == "verify":
             manifest = verify(args.app_dir, args.target_sha)
             print(f"LIVE_QA_RUNTIME_VERIFY status=passed source_sha={manifest['source_sha']}")
@@ -3394,6 +3895,26 @@ def main(argv: list[str] | None = None) -> int:
                 rollback_transaction=args.rollback_transaction,
             )
             print(f"LIVE_QA_RUNTIME_RECONCILE status=passed source_sha={manifest['source_sha']}")
+        elif args.command == "rollback-check":
+            applicable = rollback_check(
+                args.app_dir,
+                args.rollback_transaction,
+                args.target_release,
+            )
+            if not applicable:
+                print("LIVE_QA_RUNTIME_ROLLBACK_CHECK status=not_applicable")
+                return 2
+            print("LIVE_QA_RUNTIME_ROLLBACK_CHECK status=passed")
+        elif args.command == "recovery-check":
+            applicable = recovery_check(
+                args.app_dir,
+                args.transaction,
+                args.target_release,
+            )
+            if not applicable:
+                print("LIVE_QA_RUNTIME_RECOVERY_CHECK status=not_applicable")
+                return 2
+            print("LIVE_QA_RUNTIME_RECOVERY_CHECK status=passed")
         else:
             removed = _retention(args.app_dir, apply=args.apply)
             print(f"LIVE_QA_RUNTIME_RETENTION status={'applied' if args.apply else 'preview'} removed={removed}")

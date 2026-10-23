@@ -5,6 +5,8 @@
 - This is a site-only repository; application work belongs under `platform/`.
 - Read `platform/docs/CURRENT.md`, then use `platform/docs/README.md` to route
   the task to its owner document. Keep routine context focused.
+- Follow [`platform/docs/agent-token-efficiency.md`](platform/docs/agent-token-efficiency.md)
+  for compact handoffs, bounded reads and honest token-use reporting.
 - Preserve unrelated dirty files and never commit secrets, `.env*` files,
   tokens, passwords, cookies, private reports or live personal data.
 

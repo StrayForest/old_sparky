@@ -361,6 +361,8 @@ run_initial_systemd_transaction() {
 
 run_initial_systemd_candidate() {
   candidate_env
+  # This program is intentionally evaluated by the child Bash, not the caller.
+  # shellcheck disable=SC2016
   run_systemd_bounded /bin/bash -c \
     'cd -- "$1" && shift && exec "$@"' _ "$CANDIDATE" "$@" \
     >/dev/null 2>/dev/null
@@ -488,7 +490,7 @@ restore_previous_runtime() {
     current_before="$(transaction_json | json_field current_before)"
     previous_before="$(transaction_json | json_field previous_before)"
     candidate_release="$(transaction_json | json_field candidate_release)"
-    target_source_sha="$(/usr/bin/cat "$release/RELEASE.json" | json_field source_git_commit)"
+    target_source_sha="$(json_field source_git_commit < "$release/RELEASE.json")"
     rollback_installer_release="$release"
     if [[ "$operation" == "install" \
       && "$release" == "$current_before" \
@@ -502,6 +504,30 @@ restore_previous_runtime() {
         || "$phase" == "recovery-restored" ) ]]; then
       rollback_installer_release="$candidate_release"
       rollback_reconcile_args=(--rollback-reconcile-transaction "$TRANSACTION_STATE")
+    elif [[ "$operation" == "install" \
+      && "$release" == "$current_before" \
+      && -n "$candidate_release" \
+      && "$phase" == "recovery-restored" \
+      && "$(readlink -f "$APP_DIR/current" 2>/dev/null || true)" == "$current_before" \
+      && ( -z "$previous_before" || "$(readlink -f "$APP_DIR/previous" 2>/dev/null || true)" == "$previous_before" ) \
+      && -f "$candidate_release/tools/platform_live_qa_runtime_install.py" \
+      && ! -L "$candidate_release/tools/platform_live_qa_runtime_install.py" ]]; then
+      local recovery_check_status
+      if /usr/bin/python3 -I "$candidate_release/tools/platform_live_qa_runtime_install.py" \
+        recovery-check --app-dir "$APP_DIR" --target-release "$release" \
+        --transaction "$TRANSACTION_STATE" >/dev/null 2>/dev/null; then
+        # The authenticated candidate owns the provider transition code. Its
+        # read-only check validates this retained receipt, restored pointer
+        # pair and target provider before the old payload is reactivated.
+        rollback_installer_release="$candidate_release"
+        rollback_reconcile_args=(--rollback-reconcile-transaction "$TRANSACTION_STATE")
+      else
+        recovery_check_status=$?
+        if [[ "$recovery_check_status" -ne 2 ]]; then
+          public_status failed liveqa_runtime >&2
+          return 1
+        fi
+      fi
     fi
   fi
   # Runtime preparation must not implicitly enable/start managed timers. The
@@ -1574,6 +1600,17 @@ if [[ "$RESUME" -eq 0 ]]; then
   fi
   run_release_preflight_quiet --defer-active-alembic-revision-check \
     >/dev/null 2>/dev/null
+  # The installed host validator has already authenticated and extracted this
+  # private bootstrap tree. Check its browser source, active provider and copy
+  # reserve before stopping any application writer or creating a receipt.
+  bootstrap_release="$(cd "$TOOLS_DIR/.." && pwd -P)" || exit 1
+  bootstrap_slug="$(basename "$ARTIFACT" .tar.gz)"
+  if ! /usr/bin/python3 -I "$TOOLS_DIR/platform_live_qa_runtime_install.py" \
+    preflight --app-dir "$APP_DIR" --release "$bootstrap_release" \
+    --bootstrap-slug "$bootstrap_slug" --artifact "$ARTIFACT" >/dev/null; then
+    public_status failed liveqa_preflight >&2
+    exit 1
+  fi
   quiesce_runtime_writers
   # The candidate installer re-enters through the same pathname-form flock
   # supervisor.  Do not pass a numeric lock FD through the environment: util-
@@ -1656,6 +1693,15 @@ if [[ "$RESUME" -eq 1 \
 fi
 if [[ "$RESUME" -eq 1 && ( "$phase" == "staged" \
   || "$phase" == "migration-pending" || "$phase" == "migration-failed" ) ]]; then
+  live_qa_preflight="$CANDIDATE/tools/platform_live_qa_runtime_install.py"
+  if [[ -n "$CURRENT_BEFORE" ]] && {
+    [[ ! -f "$live_qa_preflight" || -L "$live_qa_preflight" ]] \
+      || ! /usr/bin/python3 -I "$live_qa_preflight" \
+        preflight --app-dir "$APP_DIR" --release "$CANDIDATE" >/dev/null;
+  }; then
+    public_status failed liveqa_preflight >&2
+    exit 1
+  fi
   quiesce_runtime_writers
 fi
 
@@ -1664,6 +1710,20 @@ fi
 if [[ "$phase" == "staged" || "$phase" == "migration-pending" || "$phase" == "migration-failed" ]]; then
   release_preflight --defer-active-alembic-revision-check \
     >/dev/null 2>/dev/null
+  # Validate the source-only browser runtime against the still-active typed
+  # provider before migration or pointer promotion. In particular, a changed
+  # web lock may require a candidate-owned provider copy and its disk reserve.
+  # The installer repeats this check at publication under the same release
+  # lock; this early gate keeps an incompatible candidate off current.
+  if [[ -n "$CURRENT_BEFORE" ]]; then
+    live_qa_preflight="$CANDIDATE/tools/platform_live_qa_runtime_install.py"
+    if [[ ! -f "$live_qa_preflight" || -L "$live_qa_preflight" ]] \
+      || ! "$SHARED_VENV/bin/python" -I "$live_qa_preflight" \
+        preflight --app-dir "$APP_DIR" --release "$CANDIDATE" >/dev/null; then
+      public_status failed liveqa_preflight >&2
+      exit 1
+    fi
+  fi
 fi
 
 case "$phase" in

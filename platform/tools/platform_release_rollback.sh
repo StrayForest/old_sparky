@@ -173,30 +173,60 @@ json_field() {
     "$field" 2>/dev/null
 }
 
-runtime_installer_for_target() {
+ROLLBACK_RUNTIME_INSTALLER=""
+ROLLBACK_RECONCILE_ARGS=()
+
+select_rollback_runtime() {
   local release="$1"
   local operation phase current_before previous_before candidate_release target_source_sha
+  local current_installer check_status
+  ROLLBACK_RUNTIME_INSTALLER="$release/tools/platform_live_qa_runtime_install.py"
+  ROLLBACK_RECONCILE_ARGS=()
+  if [[ ! -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
+    return 0
+  fi
   operation="$(transaction_json | json_field operation)"
   phase="$(transaction_json | json_field phase)"
   current_before="$(transaction_json | json_field current_before)"
   previous_before="$(transaction_json | json_field previous_before)"
   candidate_release="$(transaction_json | json_field candidate_release)"
-  target_source_sha="$(/usr/bin/cat "$release/RELEASE.json" | json_field source_git_commit)"
-  if [[ "$operation" == "rollback" \
-    && ( "$phase" == "rollback-runtime-pending" \
-      || "$phase" == "rollback-cache-purged" ) \
-    && "$current_before" == "$CURRENT_TARGET" \
-    && "$candidate_release" == "$CURRENT_TARGET" \
-    && "$previous_before" == "$release" \
-    && "$target_source_sha" == "6343099bb7686671bdef49d0c4ecd10f21ef19d2" ]]; then
-    # The only legacy-source exception uses the running release's installer,
-    # which is transaction-bound as current_before. Every other rollback
-    # target uses that target's own immutable installer (including a newer
-    # reporter-bearing release after M8 has become current again).
-    printf '%s\n' "$CURRENT_TARGET/tools/platform_live_qa_runtime_install.py"
-    return
+  target_source_sha="$(json_field source_git_commit < "$release/RELEASE.json")"
+  current_installer="$CURRENT_TARGET/tools/platform_live_qa_runtime_install.py"
+  if [[ "$operation" != "rollback" \
+    || ( "$phase" != "rollback-runtime-pending" \
+      && "$phase" != "rollback-cache-purged" ) \
+    || "$current_before" != "$CURRENT_TARGET" \
+    || "$candidate_release" != "$CURRENT_TARGET" \
+    || "$previous_before" != "$release" \
+    || "$CURRENT_TARGET" == "$release" ]]; then
+    return 0
   fi
-  printf '%s\n' "$release/tools/platform_live_qa_runtime_install.py"
+  if [[ "$target_source_sha" == "6343099bb7686671bdef49d0c4ecd10f21ef19d2" ]]; then
+    # Preserve the existing receipt-bound reporter-omission exception.
+    ROLLBACK_RUNTIME_INSTALLER="$current_installer"
+    ROLLBACK_RECONCILE_ARGS=(--rollback-reconcile-transaction "$TRANSACTION_STATE")
+    return 0
+  fi
+  if [[ ! -f "$current_installer" || -L "$current_installer" ]]; then
+    return 0
+  fi
+  # New typed-provider restores are selected by live evidence, not a list of
+  # release SHAs. The current installer checks the real receipt, exact pointer
+  # pair, immutable runtime manifests and existing target provider before it
+  # advertises this route. Unsupported historical targets keep their own
+  # installer; any other refusal fails closed.
+  if /usr/bin/python3 -I "$current_installer" rollback-check \
+    --app-dir "$APP_DIR" --target-release "$release" \
+    --rollback-transaction "$TRANSACTION_STATE" >/dev/null 2>/dev/null; then
+    ROLLBACK_RUNTIME_INSTALLER="$current_installer"
+    ROLLBACK_RECONCILE_ARGS=(--rollback-reconcile-transaction "$TRANSACTION_STATE")
+  else
+    check_status=$?
+    if [[ "$check_status" -ne 2 ]]; then
+      public_status failed runtime >&2
+      return 1
+    fi
+  fi
 }
 
 restore_release_runtime() {
@@ -204,8 +234,9 @@ restore_release_runtime() {
   local force_no_restart="${2:-0}"
   local rollback_reconcile_args=()
   local runtime_installer
-  runtime_installer="$(runtime_installer_for_target "$release")"
-  mapfile -t rollback_reconcile_args < <(rollback_reconcile_args_for_target "$release")
+  select_rollback_runtime "$release" || return 1
+  runtime_installer="$ROLLBACK_RUNTIME_INSTALLER"
+  rollback_reconcile_args=("${ROLLBACK_RECONCILE_ARGS[@]}")
   if [[ ! -f "$SYSTEMD_STATE_RECEIPT" || -L "$SYSTEMD_STATE_RECEIPT" ]]; then
     public_status failed systemd_state >&2
     return 1
@@ -229,26 +260,6 @@ restore_release_runtime() {
       --systemd-state "$SYSTEMD_STATE_RECEIPT" \
       --transaction "$TRANSACTION_STATE" \
       --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
-  fi
-}
-
-rollback_reconcile_args_for_target() {
-  local release="$1"
-  local operation phase current_before previous_before candidate_release target_source_sha
-  operation="$(transaction_json | json_field operation)"
-  phase="$(transaction_json | json_field phase)"
-  current_before="$(transaction_json | json_field current_before)"
-  previous_before="$(transaction_json | json_field previous_before)"
-  candidate_release="$(transaction_json | json_field candidate_release)"
-  target_source_sha="$(/usr/bin/cat "$release/RELEASE.json" | json_field source_git_commit)"
-  if [[ "$operation" == "rollback" \
-    && "$release" == "$previous_before" \
-    && "$CURRENT_TARGET" == "$current_before" \
-    && "$candidate_release" == "$current_before" \
-    && "$target_source_sha" == "6343099bb7686671bdef49d0c4ecd10f21ef19d2" \
-    && ( "$phase" == "rollback-runtime-pending" \
-      || "$phase" == "rollback-cache-purged" ) ]]; then
-    printf '%s\n' --rollback-reconcile-transaction "$TRANSACTION_STATE"
   fi
 }
 

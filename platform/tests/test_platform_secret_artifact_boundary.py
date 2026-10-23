@@ -7,6 +7,7 @@ import json
 import os
 import re
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -175,6 +176,34 @@ class DraftReleaseSelectorTests(unittest.TestCase):
         steps = _draft_job_steps("build-release")
         bundle = str(_named_step(steps, "Generate immutable Draft bundle")["run"])
         lines = bundle.splitlines()
+        copy_start = next(i for i, line in enumerate(lines) if line.startswith('bundle="$RUNNER_TEMP/'))
+        copy_end = next(i for i in range(copy_start, len(lines)) if lines[i].startswith("python -m venv"))
+        isolated = Path(self.scratch.name) / "bundle-closure-fixture"
+        draft = isolated / "platform/apps/platform_draft"
+        (draft / "public").mkdir(parents=True)
+        (draft / "dist/draft").mkdir(parents=True)
+        (draft / "dist/draft/index.html").write_text("<!doctype html>\n", encoding="utf-8")
+        for name in ("worker.js", "wrangler.jsonc"):
+            shutil.copy2(REPO_ROOT / "platform/apps/platform_draft" / name, draft / name)
+        for name in ("draft-core.js", "heroes.js"):
+            shutil.copy2(REPO_ROOT / "platform/apps/platform_draft/public" / name, draft / "public" / name)
+        runner_temp = isolated / "runner-temp"
+        runner_temp.mkdir()
+        copied = subprocess.run(
+            ["bash", "-e", "-o", "pipefail", "-c", "set -euo pipefail\n" + "\n".join(lines[copy_start:copy_end])],
+            cwd=isolated, env={**os.environ, "RUNNER_TEMP": str(runner_temp)},
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(copied.returncode, 0, copied.stderr)
+        staged = runner_temp / "draft-release-bundle"
+        worker_load = ["node", "--input-type=module", "-e", "await import('./worker.js')"]
+        resolved = subprocess.run(worker_load, cwd=staged, capture_output=True, text=True, check=False)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        (staged / "public/draft-core.js").unlink()
+        rejected = subprocess.run(worker_load, cwd=staged, capture_output=True, text=True, check=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("draft-core.js", rejected.stderr)
+
         cd_line = next(i for i, line in enumerate(lines) if line.strip() == "cd platform")
         start = cd_line - (lines[cd_line - 1].strip() == "(")
         end = next(i for i in range(cd_line + 1, len(lines)) if lines[i].startswith('/usr/bin/python3 - "$bundle"'))

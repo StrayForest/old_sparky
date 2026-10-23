@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -52,6 +53,79 @@ GUARD_SPEC.loader.exec_module(guard)
 
 @unittest.skipUnless(os.geteuid() == 0, "installer contract requires root-owned test paths")
 class LiveQaRuntimeInstallTests(unittest.TestCase):
+    def test_bootstrap_preflight_binds_private_release_and_stage_reserve(self) -> None:
+        bootstrap = Path("/tmp") / ("old-sparky-release-bootstrap." + uuid4().hex[:6])
+        bootstrap.mkdir(mode=0o700)
+        try:
+            os.chmod(bootstrap, 0o700)
+            source_sha = "c" * 40
+            slug = "gha-1-1-" + source_sha[:12]
+            release = bootstrap / slug
+            release.mkdir(mode=0o555)
+            payload = {
+                "release_slug": slug,
+                "source_git_commit": source_sha,
+                "python_venv_install_evidence": {
+                    "schema": 1,
+                    "builder_allocated_bytes": 4096,
+                    "wheelhouse_expanded_bytes": 8192,
+                    "host_overhead_bytes": 16384,
+                },
+            }
+            metadata = release / "RELEASE.json"
+            metadata.write_text(json.dumps(payload) + "\n", encoding="ascii")
+            os.chmod(metadata, 0o444)
+            self.assertEqual(
+                runtime._safe_bootstrap_release(release, slug),
+                (release, source_sha, slug),
+            )
+            artifact = bootstrap / (slug + ".tar.gz")
+            with tarfile.open(artifact, "w:gz") as archive:
+                member = tarfile.TarInfo(slug + "/RELEASE.json")
+                content = metadata.read_bytes()
+                member.size = len(content)
+                member.mode = 0o444
+                archive.addfile(member, io.BytesIO(content))
+            os.chmod(artifact, 0o444)
+            self.assertGreater(
+                runtime._artifact_stage_reserve(artifact, release),
+                sum(payload["python_venv_install_evidence"][key] for key in (
+                    "builder_allocated_bytes", "wheelhouse_expanded_bytes", "host_overhead_bytes",
+                )),
+            )
+            with self.assertRaises(runtime.InstallerError):
+                runtime._safe_bootstrap_release(release, "wrong-slug")
+        finally:
+            shutil.rmtree(bootstrap)
+
+    def test_deploy_preflights_live_qa_before_migration_and_pointer_switch(self) -> None:
+        deploy = (SCRIPT.parent / "platform_release_deploy.sh").read_text(encoding="utf-8")
+        bootstrap_preflight = deploy.index('--bootstrap-slug "$bootstrap_slug" --artifact "$ARTIFACT"')
+        normal_quiesce = deploy.index("  quiesce_runtime_writers\n", bootstrap_preflight)
+        resume_preflight = deploy.index('preflight --app-dir "$APP_DIR" --release "$CANDIDATE"')
+        resume_quiesce = deploy.index("  quiesce_runtime_writers\n", resume_preflight)
+        migration = deploy.index('run_candidate tools/platform_run_alembic.sh upgrade head')
+        pointer = deploy.index('--name current --target "$CANDIDATE"')
+        self.assertLess(bootstrap_preflight, normal_quiesce)
+        self.assertLess(resume_preflight, resume_quiesce)
+        self.assertLess(resume_quiesce, migration)
+        self.assertLess(migration, pointer)
+
+    def test_release_rollback_selects_current_installer_only_after_receipt_proof(self) -> None:
+        rollback = (SCRIPT.parent / "platform_release_rollback.sh").read_text(encoding="utf-8")
+        deploy = (SCRIPT.parent / "platform_release_deploy.sh").read_text(encoding="utf-8")
+        self.assertIn("rollback-check", rollback)
+        self.assertIn("--target-release \"$release\"", rollback)
+        self.assertIn("--rollback-transaction \"$TRANSACTION_STATE\"", rollback)
+        self.assertIn('"$check_status" -ne 2', rollback)
+        self.assertIn('"$previous_before" != "$release"', rollback)
+        self.assertIn('"$candidate_release" != "$CURRENT_TARGET"', rollback)
+        self.assertNotIn("e2e94c2a728c6648ab9c617118db806cc4c0d314", rollback)
+        self.assertIn("recovery-check", deploy)
+        self.assertIn("--target-release \"$release\"", deploy)
+        self.assertIn("--transaction \"$TRANSACTION_STATE\"", deploy)
+        self.assertNotIn("e2e94c2a728c6648ab9c617118db806cc4c0d314", deploy)
+
     @staticmethod
     def _source_tree_fixture(root: Path, *, cache_relative: str | None = None) -> Path:
         source = root / "checkout" / "apps" / "platform_api"
@@ -233,6 +307,165 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         node_version="26.3.1",
                         package_lock_sha256=lock_sha,
                     )
+
+    def test_typed_provider_rebinds_identical_engine_to_changed_app_lock(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            old_sha, candidate_sha = "a" * 40, "b" * 40
+            source, engine_files, old_lock_sha = self._engine_provider_fixture(root / "source")
+            payload_root = root / "trusted" / "releases"
+            old_payload = payload_root / old_sha
+            old_payload.mkdir(mode=0o555, parents=True)
+            provider_root = old_payload / "provider-runtime"
+            new_suite = root / "new-suite"
+            (new_suite / "web").mkdir(mode=0o700, parents=True)
+            new_lock = new_suite / "web/package-lock.json"
+            new_lock.write_bytes(b"lock with an application-only dependency update\n")
+            os.chmod(new_lock, 0o444)
+            new_lock_sha = runtime._digest_regular(new_lock)
+            engine_links = {"browsers/webkit-2311/browser-alias": "browser"}
+            old_engine_sha = runtime._engine_map_digest(
+                engine_files, engine_links, node_version="26.3.1", package_lock_sha256=old_lock_sha
+            )
+            new_engine_sha = runtime._engine_map_digest(
+                engine_files, engine_links, node_version="26.3.1", package_lock_sha256=new_lock_sha
+            )
+            sandbox = source / runtime.RUNTIME_SANDBOX_RELATIVE
+            with mock.patch.multiple(
+                runtime,
+                CHROMIUM_SANDBOX_SIZE=sandbox.stat().st_size,
+                CHROMIUM_SANDBOX_SHA256=hashlib.sha256(sandbox.read_bytes()).hexdigest(),
+            ):
+                runtime._copy_typed_engine_provider(
+                    source, source, provider_root,
+                    engine_files=engine_files, engine_links=engine_links, package_lock_sha256=old_lock_sha,
+                )
+                old_manifest = {
+                    "version": 3, "node_version": "26.3.1",
+                    "package_lock_sha256": old_lock_sha,
+                    "engine_tree_sha256": old_engine_sha,
+                    "engine_files": engine_files, "engine_links": engine_links,
+                }
+                provider = {
+                    "version": 2, "source_sha": old_sha, "provider_sha": old_sha,
+                    "engine_tree_sha256": old_engine_sha,
+                    "node_version": "26.3.1", "package_lock_sha256": old_lock_sha,
+                    "engine_files": engine_files, "engine_links": engine_links,
+                }
+                provider_file = old_payload / "runtime-provider.json"
+                provider_file.write_text(json.dumps(provider, sort_keys=True) + "\n", encoding="ascii")
+                os.chmod(provider_file, 0o444)
+                candidate_manifest = {
+                    **old_manifest,
+                    "package_lock_sha256": new_lock_sha,
+                    "engine_tree_sha256": new_engine_sha,
+                }
+                with (
+                    mock.patch.multiple(runtime, PAYLOAD_ROOT=payload_root),
+                    mock.patch.object(runtime, "_read_manifest", return_value={"source_sha": old_sha}),
+                    mock.patch.object(runtime, "_validate_payload"),
+                    mock.patch.object(runtime, "_validate_runtime_source", return_value=old_manifest),
+                    mock.patch.object(runtime, "_protected_shas", return_value={old_sha}),
+                ):
+                    planned, source_root = runtime._runtime_provider_plan(
+                        root, candidate_source_sha=candidate_sha,
+                        expected_manifest=candidate_manifest,
+                    )
+                    self.assertEqual(source_root, provider_root)
+                    self.assertEqual(planned["provider_sha"], candidate_sha)
+                    self.assertEqual(planned["package_lock_sha256"], new_lock_sha)
+                    runtime._require_provider_copy_capacity(
+                        source_root, new_suite, candidate_manifest,
+                    )
+                    with mock.patch.object(runtime.os, "statvfs", return_value=mock.Mock(
+                        f_frsize=4096, f_blocks=10_000_000, f_bavail=1,
+                    )):
+                        with self.assertRaisesRegex(runtime.InstallerError, "capacity is insufficient"):
+                            runtime._require_provider_copy_capacity(
+                                source_root, new_suite, candidate_manifest,
+                            )
+                    old_tree_before = (
+                        runtime._runtime_file_map(
+                            provider_root,
+                            prefixes=("node/", "browsers/", "web/node_modules/"),
+                            links=engine_links,
+                        ),
+                        runtime._digest_regular(provider_root / "web/package-lock.json"),
+                        os.readlink(provider_root / "browsers/webkit-2311/browser-alias"),
+                    )
+                    new_provider = root / "new-provider"
+                    runtime._copy_typed_engine_provider(
+                        source_root, new_suite, new_provider,
+                        engine_files=engine_files, engine_links=engine_links,
+                        package_lock_sha256=new_lock_sha,
+                    )
+                    runtime._validate_engine_root(
+                        new_provider, expected_files=engine_files, expected_links=engine_links,
+                        engine_sha256=new_engine_sha, node_version="26.3.1",
+                        package_lock_sha256=new_lock_sha,
+                    )
+                    with mock.patch.object(runtime.os, "statvfs", return_value=mock.Mock(
+                        f_frsize=4096, f_blocks=10_000_000, f_bavail=1,
+                    )):
+                        with self.assertRaisesRegex(runtime.InstallerError, "breach host floor"):
+                            runtime._require_provider_write_floor(new_provider, 4096)
+                    self.assertEqual(
+                        os.readlink(new_provider / "browsers/webkit-2311/browser-alias"), "browser"
+                    )
+                    self.assertEqual(
+                        (
+                            runtime._runtime_file_map(
+                                provider_root,
+                                prefixes=("node/", "browsers/", "web/node_modules/"),
+                                links=engine_links,
+                            ),
+                            runtime._digest_regular(provider_root / "web/package-lock.json"),
+                            os.readlink(provider_root / "browsers/webkit-2311/browser-alias"),
+                        ),
+                        old_tree_before,
+                    )
+                    self.assertEqual(runtime._digest_regular(provider_root / "web/package-lock.json"), old_lock_sha)
+                    reused, reused_source = runtime._runtime_provider_plan(
+                        root, candidate_source_sha=candidate_sha,
+                        expected_manifest=old_manifest,
+                    )
+                    self.assertEqual(reused["provider_sha"], old_sha)
+                    self.assertIsNone(reused_source)
+                    mismatched = dict(candidate_manifest)
+                    mismatched["engine_files"] = {**engine_files, "node/bin/node": "0" * 64}
+                    with self.assertRaisesRegex(runtime.InstallerError, "differs from candidate engine"):
+                        runtime._runtime_provider_plan(
+                            root, candidate_source_sha=candidate_sha,
+                            expected_manifest=mismatched,
+                        )
+                    with mock.patch.object(runtime, "_protected_shas", return_value=set()):
+                        with self.assertRaisesRegex(runtime.InstallerError, "protected release closure"):
+                            runtime._runtime_provider_plan(
+                                root, candidate_source_sha=candidate_sha,
+                                expected_manifest=candidate_manifest,
+                            )
+                    invalid_provider = dict(provider)
+                    invalid_provider["package_lock_sha256"] = new_lock_sha
+                    os.chmod(provider_file, 0o644)
+                    provider_file.write_text(json.dumps(invalid_provider, sort_keys=True) + "\n", encoding="ascii")
+                    os.chmod(provider_file, 0o444)
+                    with self.assertRaisesRegex(runtime.InstallerError, "identity is invalid"):
+                        runtime._runtime_provider_plan(
+                            root, candidate_source_sha=candidate_sha,
+                            expected_manifest=candidate_manifest,
+                        )
+                    os.chmod(provider_file, 0o644)
+                    provider_file.write_text(json.dumps(provider, sort_keys=True) + "\n", encoding="ascii")
+                    os.chmod(provider_file, 0o444)
+                    old_node = provider_root / "node/bin/node"
+                    os.chmod(old_node, 0o755)
+                    old_node.write_bytes(b"changed engine bytes\n")
+                    os.chmod(old_node, 0o555)
+                    with self.assertRaisesRegex(runtime.InstallerError, "engine digest is invalid"):
+                        runtime._runtime_provider_plan(
+                            root, candidate_source_sha=candidate_sha,
+                            expected_manifest=candidate_manifest,
+                        )
 
     def test_typed_browser_alias_provider_rebuilds_and_validates_exact_links(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
@@ -556,7 +789,9 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
 
     def _assert_installer_published_v2_payload_crosses_all_trusted_readers(self) -> None:
         """Publish real installer generations and run every independent reader."""
-        legacy_sha, repaired_sha, reused_sha = "1" * 40, "2" * 40, "3" * 40
+        legacy_sha = "6aa4b0c7e00b687a12d83af611df8c9f711615b3"
+        repaired_sha = "e2e94c2a728c6648ab9c617118db806cc4c0d314"
+        reused_sha = "3" * 40
         link_map = {
             "browsers/webkit-2311/lib/libwpe.so": "libwpe.so.1",
             "browsers/webkit-2311/lib/libwpe.so.1": "libwpe.so.1.9.3",
@@ -609,9 +844,6 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 shutil.rmtree(legacy_release / "liveqa-runtime")
                 shutil.copytree(legacy_runtime, legacy_release / "liveqa-runtime", symlinks=True)
                 repaired_files = {path: digest for path, digest in legacy_files.items() if path not in link_map}
-                engine_v2 = runtime._engine_map_digest(
-                    repaired_files, link_map, node_version="26.3.1", package_lock_sha256=lock_sha
-                )
 
                 # First publish the existing flattened provider, then let the
                 # normal source-only installer perform its v1-to-v2 repair.
@@ -619,7 +851,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     runtime.install(app_dir, legacy_release)
                     runtime.verify(app_dir, legacy_sha)
 
-                def make_candidate(candidate_sha: str) -> Path:
+                def make_candidate(candidate_sha: str, *, lock_bytes: bytes = b"lock\n") -> Path:
                     release = app_dir / "releases" / f"release-{candidate_sha[:8]}"
                     release.mkdir(mode=0o755)
                     tools = release / "tools"
@@ -643,7 +875,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     os.chmod(release / "RELEASE.json", 0o444)
                     source_runtime = release / "liveqa-runtime"
                     suite_content = {
-                        "web/package-lock.json": b"lock\n",
+                        "web/package-lock.json": lock_bytes,
                         "web/playwright.live.config.ts": b"config\n",
                         "web/tests/smoke/live-launch.spec.ts": b"launch\n",
                         "web/tests/smoke/live-user-journey.spec.ts": b"journey\n",
@@ -667,7 +899,10 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         "version": 3,
                         "node_version": "26.3.1",
                         "package_lock_sha256": lock_digest,
-                        "engine_tree_sha256": engine_v2,
+                        "engine_tree_sha256": runtime._engine_map_digest(
+                            repaired_files, link_map,
+                            node_version="26.3.1", package_lock_sha256=lock_digest,
+                        ),
                         "engine_files": repaired_files,
                         "engine_links": link_map,
                         "suite_tree_sha256": runtime._file_map_digest(
@@ -680,6 +915,21 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     return release
 
                 repaired_release = make_candidate(repaired_sha)
+                # X's deployed installer predates typed-provider rebinding.
+                # Keep that immutable target binary in the fixture so the
+                # rollback proof must use W's receipt-authorized installer.
+                historical_installer = subprocess.run(
+                    [
+                        "git", "show",
+                        "HEAD:platform/tools/platform_live_qa_runtime_install.py",
+                    ],
+                    cwd=SCRIPT.parents[2],
+                    capture_output=True,
+                    check=True,
+                ).stdout
+                old_installer_path = repaired_release / "tools/platform_live_qa_runtime_install.py"
+                old_installer_path.write_bytes(historical_installer)
+                os.chmod(old_installer_path, 0o444)
                 with mock.patch.object(runtime, "_validate_runtime_source", new=ORIGINAL_VALIDATE_RUNTIME_SOURCE):
                     # Provider planning consumes the already-published legacy
                     # generation and installer publication creates the v2 one.
@@ -733,7 +983,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         self.assertEqual(safe_env.main(["validate-runtime"]), 0)
                         self.assertEqual(guard._validate_installed_payload_root(payload, target_sha=source_sha), source_sha)
                         engine_root = guard._trusted_runtime_root()
-                        gate_root = root / f"gates-{source_sha[:4]}"
+                        gate_root = root / f"gates-{source_sha[:4]}-{uuid4().hex[:6]}"
                         gate_root.mkdir(mode=0o755)
                         gate = gate_root / f"public-live-qa.{source_sha[:8]}"
                         gate.mkdir(mode=0o700)
@@ -847,6 +1097,78 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 misplaced_sandbox.unlink()
                 misplaced_sandbox.parent.rmdir()
 
+                # Reproduce X's existing typed payload: its own package lock
+                # and provider receipt point to the protected historical 990
+                # provider. W must validate that full old identity and
+                # reactivate this payload without copying or rewriting 990.
+                historical_provider_sha = "990de9936fcd5a019a026708d805db1fd8b8c280"
+                repaired_payload = payload_root / repaired_sha
+                historical_payload = payload_root / historical_provider_sha
+                historical_payload.mkdir(mode=0o700)
+                shutil.copytree(
+                    repaired_payload / "provider-runtime",
+                    historical_payload / "provider-runtime",
+                    symlinks=True,
+                )
+                historical_source_marker = historical_payload / "source-sha"
+                historical_source_marker.write_text(
+                    historical_provider_sha + "\n", encoding="ascii",
+                )
+                os.chown(historical_source_marker, 0, 0)
+                os.chmod(historical_source_marker, 0o444)
+                os.chown(historical_payload, 0, 0)
+                for path in [historical_payload, *historical_payload.rglob("*")]:
+                    if path.is_dir() and not path.is_symlink():
+                        os.chown(path, 0, 0)
+                        os.chmod(path, 0o555)
+                    elif not path.is_symlink():
+                        os.chown(path, 0, 0)
+                        mode = (
+                            0o4755
+                            if path == historical_payload / "provider-runtime" / runtime.RUNTIME_SANDBOX_RELATIVE
+                            else 0o555 if path.stat().st_mode & 0o111 else 0o444
+                        )
+                        os.chmod(path, mode)
+                active_before_rebinding = runtime._read_manifest()
+                repaired_provider_path = repaired_payload / "runtime-provider.json"
+                repaired_provider = json.loads(repaired_provider_path.read_text(encoding="ascii"))
+                self.assertEqual(repaired_provider["provider_sha"], repaired_sha)
+                repaired_provider["provider_sha"] = historical_provider_sha
+                repaired_provider_path.chmod(0o644)
+                repaired_provider_path.write_text(
+                    json.dumps(repaired_provider, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                repaired_provider_path.chmod(0o444)
+                for path in [repaired_payload, *repaired_payload.rglob("*")]:
+                    if path.is_dir() and not path.is_symlink():
+                        os.chmod(path, 0o700)
+                shutil.rmtree(repaired_payload / "provider-runtime")
+                for path in sorted(
+                    [repaired_payload, *repaired_payload.rglob("*")],
+                    key=lambda item: len(item.parts),
+                    reverse=True,
+                ):
+                    if path.is_dir() and not path.is_symlink():
+                        os.chown(path, 0, 0)
+                        os.chmod(path, 0o555)
+                repaired_tree, repaired_payload_files = runtime._tree_digest(repaired_payload)
+                runtime._write_manifest(
+                    trusted / "active-manifest.json",
+                    {
+                        **active_before_rebinding,
+                        "payload_tree_sha256": repaired_tree,
+                        "files": repaired_payload_files,
+                    },
+                )
+                external_x_root = validate_all(repaired_sha)
+                self.assertEqual(
+                    external_x_root,
+                    historical_payload / "provider-runtime",
+                )
+                sandbox_path = external_x_root / runtime.RUNTIME_SANDBOX_RELATIVE
+                sandbox_sha = runtime._digest_regular(sandbox_path, allow_sandbox=True)
+
                 reused_release = make_candidate(reused_sha)
                 with mock.patch.object(runtime, "_validate_runtime_source", new=ORIGINAL_VALIDATE_RUNTIME_SOURCE):
                     runtime.install(app_dir, reused_release)
@@ -857,7 +1179,294 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 reused_payload = payload_root / reused_sha
                 self.assertFalse(os.path.lexists(reused_payload / "provider-runtime"))
                 reused_root = validate_all(reused_sha)
-                self.assertEqual(reused_root, payload_root / repaired_sha / "provider-runtime")
+                self.assertEqual(reused_root, historical_payload / "provider-runtime")
+
+                # A later web lock changes while the engine map, Node and
+                # browser aliases stay byte-identical. W gets a candidate-owned
+                # provider while X's old payload continues to reference 990.
+                changed_sha = "4" * 40
+                changed_release = make_candidate(changed_sha, lock_bytes=b"updated app lock\n")
+                transaction_source = SCRIPT.with_name("platform_release_transaction.py")
+                systemd_state_source = SCRIPT.with_name("platform_release_systemd_state.py")
+                transaction_tool = changed_release / "tools/platform_release_transaction.py"
+                transaction_tool.write_bytes(transaction_source.read_bytes())
+                os.chmod(transaction_tool, 0o755)
+                (changed_release / "tools/platform_release_systemd_state.py").write_bytes(
+                    systemd_state_source.read_bytes()
+                )
+                os.chmod(changed_release / "tools/platform_release_systemd_state.py", 0o555)
+                rollback_metadata = changed_release / ".rollback"
+                rollback_metadata.mkdir(mode=0o700)
+                (rollback_metadata / "previous-release").write_text(
+                    f"{repaired_release}\n", encoding="ascii",
+                )
+                (rollback_metadata / "previous-release").chmod(0o600)
+                (rollback_metadata / "venv-transition").write_text(
+                    "unchanged\n", encoding="ascii",
+                )
+                (rollback_metadata / "venv-transition").chmod(0o600)
+                freeze = changed_release / "requirements-platform.freeze.txt"
+                freeze.write_text("fixture-package==1\n", encoding="ascii")
+                freeze.chmod(0o444)
+                (rollback_metadata / "shared-freeze.sha256").write_text(
+                    hashlib.sha256(freeze.read_bytes()).hexdigest() + "\n",
+                    encoding="ascii",
+                )
+                (rollback_metadata / "shared-freeze.sha256").chmod(0o600)
+                repaired_payload = payload_root / repaired_sha
+                repaired_links = runtime._payload_link_map(repaired_payload)
+                repaired_before = runtime._tree_digest(
+                    repaired_payload, allowed_links=repaired_links,
+                )
+                with mock.patch.object(runtime, "_validate_runtime_source", new=ORIGINAL_VALIDATE_RUNTIME_SOURCE):
+                    runtime.install(app_dir, changed_release)
+                    (app_dir / "current").unlink()
+                    (app_dir / "current").symlink_to(changed_release)
+                    runtime.verify(app_dir, changed_sha)
+                    changed_payload = payload_root / changed_sha
+                    self.assertTrue((changed_payload / "provider-runtime").is_dir())
+                    changed_provider_before = runtime._tree_digest(
+                        changed_payload,
+                        allowed_links=runtime._payload_link_map(changed_payload),
+                    )
+
+                    shared = app_dir / "shared"
+                    shared.mkdir(mode=0o700)
+                    transaction_state = shared / ".release-operation.json"
+                    snapshot = changed_release / ".rollback/shared-venv-before-install"
+                    create = subprocess.run(
+                        [
+                            sys.executable, "-I", str(transaction_tool), "create",
+                            "--state", str(transaction_state),
+                            "--operation", "rollback",
+                            "--app-dir", str(app_dir),
+                            "--current-before", str(changed_release),
+                            "--previous-before", str(repaired_release),
+                            "--candidate-release", str(changed_release),
+                            "--shared-venv", str(shared / "venv"),
+                            "--peer", str(snapshot),
+                            "--snapshot", str(snapshot),
+                            "--transition", "none",
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                        text=True,
+                    )
+                    self.assertEqual(create.returncode, 0, create.stderr)
+
+                    def run_transaction_with(
+                        tool: Path,
+                        *arguments: str,
+                    ) -> subprocess.CompletedProcess[str]:
+                        return subprocess.run(
+                            [sys.executable, "-I", str(tool), *arguments],
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            check=False,
+                            text=True,
+                        )
+
+                    def run_transaction(*arguments: str) -> subprocess.CompletedProcess[str]:
+                        return run_transaction_with(transaction_tool, *arguments)
+
+                    for expected, phase in (
+                        ("prepared", "venv-transitioned"),
+                    ):
+                        result = run_transaction(
+                            "phase", "--state", str(transaction_state),
+                            "--expected", expected, "--phase", phase,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    result = run_transaction(
+                        "switch-pointer", "--state", str(transaction_state),
+                        "--name", "current", "--target", str(repaired_release),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    result = run_transaction(
+                        "phase", "--state", str(transaction_state),
+                        "--expected", "venv-transitioned", "--phase", "current-switched",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    result = run_transaction(
+                        "switch-pointer", "--state", str(transaction_state),
+                        "--name", "previous", "--target", str(changed_release),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for expected, phase in (
+                        ("current-switched", "pointers-switched"),
+                        ("pointers-switched", "rollback-runtime-pending"),
+                    ):
+                        result = run_transaction(
+                            "phase", "--state", str(transaction_state),
+                            "--expected", expected, "--phase", phase,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+
+                    current_installer = changed_release / "tools/platform_live_qa_runtime_install.py"
+                    with (
+                        mock.patch.object(runtime, "__file__", str(current_installer)),
+                        mock.patch.object(
+                            runtime, "_validate_runtime_source",
+                            wraps=ORIGINAL_VALIDATE_RUNTIME_SOURCE,
+                        ),
+                        mock.patch.multiple(
+                            runtime,
+                            CHROMIUM_SANDBOX_SIZE=sandbox_path.stat().st_size,
+                            CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+                        ),
+                    ):
+                        self.assertTrue(
+                            runtime.rollback_check(app_dir, transaction_state, repaired_release)
+                        )
+                        self.assertEqual(
+                            runtime.main([
+                                "rollback-check", "--app-dir", str(app_dir),
+                                "--target-release", str(repaired_release),
+                                "--rollback-transaction", str(transaction_state),
+                            ]),
+                            0,
+                        )
+                        restored = runtime.reconcile(
+                            app_dir, rollback_transaction=transaction_state,
+                        )
+                        self.assertEqual(restored["source_sha"], repaired_sha)
+                    (app_dir / "current").unlink()
+                    (app_dir / "current").symlink_to(repaired_release)
+                    runtime.verify(app_dir, repaired_sha)
+                    self.assertEqual(
+                        json.loads((repaired_payload / "runtime-provider.json").read_text())[
+                            "provider_sha"
+                        ],
+                        historical_provider_sha,
+                    )
+                    self.assertEqual(
+                        runtime._tree_digest(
+                            changed_payload,
+                            allowed_links=runtime._payload_link_map(changed_payload),
+                        ),
+                        changed_provider_before,
+                    )
+                    self.assertEqual(
+                        runtime._tree_digest(repaired_payload, allowed_links=repaired_links),
+                        repaired_before,
+                    )
+                    self.assertFalse(os.path.lexists(repaired_payload / ".install-rebase"))
+                    transaction_state.unlink()
+                    (app_dir / "previous").unlink()
+                    runtime.install(app_dir, reused_release)
+                    (app_dir / "previous").symlink_to(repaired_release)
+                    (app_dir / "current").unlink()
+                    (app_dir / "current").symlink_to(reused_release)
+                    runtime.verify(app_dir, reused_sha)
+
+                    # The same typed-provider path must restore X during an
+                    # install-failure recovery receipt after W's active alias
+                    # was published but before current moved from X.
+                    (app_dir / "current").unlink()
+                    (app_dir / "current").symlink_to(repaired_release)
+                    (app_dir / "previous").unlink()
+                    initial_release = app_dir / "releases" / f"release-{legacy_sha[:8]}"
+                    (app_dir / "previous").symlink_to(initial_release)
+                    failed_sha = "5" * 40
+                    failed_release = make_candidate(
+                        failed_sha, lock_bytes=b"failed app lock\n",
+                    )
+                    recovery_tool = failed_release / "tools/platform_release_transaction.py"
+                    recovery_tool.write_bytes(transaction_source.read_bytes())
+                    os.chmod(recovery_tool, 0o755)
+                    (failed_release / "tools/platform_release_systemd_state.py").write_bytes(
+                        systemd_state_source.read_bytes()
+                    )
+                    os.chmod(failed_release / "tools/platform_release_systemd_state.py", 0o555)
+                    failed_metadata = failed_release / ".rollback"
+                    failed_metadata.mkdir(mode=0o700)
+                    (failed_metadata / "previous-release").write_text(
+                        f"{repaired_release}\n", encoding="ascii",
+                    )
+                    (failed_metadata / "previous-release").chmod(0o600)
+                    (failed_metadata / "venv-transition").write_text(
+                        "unchanged\n", encoding="ascii",
+                    )
+                    (failed_metadata / "venv-transition").chmod(0o600)
+                    failed_freeze = failed_release / "requirements-platform.freeze.txt"
+                    failed_freeze.write_text("fixture-package==1\n", encoding="ascii")
+                    failed_freeze.chmod(0o444)
+                    (failed_metadata / "shared-freeze.sha256").write_text(
+                        hashlib.sha256(failed_freeze.read_bytes()).hexdigest() + "\n",
+                        encoding="ascii",
+                    )
+                    (failed_metadata / "shared-freeze.sha256").chmod(0o600)
+                    runtime.install(app_dir, repaired_release)
+                    runtime.install(app_dir, failed_release)
+                    self.assertEqual(runtime._read_manifest()["source_sha"], failed_sha)
+                    recovery_state = shared / ".release-operation.json"
+                    peer = shared / f".venv-install-{failed_release.name}.fixture"
+                    create = subprocess.run(
+                        [
+                            sys.executable, "-I", str(recovery_tool), "create",
+                            "--state", str(recovery_state),
+                            "--operation", "install",
+                            "--app-dir", str(app_dir),
+                            "--current-before", str(repaired_release),
+                            "--previous-before", str(initial_release),
+                            "--candidate-release", str(failed_release),
+                            "--shared-venv", str(shared / "venv"),
+                            "--peer", str(peer),
+                            "--snapshot", str(failed_release / ".rollback/shared-venv-before-install"),
+                            "--transition", "none",
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                        text=True,
+                    )
+                    self.assertEqual(create.returncode, 0, create.stderr)
+                    for expected, phase in (
+                        ("prepared", "venv-transitioned"),
+                        ("venv-transitioned", "snapshot-placed"),
+                        ("snapshot-placed", "staged"),
+                        ("staged", "migration-pending"),
+                        ("migration-pending", "migration-failed"),
+                        ("migration-failed", "recovery-authorized"),
+                    ):
+                        result = run_transaction_with(recovery_tool,
+                            "phase", "--state", str(recovery_state),
+                            "--expected", expected, "--phase", phase,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    result = run_transaction_with(
+                        recovery_tool, "recover", "--retain", "--state", str(recovery_state),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    recovery_installer = failed_release / "tools/platform_live_qa_runtime_install.py"
+                    with (
+                        mock.patch.object(runtime, "__file__", str(recovery_installer)),
+                        mock.patch.object(
+                            runtime, "_validate_runtime_source",
+                            wraps=ORIGINAL_VALIDATE_RUNTIME_SOURCE,
+                        ),
+                        mock.patch.multiple(
+                            runtime,
+                            CHROMIUM_SANDBOX_SIZE=sandbox_path.stat().st_size,
+                            CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+                        ),
+                    ):
+                        self.assertTrue(
+                            runtime.recovery_check(app_dir, recovery_state, repaired_release)
+                        )
+                        recovered = runtime.reconcile(
+                            app_dir, rollback_transaction=recovery_state,
+                        )
+                        self.assertEqual(recovered["source_sha"], repaired_sha)
+                    self.assertEqual(runtime._read_manifest()["source_sha"], repaired_sha)
+                    recovery_state.unlink()
+                    runtime.install(app_dir, reused_release)
+                    (app_dir / "previous").unlink()
+                    (app_dir / "previous").symlink_to(repaired_release)
+                    (app_dir / "current").unlink()
+                    (app_dir / "current").symlink_to(reused_release)
+                    runtime.verify(app_dir, reused_sha)
 
                 # External-provider metadata is still parsed strictly even
                 # though its engine bytes live in another immutable payload.

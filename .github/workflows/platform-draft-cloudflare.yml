@@ -175,6 +175,7 @@ jobs:
           cp -- platform/apps/platform_draft/wrangler.jsonc "$bundle/wrangler.jsonc"
           cp -- platform/apps/platform_draft/worker.js "$bundle/worker.js"
           mkdir -m 700 "$bundle/public" "$bundle/dist" "$bundle/heroes"
+          cp -- platform/apps/platform_draft/public/draft-core.js "$bundle/public/draft-core.js"
           cp -- platform/apps/platform_draft/public/heroes.js "$bundle/public/heroes.js"
           cp -a -- platform/apps/platform_draft/dist/draft "$bundle/dist/draft"
           python -m venv platform/.venv_draft_assets
