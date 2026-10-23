@@ -5355,6 +5355,61 @@ fail 'private lock detail must not cross the public channel'
             self.assertEqual(status, 23, dispatched.getvalue())
             self.assertEqual(dispatched.getvalue(), public.stdout)
 
+            # The deploy preflight uses the existing candidate diagnostic ABI
+            # so a pre-quiesce refusal is classified without exposing its
+            # exception text or paths.
+            preflight_run_id = diagnostic_run_id + 100
+            preflight_slug = f"gha-{preflight_run_id}-{attempt}-{target_sha[:12]}"
+            preflight_candidate = root / "liveqa-preflight-diagnostic-candidate"
+            preflight_record = (
+                "RELEASE_INSTALL_DIAG schema=1 status=failed "
+                "class=liveqa_runtime stage=runtime_prepare exit_status=1 "
+                f"release_slug={preflight_slug}\n"
+            )
+            preflight_candidate.write_text(
+                "#!/usr/bin/python3\n"
+                "import sys\n"
+                f"sys.stderr.write({preflight_record!r})\n"
+                "raise SystemExit(1)\n",
+                encoding="ascii",
+            )
+            preflight_candidate.chmod(0o700)
+            preflight_result, _, _ = invoke(preflight_candidate, preflight_run_id)
+            self.assertEqual(preflight_result.returncode, 0, preflight_result.stderr)
+            self.assertEqual(
+                preflight_result.stdout,
+                "candidate_status=1 capture_state=complete "
+                "install_diag_state=classified install_diag_reason=matched "
+                "install_class=liveqa_runtime install_stage=runtime_prepare install_exit=1\n",
+            )
+            preflight_harness = self._candidate_diagnostic_marker_harness(
+                supervisor,
+                result=preflight_result.stdout.rstrip("\n"),
+                release_slug=preflight_slug,
+                source_sha=target_sha,
+            )
+            preflight_public = subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-c", preflight_harness],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin"},
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(preflight_public.returncode, 1, preflight_public.stderr)
+            self.assertEqual(
+                preflight_public.stdout,
+                "RELEASE_DEPLOY schema=1 status=failed class=deployment "
+                "phase=candidate reason=activation_failed "
+                "candidate_diag_state=classified candidate_diag_reason=matched "
+                "candidate_class=liveqa_runtime candidate_stage=runtime_prepare "
+                f"candidate_exit_status=1 release_slug={preflight_slug} "
+                f"source_sha={target_sha}\n",
+            )
+            self.assertNotIn("InstallerError", preflight_public.stdout)
+            self.assertNotIn("/tmp/", preflight_public.stdout)
+
             diagnostic_cases = (
                 (
                     "malformed",

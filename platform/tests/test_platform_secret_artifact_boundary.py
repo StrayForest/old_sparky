@@ -374,11 +374,225 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
         self.assertIn("actions/download-artifact@", release)
         self.assertIn("bundle-manifest.json", release)
         self.assertIn("manifest digest mismatch", release)
-        self.assertIn("platform-draft-wrangler-${{ github.run_id }}-${{ github.run_attempt }}", release)
+        self.assertIn(
+            "platform-draft-wrangler-${{ github.run_id }}-${{ github.run_attempt }}",
+            jobs["build-release"],
+        )
         self.assertIn("wrangler-tool-manifest.json", release)
         self.assertIn("EXPECTED_WRANGLER_MANIFEST_SHA256", release)
         self.assertIn('node "$WRANGLER_CLI"', release)
         self.assertNotIn("npx", release)
+
+        workflow = yaml.safe_load(
+            (WORKFLOW_ROOT / "platform-draft-cloudflare.yml").read_text(encoding="utf-8")
+        )
+        build_job = workflow["jobs"]["build-release"]
+        self.assertEqual(
+            build_job["outputs"]["draft_bundle_artifact_id"],
+            "${{ steps.upload-draft-bundle.outputs.artifact-id }}",
+        )
+        self.assertEqual(
+            build_job["outputs"]["wrangler_runtime_artifact_id"],
+            "${{ steps.upload-wrangler-runtime.outputs.artifact-id }}",
+        )
+        self.assertEqual(build_job["outputs"]["build_run_id"], "${{ github.run_id }}")
+        self.assertEqual(build_job["outputs"]["build_attempt"], "${{ github.run_attempt }}")
+        upload_steps = {step.get("id"): step for step in build_job["steps"]}
+        self.assertEqual(upload_steps["upload-draft-bundle"]["uses"].split("@")[0], "actions/upload-artifact")
+        self.assertEqual(upload_steps["upload-wrangler-runtime"]["uses"].split("@")[0], "actions/upload-artifact")
+        release_steps = workflow["jobs"]["release"]["steps"]
+        bundle_download = _named_step(release_steps, "Download digest-bound Draft bundle")
+        runtime_download = _named_step(release_steps, "Download digest-bound Wrangler runtime")
+        self.assertEqual(
+            bundle_download["with"]["artifact-ids"],
+            "${{ needs.build-release.outputs.draft_bundle_artifact_id }}",
+        )
+        self.assertEqual(
+            runtime_download["with"]["artifact-ids"],
+            "${{ needs.build-release.outputs.wrangler_runtime_artifact_id }}",
+        )
+        self.assertNotIn("github.run_attempt", str(bundle_download["with"]))
+        self.assertNotIn("github.run_attempt", str(runtime_download["with"]))
+        self.assertIn('[[ "$BUILD_RUN_ID" == "$GITHUB_RUN_ID" ]]', release)
+
+        bundle_step = _named_step(build_job["steps"], "Generate immutable Draft bundle")
+        bundle_builder = re.search(r"<<'PY'\n(.*?)\nPY", str(bundle_step["run"]), re.DOTALL)
+        validator_step = _named_step(release_steps, "Validate data-only Draft handoff")
+        bundle_validator = re.search(r"<<'PY'\n(.*?)\nPY", str(validator_step["run"]), re.DOTALL)
+        self.assertIsNotNone(bundle_builder)
+        self.assertIsNotNone(bundle_validator)
+        with tempfile.TemporaryDirectory(prefix="draft-artifact-identity-") as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            (bundle / "app.js").write_text("source-bound app\n", encoding="ascii")
+            target_sha = "a" * 40
+            build_run_id = "39979966537"
+            build_attempt = "1"
+            generated = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    bundle_builder.group(1),
+                    str(bundle),
+                    target_sha,
+                    build_run_id,
+                    build_attempt,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            valid = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    bundle_validator.group(1),
+                    str(bundle / "bundle-manifest.json"),
+                    str(bundle),
+                    target_sha,
+                    build_run_id,
+                    build_attempt,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            wrong_attempt = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    bundle_validator.group(1),
+                    str(bundle / "bundle-manifest.json"),
+                    str(bundle),
+                    target_sha,
+                    build_run_id,
+                    "2",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(wrong_attempt.returncode, 0)
+            self.assertIn("Draft handoff schema or SHA is invalid", wrong_attempt.stderr)
+
+        smoke_run = str(
+            _named_step(
+                _draft_job_steps("release"),
+                "Smoke-check Draft page, assets, CDN and room creation",
+            )["run"]
+        )
+        lines = smoke_run.splitlines()
+        helper_start = next(
+            index for index, line in enumerate(lines) if line.strip() == "fetch_response() {"
+        )
+        helper_end = next(
+            index
+            for index in range(helper_start + 1, len(lines))
+            if lines[index].strip().startswith("assert_live_asset ")
+        )
+        smoke_helpers = "\n".join(lines[helper_start:helper_end])
+        current_asset = b"current candidate asset\n"
+
+        with tempfile.TemporaryDirectory(prefix="draft-live-smoke-") as temporary:
+            root = Path(temporary)
+            expected = root / "expected.js"
+            expected.write_bytes(current_asset)
+            expected_hash = hashlib.sha256(current_asset).hexdigest()
+
+            def run_readiness_case(mode: str) -> tuple[subprocess.CompletedProcess[str], int, int]:
+                call_count = root / f"{mode}.calls"
+                sleep_count = root / f"{mode}.sleeps"
+                call_count.write_text("0\n", encoding="ascii")
+                sleep_count.write_text("0\n", encoding="ascii")
+                output = root / f"{mode}.js"
+                harness = r"""
+set -euo pipefail
+@HELPERS@
+curl() {
+  local output="" headers=""
+  while (($#)); do
+    case "$1" in
+      --output) output="$2"; shift 2 ;;
+      --dump-header) headers="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local calls
+  calls="$(cat "$CALL_COUNT_FILE")"
+  calls=$((calls + 1))
+  printf '%s\n' "$calls" > "$CALL_COUNT_FILE"
+  local status="200"
+  if [[ "$MODE" == "status-then-converges" ]]; then
+    cat "$EXPECTED_FILE" > "$output"
+    if [[ "$calls" -eq 1 ]]; then
+      status="503"
+    fi
+  elif [[ "$MODE" == "converges" && "$calls" -gt 1 ]]; then
+    cat "$EXPECTED_FILE" > "$output"
+  else
+    printf 'previous candidate asset\n' > "$output"
+  fi
+  printf 'HTTP/2 %s\r\nX-Old-Sparky-Draft-Asset-Cache-Status: HIT\r\nAge: 3\r\nETag: "previous"\r\n\r\n' "$status" > "$headers"
+  printf '%s' "$status"
+}
+sleep() {
+  local sleeps
+  sleeps="$(cat "$SLEEP_COUNT_FILE")"
+  printf '%s\n' "$((sleeps + 1))" > "$SLEEP_COUNT_FILE"
+}
+if assert_live_asset "Draft heroes.js" "https://old-sparky.com/draft/heroes.js" "$OUTPUT_FILE" "$EXPECTED_FILE"; then
+  result=0
+else
+  result=$?
+fi
+printf 'RESULT=%s\n' "$result"
+""".replace("@HELPERS@", smoke_helpers)
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-c", harness],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env={
+                        **os.environ,
+                        "MODE": mode,
+                        "EXPECTED_FILE": str(expected),
+                        "OUTPUT_FILE": str(output),
+                        "CALL_COUNT_FILE": str(call_count),
+                        "SLEEP_COUNT_FILE": str(sleep_count),
+                    },
+                )
+                return result, int(call_count.read_text(encoding="ascii")), int(
+                    sleep_count.read_text(encoding="ascii")
+                )
+
+            converged, calls, sleeps = run_readiness_case("converges")
+            self.assertEqual(converged.returncode, 0, converged.stderr)
+            self.assertIn("RESULT=0", converged.stdout)
+            self.assertEqual(calls, 2)
+            self.assertEqual(sleeps, 1)
+            self.assertIn(f"expected sha256={expected_hash}", converged.stderr)
+            self.assertIn("Age: 3", converged.stderr)
+            self.assertIn(f"live body matches {expected_hash} (attempt 2/16)", converged.stdout)
+
+            status_recovered, calls, sleeps = run_readiness_case("status-then-converges")
+            self.assertEqual(status_recovered.returncode, 0, status_recovered.stderr)
+            self.assertIn("RESULT=0", status_recovered.stdout)
+            self.assertEqual(calls, 2)
+            self.assertEqual(sleeps, 1)
+            self.assertIn(f"returned HTTP 503; expected sha256={expected_hash}, received sha256={expected_hash}", status_recovered.stderr)
+            self.assertIn(f"live body matches {expected_hash} (attempt 2/16)", status_recovered.stdout)
+
+            rejected, calls, sleeps = run_readiness_case("never-converges")
+            self.assertEqual(rejected.returncode, 0, rejected.stderr)
+            self.assertIn("RESULT=1", rejected.stdout)
+            self.assertEqual(calls, 16)
+            self.assertEqual(sleeps, 15)
+            self.assertIn(f"expected sha256={expected_hash}", rejected.stderr)
+            self.assertIn("did not converge to the just-built response after 16 bounded attempts", rejected.stderr)
+            self.assertIn("Age: 3", rejected.stderr)
 
     def test_secret_provenance_jobs_pin_validators_to_trusted_default_source(self) -> None:
         for workflow_name, job_marker in (

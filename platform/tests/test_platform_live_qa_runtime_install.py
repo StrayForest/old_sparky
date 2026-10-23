@@ -81,6 +81,10 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             )
             artifact = bootstrap / (slug + ".tar.gz")
             with tarfile.open(artifact, "w:gz") as archive:
+                root_member = tarfile.TarInfo(slug)
+                root_member.type = tarfile.DIRTYPE
+                root_member.mode = 0o555
+                archive.addfile(root_member)
                 member = tarfile.TarInfo(slug + "/RELEASE.json")
                 content = metadata.read_bytes()
                 member.size = len(content)
@@ -93,6 +97,50 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     "builder_allocated_bytes", "wheelhouse_expanded_bytes", "host_overhead_bytes",
                 )),
             )
+
+            def write_archive(
+                entries: list[tuple[str, bytes, bytes | str | None]],
+            ) -> None:
+                artifact.unlink(missing_ok=True)
+                with tarfile.open(artifact, "w:gz") as archive:
+                    for name, member_type, content in entries:
+                        entry = tarfile.TarInfo(name)
+                        entry.type = member_type
+                        entry.mode = 0o555 if member_type == tarfile.DIRTYPE else 0o444
+                        file_content = content if isinstance(content, bytes) else b""
+                        if member_type == tarfile.REGTYPE:
+                            entry.size = len(file_content)
+                        if member_type == tarfile.SYMTYPE:
+                            entry.linkname = content if isinstance(content, str) else "target"
+                        archive.addfile(
+                            entry,
+                            io.BytesIO(file_content) if member_type == tarfile.REGTYPE else None,
+                        )
+                os.chmod(artifact, 0o444)
+
+            invalid_archives = {
+                "root regular file": [(slug, tarfile.REGTYPE, b"root")],
+                "root symlink": [(slug, tarfile.SYMTYPE, "RELEASE.json")],
+                "sibling path": [
+                    (slug, tarfile.DIRTYPE, None),
+                    (slug + "-sibling/RELEASE.json", tarfile.REGTYPE, b"{}"),
+                ],
+                "traversal path": [
+                    (slug, tarfile.DIRTYPE, None),
+                    (slug + "/../outside", tarfile.REGTYPE, b"{}"),
+                ],
+                "unsupported member type": [
+                    (slug, tarfile.DIRTYPE, None),
+                    (slug + "/device", tarfile.CHRTYPE, None),
+                ],
+                "missing root": [(slug + "/RELEASE.json", tarfile.REGTYPE, b"{}")],
+            }
+            for case, entries in invalid_archives.items():
+                with self.subTest(archive_case=case):
+                    write_archive(entries)
+                    with self.assertRaises(runtime.InstallerError):
+                        runtime._artifact_stage_reserve(artifact, release)
+
             with self.assertRaises(runtime.InstallerError):
                 runtime._safe_bootstrap_release(release, "wrong-slug")
         finally:
@@ -101,12 +149,18 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
     def test_deploy_preflights_live_qa_before_migration_and_pointer_switch(self) -> None:
         deploy = (SCRIPT.parent / "platform_release_deploy.sh").read_text(encoding="utf-8")
         bootstrap_preflight = deploy.index('--bootstrap-slug "$bootstrap_slug" --artifact "$ARTIFACT"')
+        preflight_diag = deploy.index(
+            "RELEASE_INSTALL_DIAG schema=1 status=failed class=liveqa_runtime "
+            "stage=runtime_prepare exit_status=1 release_slug=%s"
+        )
         normal_quiesce = deploy.index("  quiesce_runtime_writers\n", bootstrap_preflight)
         resume_preflight = deploy.index('preflight --app-dir "$APP_DIR" --release "$CANDIDATE"')
         resume_quiesce = deploy.index("  quiesce_runtime_writers\n", resume_preflight)
         migration = deploy.index('run_candidate tools/platform_run_alembic.sh upgrade head')
         pointer = deploy.index('--name current --target "$CANDIDATE"')
         self.assertLess(bootstrap_preflight, normal_quiesce)
+        self.assertLess(bootstrap_preflight, preflight_diag)
+        self.assertLess(preflight_diag, normal_quiesce)
         self.assertLess(resume_preflight, resume_quiesce)
         self.assertLess(resume_quiesce, migration)
         self.assertLess(migration, pointer)

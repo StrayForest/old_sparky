@@ -59,6 +59,8 @@ POINTER_TEMP_PATTERN = re.compile(r"^\.active\.[0-9a-f]{32}\.tmp$")
 MAX_RELEASE_JSON_BYTES = 64 * 1024
 MAX_RUNTIME_MANIFEST_BYTES = 256 * 1024
 MAX_ACTIVE_MANIFEST_BYTES = 256 * 1024
+MAX_ARCHIVE_PATH_BYTES = 4096
+MAX_ARCHIVE_COMPONENT_BYTES = 255
 MAX_FILE_BYTES = 768 * 1024 * 1024
 MAX_RUNTIME_BYTES = 2 * 1024 * 1024 * 1024
 MAX_FILES = 200_000
@@ -1978,11 +1980,38 @@ def _artifact_stage_reserve(artifact: Path, release: Path) -> int:
         raise InstallerError("bootstrap filesystem block size is invalid")
     expanded = 0
     count = 0
+    root_seen = False
     try:
         with tarfile.open(artifact, "r:gz") as archive:
             for member in archive:
                 count += 1
-                if count > 100_000 or not member.name.startswith(release.name + "/"):
+                name = member.name
+                try:
+                    name_bytes = name.encode("utf-8")
+                except UnicodeEncodeError as exc:
+                    raise InstallerError("bootstrap artifact inventory is invalid") from exc
+                parts = name.split("/")
+                if (
+                    count > 100_000
+                    or not name
+                    or name.startswith("/")
+                    or "\\" in name
+                    or len(name_bytes) > MAX_ARCHIVE_PATH_BYTES
+                    or parts[0] != release.name
+                    or any(
+                        part in {"", ".", ".."}
+                        or len(part.encode("utf-8")) > MAX_ARCHIVE_COMPONENT_BYTES
+                        or any(ord(character) < 32 or ord(character) == 127 for character in part)
+                        for part in parts
+                    )
+                    or str(PurePosixPath(*parts)) != name
+                ):
+                    raise InstallerError("bootstrap artifact inventory is invalid")
+                if name == release.name:
+                    if root_seen or not member.isdir():
+                        raise InstallerError("bootstrap artifact inventory is invalid")
+                    root_seen = True
+                elif not name.startswith(release.name + "/"):
                     raise InstallerError("bootstrap artifact inventory is invalid")
                 if member.isfile():
                     expanded += ((member.size + block - 1) // block) * block
@@ -1992,6 +2021,8 @@ def _artifact_stage_reserve(artifact: Path, release: Path) -> int:
                     raise InstallerError("bootstrap artifact member type is invalid")
                 if expanded > 4 * 1024**3:
                     raise InstallerError("bootstrap artifact expansion exceeds its bound")
+        if not root_seen:
+            raise InstallerError("bootstrap artifact inventory is invalid")
     except (OSError, tarfile.TarError) as exc:
         raise InstallerError("bootstrap artifact could not be inspected") from exc
     return expanded + sum(

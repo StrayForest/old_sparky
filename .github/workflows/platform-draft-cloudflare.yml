@@ -133,6 +133,11 @@ jobs:
     needs: [detect-release]
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    outputs:
+      draft_bundle_artifact_id: ${{ steps.upload-draft-bundle.outputs.artifact-id }}
+      wrangler_runtime_artifact_id: ${{ steps.upload-wrangler-runtime.outputs.artifact-id }}
+      build_run_id: ${{ github.run_id }}
+      build_attempt: ${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -167,6 +172,8 @@ jobs:
         shell: bash
         env:
           TARGET_SHA: ${{ needs.detect-release.outputs.target_sha }}
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_ATTEMPT: ${{ github.run_attempt }}
           WRANGLER_LOCK_SHA256: 17d717b60ee2f9edf5bbf1c21d0e99c787e974aa347eea0dedb896d36dcff145
         run: |
           set -euo pipefail
@@ -187,14 +194,18 @@ jobs:
             .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
               --output-dir "$bundle/heroes"
           )
-          /usr/bin/python3 - "$bundle" "$TARGET_SHA" <<'PY'
+          /usr/bin/python3 - "$bundle" "$TARGET_SHA" "$BUILD_RUN_ID" "$BUILD_ATTEMPT" <<'PY'
           import hashlib
           import json
           from pathlib import Path
+          import re
           import sys
 
           root = Path(sys.argv[1])
           target_sha = sys.argv[2]
+          build_run_id, build_attempt = sys.argv[3:5]
+          if re.fullmatch(r"[1-9][0-9]*", build_run_id) is None or re.fullmatch(r"[1-9][0-9]*", build_attempt) is None:
+              raise SystemExit("Draft build run identity is invalid")
           files = {}
           total_bytes = 0
           for path in sorted(root.rglob("*")):
@@ -211,7 +222,13 @@ jobs:
                   files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
           if not files or len(files) > 4096:
               raise SystemExit("Draft bundle inventory is outside its bound")
-          payload = {"schema": 1, "target_sha": target_sha, "files": files}
+          payload = {
+              "schema": 1,
+              "target_sha": target_sha,
+              "build_run_id": build_run_id,
+              "build_attempt": build_attempt,
+              "files": files,
+          }
           payload["digest"] = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
           (root / "bundle-manifest.json").write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="ascii")
           PY
@@ -281,6 +298,7 @@ jobs:
               raise SystemExit("Wrangler runtime manifest digest is not the reviewed value")
           PY
       - name: Upload digest-bound Draft bundle
+        id: upload-draft-bundle
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-draft-release-${{ github.run_id }}-${{ github.run_attempt }}
@@ -288,6 +306,7 @@ jobs:
           if-no-files-found: error
           retention-days: 2
       - name: Upload digest-bound Wrangler runtime
+        id: upload-wrangler-runtime
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-draft-wrangler-${{ github.run_id }}-${{ github.run_attempt }}
@@ -304,15 +323,30 @@ jobs:
     timeout-minutes: 25
     environment: production
     steps:
+      - name: Validate build artifact identity
+        shell: bash
+        env:
+          DRAFT_BUNDLE_ARTIFACT_ID: ${{ needs.build-release.outputs.draft_bundle_artifact_id }}
+          WRANGLER_RUNTIME_ARTIFACT_ID: ${{ needs.build-release.outputs.wrangler_runtime_artifact_id }}
+          BUILD_RUN_ID: ${{ needs.build-release.outputs.build_run_id }}
+          BUILD_ATTEMPT: ${{ needs.build-release.outputs.build_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$DRAFT_BUNDLE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$WRANGLER_RUNTIME_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$BUILD_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$BUILD_RUN_ID" == "$GITHUB_RUN_ID" ]]
+          echo "Using digest-bound Draft artifacts from run ${BUILD_RUN_ID}, build attempt ${BUILD_ATTEMPT}"
       - name: Download digest-bound Draft bundle
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-draft-release-${{ github.run_id }}-${{ github.run_attempt }}
+          artifact-ids: ${{ needs.build-release.outputs.draft_bundle_artifact_id }}
           path: ${{ runner.temp }}/draft-release-bundle
       - name: Download digest-bound Wrangler runtime
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-draft-wrangler-${{ github.run_id }}-${{ github.run_attempt }}
+          artifact-ids: ${{ needs.build-release.outputs.wrangler_runtime_artifact_id }}
           path: ${{ runner.temp }}/draft-wrangler-runtime
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
@@ -321,12 +355,14 @@ jobs:
         shell: bash
         env:
           TARGET_SHA: ${{ needs.detect-release.outputs.target_sha }}
+          BUILD_RUN_ID: ${{ needs.build-release.outputs.build_run_id }}
+          BUILD_ATTEMPT: ${{ needs.build-release.outputs.build_attempt }}
         run: |
           set -euo pipefail
           bundle="$RUNNER_TEMP/draft-release-bundle"
           test -d "$bundle" && test ! -L "$bundle"
           ! find -L "$bundle" -type l -print -quit | grep -q .
-          /usr/bin/python3 - "$bundle/bundle-manifest.json" "$bundle" "$TARGET_SHA" <<'PY'
+          /usr/bin/python3 - "$bundle/bundle-manifest.json" "$bundle" "$TARGET_SHA" "$BUILD_RUN_ID" "$BUILD_ATTEMPT" <<'PY'
           import hashlib
           import json
           from pathlib import Path
@@ -337,10 +373,21 @@ jobs:
           manifest_path = Path(sys.argv[1])
           root = Path(sys.argv[2])
           target_sha = sys.argv[3]
+          build_run_id, build_attempt = sys.argv[4:6]
           if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
               raise SystemExit("Draft target SHA is invalid")
+          if re.fullmatch(r"[1-9][0-9]*", build_run_id) is None or re.fullmatch(r"[1-9][0-9]*", build_attempt) is None:
+              raise SystemExit("Draft build run identity is invalid")
           manifest = json.loads(manifest_path.read_text(encoding="ascii"))
-          if not isinstance(manifest, dict) or manifest.get("schema") != 1 or manifest.get("target_sha") != target_sha:
+          expected_keys = {"schema", "target_sha", "build_run_id", "build_attempt", "files", "digest"}
+          if (
+              not isinstance(manifest, dict)
+              or set(manifest) != expected_keys
+              or manifest.get("schema") != 1
+              or manifest.get("target_sha") != target_sha
+              or manifest.get("build_run_id") != build_run_id
+              or manifest.get("build_attempt") != build_attempt
+          ):
               raise SystemExit("Draft handoff schema or SHA is invalid")
           files = manifest.get("files")
           if not isinstance(files, dict) or not files or len(files) > 4096:
@@ -373,7 +420,17 @@ jobs:
               digest = hashlib.sha256(path.read_bytes()).hexdigest()
               if digest != expected_digest:
                   raise SystemExit("Draft handoff digest mismatch")
-          canonical = json.dumps({"schema": 1, "target_sha": target_sha, "files": files}, sort_keys=True, separators=(",", ":")).encode()
+          canonical = json.dumps(
+              {
+                  "schema": 1,
+                  "target_sha": target_sha,
+                  "build_run_id": build_run_id,
+                  "build_attempt": build_attempt,
+                  "files": files,
+              },
+              sort_keys=True,
+              separators=(",", ":"),
+          ).encode()
           expected_manifest_digest = hashlib.sha256(canonical).hexdigest()
           if manifest.get("digest") != expected_manifest_digest:
               raise SystemExit("Draft handoff manifest digest mismatch")
@@ -524,6 +581,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          fetch_response() {
+            local url="$1"
+            local output="$2"
+            local headers="${output}.headers"
+            curl --silent --show-error --connect-timeout 5 --max-time 10 --output "$output" --dump-header "$headers" --write-out '%{http_code}' "$url" || true
+          }
+
           get_200() {
             local name="$1"
             local url="$2"
@@ -531,7 +595,7 @@ jobs:
             local headers="${output}.headers"
             local status=""
             for attempt in $(seq 1 10); do
-              status="$(curl --silent --show-error --output "$output" --dump-header "$headers" --write-out '%{http_code}' "$url" || true)"
+              status="$(fetch_response "$url" "$output")"
               echo "${name}: HTTP ${status} (attempt ${attempt})"
               if [[ "$status" == "200" ]]; then
                 return 0
@@ -543,20 +607,40 @@ jobs:
             return 1
           }
 
+          report_asset_headers() {
+            local headers="$1"
+            if [[ -s "$headers" ]]; then
+              grep -iE '^(cf-ray|cf-cache-status|age|etag|cache-control|cdn-cache-control|cloudflare-cdn-cache-control|x-old-sparky-draft(-asset-cache-status)?):' "$headers" || true
+            fi
+          }
+
           assert_live_asset() {
             local name="$1"
             local url="$2"
             local output="$3"
             local expected="$4"
-            get_200 "$name" "$url" "$output"
-            if ! cmp --silent "$output" "$expected"; then
-              echo "${name} body does not match the just-built asset" >&2
-              echo "Expected: $(sha256sum "$expected" | awk '{print $1}')" >&2
-              echo "Received: $(sha256sum "$output" | awk '{print $1}')" >&2
-              return 1
-            fi
-            echo "${name}: live body matches $(sha256sum "$expected" | awk '{print $1}')"
-            grep -iE '^(cf-cache-status|age|x-old-sparky-draft-asset-cache-status):' "${output}.headers" || true
+            local headers="${output}.headers"
+            local expected_hash="$(sha256sum "$expected" | awk '{print $1}')"
+            local received_hash="unavailable"
+            local status=""
+            for attempt in $(seq 1 16); do
+              status="$(fetch_response "$url" "$output")"
+              if [[ -f "$output" ]]; then
+                received_hash="$(sha256sum "$output" | awk '{print $1}')"
+              fi
+              if [[ "$status" == "200" ]] && cmp --silent "$output" "$expected"; then
+                echo "${name}: live body matches ${expected_hash} (attempt ${attempt}/16)"
+                report_asset_headers "$headers"
+                return 0
+              fi
+              echo "${name}: readiness attempt ${attempt}/16 returned HTTP ${status}; expected sha256=${expected_hash}, received sha256=${received_hash}" >&2
+              report_asset_headers "$headers" >&2
+              if [[ "$attempt" -lt 16 ]]; then
+                sleep 2
+              fi
+            done
+            echo "${name}: live asset did not converge to the just-built response after 16 bounded attempts" >&2
+            return 1
           }
 
           assert_live_asset \

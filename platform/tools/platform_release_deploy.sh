@@ -1608,6 +1608,10 @@ if [[ "$RESUME" -eq 0 ]]; then
   if ! /usr/bin/python3 -I "$TOOLS_DIR/platform_live_qa_runtime_install.py" \
     preflight --app-dir "$APP_DIR" --release "$bootstrap_release" \
     --bootstrap-slug "$bootstrap_slug" --artifact "$ARTIFACT" >/dev/null; then
+    if [[ "$bootstrap_slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]]; then
+      printf 'RELEASE_INSTALL_DIAG schema=1 status=failed class=liveqa_runtime stage=runtime_prepare exit_status=1 release_slug=%s\n' \
+        "$bootstrap_slug" >&2
+    fi
     public_status failed liveqa_preflight >&2
     exit 1
   fi

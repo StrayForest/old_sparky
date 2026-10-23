@@ -513,6 +513,8 @@ restores those exact states before cleanup and retries from a durable
 `filesystem-restored-services-pending` phase after an interruption. Partial or
 missing current-only snapshots remain retained before any systemd call.
 
+Draft publication and public convergence are separate checks: a successful Worker publish does not prove that every edge serves the new asset. The build job passes the upload actions' artifact IDs and binds the bundle manifest to the target SHA and build run/attempt; the release job consumes those IDs instead of reconstructing names from its own attempt, which can differ after a rerun. Smoke polls a bounded number of times for HTTP 200 and the exact expected body hash, recording response-specific cache/edge headers on mismatch; a `HIT` header alone does not establish stale content. If artifact lookup fails before any Cloudflare write, verify the source and absence of an active run, then use one canonical fresh dispatch to rebuild and publish; do not rerun failed jobs against attempt-derived names or substitute artifacts.
+
 ## Smoke
 
 ```bash
