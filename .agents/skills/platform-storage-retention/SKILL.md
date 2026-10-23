@@ -23,8 +23,9 @@ calling the task complete.
 - Require explicit operator authorization for a manual production deletion.
   The daily maintenance timer is the standing bounded policy; manual
   invocations still require an operator-approved window.
-- Do not run a production load while free space is below 5 GiB or usage is
-  above 85%; a failed or incomplete cleanup is not evidence of a passing run.
+- Do not run a production load while free space is below
+  `max(5 GiB, 10% of filesystem capacity)` or usage is above 90%; a failed or
+  incomplete cleanup is not evidence of a passing run.
 
 ## Post-run workflow
 
