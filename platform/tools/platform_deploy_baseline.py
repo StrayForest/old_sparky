@@ -29,6 +29,7 @@ from tools.platform_ci_classifier import (
     STORAGE_OPERATIONS_TRIGGER_FILES,
     ClassifierError,
     classify,
+    classify_cumulative_baseline_paths,
     validate_manifest,
 )
 from tools.platform_workflow_provenance import (
@@ -403,12 +404,9 @@ def classify_cumulative_baseline(
     if not isinstance(expected_target_sha, str) or SHA_RE.fullmatch(expected_target_sha) is None:
         raise ProvenanceError("target SHA is invalid")
     try:
-        cumulative = classify(
+        cumulative = classify_cumulative_baseline_paths(
             cumulative_changed_paths,
-            event="push",
-            branch="dev",
             target_sha=expected_target_sha,
-            repository_ready=True,
         )
         validate_manifest(cumulative, expected_target_sha=expected_target_sha)
     except ClassifierError as exc:
@@ -577,6 +575,23 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
         raise ProvenanceError("docs-only cumulative route cannot authorize an application release")
     if manifest["deployable"] is not True:
         raise ProvenanceError("cumulative non-no-op route is not deployable")
+    files = manifest.get("files")
+    target_sha = manifest.get("target_sha")
+    if (
+        not isinstance(files, list)
+        or not files
+        or any(not isinstance(path, str) for path in files)
+        or not isinstance(target_sha, str)
+        or SHA_RE.fullmatch(target_sha) is None
+    ):
+        raise ProvenanceError("cumulative deployable manifest path set is malformed")
+    try:
+        canonical = classify_cumulative_baseline_paths(files, target_sha=target_sha)
+        validate_manifest(canonical, expected_target_sha=target_sha)
+    except ClassifierError as exc:
+        raise ProvenanceError("cumulative deployable manifest cannot be reclassified") from exc
+    if canonical != dict(manifest):
+        raise ProvenanceError("cumulative deployable manifest is not the canonical path classification")
     return {
         "no_op": False,
         "runtime_required": manifest["runtime_sensitive"] is True,

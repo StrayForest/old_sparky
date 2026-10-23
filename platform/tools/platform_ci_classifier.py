@@ -659,6 +659,70 @@ def classify(
     )
 
 
+def classify_cumulative_baseline_paths(
+    files: Sequence[str], *, target_sha: str
+) -> dict[str, object]:
+    """Classify a complete X-to-target path set for baseline reconciliation.
+
+    The normal event classifier remains fail-closed for root-level ``AGENTS.md``.
+    A baseline range may treat that one known non-artifact guide as accompanying
+    documentation only when removing it yields a canonical deployable full
+    ``push/dev`` route that already contains a runtime-sensitive application
+    change. The returned manifest retains the complete path set, including the
+    guide, so its digest and provenance still bind every changed path.
+
+    In particular, this does not promote a recovery-bootstrap-only range or an
+    unknown path into a deployable route.
+    """
+
+    cumulative = classify(
+        files,
+        event="push",
+        branch="dev",
+        target_sha=target_sha,
+        repository_ready=True,
+    )
+    cumulative_files = cumulative.get("files")
+    if (
+        cumulative.get("fallback") is not True
+        or cumulative.get("reason")
+        != "unknown or global path requires fail-closed full verification"
+        or not isinstance(cumulative_files, list)
+        or cumulative_files.count("AGENTS.md") != 1
+    ):
+        return cumulative
+
+    without_guide = [path for path in cumulative_files if path != "AGENTS.md"]
+    if not without_guide:
+        return cumulative
+    recognized = classify(
+        without_guide,
+        event="push",
+        branch="dev",
+        target_sha=target_sha,
+        repository_ready=True,
+    )
+    if (
+        recognized.get("class") != "full"
+        or recognized.get("expected_gates") != list(FULL_GATE_IDS)
+        or recognized.get("fallback") is not False
+        or recognized.get("deployable") is not True
+        or recognized.get("runtime_sensitive") is not True
+    ):
+        return cumulative
+    return _build_manifest(
+        target_sha=target_sha,
+        event="push",
+        files=cumulative_files,
+        branch="dev",
+        fallback=False,
+        reason=str(recognized["reason"]),
+        route_class="full",
+        expected_gates=FULL_GATE_IDS,
+        runtime_sensitive=True,
+    )
+
+
 def validate_manifest(
     manifest: Mapping[str, object],
     *,

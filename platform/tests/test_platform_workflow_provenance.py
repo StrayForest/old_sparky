@@ -68,6 +68,7 @@ from tools.platform_ci_classifier import (  # noqa: E402
     DOCS_ONLY_GATE_IDS,
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
+    RUNTIME_SENSITIVE_FILES,
     STORAGE_OPERATIONS_REASON,
     classify,
     manifest_digest,
@@ -771,6 +772,120 @@ class WorkflowProvenanceTests(unittest.TestCase):
             validate_cumulative_reconcile_route(nonruntime),
             {"no_op": False, "runtime_required": False},
         )
+
+        # The exact active-X to prospective-D range includes one known root
+        # guide alongside the previously unshipped app/runtime and rollback
+        # changes. The normal event classifier must continue to fail closed;
+        # only cumulative reconciliation may treat the guide as non-artifact
+        # documentation, and only because the remaining range is already a
+        # canonical runtime-sensitive deployable release.
+        x_to_c_paths = [
+            ".github/workflows/platform-draft-cloudflare.yml",
+            "AGENTS.md",
+            "platform/apps/platform_web/package-lock.json",
+            "platform/apps/platform_web/package.json",
+            "platform/docs/README.md",
+            "platform/docs/adr/public-draft-edge-boundary.md",
+            "platform/docs/agent-token-efficiency.md",
+            "platform/docs/test-suite-governance.md",
+            "platform/tests/test_platform_live_qa_runtime_install.py",
+            "platform/tests/test_platform_release_recovery_boundaries.py",
+            "platform/tests/test_platform_secret_artifact_boundary.py",
+            "platform/tools/platform_live_qa_runtime_install.py",
+            "platform/tools/platform_release_deploy.sh",
+            "platform/tools/platform_release_rollback.sh",
+            "platform/tools/platform_test_catalog.py",
+        ]
+        d_incremental_paths = [
+            "platform/docs/agent-token-efficiency.md",
+            "platform/tests/test_platform_workflow_provenance.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tools/platform_deploy_baseline.py",
+        ]
+        runtime_source = "platform/tools/platform_live_qa_runtime_install.py"
+        self.assertIn(runtime_source, RUNTIME_SENSITIVE_FILES)
+        self.assertNotIn(runtime_source, RECOVERY_BOOTSTRAP_FILES)
+        self.assertIn("platform/tools/platform_release_rollback.sh", RECOVERY_BOOTSTRAP_FILES)
+
+        d_incremental = classify(
+            d_incremental_paths,
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertFalse(d_incremental["fallback"])
+        self.assertFalse(d_incremental["deployable"])
+        self.assertEqual(d_incremental["reason"], RECOVERY_BOOTSTRAP_REASON)
+
+        x_to_prospective_d_paths = [*x_to_c_paths, *d_incremental_paths]
+        direct_event_route = classify(
+            x_to_prospective_d_paths,
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertTrue(direct_event_route["fallback"])
+        self.assertFalse(direct_event_route["deployable"])
+
+        without_root_guide = [
+            path for path in x_to_prospective_d_paths if path != "AGENTS.md"
+        ]
+        recognized_app_route = classify(
+            without_root_guide,
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertEqual(recognized_app_route["class"], "full")
+        self.assertFalse(recognized_app_route["fallback"])
+        self.assertTrue(recognized_app_route["deployable"])
+        self.assertTrue(recognized_app_route["runtime_sensitive"])
+
+        prospective_d = classify_cumulative_baseline(
+            d_incremental,
+            x_to_prospective_d_paths,
+            expected_target_sha=self.SHA,
+        )
+        prospective_d_manifest = prospective_d["manifest"]
+        self.assertFalse(prospective_d["no_op"])
+        self.assertEqual(prospective_d_manifest["files"], sorted(set(x_to_prospective_d_paths)))
+        self.assertIn("AGENTS.md", prospective_d_manifest["files"])
+        self.assertFalse(prospective_d_manifest["fallback"])
+        self.assertTrue(prospective_d_manifest["deployable"])
+        self.assertTrue(prospective_d_manifest["runtime_sensitive"])
+        self.assertEqual(
+            validate_cumulative_reconcile_route(prospective_d),
+            {"no_op": False, "runtime_required": True},
+        )
+
+        unknown_mixed = [*x_to_prospective_d_paths, "unowned/private-source.txt"]
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                d_incremental,
+                unknown_mixed,
+                expected_target_sha=self.SHA,
+            )
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                classify(
+                    ["platform/tools/platform_recovery_bootstrap.py"],
+                    event="push",
+                    branch="dev",
+                    target_sha=self.SHA,
+                ),
+                ["AGENTS.md", "platform/tools/platform_recovery_bootstrap.py"],
+                expected_target_sha=self.SHA,
+            )
+
+        tampered_deployable = dict(prospective_d_manifest)
+        tampered_deployable["files"] = sorted(
+            [*prospective_d_manifest["files"], "unowned/private-source.txt"]
+        )
+        tampered_deployable["digest"] = manifest_digest(tampered_deployable)
+        with self.assertRaises(ProvenanceError):
+            validate_cumulative_reconcile_route(
+                {"manifest": tampered_deployable, "no_op": False}
+            )
 
     def test_report_only_recovery_baseline_binds_exact_failed_release_and_closed_route(self) -> None:
         failed_sha = "a" * 40

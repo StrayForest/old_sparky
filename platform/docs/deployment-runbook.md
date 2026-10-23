@@ -108,13 +108,10 @@ to `dev`. The chain is:
 
 ### Recovery-bootstrap baseline reconciliation
 
-This path is automatic-only; never dispatch it manually. It authenticates exact
-source-CI/caller/parent attempts, the pinned host baseline and its deployment
-proof from complete bounded API snapshots, plus first-parent ancestry to exact
-`dev`. Classification follows event ownership, not bundle membership (the
-bundled live-QA installer stays full/runtime). Bootstrap-only is a verified
-no-op; deployable routes need canonical gates and sensitive routes also need
-exact-target runtime gates/receipt. The finalizer preserves the push context.
+This automatic-only path authenticates exact source/caller/parent attempts, the pinned host baseline and its deployment proof, plus first-parent ancestry to `dev`.
+Classification follows event ownership (the bundled live-QA installer stays full/runtime). Bootstrap-only is a verified no-op; deployable routes require canonical gates and exact-target runtime proof when sensitive.
+The finalizer preserves push context. Cumulative baseline-to-target classification recognizes root `AGENTS.md` as a non-artifact companion only if removing it yields a canonical, deployable, runtime-sensitive `full` route.
+The cumulative manifest still binds `AGENTS.md`; normal event classification, unknown paths and bootstrap-only no-op rules remain fail-closed.
 
 Only marker-bound temporary ingress and lock files may precede comparison.
 Under both locks, the immutable supervisor checks tuple match, no pending

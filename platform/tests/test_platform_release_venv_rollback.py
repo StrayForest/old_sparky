@@ -2005,6 +2005,7 @@ else:
         self.write_release_manifest(current_release, "b" * 40)
         self.write_release_manifest(previous_release, "c" * 40)
         self.install_restore_nginx_helper(previous_release)
+        self.install_restore_runtime_reconcile_helper(previous_release, self.app_dir)
         release_tools = current_release / "tools"
         release_tools.mkdir(exist_ok=True)
         shutil.copy2(ROLLBACK_SCRIPT, release_tools / ROLLBACK_SCRIPT.name)
@@ -2015,6 +2016,20 @@ else:
         )
         shutil.copy2(systemd_state_tool, release_tools / systemd_state_tool.name)
         (release_tools / systemd_state_tool.name).chmod(0o755)
+        # The production selector probes the current release's Python
+        # installer before falling back to the fake historical target. Model
+        # an explicit unsupported target (exit 2), then fail if that installer
+        # is accidentally selected for reconcile. Generic shell helper stubs
+        # are not valid Python CLIs.
+        runtime_installer = release_tools / "platform_live_qa_runtime_install.py"
+        runtime_installer.write_text(
+            "import sys\n"
+            "if sys.argv[1:2] == ['rollback-check']:\n"
+            "    raise SystemExit(2)\n"
+            "raise SystemExit(64)\n",
+            encoding="ascii",
+        )
+        runtime_installer.chmod(0o755)
         self.install_test_lock_helper(release_tools / "platform_release_lock.sh")
         shutil.copy2(RECOVERY_SHIM_SCRIPT, release_tools / RECOVERY_SHIM_SCRIPT.name)
         invoked_through_current = (

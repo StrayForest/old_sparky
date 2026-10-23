@@ -31,6 +31,11 @@ required evidence, review, safety checks and release gates.
 - The orchestrator resumes from the latest proven state. Reopen hypotheses
   only when a new log, source diff, run result or live observation provides a
   signal.
+- Before an expensive production-bound CI push, cheaply classify the exact
+  pending source range with the canonical classifier. Require the expected
+  full, deployable, non-fallback runtime route and artifact job; classify the
+  complete baseline-to-target range for cumulative unshipped releases. Fix a
+  no-op/missing-artifact route before CI; never bypass the guard.
 
 ## Read and report narrowly
 
