@@ -225,6 +225,7 @@ jobs:
           import json
           from pathlib import Path
           import re
+          import stat
           import sys
 
           root = Path(sys.argv[1])
@@ -254,6 +255,15 @@ jobs:
           cli = "node_modules/wrangler/wrangler-dist/cli.js"
           if cli not in files:
               raise SystemExit("Wrangler CLI is missing from the runtime")
+          executable_paths = (
+              "node_modules/@cloudflare/workerd-linux-64/bin/workerd",
+              "node_modules/workerd/bin/workerd",
+              "node_modules/@esbuild/linux-x64/bin/esbuild",
+              "node_modules/esbuild/bin/esbuild",
+          )
+          for name in executable_paths:
+              if name not in files or stat.S_IMODE((root / name).stat().st_mode) != 0o755:
+                  raise SystemExit("Pinned Wrangler executable mode is invalid")
           payload = {
               "schema": 1,
               "package": "wrangler",
@@ -281,6 +291,7 @@ jobs:
         with:
           name: platform-draft-wrangler-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/draft-wrangler-runtime
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 2
 
@@ -428,6 +439,19 @@ jobs:
           cli = root / "node_modules/wrangler/wrangler-dist/cli.js"
           if not cli.is_file() or cli.is_symlink():
               raise SystemExit("validated Wrangler CLI is missing")
+          executable_paths = (
+              "node_modules/@cloudflare/workerd-linux-64/bin/workerd",
+              "node_modules/workerd/bin/workerd",
+              "node_modules/@esbuild/linux-x64/bin/esbuild",
+              "node_modules/esbuild/bin/esbuild",
+          )
+          for name in executable_paths:
+              if name not in files:
+                  raise SystemExit("Pinned Wrangler executable is missing")
+              path = root / name
+              if stat.S_IMODE(path.stat().st_mode) != 0o644:
+                  raise SystemExit("Downloaded Wrangler executable mode is invalid")
+              path.chmod(0o755)
           print("immutable Wrangler runtime accepted")
           PY
 

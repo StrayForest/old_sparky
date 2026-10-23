@@ -209,6 +209,10 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
         publisher_run = str(_named_step(_draft_job_steps("release"), "Validate immutable Wrangler runtime")["run"])
         publisher_blocks = re.findall(r"<<'PY'\n(.*?)\nPY", publisher_run, re.DOTALL)
         self.assertEqual(len(publisher_blocks), 1)
+        upload = _named_step(_draft_job_steps("build-release"), "Upload digest-bound Wrangler runtime")
+        self.assertIs(upload["with"]["include-hidden-files"], True)
+        draft_upload = _named_step(_draft_job_steps("build-release"), "Upload digest-bound Draft bundle")
+        self.assertNotIn("include-hidden-files", draft_upload["with"])
         reviewed_digest = "c27608e7efe705b963aee2f3b2d5ef15ac7d7e51816f086836aac071ea59ad6a"
         self.assertEqual(builder_blocks[1].count(reviewed_digest), 1)
 
@@ -219,10 +223,22 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
             cli = root / "node_modules/wrangler/wrangler-dist/cli.js"
             cli.parent.mkdir(parents=True)
             cli.write_bytes(b"pinned cli\n")
+            (cli.parent / ".gitkeep").write_bytes(b"hidden manifest member\n")
             workerd = root / "node_modules/@cloudflare/workerd-linux-64/bin/workerd"
             workerd.parent.mkdir(parents=True)
             with workerd.open("wb") as output:
                 output.truncate(65 * 1024 * 1024)
+            executable_paths = (
+                workerd,
+                root / "node_modules/workerd/bin/workerd",
+                root / "node_modules/@esbuild/linux-x64/bin/esbuild",
+                root / "node_modules/esbuild/bin/esbuild",
+            )
+            for path in executable_paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path != workerd:
+                    path.write_bytes(b"pinned executable\n")
+                path.chmod(0o755)
             for number in range(98):
                 (root / f"member-{number:03d}").write_bytes(b"fixture\n")
             lockfile = parent / "package-lock.json"
@@ -258,6 +274,7 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
                 )
 
             expected = manifest()
+            self.assertIn("node_modules/wrangler/wrangler-dist/.gitkeep", expected["files"])
             builder = builder_blocks[1].replace(reviewed_digest, str(expected["digest"]))
             result = run_python(builder, str(root), str(lockfile), lock_digest)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -265,14 +282,20 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
                 json.loads((root / "wrangler-tool-manifest.json").read_text(encoding="ascii")),
                 expected,
             )
+            for path in executable_paths:
+                path.chmod(0o644)
             result = run_python(
                 publisher_blocks[0], str(root), lock_digest, str(expected["digest"])
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+            for path in executable_paths:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((cli.parent / ".gitkeep").stat().st_mode & 0o777, 0o644)
 
             (root / "wrangler-tool-manifest.json").unlink()
             workerd.rename(workerd.with_name("workerd-copy"))
             workerd.write_bytes(b"pinned path now small\n")
+            workerd.chmod(0o755)
             rejected = manifest()
             result = run_python(builder, str(root), str(lockfile), lock_digest)
             self.assertNotEqual(result.returncode, 0)
