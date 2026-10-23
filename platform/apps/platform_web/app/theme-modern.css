@@ -362,6 +362,34 @@ body {
   border-color: rgba(167, 139, 250, .48);
 }
 
+.header-actions .header-shell-link {
+  position: relative;
+  color: var(--ui-text-muted);
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.header-actions .header-shell-link:hover,
+.header-actions .header-shell-link:focus-visible,
+.header-actions .header-shell-link.active {
+  color: var(--ui-text);
+  background: linear-gradient(180deg, transparent, rgba(139, 92, 246, .08));
+  border-color: transparent;
+}
+
+.header-actions .header-shell-link.active::after {
+  position: absolute;
+  right: 13px;
+  bottom: -1px;
+  left: 13px;
+  height: 2px;
+  background: linear-gradient(90deg, var(--ui-primary), var(--ui-primary-bright));
+  box-shadow: 0 0 16px rgba(139, 92, 246, .65);
+  border-radius: 999px 999px 0 0;
+  content: "";
+}
+
 .header-create-button {
   display: inline-flex;
   align-items: center;
@@ -1882,6 +1910,26 @@ a.tournament-card:focus-visible {
 
 .patch-section-header > div > span {
   color: var(--ui-primary-bright);
+}
+
+.patch-hero-display-name {
+  color: var(--ui-primary-bright);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.patch-hero-description,
+.patch-ability-description {
+  margin: 4px 0 0;
+  color: var(--ui-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.patch-ability-description {
+  margin: 0 0 12px;
 }
 
 .objective-patch-section .patch-section-header > div,

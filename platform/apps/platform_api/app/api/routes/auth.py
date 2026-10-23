@@ -143,12 +143,11 @@ async def get_auth_bootstrap(
 ) -> AuthBootstrapResponse:
     """Return the small identity snapshot used by every authenticated SSR shell."""
 
-    # The authenticated identity and roles are authoritative and remain on
-    # the blocking path. The header has a safe icon fallback, so the optional
-    # profile-avatar projection is deliberately left off this request: its
-    # second SQL round trip should not delay the first authenticated byte.
+    # The authenticated identity and roles are authoritative. Include only the
+    # lightweight avatar projection so the global shell can render the profile
+    # image without a second browser request to /users/me.
     try:
-        return await build_auth_bootstrap(auth_session)
+        return await build_auth_bootstrap(auth_session, db_session=db_session)
     finally:
         await release_db_connection(db_session)
 

@@ -2173,6 +2173,54 @@ class PlatformVerificationContractTests(unittest.TestCase):
                     aggregate_settings["platform_redis_url"],
                     "redis://127.0.0.1:6379/15",
                 )
+            ci_venv = checkout_root / ".cache" / "platform-ci-venv"
+            ci_python = ci_venv / "bin" / "python"
+            ci_python.parent.mkdir(parents=True)
+            ci_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            ci_python.chmod(0o755)
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "PLATFORM_ENV_FILE": str(env_path),
+                        "PLATFORM_CI_VENV_DIR": ".cache/platform-ci-venv",
+                        "PLATFORM_PYTHON_BIN": "/untrusted/ignored/python",
+                        **safe_environment,
+                    },
+                    clear=True,
+                ),
+                patch("tools.platform_verify.PLATFORM_ROOT", checkout_root),
+            ):
+                ci_env, _ = _validated_privileged_environment()
+                self.assertEqual(ci_env["PLATFORM_CI_VENV_DIR"], str(ci_venv))
+                self.assertEqual(ci_env["PLATFORM_PYTHON_BIN"], str(ci_python))
+                self.assertEqual(_privileged_runner_python(ci_env), str(ci_python))
+            external_venv = Path(tempfile.mkdtemp(prefix="platform-ci-venv-outside-"))
+            escaping_link = checkout_root / ".cache" / "escaping-ci-venv"
+            escaping_link.symlink_to(external_venv, target_is_directory=True)
+            with patch.dict(
+                os.environ,
+                {
+                    "PLATFORM_ENV_FILE": str(env_path),
+                    "PLATFORM_CI_VENV_DIR": ".cache/escaping-ci-venv",
+                    **safe_environment,
+                },
+                clear=True,
+            ), patch("tools.platform_verify.PLATFORM_ROOT", checkout_root):
+                with self.assertRaisesRegex(
+                    VerificationError,
+                    "PLATFORM_CI_VENV_DIR must resolve to an existing venv under the platform root",
+                ):
+                    _validated_privileged_environment()
+            external_venv_python = external_venv / "bin" / "python"
+            with self.assertRaisesRegex(
+                VerificationError, "pinned test Python runtime is unavailable"
+            ):
+                _privileged_runner_python(
+                    {"PLATFORM_PYTHON_BIN": str(external_venv_python)}
+                )
+            escaping_link.unlink()
+            external_venv.rmdir()
             with (
                 patch.dict(
                     os.environ,
@@ -2542,6 +2590,74 @@ class PlatformVerificationContractTests(unittest.TestCase):
                     self.assertNotEqual(blocked.returncode, 0)
                     self.assertIn("LOCAL GATE BLOCKED", blocked.stderr)
                     self.assertIn(missing_name, blocked.stderr)
+
+    def test_canonical_test_runner_honors_explicit_ci_venv_dir(self) -> None:
+        """The documented locked CI venv reaches the canonical shell runner."""
+
+        repo_root = Path(__file__).resolve().parents[2]
+        runner = repo_root / "platform/tools/platform_run_tests.sh"
+        with tempfile.TemporaryDirectory(
+            prefix=".tmp-platform-ci-venv-runner-", dir=repo_root / "platform"
+        ) as directory:
+            temp_root = Path(directory)
+            ci_venv = temp_root / "ci-venv"
+            fake_python = ci_venv / "bin" / "python"
+            fake_python.parent.mkdir(parents=True)
+            fake_python.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$0\" >> \"$PLATFORM_TEST_PYTHON_LOG\"\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            log_path = temp_root / "python-invocations.txt"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PLATFORM_ENVIRONMENT": "test",
+                    "PLATFORM_DATABASE_URL": (
+                        "postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/"
+                        "platformdb_test"
+                    ),
+                    "PLATFORM_DB_SCHEMA": "platform",
+                    "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+                    "PLATFORM_ENV_FILE": str(temp_root / "missing.env"),
+                    "PLATFORM_CI_VENV_DIR": str(ci_venv.relative_to(repo_root / "platform")),
+                    "PLATFORM_PYTHON_BIN": "/untrusted/ignored/python",
+                    "PLATFORM_TEST_PYTHON_LOG": str(log_path),
+                }
+            )
+            result = subprocess.run(
+                [str(runner), "--contour", "backend", "--component-dir", str(temp_root / "components")],
+                cwd=repo_root / "platform",
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            invocations = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertGreaterEqual(len(invocations), 2)
+            self.assertTrue(all(path == str(fake_python) for path in invocations))
+
+            missing_venv = temp_root / "missing-python-venv"
+            missing_venv.mkdir()
+            blocked_env = dict(env)
+            blocked_env["PLATFORM_CI_VENV_DIR"] = str(
+                missing_venv.relative_to(repo_root / "platform")
+            )
+            blocked = subprocess.run(
+                [str(runner), "--contour", "backend"],
+                cwd=repo_root / "platform",
+                env=blocked_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(blocked.returncode, 127)
+            self.assertIn("LOCAL GATE BLOCKED: pinned CI Python runtime is unavailable", blocked.stderr)
 
     def test_shared_resource_lock_excludes_migration_and_integration(self) -> None:
         """A local migration cannot reset resources during integration tests."""

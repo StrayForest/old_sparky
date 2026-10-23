@@ -24,7 +24,11 @@ PATCH_MISS_REFRESH_GATE_KEY = "platform:home-content:patch-miss-refresh:v1"
 PATCH_MISS_NEGATIVE_TTL_SECONDS = 5 * 60
 PATCH_MISS_REFRESH_GATE_SECONDS = 60
 PATCH_MISS_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
-LEGACY_PATCH_DETAIL_KEY_PREFIXES = ("platform:home-content:patch:v6:",)
+LEGACY_PATCH_DETAIL_KEY_PREFIXES = (
+    "platform:home-content:patch:v8:",
+    "platform:home-content:patch:v7:",
+    "platform:home-content:patch:v6:",
+)
 LEGACY_PATCH_REFRESH_GATE_KEY_PREFIX = "platform:home-content:patch-legacy-refresh:v1:"
 
 _BACKGROUND_REFRESH_TASKS: set[asyncio.Task[None]] = set()

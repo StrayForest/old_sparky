@@ -16,10 +16,9 @@ async def build_auth_bootstrap(
 ) -> AuthBootstrapResponse:
     """Build the global-shell identity without full account hydration.
 
-    The blocking SSR route intentionally omits ``db_session`` so avatar
-    enrichment cannot add another database round trip to the first byte.
-    Callers that explicitly need the lightweight avatar projection may still
-    provide the request session.
+    The blocking SSR shell supplies ``db_session`` for a lightweight avatar
+    projection. The query reads only the current profile's avatar URL; it does
+    not hydrate the full profile read model or issue a second browser request.
     """
 
     if db_session is None:

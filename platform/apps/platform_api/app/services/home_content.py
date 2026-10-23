@@ -36,13 +36,15 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v7:"
-PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v5"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v9:"
+PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v6"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v1"
+PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
 PATCH_SITEMAP_INDEX_KEY = "platform:seo:patch-index:v1"
 PATCH_DETAIL_TTL_SECONDS = 30 * 24 * 60 * 60
 PATCH_ASSET_CATALOG_TTL_SECONDS = 6 * 60 * 60
 PATCH_ASSET_CATALOG_STALE_TTL_SECONDS = 30 * 24 * 60 * 60
+PATCH_ASSET_PENDING_RETRY_SECONDS = 5 * 60
 REFRESH_LOCK_SECONDS = 30
 HOME_PATCH_LIMIT = 4
 HOME_VIDEO_LIMIT = 4
@@ -230,7 +232,40 @@ def _is_official_deadlock_announcement(item: dict[str, Any]) -> bool:
 
 def _asset_url(public_path: Any) -> str | None:
     normalized = str(public_path or "").strip()
-    return f"{DEADLOCK_ASSET_BASE_URL}{normalized}" if normalized.startswith("/assets/") else None
+    if (
+        not normalized.startswith("/assets/")
+        or any(character in normalized for character in ("?", "#", "\\", "\x00"))
+        or any(segment in {".", ".."} for segment in normalized.split("/"))
+    ):
+        return None
+    return f"{DEADLOCK_ASSET_BASE_URL}{normalized}"
+
+
+def _localized_catalog_text(value: Any, *, max_length: int) -> str | None:
+    """Return safe Russian-first plain text from localized game catalog data."""
+    if isinstance(value, dict):
+        localized = value.get("byLanguage")
+        candidate = (
+            localized.get("russian") if isinstance(localized, dict) else None
+        ) or value.get("english")
+    else:
+        candidate = value
+    if not isinstance(candidate, str) or not candidate.strip():
+        return None
+    # The source contains HTML and inline game tokens; neither is browser markup.
+    plain = _plain_text(candidate, max_length=max_length)
+    plain = re.sub(r"\{[gs]:[^{}]{1,160}\}", "", plain)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return plain or None
+
+
+def _has_russian_catalog_text(value: Any) -> bool:
+    localized = value.get("byLanguage") if isinstance(value, dict) else None
+    return bool(
+        isinstance(localized, dict)
+        and isinstance(localized.get("russian"), str)
+        and localized["russian"].strip()
+    )
 
 
 def _strip_named_change_prefix(change: str, name: str) -> str:
@@ -338,6 +373,8 @@ def _build_asset_catalog(
     *,
     supplemental_hero_payload: list[dict[str, Any]] | None = None,
     supplemental_item_payload: list[dict[str, Any]] | None = None,
+    localized_supplemental_hero_payload: list[dict[str, Any]] | None = None,
+    localized_supplemental_item_payload: list[dict[str, Any]] | None = None,
     icon_payload: dict[str, Any] | None = None,
     previous_catalog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -351,7 +388,8 @@ def _build_asset_catalog(
         canonical_name = "The Doorman" if display_name == "Doorman" else display_name
         abilities: dict[str, Any] = {}
         for ability in hero.get("abilities") or []:
-            ability_name = str((ability.get("displayName") or {}).get("english") or "").strip()
+            ability_names = ability.get("displayName") or {}
+            ability_name = str(ability_names.get("english") or "").strip()
             if not ability_name or ability_name.startswith("ability_"):
                 continue
             icon = _asset_url(((ability.get("assets") or {}).get("icon") or {}).get("publicPath"))
@@ -359,15 +397,40 @@ def _build_asset_catalog(
                 "id": ability.get("id"),
                 "slug": str(ability.get("slug") or ability.get("class_name") or "").strip().casefold() or None,
                 "name": ability_name,
+                "display_name": _localized_catalog_text(ability_names, max_length=120),
+                "description": _localized_catalog_text(
+                    ability.get("description"), max_length=2400
+                ),
+                "description_requires_translation": bool(
+                    _localized_catalog_text(ability.get("description"), max_length=2400)
+                    and not _has_russian_catalog_text(ability.get("description"))
+                ),
+                "russian_metadata_available": _has_russian_catalog_text(ability_names)
+                and _has_russian_catalog_text(ability.get("description")),
                 "icon_url": icon,
             }
+        assets = hero.get("assets") or {}
         hero_value = {
             "name": canonical_name,
+            "hero_id": hero.get("heroId") if isinstance(hero.get("heroId"), int) else None,
+            "display_name": _localized_catalog_text(hero.get("displayName"), max_length=120),
+            "description": _localized_catalog_text(hero.get("lore"), max_length=8000),
+            "description_requires_translation": bool(
+                _localized_catalog_text(hero.get("lore"), max_length=8000)
+                and not _has_russian_catalog_text(hero.get("lore"))
+            ),
+            "russian_metadata_available": _has_russian_catalog_text(hero.get("displayName"))
+            and _has_russian_catalog_text(hero.get("lore")),
             "slug": str(hero.get("slug") or "").strip(),
             "icon_url": _asset_url(
-                (((hero.get("assets") or {}).get("card") or {}).get("publicPath"))
-                or (((hero.get("assets") or {}).get("portrait") or {}).get("publicPath"))
-                or (((hero.get("assets") or {}).get("icon") or {}).get("publicPath"))
+                ((assets.get("card") or {}).get("publicPath"))
+                or ((assets.get("portrait") or {}).get("publicPath"))
+                or ((assets.get("icon") or {}).get("publicPath"))
+            ),
+            "hero_image_url": _asset_url(
+                ((assets.get("card") or {}).get("publicPath"))
+                or ((assets.get("portrait") or {}).get("publicPath"))
+                or ((assets.get("icon") or {}).get("publicPath"))
             ),
             "abilities": abilities,
         }
@@ -376,8 +439,11 @@ def _build_asset_catalog(
         if source_slug:
             primary_heroes_by_slug[source_slug] = hero_value
         source_id = hero.get("id")
+        source_hero_id = hero.get("heroId")
         if isinstance(source_id, (int, str)) and str(source_id).strip():
             primary_heroes_by_id[str(source_id).strip()] = hero_value
+        if isinstance(source_hero_id, (int, str)) and str(source_hero_id).strip():
+            primary_heroes_by_id[str(source_hero_id).strip()] = hero_value
         if display_name.casefold() in {"doorman", "the doorman"}:
             heroes["doorman"] = hero_value
             heroes["the doorman"] = hero_value
@@ -399,6 +465,21 @@ def _build_asset_catalog(
         for item in supplemental_item_payload or []
         if isinstance(item, dict) and str(item.get("class_name") or "").strip()
     }
+    localized_heroes_by_id = {
+        str(hero.get("id")): hero
+        for hero in localized_supplemental_hero_payload or []
+        if isinstance(hero, dict) and hero.get("id") is not None
+    }
+    localized_heroes_by_class = {
+        str(hero.get("class_name") or "").strip().casefold(): hero
+        for hero in localized_supplemental_hero_payload or []
+        if isinstance(hero, dict) and str(hero.get("class_name") or "").strip()
+    }
+    localized_items = {
+        str(item.get("class_name") or "").strip().casefold(): item
+        for item in localized_supplemental_item_payload or []
+        if isinstance(item, dict) and str(item.get("class_name") or "").strip()
+    }
     for source_name, hero in (
         supplemental_heroes.items() if supplemental_sources_available else ()
     ):
@@ -407,6 +488,10 @@ def _build_asset_catalog(
         class_name = str(hero.get("class_name") or "").strip()
         source_slug = _normalize_hero_slug(class_name)
         source_id = hero.get("id")
+        localized_hero = (
+            localized_heroes_by_id.get(str(source_id))
+            or localized_heroes_by_class.get(class_name.casefold())
+        )
         existing = (
             heroes.get(canonical_key)
             or primary_heroes_by_slug.get(source_slug)
@@ -422,12 +507,47 @@ def _build_asset_catalog(
             if class_name:
                 existing.setdefault("class_name", class_name)
                 existing.setdefault("source", "deadlock-api")
-            _merge_hero_abilities(existing, _supplemental_hero_abilities(hero, supplemental_items))
+            if isinstance(localized_hero, dict):
+                localized_description = localized_hero.get("description")
+                russian_lore = _plain_text(
+                    str((localized_description or {}).get("lore") or ""),
+                    max_length=8000,
+                )
+                english_description = hero.get("description")
+                english_lore = _plain_text(
+                    str((english_description or {}).get("lore") or ""),
+                    max_length=8000,
+                )
+                lore = russian_lore or english_lore
+                localized_name = str(localized_hero.get("name") or "").strip()
+                images = hero.get("images") if isinstance(hero.get("images"), dict) else {}
+                try:
+                    image_url = _https_url(
+                        images.get("icon_hero_card_webp") or images.get("icon_hero_card"),
+                        host_suffixes=DEADLOCK_API_ASSET_HOST_SUFFIXES,
+                    )
+                except ValueError:
+                    image_url = None
+                if localized_name:
+                    existing["display_name"] = localized_name
+                if lore:
+                    existing["description"] = lore
+                    existing["description_requires_translation"] = bool(
+                        english_lore and not russian_lore
+                    )
+                if image_url:
+                    existing["hero_image_url"] = image_url
+                existing["hero_id"] = hero.get("id")
+                existing["russian_metadata_available"] = bool(localized_name and russian_lore)
+            _merge_hero_abilities(
+                existing,
+                _supplemental_hero_abilities(hero, supplemental_items, localized_items),
+            )
             continue
         hero_id = hero.get("id")
         if not class_name or not isinstance(hero_id, int) or hero_id <= 0:
             continue
-        abilities = _supplemental_hero_abilities(hero, supplemental_items)
+        abilities = _supplemental_hero_abilities(hero, supplemental_items, localized_items)
         images = hero.get("images") if isinstance(hero.get("images"), dict) else {}
         icon_url = None
         for image_key in ("icon_hero_card_webp", "icon_hero_card", "icon_image_small_webp", "icon_image_small"):
@@ -440,13 +560,37 @@ def _build_asset_catalog(
                 continue
             if icon_url:
                 break
+        localized_description = (
+            localized_hero.get("description") if isinstance(localized_hero, dict) else None
+        )
+        russian_lore = _plain_text(
+            str((localized_description or {}).get("lore") or ""),
+            max_length=8000,
+        )
+        english_description = hero.get("description")
+        english_lore = _plain_text(
+            str((english_description or {}).get("lore") or ""),
+            max_length=8000,
+        )
+        lore = russian_lore or english_lore
+        localized_name = (
+            str(localized_hero.get("name") or "").strip()
+            if isinstance(localized_hero, dict)
+            else ""
+        )
         hero_value = {
             "id": hero_id,
+            "hero_id": hero_id,
             "class_name": class_name,
             "name": canonical_name,
+            "display_name": localized_name or None,
+            "description": lore or None,
+            "description_requires_translation": bool(english_lore and not russian_lore),
+            "russian_metadata_available": bool(localized_name and russian_lore),
             "slug": source_slug,
             "source": "deadlock-api",
             "icon_url": icon_url,
+            "hero_image_url": icon_url,
             "abilities": abilities,
         }
         heroes[canonical_key] = hero_value
@@ -540,6 +684,7 @@ def _normalize_hero_slug(value: Any) -> str:
 def _supplemental_hero_abilities(
     hero: dict[str, Any],
     supplemental_items: dict[str, dict[str, Any]],
+    localized_items: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     slot_items = hero.get("items") if isinstance(hero.get("items"), dict) else {}
     abilities: dict[str, Any] = {}
@@ -559,10 +704,46 @@ def _supplemental_hero_abilities(
             )
         except ValueError:
             pass
+        localized_ability = localized_items.get(ability_class)
+        english_ability = supplemental_items.get(ability_class)
+        localized_description = (
+            localized_ability.get("description")
+            if isinstance(localized_ability, dict)
+            else None
+        )
+        russian_description = _plain_text(
+            str((localized_description or {}).get("desc") or ""),
+            max_length=2400,
+        )
+        english_description = (
+            english_ability.get("description")
+            if isinstance(english_ability, dict)
+            else None
+        )
+        english_description_text = _plain_text(
+            str((english_description or {}).get("desc") or ""),
+            max_length=2400,
+        )
+        description = russian_description or english_description_text
+        description = re.sub(r"\{[gs]:[^{}]{1,160}\}", "", description)
         abilities[ability_name.casefold()] = {
             "id": ability.get("id"),
             "slug": ability_class,
             "name": ability_name,
+            "display_name": (
+                str(localized_ability.get("name") or "").strip() or None
+                if isinstance(localized_ability, dict)
+                else None
+            ),
+            "description": description or None,
+            "description_requires_translation": bool(
+                description and not russian_description
+            ),
+            "russian_metadata_available": bool(
+                isinstance(localized_ability, dict)
+                and str(localized_ability.get("name") or "").strip()
+                and russian_description
+            ),
             "icon_url": icon_url,
         }
     return abilities
@@ -598,7 +779,16 @@ def _merge_hero_abilities(target: dict[str, Any], abilities: Any) -> None:
             previous_name = str(merged.get("name") or prior_alias).strip()
             if previous_name and previous_name.casefold() != str(ability.get("name") or "").strip().casefold():
                 legacy_aliases = [*legacy_aliases, previous_name]
-        for field in ("id", "slug", "name"):
+        for field in (
+            "id",
+            "slug",
+            "name",
+            "display_name",
+            "description",
+            "description_requires_translation",
+            "russian_metadata_available",
+            "icon_url",
+        ):
             if ability.get(field) not in (None, ""):
                 merged[field] = ability[field]
         if legacy_aliases:
@@ -616,15 +806,34 @@ async def _fetch_deadlock_asset_catalog(
     *,
     previous_catalog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    hero_response, item_response, supplemental_heroes_result, supplemental_items_result = await asyncio.gather(
+    (
+        hero_response,
+        item_response,
+        supplemental_heroes_result,
+        supplemental_items_result,
+        localized_supplemental_heroes_result,
+        localized_supplemental_items_result,
+    ) = await asyncio.gather(
         client.get(DEADLOCK_HERO_INDEX_URL),
         client.get(DEADLOCK_ITEM_INDEX_URL),
         client.get(
             DEADLOCK_ASSET_HERO_INDEX_URL,
+            params={"language": "english"},
             headers={"User-Agent": "OldSparky/1.0 (https://old-sparky.com)"},
         ),
         client.get(
             DEADLOCK_ASSET_ITEM_INDEX_URL,
+            params={"language": "english"},
+            headers={"User-Agent": "OldSparky/1.0 (https://old-sparky.com)"},
+        ),
+        client.get(
+            DEADLOCK_ASSET_HERO_INDEX_URL,
+            params={"language": "russian"},
+            headers={"User-Agent": "OldSparky/1.0 (https://old-sparky.com)"},
+        ),
+        client.get(
+            DEADLOCK_ASSET_ITEM_INDEX_URL,
+            params={"language": "russian"},
             headers={"User-Agent": "OldSparky/1.0 (https://old-sparky.com)"},
         ),
         return_exceptions=True,
@@ -686,12 +895,40 @@ async def _fetch_deadlock_asset_catalog(
                 logger.warning("deadlock_asset_refresh_failed source=asset-items invalid-payload")
         except Exception:  # noqa: BLE001
             logger.warning("deadlock_asset_refresh_failed source=asset-items")
+    localized_supplemental_heroes: list[dict[str, Any]] | None = None
+    localized_supplemental_items: list[dict[str, Any]] | None = None
+    if isinstance(localized_supplemental_heroes_result, Exception):
+        logger.warning("deadlock_asset_refresh_failed source=asset-heroes-locale")
+    else:
+        try:
+            localized_supplemental_heroes_result.raise_for_status()
+            decoded_heroes = localized_supplemental_heroes_result.json()
+            if isinstance(decoded_heroes, list) and decoded_heroes:
+                localized_supplemental_heroes = decoded_heroes
+            else:
+                logger.warning("deadlock_asset_refresh_failed source=asset-heroes-locale invalid-payload")
+        except Exception:  # noqa: BLE001
+            logger.warning("deadlock_asset_refresh_failed source=asset-heroes-locale")
+    if isinstance(localized_supplemental_items_result, Exception):
+        logger.warning("deadlock_asset_refresh_failed source=asset-items-locale")
+    else:
+        try:
+            localized_supplemental_items_result.raise_for_status()
+            decoded_items = localized_supplemental_items_result.json()
+            if isinstance(decoded_items, list) and decoded_items:
+                localized_supplemental_items = decoded_items
+            else:
+                logger.warning("deadlock_asset_refresh_failed source=asset-items-locale invalid-payload")
+        except Exception:  # noqa: BLE001
+            logger.warning("deadlock_asset_refresh_failed source=asset-items-locale")
     return _build_asset_catalog(
         hero_response.json(),
         item_response.json(),
         rank_payload,
         supplemental_hero_payload=supplemental_heroes,
         supplemental_item_payload=supplemental_items,
+        localized_supplemental_hero_payload=localized_supplemental_heroes,
+        localized_supplemental_item_payload=localized_supplemental_items,
         icon_payload=icon_payload,
         previous_catalog=previous_catalog,
     )
@@ -851,6 +1088,9 @@ def _structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dic
                     "kind": "hero",
                     "title": str(hero.get("name") or matched_hero_alias.title()),
                     "hero_name": str(hero.get("name") or matched_hero_alias.title()),
+                    "hero_display_name": hero.get("display_name"),
+                    "hero_image_url": hero.get("hero_image_url") or hero.get("icon_url"),
+                    "hero_description": hero.get("description"),
                     "changes": [],
                     "abilities": [],
                     "_ability_map": {},
@@ -876,6 +1116,8 @@ def _structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dic
             if ability_section is None:
                 ability_section = {
                     "name": ability["name"],
+                    "display_name": ability.get("display_name"),
+                    "description": ability.get("description"),
                     "icon_url": ability.get("icon_url"),
                     "changes": [],
                 }

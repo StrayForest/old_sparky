@@ -2,6 +2,15 @@ name: Platform production content diagnostics
 
 on:
   workflow_dispatch:
+    inputs:
+      expected_home_patch_ids:
+        description: Optional comma-separated four patch IDs for release-specific acceptance
+        required: false
+        type: string
+      expected_hero_patch_ids:
+        description: Optional comma-separated three hero patch IDs for release-specific acceptance
+        required: false
+        type: string
   workflow_run:
     workflows: ["Platform production deploy"]
     types: [completed]
@@ -333,6 +342,8 @@ jobs:
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          EXPECTED_HOME_PATCH_IDS: ${{ inputs.expected_home_patch_ids || '' }}
+          EXPECTED_HERO_PATCH_IDS: ${{ inputs.expected_hero_patch_ids || '' }}
         run: |
           set -euo pipefail
           umask 077
@@ -341,6 +352,28 @@ jobs:
           : >"$remote_log"
           : >"$remote_error"
           chmod 600 "$remote_log" "$remote_error"
+          if [[ -n "$EXPECTED_HOME_PATCH_IDS" || -n "$EXPECTED_HERO_PATCH_IDS" ]]; then
+            [[ "$EXPECTED_HOME_PATCH_IDS" =~ ^[0-9]{1,32}(,[0-9]{1,32}){3}$ ]]
+            [[ "$EXPECTED_HERO_PATCH_IDS" =~ ^[0-9]{1,32}(,[0-9]{1,32}){2}$ ]]
+            IFS=',' read -r -a expected_home_ids <<< "$EXPECTED_HOME_PATCH_IDS"
+            IFS=',' read -r -a expected_hero_ids <<< "$EXPECTED_HERO_PATCH_IDS"
+            declare -A expected_home_seen=()
+            declare -A expected_hero_seen=()
+            for patch_id in "${expected_home_ids[@]}"; do
+              [[ -z "${expected_home_seen[$patch_id]+x}" ]] || { echo 'duplicate home patch ID'; exit 2; }
+              expected_home_seen[$patch_id]=1
+            done
+            for patch_id in "${expected_hero_ids[@]}"; do
+              [[ -z "${expected_hero_seen[$patch_id]+x}" ]] || { echo 'duplicate hero patch ID'; exit 2; }
+              expected_hero_seen[$patch_id]=1
+            done
+            [[ ",$EXPECTED_HOME_PATCH_IDS," == *",${EXPECTED_HERO_PATCH_IDS%%,*},"* ]]
+            hero_remainder="${EXPECTED_HERO_PATCH_IDS#*,}"
+            [[ ",$EXPECTED_HOME_PATCH_IDS," == *",${hero_remainder%%,*},"* ]]
+            [[ ",$EXPECTED_HOME_PATCH_IDS," == *",${hero_remainder#*,},"* ]]
+          fi
+          printf -v remote_command 'bash -s -- %q %q %q' \
+            "$TARGET_SHA" "$EXPECTED_HOME_PATCH_IDS" "$EXPECTED_HERO_PATCH_IDS"
           set +e
           ssh \
             -o BatchMode=yes \
@@ -349,9 +382,11 @@ jobs:
             -F "$SSH_DIR/config" \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$TARGET_SHA'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
+            "$remote_command" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
           target_sha="$1"
+          expected_home_patch_ids="$2"
+          expected_hero_patch_ids="$3"
           runtime=/opt/oldsparky/platform
           guard="$runtime/current/tools/platform_release_lock_exec.sh"
           test -f "$guard" && test ! -L "$guard" && test -x "$guard" \
@@ -359,8 +394,10 @@ jobs:
           /bin/bash "$guard" \
             --app-dir "$runtime" \
             --expected-sha "$target_sha" \
-            -- /bin/bash -s <<'MUTATION'
+            -- /bin/bash -s -- "$expected_home_patch_ids" "$expected_hero_patch_ids" <<'MUTATION'
           set -Eeuo pipefail
+          expected_home_patch_ids="$1"
+          expected_hero_patch_ids="$2"
           runtime=/opt/oldsparky/platform
           cd "$runtime/current"
           python_bin="$runtime/shared/venv/bin/python"
@@ -503,6 +540,17 @@ jobs:
           )
           PY
 
+          echo '=== Bounded public home and current patch cache reads ==='
+          export PLATFORM_APP_DIR="$runtime"
+          export PLATFORM_SHARED_DIR="$runtime/shared"
+          export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
+          export PLATFORM_PUBLIC_CONTENT_EXPECTED_HOME_PATCH_IDS="$expected_home_patch_ids"
+          export PLATFORM_PUBLIC_CONTENT_EXPECTED_HERO_PATCH_IDS="$expected_hero_patch_ids"
+          source "$runtime/current/tools/platform_runtime_common.sh"
+          platform_load_env_file
+          export PYTHONPATH="$runtime/current"
+          "$python_bin" tools/platform_public_content_diagnostic.py
+
           echo '=== Recent worker YouTube log summary ==='
           worker_raw_log_file="$(mktemp)"
           worker_log_file="$(mktemp)"
@@ -529,14 +577,37 @@ jobs:
           REMOTE
           remote_status=$?
           set -e
+          sample_line_count="$(grep -c '^PUBLIC_CONTENT_SAMPLE_JSON ' "$remote_log" || true)"
+          sample_line="$(grep '^PUBLIC_CONTENT_SAMPLE_JSON ' "$remote_log" | tail -n 1 || true)"
+          sample_line_valid=0
+          if [[ "$sample_line_count" == 1 ]] \
+            && [[ "${#sample_line}" -le 8192 ]] \
+            && [[ "$sample_line" =~ ^PUBLIC_CONTENT_SAMPLE_JSON\ \{"schema":1,"kind":"bounded_public_content_read_diagnostic","status":"(passed|incomplete|failed)", ]]; then
+            sample_line_valid=1
+            printf '%s\n' "$sample_line"
+          fi
           if (( remote_status != 0 )); then
             rm -f -- "$remote_log" "$remote_error"
-            printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=failed error_class=remote_or_transport'
+            if (( sample_line_valid == 1 )); then
+              printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=failed error_class=content_sample'
+            else
+              printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=failed error_class=remote_or_transport'
+            fi
             exit 1
           fi
           if ! grep -Eq '^CONTENT_ASSERT latest_video_id=(unavailable|[A-Za-z0-9_-]{1,128}) status=matched$' "$remote_log"; then
             rm -f -- "$remote_log" "$remote_error"
             printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=failed error_class=producer'
+            exit 1
+          fi
+          if [[ "$sample_line_count" != 1 ]] \
+            || [[ "${#sample_line}" -gt 8192 ]] \
+            || (( sample_line_valid != 1 )) \
+            || [[ "$sample_line" != *'"status":"passed"'* ]] \
+            || [[ "$sample_line" != *'"coordinated_refreshes":1'* ]] \
+            || [[ "$sample_line" != *'"patch_details_present":4'* ]]; then
+            rm -f -- "$remote_log" "$remote_error"
+            printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=failed error_class=content_sample'
             exit 1
           fi
           printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=passed error_class=none'
