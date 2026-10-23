@@ -32,7 +32,13 @@ and its historical evidence live in
 
 ## Scope
 
-Only patch **change text** is translated. The translation subsystem must not translate structural/entity labels such as:
+Only patch **change text** is translated by the translation subsystem. Structural and entity labels keep their canonical English identity; the patch API may also provide separate Russian display labels and catalog-authored descriptions for hero sections and abilities.
+
+The current hero and ability catalog comes from the community Deadlock API's per-patch game-data endpoints (`/v1/assets/heroes` and `/v1/assets/items`), which expose the latest known client build and accept a `language=russian` parameter. Old Sparky joins the English and Russian payloads by stable hero ID and ability class name. The existing deadlock.io game-data feed remains a fallback source. These are community-parsed game files, not a Valve-operated API; Steam's announcement feed remains the source for patch prose. The API selects Russian values when present and English values otherwise, strips HTML and inline game tokens from descriptions, and constructs image URLs only from validated relative `/assets/` paths or the fixed Deadlock API asset CDN host. Catalog HTML is never rendered.
+
+When a new Steam announcement appears, the normal home-content refresh fetches the catalog in the same bounded refresh. The worker's existing `home-content-refresh` schedule checks the Steam feed every 5 minutes. It avoids downloading asset bundles when nothing changed, and retries cached hero announcements with genuinely incomplete catalog fields at most once per 5 minutes, under the existing Redis lock. Catalog-pending state is separate from Russian-translation-pending state, so a source-known English fallback does not trigger repeated asset downloads. This lets game data arrive without code changes; an announcement can precede its asset source, in which case the UI reports metadata as pending. Missing Russian descriptions use English game text when available, otherwise the matching Steam ability span, and register those `description` fields directly with the existing DB-first translation pipeline. Detection is bounded by the 5-minute schedule; upstream publication delay remains outside the service's control.
+
+The translation subsystem must not translate structural/entity labels such as:
 
 - hero names;
 - item names;
@@ -40,7 +46,7 @@ Only patch **change text** is translated. The translation subsystem must not tra
 - rank names;
 - section titles and other patch structure fields.
 
-Those labels remain in the canonical form already used by the site. Protected game entity names that appear inside a change sentence are replaced with placeholders before the model call and restored unchanged afterwards.
+Protected game entity names that appear inside a change sentence are replaced with placeholders before the model call and restored unchanged afterwards.
 
 The only current exception to blind entity placeholdering is the explicit
 ambiguity set in `patch_translation_glossary.py`. Those strings remain visible
@@ -138,6 +144,8 @@ details: on a new-namespace miss, reparse that cached source with the current pa
 new key, including a translation record keyed by the new source hash. A cold catalog may defer one bounded refresh
 for that exact patch ID; it must not fan out a full-history reprocess. A parser fix for future refreshes alone does
 not repair existing cached details, and existing translation rows are not automatically valid for changed segments.
+Hero display metadata follows the same catalog refresh and exact-ID patch-cache repair path; the English source
+content and canonical patch labels remain intact.
 
 A translation-version bump intentionally invalidates previous translation result cache entries when the translation contract or canonical glossary changes.
 

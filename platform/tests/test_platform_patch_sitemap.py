@@ -14,6 +14,7 @@ class _Pipeline:
     def __init__(self, cache: "_Cache") -> None:
         self.cache = cache
         self.set_calls: list[tuple[tuple, dict]] = []
+        self.delete_calls: list[tuple[str, ...]] = []
 
     async def __aenter__(self) -> "_Pipeline":
         return self
@@ -25,8 +26,15 @@ class _Pipeline:
         self.set_calls.append((args, kwargs))
         return self
 
+    def delete(self, *keys: str):
+        self.delete_calls.append(tuple(keys))
+        return self
+
     async def execute(self) -> list[bool]:
-        return [True] * len(self.set_calls)
+        for keys in self.delete_calls:
+            for key in keys:
+                self.cache.values.pop(key, None)
+        return [True] * (len(self.set_calls) + len(self.delete_calls))
 
 
 class _Cache:
@@ -158,6 +166,10 @@ class PatchSitemapProjectionTests(PlatformIsolatedAsyncioTestCase):
 
         self.assertEqual(payload["patches"], patches)
         self.assertEqual(events, ["translation", "sitemap"])
+        self.assertIn(
+            (home_content.PATCH_ASSET_PENDING_RETRY_KEY,),
+            cache.pipeline_instance.delete_calls,
+        )
 
     async def test_forced_refresh_rechecks_asset_sources_with_warm_catalog(self) -> None:
         warm_catalog = {"heroes": {"baba": {"name": "Baba"}}, "items": {}, "ranks": {}, "objectives": {}}

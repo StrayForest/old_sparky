@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from apps.platform_api.app.services.auth_bootstrap import build_auth_bootstrap
 from apps.platform_api.app.services.profile_read_models import ProfileAvatarReadModel
+from apps.platform_api.app.api.routes import auth as auth_routes
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
@@ -59,3 +60,24 @@ class AuthBootstrapServiceTests(PlatformIsolatedAsyncioTestCase):
         read_model.assert_awaited_once_with(db_session, "user-1")
         self.assertEqual(result.avatar_url, "/media/avatar-256.webp")
         self.assertIsNone(result.avatar_media)
+
+    async def test_bootstrap_route_includes_avatar_projection_for_shell(self) -> None:
+        auth_session = object()
+        db_session = object()
+        expected = object()
+
+        with (
+            patch(
+                "apps.platform_api.app.api.routes.auth.build_auth_bootstrap",
+                new=AsyncMock(return_value=expected),
+            ) as build_bootstrap,
+            patch(
+                "apps.platform_api.app.api.routes.auth.release_db_connection",
+                new=AsyncMock(),
+            ) as release_connection,
+        ):
+            result = await auth_routes.get_auth_bootstrap(auth_session, db_session)
+
+        self.assertIs(result, expected)
+        build_bootstrap.assert_awaited_once_with(auth_session, db_session=db_session)
+        release_connection.assert_awaited_once_with(db_session)

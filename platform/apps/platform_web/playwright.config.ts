@@ -56,7 +56,8 @@ export default defineConfig({
     {
       command: "../../tools/platform_node.sh tests/support/mock-platform-api.mjs",
       env: {
-        MOCK_PLATFORM_API_PORT: "3198"
+        MOCK_PLATFORM_API_PORT: "3198",
+        PLATFORM_WEB_HERMETIC_RUN_ID: process.env.PLATFORM_WEB_HERMETIC_RUN_ID ?? ""
       },
       url: "http://127.0.0.1:3198/api/v1/health/live",
       reuseExistingServer: false,
@@ -64,6 +65,9 @@ export default defineConfig({
     },
     {
       command: "../../tools/platform_node.sh tests/support/mock-profile-proxy.mjs",
+      env: {
+        PLATFORM_WEB_HERMETIC_RUN_ID: process.env.PLATFORM_WEB_HERMETIC_RUN_ID ?? ""
+      },
       url: "http://127.0.0.1:3199/api/v1/health/live",
       reuseExistingServer: false,
       timeout: 30_000
@@ -74,7 +78,8 @@ export default defineConfig({
         HOSTNAME: "127.0.0.1",
         PORT: "3100",
         PLATFORM_API_BASE_URL: "http://127.0.0.1:3199/api/v1",
-        PLATFORM_ADSENSE_ENABLED: "false"
+        PLATFORM_ADSENSE_ENABLED: "false",
+        PLATFORM_WEB_HERMETIC_RUN_ID: process.env.PLATFORM_WEB_HERMETIC_RUN_ID ?? ""
       },
       url: "http://127.0.0.1:3100",
       reuseExistingServer: false,

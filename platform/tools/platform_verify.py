@@ -855,6 +855,8 @@ def _validated_privileged_environment() -> tuple[dict[str, str], dict[str, str]]
     """
 
     child_env = os.environ.copy()
+    ci_venv_dir = child_env.get("PLATFORM_CI_VENV_DIR")
+    ci_python_bin: str | None = None
     app_parent = PLATFORM_ROOT.parent
     if app_parent.name == "releases" and (app_parent.parent / "shared").is_dir():
         app_dir = app_parent.parent
@@ -876,6 +878,21 @@ def _validated_privileged_environment() -> tuple[dict[str, str], dict[str, str]]
         child_env["PLATFORM_PYTHON_BIN"] = (
             child_env.get("PLATFORM_PYTHON_BIN") or "/usr/bin/python3"
         )
+    elif ci_venv_dir:
+        candidate = Path(ci_venv_dir)
+        if not candidate.is_absolute():
+            candidate = PLATFORM_ROOT / candidate
+        try:
+            candidate = candidate.resolve(strict=True)
+            candidate.relative_to(PLATFORM_ROOT.resolve(strict=True))
+        except (OSError, ValueError) as exc:
+            raise VerificationError(
+                "PLATFORM_CI_VENV_DIR must resolve to an existing venv under the platform root"
+            ) from exc
+        ci_venv_dir = str(candidate)
+        ci_python_bin = str(candidate / "bin" / "python")
+        child_env["PLATFORM_CI_VENV_DIR"] = ci_venv_dir
+        child_env["PLATFORM_PYTHON_BIN"] = ci_python_bin
     else:
         child_env["PLATFORM_PYTHON_BIN"] = str(
             PLATFORM_ROOT / ".venv_platform" / "bin" / "python"
@@ -898,6 +915,11 @@ def _validated_privileged_environment() -> tuple[dict[str, str], dict[str, str]]
 
         if os.path.lexists(env_file):
             child_env.update(load_env_file(env_file))
+        if ci_python_bin is not None:
+            # An explicit CI venv selection is a runner input, not a dotenv
+            # setting; keep the verified interpreter after parsing test resources.
+            child_env["PLATFORM_CI_VENV_DIR"] = ci_venv_dir or ""
+            child_env["PLATFORM_PYTHON_BIN"] = ci_python_bin
         resource_settings = {
             "platform_environment": child_env.get("PLATFORM_ENVIRONMENT"),
             "platform_database_url": child_env.get("PLATFORM_DATABASE_URL"),

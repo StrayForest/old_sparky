@@ -37,7 +37,8 @@ export default defineConfig({
       HOSTNAME: "127.0.0.1",
       PORT: String(webPort),
       PLATFORM_API_BASE_URL: `http://127.0.0.1:${apiPort}/api/v1`,
-      PLATFORM_ADSENSE_ENABLED: "false"
+      PLATFORM_ADSENSE_ENABLED: "false",
+      PLATFORM_WEB_HERMETIC_RUN_ID: process.env.PLATFORM_WEB_HERMETIC_RUN_ID ?? ""
     },
     url: `http://127.0.0.1:${webPort}/auth/login`,
     reuseExistingServer: false,
