@@ -7,6 +7,35 @@
 Use this protocol to reduce repeated context and tool output while preserving
 required evidence, review, safety checks and release gates.
 
+## Orchestrator and delegation
+
+- The primary agent coordinates only. Delegate repository inspection, edits,
+  checks and operations to `gpt-6-luna`; do not switch models. The primary
+  assigns scope, routes findings and reports status, but does not inspect or
+  edit implementation files or run repository checks.
+- Set reasoning effort to `low` for bounded research or mechanical work,
+  `medium` for related multi-file changes or behavioral reasoning, and `high`
+  for security, data integrity, release/recovery or broad cross-module work.
+  Use a higher effort only when the risk or dependencies need it.
+- Give each agent one clear owner scope and only the task-relevant context.
+  Parallelize independent work within available capacity. Prefer assigning
+  related follow-up work to an existing idle Luna agent with useful context.
+- When an agent fails or is interrupted, resume the same objective with a Luna
+  agent from the latest checkpoint. Pass the error, current worktree/branch,
+  owned paths and concise `git diff` summary. The retry checks the current diff,
+  preserves valid work and completes only the remaining work; do not repeat
+  completed actions or successful gates without a new change or failure signal.
+  Do not loop on an unchanged external blocker.
+- Keep checks narrow but complete: remove redundant exploration/output, never
+  required gates or evidence. The delegated owner runs checks and returns their
+  exact command, status, and report location.
+- The primary agent gives short, meaningful progress updates when a decision,
+  blocker or milestone changes. Do not repeat unchanged status or repeatedly
+  poll agents for reports; use the worker's checkpoint and request an update
+  when a dependency or handoff needs it. Keep the final handoff concise.
+- Token efficiency never justifies dropping security checks, required tests,
+  independent review or release/production gates.
+
 ## Keep context small and current
 
 - Keep one short active state in the task handoff: verified facts, source SHA,
@@ -59,6 +88,11 @@ required evidence, review, safety checks and release gates.
   inconclusive result, changed environment, or explicit required rerun. Do
   not omit required CI gates, independent review, rollback checks or production
   QA to save tokens.
+- Before a heavy full suite, finish targeted tests and independent review for
+  risky changes. A quiet wrapper's silence or a live process is not success:
+  wait for its exit and inspect the retained failure log on nonzero status.
+  After an interrupted build or browser run, verify owned processes and fixed
+  ports are clear before starting another build.
 - For gates that import runtime dependencies, use the canonical locked
   environment or defer to CI. Do not rebuild the environment one missing
   import at a time.
