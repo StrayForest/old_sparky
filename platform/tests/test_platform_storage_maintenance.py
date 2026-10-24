@@ -30,6 +30,7 @@ import yaml
 
 from tests import platform_test_lock_support as lock_support
 from tools import platform_backup_success_guard as backup_success_guard
+from tools import platform_release_retention as retention
 from tools import platform_storage_maintenance as maintenance
 from tools.platform_disk_policy import BYTES_PER_GIB, snapshot_from_usage
 from tools.platform_storage_maintenance import (
@@ -2097,6 +2098,63 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "gha-37760797674-1-80e457e57081",
             {entry.path.name for entry in production_plan.candidates},
         )
+
+    def test_canonical_maintenance_plan_merges_required_and_operator_pins(self) -> None:
+        app_dir = self.root / "canonical" / "platform"
+        (app_dir / "releases").mkdir(parents=True)
+        (app_dir / "shared").mkdir()
+        required = retention.REQUIRED_PROTECTED_RELEASES
+        operator_pin = "gha-operator-approved-retention-pin"
+        current = "current-release"
+        previous = "previous-release"
+        candidate = "old-release-candidate"
+        for slug in (*required, operator_pin, current, previous, candidate):
+            self.add_runtime_release(app_dir, slug)
+        (app_dir / "current").symlink_to(f"releases/{current}")
+        (app_dir / "previous").symlink_to(f"releases/{previous}")
+        args = self.maintenance_args(app_dir)
+        args.protected_release = [operator_pin]
+        args.apply = False
+
+        with mock.patch.object(retention, "PRODUCTION_APP_DIR", app_dir):
+            preview = maintenance._plan_and_maybe_apply(
+                args, app_dir=app_dir, source_release_dir=None
+            )[0]
+            args.apply = True
+            applied = maintenance._plan_and_maybe_apply(
+                args, app_dir=app_dir, source_release_dir=None
+            )[0]
+
+        for plan in (preview, applied):
+            protected_or_retained = {
+                entry.path.name for entry in (*plan.protected, *plan.retained)
+            }
+            self.assertTrue(set(required).issubset(protected_or_retained))
+            self.assertIn(operator_pin, protected_or_retained)
+            self.assertFalse(
+                set((*required, operator_pin))
+                & {entry.path.name for entry in plan.candidates}
+            )
+        self.assertFalse((app_dir / "releases" / candidate).exists())
+
+    def test_canonical_maintenance_fails_when_required_pin_is_missing(self) -> None:
+        app_dir = self.root / "canonical" / "platform"
+        (app_dir / "releases").mkdir(parents=True)
+        (app_dir / "shared").mkdir()
+        current = self.add_runtime_release(app_dir, "current-release")
+        previous = self.add_runtime_release(app_dir, "previous-release")
+        (app_dir / "current").symlink_to(current)
+        (app_dir / "previous").symlink_to(previous)
+        args = self.maintenance_args(app_dir)
+
+        with mock.patch.object(retention, "PRODUCTION_APP_DIR", app_dir):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "A required protected production release is missing",
+            ):
+                maintenance._plan_and_maybe_apply(
+                    args, app_dir=app_dir, source_release_dir=None
+                )
 
     def test_backup_failure_prevents_retention_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"

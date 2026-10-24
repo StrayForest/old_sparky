@@ -77,6 +77,8 @@ try:
     )
     from .platform_release_retention import (
         RetentionPlan,
+        _cli_protected_releases as resolve_cli_protected_releases,
+        _require_production_pins_present as require_production_pins_present,
         apply_plan as apply_release_plan,
         build_retention_plan,
         exclusive_directory_lock,
@@ -99,6 +101,8 @@ except ImportError:  # Direct execution from the tools directory.
     )
     from platform_release_retention import (
         RetentionPlan,
+        _cli_protected_releases as resolve_cli_protected_releases,
+        _require_production_pins_present as require_production_pins_present,
         apply_plan as apply_release_plan,
         build_retention_plan,
         exclusive_directory_lock,
@@ -2473,8 +2477,11 @@ def _plan_and_maybe_apply(
         app_dir,
         keep=args.release_keep,
         min_age_days=0,
-        protect_releases=tuple(getattr(args, "protected_release", None) or ()),
+        protect_releases=resolve_cli_protected_releases(
+            app_dir, tuple(getattr(args, "protected_release", None) or ())
+        ),
     )
+    require_production_pins_present(production_plan, app_dir=app_dir)
     if source_release_dir is None:
         source_plan = ArtifactRetentionPlan((), (), ())
         failed_builds: tuple[Path, ...] = ()
