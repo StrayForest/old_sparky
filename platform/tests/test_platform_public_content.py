@@ -18,6 +18,7 @@ from apps.platform_api.app.api.schemas import (
 from apps.platform_api.app.services import home_content
 from apps.platform_api.app.services import home_content_security
 from apps.platform_api.app.services import patch_detail
+from apps.platform_api.app.services import patch_detail_security
 from apps.platform_api.app.services import patch_translation
 from python_packages.platform_infra.config import PlatformSettings
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
@@ -991,6 +992,87 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             },
         )
         self.assertFalse(response.hero_metadata_pending)
+
+        catalog_description_patch = json.loads(
+            json.dumps(structured[1], ensure_ascii=False)
+        )
+        catalog_violet = next(
+            section
+            for section in catalog_description_patch["sections"]
+            if section["kind"] == "hero"
+        )
+        catalog_living_ink = next(
+            ability
+            for ability in catalog_violet["abilities"]
+            if ability["name"] == "Living Ink"
+        )
+        english_catalog_description = (
+            "Brush in hand, Violet approaches the ritual with the same "
+            "precision she does her art, wielding Living Ink that both "
+            "empowers her bullets, and draws mere inspiration into reality."
+        )
+        catalog_living_ink.update(
+            {
+                "description": english_catalog_description,
+                "description_requires_translation": True,
+                "russian_metadata_available": False,
+                "_description_source_text": english_catalog_description,
+            }
+        )
+        catalog_living_ink.pop("description_from_announcement", None)
+
+        async def translate_catalog_description(value: dict[str, object]) -> dict[str, object]:
+            copied = json.loads(json.dumps(value, ensure_ascii=False))
+            segment = next(
+                item
+                for item in patch_translation.extract_translation_segments(copied)
+                if item["text"] == catalog_living_ink["description"]
+            )
+            return patch_translation.merge_translation(
+                copied,
+                {
+                    segment["id"]: (
+                        "Виолетта обращается с Живой тушью с точностью художника: "
+                        "она усиливает её пули и воплощает вдохновение в реальность."
+                    )
+                },
+            )
+
+        with (
+            patch.object(
+                patch_detail_security,
+                "_cached_patch_source",
+                AsyncMock(return_value=catalog_description_patch),
+            ),
+            patch.object(
+                patch_detail_security,
+                "_cached_asset_catalog",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                patch_detail_security,
+                "apply_cached_patch_translation",
+                translate_catalog_description,
+            ),
+        ):
+            catalog_translated = await patch_detail_security.get_patch_detail(
+                "1846651706683085"
+            )
+
+        catalog_response = PatchDetailResponse.model_validate(catalog_translated)
+        catalog_violet_response = next(
+            section
+            for section in catalog_response.sections
+            if section.hero_name == "Violet"
+        )
+        catalog_living_ink_response = next(
+            ability
+            for ability in catalog_violet_response.abilities
+            if ability.name == "Living Ink"
+        )
+        self.assertTrue(catalog_living_ink_response.description.startswith("Виолетта"))
+        self.assertFalse(catalog_violet_response.hero_metadata_pending)
+        self.assertFalse(catalog_response.hero_metadata_pending)
 
     def test_patch_detail_groups_live_urn_and_rift_scope_in_fixed_order(self) -> None:
         urn_icon = (

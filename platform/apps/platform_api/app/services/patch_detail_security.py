@@ -8,7 +8,10 @@ from typing import Any
 import httpx
 
 from apps.platform_api.app.services import home_content as base
-from apps.platform_api.app.services.patch_detail import structure_patch_detail
+from apps.platform_api.app.services.patch_detail import (
+    finalize_patch_translation_metadata,
+    structure_patch_detail,
+)
 from apps.platform_api.app.services.patch_translation import (
     apply_cached_patch_translation,
     ensure_patch_translation_records,
@@ -309,4 +312,5 @@ async def get_patch_detail(patch_id: str) -> dict[str, Any] | None:
             source,
             catalog or {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}},
         )
-    return await apply_cached_patch_translation(structured)
+    translated = await apply_cached_patch_translation(structured)
+    return finalize_patch_translation_metadata(translated)

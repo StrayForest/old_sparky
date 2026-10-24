@@ -160,6 +160,11 @@ def _ability_section(
             "description_requires_translation": ability.get(
                 "description_requires_translation"
             ),
+            "_description_source_text": (
+                ability.get("description")
+                if ability.get("description_requires_translation")
+                else None
+            ),
             "russian_metadata_available": ability.get("russian_metadata_available"),
             "icon_url": ability.get("icon_url"),
             "changes": [],
@@ -722,11 +727,11 @@ async def get_patch_detail_source(patch_id: str) -> dict[str, Any] | None:
     return structure_patch_detail(raw, catalog)
 
 
-async def get_patch_detail(patch_id: str) -> dict[str, Any] | None:
-    source = await get_patch_detail_source(patch_id)
-    if source is None:
-        return None
-    translated = await apply_cached_patch_translation(source)
+def finalize_patch_translation_metadata(
+    translated: dict[str, Any],
+) -> dict[str, Any]:
+    """Update Russian metadata state after cached patch text translations merge."""
+
     pending = False
     for section in translated.get("sections") or []:
         if not isinstance(section, dict) or section.get("kind") != "hero":
@@ -739,17 +744,26 @@ async def get_patch_detail(patch_id: str) -> dict[str, Any] | None:
             )
             section.pop("hero_description_requires_translation", None)
         for ability in section.get("abilities") or []:
-            if not isinstance(ability, dict) or not ability.get("description_from_announcement"):
+            if not isinstance(ability, dict) or not (
+                ability.get("description_from_announcement")
+                or ability.get("description_requires_translation")
+            ):
                 continue
             source_text = ability.pop("_description_source_text", None)
             translated_text = str(ability.get("description") or "").strip()
-            if translated_text and translated_text != source_text:
-                ability["russian_metadata_available"] = True
-            else:
-                ability["russian_metadata_available"] = False
+            ability["russian_metadata_available"] = bool(
+                translated_text
+                and isinstance(source_text, str)
+                and source_text.strip()
+                and translated_text != source_text.strip()
+            )
+            was_announcement_fallback = bool(
+                ability.get("description_from_announcement")
+            )
             ability.pop("description_from_announcement", None)
             ability.pop("description_requires_translation", None)
-            ability["changes"] = []
+            if was_announcement_fallback:
+                ability["changes"] = []
         abilities_complete = bool(section.get("abilities")) and all(
             isinstance(ability, dict)
             and ability.get("display_name")
@@ -768,3 +782,11 @@ async def get_patch_detail(patch_id: str) -> dict[str, Any] | None:
         pending = pending or bool(section["hero_metadata_pending"])
     translated["hero_metadata_pending"] = pending
     return translated
+
+
+async def get_patch_detail(patch_id: str) -> dict[str, Any] | None:
+    source = await get_patch_detail_source(patch_id)
+    if source is None:
+        return None
+    translated = await apply_cached_patch_translation(source)
+    return finalize_patch_translation_metadata(translated)
