@@ -3761,10 +3761,15 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     TOOLS_DIR / "platform_workflow_provenance.py",
                     current_release_tools / "platform_workflow_provenance.py",
                 )
+                # The isolated installed validator imports this full sibling
+                # closure; repository `sys.path` is deliberately unavailable.
                 for helper_name in (
                     "platform_backup_restore_drill.py",
+                    "platform_backup_failure_receipt.py",
                     "platform_disk_policy.py",
+                    "platform_live_qa_machine_lock.py",
                     "platform_release_retention.py",
+                    "platform_storage_maintenance.py",
                 ):
                     shutil.copyfile(
                         TOOLS_DIR / helper_name,
