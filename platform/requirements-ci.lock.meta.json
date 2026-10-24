@@ -7,7 +7,7 @@
   "input_files": [
     {
       "path": "requirements-ci.in",
-      "sha256": "f692b40528b6ee545c5173d089e463d118cd26a6df69a6d51bbfaddb75f8f444"
+      "sha256": "6a1cc60e35faa1c793d058bcccdbfe737ebc2e2da7a162b0ef5909177343776b"
     },
     {
       "path": "requirements-platform.txt",
@@ -19,7 +19,7 @@
     }
   ],
   "lock_file": "requirements-ci.lock.txt",
-  "lock_sha256": "36659e8229a9ce96786781c36ab962421a8fb537186b0e00487f5074f2290c33",
+  "lock_sha256": "4fb21615650f65a748b4bceed97c9fb22d3b15ec1773af4f46c3722ff6f12843",
   "schema": 1,
   "target": {
     "architecture": "x86_64",
@@ -29,9 +29,9 @@
   "toolchain": {
     "pip": "26.2.1",
     "pip-tools": "7.6.1",
-    "setuptools": "84.0.0",
+    "setuptools": "84.1.0",
     "wheel": "0.48.0"
   },
   "toolchain_lock_file": "requirements-ci-locker.lock.txt",
-  "toolchain_lock_sha256": "4a229dac8f30095daf85c5e3ffe529f97b79ce44a6e04838d4dd1b2f9d5d62ac"
+  "toolchain_lock_sha256": "fa19f4fa1d499e65bfdbdf1d6787dc404f5ba9a3e6ef1f6a00843a6950f862f0"
 }

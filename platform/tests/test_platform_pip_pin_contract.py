@@ -73,7 +73,7 @@ class PlatformPipPinContractTests(unittest.TestCase):
         self.assertTrue(set(runtime).isdisjoint(quality))
 
         lock = _ci_lock_pins()
-        expected = {**runtime, **quality, "setuptools": "84.0.0", "wheel": "0.48.0"}
+        expected = {**runtime, **quality, "setuptools": "84.1.0", "wheel": "0.48.0"}
         for name, version in expected.items():
             self.assertEqual(lock.get(name), version, name)
         self.assertIn("pip", lock)
@@ -82,14 +82,14 @@ class PlatformPipPinContractTests(unittest.TestCase):
         locker = _ci_lock_pins(CI_LOCKER)
         self.assertEqual(locker["pip-tools"], "7.6.1")
         self.assertEqual(locker["pip"], "26.2.1")
-        self.assertEqual(locker["setuptools"], "84.0.0")
+        self.assertEqual(locker["setuptools"], "84.1.0")
         self.assertEqual(locker["wheel"], "0.48.0")
 
     def test_ci_input_and_generator_keep_one_canonical_source(self) -> None:
         ci_input = CI_INPUT.read_text(encoding="utf-8")
         self.assertIn("-r requirements-platform.txt", ci_input)
         self.assertIn("-r requirements-quality.txt", ci_input)
-        self.assertIn("setuptools==84.0.0", ci_input)
+        self.assertIn("setuptools==84.1.0", ci_input)
         self.assertIn("wheel==0.48.0", ci_input)
 
         generator = CI_LOCK_GENERATOR.read_text(encoding="utf-8")

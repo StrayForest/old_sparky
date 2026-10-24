@@ -249,7 +249,7 @@ payload = {
     "toolchain": {
         "pip-tools": "7.6.1",
         "pip": "26.2.1",
-        "setuptools": "84.0.0",
+        "setuptools": "84.1.0",
         "wheel": "0.48.0",
     },
     "freshness_policy": {

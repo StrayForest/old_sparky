@@ -8,5 +8,5 @@
 
 # A fresh venv's bundled pip is only a bootstrap interpreter. These explicit
 # pins make the installer toolchain itself part of the reproducible CI set.
-setuptools==84.0.0
+setuptools==84.1.0
 wheel==0.48.0

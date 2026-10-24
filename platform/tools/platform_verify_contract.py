@@ -1188,7 +1188,7 @@ def _ci_dependency_issues(security_text: str) -> list[str]:
         for marker in (
             "-r requirements-platform.txt",
             "-r requirements-quality.txt",
-            "setuptools==84.0.0",
+            "setuptools==84.1.0",
             "wheel==0.48.0",
         ):
             if marker not in input_text:
@@ -1218,7 +1218,7 @@ def _ci_dependency_issues(security_text: str) -> list[str]:
             if name in direct_pins:
                 issues.append(f"CI dependency inputs duplicate package: {name}")
             direct_pins[name] = match.group("version")
-    for name, version in {"setuptools": "84.0.0", "wheel": "0.48.0"}.items():
+    for name, version in {"setuptools": "84.1.0", "wheel": "0.48.0"}.items():
         if direct_pins.get(name) != version:
             issues.append(f"CI requirement input must pin {name}=={version}")
 
@@ -1272,7 +1272,7 @@ def _ci_dependency_issues(security_text: str) -> list[str]:
         "pip-tools": "7.6.1",
         "pip": "26.2.1",
         "pyproject-hooks": "1.2.0",
-        "setuptools": "84.0.0",
+        "setuptools": "84.1.0",
         "wheel": "0.48.0",
     }
     for name, version in expected_locker.items():
@@ -1315,7 +1315,7 @@ def _ci_dependency_issues(security_text: str) -> list[str]:
         if metadata.get("toolchain") != {
             "pip": "26.2.1",
             "pip-tools": "7.6.1",
-            "setuptools": "84.0.0",
+            "setuptools": "84.1.0",
             "wheel": "0.48.0",
         }:
             issues.append("CI lock metadata toolchain versions are not pinned")
