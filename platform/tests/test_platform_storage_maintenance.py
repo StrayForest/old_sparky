@@ -30,6 +30,7 @@ import yaml
 
 from tests import platform_test_lock_support as lock_support
 from tools import platform_backup_success_guard as backup_success_guard
+from tools import platform_maintenance_qa_evidence as maintenance_evidence
 from tools import platform_release_retention as retention
 from tools import platform_storage_maintenance as maintenance
 from tools.platform_disk_policy import BYTES_PER_GIB, snapshot_from_usage
@@ -840,6 +841,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             keep=14,
             max_age_hours=24.0,
             rotate_existing=False,
+            private_failure_diagnostics=False,
+            emit_private_failure_text=False,
             protected_backup_manifest=None,
             scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
         )
@@ -2010,6 +2013,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             keep=14,
             max_age_hours=24.0,
             rotate_existing=True,
+            private_failure_diagnostics=False,
+            emit_private_failure_text=False,
             protected_backup_manifest=manifest,
             scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
         )
@@ -2155,6 +2160,176 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 maintenance._plan_and_maybe_apply(
                     args, app_dir=app_dir, source_release_dir=None
                 )
+
+    @unittest.skipUnless(os.geteuid() == 0, "receipt identity fixture requires root")
+    def test_full_apply_private_diagnostics_writes_bound_failure_receipt(self) -> None:
+        app_dir = self.root / "canonical" / "platform"
+        release = app_dir / "releases" / "release-active"
+        (release / "shared").mkdir(parents=True)
+        (release / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": "a" * 40}), encoding="ascii"
+        )
+        (release / "RELEASE.json").chmod(0o444)
+        (app_dir / "shared").mkdir()
+        (app_dir / "current").symlink_to("releases/release-active")
+        invocation_id = "0123456789abcdef0123456789abcdef"
+        failure = maintenance.BackupCommandFailure(
+            backup_disk_diagnostic={
+                "schema": 1,
+                "phase": "scratch_image_postallocation",
+                "guard_reason": "disk_floor",
+                "free_bytes": 1,
+                "required_free_bytes": 2,
+            },
+            scratch_admission_diagnostic={
+                "schema": 1,
+                "phase": "pre_create_admission",
+                "guard_reason": "memory_reserve",
+                "available_bytes": 1,
+                "required_bytes": maintenance.backup_restore_drill.SCRATCH_MEMORY_ADMISSION_BYTES,
+                "helper_rss_bytes": None,
+                "direct_parent_rss_bytes": None,
+                "observed_pair_rss_bytes": None,
+                "observed_process_count": 0,
+            },
+            scratch_first_fault={
+                "schema": 1,
+                "origin": "worker",
+                "site": "worker_restore",
+                "exception_kind": "runtime",
+                "errno": None,
+                "raw_message": "Authorization: Bearer secret-token",
+            },
+        )
+        started_at = datetime.now(UTC) - timedelta(seconds=1)
+
+        with (
+            mock.patch.object(maintenance, "DEFAULT_APP_DIR", app_dir),
+            mock.patch.dict(os.environ, {"INVOCATION_ID": invocation_id}),
+            mock.patch.object(maintenance.sys, "argv", [
+                "platform_storage_maintenance.py",
+                "--app-dir",
+                str(app_dir),
+                "--apply",
+                "--private-backup-diagnostics",
+            ]),
+            mock.patch.object(maintenance, "run_maintenance", side_effect=failure),
+            mock.patch.object(maintenance.sys, "stdout", io.StringIO()) as stdout,
+            mock.patch.object(maintenance.sys, "stderr", io.StringIO()) as stderr,
+        ):
+            self.assertEqual(maintenance.main(), 1)
+
+        receipt_path = (
+            app_dir
+            / "shared"
+            / "maintenance"
+            / f"platform-maintenance-failure-{invocation_id}.json"
+        )
+        metadata = receipt_path.stat()
+        self.assertEqual(metadata.st_mode & 0o777, 0o600)
+        self.assertEqual(metadata.st_uid, 0)
+        self.assertEqual(metadata.st_nlink, 1)
+        payload = json.loads(receipt_path.read_text(encoding="ascii"))
+        self.assertEqual(payload["kind"], "storage_maintenance_backup_failure")
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["invocation_id"], invocation_id)
+        self.assertEqual(payload["active_release_id"], "release-active")
+        self.assertEqual(payload["source_sha"], "a" * 40)
+        self.assertEqual(
+            payload["backup_disk_diagnostic"]["phase"],
+            "scratch_image_postallocation",
+        )
+        self.assertEqual(payload["scratch_admission_diagnostic"]["observed_process_count"], 0)
+        self.assertNotIn("scratch_first_fault", payload)
+        serialized = json.dumps(payload)
+        self.assertNotIn("raw_message", serialized)
+        self.assertNotIn("secret-token", serialized)
+        self.assertNotIn("Platform backup failed.", stderr.getvalue())
+        self.assertIn("Platform storage maintenance (backup)", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+        completed_at = datetime.now(UTC) + timedelta(seconds=1)
+        with mock.patch.object(
+            maintenance_evidence,
+            "MAINTENANCE_REPORT_DIRECTORY",
+            receipt_path.parent,
+        ):
+            projected = maintenance_evidence.project_maintenance_backup_failure(
+                str(receipt_path),
+                invocation_id=invocation_id,
+                active_release_id="release-active",
+                source_sha="a" * 40,
+                invocation_started_at=started_at.isoformat().replace("+00:00", "Z"),
+                invocation_completed_at=completed_at.isoformat().replace("+00:00", "Z"),
+            )
+        self.assertEqual(projected["kind"], "storage_maintenance_backup_failure")
+        self.assertEqual(projected["status"], "failed")
+        self.assertEqual(
+            projected["backup_disk_diagnostic"]["phase"],
+            "scratch_image_postallocation",
+        )
+        self.assertNotIn("scratch_first_fault", projected)
+        self.assertNotIn("secret-token", json.dumps(projected))
+
+        with (
+            mock.patch.object(maintenance, "DEFAULT_APP_DIR", app_dir),
+            mock.patch.dict(os.environ, {"INVOCATION_ID": invocation_id}),
+            self.assertRaises(FileExistsError),
+        ):
+            maintenance.write_maintenance_backup_failure_receipt(
+                app_dir, failure, started_at=started_at
+            )
+
+    def test_full_maintenance_private_backup_failure_text_is_not_journaled(self) -> None:
+        app_dir = self.root / "runtime" / "platform"
+        raw_failure = RuntimeError("raw secret from restore failure")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "create_backup",
+                side_effect=raw_failure,
+            ),
+            mock.patch.object(maintenance.sys, "stderr", stderr),
+            self.assertRaises(maintenance.BackupCommandFailure),
+        ):
+            maintenance.run_backup(
+                app_dir,
+                keep=1,
+                private_failure_diagnostics=True,
+                emit_private_failure_text=False,
+            )
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_private_backup_diagnostics_allow_only_full_apply_with_backup(self) -> None:
+        valid = [
+            "platform_storage_maintenance.py",
+            "--apply",
+            "--private-backup-diagnostics",
+        ]
+        with mock.patch.object(maintenance.sys, "argv", valid):
+            args = maintenance.parse_args()
+        self.assertTrue(args.apply)
+        self.assertTrue(args.private_backup_diagnostics)
+        for argv in (
+            ["platform_storage_maintenance.py", "--private-backup-diagnostics"],
+            [
+                "platform_storage_maintenance.py",
+                "--apply",
+                "--skip-backup",
+                "--private-backup-diagnostics",
+            ],
+            [
+                "platform_storage_maintenance.py",
+                "--backup-only",
+                "--apply",
+                "--skip-backup",
+                "--private-backup-diagnostics",
+            ],
+        ):
+            with self.subTest(argv=argv), mock.patch.object(
+                maintenance.sys, "argv", argv
+            ), self.assertRaises(SystemExit):
+                maintenance.parse_args()
 
     def test_backup_failure_prevents_retention_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
@@ -2837,6 +3012,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "ExecStart=/opt/oldsparky/platform/shared/venv/bin/python "
                 "/opt/oldsparky/platform/current/tools/"
                 "platform_storage_maintenance.py --apply "
+                "--private-backup-diagnostics "
                 "--scratch-backend disk_ext4_image_v1 "
                 "--protected-backup-manifest "
                 "/opt/oldsparky/platform/shared/backup-retention/"
@@ -2850,6 +3026,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             ],
         )
         self.assertIn("--protected-backup-manifest", service)
+        self.assertIn("--private-backup-diagnostics", service)
         self.assertNotIn("--preserve-existing-backups", service)
         self.assertNotIn("prune-runtime-cache", service)
         retention = (
@@ -6704,6 +6881,12 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('"owner":"deadlock-maintenance.service"', workflow)
         self.assertIn('"state":"service_managed"', workflow)
+        self.assertIn("project-maintenance-backup-failure", workflow)
+        self.assertIn(
+            'platform-maintenance-failure-$service_invocation_after.json', workflow
+        )
+        self.assertIn('if (( service_status != 0 )); then', workflow)
+        self.assertIn('fail_with_status report_unavailable', workflow)
         self.assertNotIn("state=held", workflow)
         start_marker = 'report_name="$(/usr/bin/python3 -I - "$report_dir" '
         start = workflow.index(start_marker)

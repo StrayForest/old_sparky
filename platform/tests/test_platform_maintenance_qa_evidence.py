@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import io
 import json
@@ -629,6 +629,155 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                 rejected_proof, manifest_digest
             )
 
+    def test_maintenance_backup_failure_projection_is_exact_and_closed(self) -> None:
+        invocation_id = "0123456789abcdef0123456789abcdef"
+        source_sha = "a" * 40
+        started = datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC)
+        failed = started + timedelta(seconds=2)
+        completed = started + timedelta(seconds=4)
+        payload = {
+            "schema": 1,
+            "kind": "storage_maintenance_backup_failure",
+            "status": "failed",
+            "invocation_id": invocation_id,
+            "active_release_id": "release-active",
+            "source_sha": source_sha,
+            "started_at_utc": (started + timedelta(milliseconds=1)).isoformat().replace("+00:00", "Z"),
+            "failed_at_utc": failed.isoformat().replace("+00:00", "Z"),
+            "backup_disk_diagnostic": {
+                "schema": 1,
+                "phase": "scratch_image_postallocation",
+                "guard_reason": "disk_floor",
+                "free_bytes": 1,
+                "required_free_bytes": 2,
+            },
+            "scratch_admission_diagnostic": {
+                "schema": 1,
+                "phase": "pre_create_admission",
+                "guard_reason": "memory_reserve",
+                "available_bytes": 1024,
+                "required_bytes": 1 << 30,
+                "helper_rss_bytes": 400,
+                "direct_parent_rss_bytes": 600,
+                "observed_pair_rss_bytes": 1000,
+                "observed_process_count": 2,
+            },
+            "restore_diagnostic": {
+                "schema": 1,
+                "restore_stage": "restore_platform",
+                "guard_reason": "command_failed",
+                "free_bytes": 100,
+                "required_free_bytes": 200,
+                "temporary_database_created": False,
+                "drop_outcome": "not_required",
+                "temporary_database_absent": None,
+                "archive_sha256": "c" * 64,
+                "archive_size_bytes": 4096,
+            },
+            "scratch_host_guard_diagnostic": {
+                "schema": 2,
+                "guard_site": "parent_before_archive_open",
+                "guard_reason": "memory_reserve",
+                "available_bytes": 1,
+                "required_bytes": 1 << 30,
+            },
+        }
+        receipt_path = (
+            f"{evidence.MAINTENANCE_REPORT_DIRECTORY}/"
+            f"platform-maintenance-failure-{invocation_id}.json"
+        )
+        bindings = {
+            "invocation_id": invocation_id,
+            "active_release_id": "release-active",
+            "source_sha": source_sha,
+            "invocation_started_at": started.isoformat().replace("+00:00", "Z"),
+            "invocation_completed_at": completed.isoformat().replace("+00:00", "Z"),
+        }
+        with patch.object(
+            evidence,
+            "_read_private_maintenance_artifact",
+            return_value=payload,
+        ):
+            projected = evidence.project_maintenance_backup_failure(
+                receipt_path, **bindings
+            )
+        self.assertEqual(projected["status"], "failed")
+        self.assertEqual(projected["invocation_id"], invocation_id)
+        self.assertEqual(
+            projected["backup_disk_diagnostic"]["phase"],
+            "scratch_image_postallocation",
+        )
+        self.assertEqual(
+            projected["scratch_admission_diagnostic"]["observed_process_count"], 2
+        )
+        self.assertEqual(
+            projected["restore_diagnostic"]["restore_stage"], "restore_platform"
+        )
+        self.assertEqual(
+            projected["scratch_host_guard_diagnostic"]["available_bytes"], 1
+        )
+        serialized = json.dumps(projected)
+        self.assertNotIn("archive_sha256", serialized)
+        self.assertNotIn("helper_rss_bytes", serialized)
+
+        cli_stdout = io.StringIO()
+        with (
+            patch.object(
+                evidence,
+                "_read_private_maintenance_artifact",
+                return_value=payload,
+            ),
+            patch("sys.stdout", cli_stdout),
+        ):
+            self.assertEqual(
+                evidence.main(
+                    [
+                        "project-maintenance-backup-failure",
+                        receipt_path,
+                        invocation_id,
+                        "release-active",
+                        source_sha,
+                        bindings["invocation_started_at"],
+                        bindings["invocation_completed_at"],
+                    ]
+                ),
+                0,
+            )
+        cli_projection = json.loads(cli_stdout.getvalue())
+        self.assertEqual(cli_projection, projected)
+
+        invalid_cases = (
+            ("invocation", {**bindings, "invocation_id": "f" * 32}, payload),
+            ("release", {**bindings, "active_release_id": "other-release"}, payload),
+            ("source", {**bindings, "source_sha": "b" * 40}, payload),
+            (
+                "outside_time_window",
+                bindings,
+                {**payload, "failed_at_utc": (completed + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")},
+            ),
+            ("extra_top_field", bindings, {**payload, "raw_exception": "secret"}),
+            (
+                "extra_disk_field",
+                bindings,
+                {
+                    **payload,
+                    "backup_disk_diagnostic": {
+                        **payload["backup_disk_diagnostic"],
+                        "operator_secret": "secret",
+                    },
+                },
+            ),
+        )
+        for case, candidate_bindings, candidate_payload in invalid_cases:
+            with self.subTest(case=case), patch.object(
+                evidence,
+                "_read_private_maintenance_artifact",
+                return_value=candidate_payload,
+            ), self.assertRaises(evidence.EvidenceError):
+                evidence.project_maintenance_backup_failure(
+                    receipt_path, **candidate_bindings
+                )
+
     def test_qa_identity_is_rejected_before_any_api_request(self) -> None:
         for case, run_id, attempt in (
             ("zero-run-id", "0", "1"),
@@ -915,6 +1064,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                 evidence._safe_unit_bytes(str(immutable_unit), installed=False)
         preview_argv = evidence.maintenance_preview_argv()
         self.assertNotIn("--apply", preview_argv)
+        self.assertNotIn("--private-backup-diagnostics", preview_argv)
         self.assertEqual(
             preview_argv[preview_argv.index("--scratch-backend") + 1],
             "disk_ext4_image_v1",

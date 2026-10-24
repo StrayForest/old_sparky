@@ -654,10 +654,24 @@ def parse_args() -> argparse.Namespace:
         parser.error("authorization probe requires --json")
     if args.authorization_probe_only and not args.private_backup_diagnostics:
         parser.error("authorization probe requires private closed diagnostics")
+    full_apply_with_backup = (
+        args.apply
+        and not args.skip_backup
+        and not args.backup_only
+        and not args.verify_existing_backup_only
+        and not args.authorization_probe_only
+        and not args.purge_profile_access_cache_after_restore
+    )
     if args.private_backup_diagnostics and not (
-        args.backup_only or args.verify_existing_backup_only or args.authorization_probe_only
+        args.backup_only
+        or args.verify_existing_backup_only
+        or args.authorization_probe_only
+        or full_apply_with_backup
     ):
-        parser.error("--private-backup-diagnostics requires a backup-only mode")
+        parser.error(
+            "--private-backup-diagnostics requires backup-only, verification-only, "
+            "authorization-probe, or full apply with backup creation"
+        )
     if args.report_keep < 1:
         parser.error("--report-keep must be at least 1")
     if not 1 <= args.live_qa_runtime_keep <= 100:
@@ -1038,6 +1052,7 @@ def run_backup(
     max_age_hours: float = 24.0,
     rotate_existing: bool = True,
     private_failure_diagnostics: bool = False,
+    emit_private_failure_text: bool = True,
     protected_backup_manifest: Path | None = None,
     scratch_backend: str = backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
 ) -> dict[str, Any]:
@@ -1067,7 +1082,7 @@ def run_backup(
         private_frame = backup_restore_drill.private_failure_frame_for_exception(
             exc, enabled=private_failure_diagnostics
         )
-        if private_failure_diagnostics:
+        if private_failure_diagnostics and emit_private_failure_text:
             forwarded = ""
             if private_frame is not None:
                 forwarded = private_frame[:65536]
@@ -2314,6 +2329,294 @@ def write_report(report_dir: Path, report: dict[str, Any], *, keep: int) -> Path
     return report_path
 
 
+MAINTENANCE_FAILURE_DIAGNOSTIC_FIELDS = (
+    "restore_diagnostic",
+    "backup_disk_diagnostic",
+    "scratch_unit_diagnostic",
+    "scratch_admission_diagnostic",
+    "scratch_host_guard_diagnostic",
+    "scratch_first_fault",
+    "scratch_resource_attribution",
+    "scratch_phase_attribution",
+    "scratch_allocation_attribution",
+    "scratch_cleanup_status",
+)
+
+
+def _active_release_source_identity(app_dir: Path) -> tuple[str, str]:
+    """Read a stable active release ID and source commit for private evidence."""
+
+    try:
+        canonical_app_dir = app_dir.resolve(strict=True)
+        expected_app_dir = DEFAULT_APP_DIR.resolve(strict=True)
+        releases_dir = (canonical_app_dir / "releases").resolve(strict=True)
+        active = resolved_release_target(canonical_app_dir, "current", releases_dir)
+        release_metadata = active / "RELEASE.json"
+        named = release_metadata.lstat()
+        if (
+            canonical_app_dir != expected_app_dir
+            or SAFE_RELEASE_ID_RE.fullmatch(active.name) is None
+            or not stat.S_ISREG(named.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+            or named.st_uid != 0
+            or named.st_gid != 0
+            or named.st_nlink != 1
+            or stat.S_IMODE(named.st_mode) & 0o022
+            or not 1 <= named.st_size <= 256 * 1024
+        ):
+            raise ValueError
+        descriptor = os.open(
+            release_metadata,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            before = os.fstat(descriptor)
+            if (before.st_dev, before.st_ino, before.st_size) != (
+                named.st_dev,
+                named.st_ino,
+                named.st_size,
+            ):
+                raise ValueError
+            raw = bytearray()
+            while len(raw) <= named.st_size:
+                block = os.read(descriptor, min(8192, named.st_size + 1 - len(raw)))
+                if not block:
+                    break
+                raw.extend(block)
+            after = os.fstat(descriptor)
+            current_named = release_metadata.lstat()
+            if (
+                len(raw) != named.st_size
+                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                != (
+                    current_named.st_dev,
+                    current_named.st_ino,
+                    current_named.st_size,
+                    current_named.st_mtime_ns,
+                )
+            ):
+                raise ValueError
+        finally:
+            os.close(descriptor)
+
+        def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError
+                result[key] = value
+            return result
+
+        metadata = json.loads(bytes(raw).decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+        source_sha = metadata.get("source_git_commit") if isinstance(metadata, dict) else None
+        if (
+            not isinstance(source_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+            or resolved_release_target(canonical_app_dir, "current", releases_dir) != active
+        ):
+            raise ValueError
+        return active.name, source_sha
+    except Exception:
+        raise RuntimeError("active release identity is unavailable for maintenance receipt") from None
+
+
+def maintenance_backup_failure_payload(
+    exc: BackupCommandFailure,
+    *,
+    invocation_id: str,
+    active_release_id: str,
+    source_sha: str,
+    started_at: datetime,
+    failed_at: datetime,
+) -> dict[str, Any]:
+    """Build the closed, private receipt payload without exception text."""
+
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None
+        or SAFE_RELEASE_ID_RE.fullmatch(active_release_id) is None
+        or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+        or started_at.tzinfo is None
+        or failed_at.tzinfo is None
+        or failed_at < started_at
+    ):
+        raise ValueError("maintenance failure receipt binding is invalid")
+    payload: dict[str, Any] = {
+        "schema": 1,
+        "kind": "storage_maintenance_backup_failure",
+        "status": "failed",
+        "invocation_id": invocation_id,
+        "active_release_id": active_release_id,
+        "source_sha": source_sha,
+        "started_at_utc": started_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "failed_at_utc": failed_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+    }
+    validators: dict[str, Callable[[Any], bool]] = {
+        "restore_diagnostic": _valid_restore_diagnostic,
+        "backup_disk_diagnostic": valid_backup_disk_diagnostic,
+        "scratch_unit_diagnostic": valid_scratch_unit_diagnostic,
+        "scratch_admission_diagnostic": valid_scratch_admission_diagnostic,
+        "scratch_host_guard_diagnostic": valid_scratch_host_guard_diagnostic,
+        "scratch_first_fault": _valid_scratch_first_fault,
+        "scratch_resource_attribution": valid_scratch_resource_attribution,
+        "scratch_phase_attribution": valid_scratch_phase_attribution,
+        "scratch_allocation_attribution": valid_scratch_allocation_attribution,
+        "scratch_cleanup_status": valid_scratch_cleanup_status,
+    }
+    for field in MAINTENANCE_FAILURE_DIAGNOSTIC_FIELDS:
+        value = getattr(exc, field, None)
+        if validators[field](value):
+            payload[field] = value
+    return payload
+
+
+def write_maintenance_backup_failure_receipt(
+    app_dir: Path,
+    exc: BackupCommandFailure,
+    *,
+    started_at: datetime,
+    invocation_id: str | None = None,
+) -> Path:
+    """Atomically write one root-only receipt bound to this systemd run."""
+
+    bound_invocation = invocation_id or os.environ.get("INVOCATION_ID", "")
+    if re.fullmatch(r"[0-9a-f]{32}", bound_invocation) is None:
+        raise RuntimeError("systemd maintenance invocation identity is unavailable")
+    active_release_id, source_sha = _active_release_source_identity(app_dir)
+    failure = maintenance_backup_failure_payload(
+        exc,
+        invocation_id=bound_invocation,
+        active_release_id=active_release_id,
+        source_sha=source_sha,
+        started_at=started_at,
+        failed_at=datetime.now(UTC),
+    )
+    encoded = (
+        json.dumps(failure, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+    filename = f"platform-maintenance-failure-{bound_invocation}.json"
+    shared_dir = app_dir.resolve(strict=True) / "shared"
+    shared_fd = os.open(
+        shared_dir,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    maintenance_fd = -1
+    temporary_name: str | None = None
+    try:
+        shared_before = shared_dir.lstat()
+        shared_open = os.fstat(shared_fd)
+        if (
+            not stat.S_ISDIR(shared_before.st_mode)
+            or stat.S_ISLNK(shared_before.st_mode)
+            or shared_open.st_uid != 0
+            or shared_open.st_gid != 0
+            or stat.S_IMODE(shared_open.st_mode) & 0o022
+            or (shared_before.st_dev, shared_before.st_ino)
+            != (shared_open.st_dev, shared_open.st_ino)
+        ):
+            raise RuntimeError("maintenance receipt parent is unsafe")
+        try:
+            os.mkdir("maintenance", 0o700, dir_fd=shared_fd)
+            os.fsync(shared_fd)
+        except FileExistsError:
+            pass
+        maintenance_fd = os.open(
+            "maintenance",
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=shared_fd,
+        )
+        maintenance_open = os.fstat(maintenance_fd)
+        maintenance_named = os.stat(
+            "maintenance", dir_fd=shared_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISDIR(maintenance_open.st_mode)
+            or maintenance_open.st_uid != 0
+            or maintenance_open.st_gid != 0
+            or stat.S_IMODE(maintenance_open.st_mode) & 0o022
+            or (maintenance_open.st_dev, maintenance_open.st_ino)
+            != (maintenance_named.st_dev, maintenance_named.st_ino)
+            or (os.fstat(shared_fd).st_dev, os.fstat(shared_fd).st_ino)
+            != (shared_open.st_dev, shared_open.st_ino)
+        ):
+            raise RuntimeError("maintenance receipt directory is unsafe")
+        temporary_name = f".{filename}.{os.urandom(12).hex()}.tmp"
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=maintenance_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != 0
+                or opened.st_gid != 0
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+            ):
+                raise RuntimeError("maintenance failure receipt metadata is unsafe")
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise RuntimeError("maintenance failure receipt write did not progress")
+                view = view[written:]
+            os.fsync(descriptor)
+            after = os.fstat(descriptor)
+            if (
+                (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+                or after.st_size != len(encoded)
+                or stat.S_IMODE(after.st_mode) != 0o600
+            ):
+                raise RuntimeError("maintenance failure receipt changed while writing")
+        finally:
+            os.close(descriptor)
+        os.link(
+            temporary_name,
+            filename,
+            src_dir_fd=maintenance_fd,
+            dst_dir_fd=maintenance_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary_name, dir_fd=maintenance_fd)
+        temporary_name = None
+        os.fsync(maintenance_fd)
+        receipt_stat = os.stat(filename, dir_fd=maintenance_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(receipt_stat.st_mode)
+            or receipt_stat.st_uid != 0
+            or receipt_stat.st_gid != 0
+            or receipt_stat.st_nlink != 1
+            or stat.S_IMODE(receipt_stat.st_mode) != 0o600
+            or receipt_stat.st_size != len(encoded)
+        ):
+            raise RuntimeError("maintenance failure receipt postcondition failed")
+        return shared_dir / "maintenance" / filename
+    finally:
+        if temporary_name is not None and maintenance_fd >= 0:
+            try:
+                os.unlink(temporary_name, dir_fd=maintenance_fd)
+            except FileNotFoundError:
+                pass
+        if maintenance_fd >= 0:
+            os.close(maintenance_fd)
+        os.close(shared_fd)
+
+
 def _open_dir_at(parent_fd: int, name: str) -> int:
     return os.open(
         name,
@@ -2520,6 +2823,10 @@ def _plan_and_maybe_apply(
                     rotate_existing=not getattr(
                         args, "preserve_existing_backups", False
                     ),
+                    private_failure_diagnostics=getattr(
+                        args, "private_backup_diagnostics", False
+                    ),
+                    emit_private_failure_text=False,
                     protected_backup_manifest=getattr(
                         args, "protected_backup_manifest", None
                     ),
@@ -2999,6 +3306,7 @@ def print_summary(report: dict[str, Any]) -> None:
 
 def main() -> int:
     args = parse_args()
+    main_started_at = datetime.now(UTC)
     try:
         report = run_maintenance(args)
         if getattr(args, "authorization_probe_only", False):
@@ -3029,6 +3337,25 @@ def main() -> int:
             print_summary(report)
         return 0 if report["ok"] else 1
     except Exception as exc:
+        if (
+            isinstance(exc, BackupCommandFailure)
+            and getattr(args, "apply", False)
+            and not getattr(args, "skip_backup", False)
+            and not getattr(args, "backup_only", False)
+            and not getattr(args, "verify_existing_backup_only", False)
+            and getattr(args, "private_backup_diagnostics", False)
+        ):
+            try:
+                write_maintenance_backup_failure_receipt(
+                    args.app_dir,
+                    exc,
+                    started_at=main_started_at,
+                )
+            except Exception:
+                print(
+                    "[WARN] Private maintenance failure receipt unavailable.",
+                    file=sys.stderr,
+                )
         if getattr(args, "authorization_probe_only", False):
             result: dict[str, Any] = {
                 "schema": 1,

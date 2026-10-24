@@ -29,6 +29,8 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import platform_backup_restore_drill as backup_restore_drill
+import platform_backup_failure_receipt as backup_failure_receipt
+import platform_storage_maintenance as storage_maintenance
 from platform_release_retention import REQUIRED_PROTECTED_RELEASES
 
 from platform_workflow_provenance import (
@@ -53,6 +55,9 @@ SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 BACKUP_DUMP_RE = re.compile(r"platformdb-[0-9]{8}T[0-9]{6}Z\.dump\Z")
 MAINTENANCE_REPORT_RE = re.compile(r"platform-maintenance-[0-9]{8}T[0-9]{6}Z\.json\Z")
+MAINTENANCE_FAILURE_RECEIPT_RE = re.compile(
+    r"platform-maintenance-failure-[0-9a-f]{32}\.json\Z"
+)
 PROTECTED_BACKUP_MANIFEST_PATH = Path(
     "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json"
 )
@@ -86,6 +91,7 @@ EXPECTED_MAINTENANCE_ARGV = (
     "/opt/oldsparky/platform/shared/venv/bin/python",
     "/opt/oldsparky/platform/current/tools/platform_storage_maintenance.py",
     "--apply",
+    "--private-backup-diagnostics",
     "--scratch-backend",
     "disk_ext4_image_v1",
     "--protected-backup-manifest",
@@ -118,6 +124,7 @@ def maintenance_preview_argv() -> tuple[str, ...]:
     if argv.count("--apply") != 1 or "--json" in argv:
         _fail()
     argv.remove("--apply")
+    argv.remove("--private-backup-diagnostics")
     argv.insert(2, "--json")
     return tuple(argv)
 
@@ -240,7 +247,12 @@ def protected_backup_manifest_snapshot_digest() -> str:
     return digest
 
 
-def _read_private_maintenance_report(path_value: str) -> dict[str, Any]:
+def _read_private_maintenance_artifact(
+    path_value: str,
+    *,
+    name_pattern: re.Pattern[str],
+    max_bytes: int,
+) -> dict[str, Any]:
     if (
         not isinstance(path_value, str)
         or "\x00" in path_value
@@ -250,7 +262,7 @@ def _read_private_maintenance_report(path_value: str) -> dict[str, Any]:
     path = Path(path_value)
     if (
         path.parent != MAINTENANCE_REPORT_DIRECTORY
-        or MAINTENANCE_REPORT_RE.fullmatch(path.name) is None
+        or name_pattern.fullmatch(path.name) is None
     ):
         _fail()
     try:
@@ -281,7 +293,7 @@ def _read_private_maintenance_report(path_value: str) -> dict[str, Any]:
             or before.st_nlink != 1
             or stat.S_IMODE(before.st_mode) != 0o600
             or before.st_size <= 0
-            or before.st_size > MAX_MAINTENANCE_REPORT_BYTES
+            or before.st_size > max_bytes
             or (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)
         ):
             _fail()
@@ -290,12 +302,12 @@ def _read_private_maintenance_report(path_value: str) -> dict[str, Any]:
         while True:
             block = os.read(
                 descriptor,
-                min(8192, MAX_MAINTENANCE_REPORT_BYTES + 1 - total),
+                min(8192, max_bytes + 1 - total),
             )
             if not block:
                 break
             total += len(block)
-            if total > MAX_MAINTENANCE_REPORT_BYTES:
+            if total > max_bytes:
                 _fail()
             chunks.append(block)
         after = os.fstat(descriptor)
@@ -320,6 +332,182 @@ def _read_private_maintenance_report(path_value: str) -> dict[str, Any]:
     finally:
         os.close(descriptor)
     return _strict_json(b"".join(chunks))
+
+
+def _read_private_maintenance_report(path_value: str) -> dict[str, Any]:
+    return _read_private_maintenance_artifact(
+        path_value,
+        name_pattern=MAINTENANCE_REPORT_RE,
+        max_bytes=MAX_MAINTENANCE_REPORT_BYTES,
+    )
+
+
+def _utc_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        _fail()
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        _fail()
+    if parsed.tzinfo != timezone.utc:
+        _fail()
+    return parsed
+
+
+def project_maintenance_backup_failure(
+    receipt_path: str,
+    *,
+    invocation_id: str,
+    active_release_id: str,
+    source_sha: str,
+    invocation_started_at: str,
+    invocation_completed_at: str,
+) -> dict[str, Any]:
+    """Validate and privacy-project an exact maintenance backup failure."""
+
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", active_release_id) is None
+        or SHA_RE.fullmatch(source_sha) is None
+    ):
+        _fail()
+    started_window = _utc_timestamp(invocation_started_at)
+    completed_window = _utc_timestamp(invocation_completed_at)
+    if completed_window < started_window:
+        _fail()
+    if Path(receipt_path).name != f"platform-maintenance-failure-{invocation_id}.json":
+        _fail()
+    payload = _read_private_maintenance_artifact(
+        receipt_path,
+        name_pattern=MAINTENANCE_FAILURE_RECEIPT_RE,
+        max_bytes=64 * 1024,
+    )
+    base_fields = {
+        "schema",
+        "kind",
+        "status",
+        "invocation_id",
+        "active_release_id",
+        "source_sha",
+        "started_at_utc",
+        "failed_at_utc",
+    }
+    diagnostic_fields = set(storage_maintenance.MAINTENANCE_FAILURE_DIAGNOSTIC_FIELDS)
+    if (
+        set(payload) - diagnostic_fields != base_fields
+        or type(payload.get("schema")) is not int
+        or payload.get("schema") != 1
+        or payload.get("kind") != "storage_maintenance_backup_failure"
+        or payload.get("status") != "failed"
+        or payload.get("invocation_id") != invocation_id
+        or payload.get("active_release_id") != active_release_id
+        or payload.get("source_sha") != source_sha
+    ):
+        _fail()
+    receipt_started = _utc_timestamp(payload.get("started_at_utc"))
+    receipt_failed = _utc_timestamp(payload.get("failed_at_utc"))
+    if not (
+        started_window <= receipt_started <= receipt_failed <= completed_window
+    ):
+        _fail()
+
+    validators = {
+        "restore_diagnostic": storage_maintenance._valid_restore_diagnostic,
+        "backup_disk_diagnostic": backup_restore_drill.valid_backup_disk_diagnostic,
+        "scratch_unit_diagnostic": backup_restore_drill.valid_scratch_unit_diagnostic,
+        "scratch_admission_diagnostic": backup_restore_drill.valid_scratch_admission_diagnostic,
+        "scratch_host_guard_diagnostic": backup_restore_drill.valid_scratch_host_guard_diagnostic,
+        "scratch_first_fault": storage_maintenance._valid_scratch_first_fault,
+        "scratch_resource_attribution": backup_restore_drill.valid_scratch_resource_attribution,
+        "scratch_phase_attribution": backup_restore_drill.valid_scratch_phase_attribution,
+        "scratch_allocation_attribution": backup_restore_drill.valid_scratch_allocation_attribution,
+        "scratch_cleanup_status": backup_restore_drill.valid_scratch_cleanup_status,
+    }
+    if any(
+        field in payload and not validators[field](payload[field])
+        for field in diagnostic_fields
+    ):
+        _fail()
+
+    # Reuse the existing typed receipt verifier and its bounded projection.
+    typed_receipt = {
+        "schema": 1,
+        "event": "platform_backup_failure",
+        "run_id": "1",
+        "attempt": "1",
+        "operation": "create",
+        "source_sha": source_sha,
+        "bundle_sha256": "0" * 64,
+        "stage": "backup_create",
+        "public_summary_error": "none",
+        "public_summary_normalizer_diagnostic": {
+            "schema": 1,
+            "status": "not_run",
+            "normalizer_exit_code": None,
+            "stdout_bytes": None,
+            "stdout_sha256": None,
+            "stdout_class": "not_run",
+            "stderr_bytes": None,
+            "stderr_sha256": None,
+            "stderr_class": "not_run",
+            "exception_class": "none",
+            "collector_error_class": "none",
+        },
+        "exit_code": 1,
+        "report_state": "typed_failure",
+        "report_error_class": "backup",
+        "restore_diagnostic": payload.get("restore_diagnostic"),
+        "scratch_unit_diagnostic": payload.get("scratch_unit_diagnostic"),
+        "scratch_admission_diagnostic": payload.get("scratch_admission_diagnostic"),
+        "backup_disk_diagnostic": payload.get("backup_disk_diagnostic"),
+        "scratch_host_guard_diagnostic": payload.get("scratch_host_guard_diagnostic"),
+        "scratch_first_fault": payload.get("scratch_first_fault"),
+        "scratch_resource_attribution": payload.get("scratch_resource_attribution"),
+        "scratch_phase_attribution": payload.get("scratch_phase_attribution"),
+        "scratch_cleanup_status": payload.get("scratch_cleanup_status"),
+        "report_bytes": 0,
+        "report_sha256": None,
+        "stderr_state": "absent",
+        "stderr_exception_class": "none",
+        "stderr_bytes": 0,
+        "stderr_sha256": None,
+    }
+    if "scratch_allocation_attribution" in payload:
+        typed_receipt["scratch_allocation_attribution"] = payload[
+            "scratch_allocation_attribution"
+        ]
+    projected = backup_failure_receipt.project_receipt(
+        json.dumps(typed_receipt, separators=(",", ":")).encode("ascii"),
+        "1",
+        "1",
+        source_sha,
+    )
+    result: dict[str, Any] = {
+        "schema": 1,
+        "kind": "storage_maintenance_backup_failure",
+        "status": "failed",
+        "invocation_id": invocation_id,
+        "active_release_id": active_release_id,
+        "source_sha": source_sha,
+        "started_at_utc": payload["started_at_utc"],
+        "failed_at_utc": payload["failed_at_utc"],
+    }
+    for field in (
+        "restore_diagnostic",
+        "backup_disk_diagnostic",
+        "scratch_admission_diagnostic",
+    ):
+        if projected[field] is not None:
+            result[field] = projected[field]
+    host_guard = payload.get("scratch_host_guard_diagnostic")
+    if host_guard is not None:
+        result["scratch_host_guard_diagnostic"] = {
+            "guard_site": host_guard["guard_site"],
+            "guard_reason": host_guard["guard_reason"],
+            "available_bytes": host_guard["available_bytes"],
+            "required_bytes": host_guard["required_bytes"],
+        }
+    return result
 
 
 def validate_protected_retention_report(
@@ -1172,6 +1360,34 @@ def main(argv: list[str] | None = None) -> int:
             print("MAINTENANCE_RETENTION_PROOF schema=1 status=unavailable", file=sys.stderr)
             return 1
         print("MAINTENANCE_RETENTION_PROOF schema=1 status=verified")
+        return 0
+    if actual_argv[:1] == ["project-maintenance-backup-failure"]:
+        failure_parser = argparse.ArgumentParser(description=__doc__)
+        failure_parser.add_argument("mode")
+        failure_parser.add_argument("receipt_path")
+        failure_parser.add_argument("invocation_id")
+        failure_parser.add_argument("active_release_id")
+        failure_parser.add_argument("source_sha")
+        failure_parser.add_argument("invocation_started_at")
+        failure_parser.add_argument("invocation_completed_at")
+        args = failure_parser.parse_args(actual_argv)
+        try:
+            result = project_maintenance_backup_failure(
+                args.receipt_path,
+                invocation_id=args.invocation_id,
+                active_release_id=args.active_release_id,
+                source_sha=args.source_sha,
+                invocation_started_at=args.invocation_started_at,
+                invocation_completed_at=args.invocation_completed_at,
+            )
+        except Exception:
+            result = {
+                "schema": 1,
+                "kind": "storage_maintenance_backup_failure",
+                "status": "unavailable",
+                "reason": "receipt_contract",
+            }
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         return 0
     if actual_argv[:1] == ["validate-maintenance-unit"]:
         unit_parser = argparse.ArgumentParser(description=__doc__)

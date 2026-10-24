@@ -539,6 +539,21 @@ jobs:
             | /usr/bin/python3 -I "$summary_tool" --mode service --service maintenance \
             || fail_for_service_status service_summary_unavailable 2
 
+          if (( service_status != 0 )); then
+            CURRENT_STAGE=backup_failure_diagnostic
+            failure_receipt="$report_dir/platform-maintenance-failure-$service_invocation_after.json"
+            failure_diagnostic="$(/usr/bin/python3 -I -B \
+              "$maintenance_unit_validator" project-maintenance-backup-failure \
+              "$failure_receipt" "$service_invocation_after" \
+              "$current_id" "$active_sha" \
+              "$invocation_started_at" "$invocation_completed_at" \
+              2>/dev/null)" \
+              || fail_for_service_status backup_failure_diagnostic_unavailable 2
+            [[ -n "$failure_diagnostic" && ${#failure_diagnostic} -le 65536 ]] \
+              || fail_for_service_status backup_failure_diagnostic_unavailable 2
+            printf '%s\n' "$failure_diagnostic"
+          fi
+
           CURRENT_STAGE=postchecks
           test "$(readlink -f "$current")" = "$current_before" \
             || fail "Current release target changed during maintenance."
