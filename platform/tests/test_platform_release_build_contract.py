@@ -193,7 +193,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
 
             slug = "gha-40101456085-1-971753818d69"
             self.assertIn(
-                f'ARTIFACT_PATH="$OUTPUT_DIR/$RELEASE_SLUG.tar.gz"',
+                'ARTIFACT_PATH="$OUTPUT_DIR/$RELEASE_SLUG.tar.gz"',
                 builder_source,
             )
             cached_archive = canonical_output / f"{slug}.tar.gz"

@@ -56,13 +56,11 @@ It never deletes shared env/runtimes, upload staging, current/previous releases,
 Live-QA cache pruning holds the machine-wide lock, requires an idle browser cgroup and user, accepts only root-owned non-symlink `runtime-<40 lowercase hex>` trees, retains the newest valid unprotected fallback, and treats keep as a hard cap rather than an age window.
 The shared disk policy requires at least `max(5 GiB, ceil(10% of filesystem total))` free; this is the independent 5 GiB absolute floor plus the 10% free (90% used) limit. Stronger configured floors are allowed, but a CLI override cannot lower the 5 GiB minimum or raise maximum use above 90%. This policy alone is not sufficient for canonical full-maintenance `disk_ext4_image_v1`: its admission requires that floor plus the unchanged 256 MiB lead and 576 MiB image on the image filesystem after the temporary dump exists. Before `pg_dump`, include the expected dump allocation when it shares that filesystem (`platform_backup_restore_drill._scratch_disk_image_required_free_bytes` and `_scratch_prepare_disk_image`; see the [backup/restore runbook](backup-restore-runbook.md)). The source-bound backup workflow defaults to `tmpfs_v1`, so its success does not exercise this image gate. An explicitly selected disk backend exercises image admission, but `--backup-only` still preserves existing pairs rather than testing maintenance rotation. Admission fails closed.
 The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it.
-Application services write structured JSON to journald. Nginx owns request
-logs, so Gunicorn access logging is disabled to avoid duplicates; warnings,
-exceptions and slow/contended records remain. The worker baseline is
-`WARNING`; the API keeps `INFO` for lifecycle diagnostics. Journald is not
-forwarded to duplicate syslog. UFW stays in `ufw.log`; the 15-minute logrotate
-timer checks Nginx, rsyslog and `btmp`. These limits never justify suppressing
-5xx or slow-request diagnostics.
+Application services write structured JSON to journald. Nginx owns request logs, so Gunicorn access logging
+is disabled to avoid duplicates; warnings, exceptions and slow/contended records remain. The worker baseline
+is `WARNING`; the API keeps `INFO` for lifecycle diagnostics. Journald is not forwarded to duplicate syslog.
+UFW stays in `ufw.log`; the 15-minute logrotate timer checks Nginx, rsyslog and `btmp`. These limits never
+justify suppressing 5xx or slow-request diagnostics.
 
 This policy follows [systemd-journald](https://www.freedesktop.org/software/systemd/man/252/journald.conf.html)
 and [logrotate](https://man7.org/linux/man-pages/man8/logrotate.8.html), uses
