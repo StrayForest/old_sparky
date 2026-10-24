@@ -61,7 +61,13 @@ async def translate_patch_to_russian(
     settings: PlatformSettings | None = None,
     expected_source_hash: str | None = None,
 ) -> dict[str, Any]:
-    """Translate once, then retry one transient OpenAI transport failure."""
+    """Use one fact correction and at most one transient transport retry.
+
+    The runtime can make at most two provider requests (initial plus one fact
+    correction). This wrapper can repeat that runtime invocation once after a
+    transient transport error, bounding one task to at most four provider
+    requests.
+    """
 
     settings = settings or get_settings()
     effective_settings = settings.model_copy(

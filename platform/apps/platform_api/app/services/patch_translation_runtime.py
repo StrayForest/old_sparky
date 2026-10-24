@@ -70,6 +70,7 @@ TRANSLATION_STATUS_SKIPPED = "skipped"
 TRANSLATION_STATUS_SUPERSEDED = "superseded"
 TRANSLATION_ENQUEUE_RETRY_SECONDS = 15 * 60
 TRANSLATION_PROCESSING_TIMEOUT_SECONDS = 15 * 60
+PATCH_TRANSLATION_FACT_CORRECTION_ATTEMPTS = 1
 
 
 def _iter_changes(patch: dict[str, Any]):
@@ -786,6 +787,7 @@ async def _request_openai(
     segments: list[dict[str, Any]],
     glossary: dict[str, list[str]],
     settings: PlatformSettings,
+    fact_correction_ids: list[str] | None = None,
 ) -> dict[str, str]:
     api_key = (settings.platform_openai_api_key or "").strip()
     if not api_key:
@@ -866,6 +868,16 @@ async def _request_openai(
             "translation_version": PATCH_TRANSLATION_VERSION,
         },
     }
+    if fact_correction_ids:
+        request_payload["instructions"] += (
+            "\n\nCORRECTION ATTEMPT: Your previous draft changed or added an "
+            "immutable numeric value or ability tier in these source segments: "
+            + ", ".join(fact_correction_ids)
+            + ". Translate the same source faithfully. Preserve every FACT "
+            "placeholder exactly, do not add digits or numeric facts outside those "
+            "placeholders, and return the complete requested segment set. This is "
+            "the only correction attempt."
+        )
     timeout = httpx.Timeout(max(60.0, settings.platform_openai_timeout_seconds))
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
@@ -919,6 +931,55 @@ async def _request_openai(
     if returned_ids != expected_ids:
         raise ValueError("OpenAI changed or omitted segment ids.")
     return translated
+
+
+async def _request_openai_with_fact_correction(
+    *,
+    patch_id: str,
+    source_segments: list[dict[str, str]],
+    prepared_segments: list[dict[str, Any]],
+    glossary: dict[str, list[str]],
+    settings: PlatformSettings,
+    entity_replacements: dict[str, dict[str, str]],
+    fact_replacements: dict[str, dict[str, str]],
+) -> dict[str, str]:
+    """Allow one bounded correction, then require the original fact fingerprint."""
+
+    correction_ids: list[str] | None = None
+    source_by_id = {segment["id"]: segment["text"] for segment in source_segments}
+    for attempt in range(PATCH_TRANSLATION_FACT_CORRECTION_ATTEMPTS + 1):
+        translated_prepared = await _request_openai(
+            patch_id=patch_id,
+            segments=prepared_segments,
+            glossary=glossary,
+            settings=settings,
+            fact_correction_ids=correction_ids,
+        )
+        translated: dict[str, str] = {}
+        for segment_id, text in translated_prepared.items():
+            restored = restore_placeholders(
+                text,
+                entity_replacements.get(segment_id, {}),
+            )
+            restored = restore_placeholders(
+                restored,
+                fact_replacements.get(segment_id, {}),
+            )
+            translated[segment_id] = localize_russian_notation(restored)
+
+        correction_ids = [
+            segment_id
+            for segment_id, text in translated.items()
+            if fact_fingerprint(source_by_id[segment_id]) != fact_fingerprint(text)
+        ]
+        if not correction_ids:
+            return translated
+        if attempt == PATCH_TRANSLATION_FACT_CORRECTION_ATTEMPTS:
+            break
+
+    raise ValueError(
+        "Translation changed a numeric value or ability tier after the bounded correction."
+    )
 
 
 def _prepare_segments(
@@ -1236,29 +1297,15 @@ async def translate_patch_to_russian(
         )
         glossary = await get_translation_glossary(settings)
         full_glossary = _glossary_payload(glossary)
-        translated_prepared = await _request_openai(
+        translated = await _request_openai_with_fact_correction(
             patch_id=patch_id,
-            segments=prepared,
+            source_segments=segments,
+            prepared_segments=prepared,
             glossary=full_glossary,
             settings=settings,
+            entity_replacements=entity_replacements,
+            fact_replacements=fact_replacements,
         )
-
-        translated: dict[str, str] = {}
-        for segment_id, text in translated_prepared.items():
-            restored = restore_placeholders(
-                text,
-                entity_replacements.get(segment_id, {}),
-            )
-            restored = restore_placeholders(
-                restored,
-                fact_replacements.get(segment_id, {}),
-            )
-            translated[segment_id] = localize_russian_notation(restored)
-
-        original_by_id = {segment["id"]: segment["text"] for segment in segments}
-        for segment_id, text in translated.items():
-            if fact_fingerprint(original_by_id[segment_id]) != fact_fingerprint(text):
-                raise ValueError("Translation changed a numeric value or ability tier.")
 
         translated_at = datetime.now(UTC)
         await _persist_translation_completion(
