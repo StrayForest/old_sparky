@@ -67,11 +67,15 @@ class EvidencePrivacyTests(unittest.TestCase):
         output = StringIO()
         with (
             mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
-            mock.patch("tools.platform_abort_retained_load._process_state", return_value=(set(), set(), 0)),
-            mock.patch("tools.platform_abort_retained_load.sys.argv", ["abort", "--verify-no-active-run", "123456"]),
+            mock.patch(
+                "tools.platform_abort_retained_load._process_state",
+                return_value=(set(), set(), 0),
+            ) as process_state,
+            mock.patch("sys.argv", ["abort", "--verify-no-active-run", "123456"]),
             mock.patch("sys.stdout", output),
         ):
             self.assertEqual(abort_retained_load_main(), 0)
+        process_state.assert_called_once_with("123456")
         self.assertEqual(
             output.getvalue(),
             "RETAINED_LOAD_ACTIVITY_CHECK schema=1 status=clear\n",
@@ -88,10 +92,20 @@ class EvidencePrivacyTests(unittest.TestCase):
                         "tools.platform_abort_retained_load._process_state",
                         return_value=process_state,
                     ),
-                    mock.patch("tools.platform_abort_retained_load.sys.argv", ["abort", "--verify-no-active-run", "123456"]),
+                    mock.patch("sys.argv", ["abort", "--verify-no-active-run", "123456"]),
                 ):
                     with self.assertRaisesRegex(SystemExit, "exact retained-load activity"):
                         abort_retained_load_main()
+
+        with (
+            mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
+            mock.patch(
+                "sys.argv",
+                ["abort", "--verify-no-active-run", "123456", "unexpected"],
+            ),
+        ):
+            with self.assertRaisesRegex(SystemExit, "exact retained-load activity check input"):
+                abort_retained_load_main()
 
     def test_capacity_attribution_projection_preserves_closed_claim_and_unknowns(self) -> None:
         eligible = {

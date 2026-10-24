@@ -184,8 +184,10 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
         self.assertLess(cleanup.index('platform_retained_load_lock_supervise "${ORIGINAL_ARGS[@]}"'), no_start)
 
         abort = (tools / "platform_abort_retained_load.py").read_text(encoding="utf-8")
-        activity_branch = abort.split('if args.verify_no_active_run:', 1)[1].split('\n    if any(', 1)[0]
-        self.assertIn('_process_state(args.load_run_id)', activity_branch)
+        activity_branch = abort.split(
+            'if args.verify_no_active_run is not None:', 1
+        )[1].split('\n    if any(', 1)[0]
+        self.assertIn('_process_state(args.verify_no_active_run)', activity_branch)
         self.assertIn('if scan_errors or roots or tree:', activity_branch)
         self.assertIn('RETAINED_LOAD_ACTIVITY_CHECK schema=1 status=clear', activity_branch)
 

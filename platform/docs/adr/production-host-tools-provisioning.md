@@ -33,21 +33,21 @@ provisioning and self-test remain required; the pin does not prove installation.
 The retained-load export-authority bump uses **C**
 `47551d9c9278da79234314aade6aa1ce55d7f979` and pin commit **P**
 `b806ff4f141b29d2d970ada36b2e3521cd2ce1e9`; the pin records C's exact
-14-member closure. Root provisioning and the exact-P preflight/reconcile remain
-pending the reviewed merge and are required before the capability is used. The
-follow-up stdin-boundary and cleanup-ownership correction uses **C**
-`9b9c0317776b8e788d916b2eb5d4d7ac9cb71af8`; its pin update records the same
-14-member closure with the exact changed dispatcher and input-guard digests.
-The exact-P preflight and root provisioning remain required before that
-generation is used. The sudo-policy denial compatibility correction uses **C**
+14-member closure. Root provisioning and the exact-P preflight/reconcile remain pending the reviewed merge and are required before the capability is used.
+Pin-only P `01cb972cd6370490031625a2ec4aff973c5c5564` selects cleanup transport
+generation C `b98e54f0a3f90dfb1b34883c0aa9334222b3ac49`. Its 15-member closure
+includes the dispatcher and input guard; pin resolution does not prove provisioning.
+Follow-up stdin-boundary and cleanup-ownership correction uses **C**
+`9b9c0317776b8e788d916b2eb5d4d7ac9cb71af8`; its pin update records the same 14-member
+closure with the exact changed dispatcher and input-guard digests. Exact-P preflight
+and root provisioning remain required before that generation is used. The sudo-policy denial compatibility correction uses **C**
 `f997be4747f70631b79439d02deffd1160bea149` and pin commit **P**
 `246184a12e19fcb2b9e3aabf2cd7d767a08d2214`; P records C's exact 14-member
 closure. Its retained-load executor accepts only status 0 or 1 paired with the
 exact single ASCII denial line for the fixed artifact account and local host.
 Granted privilege output, extra output, other statuses and check errors remain
 fail-closed. Exact-P provisioning and the installed generation self-test are
-required before this generation is used. The
-deploy-supervisor inventory alignment uses **C**
+required before this generation is used. The deploy-supervisor inventory alignment uses **C**
 `53e99544da7a98e14909f4cd17737cb76e176d22` and pin commit **P**
 `626d7c03a79b0a5bff46185bdf4398d547c055a3`; P records C's exact 14-member
 closure. C includes `platform_retained_load_export_executor.py` in both the

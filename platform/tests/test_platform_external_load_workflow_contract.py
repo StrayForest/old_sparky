@@ -1761,6 +1761,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     root = Path(temporary)
                     event_path = root / "event.json"
                     output_path = root / "platform-retained-cleanup-input.json"
+                    github_output_path = root / "github-output"
+                    github_output_path.touch()
                     binding_dir = root / "retained-cleanup-source-binding"
                     binding_dir.mkdir(mode=0o700)
                     binding_path = binding_dir / "source-binding.json"
@@ -1792,6 +1794,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                             "SOURCE_BINDING_ARTIFACT_ID": "654321",
                             "SOURCE_BINDING_ARTIFACT_DIGEST": "sha256:" + "c" * 64,
                             "RUNNER_TEMP": str(root),
+                            "GITHUB_OUTPUT": str(github_output_path),
                         },
                         capture_output=True,
                         text=True,
@@ -1842,6 +1845,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             root = Path(temporary)
             event_path = root / "event.json"
             output_path = root / "platform-retained-cleanup-input.json"
+            github_output_path = root / "github-output"
+            github_output_path.touch()
             event_path.write_text(json.dumps(valid_event), encoding="utf-8")
             result = subprocess.run(
                 ["/bin/bash", "-euo", "pipefail", "-c", cleanup_validation],
@@ -1857,6 +1862,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     "SOURCE_BINDING_ARTIFACT_ID": "654321",
                     "SOURCE_BINDING_ARTIFACT_DIGEST": "sha256:" + "c" * 64,
                     "RUNNER_TEMP": str(root),
+                    "GITHUB_OUTPUT": str(github_output_path),
                 },
                 capture_output=True,
                 text=True,
