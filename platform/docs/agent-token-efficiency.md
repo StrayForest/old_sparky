@@ -38,6 +38,16 @@ required evidence, review, safety checks and release gates.
 
 ## Keep context small and current
 
+### Retained private operator inputs
+
+- Before asking for `control_email` or another operator input the user has
+  already provided, check the existing private
+  `.local/private/operator-inputs.md` in the primary checkout. From a
+  worktree, use `/root/old_sparky/.local/private/operator-inputs.md` or resolve
+  the primary checkout through Git's common directory.
+- If the requested value is present, use it without asking again. Read values
+  without printing them; never copy them into Git, logs, artifacts or reports.
+
 - Keep one short active state in the task handoff: verified facts, source SHA,
   relevant run IDs, owners, blocker (if any) and the single next action. Link
   detailed evidence; do not paste the incident history into every handoff.
