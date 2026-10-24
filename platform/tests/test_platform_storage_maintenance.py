@@ -4952,7 +4952,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         },
                         "backup_disk_diagnostic": {
                             "schema": 1,
-                            "phase": "backup_admission",
+                            "phase": "scratch_image_admission",
                             "guard_reason": "disk_floor",
                             "free_bytes": 10,
                             "required_free_bytes": 20,
@@ -5052,7 +5052,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 typed_receipt["backup_disk_diagnostic"],
                 {
                     "schema": 1,
-                    "phase": "backup_admission",
+                    "phase": "scratch_image_admission",
                     "guard_reason": "disk_floor",
                     "free_bytes": 10,
                     "required_free_bytes": 20,

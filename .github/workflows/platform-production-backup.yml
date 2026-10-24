@@ -2183,8 +2183,9 @@ jobs:
                               host_guard_invalid = True
                       valid_backup_disk = False
                       backup_disk_phases = {
-                          "backup_admission", "pg_dump_pre_spawn", "pg_dump_post_start",
-                          "pg_dump_monitor", "pg_dump_post_exit",
+                          "backup_admission", "scratch_image_admission",
+                          "scratch_image_postallocation", "pg_dump_pre_spawn",
+                          "pg_dump_post_start", "pg_dump_monitor", "pg_dump_post_exit",
                       }
                       backup_disk_reasons = {
                           "disk_floor", "disk_unavailable", "child_unstopped",

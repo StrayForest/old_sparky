@@ -481,7 +481,7 @@ measurement and threshold, temporary-database creation and drop outcome. It reco
 after checking the exact drill database through the scratch admin connection. Missing evidence stays unknown; the
 receipt excludes database names, raw command output, exception text and credentials.
 
-A failed create can stop at the disk guard before/during `pg_dump`; its private receipt records fixed phase/reason and available/required bytes, never raw output.
+A failed create can stop at the disk guard during base admission, fixed scratch-image reservation/allocation, or `pg_dump`; its private receipt records only a closed phase/reason and available/required bytes, never raw output. Scratch-image phases are `scratch_image_admission` and `scratch_image_postallocation`.
 It does not change the guard or preservation policy. Compare receipt bytes; retry only after headroom and health checks pass.
 Use storage-retention preview/exact-candidate cleanup; preserve `current`, `previous`, protected releases and backups. Never use broad globs or lower the guard.
 Start one source-bound create during exact-SHA Security; it may wait. If either fails, fix the cause, start fresh Security, then bind one new create; never duplicate/rebind a completed attempt.

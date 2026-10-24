@@ -9993,6 +9993,7 @@ raise SystemExit(status)
         self._assert_normal_guarded_child_completes(target, high)
         self._assert_low_space_abort_stops_only_owned_dump()
         self._assert_backup_admission_reports_private_disk_phase()
+        self._assert_scratch_image_disk_phases_report_private_disk_phase()
 
     def _assert_unavailable_disk_fails_before_child_start(
         self, target: backup_drill.DatabaseTarget
@@ -10178,6 +10179,119 @@ raise SystemExit(status)
                 self.assertEqual(
                     (path.read_bytes(), metadata.st_ino, metadata.st_mode), expected
                 )
+
+    def _assert_scratch_image_disk_phases_report_private_disk_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            parent = pathlib.Path(temporary_dir) / "scratch-images"
+            parent_parent = parent.parent
+            total_bytes = 10 * 1024**3
+            free_bytes = 100
+            snapshot = types.SimpleNamespace(
+                valid=True, total_bytes=total_bytes, free_bytes=free_bytes
+            )
+            parent_info = types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755,
+                st_uid=0,
+                st_gid=0,
+                st_dev=123,
+            )
+            with (
+                mock.patch.object(backup_drill, "SCRATCH_DISK_IMAGE_ROOT", parent),
+                mock.patch.object(backup_drill.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    backup_drill,
+                    "_scratch_mountinfo_for",
+                    return_value=("/", "8:1", "ext4", "/dev/synthetic", "/", "rw"),
+                ),
+                mock.patch.object(
+                    pathlib.Path, "lstat", return_value=parent_info
+                ),
+                mock.patch.object(
+                    backup_drill.os,
+                    "stat",
+                    return_value=types.SimpleNamespace(st_dev=123),
+                ),
+                mock.patch.object(
+                    backup_drill, "snapshot_for_path", return_value=snapshot
+                ),
+                mock.patch.object(pathlib.Path, "mkdir") as mkdir,
+            ):
+                with self.assertRaises(backup_drill.RestoreGuardStop) as raised:
+                    backup_drill._scratch_prepare_disk_image("a" * 24)
+
+            failure = raised.exception
+            required_free_bytes = backup_drill._scratch_disk_image_required_free_bytes(
+                total_bytes
+            )
+            diagnostic = failure.private_backup_disk_diagnostic()
+            self.assertEqual(
+                diagnostic,
+                {
+                    "schema": 1,
+                    "phase": "scratch_image_admission",
+                    "guard_reason": "disk_floor",
+                    "free_bytes": free_bytes,
+                    "required_free_bytes": required_free_bytes,
+                },
+            )
+            self.assertTrue(backup_drill.valid_backup_disk_diagnostic(diagnostic))
+            self.assertNotIn(str(free_bytes), str(failure))
+            self.assertNotIn(str(required_free_bytes), str(failure))
+            mkdir.assert_not_called()
+            self.assertFalse(parent.exists())
+
+        postallocation = backup_drill.RestoreGuardStop(
+            "disk_floor",
+            free_bytes=100,
+            required_free_bytes=200,
+            phase="scratch_image_postallocation",
+        )
+        postallocation_diagnostic = (
+            postallocation.private_backup_disk_diagnostic() or {}
+        )
+        self.assertEqual(
+            postallocation_diagnostic,
+            {
+                "schema": 1,
+                "phase": "scratch_image_postallocation",
+                "guard_reason": "disk_floor",
+                "free_bytes": 100,
+                "required_free_bytes": 200,
+            },
+        )
+        self.assertTrue(
+            backup_drill.valid_backup_disk_diagnostic(postallocation_diagnostic)
+        )
+
+        unknown_phase = backup_drill.RestoreGuardStop(
+            "disk_floor", free_bytes=100, required_free_bytes=200,
+            phase="unrecognized_image_phase",
+        )
+        self.assertIsNone(unknown_phase.private_backup_disk_diagnostic())
+        self.assertFalse(
+            backup_drill.valid_backup_disk_diagnostic(
+                {
+                    **postallocation_diagnostic,
+                    "phase": "unrecognized_image_phase",
+                }
+            )
+        )
+        self.assertFalse(
+            backup_drill.valid_backup_disk_diagnostic(
+                {
+                    **postallocation_diagnostic,
+                    "unexpected": "field",
+                }
+            )
+        )
+        self.assertFalse(
+            backup_drill.valid_backup_disk_diagnostic(
+                {
+                    **postallocation_diagnostic,
+                    "free_bytes": -1,
+                }
+            )
+        )
 
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
