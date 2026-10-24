@@ -4,7 +4,41 @@ umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-OUTPUT_DIR="${PLATFORM_RELEASE_OUTPUT_DIR:-$ROOT_DIR/dist/releases}"
+resolve_release_output_dir() {
+  if [[ -n "${PLATFORM_RELEASE_OUTPUT_DIR:-}" ]]; then
+    printf '%s\n' "$PLATFORM_RELEASE_OUTPUT_DIR"
+    return 0
+  fi
+
+  local output_root="$ROOT_DIR"
+  local repo_root=""
+  local common_git_dir=""
+  local primary_repo_root=""
+  local primary_repo_top=""
+  local primary_common_git_dir=""
+
+  repo_root="$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$repo_root" && "$ROOT_DIR" == "$repo_root/platform" ]]; then
+    common_git_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    case "$common_git_dir" in
+      */.git) primary_repo_root="${common_git_dir%/.git}" ;;
+      *) primary_repo_root="" ;;
+    esac
+    if [[ -n "$primary_repo_root" && -d "$primary_repo_root" \
+      && -d "$primary_repo_root/platform" ]]; then
+      primary_repo_root="$(cd "$primary_repo_root" && pwd -P)"
+      primary_repo_top="$(git -C "$primary_repo_root" rev-parse --show-toplevel 2>/dev/null || true)"
+      primary_common_git_dir="$(git -C "$primary_repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+      if [[ "$primary_repo_top" == "$primary_repo_root" \
+        && "$primary_common_git_dir" == "$common_git_dir" ]]; then
+        output_root="$primary_repo_root/platform"
+      fi
+    fi
+  fi
+  printf '%s/dist/releases\n' "$output_root"
+}
+
+OUTPUT_DIR="$(resolve_release_output_dir)"
 PLATFORM_RELEASE_PYTHON="${PLATFORM_RELEASE_PYTHON:-/usr/bin/python3.12}"
 WEB_NEXT_COMPRESSION="${PLATFORM_WEB_NEXT_COMPRESSION:-true}"
 DEPENDENCY_BASELINE=""

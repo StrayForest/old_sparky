@@ -39,6 +39,7 @@ from tools import platform_recovery_bootstrap
 from tools import platform_fetch_artifact_metadata
 from tools import platform_configure_shared_env
 from tools import platform_build_node_cache
+from tools import platform_storage_maintenance
 from tools import platform_live_qa_guard
 from tools import platform_test_catalog
 from tools import platform_release_venv_capacity as venv_capacity
@@ -76,6 +77,142 @@ def workflow_job(source: str, name: str) -> str:
 
 
 class PlatformReleaseBuildContractTests(unittest.TestCase):
+    def test_build_output_uses_common_checkout_and_existing_retention_owner(self) -> None:
+        builder_source = BUILD_SCRIPT.read_text(encoding="utf-8")
+        function_start = builder_source.index("resolve_release_output_dir() {")
+        function_end = builder_source.index("\n}\n", function_start) + 3
+        resolver_source = builder_source[function_start:function_end]
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            workspace = Path(temporary)
+            primary = workspace / "primary checkout with spaces"
+            (primary / "platform" / "tools").mkdir(parents=True)
+            (primary / "platform" / "tools" / "platform_build_release.sh").write_text(
+                "#!/usr/bin/env bash\n", encoding="ascii"
+            )
+            subprocess.run(
+                ["git", "init", "--quiet", "--initial-branch=dev", str(primary)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            for key, value in (
+                ("user.name", "Release Cache Fixture"),
+                ("user.email", "release-cache-fixture@example.invalid"),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(primary), "config", key, value],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            subprocess.run(
+                ["git", "-C", str(primary), "add", "platform"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(primary), "commit", "--quiet", "-m", "fixture"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            linked = workspace / "linked worktree with spaces"
+            subprocess.run(
+                [
+                    "git", "-C", str(primary), "worktree", "add", "--quiet",
+                    "--detach", str(linked),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            def resolve(root: Path, *, override: str | None = None) -> Path:
+                environment = os.environ.copy()
+                environment["ROOT_DIR"] = str(root)
+                environment.pop("PLATFORM_RELEASE_OUTPUT_DIR", None)
+                if override is not None:
+                    environment["PLATFORM_RELEASE_OUTPUT_DIR"] = override
+                result = subprocess.run(
+                    ["bash", "-c", resolver_source + "\nresolve_release_output_dir"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+                return Path(result.stdout.rstrip("\n"))
+
+            canonical_output = primary / "platform" / "dist" / "releases"
+            self.assertEqual(resolve(primary / "platform"), canonical_output)
+            self.assertEqual(resolve(linked / "platform"), canonical_output)
+            override = str(workspace / "explicit output with spaces")
+            self.assertEqual(
+                resolve(linked / "platform", override=override), Path(override)
+            )
+
+            bundle_root = workspace / "source bundle" / "platform"
+            bundle_root.mkdir(parents=True)
+            self.assertEqual(
+                resolve(bundle_root), bundle_root / "dist" / "releases"
+            )
+            bare_root = workspace / "source.git"
+            subprocess.run(
+                ["git", "init", "--bare", "--quiet", str(bare_root)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            bare_platform = bare_root / "platform"
+            bare_platform.mkdir()
+            self.assertEqual(
+                resolve(bare_platform), bare_platform / "dist" / "releases"
+            )
+            self.assertEqual(
+                resolve(primary / "platform", override=""), canonical_output
+            )
+
+            canonical_output.mkdir(parents=True)
+            lock_fd = os.open(canonical_output, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                blocked = subprocess.run(
+                    [
+                        "bash", "-c",
+                        'exec {fd}<"$1"; /usr/bin/flock -n "$fd"',
+                        "release-cache-lock-test", str(resolve(linked / "platform")),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(blocked.returncode, 0)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+            slug = "gha-40101456085-1-971753818d69"
+            self.assertIn(
+                f'ARTIFACT_PATH="$OUTPUT_DIR/$RELEASE_SLUG.tar.gz"',
+                builder_source,
+            )
+            cached_archive = canonical_output / f"{slug}.tar.gz"
+            cached_checksum = canonical_output / f"{slug}.tar.gz.sha256"
+            cached_archive.write_bytes(b"validated release archive fixture\n")
+            cached_checksum.write_text(
+                "0" * 64 + f"  {cached_archive.name}\n", encoding="ascii"
+            )
+            self.assertEqual(
+                platform_storage_maintenance.artifact_slug(cached_archive),
+                slug,
+            )
+            self.assertEqual(
+                platform_storage_maintenance.artifact_slug(cached_checksum),
+                slug,
+            )
+            self.assertIn('exec {BUILD_LOCK_FD}<"$OUTPUT_DIR"', builder_source)
+            self.assertIn('/usr/bin/flock -n "$BUILD_LOCK_FD"', builder_source)
+
     def test_fresh_venv_capacity_binds_exact_inputs_and_expanded_wheels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             release = Path(directory) / "release"

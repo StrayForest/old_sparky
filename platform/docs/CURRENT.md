@@ -2,11 +2,19 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-20
+- Last reviewed: 2026-10-24
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
-## Current production baseline — 2026-10-20
+## Current production baseline — 2026-10-24
+
+- Production runs application source `971753818d69bfce6f799fd633f94ca987c6ee55` in active release `gha-40101456085-1-971753818d69`; previous is `gha-40091365136-1-e7e516008281`, source `e7e51600828148ef217d213c9000970ba0b1e006`. Exact-source Security [run `40097864116/2`](https://github.com/StrayForest/old_sparky/actions/runs/40097864116), source-bound restore-verified backup [run `40100017828/1`](https://github.com/StrayForest/old_sparky/actions/runs/40100017828), automatic parent [run `40101080179/1`](https://github.com/StrayForest/old_sparky/actions/runs/40101080179), production child [run `40101456085/1`](https://github.com/StrayForest/old_sparky/actions/runs/40101456085), and post-deploy storage diagnostics [run `40102336454/1`](https://github.com/StrayForest/old_sparky/actions/runs/40102336454) passed. These are the latest verified release checks recorded here.
+- The post-deploy read-only host snapshot found API, worker and web active with zero service restarts; API readiness and local web returned HTTP 200. Available root filesystem space was `6,648,963,072` bytes (`83%` free), and `MemAvailable` was `2,032,112` KiB. The free-space floor remains `max(5 GiB, ceil(10% of total))`; disk-image admission still includes its existing lead and temporary dump allocation.
+- Content diagnostics [run `40102218636/1`](https://github.com/StrayForest/old_sparky/actions/runs/40102218636) failed. The fresh read-only check found no pending release transaction, systemd jobs or in-progress GitHub workflow; the diagnostic failure cause remains unknown. This did not change the deployed release.
+- The existing Live-QA runtime closure is current/previous/active source `971753818d69bfce6f799fd633f94ca987c6ee55` plus recursively referenced previous source `e7e51600828148ef217d213c9000970ba0b1e006`; the runtime retention preview reported no removal candidates. The zero-extra installer-retention change in the current feature branch is not deployed and no provider payload was deleted by this work.
+- The current feature branch's storage/reuse and Russian-description changes remain pending review and are not deployed. The LivingInk Violet Russian ability descriptions remain `3/4`; the second fact-correction attempt failed strict numeric/tier validation, and that validator remains unchanged. The authorized baseline load [run `40092960587/1`](https://github.com/StrayForest/old_sparky/actions/runs/40092960587) failed its burst logical SLO while returning `20,000/20,000` HTTP 200 responses and completing namespace cleanup. Broader human-visible authentication/Turnstile QA remains **NOT RUN**.
+
+## Historical production baseline — 2026-10-20
 
 - Production runs application source I `6aa4b0c7e00b687a12d83af611df8c9f711615b3` in active release `gha-39475252873-1-6aa4b0c7e00b`; previous is H `gha-39466407941-1-acdd67eaf070`. PR310, exact-source Security [run `39472946495/1`](https://github.com/StrayForest/old_sparky/actions/runs/39472946495), source-bound restore-verified backup [run `39472994359/1`](https://github.com/StrayForest/old_sparky/actions/runs/39472994359), automatic parent [run `39474527960/1`](https://github.com/StrayForest/old_sparky/actions/runs/39474527960) and deployment child [run `39475252873/1`](https://github.com/StrayForest/old_sparky/actions/runs/39475252873) succeeded. The backup job started at 18:14:24Z before Security's final job completed at 18:24:58Z; it completed at 18:27:43Z with a 126,648,161-byte checksummed dump, restore verification and Alembic success across 36 tables.
 - Runtime identities remain separate: app I owns the application release; installed host-control generation C4 `059ac7866ed4e3f1dd59948c8b8cf2a0cc560118` is selected by P4 `73c1cdf043db6d55ee1815e666143c7e1deaff7d`; the Live-QA engine is provider S `990de9936fcd5a019a026708d805db1fd8b8c280`. C4 was provisioned under app E and reused by F through I. See the [host-tools provisioning ADR](adr/production-host-tools-provisioning.md).
@@ -97,7 +105,7 @@ Historical release, backup and diagnostic records for 2026-10-10 are retained in
 
 ## Current engineering priority
 
-The exact-I deployment, automated LiveLaunch/UserQA, maintenance and post-maintenance storage diagnostics are complete. Keep broader human-visible authentication/Turnstile QA marked **NOT RUN** unless separately executed.
+Production remains on LIVE971. The current storage/reuse and Russian-description feature branch is not deployed; no future deployment or QA result is asserted here. Finish its exact-source CI and independent review before any release. The LivingInk Violet Russian descriptions remain 3/4 after the strict numeric/tier fact validator rejected the second correction attempt. Keep broader human-visible authentication/Turnstile QA marked **NOT RUN** unless separately executed.
 The historical production performance stage completed on 2026-09-07 against deployed SHA `bba3fb278e348906a6942aee8462b758c3d616ef`. The measurement
 boundary and retained-load runtime contour were corrected, then the exact
 13-profile matrix was rerun with the original contracts, thresholds and

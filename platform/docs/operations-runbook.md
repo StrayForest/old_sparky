@@ -36,7 +36,7 @@ probes the origin externally. It is read-only, publishes no origin addresses, an
 
 ## Retention and disk safety
 
-Maintenance keeps:
+Retention policies keep:
 
 | Data | Policy |
 | --- | --- |
@@ -46,7 +46,7 @@ Maintenance keeps:
 | Playwright results on the production/pre-production host | 7 days |
 | GitHub Actions Playwright and CI evidence artifacts | 14 days |
 | trusted live-QA generations | protect the active/current/previous source SHAs; remove only older inactive generations after exact identity checks |
-| live-QA runtime provider payloads | protect current/previous/active source commits and every recursively referenced provider; retain no unreferenced additional payloads |
+| live-QA runtime provider payloads | the runtime installer retains current/previous/active source commits and every recursively referenced provider; it keeps no unreferenced additional payloads after successful installation or explicit retention apply; daily storage maintenance does not prune provider payloads |
 | maintenance reports | newest 30 |
 | systemd journal | 30 days, 256 MiB, 32 MiB files, preserve 5 GiB free |
 | Nginx/system text logs | rotate at 50 MiB, keep 7 compressed files |

@@ -38,6 +38,24 @@ required evidence, review, safety checks and release gates.
 
 ## Keep context small and current
 
+### Reuse source worktrees and release artifacts
+
+- Continue in the existing clean worktree supplied for the task. Do not create
+  another repository copy just to build or inspect a release.
+- The release builder defaults to the primary checkout's
+  `platform/dist/releases`, including when invoked from a linked worktree.
+  That is the source-artifact owner path shared with maintenance retention and
+  the release-output flock. Use `PLATFORM_RELEASE_OUTPUT_DIR` only for an
+  intentionally isolated fixture or a separately owned build.
+- Keep release archives and their checksum sidecars together under that owner
+  path. Do not copy release bundles into worktree-local `dist/releases`,
+  arbitrary `.git` directories or `/tmp` for convenience. Existing same-slug
+  output remains immutable and the builder refuses collisions; artifact
+  storage identity does not grant release/deployment authority.
+- The existing maintenance retention owns old canonical source artifacts.
+  Review its exact plan and preserve current/previous releases and all active
+  work; do not add a second cleanup timer or broad temporary-file sweep.
+
 ### Retained private operator inputs
 
 - Before asking for `control_email` or another operator input the user has
