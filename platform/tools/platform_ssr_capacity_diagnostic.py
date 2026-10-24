@@ -53,6 +53,13 @@ REMOTE_WATCH_CAP = 128 * 1024
 REMOTE_ROW_CAP = 2_048
 CPU_EDGE_TOLERANCE_NS = 250_000_000
 CPU_WINDOW_TOLERANCE_NS = 500_000_000
+# The plan is accepted only when its +52s requested start is 45–60s ahead
+# remotely, which bounds host-minus-runner clock offset to [-8s, +7s]. Its expiry
+# is requested on_end (+97s from plan creation); add 8s for that offset and 1s
+# so the host's strict `expires_at_ms < now` cleanup guard is satisfied.
+PLAN_EXPIRY_SKEW_MARGIN_MS = 9_000
+PLAN_EXPIRY_HORIZON_MS = 97_000
+PLAN_EXPIRY_WAIT_LIMIT_MS = 107_000
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_RE = re.compile(r"^[0-9a-f]{32}$")
 ATTEMPT_RE = re.compile(r"^[1-9][0-9]{0,8}$")
@@ -87,10 +94,18 @@ SSH_STDOUT_SHAPES = frozenset({
 class _RemoteCapacityPlanError(ValueError):
     """Closed remote-plan failure retaining only the helper's lifecycle frame."""
 
-    def __init__(self, lifecycle: Mapping[str, Any], error_class: str) -> None:
+    def __init__(
+        self, lifecycle: Mapping[str, Any], error_class: str,
+        expires_at_ms: int | None = None,
+        plan_created_at_ms: int | None = None,
+        plan_created_monotonic: float | None = None,
+    ) -> None:
         super().__init__("capacity plan preparation failed")
         self.lifecycle = dict(lifecycle)
         self.error_class = error_class if error_class in PARENT_ERROR_CLASSES else "unexpected"
+        self.expires_at_ms = expires_at_ms
+        self.plan_created_at_ms = plan_created_at_ms
+        self.plan_created_monotonic = plan_created_monotonic
 
 
 class _RemoteMemoryWatcher:
@@ -987,6 +1002,8 @@ def run_isolated_capacity_worker(
     namespace_closed = result.namespace_closed is True and result.reason == "none"
     valid_worker = _worker_report_matches(worker_payload, capacity_config)
     memory = watcher_summary[0]
+    if memory.get("memory_events_sampled_max_delta") == {}:
+        memory = {**memory, "memory_events_sampled_max_delta": None}
     worker_status = worker_payload.get("status") if valid_worker else "incomplete"
     complete = bool(
         namespace_closed and valid_worker and worker_status == "complete"
@@ -1226,7 +1243,8 @@ def _restore_parent_ssh_material(
 
 def _prepare_remote_capacity_plan(
     *, host: str, user: str, config: Path, key: Path, run_id: str,
-    source_sha: str, now_ms: int, lifecycle: dict[str, Any] | None = None,
+    source_sha: str, now_ms: int, plan_created_monotonic: float,
+    lifecycle: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         from tools import platform_cpu_diagnostic_pair as cpu_pair
@@ -1250,13 +1268,25 @@ def _prepare_remote_capacity_plan(
         )
     except Exception as exc:
         error_class = type(exc).__name__
-        raise _RemoteCapacityPlanError(lifecycle, error_class) from None
+        raise _RemoteCapacityPlanError(
+            lifecycle, error_class, expires_at_ms=plan["on_end_ms"],
+            plan_created_at_ms=now_ms,
+            plan_created_monotonic=plan_created_monotonic,
+        ) from None
     if (not prepared or not isinstance(release_slug, str)
             or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", release_slug) is None
             or summary is not None):
         refusal = lifecycle.get("plan_prepare_refusal_class")
         error_class = refusal if refusal in PARENT_ERROR_CLASSES else "ValueError"
-        raise _RemoteCapacityPlanError(lifecycle, error_class) from None
+        raise _RemoteCapacityPlanError(
+            lifecycle, error_class,
+            expires_at_ms=(
+                plan["on_end_ms"]
+                if lifecycle.get("plan_prepare_status") == "prepared" else None
+            ),
+            plan_created_at_ms=now_ms,
+            plan_created_monotonic=plan_created_monotonic,
+        ) from None
     plan["release_slug"] = release_slug
     return plan, lifecycle
 
@@ -1304,6 +1334,32 @@ def _prepare_transport_is_closed(lifecycle: Mapping[str, Any]) -> bool:
         and isinstance(transport, Mapping)
         and transport.get("child_state") in {"reaped", "not_started"}
     )
+
+
+def _wait_for_remote_plan_expiry(
+    expires_at_ms: int, *, plan_created_at_ms: int,
+    plan_created_monotonic: float,
+) -> None:
+    """Wait against the plan-creation monotonic clock, with a fixed upper bound."""
+
+    if (type(expires_at_ms) is not int or expires_at_ms < 0
+            or type(plan_created_at_ms) is not int or plan_created_at_ms < 0
+            or type(plan_created_monotonic) not in (int, float)
+            or not math.isfinite(plan_created_monotonic)
+            or expires_at_ms - plan_created_at_ms != PLAN_EXPIRY_HORIZON_MS):
+        raise ValueError("capacity plan expiry rejected")
+    target_monotonic = plan_created_monotonic + (
+        PLAN_EXPIRY_HORIZON_MS + PLAN_EXPIRY_SKEW_MARGIN_MS
+    ) / 1000
+    deadline = plan_created_monotonic + PLAN_EXPIRY_WAIT_LIMIT_MS / 1000
+    while True:
+        remaining = target_monotonic - time.monotonic()
+        if remaining <= 0:
+            return
+        remaining_budget = deadline - time.monotonic()
+        if remaining_budget <= 0:
+            raise TimeoutError("capacity plan expiry wait exceeded its bound")
+        time.sleep(min(remaining, remaining_budget, 0.1))
 
 
 def _parent_failure_receipt(
@@ -1415,7 +1471,7 @@ def _project_server_telemetry(summary: Any) -> dict[str, Any]:
     cpu_status = "incomplete"
     cpu_reason = "missing"
     memory_status = "incomplete"
-    memory_reason = "missing"
+    memory_reason = "unavailable"
     cgroup_status = "unknown"
     cgroup_reason = "hierarchy_unavailable"
     if isinstance(summary, dict):
@@ -1521,6 +1577,7 @@ def _parent_run(
     state.update({
         "stage": "identity", "prepare_lifecycle": {},
         "cleanup_lifecycle": {}, "cleanup_ok": False,
+        "namespace_closed": False,
         "source_sha": args.source_sha, "app_target_sha": args.app_target_sha,
         "external_run_id": args.external_run_id,
         "external_run_attempt": args.external_run_attempt,
@@ -1561,33 +1618,62 @@ def _parent_run(
     lifecycle: dict[str, Any] = {}
     state["stage"] = "remote_plan_prepare"
     state["prepare_lifecycle"] = lifecycle
+    plan_created_monotonic = time.monotonic()
+    plan_created_at_ms = time.time_ns() // 1_000_000
+    state["plan_created_monotonic"] = plan_created_monotonic
+    state["plan_created_at_ms"] = plan_created_at_ms
     try:
         planned, lifecycle = _prepare_remote_capacity_plan(
             host=args.ssh_host, user=args.ssh_user, config=ssh_config, key=ssh_key,
             run_id=run_id, source_sha=args.app_target_sha,
-            now_ms=time.time_ns() // 1_000_000, lifecycle=lifecycle,
+            now_ms=plan_created_at_ms,
+            plan_created_monotonic=plan_created_monotonic, lifecycle=lifecycle,
         )
     except _RemoteCapacityPlanError as exc:
         cleanup_lifecycle: dict[str, Any] = {}
         state["prepare_lifecycle"] = exc.lifecycle
-        if _prepare_transport_is_closed(exc.lifecycle):
+        if (
+            exc.lifecycle.get("plan_prepare_status") == "prepared"
+            and type(exc.expires_at_ms) is int
+            and _prepare_transport_is_closed(exc.lifecycle)
+        ):
             try:
                 state["stage"] = "plan_cleanup"
-                cleanup_ok, _ = _cleanup_remote_capacity_plan(
-                    host=args.ssh_host, user=args.ssh_user,
-                    config=ssh_config, key=ssh_key, run_id=run_id,
-                    lifecycle=cleanup_lifecycle,
+                if (type(exc.plan_created_at_ms) is not int
+                        or not isinstance(exc.plan_created_monotonic, (int, float))):
+                    raise ValueError("capacity plan clock anchor unavailable")
+                _wait_for_remote_plan_expiry(
+                    exc.expires_at_ms,
+                    plan_created_at_ms=exc.plan_created_at_ms,
+                    plan_created_monotonic=exc.plan_created_monotonic,
                 )
-            except Exception:
+            except TimeoutError:
                 cleanup_ok = False
                 cleanup_lifecycle.update({
-                    "plan_cleanup_status": "transport_failed",
+                    "plan_cleanup_status": "not_attempted",
                     "plan_cleanup_refusal_class": "none",
                     "cleanup_transport": {
-                        "stage": "transport_failed", "return_code": None,
-                        "stdout_shape": "none", "child_state": "unknown",
+                        "stage": "not_started", "return_code": None,
+                        "stdout_shape": "none", "child_state": "not_started",
                     },
                 })
+            else:
+                try:
+                    cleanup_ok, _ = _cleanup_remote_capacity_plan(
+                        host=args.ssh_host, user=args.ssh_user,
+                        config=ssh_config, key=ssh_key, run_id=run_id,
+                        lifecycle=cleanup_lifecycle,
+                    )
+                except Exception:
+                    cleanup_ok = False
+                    cleanup_lifecycle.update({
+                        "plan_cleanup_status": "transport_failed",
+                        "plan_cleanup_refusal_class": "none",
+                        "cleanup_transport": {
+                            "stage": "transport_failed", "return_code": None,
+                            "stdout_shape": "none", "child_state": "unknown",
+                        },
+                    })
             state["stage"] = "remote_plan_prepare"
         else:
             cleanup_ok = False
@@ -1611,6 +1697,7 @@ def _parent_run(
             prepare_lifecycle=exc.lifecycle,
             cleanup_lifecycle=cleanup_lifecycle, cleanup_ok=cleanup_ok,
         )
+    state["plan_expiry_ms"] = planned["on_end_ms"]
     control_path: Path | None = None
     ssh_contents: dict[str, bytearray] = {}
     ssh_lifecycle: dict[str, int] = {}
@@ -1668,6 +1755,7 @@ def _parent_run(
                 on_start_ms=planned["on_start_ms"],
                 on_end_ms=planned["on_end_ms"],
             )
+            state["namespace_closed"] = outcome.get("namespace_closed") is True
         finally:
             if hidden["value"]:
                 try:
@@ -1677,11 +1765,44 @@ def _parent_run(
             cleanup_lifecycle: dict[str, Any] = {}
             state["stage"] = "plan_cleanup"
             state["cleanup_lifecycle"] = cleanup_lifecycle
-            cleanup_ok, telemetry_summary = _cleanup_remote_capacity_plan(
-                host=args.ssh_host, user=args.ssh_user,
-                config=ssh_config, key=ssh_key, run_id=run_id,
-                lifecycle=cleanup_lifecycle,
-            )
+            if (
+                isinstance(outcome, dict)
+                and outcome.get("namespace_closed") is True
+                and lifecycle.get("plan_prepare_status") == "prepared"
+                and _prepare_transport_is_closed(lifecycle)
+            ):
+                try:
+                    _wait_for_remote_plan_expiry(
+                        planned["on_end_ms"],
+                        plan_created_at_ms=plan_created_at_ms,
+                        plan_created_monotonic=plan_created_monotonic,
+                    )
+                except TimeoutError:
+                    cleanup_ok = False
+                    cleanup_lifecycle.update({
+                        "plan_cleanup_status": "not_attempted",
+                        "plan_cleanup_refusal_class": "none",
+                        "cleanup_transport": {
+                            "stage": "not_started", "return_code": None,
+                            "stdout_shape": "none", "child_state": "not_started",
+                        },
+                    })
+                else:
+                    cleanup_ok, telemetry_summary = _cleanup_remote_capacity_plan(
+                        host=args.ssh_host, user=args.ssh_user,
+                        config=ssh_config, key=ssh_key, run_id=run_id,
+                        lifecycle=cleanup_lifecycle,
+                    )
+            else:
+                cleanup_ok = False
+                cleanup_lifecycle.update({
+                    "plan_cleanup_status": "not_attempted",
+                    "plan_cleanup_refusal_class": "none",
+                    "cleanup_transport": {
+                        "stage": "not_started", "return_code": None,
+                        "stdout_shape": "none", "child_state": "not_started",
+                    },
+                })
             state["cleanup_ok"] = cleanup_ok
             state["stage"] = "worker_supervision"
     if isinstance(outcome, dict):
@@ -2243,16 +2364,39 @@ def main(argv: list[str] | None = None) -> int:
         if (
             isinstance(run_id, str) and RUN_RE.fullmatch(run_id) is not None
             and prepare_lifecycle.get("plan_prepare_status") == "prepared"
-            and cleanup_lifecycle.get("plan_cleanup_status") in {None, "not_attempted"}
+            and cleanup_lifecycle.get("plan_cleanup_status") is None
+            and stage_state.get("namespace_closed") is True
             and _prepare_transport_is_closed(prepare_lifecycle)
         ):
             try:
                 cleanup_lifecycle = {}
+                planned_expiry = stage_state.get("plan_expiry_ms")
+                plan_created_at_ms = stage_state.get("plan_created_at_ms")
+                plan_created_monotonic = stage_state.get("plan_created_monotonic")
+                if (type(planned_expiry) is not int
+                        or type(plan_created_at_ms) is not int
+                        or not isinstance(plan_created_monotonic, (int, float))):
+                    raise ValueError("capacity plan expiry unavailable")
+                _wait_for_remote_plan_expiry(
+                    planned_expiry,
+                    plan_created_at_ms=plan_created_at_ms,
+                    plan_created_monotonic=plan_created_monotonic,
+                )
                 cleanup_ok, _ = _cleanup_remote_capacity_plan(
                     host=args.ssh_host, user=args.ssh_user,
                     config=Path(args.ssh_config), key=Path(args.ssh_key),
                     run_id=run_id, lifecycle=cleanup_lifecycle,
                 )
+            except TimeoutError:
+                cleanup_ok = False
+                cleanup_lifecycle = {
+                    "plan_cleanup_status": "not_attempted",
+                    "plan_cleanup_refusal_class": "none",
+                    "cleanup_transport": {
+                        "stage": "not_started", "return_code": None,
+                        "stdout_shape": "none", "child_state": "not_started",
+                    },
+                }
             except Exception:
                 cleanup_ok = False
                 cleanup_lifecycle = {

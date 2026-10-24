@@ -53,16 +53,23 @@ belong in the linked owner documents below.
   returned `20,000/20,000` HTTP 200 responses but failed its logical SLO.
   Fixture cleanup passed; exact profile and comparison evidence live in the
   [performance reference](../performance/README.md#authenticated-page-load-comparison-2026-10-24).
-- SSR run [40139325122](https://github.com/StrayForest/old_sparky/actions/runs/40139325122)
-  failed before capacity work with a `ValueError` and incomplete evidence.
-  Canonical abort stopped the process tree, but normalization failed and did
-  not produce complete diagnostic/capacity evidence. Exact fixture cleanup
-  [40139543532](https://github.com/StrayForest/old_sparky/actions/runs/40139543532)
-  passed, removing 14 users, 1 tournament and 1 marker while preserving
-  control state; all fixtures, retained tree and locks are closed. The
-  historical normalization failure is not an open cleanup action. The parent
-  `ValueError` cause and missing diagnostic/capacity evidence remain open; no
-  capacity credit is awarded.
+- SSR run [40143438718](https://github.com/StrayForest/old_sparky/actions/runs/40143438718)
+  was refused at remote-plan preparation because an expired API/web plan pair
+  from e920 remained; cleanup under a new run ID was correctly refused. Exact
+  fixture cleanup [40143901154](https://github.com/StrayForest/old_sparky/actions/runs/40143901154)
+  passed, and canonical cleanup of the expired pair removed both plans. Abort
+  [40143759494](https://github.com/StrayForest/old_sparky/actions/runs/40143759494)
+  stopped the exact process tree, but normalization did not produce CPU proof.
+  Retry [40144108246](https://github.com/StrayForest/old_sparky/actions/runs/40144108246)
+  terminated in the guarded step with exit 2; report sanitization failed with
+  `ValueError`, so no sanitized artifact or primary marker was produced. Its
+  precise cause is unproven. Exact fixture cleanup
+  [40144546228](https://github.com/StrayForest/old_sparky/actions/runs/40144546228)
+  passed, removing 14 users, 1 tournament and 1 marker while preserving control
+  state; the expired pair was canonically removed and both plans are absent.
+  Activity is clear. No capacity credit is awarded. See the
+  [performance reference](../performance/README.md) for expiry, cleanup
+  ownership and failure-report closure.
 - The installed canonical content sample on e920 exited successfully. This is
   not a new full GitHub content-diagnostics result; details were lost from its
   bounded prefix. Earlier full diagnostic [40113453588](https://github.com/StrayForest/old_sparky/actions/runs/40113453588)

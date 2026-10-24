@@ -441,7 +441,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 patch.object(cpu_pair, "_ssh_plan", side_effect=fake_ssh_plan) as ssh_plan,
             ):
                 receipt = capacity_diagnostic._parent_run(args)
-                self.assertEqual(ssh_plan.call_count, 2)
+                self.assertEqual(ssh_plan.call_count, 1)
 
             self.assertIsNotNone(capacity_diagnostic._project_parent_failure_receipt(receipt))
             self.assertEqual(receipt["status"], "incomplete")
@@ -453,8 +453,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "stage": "complete", "return_code": 2,
                 "stdout_shape": "refusal_marker", "child_state": "reaped",
             })
-            self.assertEqual(receipt["plan_cleanup_status"], "complete")
-            self.assertEqual(receipt["remote_plan_cleanup"], "complete")
+            self.assertEqual(receipt["plan_cleanup_status"], "not_attempted")
+            self.assertEqual(receipt["remote_plan_cleanup"], "failed")
             self.assertFalse(receipt["namespace_closed"])
             self.assertFalse(receipt["passed"])
             self.assertFalse(receipt["diagnostic_credit"])
@@ -569,7 +569,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             )
 
             worker_report_path = root / "worker-failure-report.json"
-            def fake_prepare_plan(*, lifecycle, **_kwargs):
+            prepared_run_ids: list[str] = []
+
+            def fake_prepare_plan(*, lifecycle, run_id, **_kwargs):
+                prepared_run_ids.append(run_id)
                 lifecycle.update({
                     "closed": True, "plan_prepare_status": "prepared",
                     "plan_prepare_refusal_class": "none",
@@ -601,7 +604,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
                 patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
                 patch.object(capacity_diagnostic, "run_isolated_capacity_worker", side_effect=RuntimeError("private worker detail")),
-                patch.object(cpu_pair, "_ssh_plan", side_effect=fake_cleanup),
+                patch.object(cpu_pair, "_ssh_plan", side_effect=fake_cleanup) as cleanup_ssh,
                 redirect_stdout(worker_stdout),
             ):
                 self.assertEqual(capacity_diagnostic.main([
@@ -616,11 +619,141 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             worker_failure = json.loads(worker_report_path.read_text(encoding="ascii"))
             self.assertEqual(worker_failure["stage"], "worker_supervision")
             self.assertEqual(worker_failure["error_class"], "RuntimeError")
-            self.assertEqual(worker_failure["plan_cleanup_status"], "complete")
-            self.assertEqual(worker_failure["remote_plan_cleanup"], "complete")
+            self.assertEqual(worker_failure["plan_cleanup_status"], "not_attempted")
+            self.assertEqual(worker_failure["remote_plan_cleanup"], "failed")
             self.assertFalse(worker_failure["namespace_closed"])
+            cleanup_ssh.assert_not_called()
             self.assertNotIn("private worker detail", worker_stdout.getvalue())
             self.assertNotIn(str(root), worker_report_path.read_text(encoding="ascii"))
+
+            events: list[tuple[str, int | None]] = []
+
+            def fake_closed_worker(**_kwargs):
+                return {
+                    "namespace_closed": True,
+                    "worker": {}, "runner_headroom": {},
+                }
+
+            def fake_wait(expiry_ms: int, **_clock_anchor: Any) -> None:
+                events.append(("wait", expiry_ms))
+
+            def fake_exact_cleanup(*, run_id, lifecycle, **_kwargs):
+                self.assertEqual(run_id, prepared_run_ids[-1])
+                events.append(("cleanup", None))
+                lifecycle.update({
+                    "plan_cleanup_status": "complete",
+                    "plan_cleanup_refusal_class": "none",
+                    "cleanup_transport": {
+                        "stage": "complete", "return_code": 0,
+                        "stdout_shape": "summary_marker", "child_state": "reaped",
+                    },
+                })
+                return True, {}
+
+            closed_args = Namespace(**vars(args))
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
+                patch.object(capacity_diagnostic, "run_isolated_capacity_worker", side_effect=fake_closed_worker),
+                patch.object(capacity_diagnostic, "_wait_for_remote_plan_expiry", side_effect=fake_wait),
+                patch.object(capacity_diagnostic, "_cleanup_remote_capacity_plan", side_effect=fake_exact_cleanup) as exact_cleanup,
+            ):
+                closed_outcome = capacity_diagnostic._parent_run(closed_args)
+            self.assertEqual(events, [("wait", 145_000), ("cleanup", None)])
+            exact_cleanup.assert_called_once()
+            self.assertTrue(closed_outcome["namespace_closed"])
+            self.assertEqual(closed_outcome["remote_plan_cleanup"], "complete")
+
+            fake_monotonic = [50.0]
+
+            def advance(seconds: float) -> None:
+                fake_monotonic[0] += seconds
+
+            with (
+                patch.object(capacity_diagnostic.time, "time_ns", return_value=9_999_999_999_000_000) as wall_clock,
+                patch.object(capacity_diagnostic.time, "monotonic", side_effect=lambda: fake_monotonic[0]),
+                patch.object(capacity_diagnostic.time, "sleep", side_effect=advance) as fake_sleep,
+            ):
+                capacity_diagnostic._wait_for_remote_plan_expiry(
+                    1_097_000, plan_created_at_ms=1_000_000,
+                    plan_created_monotonic=50.0,
+                )
+            self.assertLessEqual(sum(call.args[0] for call in fake_sleep.call_args_list), 106.1)
+            wall_clock.assert_not_called()
+
+            simulated_wait = sum(call.args[0] for call in fake_sleep.call_args_list)
+            self.assertLessEqual(simulated_wait, capacity_diagnostic.PLAN_EXPIRY_WAIT_LIMIT_MS / 1000)
+
+            fake_monotonic[0] = 157.0
+            with patch.object(capacity_diagnostic.time, "sleep") as no_sleep:
+                capacity_diagnostic._wait_for_remote_plan_expiry(
+                    1_097_000, plan_created_at_ms=1_000_000,
+                    plan_created_monotonic=50.0,
+                )
+            no_sleep.assert_not_called()
+
+            class FakeRunnerSampler:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def start(self, *_args):
+                    raise AssertionError("namespace callback must not run")
+
+                def stop(self, **_kwargs):
+                    return {
+                        "schema": 1, "status": "unknown", "reason": "parent_error",
+                        "runner_environment": "unknown",
+                        "identity": {key: False for key in (
+                            "outer_pid_namespace_matches_pid1", "outer_mount_namespace_matches_pid1",
+                            "outer_cgroup_namespace_matches_pid1", "target_cgroup_namespace_matches_outer",
+                            "target_mount_namespace_is_isolated", "target_pid_namespace_is_isolated",
+                            "global_cgroup2_mount", "workload_membership_matches_outer",
+                        )},
+                        "sample_count": 0, "window_seconds": None,
+                        "effective_cpu_capacity_cores": None,
+                        "max_cgroup_cpu_usage_cores": None,
+                        "max_visible_throttled_periods_delta": None,
+                        "window_scope": "on_window", "window_start_offset_ms": None,
+                        "window_end_offset_ms": None,
+                    }
+
+            producer_report = root / "namespace-open-parent-report.json"
+            sanitized_report = root / "namespace-open-sanitized.json"
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
+                patch.object(capacity_diagnostic.external_load, "RunnerCgroupSampler", FakeRunnerSampler),
+                patch.object(
+                    capacity_diagnostic.load_runtime, "run_supervised",
+                    return_value=SimpleNamespace(namespace_closed=False, reason="namespace_not_closed"),
+                ),
+                patch.object(capacity_diagnostic, "_cleanup_remote_capacity_plan") as no_namespace_cleanup,
+            ):
+                composed = capacity_diagnostic._parent_run(Namespace(**vars(args)))
+            no_namespace_cleanup.assert_not_called()
+            self.assertFalse(composed["namespace_closed"])
+            self.assertFalse(composed["passed"])
+            self.assertEqual(composed["remote_plan_cleanup"], "failed")
+            self.assertEqual(composed["memory_guard"]["memory_events_sampled_max_delta"], None)
+            self.assertEqual(composed["server_telemetry"]["node_memory_reason"], "unavailable")
+            self.assertIsNotNone(capacity_diagnostic._project_capacity_report(composed))
+            capacity_diagnostic._write_report(producer_report, composed)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                decision = capacity_diagnostic.sanitize_capacity_report(
+                    input_path=producer_report, output_path=sanitized_report,
+                    manifest_path=manifest_path, source_sha="a" * 40,
+                    app_target_sha="b" * 40, run_id="12345", attempt="1",
+                )
+            self.assertEqual(decision, "INVALID")
+            closed_failure = json.loads(sanitized_report.read_text(encoding="ascii"))
+            self.assertFalse(closed_failure["passed"])
+            self.assertFalse(closed_failure["namespace_closed"])
+            self.assertFalse(closed_failure["matrix_credit"])
+            self.assertFalse(closed_failure["slo_credit"])
+            self.assertFalse(closed_failure["diagnostic_credit"])
 
     def test_ssr_capacity_evaluator_requires_complete_bound_zero_credit_evidence(self) -> None:
         report = {

@@ -175,6 +175,26 @@ concurrency is present only for the SSR diagnostic. The consumer also binds
 the handoff to the exact target SHA, run ID and fixture source manifest before
 starting the candidate.
 
+The SSR diagnostic's exact API/web plan pair expires at the requested
+`on_end_ms`; the remote helper refuses prepare while either plan exists and
+accepts cleanup only for the plan's embedded run ID after strict expiry. Its
+parent waits through that bounded expiry only after the worker namespace is
+proven closed and the same invocation's prepare was confirmed. A prepare
+refusal under a fresh run ID does not authorize cleanup of an older owner's
+plan. The remote helper publishes both service plans as one operation and
+attempts to roll back only files whose inode and content hash still match its
+own writes.
+If a prior plan remains after fixture closure, use the canonical cleanup path
+with its embedded owner ID after expiry, then make at most one justified retry;
+never remove plan files directly. Plan lifetime is about 105 seconds at most,
+with the parent cleanup wait bounded to 107 seconds for the accepted host
+clock offset and strict-expiry margin.
+For a namespace-open or otherwise incomplete producer result, unavailable
+server telemetry uses the existing `unavailable` reason, and an empty
+no-sample memory-event set is represented as `null`; neither is converted into
+measured zero counters. The parent projection and sanitizer preserve that
+closed failure report as `INVALID` with all capacity credits false.
+
 The external runner preserves schema-1 report fields and adds measurement
 schema 2. Compatibility `latency` remains service latency; the additive timing
 block reports schedule/enqueue/actual start/completion, executor queue wait,
