@@ -96,23 +96,46 @@ def validate_cleanup_completion_result(result: object) -> None:
         raise RuntimeError("retained cleanup result is incomplete")
     result_keys = set(result)
     already_cleaned = result.get("already_cleaned")
+    never_started = result.get("never_started")
     expected_keys = CLEANUP_RESULT_KEYS
     if "already_cleaned" in result:
         if already_cleaned is not True:
             raise RuntimeError("retained cleanup result is incomplete")
         expected_keys = CLEANUP_RESULT_KEYS | {"already_cleaned"}
+    if "never_started" in result:
+        if never_started is not True or "already_cleaned" in result:
+            raise RuntimeError("retained cleanup result is incomplete")
+        expected_keys = CLEANUP_RESULT_KEYS | {
+            "never_started", "load_run_id", "load_run_attempt", "load_source_sha"
+        }
     if result_keys != expected_keys:
         raise RuntimeError("retained cleanup result is incomplete")
     if result.get("ok") is not True or result.get("control_account_preserved") is not True:
         raise RuntimeError("retained cleanup result is incomplete")
     marker_count = result.get("markers")
-    if type(marker_count) is not int or marker_count < 1:
+    if (
+        type(marker_count) is not int
+        or (marker_count != 0 if never_started is True else marker_count < 1)
+    ):
+        raise RuntimeError("retained cleanup result is incomplete")
+    if never_started is True and (
+        not isinstance(result.get("load_run_id"), str)
+        or re.fullmatch(r"[1-9][0-9]{0,31}", result["load_run_id"]) is None
+        or not isinstance(result.get("load_run_attempt"), str)
+        or re.fullmatch(r"[1-9][0-9]{0,31}", result["load_run_attempt"]) is None
+        or not isinstance(result.get("load_source_sha"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", result["load_source_sha"]) is None
+    ):
         raise RuntimeError("retained cleanup result is incomplete")
     for key in ("users_deleted", "tournaments_deleted"):
         value = result.get(key)
-        if type(value) is not int or value < 0:
+        if (
+            type(value) is not int
+            or value < 0
+            or (never_started is True and value != 0)
+        ):
             raise RuntimeError("retained cleanup result is incomplete")
-    if already_cleaned is True:
+    if never_started is True or already_cleaned is True:
         if result["users_deleted"] != 0 or result["tournaments_deleted"] != 0:
             raise RuntimeError("retained cleanup result is incomplete")
     elif result["users_deleted"] < 1:
@@ -135,6 +158,7 @@ def validate_cleanup_completion_result(result: object) -> None:
     if (
         read_models["keys_remaining"] != 0
         or read_models["keys_deleted"] > read_models["keys_expected"]
+        or (never_started is True and any(read_models.values()))
     ):
         raise RuntimeError("retained cleanup result is incomplete")
 

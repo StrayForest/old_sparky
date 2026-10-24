@@ -3593,15 +3593,31 @@ def main(argv: list[str] | None = None) -> int:
             app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
             if payload["load_run_id"] != arguments[4]:
                 return _fail()
+            cleanup_arguments = [
+                DELETE_CONFIRMATION,
+                payload["target_sha"],
+                payload["load_run_id"],
+                payload["cleanup_run_id"],
+                *source_arguments,
+            ]
+            never_started_proof = payload.get("never_started_proof")
+            if never_started_proof is not None:
+                proof_bytes = json.dumps(
+                    never_started_proof,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+                cleanup_arguments.extend(
+                    [
+                        "--never-started-proof-base64",
+                        base64.b64encode(proof_bytes).decode("ascii"),
+                    ]
+                )
             return _run_retained_cleanup_sudo(
                 CLEANUP_HELPER,
-                [
-                    DELETE_CONFIRMATION,
-                    payload["target_sha"],
-                    payload["load_run_id"],
-                    payload["cleanup_run_id"],
-                    *source_arguments,
-                ],
+                cleanup_arguments,
                 control_email=payload["control_email"],
                 diagnostic_binding={
                     "source_sha": payload["target_sha"],

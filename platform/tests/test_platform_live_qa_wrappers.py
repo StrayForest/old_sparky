@@ -4533,6 +4533,54 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertIn("remote_ssh_exit_code", workflow)
             self.assertIn('>> "$GITHUB_STEP_SUMMARY"', workflow)
 
+        project_start = retained.index("          project_cleanup_summary() {")
+        project_end = retained.index(
+            "\n          runner_failure_stage=ssh_invocation", project_start
+        )
+        project_function = textwrap.dedent(retained[project_start:project_end])
+        receipt = {
+            "ok": True,
+            "markers": 0,
+            "users_deleted": 0,
+            "tournaments_deleted": 0,
+            "control_account_preserved": True,
+            "never_started": True,
+            "load_run_id": "567890",
+            "load_run_attempt": "2",
+            "load_source_sha": "d" * 40,
+        }
+        with tempfile.TemporaryDirectory(prefix="retained-cleanup-summary-projection-") as temporary:
+            root = Path(temporary)
+            source = root / "source.json"
+            destination = root / "projected.json"
+            for mutation, expected_attempt, expected_sha, expected_status in (
+                (receipt, "2", "d" * 40, 0),
+                ({**receipt, "load_run_attempt": "1"}, "2", "d" * 40, 1),
+                ({**receipt, "load_source_sha": "e" * 40}, "2", "d" * 40, 1),
+                (receipt, "", "", 1),
+            ):
+                source.write_text(json.dumps(mutation), encoding="utf-8")
+                destination.unlink(missing_ok=True)
+                completed = subprocess.run(
+                    [
+                        "/bin/bash",
+                        "-c",
+                        project_function
+                        + '\nproject_cleanup_summary "$1" "$2" "$3" "$4" "$5"\n',
+                        "bash",
+                        str(source),
+                        str(destination),
+                        "567890",
+                        expected_attempt,
+                        expected_sha,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(completed.returncode, expected_status, completed.stderr)
+
         abort = (
             REPO_ROOT / ".github/workflows/platform-production-retained-load-abort.yml"
         ).read_text(encoding="utf-8")
@@ -4747,6 +4795,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         "TARGET_SHA": source_sha,
                         "APP_TARGET_SHA": app_sha,
                         "LOAD_RUN_ID": "234567",
+                        "NEVER_STARTED_ATTEMPT": "",
+                        "NEVER_STARTED_SOURCE_SHA": "",
                         "PROD_SSH_HOST": "fixture.invalid",
                         "PROD_SSH_USER": "synthetic-runner",
                         "SSH_MODE": (

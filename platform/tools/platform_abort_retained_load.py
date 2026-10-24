@@ -33,10 +33,11 @@ RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("confirmation")
-    parser.add_argument("target_sha")
-    parser.add_argument("load_run_id")
-    parser.add_argument("load_run_attempt")
+    parser.add_argument("--verify-no-active-run", action="store_true")
+    parser.add_argument("confirmation", nargs="?")
+    parser.add_argument("target_sha", nargs="?")
+    parser.add_argument("load_run_id", nargs="?")
+    parser.add_argument("load_run_attempt", nargs="?")
     return parser.parse_args()
 
 
@@ -607,6 +608,29 @@ def main() -> int:
     args = parse_args()
     if os.geteuid() != 0:
         raise SystemExit("retained-load abort must run as root")
+    if args.verify_no_active_run:
+        if (
+            args.confirmation is not None
+            or args.target_sha is not None
+            or args.load_run_attempt is not None
+            or RUN_ID_RE.fullmatch(args.load_run_id or "") is None
+        ):
+            raise SystemExit("exact retained-load activity check input is invalid")
+        roots, tree, scan_errors = _process_state(args.load_run_id)
+        if scan_errors or roots or tree:
+            raise SystemExit("exact retained-load activity could not be excluded")
+        print("RETAINED_LOAD_ACTIVITY_CHECK schema=1 status=clear")
+        return 0
+    if any(
+        value is None
+        for value in (
+            args.confirmation,
+            args.target_sha,
+            args.load_run_id,
+            args.load_run_attempt,
+        )
+    ):
+        raise SystemExit("retained-load abort inputs are incomplete")
     if args.confirmation != CONFIRMATION:
         raise SystemExit("refusing abort without exact confirmation")
     if not re.fullmatch(r"[0-9a-f]{40}", args.target_sha):

@@ -2694,6 +2694,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 payload = payload_root / source_sha
                 cleanup_tools = (
                     "platform_cleanup_retained_orphan.py",
+                    "platform_workflow_input_guard.py",
                     "platform_recover_retained_report.py",
                     "platform_cleanup_retained_matrix.py",
                 )

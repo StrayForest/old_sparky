@@ -176,6 +176,27 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
         self.assertNotIn('--control-email "$control_email"', cleanup)
         self.assertRegex(cleanup, r'printf .+\\n. \"\$control_email\" \\|')
 
+        no_start = cleanup.index("--verify-no-active-run")
+        orphan = cleanup.index('platform_cleanup_retained_orphan.py"')
+        self.assertLess(no_start, orphan)
+        self.assertIn('external_load_export_dir="/tmp/old-sparky-production-retained-load-$load_run_id"', cleanup)
+        self.assertIn('[[ -e "$external_load_export_dir" || -L "$external_load_export_dir" ]]', cleanup)
+        self.assertLess(cleanup.index('platform_retained_load_lock_supervise "${ORIGINAL_ARGS[@]}"'), no_start)
+
+        abort = (tools / "platform_abort_retained_load.py").read_text(encoding="utf-8")
+        activity_branch = abort.split('if args.verify_no_active_run:', 1)[1].split('\n    if any(', 1)[0]
+        self.assertIn('_process_state(args.load_run_id)', activity_branch)
+        self.assertIn('if scan_errors or roots or tree:', activity_branch)
+        self.assertIn('RETAINED_LOAD_ACTIVITY_CHECK schema=1 status=clear', activity_branch)
+
+        cleanup_workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/platform-production-retained-load-cleanup.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('/attempts/{original_attempt}/jobs?per_page=100', cleanup_workflow)
+        self.assertIn('current_run.get("run_attempt") != original_attempt', cleanup_workflow)
+        self.assertIn('current_run.get("head_sha") != original_run.get("head_sha")', cleanup_workflow)
+
         lock_helper = (
             tools / "platform_release_lock.sh"
         ).read_text(encoding="utf-8")

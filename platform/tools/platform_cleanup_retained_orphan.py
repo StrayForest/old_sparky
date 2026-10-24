@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from python_packages.platform_infra.config import get_settings, validate_platform_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import PreprodTestRun, User
+from platform_workflow_input_guard import validate_never_started_cleanup_proof
 from platform_cleanup_retained_matrix import (
     CONFIRMATION,
     EMAIL_PATTERN,
@@ -43,10 +45,17 @@ from platform_cleanup_retained_matrix import (
 
 
 RUN_ROOT_BASE = Path("/opt/oldsparky/platform/shared/production-retained-matrix")
+EXTERNAL_LOAD_EXPORT_BASE = Path("/tmp/old-sparky-production-retained-load-")
 SUPPORTED_MODES = frozenset({"read-mix", "write-burst"})
 LEGACY_EXTERNAL_VOTE_MODE = "external-vote"
 MAX_COMPACT_USER_RECOVERY = 20_000
 RUN_ID_PATTERN = r"[1-9][0-9]{0,31}"
+
+
+def _external_load_export_path(load_run_id: str) -> Path:
+    if not re.fullmatch(RUN_ID_PATTERN, load_run_id):
+        raise RuntimeError("load run id must be numeric")
+    return Path(f"{EXTERNAL_LOAD_EXPORT_BASE}{load_run_id}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     add_control_email_argument(parser)
     parser.add_argument("--confirm", required=True)
     parser.add_argument("--result-path", type=Path, required=True)
+    parser.add_argument("--never-started-proof-base64")
     args = parser.parse_args()
     args.control_email = resolve_control_email(args)
     return args
@@ -230,6 +240,37 @@ async def clean_orphan(args: argparse.Namespace) -> dict[str, Any]:
     if run_root.exists() or run_root.is_symlink():
         raise RuntimeError("exact retained run root still exists; use normal manifest cleanup")
 
+    never_started_proof = None
+    if args.never_started_proof_base64 is not None:
+        encoded = args.never_started_proof_base64
+        if (
+            not isinstance(encoded, str)
+            or not 1 <= len(encoded) <= 8192
+            or re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded) is None
+        ):
+            raise RuntimeError("never-started cleanup proof is malformed")
+        try:
+            raw_proof = base64.b64decode(encoded, validate=True)
+            if base64.b64encode(raw_proof).decode("ascii") != encoded or len(raw_proof) > 6144:
+                raise ValueError
+
+            def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                values: dict[str, Any] = {}
+                for key, value in pairs:
+                    if key in values:
+                        raise ValueError
+                    values[key] = value
+                return values
+
+            proof_document = json.loads(
+                raw_proof.decode("ascii"), object_pairs_hook=reject_duplicate_keys
+            )
+            never_started_proof = validate_never_started_cleanup_proof(
+                proof_document, expected_load_run_id=args.load_run_id
+            )
+        except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("never-started cleanup proof is invalid") from exc
+
     settings = get_settings()
     validate_platform_settings(settings)
     if settings.platform_environment.strip().lower() != "production":
@@ -238,6 +279,11 @@ async def clean_orphan(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("retained orphan cleanup requires the canonical origin")
 
     control_email = args.control_email.strip().lower()
+    external_export = _external_load_export_path(args.load_run_id)
+    if never_started_proof is not None and (
+        external_export.exists() or external_export.is_symlink()
+    ):
+        raise RuntimeError("never-started cleanup proof conflicts with a retained-load export")
     report_paths = {
         _canonical_report_path(run_id=args.load_run_id, mode=mode)
         for mode in SUPPORTED_MODES
@@ -253,8 +299,35 @@ async def clean_orphan(args: argparse.Namespace) -> dict[str, Any]:
                 )
             ).all()
         )
-        if len(rows) != 1:
+        if not rows and never_started_proof is not None:
+            result = {
+                "ok": True,
+                "markers": 0,
+                "users_deleted": 0,
+                "tournaments_deleted": 0,
+                "control_account_preserved": True,
+                "remaining_users": 0,
+                "remaining_tournaments": 0,
+                "remaining_sessions": 0,
+                "remaining_audit_logs": 0,
+                "read_models": {
+                    "keys_expected": 0,
+                    "keys_deleted": 0,
+                    "keys_remaining": 0,
+                },
+                "never_started": True,
+                "load_run_id": never_started_proof["load_run_id"],
+                "load_run_attempt": never_started_proof["load_run_attempt"],
+                "load_source_sha": never_started_proof["head_sha"],
+            }
+            args.result_path.write_text(
+                json.dumps(result, indent=2) + "\n", encoding="utf-8"
+            )
+            return result
+        if not rows or len(rows) != 1:
             raise RuntimeError("exactly one durable QA row is required for the orphan run")
+        if never_started_proof is not None:
+            raise RuntimeError("never-started cleanup proof conflicts with a durable QA row")
         stored_user_ids = (rows[0].report or {}).get("user_ids")
         already_cleaned = (
             str(rows[0].status or "").lower() == "cleaned"

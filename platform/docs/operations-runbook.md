@@ -574,7 +574,7 @@ gh workflow run platform-production-retained-load-cleanup.yml \
 gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The cleanup supervisor holds the load host lock, validates production ownership, and delegates exact fixture/database/Redis checks to the [cleanup contract](#retained-load-cleanup-and-hermetic-web-verification) before removing matching reports. Failed cleanup retains data; never run broad cleanup. A durable cleaned row permits exact-ID artifact removal only after provenance, empty-fixture and root ownership/mode/symlink checks; mixed state fails closed.
+The cleanup supervisor holds the load host lock, validates production ownership, and delegates exact fixture/database/Redis checks to the [cleanup contract](#retained-load-cleanup-and-hermetic-web-verification) before removing matching reports. A missing run root with zero durable rows closes only when the current failed workflow attempt proves validation failed before fixture admission, all workload mutation steps were skipped, and exact host lock/process/path checks are clear; its receipt binds that attempt and source SHA and awards zero credit. Failed cleanup retains data; never run broad cleanup. A durable cleaned row permits exact-ID artifact removal only after provenance, empty-fixture and root ownership/mode/symlink checks; mixed state fails closed.
 
 Cleanup and abort diagnostics emit `RETAINED_CLEANUP_INPUT`,
 `RETAINED_CLEANUP_EVIDENCE`, `RETAINED_ABORT_INPUT` and

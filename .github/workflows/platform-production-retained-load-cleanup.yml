@@ -360,6 +360,8 @@ jobs:
       - name: Validate explicit cleanup confirmation
         id: validate_cleanup_inputs
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           umask 077
@@ -385,6 +387,8 @@ jobs:
           import re
           import stat
           import sys
+          import urllib.error
+          import urllib.request
 
           target_sha, load_run_id, cleanup_run_id, event_path, binding_path_value, expected_app_sha = sys.argv[1:]
           try:
@@ -519,6 +523,166 @@ jobs:
                   or source_binding.get("receipt_archive_sha256") != source_binding.get("receipt_artifact_digest", "").removeprefix("sha256:")
               ):
                   raise SystemExit("cleanup verified-noop binding proof is malformed")
+
+          def exact_api_json(path):
+              request = urllib.request.Request(
+                  os.environ["GITHUB_API_URL"].rstrip("/") + path,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "OldSparky-retained-cleanup-never-started-proof",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  raw = response.read(131073)
+              if len(raw) > 131072:
+                  raise ValueError
+              return json.loads(
+                  raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
+              )
+
+          never_started_proof = None
+          try:
+              original_run = exact_api_json(
+                  f"/repos/StrayForest/old_sparky/actions/runs/{load_run_id}"
+              )
+              original_attempt = original_run.get("run_attempt")
+              if (
+                  original_run.get("id") == int(load_run_id)
+                  and original_run.get("repository", {}).get("full_name")
+                  == "StrayForest/old_sparky"
+                  and original_run.get("path")
+                  == ".github/workflows/platform-production-external-load.yml"
+                  and original_run.get("head_branch") == "dev"
+                  and original_run.get("event") == "workflow_dispatch"
+                  and original_run.get("status") == "completed"
+                  and original_run.get("conclusion") == "failure"
+                  and type(original_attempt) is int
+                  and 1 <= original_attempt <= 2**31 - 1
+                  and re.fullmatch(r"[0-9a-f]{40}", str(original_run.get("head_sha")))
+                  is not None
+              ):
+                  jobs_response = exact_api_json(
+                      f"/repos/StrayForest/old_sparky/actions/runs/{load_run_id}"
+                      f"/attempts/{original_attempt}/jobs?per_page=100"
+                  )
+                  api_jobs = jobs_response.get("jobs")
+                  total_count = jobs_response.get("total_count")
+                  if (
+                      type(total_count) is int
+                      and total_count == len(api_jobs)
+                      and total_count <= 100
+                      and isinstance(api_jobs, list)
+                  ):
+                      by_name = {}
+                      for job in api_jobs:
+                          if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+                              raise ValueError
+                          name = job["name"]
+                          if name in by_name:
+                              raise ValueError
+                          by_name[name] = job
+                      required_jobs = {
+                          "Validate external-load dispatch": "failure",
+                          "Prepare external fixture with ephemeral SSH": "skipped",
+                          "Run checked-out external HTTP load client": "skipped",
+                          "Run isolated zero-credit authenticated SSR CPU pair": "skipped",
+                      }
+                      projected_jobs = {}
+                      for name, conclusion in required_jobs.items():
+                          job = by_name.get(name)
+                          if (
+                              not isinstance(job, dict)
+                              or job.get("status") != "completed"
+                              or job.get("conclusion") != conclusion
+                          ):
+                              raise ValueError
+                          projected_jobs[
+                              {
+                                  "Validate external-load dispatch": "validate-external-inputs",
+                                  "Prepare external fixture with ephemeral SSH": "fixture-setup",
+                                  "Run checked-out external HTTP load client": "load-client",
+                                  "Run isolated zero-credit authenticated SSR CPU pair": "cpu-diagnostic-pair",
+                              }[name]
+                          ] = {"status": "completed", "conclusion": conclusion}
+                      finalizer_job = by_name.get(
+                          "Signal fixture completion and collect origin evidence"
+                      )
+                      if not isinstance(finalizer_job, dict) or finalizer_job.get("status") != "completed":
+                          raise ValueError
+                      finalizer_rows = finalizer_job.get("steps")
+                      if not isinstance(finalizer_rows, list):
+                          raise ValueError
+                      finalizer_by_name = {}
+                      for step in finalizer_rows:
+                          if not isinstance(step, dict) or not isinstance(step.get("name"), str):
+                              raise ValueError
+                          if step["name"] in finalizer_by_name:
+                              raise ValueError
+                          finalizer_by_name[step["name"]] = step
+                      finalizer_step_names = (
+                          "Configure finalizer SSH",
+                          "Signal fixture completion and collect origin evidence",
+                          "Exact cleanup of external fixture",
+                      )
+                      projected_finalizer_steps = {}
+                      for name in finalizer_step_names:
+                          step = finalizer_by_name.get(name)
+                          if (
+                              not isinstance(step, dict)
+                              or step.get("status") != "completed"
+                              or step.get("conclusion") != "skipped"
+                          ):
+                              raise ValueError
+                          projected_finalizer_steps[name] = "skipped"
+                      # A run can be rerun while the attempt-specific jobs are
+                      # being read. Re-read the run metadata so an old failed
+                      # attempt cannot authorize a no-start receipt after a
+                      # newer attempt has become current.
+                      current_run = exact_api_json(
+                          f"/repos/StrayForest/old_sparky/actions/runs/{load_run_id}"
+                      )
+                      if (
+                          current_run.get("id") != int(load_run_id)
+                          or type(current_run.get("run_attempt")) is not int
+                          or current_run.get("run_attempt") != original_attempt
+                          or current_run.get("path") != original_run.get("path")
+                          or current_run.get("head_branch") != original_run.get("head_branch")
+                          or current_run.get("head_sha") != original_run.get("head_sha")
+                          or current_run.get("event") != original_run.get("event")
+                          or current_run.get("status") != "completed"
+                          or current_run.get("conclusion") != "failure"
+                      ):
+                          raise ValueError
+                      current_repository = current_run.get("repository")
+                      original_repository = original_run.get("repository")
+                      if (
+                          not isinstance(current_repository, dict)
+                          or not isinstance(original_repository, dict)
+                          or current_repository.get("full_name") != "StrayForest/old_sparky"
+                          or current_repository.get("full_name")
+                          != original_repository.get("full_name")
+                      ):
+                          raise ValueError
+                      never_started_proof = {
+                          "schema": 1,
+                          "load_run_id": load_run_id,
+                          "load_run_attempt": str(original_attempt),
+                          "repository": "StrayForest/old_sparky",
+                          "workflow_path": original_run["path"],
+                          "head_branch": original_run["head_branch"],
+                          "head_sha": original_run["head_sha"],
+                          "event": original_run["event"],
+                          "status": original_run["status"],
+                          "conclusion": original_run["conclusion"],
+                          "jobs": projected_jobs,
+                          "finalizer_steps": projected_finalizer_steps,
+                      }
+          except (AttributeError, KeyError, OSError, TypeError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+              # Lack of GitHub proof does not block ordinary durable-row
+              # cleanup. The host no-row route requires this exact projection.
+              never_started_proof = None
           if (
               re.fullmatch(r"[0-9a-f]{40}", target_sha) is None
               or re.fullmatch(r"[1-9][0-9]{0,31}", load_run_id) is None
@@ -540,6 +704,7 @@ jobs:
               "load_run_id": load_run_id,
               "cleanup_run_id": cleanup_run_id,
               **({"source_binding": source_binding} if source_binding is not None else {}),
+              **({"never_started_proof": never_started_proof} if never_started_proof is not None else {}),
           }, separators=(",", ":")).encode("ascii") + b"\n"
           output_path = Path(os.environ["RUNNER_TEMP"]) / "platform-retained-cleanup-input.json"
           try:
@@ -573,6 +738,19 @@ jobs:
                   os.close(descriptor)
           except OSError:
               raise SystemExit("cleanup handoff could not be created safely")
+          never_started_attempt = ""
+          never_started_source_sha = ""
+          if never_started_proof is not None:
+              never_started_attempt = never_started_proof["load_run_attempt"]
+              never_started_source_sha = never_started_proof["head_sha"]
+              if (
+                  re.fullmatch(r"[1-9][0-9]{0,31}", never_started_attempt) is None
+                  or re.fullmatch(r"[0-9a-f]{40}", never_started_source_sha) is None
+              ):
+                  raise SystemExit("never-started proof identity is invalid")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as output_file:
+              output_file.write(f"never_started_attempt={never_started_attempt}\n")
+              output_file.write(f"never_started_source_sha={never_started_source_sha}\n")
           PY
           test "$(stat -c '%F:%h:%a:%u' -- "$RUNNER_TEMP/platform-retained-cleanup-input.json")" = "regular file:1:600:$(id -u)"
 
@@ -645,6 +823,8 @@ jobs:
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          NEVER_STARTED_ATTEMPT: ${{ steps.validate_cleanup_inputs.outputs.never_started_attempt }}
+          NEVER_STARTED_SOURCE_SHA: ${{ steps.validate_cleanup_inputs.outputs.never_started_source_sha }}
         run: |
           set -u
           umask 077
@@ -838,12 +1018,18 @@ jobs:
           project_cleanup_summary() {
             local source="$1"
             local destination="$2"
-            /usr/bin/python3 - "$source" "$destination" <<'PY'
+            local expected_load_run_id="$3"
+            local expected_load_attempt="$4"
+            local expected_load_source_sha="$5"
+            /usr/bin/python3 - "$source" "$destination" "$expected_load_run_id" \
+              "$expected_load_attempt" "$expected_load_source_sha" <<'PY'
           import json
           from pathlib import Path
+          import re
           import sys
 
-          source_path, destination_path = (Path(value) for value in sys.argv[1:])
+          source_path, destination_path = (Path(value) for value in sys.argv[1:3])
+          expected_load_run_id, expected_load_attempt, expected_load_source_sha = sys.argv[3:6]
           fallback = {
               "schema": 1,
               "ok": False,
@@ -881,6 +1067,30 @@ jobs:
                   "tournaments_deleted": bounded_count("tournaments_deleted"),
                   "control_account_preserved": source["control_account_preserved"] is True,
               }
+              if "never_started" in source:
+                  load_run_id = source.get("load_run_id")
+                  load_run_attempt = source.get("load_run_attempt")
+                  load_source_sha = source.get("load_source_sha")
+                  if (
+                      source["never_started"] is not True
+                      or projection["markers"] != 0
+                      or projection["users_deleted"] != 0
+                      or projection["tournaments_deleted"] != 0
+                      or load_run_id != expected_load_run_id
+                      or not isinstance(load_run_attempt, str)
+                      or re.fullmatch(r"[1-9][0-9]{0,31}", load_run_attempt) is None
+                      or load_run_attempt != expected_load_attempt
+                      or not isinstance(load_source_sha, str)
+                      or re.fullmatch(r"[0-9a-f]{40}", load_source_sha) is None
+                      or load_source_sha != expected_load_source_sha
+                  ):
+                      raise ValueError("never_started")
+                  projection["never_started"] = True
+                  projection["load_run_id"] = load_run_id
+                  projection["load_run_attempt"] = load_run_attempt
+                  projection["load_source_sha"] = load_source_sha
+              elif any(key in source for key in ("load_run_id", "load_run_attempt", "load_source_sha")):
+                  raise ValueError("unbound never_started receipt")
               if "partial_run_root_removed" in source:
                   if not isinstance(source["partial_run_root_removed"], bool):
                       raise ValueError("partial_run_root_removed")
@@ -1020,7 +1230,8 @@ jobs:
           if [[ "$summary_copy_status" == "0" ]]; then
             public_summary="$cleanup_summary.public"
             set +e
-            project_cleanup_summary "$cleanup_summary" "$public_summary"
+            project_cleanup_summary "$cleanup_summary" "$public_summary" "$LOAD_RUN_ID" \
+              "$NEVER_STARTED_ATTEMPT" "$NEVER_STARTED_SOURCE_SHA"
             projection_status="$?"
             set -e
             if [[ "$projection_status" == "0" && -s "$public_summary" ]]; then
@@ -1582,6 +1793,8 @@ jobs:
           print(f"- Markers cleaned: {payload.get('markers', 0)}")
           print(f"- Synthetic users deleted: {payload.get('users_deleted', 0)}")
           print(f"- Tournaments deleted: {payload.get('tournaments_deleted', 0)}")
+          if payload.get("never_started") is True:
+              print("- Fixture state: verified never started; zero data deleted")
           print(f"- Control account preserved: `{payload.get('control_account_preserved')}`")
           PY
 

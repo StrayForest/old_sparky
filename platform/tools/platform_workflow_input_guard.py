@@ -603,6 +603,8 @@ def validate_cleanup_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
     schema, source_binding = _validate_source_binding_schema(payload)
     keys = base_keys if schema == 1 else base_keys | {"source_binding"}
+    if "never_started_proof" in payload:
+        keys = keys | {"never_started_proof"}
     _require_exact_keys(payload, keys)
     target_sha = _require_string(payload, "target_sha")
     if SHA_RE.fullmatch(target_sha) is None:
@@ -618,7 +620,105 @@ def validate_cleanup_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
     if source_binding is not None:
         result["source_binding"] = source_binding
+    if "never_started_proof" in payload:
+        result["never_started_proof"] = validate_never_started_cleanup_proof(
+            payload.get("never_started_proof"), expected_load_run_id=result["load_run_id"]
+        )
     return result
+
+
+def validate_never_started_cleanup_proof(
+    value: object, *, expected_load_run_id: str
+) -> dict[str, Any]:
+    """Validate the closed API projection for an exact failed-before-fixture run."""
+
+    payload = _require_mapping(value)
+    keys = {
+        "schema",
+        "load_run_id",
+        "load_run_attempt",
+        "repository",
+        "workflow_path",
+        "head_branch",
+        "head_sha",
+        "event",
+        "status",
+        "conclusion",
+        "jobs",
+        "finalizer_steps",
+    }
+    _require_exact_keys(payload, keys)
+    if type(payload.get("schema")) is not int or payload["schema"] != 1:
+        raise _invalid()
+    load_run_id = _validate_run_id(payload.get("load_run_id"))
+    if load_run_id != expected_load_run_id:
+        raise _invalid()
+    load_run_attempt = _validate_run_id(payload.get("load_run_attempt"))
+    if int(load_run_attempt) > 2**31 - 1:
+        raise _invalid()
+    if (
+        payload.get("repository") != "StrayForest/old_sparky"
+        or payload.get("workflow_path")
+        != ".github/workflows/platform-production-external-load.yml"
+        or payload.get("head_branch") != "dev"
+        or payload.get("event") != "workflow_dispatch"
+        or payload.get("status") != "completed"
+        or payload.get("conclusion") != "failure"
+    ):
+        raise _invalid()
+    head_sha = _require_string(payload, "head_sha")
+    if SHA_RE.fullmatch(head_sha) is None:
+        raise _invalid()
+    expected_jobs = {
+        "validate-external-inputs": "failure",
+        "fixture-setup": "skipped",
+        "load-client": "skipped",
+        "cpu-diagnostic-pair": "skipped",
+    }
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, Mapping) or set(jobs) != set(expected_jobs):
+        raise _invalid()
+    normalized_jobs: dict[str, dict[str, str]] = {}
+    for name, expected_conclusion in expected_jobs.items():
+        row = jobs.get(name)
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != {"status", "conclusion"}
+            or row.get("status") != "completed"
+            or row.get("conclusion") != expected_conclusion
+        ):
+            raise _invalid()
+        normalized_jobs[name] = {"status": "completed", "conclusion": expected_conclusion}
+
+    expected_finalizer_steps = {
+        "Configure finalizer SSH",
+        "Signal fixture completion and collect origin evidence",
+        "Exact cleanup of external fixture",
+    }
+    finalizer_steps = payload.get("finalizer_steps")
+    if (
+        not isinstance(finalizer_steps, Mapping)
+        or set(finalizer_steps) != expected_finalizer_steps
+        or any(value != "skipped" for value in finalizer_steps.values())
+    ):
+        raise _invalid()
+
+    return {
+        "schema": 1,
+        "load_run_id": load_run_id,
+        "load_run_attempt": load_run_attempt,
+        "repository": "StrayForest/old_sparky",
+        "workflow_path": ".github/workflows/platform-production-external-load.yml",
+        "head_branch": "dev",
+        "head_sha": head_sha,
+        "event": "workflow_dispatch",
+        "status": "completed",
+        "conclusion": "failure",
+        "jobs": normalized_jobs,
+        "finalizer_steps": {
+            name: "skipped" for name in sorted(expected_finalizer_steps)
+        },
+    }
 
 
 def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, Any]:

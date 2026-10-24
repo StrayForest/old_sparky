@@ -34,6 +34,7 @@ from tools.platform_abort_retained_load import (
     _closed_root_json,
     _cpu_abort_binding,
     export_abort_evidence,
+    main as abort_retained_load_main,
 )
 from tools.platform_live_launch_report import sanitize_live_launch_lines
 from tools.platform_production_qa import (
@@ -62,6 +63,36 @@ def serialized(value: object) -> str:
 
 
 class EvidencePrivacyTests(unittest.TestCase):
+    def test_exact_no_active_run_check_is_read_only_and_fails_closed(self) -> None:
+        output = StringIO()
+        with (
+            mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
+            mock.patch("tools.platform_abort_retained_load._process_state", return_value=(set(), set(), 0)),
+            mock.patch("tools.platform_abort_retained_load.sys.argv", ["abort", "--verify-no-active-run", "123456"]),
+            mock.patch("sys.stdout", output),
+        ):
+            self.assertEqual(abort_retained_load_main(), 0)
+        self.assertEqual(
+            output.getvalue(),
+            "RETAINED_LOAD_ACTIVITY_CHECK schema=1 status=clear\n",
+        )
+
+        for process_state in (
+            ({123}, {123}, 0),
+            (set(), set(), 1),
+        ):
+            with self.subTest(process_state=process_state):
+                with (
+                    mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
+                    mock.patch(
+                        "tools.platform_abort_retained_load._process_state",
+                        return_value=process_state,
+                    ),
+                    mock.patch("tools.platform_abort_retained_load.sys.argv", ["abort", "--verify-no-active-run", "123456"]),
+                ):
+                    with self.assertRaisesRegex(SystemExit, "exact retained-load activity"):
+                        abort_retained_load_main()
+
     def test_capacity_attribution_projection_preserves_closed_claim_and_unknowns(self) -> None:
         eligible = {
             "schema": 1, "status": "eligible", "reason": "headroom_observed",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 from pathlib import Path
@@ -12,6 +13,7 @@ from uuid import uuid4
 
 from tools import platform_cleanup_retained_orphan as cleanup
 from tools.platform_evidence_sanitizer import sanitized_log_summary
+from tools.platform_cleanup_retained_matrix import validate_cleanup_completion_result
 from tools.platform_production_qa import ProductionQa
 
 
@@ -82,6 +84,156 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
         }
         values.update(overrides)
         return SimpleNamespace(**values)
+
+    @staticmethod
+    def _never_started_proof(load_run_id: str) -> dict[str, object]:
+        return {
+            "schema": 1,
+            "load_run_id": load_run_id,
+            "load_run_attempt": "2",
+            "repository": "StrayForest/old_sparky",
+            "workflow_path": ".github/workflows/platform-production-external-load.yml",
+            "head_branch": "dev",
+            "head_sha": "d" * 40,
+            "event": "workflow_dispatch",
+            "status": "completed",
+            "conclusion": "failure",
+            "jobs": {
+                "validate-external-inputs": {"status": "completed", "conclusion": "failure"},
+                "fixture-setup": {"status": "completed", "conclusion": "skipped"},
+                "load-client": {"status": "completed", "conclusion": "skipped"},
+                "cpu-diagnostic-pair": {"status": "completed", "conclusion": "skipped"},
+            },
+            "finalizer_steps": {
+                "Configure finalizer SSH": "skipped",
+                "Signal fixture completion and collect origin evidence": "skipped",
+                "Exact cleanup of external fixture": "skipped",
+            },
+        }
+
+    def _invoke_no_start_proof(
+        self,
+        *,
+        proof: dict[str, object] | None,
+        rows: list[object],
+        run_id: str = "9876543210",
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        with tempfile.TemporaryDirectory(prefix="retained-no-start-") as temporary:
+            root = Path(temporary)
+            run_root_base = root / "run-roots"
+            result_path = root / "cleanup-result.json"
+            export_base = root / "external-load-export-"
+            session = SimpleNamespace(
+                scalars=AsyncMock(return_value=SimpleNamespace(all=lambda: rows))
+            )
+
+            class SessionContext:
+                async def __aenter__(self):
+                    return session
+
+                async def __aexit__(self, *_args):
+                    return None
+
+            arguments = SimpleNamespace(
+                load_run_id=run_id,
+                confirm=cleanup.CONFIRMATION,
+                control_email="qa.control@example.test",
+                result_path=result_path,
+                never_started_proof_base64=(
+                    base64.b64encode(
+                        json.dumps(proof, sort_keys=True, separators=(",", ":")).encode("ascii")
+                    ).decode("ascii")
+                    if proof is not None
+                    else None
+                ),
+            )
+            settings = SimpleNamespace(
+                platform_environment="production",
+                platform_web_origin=cleanup.EXPECTED_ORIGIN,
+            )
+            with (
+                patch.object(cleanup.os, "geteuid", return_value=0),
+                patch.object(cleanup, "RUN_ROOT_BASE", run_root_base),
+                patch.object(cleanup, "EXTERNAL_LOAD_EXPORT_BASE", export_base),
+                patch.object(cleanup, "get_settings", return_value=settings),
+                patch.object(cleanup, "validate_platform_settings"),
+                patch.object(cleanup, "session_factory", return_value=lambda: SessionContext()),
+            ):
+                result = asyncio.run(cleanup.clean_orphan(arguments))
+            return result, json.loads(result_path.read_text(encoding="utf-8"))
+
+    def test_never_started_zero_row_cleanup_emits_explicit_zero_credit_receipt(self) -> None:
+        proof = self._never_started_proof("9876543210")
+        result, published = self._invoke_no_start_proof(proof=proof, rows=[])
+        validate_cleanup_completion_result(result)
+        self.assertEqual(result["never_started"], True)
+        self.assertEqual((result["markers"], result["users_deleted"], result["tournaments_deleted"]), (0, 0, 0))
+        self.assertEqual(published, result)
+        self.assertEqual(
+            (published["load_run_id"], published["load_run_attempt"], published["load_source_sha"]),
+            ("9876543210", "2", "d" * 40),
+        )
+        for mutation in (
+            {**result, "load_run_attempt": "3" * 40},
+            {**result, "load_source_sha": "not-a-source-sha"},
+            {**result, "unexpected": "field"},
+            {**result, "users_deleted": 1},
+        ):
+            with self.subTest(receipt=mutation):
+                with self.assertRaises(RuntimeError):
+                    validate_cleanup_completion_result(mutation)
+
+    def test_never_started_noop_requires_zero_rows_and_exact_absent_paths(self) -> None:
+        proof = self._never_started_proof("9876543210")
+        row = self._run()
+        with self.assertRaisesRegex(RuntimeError, "conflicts with a durable QA row"):
+            self._invoke_no_start_proof(proof=proof, rows=[row])
+        with self.assertRaisesRegex(RuntimeError, "exactly one durable QA row"):
+            self._invoke_no_start_proof(proof=None, rows=[])
+
+        proof = self._never_started_proof("9876543211")
+        with tempfile.TemporaryDirectory(prefix="retained-no-start-export-") as temporary:
+            export_base = Path(temporary) / "export-"
+            export_path = Path(f"{export_base}9876543211")
+            export_path.mkdir(mode=0o700)
+            arguments = SimpleNamespace(
+                load_run_id="9876543211",
+                confirm=cleanup.CONFIRMATION,
+                control_email="qa.control@example.test",
+                result_path=Path(temporary) / "result.json",
+                never_started_proof_base64=base64.b64encode(
+                    json.dumps(proof, sort_keys=True, separators=(",", ":")).encode("ascii")
+                ).decode("ascii"),
+            )
+            session = SimpleNamespace(
+                scalars=AsyncMock(return_value=SimpleNamespace(all=lambda: []))
+            )
+
+            class SessionContext:
+                async def __aenter__(self):
+                    return session
+
+                async def __aexit__(self, *_args):
+                    return None
+
+            with (
+                patch.object(cleanup.os, "geteuid", return_value=0),
+                patch.object(cleanup, "RUN_ROOT_BASE", Path(temporary) / "run-roots"),
+                patch.object(cleanup, "EXTERNAL_LOAD_EXPORT_BASE", export_base),
+                patch.object(
+                    cleanup,
+                    "get_settings",
+                    return_value=SimpleNamespace(
+                        platform_environment="production",
+                        platform_web_origin=cleanup.EXPECTED_ORIGIN,
+                    ),
+                ),
+                patch.object(cleanup, "validate_platform_settings"),
+                patch.object(cleanup, "session_factory", return_value=lambda: SessionContext()),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "conflicts with a retained-load export"):
+                    asyncio.run(cleanup.clean_orphan(arguments))
+            self.assertFalse(arguments.result_path.exists())
 
     def test_builds_manifest_from_one_exact_durable_row(self) -> None:
         manifest = cleanup.build_durable_manifest(

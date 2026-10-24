@@ -80,13 +80,8 @@ run_external_vote_recovery() {
 EOF
 }
 source_binding_b64=""
-if (( $# == 6 )); then
-  [[ "${5}" == "--source-binding-base64" ]] || {
-    echo "Source-binding option is invalid." >&2
-    exit 2
-  }
-  source_binding_b64="${6}"
-elif (( $# != 4 )); then
+never_started_proof_b64=""
+if (( $# < 4 )); then
   echo "Usage: $0 $CONFIRMATION <runner-sha> <load-run-id> <cleanup-run-id> [--source-binding-base64 <binding>]" >&2
   exit 2
 fi
@@ -99,6 +94,35 @@ confirmation="$1"
 target_sha="$2"
 load_run_id="$3"
 cleanup_run_id="$4"
+shift 4
+while (( $# > 0 )); do
+  (( $# >= 2 )) || {
+    echo "Retained cleanup option is incomplete." >&2
+    exit 2
+  }
+  case "$1" in
+    --source-binding-base64)
+      [[ -z "$source_binding_b64" && -n "$2" ]] || {
+        echo "Source-binding option is invalid." >&2
+        exit 2
+      }
+      source_binding_b64="$2"
+      ;;
+    --never-started-proof-base64)
+      [[ -z "$never_started_proof_b64" && -n "$2" && ${#2} -le 8192 \
+        && "$2" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || {
+        echo "Never-started proof option is invalid." >&2
+        exit 2
+      }
+      never_started_proof_b64="$2"
+      ;;
+    *)
+      echo "Retained cleanup option is invalid." >&2
+      exit 2
+      ;;
+  esac
+  shift 2
+done
 
 [[ "$confirmation" == "$CONFIRMATION" ]]
 [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || {
@@ -232,6 +256,18 @@ if [[ -L "$run_root" ]]; then
   exit 1
 fi
 if [[ ! -e "$run_root" ]]; then
+  if [[ -n "$never_started_proof_b64" ]]; then
+    external_load_export_dir="/tmp/old-sparky-production-retained-load-$load_run_id"
+    if [[ -e "$external_load_export_dir" || -L "$external_load_export_dir" ]]; then
+      echo "Never-started proof conflicts with a retained-load export path." >&2
+      exit 1
+    fi
+    "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_abort_retained_load.py" \
+      --verify-no-active-run "$load_run_id" >/dev/null || {
+      echo "Never-started proof conflicts with exact retained-load activity." >&2
+      exit 1
+    }
+  fi
   export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
   if [[ -e "$export_dir" || -L "$export_dir" ]]; then
     echo "A retained-load cleanup export already exists for this cleanup run id." >&2
@@ -244,14 +280,22 @@ if [[ ! -e "$run_root" ]]; then
   raw_log_path="$export_dir/cleanup-raw.log"
   result_path="$export_dir/cleanup-summary.json"
   CLEANUP_STAGE="orphan_cleanup"
+  orphan_cleanup_args=(
+    --load-run-id "$load_run_id"
+    --control-email-stdin
+    --confirm "$CONFIRMATION"
+    --result-path "$result_path"
+  )
+  if [[ -n "$never_started_proof_b64" ]]; then
+    orphan_cleanup_args+=(
+      --never-started-proof-base64 "$never_started_proof_b64"
+    )
+  fi
   set +e
   printf '%s\n' "$control_email" | "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
     --pythonpath "$LIVE_QA_PAYLOAD_ROOT" \
     -- "$QA_PYTHON" "$LIVE_QA_PAYLOAD_ROOT/platform/tools/platform_cleanup_retained_orphan.py" \
-    --load-run-id "$load_run_id" \
-    --control-email-stdin \
-    --confirm "$CONFIRMATION" \
-    --result-path "$result_path" \
+    "${orphan_cleanup_args[@]}" \
     > "$raw_log_path" 2>&1
   cleanup_status="$?"
   set -e
@@ -286,6 +330,10 @@ test -d "$run_root" || {
   echo "The selected retained load run root does not exist." >&2
   exit 1
 }
+if [[ -n "$never_started_proof_b64" ]]; then
+  echo "Never-started proof conflicts with a retained run root." >&2
+  exit 1
+fi
 test ! -L "$run_root" || {
   echo "The selected retained load run root must not be a symlink." >&2
   exit 1

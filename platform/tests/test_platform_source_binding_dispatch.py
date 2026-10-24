@@ -75,6 +75,32 @@ def _binding() -> dict[str, object]:
     }
 
 
+def _never_started_cleanup_proof(load_run_id: str = "567890") -> dict[str, object]:
+    return {
+        "schema": 1,
+        "load_run_id": load_run_id,
+        "load_run_attempt": "2",
+        "repository": "StrayForest/old_sparky",
+        "workflow_path": ".github/workflows/platform-production-external-load.yml",
+        "head_branch": "dev",
+        "head_sha": "d" * 40,
+        "event": "workflow_dispatch",
+        "status": "completed",
+        "conclusion": "failure",
+        "jobs": {
+            "validate-external-inputs": {"status": "completed", "conclusion": "failure"},
+            "fixture-setup": {"status": "completed", "conclusion": "skipped"},
+            "load-client": {"status": "completed", "conclusion": "skipped"},
+            "cpu-diagnostic-pair": {"status": "completed", "conclusion": "skipped"},
+        },
+        "finalizer_steps": {
+            "Configure finalizer SSH": "skipped",
+            "Signal fixture completion and collect origin evidence": "skipped",
+            "Exact cleanup of external fixture": "skipped",
+        },
+    }
+
+
 def _external_payload(schema: int = 2) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema": schema,
@@ -178,6 +204,56 @@ class SourceBindingDispatchTests(unittest.TestCase):
         }
         with self.assertRaises(WorkflowInputError):
             validate_external_payload(oversized)
+
+    def test_never_started_cleanup_proof_is_exact_and_keeps_old_load_sha_separate(self) -> None:
+        proof = _never_started_cleanup_proof()
+        payload = validate_cleanup_payload(
+            {
+                "schema": 2,
+                "target_sha": RUNNER_SHA,
+                "control_email": "qa.control@example.test",
+                "load_run_id": "567890",
+                "cleanup_run_id": "678901",
+                "source_binding": _binding(),
+                "never_started_proof": proof,
+            }
+        )
+        self.assertEqual(payload["never_started_proof"], proof)
+        self.assertNotEqual(proof["head_sha"], payload["target_sha"])
+        self.assertNotEqual(proof["head_sha"], payload["source_binding"]["app_target_sha"])
+
+        invalid_proofs = []
+        invalid_proofs.append({**proof, "load_run_id": "123456"})
+        invalid_proofs.append({**proof, "workflow_path": ".github/workflows/other.yml"})
+        invalid_proofs.append({**proof, "head_sha": "not-a-sha"})
+        invalid_proofs.append({**proof, "conclusion": "success"})
+        invalid_proofs.append(
+            {**proof, "jobs": {**proof["jobs"], "fixture-setup": {"status": "completed", "conclusion": "failure"}}}
+        )
+        invalid_proofs.append(
+            {
+                **proof,
+                "finalizer_steps": {
+                    **proof["finalizer_steps"],
+                    "Configure finalizer SSH": "success",
+                },
+            }
+        )
+        invalid_proofs.append({**proof, "unexpected": True})
+        for invalid in invalid_proofs:
+            with self.subTest(proof=invalid):
+                with self.assertRaises(WorkflowInputError):
+                    validate_cleanup_payload(
+                        {
+                            "schema": 2,
+                            "target_sha": RUNNER_SHA,
+                            "control_email": "qa.control@example.test",
+                            "load_run_id": "567890",
+                            "cleanup_run_id": "678901",
+                            "source_binding": _binding(),
+                            "never_started_proof": invalid,
+                        }
+                    )
 
     def test_cpu_only_fixture_is_explicit_and_fixed_to_qa_minimum(self) -> None:
         payload = _external_payload()
@@ -359,9 +435,42 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 "profile": "ready-vote-slo-v2",
             },
         )
+
+    def test_retained_cleanup_dispatch_forwards_exact_never_started_proof(self) -> None:
+        proof = _never_started_cleanup_proof()
+        payload = validate_cleanup_payload(
+            {
+                "schema": 2,
+                "target_sha": RUNNER_SHA,
+                "control_email": "qa.control@example.test",
+                "load_run_id": "567890",
+                "cleanup_run_id": "678901",
+                "source_binding": _binding(),
+                "never_started_proof": proof,
+            }
+        )
+        with (
+            patch.object(dispatcher, "load_stdin_payload", return_value=payload),
+            patch.object(dispatcher, "_run_retained_cleanup_sudo", return_value=0) as cleanup,
+        ):
+            self.assertEqual(
+                dispatcher.main(
+                    ["retained-cleanup", "--run-attempt", "2", "--load-run-id", "567890"]
+                ),
+                0,
+            )
+        arguments = cleanup.call_args.args[1]
+        self.assertEqual(arguments[:4], [
+            "DELETE-PRODUCTION-RETAINED-LOAD", RUNNER_SHA, "567890", "678901"
+        ])
         self.assertEqual(arguments[4], "--source-binding-base64")
         self.assertEqual(
             json.loads(base64.b64decode(arguments[5], validate=True)), _binding()
+        )
+        self.assertEqual(cleanup.call_args.kwargs["diagnostic_binding"]["app_sha"], APP_SHA)
+        self.assertEqual(arguments[6], "--never-started-proof-base64")
+        self.assertEqual(
+            json.loads(base64.b64decode(arguments[7], validate=True)), proof
         )
 
         mismatched_payload = validate_cleanup_payload(
@@ -401,7 +510,7 @@ class SourceBindingDispatchTests(unittest.TestCase):
             {
                 "source_sha": RUNNER_SHA,
                 "app_sha": APP_SHA,
-                "run_id": "567890",
+                "run_id": "678901",
                 "load_run_id": "567890",
                 "run_attempt": "1",
                 "profile": "retained-load-cleanup",
