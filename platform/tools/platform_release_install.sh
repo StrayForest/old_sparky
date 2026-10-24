@@ -249,7 +249,7 @@ install_space_floor_ok() {
   local available="$1"
   local total="$2"
   [[ "$available" =~ ^[0-9]+$ && "$total" =~ ^[1-9][0-9]*$ ]] || return 1
-  local filesystem_floor=$(((total * 15 + 99) / 100))
+  local filesystem_floor=$(((total * 10 + 99) / 100))
   local hard_floor=$((5 * 1024 * 1024 * 1024))
   local margin=$((128 * 1024 * 1024))
   (( filesystem_floor > hard_floor )) || filesystem_floor="$hard_floor"
@@ -262,7 +262,7 @@ install_space_fresh_ok() {
   local additional="$3"
   [[ "$available" =~ ^[0-9]+$ && "$total" =~ ^[1-9][0-9]*$ \
     && "$additional" =~ ^[1-9][0-9]*$ ]] || return 1
-  local filesystem_floor=$(((total * 15 + 99) / 100))
+  local filesystem_floor=$(((total * 10 + 99) / 100))
   local hard_floor=$((5 * 1024 * 1024 * 1024))
   local margin=$((128 * 1024 * 1024))
   (( filesystem_floor > hard_floor )) || filesystem_floor="$hard_floor"

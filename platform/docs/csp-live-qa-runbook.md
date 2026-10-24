@@ -14,8 +14,9 @@ rollback and release-transaction recovery are owned by
    metadata records `HEAD`; never build an artifact from dirty release sources.
 2. Run focused checks and all gates required by the changed owners.
 3. Confirm migration expand/rollback compatibility.
-4. Confirm services healthy, disk has at least 5 GiB available and at most 85%
-   conservative use, and protected `current`/`previous` releases.
+4. Confirm services healthy, disk has at least `max(5 GiB, 10% of total
+   capacity)` available and at most 90% conservative use, and protected
+   `current`/`previous` releases.
 5. Create a fresh restore-verified backup.
 
 ## Build

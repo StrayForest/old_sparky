@@ -39,9 +39,9 @@ cd /opt/oldsparky/platform/current
   --backup-only --apply --json
 ```
 
-The drill checks disk availability before starting `pg_dump` and monitors the
-root filesystem while dump and restore children run. Its stop threshold is the
-larger of 5 GiB or 15% of filesystem capacity, with a 256 MiB lead margin.
+The drill checks disk availability before starting `pg_dump` and monitors the root
+filesystem while dump and restore children run. Its stop threshold is the larger
+of the independent 5 GiB absolute floor or rounded-up 10% capacity, plus the 256 MiB lead margin.
 During isolated restore it also checks that the effective tmpfs remains exactly
 512 MiB with at least 64 MiB free, the unit stays below its 640 MiB memory cap
 with at least 32 MiB headroom, swap remains disabled, and host `MemAvailable`

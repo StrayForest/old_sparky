@@ -79,7 +79,8 @@ TIMER_SHOW_PROPERTIES = (
 )
 MAX_CONFIG_BYTES = 1024 * 1024
 MIN_FREE_BYTES = 5 * 1024**3
-MAX_USED_PERCENT = 85.0
+MIN_FREE_PERCENT = 10
+MAX_USED_PERCENT = 90.0
 # The stopped-worker read-only probe took up to 8.27s, including a 5.10s
 # Celery ping timeout; keep this bounded child cap above that measured cold path.
 WORKER_PROBE_TIMEOUT = 10.0
@@ -673,7 +674,12 @@ def _assert_disk(app_dir: Path) -> None:
         raise RecoveryRefusal("disk_state") from exc
     if usage.total <= 0 or usage.free < MIN_FREE_BYTES:
         raise RecoveryRefusal("disk_state")
-    used_percent = (usage.used / usage.total) * 100
+    required_free_bytes = max(MIN_FREE_BYTES, (usage.total * MIN_FREE_PERCENT + 99) // 100)
+    if usage.free < required_free_bytes:
+        raise RecoveryRefusal("disk_state")
+    # Use the same available-free accounting as the 10% floor. `usage.used`
+    # excludes blocks reserved from non-root users and can disagree with it.
+    used_percent = ((usage.total - usage.free) / usage.total) * 100
     if used_percent > MAX_USED_PERCENT:
         raise RecoveryRefusal("disk_state")
 

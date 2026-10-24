@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 from datetime import UTC, datetime, timedelta
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shutil
@@ -107,7 +109,7 @@ class PlatformHealthMonitorTests(unittest.TestCase):
 
     def test_disk_check_accepts_exact_hard_boundaries(self) -> None:
         cases = (
-            (100 * BYTES_PER_GIB, 15 * BYTES_PER_GIB, "percent"),
+            (100 * BYTES_PER_GIB, 10 * BYTES_PER_GIB, "percent"),
             (20 * BYTES_PER_GIB, 5 * BYTES_PER_GIB, "free"),
         )
         for total, free, boundary in cases:
@@ -123,13 +125,13 @@ class PlatformHealthMonitorTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(result.detail["minimum_free_gib"], 5.0)
             if boundary == "percent":
-                self.assertEqual(result.detail["used_percent"], 85.0)
+                self.assertEqual(result.detail["used_percent"], 90.0)
             else:
                 self.assertEqual(result.detail["free_gib"], 5.0)
 
     def test_disk_check_rejects_each_hard_limit(self) -> None:
         cases = (
-            (100 * BYTES_PER_GIB, 14 * BYTES_PER_GIB, "percent"),
+            (100 * BYTES_PER_GIB, 10 * BYTES_PER_GIB - 1, "percent"),
             (20 * BYTES_PER_GIB, 4 * BYTES_PER_GIB, "free"),
         )
         for total, free, boundary in cases:
@@ -160,11 +162,35 @@ class PlatformHealthMonitorTests(unittest.TestCase):
             args = MODULE.parse_args()
 
         self.assertEqual(args.disk_min_free_gib, 5.0)
-        self.assertEqual(args.disk_max_used_percent, 85.0)
+        self.assertEqual(args.disk_max_used_percent, 90.0)
+
+        for override in (
+            ["--disk-min-free-gib", "4.9"],
+            ["--disk-max-used-percent", "90.1"],
+        ):
+            with (
+                patch.object(MODULE.sys, "argv", [str(SCRIPT_PATH), *override]),
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                MODULE.parse_args()
+
+        with patch.object(
+            MODULE.sys,
+            "argv",
+            [
+                str(SCRIPT_PATH),
+                "--disk-min-free-gib", "6",
+                "--disk-max-used-percent", "80",
+            ],
+        ):
+            stronger_args = MODULE.parse_args()
+        self.assertEqual(stronger_args.disk_min_free_gib, 6.0)
+        self.assertEqual(stronger_args.disk_max_used_percent, 80.0)
 
     def test_storage_and_health_share_conservative_disk_policy(self) -> None:
         snapshot = snapshot_from_usage(
-            SimpleNamespace(total=100 * BYTES_PER_GIB, free=15 * BYTES_PER_GIB)
+            SimpleNamespace(total=100 * BYTES_PER_GIB, free=10 * BYTES_PER_GIB)
         )
         with patch.object(MODULE, "snapshot_for_path", return_value=snapshot), patch.object(
             STORAGE, "disk_snapshot_for_path", return_value=snapshot
@@ -173,14 +199,28 @@ class PlatformHealthMonitorTests(unittest.TestCase):
             storage_result = STORAGE.disk_snapshot(Path("/safe"))
 
         self.assertTrue(health_result.ok)
-        self.assertEqual(storage_result["used_bytes"], 85 * BYTES_PER_GIB)
-        self.assertEqual(storage_result["free_bytes"], 15 * BYTES_PER_GIB)
-        self.assertEqual(storage_result["used_percent"], 85.0)
+        self.assertEqual(storage_result["used_bytes"], 90 * BYTES_PER_GIB)
+        self.assertEqual(storage_result["free_bytes"], 10 * BYTES_PER_GIB)
+        self.assertEqual(storage_result["used_percent"], 90.0)
         self.assertTrue(
             STORAGE.disk_is_healthy(
                 snapshot,
                 min_free_bytes=5 * BYTES_PER_GIB,
-                max_used_percent=85.0,
+                max_used_percent=90.0,
+            )
+        )
+        self.assertFalse(
+            STORAGE.disk_is_healthy(
+                snapshot,
+                min_free_bytes=4 * BYTES_PER_GIB,
+                max_used_percent=90.0,
+            )
+        )
+        self.assertFalse(
+            STORAGE.disk_is_healthy(
+                snapshot,
+                min_free_bytes=5 * BYTES_PER_GIB,
+                max_used_percent=90.1,
             )
         )
 

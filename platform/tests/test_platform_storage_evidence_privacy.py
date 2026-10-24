@@ -315,7 +315,7 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
                     "duration_seconds": 12.5,
                     "limits": {
                         "minimum_free_bytes": 5 * 1024**3,
-                        "maximum_used_percent": 85,
+                        "maximum_used_percent": 90,
                     },
                     "disk_before": {"free_bytes": 6 * 1024**3, "used_percent": 76.5},
                     "disk_after": {"free_bytes": 7 * 1024**3, "used_percent": 71.5},
@@ -341,7 +341,7 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(report["disk_before"]["free_bytes"], 6 * 1024**3)
         self.assertEqual(report["limits"], {
             "minimum_free_bytes": 5 * 1024**3,
-            "maximum_used_percent": 85.0,
+            "maximum_used_percent": 90.0,
         })
         self.assertEqual(report["duration_seconds"], 12.5)
         self.assertEqual(report["backup"]["status"], "completed")

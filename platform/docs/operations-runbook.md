@@ -54,7 +54,7 @@ Maintenance keeps:
 
 It never deletes shared env/runtimes, upload staging, current/previous releases, active/source-protected live-QA generations or caches, business rows or canonical reports; backup failure stops pruning. The canonical unit in this source tree uses the fixed protected-pair manifest while running other retention. Backup-only preserves complete pairs but skips other retention; generic callers retain their existing rotation (see the [backup and restore runbook](backup-restore-runbook.md)). The currently deployed unit remains unchanged until the reviewed source is released; see the [named backup retention policy](backup-retention-protection.md).
 Live-QA cache pruning holds the machine-wide lock, requires an idle browser cgroup and user, accepts only root-owned non-symlink `runtime-<40 lowercase hex>` trees, retains the newest valid unprotected fallback, and treats keep as a hard cap rather than an age window.
-The generic 5 GiB free/85% use gate is not sufficient for canonical full-maintenance `disk_ext4_image_v1`: its admission requires `max(5 GiB, ceil(15% of filesystem total)) + 256 MiB lead + 576 MiB image` free on the image filesystem after the temporary dump exists. Before `pg_dump`, include the expected dump allocation when it shares that filesystem (`platform_backup_restore_drill._scratch_disk_image_required_free_bytes` and `_scratch_prepare_disk_image`; see the [backup/restore runbook](backup-restore-runbook.md)). The source-bound backup workflow defaults to `tmpfs_v1`, so its success does not exercise this image gate. An explicitly selected disk backend exercises image admission, but `--backup-only` still preserves existing pairs rather than testing maintenance rotation. Keep the floors; admission fails closed.
+The shared disk policy requires at least `max(5 GiB, ceil(10% of filesystem total))` free; this is the independent 5 GiB absolute floor plus the 10% free (90% used) limit. Stronger configured floors are allowed, but a CLI override cannot lower the 5 GiB minimum or raise maximum use above 90%. This policy alone is not sufficient for canonical full-maintenance `disk_ext4_image_v1`: its admission requires that floor plus the unchanged 256 MiB lead and 576 MiB image on the image filesystem after the temporary dump exists. Before `pg_dump`, include the expected dump allocation when it shares that filesystem (`platform_backup_restore_drill._scratch_disk_image_required_free_bytes` and `_scratch_prepare_disk_image`; see the [backup/restore runbook](backup-restore-runbook.md)). The source-bound backup workflow defaults to `tmpfs_v1`, so its success does not exercise this image gate. An explicitly selected disk backend exercises image admission, but `--backup-only` still preserves existing pairs rather than testing maintenance rotation. Admission fails closed.
 The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it.
 Application services write structured JSON to journald. Nginx owns request
 logs, so Gunicorn access logging is disabled to avoid duplicates; warnings,
@@ -120,7 +120,7 @@ Preview live-QA runtime cache retention (also machine-locked and idle-gated):
   prune-runtime-cache --keep 1
 ```
 
-The preview is dry-run unless `--apply` and takes release then live-QA locks; the maintenance unit in this source tree uses the fixed named-pair policy while running other retention and health checks. Growth is bounded by its named-plus-recent policy and unchanged 5 GiB/85% gates. The rollout enables the timer only through the source-bound workflow after load/CPU/live-QA evidence passes. After enabling, let any timer-started service finish and confirm it is inactive with no operation locks before final diagnostics; do not weaken guards or blindly retry. After each run, follow `.agents/skills/platform-storage-retention/SKILL.md` for exact cleanup; never use broad deletion.
+The preview is dry-run unless `--apply` and takes release then live-QA locks; the maintenance unit in this source tree uses the fixed named-pair policy while running other retention and health checks. Growth is bounded by its named-plus-recent policy and unchanged `max(5 GiB, 10% free)` disk gate. The rollout enables the timer only through the source-bound workflow after load/CPU/live-QA evidence passes. After enabling, let any timer-started service finish and confirm it is inactive with no operation locks before final diagnostics; do not weaken guards or blindly retry. After each run, follow `.agents/skills/platform-storage-retention/SKILL.md` for exact cleanup; never use broad deletion.
 
 ## Prepared media and R2
 
@@ -591,7 +591,7 @@ The external-load workflow always invokes this supervisor, even when the filesys
 ## Alert thresholds
 
 - failed/restarted service;
-- disk below 5 GiB available or above 85% conservative use (the exact boundary is allowed);
+- disk below `max(5 GiB, 10% of total capacity)` available or above 90% conservative use (the exact boundary is allowed);
 - newest backup older than 24 hours or not restore-verified;
 - sustained Celery queue growth or retry exhaustion;
 - repeated 5xx/security delivery errors;

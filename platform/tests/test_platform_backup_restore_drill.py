@@ -1954,6 +1954,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def test_scratch_disk_image_admission_reserves_floor_lead_and_full_image(self) -> None:
         total_bytes = 100 * 1024**3
         required = backup_drill._scratch_disk_image_required_free_bytes(total_bytes)
+        self.assertEqual(backup_drill._required_disk_floor(total_bytes), 10 * 1024**3)
         self.assertEqual(
             required,
             backup_drill._required_disk_floor(total_bytes)
@@ -9775,13 +9776,20 @@ raise SystemExit(status)
         )
         total_bytes = 100 * 1024**3
         floor = backup_drill._required_disk_floor(total_bytes)
-        self.assertEqual(floor, 15 * 1024**3)
+        self.assertEqual(floor, 10 * 1024**3)
         self.assertEqual(
             backup_drill._required_disk_floor(20 * 1024**3), 5 * 1024**3
         )
         self.assertEqual(
+            backup_drill._required_disk_floor(100 * 1024**3), 10 * 1024**3
+        )
+        self.assertEqual(
+            backup_drill._required_disk_floor(100 * 1024**3 + 1),
+            10 * 1024**3 + 1,
+        )
+        self.assertEqual(
             backup_drill._required_disk_floor(40 * 1024**3 + 1),
-            6 * 1024**3 + 1,
+            5 * 1024**3,
         )
         high = type(
             "Disk",

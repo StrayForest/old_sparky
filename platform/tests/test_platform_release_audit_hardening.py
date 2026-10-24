@@ -2798,7 +2798,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     "ok": False,
                     "mode": "dry-run",
                     "disk_after": {"free_bytes": 1024, "used_percent": 99.5},
-                    "limits": {"minimum_free_bytes": 5 * 1024**3, "maximum_used_percent": 85},
+                    "limits": {"minimum_free_bytes": 5 * 1024**3, "maximum_used_percent": 90},
                     "private": "/home/operator/report.json",
                 },
                 "unhealthy",
@@ -2816,7 +2816,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     "disk_after": {"free_bytes": 8 * 1024**3, "used_percent": 70},
                     "limits": {
                         "minimum_free_bytes": 5 * 1024**3,
-                        "maximum_used_percent": 85,
+                        "maximum_used_percent": 90,
                     },
                 },
                 "ok",
@@ -2829,7 +2829,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     "disk_after": {"free_bytes": 8 * 1024**3, "used_percent": 70},
                     "limits": {
                         "minimum_free_bytes": 5 * 1024**3,
-                        "maximum_used_percent": 85,
+                        "maximum_used_percent": 90,
                     },
                 },
                 "failed",
@@ -2842,7 +2842,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     "disk_after": {"free_bytes": 1024, "used_percent": 99.5},
                     "limits": {
                         "minimum_free_bytes": 5 * 1024**3,
-                        "maximum_used_percent": 85,
+                        "maximum_used_percent": 90,
                     },
                 },
                 "failed",
@@ -2908,7 +2908,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             "disk_after": {"free_bytes": 1024, "used_percent": 99.5},
             "limits": {
                 "minimum_free_bytes": 5 * 1024**3,
-                "maximum_used_percent": 85,
+                "maximum_used_percent": 90,
             },
             "private": "must-not-appear-in-evidence",
         }

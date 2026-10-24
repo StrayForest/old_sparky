@@ -658,13 +658,20 @@ def parse_args() -> argparse.Namespace:
         parser.error("--report-keep must be at least 1")
     if not 1 <= args.live_qa_runtime_keep <= 100:
         parser.error("--live-qa-runtime-keep must be between 1 and 100")
-    if not math.isfinite(args.minimum_free_gib) or args.minimum_free_gib < 0:
-        parser.error("--minimum-free-gib must be finite and non-negative")
+    if (
+        not math.isfinite(args.minimum_free_gib)
+        or args.minimum_free_gib < DEFAULT_MIN_FREE_GIB
+    ):
+        parser.error(
+            f"--minimum-free-gib must be finite and at least {DEFAULT_MIN_FREE_GIB:g}"
+        )
     if (
         not math.isfinite(args.maximum_used_percent)
-        or not 0 < args.maximum_used_percent <= 100
+        or not 0 < args.maximum_used_percent <= DEFAULT_MAX_USED_PERCENT
     ):
-        parser.error("--maximum-used-percent must be within (0, 100]")
+        parser.error(
+            f"--maximum-used-percent must be within (0, {DEFAULT_MAX_USED_PERCENT:g}]"
+        )
     return args
 
 

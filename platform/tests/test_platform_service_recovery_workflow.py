@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import contextlib
 import io
+import importlib.util
 import os
 from pathlib import Path
 import pwd
@@ -276,6 +277,11 @@ class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
     def test_secret_job_embeds_exact_reviewed_controller_without_checkout(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(_embedded_controller(), TOOL.read_bytes())
+        controller_namespace = {"__name__": "service_recovery_policy_contract"}
+        exec(compile(_embedded_controller(), "embedded-service-recovery.py", "exec"), controller_namespace)
+        self.assertEqual(controller_namespace["MIN_FREE_BYTES"], 5 * 1024**3)
+        self.assertEqual(controller_namespace["MIN_FREE_PERCENT"], 10)
+        self.assertEqual(controller_namespace["MAX_USED_PERCENT"], 90.0)
         self.assertIn("      - name: Recover deadlock-api, deadlock-worker, and optional nginx", workflow)
         self.assertIn("inputs.mode == 'api-worker' || inputs.mode == 'api-worker-nginx'", workflow)
         self.assertIn("RECOVER-DEADLOCK-API-WORKER", workflow)
@@ -291,6 +297,35 @@ class PlatformServiceRecoveryWorkflowTests(unittest.TestCase):
         self.assertLess(api_mode.index("platform_release_lock_supervisor_holds"), api_mode.index("<<'SERVICE_RECOVERY'"))
         self.assertIn("--expected-source-sha", api_mode)
         self.assertIn("--expected-release-slug", api_mode)
+
+    def test_source_and_embedded_recovery_use_available_free_capacity_floor(self) -> None:
+        source_spec = importlib.util.spec_from_file_location("service_recovery_source_test", TOOL)
+        self.assertIsNotNone(source_spec)
+        self.assertIsNotNone(source_spec.loader)
+        source_namespace = importlib.util.module_from_spec(source_spec)
+        source_spec.loader.exec_module(source_namespace)
+        embedded_namespace = {"__name__": "service_recovery_embedded_test"}
+        exec(compile(_embedded_controller(), "embedded-service-recovery.py", "exec"), embedded_namespace)
+
+        cases = (
+            # On a 100 GiB filesystem exactly 10 GiB available passes even
+            # where statvfs reports 91 GiB used due to reserved blocks.
+            (100 * 1024**3, 10 * 1024**3, 91 * 1024**3, True),
+            (100 * 1024**3, 10 * 1024**3 - 1, 89 * 1024**3, False),
+            # On smaller filesystems, the independent 5 GiB floor wins.
+            (20 * 1024**3, 5 * 1024**3, 14 * 1024**3, True),
+            (20 * 1024**3, 5 * 1024**3 - 1, 14 * 1024**3, False),
+        )
+        for namespace in (source_namespace.__dict__, embedded_namespace):
+            for total, free, used, should_pass in cases:
+                with self.subTest(namespace=namespace["__name__"], total=total, free=free):
+                    usage = SimpleNamespace(total=total, free=free, used=used)
+                    with patch.object(namespace["shutil"], "disk_usage", return_value=usage):
+                        if should_pass:
+                            namespace["_assert_disk"](Path("/tmp/platform"))
+                        else:
+                            with self.assertRaises(namespace["RecoveryRefusal"]):
+                                namespace["_assert_disk"](Path("/tmp/platform"))
 
     def test_embedded_worker_ping_is_bounded_and_secret_output_is_not_projected(self) -> None:
         namespace = {"__name__": "service_recovery_test"}

@@ -8871,7 +8871,8 @@ cleanup
                 self.assertFalse(sentinel.exists())
 
             low_space, marker, sentinel = run_guard(
-                valid_policy, space="6576668671 42949672960"
+                valid_policy,
+                space=f"{5 * 1024**3 + 128 * 1024**2 - 1} {40 * 1024**3}",
             )
             self.assertEqual(low_space.returncode, 0, low_space.stderr)
             self.assertEqual(low_space.stdout.strip(), "rejected:0")
@@ -8910,7 +8911,10 @@ cleanup
 
             fresh_low_space, marker, sentinel = run_guard(
                 fresh_policy,
-                space="6714032127 42949672960",
+                space=(
+                    f"{5 * 1024**3 + 128 * 1024**2 + 1 * 1024**2 + 2 * 1024**2 + 128 * 1024**2 - 1} "
+                    f"{40 * 1024**3}"
+                ),
             )
             self.assertEqual(fresh_low_space.returncode, 0, fresh_low_space.stderr)
             self.assertEqual(fresh_low_space.stdout.strip(), "rejected:0")
@@ -8933,8 +8937,10 @@ cleanup
         threshold_cases = (
             (5 * 1024**3 + 128 * 1024**2, 10 * 1024**3, True),
             (5 * 1024**3 + 128 * 1024**2 - 1, 10 * 1024**3, False),
-            (6 * 1024**3 + 128 * 1024**2, 40 * 1024**3, True),
-            (6 * 1024**3 + 128 * 1024**2 - 1, 40 * 1024**3, False),
+            (5 * 1024**3 + 128 * 1024**2, 40 * 1024**3, True),
+            (5 * 1024**3 + 128 * 1024**2 - 1, 40 * 1024**3, False),
+            (10 * 1024**3 + 128 * 1024**2, 100 * 1024**3, True),
+            (10 * 1024**3 + 128 * 1024**2 - 1, 100 * 1024**3, False),
         )
         for available, total, expected in threshold_cases:
             result = subprocess.run(
@@ -8954,8 +8960,10 @@ cleanup
         fresh_threshold_cases = (
             (5 * 1024**3 + 128 * 1024**2 + additional, 10 * 1024**3, additional, True),
             (5 * 1024**3 + 128 * 1024**2 + additional - 1, 10 * 1024**3, additional, False),
-            (6 * 1024**3 + 128 * 1024**2 + additional, 40 * 1024**3, additional, True),
-            (6 * 1024**3 + 128 * 1024**2 + additional - 1, 40 * 1024**3, additional, False),
+            (5 * 1024**3 + 128 * 1024**2 + additional, 40 * 1024**3, additional, True),
+            (5 * 1024**3 + 128 * 1024**2 + additional - 1, 40 * 1024**3, additional, False),
+            (10 * 1024**3 + 128 * 1024**2 + additional, 100 * 1024**3, additional, True),
+            (10 * 1024**3 + 128 * 1024**2 + additional - 1, 100 * 1024**3, additional, False),
             (10 * 1024**3, 40 * 1024**3, 0, False),
         )
         for available, total, required, expected in fresh_threshold_cases:

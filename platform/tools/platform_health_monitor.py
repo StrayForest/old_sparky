@@ -99,13 +99,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--http-timeout", type=float, default=5.0)
     parser.add_argument("--service", action="append", dest="services")
     args = parser.parse_args()
-    if not math.isfinite(args.disk_min_free_gib) or args.disk_min_free_gib < 0:
-        parser.error("--disk-min-free-gib must be finite and non-negative")
+    if (
+        not math.isfinite(args.disk_min_free_gib)
+        or args.disk_min_free_gib < DEFAULT_MIN_FREE_GIB
+    ):
+        parser.error(
+            f"--disk-min-free-gib must be finite and at least {DEFAULT_MIN_FREE_GIB:g}"
+        )
     if (
         not math.isfinite(args.disk_max_used_percent)
-        or not 0 < args.disk_max_used_percent <= 100
+        or not 0 < args.disk_max_used_percent <= DEFAULT_MAX_USED_PERCENT
     ):
-        parser.error("--disk-max-used-percent must be within (0, 100]")
+        parser.error(
+            f"--disk-max-used-percent must be within (0, {DEFAULT_MAX_USED_PERCENT:g}]"
+        )
     if (
         not math.isfinite(args.http_timeout)
         or args.http_timeout <= 0

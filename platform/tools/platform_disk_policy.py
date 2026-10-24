@@ -12,7 +12,8 @@ from typing import Any
 
 BYTES_PER_GIB = 1024**3
 DEFAULT_MIN_FREE_GIB = 5.0
-DEFAULT_MAX_USED_PERCENT = 85.0
+MINIMUM_FREE_PERCENT = 10
+DEFAULT_MAX_USED_PERCENT = 100.0 - MINIMUM_FREE_PERCENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,23 @@ def minimum_free_bytes(min_free_gib: float) -> int:
     if not math.isfinite(min_free_gib) or min_free_gib < 0:
         raise ValueError("minimum free space must be finite and non-negative")
     return int(min_free_gib * BYTES_PER_GIB)
+
+
+def minimum_free_bytes_for_capacity(
+    total_bytes: int, *, absolute_minimum_free_bytes: int
+) -> int:
+    """Return the absolute floor or a rounded-up 10% capacity floor."""
+
+    if type(total_bytes) is not int or total_bytes <= 0:
+        raise ValueError("filesystem capacity must be a positive integer")
+    fixed_minimum_free_bytes = minimum_free_bytes(DEFAULT_MIN_FREE_GIB)
+    if (
+        type(absolute_minimum_free_bytes) is not int
+        or absolute_minimum_free_bytes < fixed_minimum_free_bytes
+    ):
+        raise ValueError("absolute minimum free space must be at least 5 GiB")
+    percentage_floor = (total_bytes * MINIMUM_FREE_PERCENT + 99) // 100
+    return max(absolute_minimum_free_bytes, percentage_floor)
 
 
 def snapshot_from_usage(usage: Any) -> DiskSnapshot:
@@ -87,15 +105,21 @@ def is_healthy(
 ) -> bool:
     """Apply the hard gate; exact threshold boundaries are healthy."""
 
+    fixed_minimum_free_bytes = minimum_free_bytes(DEFAULT_MIN_FREE_GIB)
     if (
         not snapshot.valid
-        or min_free_bytes < 0
+        or type(min_free_bytes) is not int
+        or min_free_bytes < fixed_minimum_free_bytes
         or not math.isfinite(max_used_percent)
         or max_used_percent <= 0
-        or max_used_percent > 100
+        or max_used_percent > DEFAULT_MAX_USED_PERCENT
     ):
         return False
+    required_free_bytes = minimum_free_bytes_for_capacity(
+        snapshot.total_bytes,
+        absolute_minimum_free_bytes=min_free_bytes,
+    )
     return (
-        snapshot.free_bytes >= min_free_bytes
+        snapshot.free_bytes >= required_free_bytes
         and snapshot.used_percent <= max_used_percent
     )

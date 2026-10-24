@@ -18,7 +18,7 @@ Use this document for the normal immutable release path. CSP mode changes and pr
    Recovery-bootstrap-only results are also non-deployable; the automatic chain may route them through baseline
    checks below. Local tests do not substitute for these release gates.
 3. Confirm migration expand/rollback compatibility.
-4. Confirm healthy services, at least 5 GiB free and at most 85% conservative disk use; protect `current`/`previous`.
+4. Confirm healthy services, at least `max(5 GiB, 10% of total capacity)` free and at most 90% conservative disk use; protect `current`/`previous`.
 5. The automatic chain validates the exact successful Security attempt and source-bound backup before dispatching
    the production child. Never dispatch normal deployment manually.
 
@@ -215,7 +215,7 @@ artifact and invokes the guarded state machine without source checkout or depend
 Record run URL/ID, target SHA, release slug, smoke result and host-tools SHA in the handoff and receipt.
 
 Archives may carry `deploy/python-venv-policy.json` (`schema: 1`) with `transition: require_proven_reuse` or explicit `require_fresh_venv`.
-`require_proven_reuse` keeps strict shared-venv proof, rejects dependency-skip requests and requires `max(5 GiB, 15% of filesystem) + 128 MiB` free; proof or space failure aborts before replacement or pointer changes.
+`require_proven_reuse` keeps strict shared-venv proof, rejects dependency-skip requests and requires `max(5 GiB, ceil(10% of filesystem)) + 128 MiB` free; proof or space failure aborts before replacement or pointer changes. The source-bound normal release updates the reviewed systemd templates with the candidate; the exact-SHA Security gate and automatic deployment chain remain required. Do not pass one-off threshold overrides or install the unit outside that chain.
 `require_fresh_venv` is explicit for a reviewed dependency upgrade only and never follows a failed reuse proof. It requires `RELEASE.json.python_venv_install_evidence` with `schema=1`, `builder_allocated_bytes` (1 byte–1 GiB), `wheelhouse_expanded_bytes` (1 byte–4 GiB), `host_overhead_bytes=134217728` and a 64-character lowercase `inputs_sha256`.
 The input digest binds exact requirements, lock, freeze and wheelhouse manifest bytes; expanded wheelhouse size is the sum of ZIP member sizes. After extraction, free space must cover the base floor plus measured builder allocation, expanded wheels and the additional 128 MiB; `f_bavail` already includes the artifact, candidate and old venv.
 Fresh install disables pip cache, puts `TMPDIR` inside the new venv, caps actual venv allocation at builder allocation plus 128 MiB and rechecks the base floor before transaction exchange. The old venv and rollback snapshot remain protected through activation.

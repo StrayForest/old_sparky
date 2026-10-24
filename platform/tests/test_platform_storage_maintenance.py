@@ -162,8 +162,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             failed_build_max_age_days=1,
             live_qa_runtime_keep=1,
             live_qa_runtime_root=self.root / "liveqa-cache",
-            minimum_free_gib=0.0,
-            maximum_used_percent=100.0,
+            minimum_free_gib=5.0,
+            maximum_used_percent=90.0,
             skip_backup=True,
             apply=True,
             backup_only=False,
@@ -311,7 +311,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             args = maintenance.parse_args()
 
         self.assertEqual(args.minimum_free_gib, 5.0)
-        self.assertEqual(args.maximum_used_percent, 85.0)
+        self.assertEqual(args.maximum_used_percent, 90.0)
         self.assertEqual(args.backup_max_age_hours, 24.0)
         self.assertEqual(
             args.scratch_backend,
@@ -370,6 +370,30 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             ):
                 with self.assertRaises(SystemExit):
                     maintenance.parse_args()
+
+        for override in (
+            ["--minimum-free-gib", "4.9"],
+            ["--maximum-used-percent", "90.1"],
+        ):
+            with mock.patch.object(
+                maintenance.sys,
+                "argv",
+                ["platform_storage_maintenance.py", *override],
+            ), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                maintenance.parse_args()
+
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--minimum-free-gib", "6",
+                "--maximum-used-percent", "80",
+            ],
+        ):
+            stronger_args = maintenance.parse_args()
+        self.assertEqual(stronger_args.minimum_free_gib, 6.0)
+        self.assertEqual(stronger_args.maximum_used_percent, 80.0)
 
     def test_disk_backend_full_maintenance_preview_is_read_only(self) -> None:
         app_dir = self.root / "preview-app"
@@ -2044,7 +2068,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             backup_keep=15,
             backup_max_age_hours=24,
             minimum_free_gib=5,
-            maximum_used_percent=85,
+            maximum_used_percent=90,
         )
         app_dir = self.root / "platform"
         (app_dir / "releases").mkdir(parents=True)
@@ -2686,7 +2710,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         snapshot = snapshot_from_usage(
             SimpleNamespace(
                 total=100 * BYTES_PER_GIB,
-                free=15 * BYTES_PER_GIB,
+                free=10 * BYTES_PER_GIB,
             )
         )
         with mock.patch.object(
@@ -2694,15 +2718,15 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         ):
             result = maintenance.disk_snapshot(self.root)
 
-        self.assertEqual(result["used_bytes"], 85 * BYTES_PER_GIB)
-        self.assertEqual(result["free_bytes"], 15 * BYTES_PER_GIB)
-        self.assertEqual(result["used_percent"], 85.0)
+        self.assertEqual(result["used_bytes"], 90 * BYTES_PER_GIB)
+        self.assertEqual(result["free_bytes"], 10 * BYTES_PER_GIB)
+        self.assertEqual(result["used_percent"], 90.0)
 
     def test_storage_gate_accepts_exact_boundaries_and_fails_closed(self) -> None:
         cases = (
-            (100 * BYTES_PER_GIB, 15 * BYTES_PER_GIB, True),
+            (100 * BYTES_PER_GIB, 10 * BYTES_PER_GIB, True),
             (20 * BYTES_PER_GIB, 5 * BYTES_PER_GIB, True),
-            (100 * BYTES_PER_GIB, 14 * BYTES_PER_GIB, False),
+            (100 * BYTES_PER_GIB, 10 * BYTES_PER_GIB - 1, False),
             (20 * BYTES_PER_GIB, 4 * BYTES_PER_GIB, False),
             (0, 0, False),
         )
@@ -2715,7 +2739,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     maintenance.disk_is_healthy(
                         snapshot,
                         min_free_bytes=5 * BYTES_PER_GIB,
-                        max_used_percent=85.0,
+                        max_used_percent=90.0,
                     ),
                     expected,
                 )
@@ -2735,7 +2759,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             [
                 "ExecStart=/opt/oldsparky/platform/shared/venv/bin/python "
                 "/opt/oldsparky/platform/current/tools/platform_health_monitor.py "
-                "--disk-min-free-gib 5 --disk-max-used-percent 85"
+                "--disk-min-free-gib 5 --disk-max-used-percent 90"
             ],
         )
         service = (
@@ -2764,7 +2788,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "--protected-release gha-38182702358-1-f1154c7dba4f "
                 "--release-keep 5 --test-artifact-max-age-days 7 "
                 "--screenshot-max-age-days 30 --failed-build-max-age-days 1 "
-                "--minimum-free-gib 5 --maximum-used-percent 85"
+                "--minimum-free-gib 5 --maximum-used-percent 90"
             ],
         )
         self.assertIn("--protected-backup-manifest", service)
@@ -2806,7 +2830,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn("CPUQuota=50%", service)
         self.assertIn("MemoryMax=512M", service)
         self.assertIn("TimeoutStartSec=30min", service)
-        self.assertIn("--minimum-free-gib 5 --maximum-used-percent 85", service)
+        self.assertIn("--minimum-free-gib 5 --maximum-used-percent 90", service)
         self.assertIn("IOSchedulingClass=idle", service)
         self.assertIn("Persistent=true", timer)
         self.assertIn("RandomizedDelaySec=30m", timer)
@@ -6929,7 +6953,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     },
                     "limits": {
                         "minimum_free_bytes": 5 * BYTES_PER_GIB,
-                        "maximum_used_percent": 85,
+                        "maximum_used_percent": 90,
                     },
                     "private": "PRIVATE_REPORT_CONTENT",
                 }
@@ -6995,11 +7019,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 },
                 "disk_after": {
                     "free_bytes": 5 * BYTES_PER_GIB,
-                    "used_percent": 85,
+                    "used_percent": 90,
                 },
                 "limits": {
                     "minimum_free_bytes": 5 * BYTES_PER_GIB,
-                    "maximum_used_percent": 85,
+                    "maximum_used_percent": 90,
                 },
             }
             summary_path.write_text(

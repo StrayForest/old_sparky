@@ -108,7 +108,7 @@ EXPECTED_MAINTENANCE_ARGV = (
     "--minimum-free-gib",
     "5",
     "--maximum-used-percent",
-    "85",
+    "90",
 )
 
 

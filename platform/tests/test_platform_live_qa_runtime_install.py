@@ -363,6 +363,18 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     )
 
     def test_typed_provider_rebinds_identical_engine_to_changed_app_lock(self) -> None:
+        self.assertEqual(
+            runtime._provider_disk_floor(40 * 1024**3),
+            5 * 1024**3 + 128 * 1024**2,
+        )
+        self.assertEqual(
+            runtime._provider_disk_floor(100 * 1024**3),
+            10 * 1024**3 + 128 * 1024**2,
+        )
+        self.assertEqual(
+            runtime._provider_disk_floor(100 * 1024**3 + 1),
+            10 * 1024**3 + 128 * 1024**2 + 1,
+        )
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             root = Path(temporary)
             old_sha, candidate_sha = "a" * 40, "b" * 40

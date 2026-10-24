@@ -186,10 +186,15 @@ class ReleaseCaptureProbeTests(unittest.TestCase):
                     else b"#!/bin/sh\nexit 0\n"
                 )
                 helper.chmod(0o755)
-        # These are trusted source fixtures for the read-only checker invocation.
+        # These are immutable source fixtures for the historical release SHA;
+        # the active branch may change these tools without changing that target.
+        historical_tools = (
+            Path(__file__).parent
+            / "fixtures/release-capture/9ceaf09ab7ba/tools"
+        )
         for relative in ("platform_health_monitor.py", "platform_disk_policy.py"):
             (current / "tools" / relative).write_bytes(
-                (Path(probe.__file__).parent / relative).read_bytes()
+                (historical_tools / relative).read_bytes()
             )
         current_link = app_dir / "current"
         previous_link = app_dir / "previous"

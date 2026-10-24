@@ -65,6 +65,9 @@ MAX_FILE_BYTES = 768 * 1024 * 1024
 MAX_RUNTIME_BYTES = 2 * 1024 * 1024 * 1024
 MAX_FILES = 200_000
 MAX_ADDITIONAL_PAYLOADS = 1
+HOST_MINIMUM_FREE_BYTES = 5 * 1024**3
+HOST_MINIMUM_FREE_PERCENT = 10
+HOST_FREE_SPACE_LEAD_BYTES = 128 * 1024**2
 INSTALL_DIAGNOSTIC_STAGES = frozenset(
     {
         "trusted_layout",
@@ -1883,6 +1886,15 @@ def _runtime_provider_plan(
     )
 
 
+def _provider_disk_floor(total_bytes: int) -> int:
+    """Keep 5 GiB or 10% free, whichever is larger, plus the install lead."""
+
+    if type(total_bytes) is not int or total_bytes <= 0:
+        raise InstallerError("typed runtime provider filesystem is invalid")
+    percentage_floor = (total_bytes * HOST_MINIMUM_FREE_PERCENT + 99) // 100
+    return max(HOST_MINIMUM_FREE_BYTES, percentage_floor) + HOST_FREE_SPACE_LEAD_BYTES
+
+
 def _require_provider_copy_capacity(
     source_root: Path,
     runtime_source: Path,
@@ -1917,7 +1929,7 @@ def _require_provider_copy_capacity(
     projected += (len(engine_files) + len(engine_links) + 64) * block
     total = filesystem.f_blocks * block
     available = filesystem.f_bavail * block
-    floor = max(5 * 1024**3, (total * 15 + 99) // 100) + 128 * 1024**2
+    floor = _provider_disk_floor(total)
     if additional_bytes < 0 or available < floor + projected + additional_bytes + 128 * 1024**2:
         raise InstallerError("typed runtime provider capacity is insufficient")
 
@@ -1931,7 +1943,7 @@ def _require_provider_write_floor(destination: Path, next_file_bytes: int = 0) -
         raise InstallerError("typed runtime provider filesystem is invalid")
     total = filesystem.f_blocks * block
     available = filesystem.f_bavail * block
-    floor = max(5 * 1024**3, (total * 15 + 99) // 100) + 128 * 1024**2
+    floor = _provider_disk_floor(total)
     next_allocation = ((next_file_bytes + block - 1) // block) * block
     if available < floor + next_allocation + 16 * 1024**2:
         raise InstallerError("typed runtime provider write would breach host floor")

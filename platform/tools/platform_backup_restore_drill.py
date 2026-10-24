@@ -47,12 +47,14 @@ try:
     from .platform_disk_policy import (
         DEFAULT_MIN_FREE_GIB,
         minimum_free_bytes,
+        minimum_free_bytes_for_capacity,
         snapshot_for_path,
     )
 except ImportError:  # Direct execution from the tools directory.
     _disk_policy = _load_staged_disk_policy()
     DEFAULT_MIN_FREE_GIB = _disk_policy.DEFAULT_MIN_FREE_GIB
     minimum_free_bytes = _disk_policy.minimum_free_bytes
+    minimum_free_bytes_for_capacity = _disk_policy.minimum_free_bytes_for_capacity
     snapshot_for_path = _disk_policy.snapshot_for_path
 
 
@@ -2985,8 +2987,10 @@ def run_command(
 def _required_disk_floor(total_bytes: int, *, phase: str | None = None) -> int:
     if type(total_bytes) is not int or total_bytes <= 0:
         raise RestoreGuardStop("disk_unavailable", phase=phase)
-    fifteen_percent_ceil = (total_bytes * 15 + 99) // 100
-    return max(RESTORE_DISK_MINIMUM_BYTES, fifteen_percent_ceil)
+    return minimum_free_bytes_for_capacity(
+        total_bytes,
+        absolute_minimum_free_bytes=RESTORE_DISK_MINIMUM_BYTES,
+    )
 
 
 def require_restore_headroom(

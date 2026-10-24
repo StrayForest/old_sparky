@@ -1190,7 +1190,7 @@ def _health_monitor_identity() -> tuple[dict[str, str], dict[str, str]]:
     expected_argv = (
         "/opt/oldsparky/platform/shared/venv/bin/python",
         "/opt/oldsparky/platform/current/tools/platform_health_monitor.py",
-        "--disk-min-free-gib", "5", "--disk-max-used-percent", "85",
+        "--disk-min-free-gib", "5", "--disk-max-used-percent", "90",
     )
     exec_value = service["ExecStart"]
     if not exec_value.startswith("{ ") or not exec_value.endswith(" }"):
