@@ -2381,7 +2381,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 os.chmod(release / "RELEASE.json", 0o444)
             (app_dir / "current").symlink_to(releases / f"release-{source_shas[0][:8]}")
             (app_dir / "previous").symlink_to(releases / f"release-{source_shas[1][:8]}")
-            for source_sha in source_shas[1:]:
+            for source_sha in (*source_shas[1:2], *source_shas[3:]):
                 payload = payloads / source_sha
                 payload.mkdir(mode=0o555)
             provider = {
@@ -2405,8 +2405,18 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             ):
                 protected = runtime._protected_shas(app_dir)
                 self.assertIn(source_shas[2], protected)
-                runtime._retention(app_dir, apply=True)
+                self.assertEqual(protected, set(source_shas[:3]))
+                # A protected manifest may name a provider that is not yet
+                # present during repair. Keep its identity in the closure so
+                # a later materialization cannot be treated as spare cache.
+                (payloads / source_shas[2]).mkdir(mode=0o555)
+                self.assertEqual(runtime._retention(app_dir, apply=False), 2)
+                self.assertTrue((payloads / source_shas[3]).exists())
+                self.assertTrue((payloads / source_shas[4]).exists())
+                self.assertEqual(runtime._retention(app_dir, apply=True), 2)
                 self.assertTrue((payloads / source_shas[2]).exists())
+                self.assertFalse((payloads / source_shas[3]).exists())
+                self.assertFalse((payloads / source_shas[4]).exists())
                 os.chmod(provider_path, 0o644)
                 provider_path.write_text("{}\n", encoding="ascii")
                 os.chmod(provider_path, 0o444)
@@ -4311,9 +4321,12 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 mock.patch.object(runtime, "PAYLOAD_ROOT", payload_root),
                 mock.patch.object(runtime, "ACTIVE_POINTER", root / "active"),
             ):
-                self.assertEqual(runtime._retention(root / "app", apply=True), 1)
+                self.assertEqual(runtime._retention(root / "app", apply=False), 2)
+                self.assertTrue(old.exists())
+                self.assertTrue(newest.exists())
+                self.assertEqual(runtime._retention(root / "app", apply=True), 2)
             self.assertFalse(old.exists())
-            self.assertTrue(newest.exists())
+            self.assertFalse(newest.exists())
 
     def test_retention_rejects_real_nested_hardlinks(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
