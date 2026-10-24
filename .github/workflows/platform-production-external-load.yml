@@ -279,7 +279,7 @@ jobs:
           set -euo pipefail
           profile_env="$RUNNER_TEMP/profile.env"
           run_checked_out_client() {
-            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 RUNNER_TEMP="$RUNNER_TEMP" SOURCE_GIT_SHA="$TARGET_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" "$@"
+            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 RUNNER_TEMP="$RUNNER_TEMP" SOURCE_GIT_SHA="$TARGET_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY" "$@"
           }
           run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py validate --profile "$PROFILE_ID" --dispatchable
           run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py export-env --profile "$PROFILE_ID" > "$profile_env"

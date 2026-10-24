@@ -393,6 +393,60 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertNotEqual(rejected.returncode, 0)
         self._assert_load_manifest_consumer_contract()
 
+    def test_ssr_concurrency_survives_checked_out_validator_environment(self) -> None:
+        """The SSR input must cross the validator's explicit env -i boundary."""
+        workflow = yaml.safe_load(self.source)
+        job_env = workflow["jobs"]["validate-external-inputs"]["env"]
+        self.assertEqual(
+            job_env["SSR_CAPACITY_CONCURRENCY"],
+            "${{ inputs.ssr_capacity_concurrency }}",
+        )
+
+        validate_step = _step_script(
+            self.jobs["validate-external-inputs"],
+            "Validate explicit external production load",
+        )
+        function = re.search(
+            r"(?ms)^run_checked_out_client\(\) \{\n.*?^\s*\}",
+            validate_step,
+        )
+        self.assertIsNotNone(function)
+        assert function is not None
+        self.assertIn(
+            'SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY"',
+            function.group(0),
+        )
+        self.assertIn(
+            'payload["ssr_capacity_concurrency"] = os.environ["SSR_CAPACITY_CONCURRENCY"]',
+            validate_step,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="external-load-ssr-env-") as temp_dir:
+            probe = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-euo",
+                    "pipefail",
+                    "-c",
+                    function.group(0)
+                    + '\nrun_checked_out_client /usr/bin/python3 -c '
+                    + "'import os; print(os.environ[\"SSR_CAPACITY_CONCURRENCY\"])'",
+                ],
+                env={
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "RUNNER_TEMP": temp_dir,
+                    "TARGET_SHA": "a" * 40,
+                    "APP_TARGET_SHA": "a" * 40,
+                    "GITHUB_RUN_ID": "40118074720",
+                    "SSR_CAPACITY_CONCURRENCY": "8",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(probe.stdout.strip(), "8")
+
     def _assert_load_manifest_consumer_contract(self) -> None:
         step = _step_script(
             self.jobs["load-client"], "Validate load manifest before candidate execution"
