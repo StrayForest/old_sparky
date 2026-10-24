@@ -76,6 +76,195 @@ def _extract_scan_template(source: str) -> str:
 
 
 class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
+    def test_trusted_parent_setup_leaves_only_allowlisted_ssh_material(self) -> None:
+        workflow = WORKFLOW_DIR / "platform-production-external-load.yml"
+        document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        setup_runs = [
+            step["run"]
+            for job in document.get("jobs", {}).values()
+            for step in job.get("steps", [])
+            if isinstance(step, dict)
+            and step.get("name") == "Configure pinned production SSH for the trusted parent"
+            and isinstance(step.get("run"), str)
+        ]
+        self.assertEqual(len(setup_runs), 1)
+        cleanup_runs = [
+            step["run"]
+            for job in document.get("jobs", {}).values()
+            for step in job.get("steps", [])
+            if isinstance(step, dict)
+            and step.get("name") == "Remove SSR capacity SSH material"
+            and isinstance(step.get("run"), str)
+        ]
+        self.assertEqual(len(cleanup_runs), 1)
+        setup = setup_runs[0]
+        self.assertGreaterEqual(setup.count(PINNED_FINGERPRINT), 1)
+        setup = setup.replace(PINNED_FINGERPRINT, FIXTURE_FINGERPRINT)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            stub_dir = Path(temporary) / "stub-bin"
+            stub_dir.mkdir(mode=0o700)
+            keyscan = stub_dir / "ssh-keyscan"
+            keyscan.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "[[ \"$*\" == '-T 3 -t ed25519 prod.example.test' ]] || exit 2\n"
+                "if [[ \"${CREATE_UNKNOWN_SSH_FILE:-0}\" == 1 ]]; then printf 'unknown\\n' > \"$RUNNER_TEMP/external-ssh/unexpected\"; fi\n"
+                "printf '%s\\n' \"$SCAN_KEY\"\n",
+                encoding="utf-8",
+            )
+            keyscan.chmod(0o700)
+            def run_setup(
+                name: str,
+                scan_key: str,
+                *,
+                create_unknown: bool = False,
+                preexisting: str | None = None,
+            ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+                runner_temp = Path(temporary) / f"runner-{name}"
+                runner_temp.mkdir(mode=0o700)
+                ssh_dir = runner_temp / "external-ssh"
+                if preexisting == "directory":
+                    ssh_dir.mkdir(mode=0o700)
+                    (ssh_dir / "sentinel").write_text("keep\n", encoding="ascii")
+                elif preexisting == "dangling-symlink":
+                    ssh_dir.symlink_to(runner_temp / "missing-target", target_is_directory=True)
+                github_env = Path(temporary) / f"{name}.github-env"
+                github_env.touch(mode=0o600)
+                env = {
+                    **os.environ,
+                    "PATH": f"{stub_dir}:{os.environ['PATH']}",
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_ENV": str(github_env),
+                    "PROD_SSH_HOST": "prod.example.test",
+                    "PROD_SSH_KEY": "safe-private-key-fixture",
+                    "SCAN_KEY": scan_key,
+                    "CREATE_UNKNOWN_SSH_FILE": "1" if create_unknown else "0",
+                }
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", setup],
+                    cwd=temporary,
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=10,
+                )
+                return result, runner_temp, github_env
+
+            def run_cleanup(runner_temp: Path) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        "bash",
+                        "--noprofile",
+                        "--norc",
+                        "-e",
+                        "-o",
+                        "pipefail",
+                        "-c",
+                        cleanup_runs[0],
+                    ],
+                    cwd=temporary,
+                    env={**os.environ, "RUNNER_TEMP": str(runner_temp)},
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=10,
+                )
+
+            result, runner_temp, github_env = run_setup("success", FIXTURE_KEY)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            ssh_dir = runner_temp / "external-ssh"
+            self.assertEqual(
+                {entry.name for entry in ssh_dir.iterdir()},
+                {"config", "id_ed25519", "known_hosts"},
+            )
+            self.assertEqual(
+                (ssh_dir / "known_hosts").read_text(encoding="utf-8"),
+                FIXTURE_KEY + "\n",
+            )
+            self.assertIn(
+                f"UserKnownHostsFile {ssh_dir / 'known_hosts'}",
+                (ssh_dir / "config").read_text(encoding="utf-8"),
+            )
+            for name in ("config", "id_ed25519", "known_hosts"):
+                path = ssh_dir / name
+                self.assertTrue(path.is_file())
+                self.assertFalse(path.is_symlink())
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600, name)
+            self.assertEqual(ssh_dir.stat().st_mode & 0o777, 0o700)
+            self.assertTrue((runner_temp / "cpu-diagnostic-report").is_dir())
+            self.assertEqual(github_env.read_text(encoding="utf-8"), "")
+            cleanup = run_cleanup(runner_temp)
+            self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+            self.assertFalse(ssh_dir.exists())
+
+            failed, failed_runner_temp, failed_github_env = run_setup(
+                "wrong-fingerprint", WRONG_FINGERPRINT_KEY
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertNotIn(WRONG_FINGERPRINT_KEY, failed.stderr)
+            self.assertNotIn(WRONG_FINGERPRINT_KEY, failed.stdout)
+            self.assertEqual(failed_github_env.read_text(encoding="utf-8"), "")
+            failed_ssh_dir = failed_runner_temp / "external-ssh"
+            self.assertFalse(failed_ssh_dir.exists())
+            for name in (
+                "id_ed25519",
+                "known_hosts",
+                "known_hosts.scan",
+                "known_hosts.scan.1",
+                "known_hosts.scan.2",
+                "config",
+            ):
+                self.assertFalse((failed_ssh_dir / name).exists(), name)
+            failed_cleanup = run_cleanup(failed_runner_temp)
+            self.assertEqual(failed_cleanup.returncode, 0, failed_cleanup.stderr)
+
+            unknown, unknown_runner_temp, unknown_github_env = run_setup(
+                "unknown-file", WRONG_FINGERPRINT_KEY, create_unknown=True
+            )
+            self.assertNotEqual(unknown.returncode, 0)
+            self.assertNotIn(WRONG_FINGERPRINT_KEY, unknown.stderr)
+            self.assertEqual(unknown_github_env.read_text(encoding="utf-8"), "")
+            unknown_ssh_dir = unknown_runner_temp / "external-ssh"
+            self.assertEqual(
+                {entry.name for entry in unknown_ssh_dir.iterdir()},
+                {"unexpected"},
+            )
+
+            existing, existing_runner_temp, existing_github_env = run_setup(
+                "preexisting-directory", FIXTURE_KEY, preexisting="directory"
+            )
+            self.assertNotEqual(existing.returncode, 0)
+            existing_ssh_dir = existing_runner_temp / "external-ssh"
+            self.assertEqual(
+                {entry.name for entry in existing_ssh_dir.iterdir()},
+                {"sentinel"},
+            )
+            self.assertEqual(
+                (existing_ssh_dir / "sentinel").read_text(encoding="ascii"), "keep\n"
+            )
+            self.assertEqual(existing_github_env.read_text(encoding="utf-8"), "")
+
+            symlink, symlink_runner_temp, symlink_github_env = run_setup(
+                "preexisting-dangling-symlink",
+                FIXTURE_KEY,
+                preexisting="dangling-symlink",
+            )
+            self.assertNotEqual(symlink.returncode, 0)
+            symlink_ssh_dir = symlink_runner_temp / "external-ssh"
+            self.assertTrue(symlink_ssh_dir.is_symlink())
+            self.assertFalse(symlink_ssh_dir.exists())
+            self.assertEqual(symlink_github_env.read_text(encoding="utf-8"), "")
+            unknown_cleanup = run_cleanup(unknown_runner_temp)
+            self.assertNotEqual(unknown_cleanup.returncode, 0)
+            self.assertEqual(
+                {entry.name for entry in unknown_ssh_dir.iterdir()},
+                {"unexpected"},
+            )
+
     def test_every_workflow_site_uses_the_same_bounded_pinned_contract(self) -> None:
         site_count = 0
         workflow_count = 0

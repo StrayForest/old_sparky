@@ -1716,7 +1716,29 @@ jobs:
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/external-ssh"
-          install -d -m 700 "$ssh_dir"
+          mkdir -m 700 -- "$ssh_dir"
+          ssh_setup_complete=0
+          cleanup_failed_ssh_setup() {
+            local setup_status=$? cleanup_status=0 member
+            trap - EXIT
+            if (( setup_status != 0 && ssh_setup_complete == 0 )); then
+              for member in \
+                id_ed25519 known_hosts known_hosts.scan \
+                known_hosts.scan.1 known_hosts.scan.2 config; do
+                if [[ -e "$ssh_dir/$member" || -L "$ssh_dir/$member" ]]; then
+                  rm -f -- "$ssh_dir/$member" || cleanup_status=1
+                fi
+              done
+              rmdir -- "$ssh_dir" || cleanup_status=1
+              if (( cleanup_status != 0 )); then
+                printf '%s\n' 'Production SSH setup failure cleanup could not remove its private directory' >&2
+              fi
+            fi
+            exit "$setup_status"
+          }
+          trap cleanup_failed_ssh_setup EXIT
+          test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          test "$(stat -c '%u:%g:%a' -- "$ssh_dir")" = "$(id -u):$(id -g):700"
           report_dir="$RUNNER_TEMP/cpu-diagnostic-report"
           install -d -m 700 "$report_dir"
           test -d "$report_dir" && test ! -L "$report_dir"
@@ -1725,9 +1747,13 @@ jobs:
           test ! -e "$report_dir/ssh-lifecycle.json" && test ! -L "$report_dir/ssh-lifecycle.json"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
-          ssh_scan="$ssh_dir/known_hosts.scan"; rm -f -- "$ssh_scan"; ssh_scan_ok=0
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          test ! -e "$ssh_scan" && test ! -L "$ssh_scan"
+          ssh_scan_ok=0
           for ssh_attempt in 1 2; do
-            ssh_scan_attempt="$ssh_scan.$ssh_attempt"; rm -f -- "$ssh_scan_attempt"; install -m 600 /dev/null "$ssh_scan_attempt"
+            ssh_scan_attempt="$ssh_scan.$ssh_attempt"
+            test ! -e "$ssh_scan_attempt" && test ! -L "$ssh_scan_attempt"
+            install -m 600 /dev/null "$ssh_scan_attempt"
             ssh_scan_rc=0
             if timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" >"$ssh_scan_attempt" 2>/dev/null; then
               :
@@ -1764,12 +1790,15 @@ jobs:
           done
           test "$ssh_scan_ok" = 1 || { echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2; exit 1; }
           install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          rm -f -- "$ssh_scan"
+          test ! -e "$ssh_scan" && test ! -L "$ssh_scan"
           {
             printf '%s\n' 'Host *' '  StrictHostKeyChecking yes'
             printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
             printf '%s\n' '  ControlMaster no' '  ControlPersist no' '  ControlPath none'
           } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"
+          ssh_setup_complete=1
 
       - name: Prepare SSR capacity report directory
         if: ${{ inputs.ssr_capacity_diagnostic_only == true }}
@@ -2057,6 +2086,8 @@ jobs:
           import sys
 
           directory = Path(sys.argv[1])
+          if not os.path.lexists(directory):
+              raise SystemExit(0)
           try:
               before = directory.lstat()
               if (not stat.S_ISDIR(before.st_mode) or before.st_uid != os.geteuid()
