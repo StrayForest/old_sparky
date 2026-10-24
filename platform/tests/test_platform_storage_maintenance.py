@@ -430,7 +430,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "--protected-release",
             "gha-37760797674-1-80e457e57081",
             "--minimum-free-gib",
-            "0",
+            "5",
         ]
         before_links = {
             "current": (app_dir / "current").resolve(strict=True),
