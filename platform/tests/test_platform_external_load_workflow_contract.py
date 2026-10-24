@@ -22,6 +22,7 @@ import unittest
 import zipfile
 
 import yaml
+from tools.platform_workflow_input_guard import validate_external_payload
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -390,6 +391,95 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 capture_output=True, text=True, check=False,
             )
             self.assertNotEqual(rejected.returncode, 0)
+        self._assert_load_manifest_consumer_contract()
+
+    def _assert_load_manifest_consumer_contract(self) -> None:
+        step = _step_script(
+            self.jobs["load-client"], "Validate load manifest before candidate execution"
+        )
+        consumer = step.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+        manifest = {
+            "schema": 2,
+            "purpose": "external_ready_vote",
+            "origin": "https://old-sparky.com",
+            "session_cookie_name": "session",
+            "csrf_cookie_name": "csrf",
+            "marker": "preprod123456789012abcd",
+            "created_at": "2026-10-24T00:00:00Z",
+            "tournaments": [],
+            "users": [{"id": 1}],
+            "runner_sha": "a" * 40,
+            "app_target_sha": "a" * 40,
+            "source_binding": None,
+            "source_binding_sha256": None,
+        }
+        producer_inputs = (
+            {
+                "schema": 1,
+                "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
+                "target_sha": "a" * 40,
+                "control_email": "qa@example.com",
+                "setup_concurrency": "16",
+                "run_id": "123456",
+                "profile": "external-vote",
+                "tournament_count": "40",
+                "users_per_tournament": "500",
+                "timeout_diagnostics": "false",
+                "fixture_kind": "external_load",
+            },
+            {
+                "schema": 1,
+                "confirmation": "RUN-PRODUCTION-CPU-DIAGNOSTIC",
+                "target_sha": "a" * 40,
+                "control_email": "qa@example.com",
+                "setup_concurrency": "16",
+                "run_id": "123456",
+                "profile": "external-vote",
+                "tournament_count": "1",
+                "users_per_tournament": "14",
+                "timeout_diagnostics": "false",
+                "fixture_kind": "cpu_diagnostic_only_v1",
+            },
+        )
+
+        def run(
+            payload: dict[str, object], target_sha: str = "a" * 40,
+            run_id: str = "123456",
+        ) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                input_path = root / "input.json"
+                manifest_path = root / "manifest.json"
+                input_path.write_text(json.dumps(payload), encoding="utf-8")
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                return subprocess.run(
+                    [
+                        sys.executable, "-", str(input_path), str(manifest_path),
+                        target_sha, run_id, "a" * 40,
+                    ],
+                    input=consumer,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    cwd=REPO_ROOT,
+                )
+
+        for raw in producer_inputs:
+            with self.subTest(fixture_kind=raw["fixture_kind"]):
+                producer_payload = validate_external_payload(raw)
+                completed = run(producer_payload)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn("closed external handoff accepted", completed.stdout)
+
+        valid = validate_external_payload(producer_inputs[0])
+        for mutation in (
+            {**valid, "fixture_kind": "unrecognized_mode"},
+            {**valid, "unexpected": "field"},
+        ):
+            with self.subTest(payload=mutation):
+                self.assertNotEqual(run(mutation).returncode, 0)
+        self.assertNotEqual(run(valid, target_sha="b" * 40).returncode, 0)
+        self.assertNotEqual(run(valid, run_id="654321").returncode, 0)
 
     def test_every_authoritative_status_is_consumed_by_the_gate(self) -> None:
         gate = self.jobs["evaluate-load"].split("- name: Enforce external load", 1)[1]

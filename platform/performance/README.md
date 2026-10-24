@@ -159,6 +159,14 @@ still runs with `always()` and owns fixture cleanup; only the later evaluation,
 sanitization and exact cleanup gates can produce a successful evidence
 artifact.
 
+The fixture producer and load-client consumer share a closed JSON handoff.
+`fixture_kind` is required and must be `external_load`,
+`cpu_diagnostic_only_v1` or `ssr_capacity_diagnostic_v1`; diagnostic kinds are
+bound to their confirmation and fixed fixture dimensions, and SSR capacity
+concurrency is present only for the SSR diagnostic. The consumer also binds
+the handoff to the exact target SHA, run ID and fixture source manifest before
+starting the candidate.
+
 The external runner preserves schema-1 report fields and adds measurement
 schema 2. Compatibility `latency` remains service latency; the additive timing
 block reports schedule/enqueue/actual start/completion, executor queue wait,

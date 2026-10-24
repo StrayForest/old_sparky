@@ -1203,14 +1203,26 @@ jobs:
           import re
           import sys
 
+          sys.path.insert(0, str(Path("platform").resolve()))
+          from tools.platform_workflow_input_guard import validate_external_payload
+
           input_path, manifest_path, target_sha, run_id, app_target_sha = sys.argv[1:]
           payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
-          base_input_keys = {"schema", "confirmation", "target_sha", "control_email", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics"}
+          base_input_keys = {
+              "schema", "confirmation", "target_sha", "control_email", "setup_concurrency",
+              "run_id", "profile", "tournament_count", "users_per_tournament",
+              "timeout_diagnostics", "fixture_kind",
+          }
           schema = payload.get("schema")
           source_binding = payload.get("source_binding")
           expected_input_keys = base_input_keys | ({"source_binding"} if schema in (2, "2") else set())
           if set(payload) != expected_input_keys or schema not in (1, "1", 2, "2") or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id:
               raise SystemExit("external handoff schema or exact target SHA mismatch")
+          try:
+              if "fixture_kind" not in payload or validate_external_payload(payload) != payload:
+                  raise ValueError
+          except (TypeError, ValueError):
+              raise SystemExit("external handoff fixture schema or mode is invalid")
           manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
           keys = {"schema", "purpose", "origin", "session_cookie_name", "csrf_cookie_name", "marker", "created_at", "tournaments", "users", "runner_sha", "app_target_sha", "source_binding", "source_binding_sha256"}
           if set(manifest) != keys or type(manifest.get("schema")) is not int or manifest.get("schema") != 2 or manifest.get("origin") != "https://old-sparky.com" or re.fullmatch(r"preprod[0-9]{12}[0-9a-f]{4}", str(manifest.get("marker"))) is None:
