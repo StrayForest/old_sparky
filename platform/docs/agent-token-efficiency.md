@@ -45,7 +45,8 @@ required evidence, review, safety checks and release gates.
 - The release builder defaults to the primary checkout's
   `platform/dist/releases`, including when invoked from a linked worktree.
   That is the source-artifact owner path shared with maintenance retention and
-  the release-output flock. Use `PLATFORM_RELEASE_OUTPUT_DIR` only for an
+  the release-output flock; production CI's per-run output override stays
+  isolated. Use `PLATFORM_RELEASE_OUTPUT_DIR` only for an
   intentionally isolated fixture or a separately owned build.
 - Keep release archives and their checksum sidecars together under that owner
   path. Do not copy release bundles into worktree-local `dist/releases`,

@@ -402,6 +402,21 @@ jobs:
           cd "$runtime/current"
           python_bin="$runtime/shared/venv/bin/python"
 
+          CURRENT_CONTENT_STAGE=""
+          content_diagnostic_error() {
+            local exit_status=$?
+            trap - ERR
+            case "$CURRENT_CONTENT_STAGE" in
+              youtube_probe|forced_home_refresh|local_home_shape|public_content_sample)
+                printf 'CONTENT_DIAGNOSTIC_PHASE schema=1 stage=%s status=failed exit_class=command\n' \
+                  "$CURRENT_CONTENT_STAGE"
+                ;;
+            esac
+            exit "$exit_status"
+          }
+          trap content_diagnostic_error ERR
+
+          CURRENT_CONTENT_STAGE=youtube_probe
           echo '=== YouTube endpoint probe ==='
           "$python_bin" - <<'PY'
           import httpx
@@ -440,10 +455,16 @@ jobs:
                           "error_class=request",
                       )
           PY
+          printf '%s\n' 'CONTENT_DIAGNOSTIC_PHASE schema=1 stage=youtube_probe status=passed exit_class=none'
+          CURRENT_CONTENT_STAGE=""
 
+          CURRENT_CONTENT_STAGE=forced_home_refresh
           echo '=== Forced home content refresh ==='
           tools/platform_refresh_home_content.sh >/dev/null 2>/dev/null
+          printf '%s\n' 'CONTENT_DIAGNOSTIC_PHASE schema=1 stage=forced_home_refresh status=passed exit_class=none'
+          CURRENT_CONTENT_STAGE=""
 
+          CURRENT_CONTENT_STAGE=local_home_shape
           echo '=== Local API home content and live page shape ==='
           "$python_bin" - <<'PY'
           import json
@@ -539,7 +560,10 @@ jobs:
               "status=matched",
           )
           PY
+          printf '%s\n' 'CONTENT_DIAGNOSTIC_PHASE schema=1 stage=local_home_shape status=passed exit_class=none'
+          CURRENT_CONTENT_STAGE=""
 
+          CURRENT_CONTENT_STAGE=public_content_sample
           echo '=== Bounded public home and current patch cache reads ==='
           export PLATFORM_APP_DIR="$runtime"
           export PLATFORM_SHARED_DIR="$runtime/shared"
@@ -550,6 +574,8 @@ jobs:
           platform_load_env_file
           export PYTHONPATH="$runtime/current"
           "$python_bin" tools/platform_public_content_diagnostic.py
+          printf '%s\n' 'CONTENT_DIAGNOSTIC_PHASE schema=1 stage=public_content_sample status=passed exit_class=none'
+          CURRENT_CONTENT_STAGE=""
 
           echo '=== Recent worker YouTube log summary ==='
           worker_raw_log_file="$(mktemp)"
@@ -577,6 +603,44 @@ jobs:
           REMOTE
           remote_status=$?
           set -e
+
+          validate_content_failure_phase() {
+            local remote_path="$1"
+            local line
+            local stage
+            local status
+            local exit_class
+            local phase_count=0
+            local failed_line=""
+            local failed_seen=0
+            local -a expected_stages=(
+              youtube_probe
+              forced_home_refresh
+              local_home_shape
+              public_content_sample
+            )
+            while IFS= read -r line; do
+              [[ "$line" == CONTENT_DIAGNOSTIC_PHASE* ]] || continue
+              [[ "$line" =~ ^CONTENT_DIAGNOSTIC_PHASE\ schema=1\ stage=(youtube_probe|forced_home_refresh|local_home_shape|public_content_sample)\ status=(passed|failed)\ exit_class=(none|command)$ ]] || return 1
+              stage="${BASH_REMATCH[1]}"
+              status="${BASH_REMATCH[2]}"
+              exit_class="${BASH_REMATCH[3]}"
+              (( failed_seen == 0 )) || return 1
+              (( phase_count < ${#expected_stages[@]} )) || return 1
+              [[ "$stage" == "${expected_stages[$phase_count]}" ]] || return 1
+              phase_count=$((phase_count + 1))
+              if [[ "$status" == failed ]]; then
+                [[ "$exit_class" == command ]] || return 1
+                failed_seen=1
+                failed_line="$line"
+              else
+                [[ "$exit_class" == none ]] || return 1
+              fi
+            done < "$remote_path"
+            (( failed_seen == 1 )) || return 1
+            printf '%s\n' "$failed_line"
+          }
+
           sample_line_count="$(grep -c '^PUBLIC_CONTENT_SAMPLE_JSON ' "$remote_log" || true)"
           sample_line="$(grep '^PUBLIC_CONTENT_SAMPLE_JSON ' "$remote_log" | tail -n 1 || true)"
           sample_line_valid=0
@@ -587,6 +651,10 @@ jobs:
             printf '%s\n' "$sample_line"
           fi
           if (( remote_status != 0 )); then
+            phase_line=""
+            if phase_line="$(validate_content_failure_phase "$remote_log")"; then
+              printf '%s\n' "$phase_line"
+            fi
             rm -f -- "$remote_log" "$remote_error"
             if (( sample_line_valid == 1 )); then
               printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=failed error_class=content_sample'

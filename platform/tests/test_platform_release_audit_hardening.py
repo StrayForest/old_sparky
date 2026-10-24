@@ -1747,6 +1747,88 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn('context\\":\\"platform-production-deploy', deploy[marker_at:])
         self.assertIn('description\\":\\"Production deployment and live smoke passed', deploy[marker_at:])
 
+    def test_content_diagnostics_failure_phase_is_closed_and_private(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-content-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        function_start = workflow.index("validate_content_failure_phase() {")
+        function_end = workflow.index("\n          }\n", function_start) + len("\n          }\n")
+        function_source = textwrap.dedent(workflow[function_start:function_end])
+
+        def validate(markers: list[str]) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as temporary:
+                remote_log = Path(temporary) / "remote.log"
+                remote_log.write_text("\n".join(markers) + "\n", encoding="ascii")
+                return subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        function_source + '\nvalidate_content_failure_phase "$1"',
+                        "content-phase-contract",
+                        str(remote_log),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+        youtube_passed = (
+            "CONTENT_DIAGNOSTIC_PHASE schema=1 stage=youtube_probe "
+            "status=passed exit_class=none"
+        )
+        forced_refresh_failed = (
+            "CONTENT_DIAGNOSTIC_PHASE schema=1 stage=forced_home_refresh "
+            "status=failed exit_class=command"
+        )
+        valid = validate([youtube_passed, forced_refresh_failed])
+        self.assertEqual(valid.returncode, 0)
+        self.assertEqual(valid.stdout, forced_refresh_failed + "\n")
+        self.assertEqual(valid.stderr, "")
+
+        for invalid_markers in (
+            [youtube_passed, forced_refresh_failed, forced_refresh_failed],
+            [youtube_passed, forced_refresh_failed + " detail=secret"],
+            [forced_refresh_failed],
+            [
+                youtube_passed,
+                forced_refresh_failed,
+                "CONTENT_DIAGNOSTIC_PHASE schema=1 stage=unknown status=failed exit_class=command",
+            ],
+            [
+                "CONTENT_DIAGNOSTIC_PHASE schema=1 stage=youtube_probe "
+                "status=failed exit_class=command",
+                forced_refresh_failed,
+            ],
+            [youtube_passed],
+            [],
+        ):
+            with self.subTest(markers=invalid_markers):
+                result = validate(invalid_markers)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+        marker = "CONTENT_DIAGNOSTIC_PHASE schema=1 stage="
+        self.assertIn("trap content_diagnostic_error ERR", workflow)
+        self.assertIn("exit_class=command", workflow)
+        self.assertEqual(
+            workflow.count("CURRENT_CONTENT_STAGE="), 9,
+            "only four fixed stage starts, four clears and one initial clear are expected",
+        )
+        for stage in (
+            "youtube_probe",
+            "forced_home_refresh",
+            "local_home_shape",
+            "public_content_sample",
+        ):
+            self.assertIn(f"CURRENT_CONTENT_STAGE={stage}", workflow)
+            self.assertIn(f"stage={stage} status=passed exit_class=none", workflow)
+        self.assertIn(marker, workflow)
+        self.assertLess(
+            workflow.index('printf \'%s\\n\' "$phase_line"'),
+            workflow.index('rm -f -- "$remote_log" "$remote_error"', workflow.index("validate_content_failure_phase")),
+        )
+        self.assertIn("exit 1", workflow[workflow.index("if (( remote_status != 0 )); then"):])
+
     def test_all_production_ssh_workflows_pin_host_identity(self) -> None:
         workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-as12-proof.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-diagnostics.yml', 'platform-production-external-load.yml', 'platform-production-release-abort.yml', 'platform-production-retained-load-cleanup.yml', 'platform-production-retained-load-abort.yml', 'platform-production-storage-diagnostics.yml', 'platform-production-web-runtime-diagnostics.yml')
         expected_fingerprint = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
