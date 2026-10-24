@@ -283,7 +283,15 @@ jobs:
                       raise ReceiptError
                   if (
                       type(disk["schema"]) is not int or disk["schema"] != 1
-                      or disk["phase"] not in {"backup_admission", "pg_dump_pre_spawn", "pg_dump_post_start", "pg_dump_monitor", "pg_dump_post_exit"}
+                      or disk["phase"] not in {
+                          "backup_admission",
+                          "scratch_image_admission",
+                          "scratch_image_postallocation",
+                          "pg_dump_pre_spawn",
+                          "pg_dump_post_start",
+                          "pg_dump_monitor",
+                          "pg_dump_post_exit",
+                      }
                       or disk["guard_reason"] not in {"disk_floor", "disk_unavailable", "child_unstopped", "command_start_failed", "command_failed"}
                       or not _integer(disk["free_bytes"], nullable=True)
                       or not _integer(disk["required_free_bytes"], nullable=True)
