@@ -80,7 +80,7 @@ Retention does not recompute multi-gigabyte tree digests. Deletion requires the
 exact 40-hex name, matching manifest identity, root ownership, expected
 read-only modes, same-device file/directory types and non-escaping symlinks.
 Runtime reuse verifies the full digest. Deletion renames revalidated caches to
-hidden tombstones; a later run validates and reclaims interrupted tombstones.
+hidden tombstones; a later run validates and reclaims interrupted tombstones. Dependent destructive cleanup is fail-closed: path, identity, lock and source prechecks must all pass in one controlled execution before mutation. Use checked return codes or single-program flow so a failed precheck cannot be followed by deletion through shell continuation. After partial cleanup/error, record completed exact paths, verify post-state before resuming and never repeat a completed deletion.
 
 Apply the bounded sweep through the reviewed workflow after reviewing the `run-retention-preview` plan below; the generic diagnostics inventory is not an apply plan:
 
