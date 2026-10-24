@@ -944,6 +944,8 @@ _RESTORE_GUARD_MESSAGES = {
 }
 _BACKUP_DISK_DIAGNOSTIC_PHASES = {
     "backup_admission",
+    "scratch_image_admission",
+    "scratch_image_postallocation",
     "pg_dump_pre_spawn",
     "pg_dump_post_start",
     "pg_dump_monitor",

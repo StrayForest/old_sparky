@@ -197,7 +197,7 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
 
         receipt["backup_disk_diagnostic"] = {
             "schema": 1,
-            "phase": "backup_admission",
+            "phase": "scratch_image_admission",
             "guard_reason": "disk_floor",
             "free_bytes": 1,
             "required_free_bytes": 2,
@@ -206,12 +206,31 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(
             disk_result["backup_disk_diagnostic"],
             {
-                "phase": "backup_admission",
+                "phase": "scratch_image_admission",
                 "guard_reason": "disk_floor",
                 "free_bytes": 1,
                 "required_free_bytes": 2,
             },
         )
+        for phase in ("scratch_image_postallocation",):
+            receipt["backup_disk_diagnostic"]["phase"] = phase
+            phase_result = project_receipt(
+                json.dumps(receipt).encode("ascii"), run_id, attempt, source_sha
+            )
+            self.assertEqual(phase_result["backup_disk_diagnostic"]["phase"], phase)
+        receipt["backup_disk_diagnostic"]["phase"] = "unrecognized_image_phase"
+        with self.assertRaises(ReceiptError):
+            project_receipt(json.dumps(receipt).encode("ascii"), run_id, attempt, source_sha)
+        receipt["backup_disk_diagnostic"] = {
+            "schema": 1,
+            "phase": "scratch_image_admission",
+            "guard_reason": "disk_floor",
+            "free_bytes": 1,
+            "required_free_bytes": 2,
+            "unexpected": "field",
+        }
+        with self.assertRaises(ReceiptError):
+            project_receipt(json.dumps(receipt).encode("ascii"), run_id, attempt, source_sha)
 
     def test_backup_failure_receipt_rejects_wrong_binding_and_open_schema(self) -> None:
         receipt = {
