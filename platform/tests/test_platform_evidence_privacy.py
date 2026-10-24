@@ -8,6 +8,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -63,6 +65,26 @@ def serialized(value: object) -> str:
 
 
 class EvidencePrivacyTests(unittest.TestCase):
+    def test_abort_cli_help_starts_under_isolated_python_from_unrelated_cwd(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "tools"
+            / "platform_abort_retained_load.py"
+        )
+        with tempfile.TemporaryDirectory() as working_directory:
+            completed = subprocess.run(
+                [sys.executable, "-I", "-B", str(script), "--help"],
+                cwd=working_directory,
+                env={},
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--verify-no-active-run", completed.stdout)
+        self.assertEqual(completed.stderr, "")
+
     def test_exact_no_active_run_check_is_read_only_and_fails_closed(self) -> None:
         output = StringIO()
         with (

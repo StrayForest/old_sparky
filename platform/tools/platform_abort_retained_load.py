@@ -13,7 +13,16 @@ import re
 import signal
 import stat
 import subprocess
+import sys
 import time
+
+# This CLI is executed with ``python -I`` by the production cleanup wrapper.
+# Isolated mode intentionally excludes the working directory and ambient
+# PYTHONPATH, so resolve only the immutable script's trusted sibling roots.
+PLATFORM_ROOT = Path(__file__).resolve().parents[1]
+TOOLS_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PLATFORM_ROOT))
+sys.path.insert(0, str(TOOLS_ROOT))
 
 try:
     from tools.platform_evidence_sanitizer import project_public_artifact, sanitize_log_file
