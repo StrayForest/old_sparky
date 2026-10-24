@@ -15,8 +15,17 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
     ) -> None:
         source_text = "Next Tuesday, October 20th at 2pm PDT."
         protected_text, fact_map = translation.protect_facts(source_text)
-        source_segments = [{"id": "s000-c001", "text": source_text}]
-        prepared_segments = [{"id": "s000-c001", "text": protected_text}]
+        source_segments = [
+            {"id": "s000-c000", "text": "Violet is available in-game now."},
+            {"id": "s000-c001", "text": source_text},
+        ]
+        prepared_segments = [
+            {
+                "id": "s000-c000",
+                "text": "Violet is available in-game now.",
+            },
+            {"id": "s000-c001", "text": protected_text},
+        ]
         initial = (
             "Следующий вторник, [[FACT_0000]] октября в [[FACT_0001]] "
             "по тихоокеанскому времени, затем 99."
@@ -27,7 +36,10 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
         )
         request = AsyncMock(
             side_effect=[
-                {"s000-c001": initial},
+                {
+                    "s000-c000": "Виолетта уже доступна в игре.",
+                    "s000-c001": initial,
+                },
                 {"s000-c001": corrected},
             ]
         )
@@ -47,6 +59,13 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(
             request.await_args_list[1].kwargs["fact_correction_ids"],
             ["s000-c001"],
+        )
+        self.assertEqual(
+            [segment["id"] for segment in request.await_args_list[1].kwargs["segments"]],
+            ["s000-c001"],
+        )
+        self.assertEqual(
+            translated["s000-c000"], "Виолетта уже доступна в игре."
         )
         self.assertEqual(
             translation._fact_fingerprint(source_text),

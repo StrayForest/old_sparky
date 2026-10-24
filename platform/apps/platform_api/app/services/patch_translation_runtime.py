@@ -946,15 +946,33 @@ async def _request_openai_with_fact_correction(
     """Allow one bounded correction, then require the original fact fingerprint."""
 
     correction_ids: list[str] | None = None
+    translated_prepared: dict[str, str] | None = None
     source_by_id = {segment["id"]: segment["text"] for segment in source_segments}
+    expected_ids = [segment["id"] for segment in source_segments]
     for attempt in range(PATCH_TRANSLATION_FACT_CORRECTION_ATTEMPTS + 1):
-        translated_prepared = await _request_openai(
+        request_segments = (
+            prepared_segments
+            if correction_ids is None
+            else [
+                segment
+                for segment in prepared_segments
+                if segment["id"] in correction_ids
+            ]
+        )
+        corrected_segments = await _request_openai(
             patch_id=patch_id,
-            segments=prepared_segments,
+            segments=request_segments,
             glossary=glossary,
             settings=settings,
             fact_correction_ids=correction_ids,
         )
+        if translated_prepared is None:
+            translated_prepared = corrected_segments
+        else:
+            translated_prepared.update(corrected_segments)
+        if list(translated_prepared) != expected_ids:
+            raise ValueError("OpenAI changed or omitted segment ids during correction.")
+
         translated: dict[str, str] = {}
         for segment_id, text in translated_prepared.items():
             restored = restore_placeholders(
