@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-24
+- Last reviewed: 2026-10-25
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -15,7 +15,7 @@ Use this document for the normal immutable release path. CSP mode changes and pr
 3. While Security is active and the shared slot unowned, the operator dispatches one `create` backup with that exact
    ID/attempt/SHA. Require `security_started <= backup.created_at <= backup.run_started_at <= backup_job.started_at < security_last_job_completed`.
    Confirm the backup workflow and production job actually start before that bound; a queued run that starts later
-   cannot qualify. Do not wait for CI to finish or substitute an ID, attempt, SHA or timestamp; see the [backup procedure](backup-restore-runbook.md#local-verified-backup).
+   cannot qualify. Do not wait for CI to finish or substitute an ID, attempt, SHA or timestamp. The verifier counts every matching backup run ID, including failed/cancelled runs; reserve exactly one. See the [backup procedure](backup-restore-runbook.md#local-verified-backup).
 4. Wait for exact Security success and the restore-verified receipt. Auto-deploy starts after Security completes; it never dispatches the backup, only polls it and dispatches the child after both proofs pass.
 5. Confirm migration compatibility, healthy services and at least `max(5 GiB, 10% of total)` free / at most 90% used; protect `current`/`previous`. Never manually deploy. Other routes use their own procedures; local tests do not replace release gates.
 
@@ -280,11 +280,13 @@ They are workflow implementation details; direct server execution is limited to 
 
 ### Service preflight recovery
 
-If the deploy preflight reports that `deadlock-web` is not active, do not
-disable the service check or invoke the release installer directly. Use the
-operator-only service recovery workflow, which takes the release lock, refuses
-to run during a retained release transaction, restarts only `deadlock-web`,
-and verifies the existing active release on port 3000:
+Use the existing web-only recovery if `deadlock-web` is inactive/unhealthy, or
+measured post-QA web memory pressure tripped the unchanged 1 GiB backup guard.
+Do not weaken the guard or invoke the release installer. The operator-only
+workflow takes the canonical release lock, refuses a pending transaction,
+restarts only web and verifies HTTP 200; follow the [service recovery
+runbook](service-recovery-runbook.md) for no-activity, exact-identity and
+pre/post memory/readiness checks:
 
 ```bash
 gh workflow run platform-production-service-recovery.yml \

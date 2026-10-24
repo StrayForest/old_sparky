@@ -464,7 +464,9 @@ def project_maintenance_backup_failure(
         "scratch_first_fault": payload.get("scratch_first_fault"),
         "scratch_resource_attribution": payload.get("scratch_resource_attribution"),
         "scratch_phase_attribution": payload.get("scratch_phase_attribution"),
-        "scratch_cleanup_status": payload.get("scratch_cleanup_status"),
+        # This cleanup outcome is a closed string enum validated above, not a
+        # structured diagnostic object owned by the generic receipt projector.
+        "scratch_cleanup_status": None,
         "report_bytes": 0,
         "report_sha256": None,
         "stderr_state": "absent",
@@ -499,6 +501,9 @@ def project_maintenance_backup_failure(
     ):
         if projected[field] is not None:
             result[field] = projected[field]
+    if "scratch_cleanup_status" in payload:
+        # Preserve only the existing validator's closed enum result.
+        result["scratch_cleanup_status"] = payload["scratch_cleanup_status"]
     host_guard = payload.get("scratch_host_guard_diagnostic")
     if host_guard is not None:
         result["scratch_host_guard_diagnostic"] = {

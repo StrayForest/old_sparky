@@ -1,22 +1,56 @@
-# API and worker service recovery
+# Production service recovery
 
 - Status: Exceptional operator procedure
 - Owner: Production operator
-- Last reviewed: 2026-10-19
+- Last reviewed: 2026-10-25
 
-Use this procedure only to restore the API and worker services on the exact
+Use this procedure only to restore web, API or worker services on the exact
 currently active immutable release. It does not install or select a release,
 change configuration or schema, or replace the normal release workflow.
 
 ## Preconditions and behavior
 
 The operator-only `platform-production-service-recovery.yml` workflow offers
-two API/worker modes, each requiring its exact confirmation phrase, active
-source SHA, and release slug. Use `api-worker` only when Nginx is already
-healthy and active. Use `api-worker-nginx` for the observed API/worker/Nginx
-dead-success prestate. The reviewed controller runs from the workflow's
-trusted no-checkout secret job; it does not fetch code or copy an unverified
-helper to the host.
+`web`, `api-worker`, and `api-worker-nginx` modes. API/worker modes require
+their exact confirmation phrase, active source SHA, and release slug. Use
+`api-worker` only when Nginx is already healthy and active; use
+`api-worker-nginx` for the observed API/worker/Nginx dead-success prestate.
+The reviewed controller runs from the workflow's trusted no-checkout secret
+job; it does not fetch code or copy an unverified helper to the host.
+
+### Web-only recovery
+
+The existing `web` mode uses the exact confirmation `RECOVER-DEADLOCK-WEB` and
+restarts only `deadlock-web`, even when systemd reports it active. It requires
+the current release and canonical release lock to validate, no pending release
+transaction, and API, worker, and Nginx active. It polls the web origin for
+HTTP 200 readiness; a successful marker proves web readiness, not memory
+headroom. The restart can briefly interrupt visitor requests.
+
+A measured post-QA memory-reserve failure is also a valid reason to use this
+existing mode when the proactive backup guard's closed `parent_active_poll`
+sample is below the existing 1 GiB `MemAvailable` floor and separate
+post-load evidence shows web-process memory pressure. This is a diagnostic
+trigger, not an OOM finding or attribution to a particular service. Preserve
+the 1 GiB guard and all additive backup reserves; an observed recovery margin
+does not create a new policy threshold.
+
+Before dispatch, close the exact QA/load namespace and verify there is no
+active load/client, backup, deployment, or retained-load lock. Record the
+exact active source SHA, release slug, current/previous targets, closed
+pre-recovery memory sample, and API/web/Nginx readiness. Web mode has no
+expected-SHA or release-slug inputs: these identity checks are operator-run
+before and after recovery, not workflow-enforced binding. The workflow holds
+the canonical release lock but does not acquire a retained-load lock; the
+operator idle-window check is not mutual exclusion or race protection. Coordinate
+so no external load starts until recovery and post-checks finish.
+
+After recovery, confirm the same source SHA, release slug, current/previous
+targets, and release artifact identity; verify API readiness and web HTTP 200,
+then capture closed memory evidence again. A recovery pass is not a backup
+admission pass. Require the existing memory floor and operation reserves before
+one backup producer, and stop if memory remains below threshold or any activity
+or identity changes. Do not infer that the restart caused the memory change.
 
 Before starting either service, the controller holds the canonical platform
 release lock and checks the active release SHA and slug, stable current/active

@@ -2,13 +2,21 @@
 
 - Status: Active reference
 - Owner: Platform performance
-- Last reviewed: 2026-10-01
+- Last reviewed: 2026-10-25
 
 The top-level JSON files in `profiles/` are the only authored canonical load
 contracts (schema 2). `tools/platform_load.py` validates, fingerprints and
 dispatches them; `tools/platform_external_load.py` remains the external HTTP
 implementation detail. `tools/platform_load_acceptance.py` owns the shared
 SLO, capacity, spike and stress decisions.
+
+## Authenticated-page load comparison (2026-10-24)
+
+Candidate [run `40114878581/1`](https://github.com/StrayForest/old_sparky/actions/runs/40114878581), source `70915e23fef5b225b6e272c0aeb50e0d2d253aec`, used the exact `authenticated-page-load-v1` profile from baseline [run `40092960587`](https://github.com/StrayForest/old_sparky/actions/runs/40092960587), source e7. Both used 20,000 users across 40 tournaments, setup concurrency 20, client concurrency 64, zero spread, a 30-second timeout, no retries and the 1,800-second maximum duration.
+
+The candidate completed `20,000/20,000` HTTP requests with status 200 at `36.078` requests/s over `554.35` seconds. HTTP p95/p99 were `2.576/2.937` seconds; full logical p95/p99 were `526.516/549.414` seconds. Its logical SLO **failed** despite every HTTP request returning 200. The baseline duration was `628.28` seconds at `31.833` requests/s; this comparison does not change the failed acceptance result.
+
+Exact cleanup removed all 20,000 synthetic users and 40 tournaments, preserved the control sentinel, and passed namespace/origin-boundary checks. The run earns no passing SLO credit.
 
 The pre-separation v1 contracts and retired saturation sweeps remain under
 [`profiles/retained-v1/`](profiles/retained-v1/README.md) solely as historical

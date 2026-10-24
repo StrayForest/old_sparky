@@ -2,7 +2,7 @@
 
 - Status: Active
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-24
+- Last reviewed: 2026-10-25
 
 Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current production state and next engineering priority. Open deeper documents only when the task requires them.
 
@@ -22,7 +22,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | UI system and responsive rules | [Visual theme](platform-visual-theme.md) |
 | Admin console structure and metric definitions | [Admin console IA](admin-console-information-architecture.md) |
 | Normal release or rollback | [Deployment runbook](deployment-runbook.md) |
-| API/worker-only service recovery | [Service recovery runbook](service-recovery-runbook.md) |
+| Production web/API/worker service recovery | [Service recovery runbook](service-recovery-runbook.md) |
 | Space-bounded production release bootstrap | [Release bootstrap subset extraction ADR](adr/release-bootstrap-subset-extraction.md) |
 | Release transaction and recovery | [Release state machine](release-state-machine.md) |
 | Candidate-bound forward migration safety | [Candidate forward migration guard ADR](adr/candidate-forward-migration-guard.md) |

@@ -56,6 +56,41 @@ CPU_WINDOW_TOLERANCE_NS = 500_000_000
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_RE = re.compile(r"^[0-9a-f]{32}$")
 ATTEMPT_RE = re.compile(r"^[1-9][0-9]{0,8}$")
+PARENT_FAILURE_STAGES = frozenset({
+    "identity", "manifest_read", "binding", "remote_plan_prepare",
+    "worker_supervision", "plan_cleanup", "report_write",
+})
+PARENT_ERROR_CLASSES = frozenset({
+    "OSError", "ValueError", "KeyError", "TypeError", "RuntimeError",
+    "PlanError", "UntrustedHelper", "unexpected",
+})
+PLAN_PREPARE_STATUSES = frozenset({
+    "not_attempted", "prepared", "refused", "transport_failed", "bad_protocol",
+})
+PLAN_CLEANUP_STATUSES = frozenset({
+    "not_attempted", "pending", "complete", "refused", "transport_failed",
+    "bad_protocol", "failed",
+})
+PLAN_REFUSAL_CLASSES = frozenset({
+    "PlanError", "OSError", "ValueError", "KeyError", "UntrustedHelper", "unexpected", "none",
+})
+SSH_TRANSPORT_STAGES = frozenset({
+    "not_started", "spawn_failed", "input", "read", "timeout", "output_limit",
+    "wait", "protocol", "complete", "transport_failed",
+})
+SSH_CHILD_STATES = frozenset({"not_started", "running", "reaped", "unknown"})
+SSH_STDOUT_SHAPES = frozenset({
+    "none", "single_line", "prepared_marker", "refusal_marker", "summary_marker", "malformed",
+})
+
+
+class _RemoteCapacityPlanError(ValueError):
+    """Closed remote-plan failure retaining only the helper's lifecycle frame."""
+
+    def __init__(self, lifecycle: Mapping[str, Any], error_class: str) -> None:
+        super().__init__("capacity plan preparation failed")
+        self.lifecycle = dict(lifecycle)
+        self.error_class = error_class if error_class in PARENT_ERROR_CLASSES else "unexpected"
 
 
 class _RemoteMemoryWatcher:
@@ -1191,7 +1226,7 @@ def _restore_parent_ssh_material(
 
 def _prepare_remote_capacity_plan(
     *, host: str, user: str, config: Path, key: Path, run_id: str,
-    source_sha: str, now_ms: int,
+    source_sha: str, now_ms: int, lifecycle: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         from tools import platform_cpu_diagnostic_pair as cpu_pair
@@ -1204,38 +1239,172 @@ def _prepare_remote_capacity_plan(
         "off_start_ms": off_start, "off_end_ms": off_start + 20_000,
         "on_start_ms": off_start + 25_000, "on_end_ms": off_start + 45_000,
     }
-    lifecycle: dict[str, Any] = {
+    lifecycle = lifecycle if lifecycle is not None else {}
+    lifecycle.update({
         "closed": True, "mux_off_enforced": False,
         "last_command_returned": False,
-    }
-    prepared, release_slug, summary = cpu_pair._ssh_plan(
-        argparse.Namespace(), host, user, config, key, plan, lifecycle,
-    )
+    })
+    try:
+        prepared, release_slug, summary = cpu_pair._ssh_plan(
+            argparse.Namespace(), host, user, config, key, plan, lifecycle,
+        )
+    except Exception as exc:
+        error_class = type(exc).__name__
+        raise _RemoteCapacityPlanError(lifecycle, error_class) from None
     if (not prepared or not isinstance(release_slug, str)
             or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", release_slug) is None
             or summary is not None):
-        raise ValueError("capacity plan preparation failed")
+        refusal = lifecycle.get("plan_prepare_refusal_class")
+        error_class = refusal if refusal in PARENT_ERROR_CLASSES else "ValueError"
+        raise _RemoteCapacityPlanError(lifecycle, error_class) from None
     plan["release_slug"] = release_slug
     return plan, lifecycle
 
 
 def _cleanup_remote_capacity_plan(
     *, host: str, user: str, config: Path, key: Path, run_id: str,
+    lifecycle: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, Any] | None]:
     try:
         from tools import platform_cpu_diagnostic_pair as cpu_pair
     except ModuleNotFoundError:  # direct execution from platform/tools
         import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
-    lifecycle: dict[str, Any] = {
+    lifecycle = lifecycle if lifecycle is not None else {}
+    lifecycle.update({
         "closed": True, "mux_off_enforced": False,
         "last_command_returned": False,
-    }
+    })
     payload = {"schema": 1, "operation": "cleanup", "run_id": run_id}
     result, _release_slug, summary = cpu_pair._ssh_plan(
         argparse.Namespace(), host, user, config, key, payload, lifecycle,
         allow_noop_cleanup=True,
     )
     return bool(result and isinstance(summary, dict)), summary if isinstance(summary, dict) else None
+
+
+def _project_parent_ssh_transport(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        value = {}
+    stage = value.get("stage")
+    shape = value.get("stdout_shape")
+    child_state = value.get("child_state")
+    code = value.get("return_code")
+    return {
+        "stage": stage if isinstance(stage, str) and stage in SSH_TRANSPORT_STAGES else "transport_failed",
+        "stdout_shape": shape if isinstance(shape, str) and shape in SSH_STDOUT_SHAPES else "malformed",
+        "child_state": child_state if isinstance(child_state, str) and child_state in SSH_CHILD_STATES else "unknown",
+        "return_code": code if type(code) is int and -255 <= code <= 255 else None,
+    }
+
+
+def _prepare_transport_is_closed(lifecycle: Mapping[str, Any]) -> bool:
+    transport = lifecycle.get("prepare_transport")
+    return (
+        lifecycle.get("closed") is True
+        and isinstance(transport, Mapping)
+        and transport.get("child_state") in {"reaped", "not_started"}
+    )
+
+
+def _parent_failure_receipt(
+    *, error_class: str, stage: str, source_sha: str, app_target_sha: str,
+    external_run_id: str, external_run_attempt: str, run_id: str,
+    profile_digest_value: str, manifest_sha256: str | None, manifest_bytes: int | None,
+    concurrency: int, prepare_lifecycle: Mapping[str, Any],
+    cleanup_lifecycle: Mapping[str, Any], cleanup_ok: bool,
+) -> dict[str, Any]:
+    prepare_status = prepare_lifecycle.get("plan_prepare_status")
+    refusal_class = prepare_lifecycle.get("plan_prepare_refusal_class")
+    cleanup_status = cleanup_lifecycle.get("plan_cleanup_status")
+    cleanup_refusal = cleanup_lifecycle.get("plan_cleanup_refusal_class")
+    return {
+        "schema": 1, "report_complete": True, "failure_only": True,
+        "status": "incomplete", "passed": False,
+        "matrix_credit": False, "slo_credit": False, "diagnostic_credit": False,
+        "source_sha": source_sha, "app_target_sha": app_target_sha,
+        "external_run_id": external_run_id, "external_run_attempt": external_run_attempt,
+        "run_id": run_id, "profile_digest": profile_digest_value,
+        "fixture_manifest_sha256": manifest_sha256,
+        "fixture_manifest_bytes": manifest_bytes,
+        "concurrency": concurrency, "namespace_closed": False,
+        "stage": stage if stage in PARENT_FAILURE_STAGES else "remote_plan_prepare",
+        "error_class": error_class if error_class in PARENT_ERROR_CLASSES else "unexpected",
+        "plan_prepare_status": prepare_status if isinstance(prepare_status, str) and prepare_status in PLAN_PREPARE_STATUSES else "not_attempted",
+        "plan_prepare_refusal_class": refusal_class if isinstance(refusal_class, str) and refusal_class in PLAN_REFUSAL_CLASSES else "none",
+        "ssh_prepare_transport": _project_parent_ssh_transport(prepare_lifecycle.get("prepare_transport")),
+        "plan_cleanup_status": cleanup_status if isinstance(cleanup_status, str) and cleanup_status in PLAN_CLEANUP_STATUSES else "not_attempted",
+        "plan_cleanup_refusal_class": cleanup_refusal if isinstance(cleanup_refusal, str) and cleanup_refusal in PLAN_REFUSAL_CLASSES else "none",
+        "ssh_cleanup_transport": _project_parent_ssh_transport(cleanup_lifecycle.get("cleanup_transport")),
+        "remote_plan_cleanup": (
+            "complete" if cleanup_ok
+            else "not_attempted"
+            if (cleanup_lifecycle.get("plan_cleanup_status") == "not_attempted"
+                and prepare_status == "not_attempted")
+            else "failed"
+        ),
+    }
+
+
+def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
+    fields = {
+        "schema", "report_complete", "failure_only", "status", "passed",
+        "matrix_credit", "slo_credit", "diagnostic_credit", "source_sha",
+        "app_target_sha", "external_run_id", "external_run_attempt", "run_id",
+        "profile_digest", "fixture_manifest_sha256", "fixture_manifest_bytes",
+        "concurrency", "namespace_closed", "stage", "error_class",
+        "plan_prepare_status", "plan_prepare_refusal_class", "ssh_prepare_transport",
+        "plan_cleanup_status", "plan_cleanup_refusal_class", "ssh_cleanup_transport",
+        "remote_plan_cleanup",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        return None
+    if (
+        type(value.get("schema")) is not int or value["schema"] != 1
+        or value.get("report_complete") is not True or value.get("failure_only") is not True
+        or value.get("status") != "incomplete" or value.get("passed") is not False
+        or any(value.get(key) is not False for key in ("matrix_credit", "slo_credit", "diagnostic_credit"))
+        or not isinstance(value.get("source_sha"), str) or SHA_RE.fullmatch(value["source_sha"]) is None
+        or not isinstance(value.get("app_target_sha"), str) or SHA_RE.fullmatch(value["app_target_sha"]) is None
+        or not isinstance(value.get("external_run_id"), str) or not value["external_run_id"].isdecimal()
+        or not isinstance(value.get("external_run_attempt"), str) or ATTEMPT_RE.fullmatch(value["external_run_attempt"]) is None
+        or not isinstance(value.get("run_id"), str) or RUN_RE.fullmatch(value["run_id"]) is None
+        or not isinstance(value.get("profile_digest"), str) or re.fullmatch(r"[0-9a-f]{64}", value["profile_digest"]) is None
+        or type(value.get("concurrency")) is not int or value["concurrency"] not in CONCURRENCY_PRESETS
+        or value.get("namespace_closed") is not False
+        or not isinstance(value.get("stage"), str) or value["stage"] not in PARENT_FAILURE_STAGES
+        or not isinstance(value.get("error_class"), str) or value["error_class"] not in PARENT_ERROR_CLASSES
+        or not isinstance(value.get("plan_prepare_status"), str) or value["plan_prepare_status"] not in PLAN_PREPARE_STATUSES
+        or not isinstance(value.get("plan_prepare_refusal_class"), str) or value["plan_prepare_refusal_class"] not in PLAN_REFUSAL_CLASSES
+        or not isinstance(value.get("plan_cleanup_status"), str) or value["plan_cleanup_status"] not in PLAN_CLEANUP_STATUSES
+        or not isinstance(value.get("plan_cleanup_refusal_class"), str) or value["plan_cleanup_refusal_class"] not in PLAN_REFUSAL_CLASSES
+        or not isinstance(value.get("remote_plan_cleanup"), str) or value["remote_plan_cleanup"] not in {"not_attempted", "complete", "failed"}
+    ):
+        return None
+    manifest_sha = value.get("fixture_manifest_sha256")
+    manifest_bytes = value.get("fixture_manifest_bytes")
+    manifest_missing = manifest_sha is None and manifest_bytes is None
+    manifest_bound = (
+        isinstance(manifest_sha, str)
+        and re.fullmatch(r"[0-9a-f]{64}", manifest_sha) is not None
+        and type(manifest_bytes) is int and 0 < manifest_bytes <= 256 * 1024
+    )
+    if not manifest_bound and not (
+        manifest_missing and value["stage"] in {"identity", "manifest_read"}
+    ):
+        return None
+    for key in ("ssh_prepare_transport", "ssh_cleanup_transport"):
+        transport = value.get(key)
+        if (not isinstance(transport, dict)
+                or set(transport) != {"stage", "stdout_shape", "child_state", "return_code"}
+                or not isinstance(transport.get("stage"), str) or transport["stage"] not in SSH_TRANSPORT_STAGES
+                or not isinstance(transport.get("stdout_shape"), str) or transport["stdout_shape"] not in SSH_STDOUT_SHAPES
+                or not isinstance(transport.get("child_state"), str) or transport["child_state"] not in SSH_CHILD_STATES
+                or (transport.get("return_code") is not None
+                    and (type(transport["return_code"]) is not int or not -255 <= transport["return_code"] <= 255))):
+            return None
+    if value["profile_digest"] != profile_digest(value["concurrency"]):
+        return None
+    return value
 
 
 def _project_server_telemetry(summary: Any) -> dict[str, Any]:
@@ -1345,7 +1514,21 @@ def _write_report(path: Path, payload: Mapping[str, Any]) -> None:
         os.close(fd)
 
 
-def _parent_run(args: argparse.Namespace) -> dict[str, Any]:
+def _parent_run(
+    args: argparse.Namespace, stage_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state = stage_state if stage_state is not None else {}
+    state.update({
+        "stage": "identity", "prepare_lifecycle": {},
+        "cleanup_lifecycle": {}, "cleanup_ok": False,
+        "source_sha": args.source_sha, "app_target_sha": args.app_target_sha,
+        "external_run_id": args.external_run_id,
+        "external_run_attempt": args.external_run_attempt,
+        "concurrency": args.concurrency,
+    })
+    if type(args.concurrency) is int and args.concurrency in CONCURRENCY_PRESETS:
+        state["run_id"] = os.urandom(16).hex()
+        state["profile_digest"] = profile_digest(args.concurrency)
     if (SHA_RE.fullmatch(args.source_sha) is None or SHA_RE.fullmatch(args.app_target_sha) is None
             or not args.external_run_id.isdecimal() or ATTEMPT_RE.fullmatch(args.external_run_attempt) is None
             or type(args.concurrency) is not int or args.concurrency not in CONCURRENCY_PRESETS):
@@ -1356,27 +1539,78 @@ def _parent_run(args: argparse.Namespace) -> dict[str, Any]:
     if (ssh_dir.name != "external-ssh" or ssh_config.name != "config"
             or ssh_key.parent != ssh_dir or ssh_key.name != "id_ed25519"):
         raise ValueError("capacity parent SSH paths rejected")
+    run_id = state["run_id"]
+    digest = state["profile_digest"]
+    state["stage"] = "manifest_read"
     raw, manifest, actors = _read_manifest(Path(args.manifest))
     manifest_sha = hashlib.sha256(raw).hexdigest()
+    state.update({"manifest_sha256": manifest_sha, "manifest_bytes": len(raw)})
+    state["stage"] = "binding"
     if (manifest.get("runner_sha") != args.source_sha
             or manifest.get("app_target_sha") != args.app_target_sha
             or len(manifest.get("tournaments", [])) != FIXTURE_TOURNAMENTS
             or len(actors) != FIXTURE_USERS
             or any(item.get("user_count") != FIXTURE_USERS for item in manifest["tournaments"])):
         raise ValueError("capacity manifest source or fixture binding rejected")
-    run_id = os.urandom(16).hex()
-    digest = profile_digest(args.concurrency)
     binding = {
         "run_id": run_id, "source_sha": args.source_sha,
         "app_target_sha": args.app_target_sha, "profile_digest": digest,
         "external_run_id": args.external_run_id,
         "external_run_attempt": args.external_run_attempt,
     }
-    planned, lifecycle = _prepare_remote_capacity_plan(
-        host=args.ssh_host, user=args.ssh_user, config=ssh_config, key=ssh_key,
-        run_id=run_id, source_sha=args.app_target_sha,
-        now_ms=time.time_ns() // 1_000_000,
-    )
+    lifecycle: dict[str, Any] = {}
+    state["stage"] = "remote_plan_prepare"
+    state["prepare_lifecycle"] = lifecycle
+    try:
+        planned, lifecycle = _prepare_remote_capacity_plan(
+            host=args.ssh_host, user=args.ssh_user, config=ssh_config, key=ssh_key,
+            run_id=run_id, source_sha=args.app_target_sha,
+            now_ms=time.time_ns() // 1_000_000, lifecycle=lifecycle,
+        )
+    except _RemoteCapacityPlanError as exc:
+        cleanup_lifecycle: dict[str, Any] = {}
+        state["prepare_lifecycle"] = exc.lifecycle
+        if _prepare_transport_is_closed(exc.lifecycle):
+            try:
+                state["stage"] = "plan_cleanup"
+                cleanup_ok, _ = _cleanup_remote_capacity_plan(
+                    host=args.ssh_host, user=args.ssh_user,
+                    config=ssh_config, key=ssh_key, run_id=run_id,
+                    lifecycle=cleanup_lifecycle,
+                )
+            except Exception:
+                cleanup_ok = False
+                cleanup_lifecycle.update({
+                    "plan_cleanup_status": "transport_failed",
+                    "plan_cleanup_refusal_class": "none",
+                    "cleanup_transport": {
+                        "stage": "transport_failed", "return_code": None,
+                        "stdout_shape": "none", "child_state": "unknown",
+                    },
+                })
+            state["stage"] = "remote_plan_prepare"
+        else:
+            cleanup_ok = False
+            cleanup_lifecycle.update({
+                "plan_cleanup_status": "not_attempted",
+                "plan_cleanup_refusal_class": "none",
+                "cleanup_transport": {
+                    "stage": "not_started", "return_code": None,
+                    "stdout_shape": "none", "child_state": "unknown",
+                },
+            })
+        state["cleanup_lifecycle"] = cleanup_lifecycle
+        state["cleanup_ok"] = cleanup_ok
+        return _parent_failure_receipt(
+            error_class=exc.error_class, stage="remote_plan_prepare",
+            source_sha=args.source_sha, app_target_sha=args.app_target_sha,
+            external_run_id=args.external_run_id,
+            external_run_attempt=args.external_run_attempt, run_id=run_id,
+            profile_digest_value=digest, manifest_sha256=manifest_sha,
+            manifest_bytes=len(raw), concurrency=args.concurrency,
+            prepare_lifecycle=exc.lifecycle,
+            cleanup_lifecycle=cleanup_lifecycle, cleanup_ok=cleanup_ok,
+        )
     control_path: Path | None = None
     ssh_contents: dict[str, bytearray] = {}
     ssh_lifecycle: dict[str, int] = {}
@@ -1384,6 +1618,7 @@ def _parent_run(args: argparse.Namespace) -> dict[str, Any]:
     outcome: dict[str, Any] | None = None
     cleanup_ok = False
     telemetry_summary: dict[str, Any] | None = None
+    state["stage"] = "worker_supervision"
     with tempfile.TemporaryDirectory(prefix="ssr-capacity-", dir=report_path.parent) as private_dir:
         private = Path(private_dir)
         os.chmod(private, 0o700)
@@ -1439,10 +1674,16 @@ def _parent_run(args: argparse.Namespace) -> dict[str, Any]:
                     restore_material()
                 except Exception:
                     watcher.fail_closed()
+            cleanup_lifecycle: dict[str, Any] = {}
+            state["stage"] = "plan_cleanup"
+            state["cleanup_lifecycle"] = cleanup_lifecycle
             cleanup_ok, telemetry_summary = _cleanup_remote_capacity_plan(
                 host=args.ssh_host, user=args.ssh_user,
                 config=ssh_config, key=ssh_key, run_id=run_id,
+                lifecycle=cleanup_lifecycle,
             )
+            state["cleanup_ok"] = cleanup_ok
+            state["stage"] = "worker_supervision"
     if isinstance(outcome, dict):
         server_telemetry = _project_server_telemetry(telemetry_summary)
         outcome["server_telemetry"] = server_telemetry
@@ -1772,6 +2013,8 @@ def evaluate_capacity_report(
     value: Any, *, source_sha: str, app_target_sha: str, run_id: str,
     attempt: str, manifest_sha256: str,
 ) -> str:
+    if _project_parent_failure_receipt(value) is not None:
+        return "INVALID"
     report = _project_capacity_report(value)
     if report is None or any((
         report.get("source_sha") != source_sha,
@@ -1898,6 +2141,28 @@ def sanitize_capacity_report(
         value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"),
     ).encode("ascii") + b"\n" != bytes(raw):
         raise ValueError("capacity report is not canonical")
+    failure_receipt = _project_parent_failure_receipt(value)
+    if failure_receipt is not None:
+        if any((
+            failure_receipt.get("source_sha") != source_sha,
+            failure_receipt.get("app_target_sha") != app_target_sha,
+            failure_receipt.get("external_run_id") != run_id,
+            failure_receipt.get("external_run_attempt") != attempt,
+            manifest.get("runner_sha") != source_sha,
+            manifest.get("app_target_sha") != app_target_sha,
+        )):
+            raise ValueError("capacity failure receipt binding rejected")
+        actual_manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+        if failure_receipt["fixture_manifest_sha256"] is None:
+            failure_receipt = {
+                **failure_receipt,
+                "fixture_manifest_sha256": actual_manifest_sha,
+                "fixture_manifest_bytes": len(manifest_raw),
+            }
+        elif failure_receipt["fixture_manifest_sha256"] != actual_manifest_sha:
+            raise ValueError("capacity failure receipt manifest binding rejected")
+        _write_report(output_path, failure_receipt)
+        return "INVALID"
     projected = _project_capacity_report(value)
     if (projected is None or projected.get("source_sha") != source_sha
             or projected.get("app_target_sha") != app_target_sha
@@ -1956,11 +2221,95 @@ def main(argv: list[str] | None = None) -> int:
             or re.fullmatch(r"[A-Za-z0-9.-]{1,253}", args.ssh_host) is None
             or re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", args.ssh_user) is None):
         parser.error("parent command arguments are incomplete")
+    stage_state: dict[str, Any] = {}
     try:
-        outcome = _parent_run(args)
+        outcome = _parent_run(args, stage_state)
+        stage_state["stage"] = "report_write"
         _write_report(Path(args.report), outcome)
     except Exception as exc:
-        print(json.dumps({"status": "incomplete", "error_class": type(exc).__name__}, sort_keys=True))
+        stage = stage_state.get("stage", "identity")
+        if not isinstance(stage, str) or stage not in PARENT_FAILURE_STAGES:
+            stage = "identity"
+        error_name = type(exc).__name__
+        error_class = error_name if error_name in PARENT_ERROR_CLASSES else "unexpected"
+        prepare_lifecycle = stage_state.get("prepare_lifecycle")
+        if not isinstance(prepare_lifecycle, dict):
+            prepare_lifecycle = {}
+        cleanup_lifecycle = stage_state.get("cleanup_lifecycle")
+        if not isinstance(cleanup_lifecycle, dict):
+            cleanup_lifecycle = {}
+        cleanup_ok = stage_state.get("cleanup_ok") is True
+        run_id = stage_state.get("run_id")
+        if (
+            isinstance(run_id, str) and RUN_RE.fullmatch(run_id) is not None
+            and prepare_lifecycle.get("plan_prepare_status") == "prepared"
+            and cleanup_lifecycle.get("plan_cleanup_status") in {None, "not_attempted"}
+            and _prepare_transport_is_closed(prepare_lifecycle)
+        ):
+            try:
+                cleanup_lifecycle = {}
+                cleanup_ok, _ = _cleanup_remote_capacity_plan(
+                    host=args.ssh_host, user=args.ssh_user,
+                    config=Path(args.ssh_config), key=Path(args.ssh_key),
+                    run_id=run_id, lifecycle=cleanup_lifecycle,
+                )
+            except Exception:
+                cleanup_ok = False
+                cleanup_lifecycle = {
+                    "plan_cleanup_status": "transport_failed",
+                    "plan_cleanup_refusal_class": "none",
+                    "cleanup_transport": {
+                        "stage": "transport_failed", "return_code": None,
+                        "stdout_shape": "none", "child_state": "unknown",
+                    },
+                }
+        if not cleanup_lifecycle:
+            cleanup_lifecycle = {
+                "plan_cleanup_status": "not_attempted",
+                "plan_cleanup_refusal_class": "none",
+                "cleanup_transport": {
+                    "stage": "not_started", "return_code": None,
+                    "stdout_shape": "none", "child_state": "unknown",
+                },
+            }
+        identity = (
+            isinstance(stage_state.get("source_sha", args.source_sha), str)
+            and SHA_RE.fullmatch(stage_state.get("source_sha", args.source_sha)) is not None
+            and isinstance(stage_state.get("app_target_sha", args.app_target_sha), str)
+            and SHA_RE.fullmatch(stage_state.get("app_target_sha", args.app_target_sha)) is not None
+            and isinstance(stage_state.get("external_run_id", args.external_run_id), str)
+            and str(stage_state.get("external_run_id", args.external_run_id)).isdecimal()
+            and isinstance(stage_state.get("external_run_attempt", args.external_run_attempt), str)
+            and ATTEMPT_RE.fullmatch(str(stage_state.get("external_run_attempt", args.external_run_attempt))) is not None
+            and isinstance(run_id, str) and RUN_RE.fullmatch(run_id) is not None
+            and isinstance(stage_state.get("profile_digest"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", stage_state["profile_digest"]) is not None
+            and type(stage_state.get("concurrency", args.concurrency)) is int
+            and stage_state.get("concurrency", args.concurrency) in CONCURRENCY_PRESETS
+        )
+        if identity:
+            receipt = _parent_failure_receipt(
+                error_class=error_class, stage=stage,
+                source_sha=stage_state.get("source_sha", args.source_sha),
+                app_target_sha=stage_state.get("app_target_sha", args.app_target_sha),
+                external_run_id=stage_state.get("external_run_id", args.external_run_id),
+                external_run_attempt=stage_state.get("external_run_attempt", args.external_run_attempt),
+                run_id=run_id,
+                profile_digest_value=stage_state["profile_digest"],
+                manifest_sha256=stage_state.get("manifest_sha256"),
+                manifest_bytes=stage_state.get("manifest_bytes"),
+                concurrency=stage_state.get("concurrency", args.concurrency),
+                prepare_lifecycle=prepare_lifecycle,
+                cleanup_lifecycle=cleanup_lifecycle, cleanup_ok=cleanup_ok,
+            )
+            try:
+                if not os.path.lexists(args.report):
+                    _write_report(Path(args.report), receipt)
+            except Exception:
+                pass
+        print(json.dumps({
+            "status": "incomplete", "error_class": error_class, "stage": stage,
+        }, sort_keys=True))
         return 2
     return 0 if outcome.get("passed") is True else 2
 

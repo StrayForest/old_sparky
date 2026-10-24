@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-24
+- Last reviewed: 2026-10-25
 
 ## Ephemeral synthetic restore diagnostic
 
@@ -238,12 +238,12 @@ does not dispatch it. Use this order:
 2. While that Security attempt is active and the shared slot is unowned, dispatch
    one `operation=create` with the same ID/attempt/SHA. Require
    `security_started <= backup.created_at <= backup.run_started_at <= backup_job.started_at < security_last_job_completed`.
-   Confirm both workflow and production job actually start before the bound; a late queued run cannot qualify. Once started, the workflow waits for Security success before staging or SSH.
+   Confirm both workflow and production job actually start before the bound; a late queued run cannot qualify. Once started, the workflow waits for Security success before staging or SSH. The proof counts every matching backup run ID, including failed and cancelled runs, so use only one backup ID per exact Security run/attempt/SHA.
 3. Wait for exact Security success and the restore-verified backup receipt.
    Auto-deploy starts after Security completes; it only polls the dispatched backup
    and dispatches production after both exact proofs pass.
 
-Do not wait for Security completion or substitute another run, attempt, SHA or timestamp. If missed, confirm the original SHA is still current `dev`, rerun all jobs of its Security run (not failed jobs only), record the new attempt and reserve the backup while it runs. If `dev` moved, stop and replan from current `dev` and its own Security run. See the [deployment runbook](deployment-runbook.md#preconditions); never deploy manually.
+Do not wait for Security completion or substitute another run, attempt, SHA or timestamp. If missed, confirm the original SHA is still current `dev`, rerun all jobs of its Security run (not failed jobs only), record the new attempt and reserve exactly one backup run ID while it runs. The verifier counts matching IDs regardless of conclusion; multiple IDs are permanently ambiguous even when all but one failed or were cancelled. Recover an ambiguous attempt only with a new all-jobs Security attempt and one fresh backup producer. Rerunning the same backup ID remains structurally unique, but still needs documented authority and the original timing; it cannot backfill a completed Security attempt. If `dev` moved, stop and replan from current `dev` and its own Security run. See the [deployment runbook](deployment-runbook.md#preconditions); never deploy manually.
 
 Run the workflow through GitHub Actions, not a production shell. It waits up to
 30 minutes for Security within its 120-minute deadline; attestation is capped at

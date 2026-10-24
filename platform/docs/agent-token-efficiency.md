@@ -2,7 +2,7 @@
 
 - Status: Active working reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-23
+- Last reviewed: 2026-10-25
 
 Use this protocol to reduce repeated context and tool output while preserving
 required evidence, review, safety checks and release gates.
@@ -56,6 +56,23 @@ required evidence, review, safety checks and release gates.
 - The existing maintenance retention owns old canonical source artifacts.
   Review its exact plan and preserve current/previous releases and all active
   work; do not add a second cleanup timer or broad temporary-file sweep.
+- For production Python probes, use the approved wrapper or the exact approved
+  interpreter with bytecode disabled (`-B` or `PYTHONDONTWRITEBYTECODE=1`).
+  Never run a naked venv CLI against an immutable payload, and do not parallelize
+  checks on one payload if any may write bytecode or caches.
+- On a production-sharing checkout, an exact known own-site receipt or report
+  may be inspected locally with a bounded read under its existing ownership and
+  permissions. Check that evidence before proposing a new capture workflow;
+  keep raw private output private. This read-only evidence path does not grant
+  permission to mutate production: release, cleanup and deployment still use
+  their documented workflows and locks.
+- If a worktree-local test environment is missing, do not create another copy
+  on a production-sharing filesystem. A focused hermetic test may use an
+  existing approved environment only when its dependencies are already
+  compatible; invoke its exact interpreter with bytecode disabled and do not
+  install into or alter that environment. This supplements but never replaces
+  required hash-locked CI gates; otherwise report `LOCAL GATE BLOCKED` and let
+  CI run the required gate.
 
 ### Retained private operator inputs
 
@@ -66,6 +83,8 @@ required evidence, review, safety checks and release gates.
   the primary checkout through Git's common directory.
 - If the requested value is present, use it without asking again. Read values
   without printing them; never copy them into Git, logs, artifacts or reports.
+- In documents and handoffs, keep only the private-file pointer; never include
+  the operator input value.
 
 - Keep one short active state in the task handoff: verified facts, source SHA,
   relevant run IDs, owners, blocker (if any) and the single next action. Link
@@ -83,6 +102,10 @@ required evidence, review, safety checks and release gates.
   short backoff before retrying; never run a rapid retry loop. Retry the
   requested model when it recovers; do not switch this task to another model
   or provider unless the user changes that constraint.
+- Treat a failed default environment or workflow attempt as a checkpoint, not
+  a reason to repeat a completed gate or create duplicate repositories or
+  environments. Check for an existing permitted reuse route and continue from
+  the failed stage.
 - Assign one owner/poller to each CI run, production operation and live QA.
   Other agents can review saved evidence; they do not independently poll the
   same run or repeat the same production check.

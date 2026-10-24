@@ -392,6 +392,236 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             None, local_window_end_monotonic=20.0, now_monotonic=19.0,
         ))
 
+    def test_ssr_parent_plan_refusal_preserves_closed_failure_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            os.chmod(root, 0o700)
+            ssh_dir = root / "external-ssh"
+            ssh_dir.mkdir(mode=0o700)
+            manifest_path = root / "manifest.json"
+            report_path = root / "report.json"
+            manifest_raw = b"fixture manifest\n"
+            manifest = {
+                "runner_sha": "a" * 40,
+                "app_target_sha": "b" * 40,
+                "tournaments": [{"user_count": 14}],
+            }
+            actors = [object() for _ in range(14)]
+
+            def fake_ssh_plan(_args, _host, _user, _config, _key, payload, lifecycle, **_kwargs):
+                if payload["operation"] == "prepare":
+                    lifecycle.update({
+                        "plan_prepare_status": "refused",
+                        "plan_prepare_refusal_class": "ValueError",
+                        "prepare_transport": {
+                            "stage": "complete", "return_code": 2,
+                            "stdout_shape": "refusal_marker", "child_state": "reaped",
+                        },
+                    })
+                    return False, None, None
+                lifecycle.update({
+                    "plan_cleanup_status": "complete",
+                    "plan_cleanup_refusal_class": "none",
+                    "cleanup_transport": {
+                        "stage": "complete", "return_code": 0,
+                        "stdout_shape": "summary_marker", "child_state": "reaped",
+                    },
+                })
+                return True, None, {"service_count": 0}
+
+            args = Namespace(
+                source_sha="a" * 40, app_target_sha="b" * 40,
+                external_run_id="12345", external_run_attempt="1",
+                concurrency=8, report=str(report_path),
+                ssh_config=str(ssh_dir / "config"), ssh_key=str(ssh_dir / "id_ed25519"),
+                manifest=str(manifest_path), ssh_host="example.test", ssh_user="deploy",
+            )
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(cpu_pair, "_ssh_plan", side_effect=fake_ssh_plan) as ssh_plan,
+            ):
+                receipt = capacity_diagnostic._parent_run(args)
+                self.assertEqual(ssh_plan.call_count, 2)
+
+            self.assertIsNotNone(capacity_diagnostic._project_parent_failure_receipt(receipt))
+            self.assertEqual(receipt["status"], "incomplete")
+            self.assertEqual(receipt["stage"], "remote_plan_prepare")
+            self.assertEqual(receipt["error_class"], "ValueError")
+            self.assertEqual(receipt["plan_prepare_status"], "refused")
+            self.assertEqual(receipt["plan_prepare_refusal_class"], "ValueError")
+            self.assertEqual(receipt["ssh_prepare_transport"], {
+                "stage": "complete", "return_code": 2,
+                "stdout_shape": "refusal_marker", "child_state": "reaped",
+            })
+            self.assertEqual(receipt["plan_cleanup_status"], "complete")
+            self.assertEqual(receipt["remote_plan_cleanup"], "complete")
+            self.assertFalse(receipt["namespace_closed"])
+            self.assertFalse(receipt["passed"])
+            self.assertFalse(receipt["diagnostic_credit"])
+            self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+                receipt, source_sha="a" * 40, app_target_sha="b" * 40,
+                run_id="12345", attempt="1",
+                manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+            ), "INVALID")
+            bad_profile_binding = {**receipt, "profile_digest": "0" * 64}
+            self.assertIsNone(capacity_diagnostic._project_parent_failure_receipt(
+                bad_profile_binding
+            ))
+            serialized = json.dumps(receipt, sort_keys=True)
+            self.assertNotIn("example.test", serialized)
+            self.assertNotIn(str(root), serialized)
+            self.assertNotIn("argv", serialized)
+
+            input_path = root / "input.json"
+            output_path = root / "sanitized.json"
+            capacity_diagnostic._write_report(input_path, receipt)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                self.assertEqual(capacity_diagnostic.sanitize_capacity_report(
+                    input_path=input_path, output_path=output_path,
+                    manifest_path=manifest_path, source_sha="a" * 40,
+                    app_target_sha="b" * 40, run_id="12345", attempt="1",
+                ), "INVALID")
+            public = json.loads(output_path.read_text(encoding="ascii"))
+            self.assertEqual(public, receipt)
+            self.assertEqual(stat.S_IMODE(output_path.stat().st_mode), 0o600)
+
+            def fake_unknown_prepare(_args, _host, _user, _config, _key, payload, lifecycle, **_kwargs):
+                self.assertEqual(payload["operation"], "prepare")
+                lifecycle.update({
+                    "closed": False,
+                    "plan_prepare_status": "transport_failed",
+                    "plan_prepare_refusal_class": "none",
+                    "prepare_transport": {
+                        "stage": "timeout", "return_code": None,
+                        "stdout_shape": "none", "child_state": "unknown",
+                    },
+                })
+                return False, None, None
+
+            cli_output_path = root / "main-report.json"
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(cpu_pair, "_ssh_plan", side_effect=fake_unknown_prepare) as unknown_ssh,
+            ):
+                self.assertEqual(capacity_diagnostic.main([
+                    "parent", "--manifest", str(manifest_path),
+                    "--report", str(cli_output_path),
+                    "--source-sha", "a" * 40, "--app-target-sha", "b" * 40,
+                    "--external-run-id", "12345", "--external-run-attempt", "1",
+                    "--concurrency", "8", "--ssh-config", str(ssh_dir / "config"),
+                    "--ssh-key", str(ssh_dir / "id_ed25519"),
+                    "--ssh-host", "example.test", "--ssh-user", "deploy",
+                ]), 2)
+            unknown_ssh.assert_called_once()
+            unknown_receipt = json.loads(cli_output_path.read_text(encoding="ascii"))
+            self.assertEqual(stat.S_IMODE(cli_output_path.stat().st_mode), 0o600)
+            self.assertEqual(unknown_receipt["plan_cleanup_status"], "not_attempted")
+            self.assertEqual(unknown_receipt["remote_plan_cleanup"], "failed")
+            self.assertEqual(unknown_receipt["profile_digest"], capacity_diagnostic.profile_digest(8))
+            self.assertEqual(unknown_receipt["ssh_cleanup_transport"], {
+                "stage": "not_started", "return_code": None,
+                "stdout_shape": "none", "child_state": "unknown",
+            })
+            self.assertFalse(unknown_receipt["namespace_closed"])
+            self.assertEqual(unknown_receipt["stage"], "remote_plan_prepare")
+
+            early_report_path = root / "manifest-read-report.json"
+            early_stdout = io.StringIO()
+            with (
+                patch.object(
+                    capacity_diagnostic, "_read_manifest",
+                    side_effect=ValueError("private manifest parse detail"),
+                ),
+                redirect_stdout(early_stdout),
+            ):
+                self.assertEqual(capacity_diagnostic.main([
+                    "parent", "--manifest", str(manifest_path),
+                    "--report", str(early_report_path),
+                    "--source-sha", "a" * 40, "--app-target-sha", "b" * 40,
+                    "--external-run-id", "12345", "--external-run-attempt", "1",
+                    "--concurrency", "8", "--ssh-config", str(ssh_dir / "config"),
+                    "--ssh-key", str(ssh_dir / "id_ed25519"),
+                    "--ssh-host", "example.test", "--ssh-user", "deploy",
+                ]), 2)
+            early_receipt = json.loads(early_report_path.read_text(encoding="ascii"))
+            self.assertEqual(early_receipt["stage"], "manifest_read")
+            self.assertEqual(early_receipt["error_class"], "ValueError")
+            self.assertIsNone(early_receipt["fixture_manifest_sha256"])
+            self.assertNotIn("private manifest parse detail", early_stdout.getvalue())
+            self.assertNotIn(str(root), early_report_path.read_text(encoding="ascii"))
+            sanitized_early = root / "manifest-read-sanitized.json"
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                self.assertEqual(capacity_diagnostic.sanitize_capacity_report(
+                    input_path=early_report_path, output_path=sanitized_early,
+                    manifest_path=manifest_path, source_sha="a" * 40,
+                    app_target_sha="b" * 40, run_id="12345", attempt="1",
+                ), "INVALID")
+            sanitized_receipt = json.loads(sanitized_early.read_text(encoding="ascii"))
+            self.assertEqual(
+                sanitized_receipt["fixture_manifest_sha256"],
+                hashlib.sha256(manifest_raw).hexdigest(),
+            )
+
+            worker_report_path = root / "worker-failure-report.json"
+            def fake_prepare_plan(*, lifecycle, **_kwargs):
+                lifecycle.update({
+                    "closed": True, "plan_prepare_status": "prepared",
+                    "plan_prepare_refusal_class": "none",
+                    "prepare_transport": {
+                        "stage": "complete", "return_code": 0,
+                        "stdout_shape": "prepared_marker", "child_state": "reaped",
+                    },
+                })
+                return ({
+                    "release_slug": "release-test", "off_start_ms": 100_000,
+                    "off_end_ms": 120_000, "on_start_ms": 125_000,
+                    "on_end_ms": 145_000,
+                }, lifecycle)
+
+            def fake_cleanup(_args, _host, _user, _config, _key, payload, lifecycle, **_kwargs):
+                self.assertEqual(payload["operation"], "cleanup")
+                lifecycle.update({
+                    "plan_cleanup_status": "complete",
+                    "plan_cleanup_refusal_class": "none",
+                    "cleanup_transport": {
+                        "stage": "complete", "return_code": 0,
+                        "stdout_shape": "summary_marker", "child_state": "reaped",
+                    },
+                })
+                return True, None, {"service_count": 0}
+
+            worker_stdout = io.StringIO()
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
+                patch.object(capacity_diagnostic, "run_isolated_capacity_worker", side_effect=RuntimeError("private worker detail")),
+                patch.object(cpu_pair, "_ssh_plan", side_effect=fake_cleanup),
+                redirect_stdout(worker_stdout),
+            ):
+                self.assertEqual(capacity_diagnostic.main([
+                    "parent", "--manifest", str(manifest_path),
+                    "--report", str(worker_report_path),
+                    "--source-sha", "a" * 40, "--app-target-sha", "b" * 40,
+                    "--external-run-id", "12345", "--external-run-attempt", "1",
+                    "--concurrency", "8", "--ssh-config", str(ssh_dir / "config"),
+                    "--ssh-key", str(ssh_dir / "id_ed25519"),
+                    "--ssh-host", "example.test", "--ssh-user", "deploy",
+                ]), 2)
+            worker_failure = json.loads(worker_report_path.read_text(encoding="ascii"))
+            self.assertEqual(worker_failure["stage"], "worker_supervision")
+            self.assertEqual(worker_failure["error_class"], "RuntimeError")
+            self.assertEqual(worker_failure["plan_cleanup_status"], "complete")
+            self.assertEqual(worker_failure["remote_plan_cleanup"], "complete")
+            self.assertFalse(worker_failure["namespace_closed"])
+            self.assertNotIn("private worker detail", worker_stdout.getvalue())
+            self.assertNotIn(str(root), worker_report_path.read_text(encoding="ascii"))
+
     def test_ssr_capacity_evaluator_requires_complete_bound_zero_credit_evidence(self) -> None:
         report = {
             "schema": 1, "report_complete": True,

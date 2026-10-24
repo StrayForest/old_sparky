@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -1099,6 +1100,26 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             self.assertIn(condition, gate)
         self.assertIn("status\") == \"completed\"", workflow)
         self.assertIn("conclusion\") == \"success\"", workflow)
+
+    def test_recovery_capability_evidence_consumers_match_canonical_closed_set(self) -> None:
+        consumers = (
+            REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+            REPO_ROOT / ".github/workflows/platform-production-release-recover.yml",
+        )
+        for path in consumers:
+            source = path.read_text(encoding="utf-8")
+            literals = re.findall(
+                r'payload\.get\("capabilities"\)\s*!=\s*(\[[^\n]+?\])',
+                source,
+            )
+            with self.subTest(workflow=path.name):
+                self.assertTrue(literals, "closed capability predicate is missing")
+                self.assertTrue(all(
+                    json.loads(literal) == recovery.RECOVERY_CAPABILITIES
+                    for literal in literals
+                ))
+                self.assertIn("set(payload) !=", source)
+                self.assertIn('payload.get("deployable") is not False', source)
 
     def test_manual_abort_validates_artifacts_before_secrets_and_uses_bundle_only(self) -> None:
         self._assert_runtime_child_private_capture_is_opt_in_bounded_and_runner_only()

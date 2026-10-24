@@ -681,6 +681,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                 "available_bytes": 1,
                 "required_bytes": 1 << 30,
             },
+            "scratch_cleanup_status": "confirmed",
         }
         receipt_path = (
             f"{evidence.MAINTENANCE_REPORT_DIRECTORY}/"
@@ -703,6 +704,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             )
         self.assertEqual(projected["status"], "failed")
         self.assertEqual(projected["invocation_id"], invocation_id)
+        self.assertEqual(projected["scratch_cleanup_status"], "confirmed")
         self.assertEqual(
             projected["backup_disk_diagnostic"]["phase"],
             "scratch_image_postallocation",
@@ -754,6 +756,11 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
                 "outside_time_window",
                 bindings,
                 {**payload, "failed_at_utc": (completed + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")},
+            ),
+            (
+                "invalid_scratch_cleanup_status",
+                bindings,
+                {**payload, "scratch_cleanup_status": "maybe"},
             ),
             ("extra_top_field", bindings, {**payload, "raw_exception": "secret"}),
             (
