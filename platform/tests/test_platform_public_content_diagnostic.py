@@ -43,12 +43,13 @@ class PlatformPublicContentDiagnosticTests(unittest.TestCase):
             "hero_metadata_pending": False,
             "abilities": abilities,
         }
+        partial_balance_section = {**hero_section, "abilities": abilities[:3]}
         details = {
             patch_id: {
                 "id": patch_id,
                 "title": title,
                 "content": "PRIVATE_SOURCE_BODY",
-                "sections": [{**hero_section, "abilities": abilities[:2]}]
+                "sections": [partial_balance_section, partial_balance_section]
                 if index == 2
                 else [hero_section],
             }
@@ -105,8 +106,8 @@ class PlatformPublicContentDiagnosticTests(unittest.TestCase):
         self.assertEqual(report["metadata"][0]["russian_abilities"], 4)
         self.assertEqual(report["metadata"][0]["ability_icons"], 4)
         self.assertEqual(report["metadata"][0]["complete_hero_sections"], 1)
-        self.assertEqual(report["metadata"][2]["hero_sections"], 1)
-        self.assertEqual(report["metadata"][2]["abilities"], 2)
+        self.assertEqual(report["metadata"][2]["hero_sections"], 2)
+        self.assertEqual(report["metadata"][2]["abilities"], 6)
         self.assertLessEqual(maximum_active, 4)
         self.assertEqual(calls.count("home"), 3)
         self.assertEqual(len(calls), 15)
@@ -172,6 +173,24 @@ class PlatformPublicContentDiagnosticTests(unittest.TestCase):
             )
         self.assertEqual(unstable["status"], "incomplete")
         self.assertFalse(unstable["metadata"][0]["metadata_stable"])
+
+        details[PATCH_IDS[1]]["sections"] = []
+        with (
+            patch.object(diagnostic, "_request_json", side_effect=fake_request),
+            patch.object(
+                diagnostic,
+                "_cache_coverage",
+                new=AsyncMock(return_value=(True, 4)),
+            ),
+        ):
+            missing_expected_hero = asyncio.run(
+                diagnostic.run_diagnostic(
+                    expected_home_patch_ids=PATCH_IDS,
+                    expected_hero_patch_ids=HERO_PATCH_IDS,
+                )
+            )
+        self.assertEqual(missing_expected_hero["status"], "incomplete")
+        self.assertEqual(missing_expected_hero["metadata"][1]["hero_sections"], 0)
 
         pass_report = {"schema": 1, "kind": "bounded_public_content_read_diagnostic", "status": "passed"}
         output = io.StringIO()

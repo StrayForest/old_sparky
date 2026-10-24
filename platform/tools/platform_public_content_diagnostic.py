@@ -377,16 +377,17 @@ async def run_diagnostic(
     ):
         raise RuntimeError("home_cache_headers_invalid")
 
-    hero_rows = [row for row in metadata if row["hero_sections"] > 0]
-    heroes_ready = all(_hero_metadata_ready(row) for row in hero_rows)
     if expected_hero_patch_ids is not None:
         expected_hero_rows = [row for row in metadata if row["id"] in expected_hero_patch_ids]
-        heroes_ready = heroes_ready and len(expected_hero_rows) == len(expected_hero_patch_ids) and all(
+        heroes_ready = len(expected_hero_rows) == len(expected_hero_patch_ids) and all(
             _hero_metadata_ready(row)
             and row["complete_hero_sections"] == 1
             and row["abilities"] == row["ability_icons"] == row["russian_abilities"] == 4
             for row in expected_hero_rows
         )
+    else:
+        hero_rows = [row for row in metadata if row["hero_sections"] > 0]
+        heroes_ready = all(_hero_metadata_ready(row) for row in hero_rows)
     all_patch_reads = [read for reads in patch_reads_by_id.values() for read in reads]
     return {
         "schema": 1,
