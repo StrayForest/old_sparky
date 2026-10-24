@@ -10191,7 +10191,6 @@ raise SystemExit(status)
     def _assert_scratch_image_disk_phases_report_private_disk_phase(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             parent = pathlib.Path(temporary_dir) / "scratch-images"
-            parent_parent = parent.parent
             total_bytes = 10 * 1024**3
             free_bytes = 100
             snapshot = types.SimpleNamespace(
