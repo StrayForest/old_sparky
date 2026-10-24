@@ -2,25 +2,24 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-21
+- Last reviewed: 2026-10-24
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
 ## Preconditions
 
 1. Start from a clean, reviewed commit; release metadata records its exact GitHub target SHA.
-2. Push to `dev` and record the exact `Platform security and build` run ID, attempt and target SHA. While that run
-   is active, dispatch its source-bound production backup. Confirm the backup production job starts before that
-   Security attempt's final job completion bound; wait for Security success and the restore-verified backup receipt.
-   Follow the [backup runbook's exact dispatch procedure](backup-restore-runbook.md#local-verified-backup) and
-   confirm no deployment owns the shared slot first. A deployable full-route push for current `dev` HEAD is consumed
-   by auto-deploy; docs-only, out-of-scope and candidate-packaging-only routes succeed as non-deployable no-ops.
-   Recovery-bootstrap-only results are also non-deployable; the automatic chain may route them through baseline
-   checks below. Local tests do not substitute for these release gates.
-3. Confirm migration expand/rollback compatibility.
-4. Confirm healthy services, at least `max(5 GiB, 10% of total capacity)` free and at most 90% conservative disk use; protect `current`/`previous`.
-5. The automatic chain validates the exact successful Security attempt and source-bound backup before dispatching
-   the production child. Never dispatch normal deployment manually.
+2. Push it to `dev`; record the exact Security run ID/attempt/SHA and verify its classifier is full, deployable and
+   non-fallback for this normal app release. Global-guidance routes do not qualify; documented recovery, bootstrap,
+   candidate and docs routes use their own procedures.
+3. While Security is active and the shared slot unowned, the operator dispatches one `create` backup with that exact
+   ID/attempt/SHA. Require `security_started <= backup.created_at <= backup.run_started_at <= backup_job.started_at < security_last_job_completed`.
+   Confirm the backup workflow and production job actually start before that bound; a queued run that starts later
+   cannot qualify. Do not wait for CI to finish or substitute an ID, attempt, SHA or timestamp; see the [backup procedure](backup-restore-runbook.md#local-verified-backup).
+4. Wait for exact Security success and the restore-verified receipt. Auto-deploy starts after Security completes; it never dispatches the backup, only polls it and dispatches the child after both proofs pass.
+5. Confirm migration compatibility, healthy services and at least `max(5 GiB, 10% of total)` free / at most 90% used; protect `current`/`previous`. Never manually deploy. Other routes use their own procedures; local tests do not replace release gates.
+
+If missed, first confirm that the original SHA is still current `dev`. Then rerun all jobs of that push's Security run (not failed jobs only), record its new attempt, and reserve a backup with the same run ID, new attempt and SHA while it runs. If `dev` moved, stop and replan from current `dev` and its own Security run. This creates a new proof; it does not backfill the completed attempt.
 
 GitHub's active `Protect dev` ruleset requires no PR approval, but prevents branch deletion/force-push; exact-SHA
 security/build and the automatic production chain remain mandatory release gates.

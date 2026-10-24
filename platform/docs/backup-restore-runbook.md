@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-21
+- Last reviewed: 2026-10-24
 
 ## Ephemeral synthetic restore diagnostic
 
@@ -228,33 +228,36 @@ restore-status class where applicable. It does not hash dump payloads. Drift
 fails closed, but pruning that already began is not transactional. Public
 summaries omit manifest names, paths and proof digests.
 
-For a reviewed `dev` release, run the guarded backup through GitHub Actions
-without a direct production shell. Bind the exact `Platform security and build`
-run ID, attempt, and source SHA; dispatch while that run is active and the shared
-production slot is unowned. The workflow waits at most 30 minutes within its
-120-minute job deadline. Attestation verification is capped at 10 minutes; SSH
-requires 60 minutes remaining for a 45-minute backup/restore budget plus
-15 minutes for completion and cleanup. Each API
-request and sleep is capped by the remaining poll deadline; guards never substitute another
-run or newer `dev` head. After exact-run success, both guards re-fetch that same run/attempt
-and stable job-ID set for at most 15 minutes within existing deadlines. Only source-bound
-success/skips pass; failures, malformed rows, and identity drift fail closed. Backup validates
-the exact verification job, artifact digest, attestation, and helper manifest before staging.
-Attempt-job timestamps are parsed and bounded to that exact run. Start must not
-exceed completion for executed jobs. On the validated `push` route, the
-conditional `Dispatch exact baseline proof finalizer` and `Authenticate
-internal baseline runtime proof` jobs are skipped because their respective
-workflow-dispatch/baseline-runtime conditions are false. An inverted timestamp
-pair is accepted only for those exact jobs with terminal `skipped` results and
-a present `steps` field of `null` or an empty list. The auth job must also have
-all four runner fields present and explicitly null, matching its captured API
-row. Both timestamps must remain inside the exact run bounds, and each
-completion remains included in the maximum job-completion reservation bound.
-It runs those staged, source-bound helper bytes for create, verify-existing
-and the opt-in authorization probe. If the run fails, times out, the source
-moves, or any bundle check fails, it stops without running a production backup
-or falling back to the installed helper. The normal deploy's freshness check
-is unchanged.
+For a normal reviewed `dev` release, the operator reserves the backup; auto-deploy
+does not dispatch it. Use this order:
+
+1. Push the reviewed commit; record the exact Security run ID, attempt and SHA.
+   Require full, deployable and non-fallback classification for a normal app
+   release. Global-guidance routes do not qualify; documented recovery,
+   bootstrap, candidate and docs routes use their own procedures.
+2. While that Security attempt is active and the shared slot is unowned, dispatch
+   one `operation=create` with the same ID/attempt/SHA. Require
+   `security_started <= backup.created_at <= backup.run_started_at <= backup_job.started_at < security_last_job_completed`.
+   Confirm both workflow and production job actually start before the bound; a late queued run cannot qualify. Once started, the workflow waits for Security success before staging or SSH.
+3. Wait for exact Security success and the restore-verified backup receipt.
+   Auto-deploy starts after Security completes; it only polls the dispatched backup
+   and dispatches production after both exact proofs pass.
+
+Do not wait for Security completion or substitute another run, attempt, SHA or timestamp. If missed, confirm the original SHA is still current `dev`, rerun all jobs of its Security run (not failed jobs only), record the new attempt and reserve the backup while it runs. If `dev` moved, stop and replan from current `dev` and its own Security run. See the [deployment runbook](deployment-runbook.md#preconditions); never deploy manually.
+
+Run the workflow through GitHub Actions, not a production shell. It waits up to
+30 minutes for Security within its 120-minute deadline; attestation is capped at
+10 minutes and SSH needs 60 minutes for backup/restore and cleanup. Polling is
+bounded. Both guards re-fetch the exact run/attempt and stable job set; failures,
+malformed rows and identity drift fail closed. Attempt timestamps stay within
+the run; executed jobs start before completion, and the reservation bound is the
+maximum Security job completion. The backup verifies the exact restore job,
+artifact digest, attestation and helper manifest before staging source-bound
+helpers. Any timeout, SHA drift or bundle error stops before backup with no
+installed-helper fallback. On push, only the exact finalizer/auth baseline jobs
+may be skipped; each must be terminal skipped with `steps` null/empty, and auth
+also requires all four runner fields explicitly null. Their timestamps remain
+within run bounds and their completions stay in the reservation maximum.
 
 After staging, an `always()` finalizer removes any leftover run-specific helper
 bundle before deleting the SSH material. Transfer, the remote backup operation,
@@ -292,13 +295,7 @@ gh workflow run platform-production-backup.yml \
   -f source_sha="$SOURCE_SHA"
 ```
 
-Dispatch the backup while the exact Security run is still active so its
-production job reserves the shared slot before the automatic workflow can
-dispatch a deployment child. The auto-deploy workflow waits for that exact
-backup run to complete successfully and validates its source-bound receipt;
-only then does it make the single child-dispatch request. No deployment child
-is queued behind the backup while that proof is pending. Do not dispatch
-another production operation in between. The backup invokes the
+Do not dispatch another production operation while this proof is pending. The backup invokes the
 lock-aware backup-only mode and acquires locks in the fixed order
 release -> retained-load -> build -> live-QA. Backup-only does not apply
 production-release, source-artifact, transient-browser or live-QA retention.
