@@ -491,7 +491,7 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(delayed_result.status, 0)
         self.assertEqual(delayed_result.error_kind, "TimeoutError")
         self.assertIsNone(delayed_result.html_marker_flags)
-        self.assertEqual(delayed_result.html_content_encoding, "unknown")
+        self.assertIsNone(delayed_result.html_content_encoding)
 
     def test_html_capacity_response_failure_stops_refill_and_keeps_partial_counts(self) -> None:
         actors = [VirtualUser(f"actor-{index}", "fixture", "s" * 32, "c" * 32) for index in range(14)]

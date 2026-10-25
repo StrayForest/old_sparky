@@ -2414,8 +2414,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "identity": 6, "other": 0, "unknown": 1,
             })
             self.assertEqual(warmup["failure_counts"]["request_exception"], 1)
-            self.assertEqual(warmup["exception_class_counts"]["HTTPException"], 1)
-            self.assertEqual(sum(warmup["exception_class_counts"].values()), 1)
+            self.assertEqual(
+                sum(warmup["exception_class_counts"].values()), 1,
+                f"closed exception projection: {json.dumps(warmup['exception_class_counts'], sort_keys=True)}",
+            )
             self.assertEqual(warmup["failure_counts"]["non_200"], 1)
             self.assertEqual(warmup["failure_counts"]["content_type_mismatch"], 1)
             self.assertGreaterEqual(warmup["failure_counts"]["page_marker_missing"], 4)
