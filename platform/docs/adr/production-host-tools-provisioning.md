@@ -474,20 +474,11 @@ Source **C4** `6d9f593e2214dacfda55d119b2090e7264ef1ab7` adds external-load clea
 
 The bounded SSR follow-up uses source **C5** `d2afef17db081bf435514fa59b6e1d1b3e41c838`: it bounds server-side read-only workspace/auth requests, adds sampled admission-shed aggregates and their public projection, and restores the SSR workspace-error flag with `authenticated-read-admission-24x8`. Its only host-tools change is the supervisor restore selector; the other 14 pinned helpers, modes, v4 layout and capability contract are unchanged. Pin-only **P5** `a2e8dfaa16962074c59047428d22ed2f823cd521` selects C5 and records that supervisor digest. CI, signed artifact verification, approved provisioning and deployment remain separate required evidence.
 
-The populated-quiesce recovery follow-up uses source **C6** `af425b0500d72fd7dbd9a1a48fd35c5d37a59b48` and pin-only **P6**
-`112653973b37e38e06293c8c4cde8ab2854062a4`. Its 15-entry v4 closure changes
-only `platform_workflow_remote_dispatch.py` and
-`platform_production_deploy_supervisor.sh` from C5. C6 adds separately authorized signed preservation
-of populated quiesce candidates and pruning only a fully reviewed task-created
-release set; the empty-only abort remains unchanged. Exact CI, signed bundle,
-approved recovery/provisioning and post-action checks remain required; neither
-SHA proves installation.
+The populated-quiesce follow-up uses **C6** `af425b0500d72fd7dbd9a1a48fd35c5d37a59b48` and pin-only **P6** `112653973b37e38e06293c8c4cde8ab2854062a4`; it changes dispatcher/supervisor, preserves signed populated candidates, and still aborts on empty-only mismatch. The START/DONE barrier uses **C7** `56036d18604df69da2f8ac79ce7196142a803a0f` and **P7** `c5f80abdc41ac012ec97cf305c01340cfa4aec09`. Each requires its exact CI, signed preflight, approved provisioning and installed self-test; neither pin proves installation.
 
-The backup START/DONE barrier and source-bound receipt use **C7** `56036d18604df69da2f8ac79ce7196142a803a0f` and pin-only **P7**
-`c5f80abdc41ac012ec97cf305c01340cfa4aec09`. P7 records C7's 15-member closure.
-Full CI, signed preflight, approved provisioning and installed self-test remain required; neither SHA proves C7 is installed or active in production.
+The CPU diagnostic evidence follow-up uses **C8** `f0f4b460ea56075febab9b53ce42c21d776d6675` and **P8** `cf90411596ae4cca7a810727d74740d4437b64d5`. Cleanup compatibility is **C9** `c47001f296857f2c64c44336bdeb777a289048d0` / **P9** `5af9efb79796fd4a22398f6047919f5923637804`, retaining plan refusal and complete fallback rows. Transport propagation is **C10** `ce3b53b995ba046e4e1b2f64c61fbcfa39308732` / **P10** `6bcb428a56a7c66f836d0c00286d29cac328fd93`; it adds the web auth-transport selector to the renderer.
 
-The CPU-diagnostic first-fault and exact abort-evidence follow-up uses source **C8** `f0f4b460ea56075febab9b53ce42c21d776d6675` and pin-only **P8** `cf90411596ae4cca7a810727d74740d4437b64d5`; its 15-member v4 closure changes the CPU plan and dispatcher. Exact-P8 CI, signed preflight, approved provisioning and installed self-test remain required. Cleanup compatibility uses source **C9** `c47001f296857f2c64c44336bdeb777a289048d0` and pin-only **P9** `5af9efb79796fd4a22398f6047919f5923637804`; it changes only the plan controller, preserving single-plan refusal and schema-complete fallback rows. Transport propagation uses source **C10** `ce3b53b995ba046e4e1b2f64c61fbcfa39308732` and pin-only **P10** `6bcb428a56a7c66f836d0c00286d29cac328fd93`; C10 adds `PLATFORM_WEB_SERVER_AUTH_TRANSPORT` to the web env renderer and P10 updates only that member's digest and `host_tools_sha`, preserving the 15-member closure. Exact-P10 CI, signed preflight, approved provisioning and installed self-test remain required; these source pins do not prove provisioning or active host behavior.
+The bounded memory-observer and typed-handoff correction uses **C11** `d6ba6ce0826242047494919ba3faf50274f09e7a` and pin-only **P11** `9c0838086d4415ff8cb443312f8edc2381b9bf44`. C11 changes only the dispatcher in the 15-member closure; P11 updates that digest and `host_tools_sha`, while retaining C10's renderer digest. Relative to P9, the cumulative closure changes only the renderer and dispatcher. C11 bounds memory-watch duration/output, fixes row framing and cleanup projection, and adds typed mode binding plus bounded failure evidence without granting diagnostic credit. Exact-P11 CI, signed preflight, approved provisioning and installed self-test remain required; source pins do not prove provisioning or active host behavior.
 
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
