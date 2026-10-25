@@ -914,7 +914,7 @@ class ExternalLoadTests(unittest.TestCase):
                 self.assertIsNone(external_load._parse_effective_cpu_set(invalid))
         sampler = external_load.RunnerCgroupSampler(runner_environment="self-hosted")
         sampler.start(2, 1)
-        result = sampler.stop()
+        result = sampler.stop(namespace_pid=2, namespace_starttime=1)
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(result["reason"], "trusted_runner_context_unavailable")
         self.assertEqual(set(result["identity"]), set(sampler.IDENTITY_FIELDS))
@@ -964,7 +964,7 @@ class ExternalLoadTests(unittest.TestCase):
                 self.assertEqual(raised.exception.reason, "runner_snapshot_unavailable")
         with patch(
             "tools.platform_external_load.subprocess.run",
-            side_effect=external_load.subprocess.TimeoutExpired(command="fixed-stat", timeout=3.0),
+            side_effect=external_load.subprocess.TimeoutExpired(cmd="fixed-stat", timeout=3.0),
         ):
             with self.assertRaises(external_load._CgroupDiagnosticError) as raised:
                 external_load._read_proc1_namespace_identities()

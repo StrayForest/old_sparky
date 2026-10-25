@@ -1120,7 +1120,11 @@ class RunnerCgroupSampler:
             self._thread.join(2.0)
             if self._thread.is_alive():
                 self._failure = "runner_sampler_join_timeout"
-        if namespace_pid is not None or namespace_starttime is not None:
+        if (
+            self._pid is not None
+            and self._starttime is not None
+            and (namespace_pid is not None or namespace_starttime is not None)
+        ):
             if (
                 namespace_pid != self._pid
                 or namespace_starttime != self._starttime

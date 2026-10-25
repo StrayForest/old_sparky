@@ -2088,6 +2088,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("namespace_closed", self.canary_source)
         self.assertIn("os.setsid", self.canary_source)
         self.assertIn("os.fork()", self.canary_source)
+        self.assertIn("PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}", self.canary_source)
+        self.assertIn('PLATFORM_RUNNER_ENVIRONMENT="$PLATFORM_RUNNER_ENVIRONMENT"', self.canary_source)
         self.assertIn("nested-descendant", self.canary_source)
         self.assertIn("double-fork-grandchild", self.canary_source)
         self.assertIn("starttime", self.canary_source)
