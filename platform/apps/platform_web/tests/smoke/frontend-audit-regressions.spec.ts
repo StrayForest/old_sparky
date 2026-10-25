@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { createServer, get as httpGet } from "node:http";
 import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 import { NextRequest } from "next/server";
@@ -6,6 +7,10 @@ import { getTournamentWorkspace, PlatformApiError } from "../../lib/platform-api
 import { cancelServerAuthFetchTerminalResponse } from "../../lib/server-fetch-response";
 import { formatWorkspaceApiErrorDiagnostic } from "../../lib/ssr-error-diagnostic";
 import { hasAuthorizedDiagnosticRunMarker } from "../../lib/performance-diagnostic-marker";
+import {
+  readServerAuthJsonResponse,
+  SERVER_AUTH_RESPONSE_MAX_BYTES,
+} from "../../lib/server-auth-http-response";
 import {
   ServerInternalReadQueueError,
   ServerInternalReadScheduler
@@ -222,8 +227,8 @@ test("workspace subspans preserve fetch and body-parse failure outcomes", async 
 
 test("native auth transport keeps eager malformed non-success JSON semantics", () => {
   const auth = source("lib/server-auth.ts");
-  const nodeTransport = auth.slice(auth.indexOf("function requestServerJson("));
-  const responseEnd = nodeTransport.slice(nodeTransport.indexOf('response.on("end"'));
+  const responseSource = source("lib/server-auth-http-response.ts");
+  const responseEnd = responseSource.slice(responseSource.indexOf("function responseEnd(): void"));
   const parseIndex = responseEnd.indexOf("JSON.parse(bodyText)");
   const resolveIndex = responseEnd.indexOf("resolve({ status, ok, json: async () => payload })");
 
@@ -232,7 +237,102 @@ test("native auth transport keeps eager malformed non-success JSON semantics", (
   expect(responseEnd).toContain("historical eager parse on every");
   expect(responseEnd).toContain("status. Malformed 401/403 bodies");
   expect(responseEnd).toContain("reject(error instanceof Error ? error : new Error(\"Invalid server auth response.\"))");
+  expect(auth).toContain("readServerAuthJsonResponse(response, jsonParseObserver)");
   expect(auth).toContain("response.status === 401 || response.status === 403");
+});
+
+test("native auth destroys a declared oversized stalled response promptly", async () => {
+  const upstreamClosed = deferred<void>();
+  const server = createServer((_request, response) => {
+    response.on("error", () => {});
+    response.on("close", () => upstreamClosed.resolve());
+    response.writeHead(200, {
+      "content-length": String(SERVER_AUTH_RESPONSE_MAX_BYTES + 1),
+    });
+    response.write("{");
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.closeAllConnections();
+    throw new Error("The synthetic auth server did not bind a TCP port.");
+  }
+
+  try {
+    const responseResult = new Promise<Awaited<ReturnType<typeof readServerAuthJsonResponse>>>(
+      (resolveResponse, rejectResponse) => {
+        const request = httpGet({
+          host: "127.0.0.1",
+          port: address.port,
+          path: "/api/v1/users/me",
+        }, (response) => {
+          void readServerAuthJsonResponse(response).then(resolveResponse, rejectResponse);
+        });
+        request.on("error", rejectResponse);
+      },
+    );
+    await expect(responseResult).rejects.toThrow("Server auth response exceeded its size limit.");
+
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const closed = await Promise.race([
+      upstreamClosed.promise.then(() => true),
+      new Promise<boolean>((resolveDeadline) => {
+        deadline = setTimeout(() => resolveDeadline(false), 2_000);
+      }),
+    ]);
+    if (deadline !== undefined) clearTimeout(deadline);
+    expect(closed).toBe(true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  }
+});
+
+test("native auth keeps late errors handled after a premature response close", async () => {
+  let clientResponse: import("node:http").IncomingMessage | undefined;
+  const server = createServer((_request, response) => {
+    response.on("error", () => {});
+    response.writeHead(200, { "content-length": "32" });
+    response.write("{", () => {
+      setTimeout(() => response.socket?.destroy(), 20);
+    });
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.closeAllConnections();
+    throw new Error("The synthetic auth server did not bind a TCP port.");
+  }
+
+  try {
+    const responseResult = new Promise<Awaited<ReturnType<typeof readServerAuthJsonResponse>>>(
+      (resolveResponse, rejectResponse) => {
+        const request = httpGet({
+          host: "127.0.0.1",
+          port: address.port,
+          path: "/api/v1/auth/bootstrap",
+        }, (response) => {
+          clientResponse = response;
+          void readServerAuthJsonResponse(response).then(resolveResponse, rejectResponse);
+        });
+        request.on("error", rejectResponse);
+      },
+    );
+    await expect(responseResult).rejects.toThrow();
+    expect(clientResponse).toBeDefined();
+    expect(clientResponse?.complete).toBe(false);
+    expect(clientResponse?.listenerCount("error")).toBeGreaterThan(0);
+    expect(() => clientResponse?.emit("error", new Error("late socket reset"))).not.toThrow();
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  }
 });
 
 test("terminal server auth fetch responses retain snapshots without awaiting body cancellation", async () => {
@@ -423,6 +523,10 @@ test("workspace CPU diagnostics require an exact private run marker", () => {
   }
   const planModule = source("lib/performance-diagnostic-plan.ts");
   expect(planModule).toContain('resolve(process.cwd(), "../../..", "RELEASE.json")');
+  expect(planModule).toContain('const WORKLOAD_HTML_SSR_CAPACITY = "authenticated_html_ssr_capacity_v1";');
+  expect(planModule).toContain("plan.workload !== WORKLOAD_HTML_SSR_CAPACITY");
+  expect(planModule).toContain("&& plan.workload !== WORKLOAD_HTML_SSR_CAPACITY");
+  expect(planModule).toContain("plan.workload === WORKLOAD_CPU_PAIR && phase === \"on\"");
   expect(planModule).toContain("hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)");
   expect(planModule.indexOf("if (!hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id))"))
     .toBeLessThan(planModule.indexOf("diagnosticStorage.run({ plan, phase }, operation)"));
@@ -449,6 +553,7 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
   const api = source("lib/platform-api.ts");
   const auth = source("lib/server-auth.ts");
+  const authResponse = source("lib/server-auth-http-response.ts");
   const scheduler = source("lib/server-internal-read-scheduler.ts");
   const workspaceCalls = detailPage.match(/\bgetTournamentWorkspace\s*\(/gu) ?? [];
 
@@ -491,8 +596,7 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(auth).toContain("getSsrAdmissionStageObserver");
   expect(auth.match(/serverAuthTransport === "node" && isSsrObservabilityActive\(\)/gu))
     .toHaveLength(2);
-  const nodeAuthResponse = auth.slice(auth.indexOf("function requestServerJson("));
-  const nodeJsonEnd = nodeAuthResponse.slice(nodeAuthResponse.indexOf('response.on("end"'));
+  const nodeJsonEnd = authResponse.slice(authResponse.indexOf("function responseEnd(): void"));
   expect(nodeJsonEnd.indexOf("JSON.parse(bodyText)")).toBeGreaterThanOrEqual(0);
   expect(nodeJsonEnd.indexOf("JSON.parse(bodyText)"))
     .toBeLessThan(nodeJsonEnd.indexOf("resolve({ status, ok, json: async () => payload })"));

@@ -34,6 +34,7 @@ const GC_EVENT_LIMIT = 10_000;
 const CGROUP_MEMORY_EVENT_NAMES = ["low", "high", "max", "oom", "oom_kill", "oom_group_kill"] as const;
 const WORKLOAD_CPU_PAIR = "authenticated_workspace_read_pair_v1";
 const WORKLOAD_SSR_CAPACITY = "authenticated_workspace_read_capacity_v1";
+const WORKLOAD_HTML_SSR_CAPACITY = "authenticated_html_ssr_capacity_v1";
 const DIAGNOSTIC_TRACE_HEADER = "x-platform-ssr-trace";
 
 type PlanTarget = {
@@ -48,7 +49,7 @@ type DiagnosticPlan = {
   readonly run_id: string;
   readonly source_sha: string;
   readonly release_slug: string;
-  readonly workload: typeof WORKLOAD_CPU_PAIR | typeof WORKLOAD_SSR_CAPACITY;
+  readonly workload: typeof WORKLOAD_CPU_PAIR | typeof WORKLOAD_SSR_CAPACITY | typeof WORKLOAD_HTML_SSR_CAPACITY;
   readonly off_start_ms: number;
   readonly off_end_ms: number;
   readonly on_start_ms: number;
@@ -146,7 +147,9 @@ function validatePayload(value: unknown): DiagnosticPlan | null {
   ].sort();
   if (Object.keys(plan).sort().join("|") !== keys.join("|")) return null;
   if (plan.schema !== 1
-      || (plan.workload !== WORKLOAD_CPU_PAIR && plan.workload !== WORKLOAD_SSR_CAPACITY)
+      || (plan.workload !== WORKLOAD_CPU_PAIR
+        && plan.workload !== WORKLOAD_SSR_CAPACITY
+        && plan.workload !== WORKLOAD_HTML_SSR_CAPACITY)
       || typeof plan.run_id !== "string" || !/^[0-9a-f]{32}$/u.test(plan.run_id)
       || typeof plan.source_sha !== "string" || !/^[0-9a-f]{40}$/u.test(plan.source_sha)
       || typeof plan.release_slug !== "string" || !/^[a-z0-9][a-z0-9-]{0,79}$/u.test(plan.release_slug)) {

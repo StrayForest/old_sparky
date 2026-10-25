@@ -50,13 +50,23 @@ on:
         default: false
         type: boolean
       ssr_capacity_concurrency:
-        description: "SSR capacity concurrency preset (8 or 16); non-SSR runs use 8"
+        description: "SSR capacity concurrency; the HTML diagnostic reuses 14 actors at 32/64"
         required: false
         default: "8"
         type: choice
         options:
           - "8"
           - "16"
+          - "32"
+          - "64"
+      ssr_capacity_workload:
+        description: "Typed SSR diagnostic workload"
+        required: false
+        default: "authenticated_workspace_read_capacity_v1"
+        type: choice
+        options:
+          - authenticated_workspace_read_capacity_v1
+          - authenticated_html_ssr_capacity_v1
 
 permissions:
   contents: read
@@ -87,6 +97,7 @@ jobs:
       CPU_DIAGNOSTIC_ONLY: ${{ inputs.cpu_diagnostic_only }}
       SSR_CAPACITY_DIAGNOSTIC_ONLY: ${{ inputs.ssr_capacity_diagnostic_only }}
       SSR_CAPACITY_CONCURRENCY: ${{ inputs.ssr_capacity_concurrency }}
+      SSR_CAPACITY_WORKLOAD: ${{ inputs.ssr_capacity_workload }}
       TARGET_SHA: ${{ github.sha }}
     steps:
       - name: Mask and stage the control identity from the event file
@@ -136,7 +147,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency", "ssr_capacity_workload"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -204,9 +215,17 @@ jobs:
           CPU_DIAGNOSTIC_PAIR='${{ inputs.cpu_diagnostic_pair }}'
           SSR_CAPACITY_DIAGNOSTIC_ONLY='${{ inputs.ssr_capacity_diagnostic_only }}'
           SSR_CAPACITY_CONCURRENCY='${{ inputs.ssr_capacity_concurrency }}'
-          case "$SSR_CAPACITY_CONCURRENCY" in 8|16) ;; *) echo "SSR capacity concurrency preset is invalid." >&2; exit 1 ;; esac
+          SSR_CAPACITY_WORKLOAD='${{ inputs.ssr_capacity_workload }}'
+          case "$SSR_CAPACITY_WORKLOAD:$SSR_CAPACITY_CONCURRENCY" in
+            authenticated_workspace_read_capacity_v1:8|authenticated_workspace_read_capacity_v1:16|authenticated_html_ssr_capacity_v1:8|authenticated_html_ssr_capacity_v1:16|authenticated_html_ssr_capacity_v1:32|authenticated_html_ssr_capacity_v1:64) ;;
+            *) echo "SSR capacity workload/concurrency pair is invalid." >&2; exit 1 ;;
+          esac
           if [[ "$SSR_CAPACITY_DIAGNOSTIC_ONLY" != true && "$SSR_CAPACITY_CONCURRENCY" != 8 ]]; then
             echo "SSR capacity concurrency override requires SSR diagnostic mode." >&2
+            exit 1
+          fi
+          if [[ "$SSR_CAPACITY_DIAGNOSTIC_ONLY" != true && "$SSR_CAPACITY_WORKLOAD" != authenticated_workspace_read_capacity_v1 ]]; then
+            echo "HTML SSR workload requires SSR diagnostic mode." >&2
             exit 1
           fi
           case "$TIMEOUT_DIAGNOSTICS:$PROFILE_ID:$QA_CONFIRMATION:$CPU_DIAGNOSTIC_PAIR:$CPU_DIAGNOSTIC_ONLY:$SSR_CAPACITY_DIAGNOSTIC_ONLY" in
@@ -279,7 +298,7 @@ jobs:
           set -euo pipefail
           profile_env="$RUNNER_TEMP/profile.env"
           run_checked_out_client() {
-            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 RUNNER_TEMP="$RUNNER_TEMP" SOURCE_GIT_SHA="$TARGET_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY" "$@"
+            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 RUNNER_TEMP="$RUNNER_TEMP" SOURCE_GIT_SHA="$TARGET_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY" SSR_CAPACITY_WORKLOAD="$SSR_CAPACITY_WORKLOAD" "$@"
           }
           run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py validate --profile "$PROFILE_ID" --dispatchable
           run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py export-env --profile "$PROFILE_ID" > "$profile_env"
@@ -372,12 +391,15 @@ jobs:
               "tournament_count": "1" if diagnostic_only else tournaments,
               "users_per_tournament": "14" if diagnostic_only else users,
               "fixture_kind": ("cpu_diagnostic_only_v1" if cpu_diagnostic_only == "true" else
+                               "ssr_html_capacity_diagnostic_v1" if ssr_capacity_diagnostic_only == "true" and os.environ["SSR_CAPACITY_WORKLOAD"] == "authenticated_html_ssr_capacity_v1" else
                                "ssr_capacity_diagnostic_v1" if ssr_capacity_diagnostic_only == "true" else
                                "external_load"),
               "timeout_diagnostics": timeout_diagnostics,
           }
           if ssr_capacity_diagnostic_only == "true":
               payload["ssr_capacity_concurrency"] = os.environ["SSR_CAPACITY_CONCURRENCY"]
+              if os.environ["SSR_CAPACITY_WORKLOAD"] == "authenticated_html_ssr_capacity_v1":
+                  payload["ssr_capacity_workload"] = os.environ["SSR_CAPACITY_WORKLOAD"]
           if binding is not None:
               payload["source_binding"] = binding
           _write_private_json(Path(output_path), validate_external_payload(payload))
@@ -521,7 +543,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency", "ssr_capacity_workload"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -627,7 +649,9 @@ jobs:
           binding_keys = {"schema", "binding_mode", "runner_sha", "app_target_sha", "baseline_identity", "receipt_document_sha256", "receipt_artifact_id", "receipt_artifact_name", "receipt_artifact_digest", "receipt_archive_sha256", "cumulative_manifest_sha256", "source_security_run_id", "source_security_run_attempt", "autodeploy_run_id", "autodeploy_run_attempt", "production_deploy_run_id", "production_deploy_run_attempt"}
           schema = payload.get("schema")
           binding = payload.get("source_binding")
-          expected = base_keys | ({"fixture_kind"} if "fixture_kind" in payload else set()) | ({"ssr_capacity_concurrency"} if payload.get("fixture_kind") == "ssr_capacity_diagnostic_v1" else set()) | ({"source_binding"} if schema in (2, "2") else set())
+          capacity_kinds = {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}
+          html_capacity = payload.get("fixture_kind") == "ssr_html_capacity_diagnostic_v1"
+          expected = base_keys | ({"fixture_kind"} if "fixture_kind" in payload else set()) | ({"ssr_capacity_concurrency"} if payload.get("fixture_kind") in capacity_kinds else set()) | ({"ssr_capacity_workload"} if html_capacity else set()) | ({"source_binding"} if schema in (2, "2") else set())
           if set(payload) != expected:
               raise SystemExit("external handoff schema is not closed")
           if schema not in (1, "1", 2, "2") or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id:
@@ -646,9 +670,9 @@ jobs:
           if payload.get("profile") != "external-vote" or payload.get("timeout_diagnostics") not in {"true", "false"}:
               raise SystemExit("external handoff profile is invalid")
           fixture_kind = payload.get("fixture_kind", "external_load")
-          if fixture_kind not in {"external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1"}:
+          if fixture_kind not in {"external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
               raise SystemExit("external handoff fixture mode is invalid")
-          if fixture_kind in {"cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1"} and (
+          if fixture_kind in {"cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"} and (
               payload.get("confirmation") != (
                   "RUN-PRODUCTION-CPU-DIAGNOSTIC" if fixture_kind == "cpu_diagnostic_only_v1"
                   else "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC"
@@ -659,8 +683,11 @@ jobs:
           ):
               raise SystemExit("CPU diagnostic fixture dimensions are invalid")
           ssr_concurrency = payload.get("ssr_capacity_concurrency")
-          if (fixture_kind == "ssr_capacity_diagnostic_v1" and ssr_concurrency not in {"8", "16"}) or (
-              fixture_kind != "ssr_capacity_diagnostic_v1" and ssr_concurrency is not None
+          ssr_workload = payload.get("ssr_capacity_workload")
+          if (fixture_kind == "ssr_capacity_diagnostic_v1" and (ssr_concurrency not in {"8", "16"} or ssr_workload is not None)) or (
+              fixture_kind == "ssr_html_capacity_diagnostic_v1" and (ssr_concurrency not in {"8", "16", "32", "64"} or ssr_workload != "authenticated_html_ssr_capacity_v1")
+          ) or (
+              fixture_kind not in capacity_kinds and (ssr_concurrency is not None or ssr_workload is not None)
           ):
               raise SystemExit("SSR capacity concurrency is invalid")
           if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None or re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None:
@@ -1056,7 +1083,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency", "ssr_capacity_workload"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -1524,6 +1551,12 @@ jobs:
         id: namespace-barrier
         if: ${{ always() }}
         shell: bash
+        env:
+          EXPECTED_SSR_WORKLOAD: ${{ inputs.ssr_capacity_workload }}
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
+          EXPECTED_EXTERNAL_RUN_ID: ${{ github.run_id }}
+          EXPECTED_EXTERNAL_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -u
           status=1
@@ -1536,6 +1569,7 @@ jobs:
           fi
           if /usr/bin/python3 - "$report" <<'PY'
           import json
+          import os
           from pathlib import Path
           import sys
 
@@ -1548,10 +1582,22 @@ jobs:
           if payload.get("fixture_kind") == "cpu_diagnostic_only_v1":
               if payload.get("capacity_slo_credit") is not False or payload.get("diagnostic_credit") is not False:
                   raise SystemExit("CPU-only report is not zero-credit")
-          elif payload.get("fixture_kind") == "ssr_capacity_diagnostic_v1":
+          elif payload.get("fixture_kind") in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
+              expected_workload = os.environ.get("EXPECTED_SSR_WORKLOAD", "")
+              expected_fixture = {
+                  "authenticated_workspace_read_capacity_v1": "ssr_capacity_diagnostic_v1",
+                  "authenticated_html_ssr_capacity_v1": "ssr_html_capacity_diagnostic_v1",
+              }.get(expected_workload)
               if (
-                  payload.get("schema") != 1
-                  or payload.get("workload") != "authenticated_workspace_read_capacity_v1"
+                  type(payload.get("schema")) is not int
+                  or payload.get("schema") != 1
+                  or expected_fixture is None
+                  or payload.get("workload") != expected_workload
+                  or payload.get("fixture_kind") != expected_fixture
+                  or payload.get("source_sha") != os.environ.get("EXPECTED_SOURCE_SHA")
+                  or payload.get("app_target_sha") != os.environ.get("EXPECTED_APP_TARGET_SHA")
+                  or payload.get("external_run_id") != os.environ.get("EXPECTED_EXTERNAL_RUN_ID")
+                  or payload.get("external_run_attempt") != os.environ.get("EXPECTED_EXTERNAL_RUN_ATTEMPT")
                   or payload.get("matrix_credit") is not False
                   or payload.get("slo_credit") is not False
                   or payload.get("diagnostic_credit") is not False
@@ -2167,7 +2213,8 @@ jobs:
             --output "$RUNNER_TEMP/ssr-capacity-report/ssr-capacity.json" \
             --manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" \
             --source-sha "$TARGET_SHA" --app-target-sha "$APP_TARGET_SHA" \
-            --external-run-id "$GITHUB_RUN_ID" --external-run-attempt "$GITHUB_RUN_ATTEMPT"
+            --external-run-id "$GITHUB_RUN_ID" --external-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --workload '${{ inputs.ssr_capacity_workload }}'
 
       - name: Publish only the bounded SSR capacity summary
         id: publish-ssr-capacity
@@ -2275,7 +2322,7 @@ jobs:
                   raise ValueError
               inputs = event.get("inputs")
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency"
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency", "ssr_capacity_workload"
               }:
                   raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
@@ -2397,8 +2444,10 @@ jobs:
           handoff = json.loads(Path(handoff_path).read_text(encoding="ascii"))
           source_binding = handoff.get("source_binding")
           base_handoff_keys = {"schema", "confirmation", "target_sha", "control_email", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics"}
-          if handoff.get("fixture_kind") == "ssr_capacity_diagnostic_v1":
+          if handoff.get("fixture_kind") in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
               base_handoff_keys.add("ssr_capacity_concurrency")
+          if handoff.get("fixture_kind") == "ssr_html_capacity_diagnostic_v1":
+              base_handoff_keys.add("ssr_capacity_workload")
           if (
               not isinstance(handoff, dict)
               or handoff.get("schema") not in (1, "1", 2, "2")
@@ -3663,7 +3712,7 @@ jobs:
                   or len(manifest.get("users", [])) != 14
                   or handoff.get("target_sha") != source_sha
                   or handoff.get("run_id") != run_id
-                  or handoff.get("fixture_kind") != "ssr_capacity_diagnostic_v1"
+                  or handoff.get("fixture_kind") not in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}
                   or handoff.get("tournament_count") != "1"
                   or handoff.get("users_per_tournament") != "14"
                   or manifest.get("runner_sha") != source_sha
@@ -3677,6 +3726,7 @@ jobs:
                   report, source_sha=source_sha, app_target_sha=app_sha,
                   run_id=run_id, attempt=attempt,
                   manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+                  workload=handoff.get("ssr_capacity_workload", "authenticated_workspace_read_capacity_v1"),
               ))
           except Exception:
               print("INVALID")

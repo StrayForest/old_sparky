@@ -42,8 +42,15 @@ except ModuleNotFoundError:  # direct execution from platform/tools
 
 WORKLOAD = "authenticated_workspace_read_capacity_v1"
 FIXTURE_KIND = "ssr_capacity_diagnostic_v1"
+HTML_WORKLOAD = "authenticated_html_ssr_capacity_v1"
+HTML_FIXTURE_KIND = "ssr_html_capacity_diagnostic_v1"
 SCHEMA = 1
 CONCURRENCY_PRESETS = frozenset({8, 16})
+HTML_CONCURRENCY_PRESETS = frozenset({8, 16, 32, 64})
+CAPACITY_ERROR_CODES = frozenset({
+    "auth", "http_error", "other", "page_marker_missing", "rate_limited",
+    "server_error", "timeout", "transport", "unexpected_content_type", "validation",
+})
 FIXTURE_TOURNAMENTS = 1
 FIXTURE_USERS = 14
 ON_WINDOW_MS = 20_000
@@ -150,7 +157,7 @@ class _RemoteMemoryWatcher:
     def __init__(
         self, *, ssh_host: str, ssh_user: str, ssh_config: Path, ssh_key: Path,
         control_path: Path, binding: Mapping[str, Any], run_id: str, source_sha: str,
-        expected_plan: tuple[int, int, int],
+        expected_plan: tuple[int, int, int], workload: str = WORKLOAD,
     ) -> None:
         self.ssh_host = ssh_host
         self.ssh_user = ssh_user
@@ -167,6 +174,7 @@ class _RemoteMemoryWatcher:
         self.total = 0
         self.sequence = 0
         self.expected_plan = expected_plan
+        self.workload = workload
         self.expected_target: tuple[int, int, str] | None = None
         self.terminal = False
         self.terminal_decision: str | None = None
@@ -230,7 +238,7 @@ class _RemoteMemoryWatcher:
         }
         if (set(row) != expected_fields or type(row.get("schema")) is not int
                 or row["schema"] != 1 or row.get("run_id") != self.run_id
-                or row.get("source_sha") != self.source_sha or row.get("workload") != WORKLOAD
+                or row.get("source_sha") != self.source_sha or row.get("workload") != self.workload
                 or type(row.get("sequence")) is not int or row["sequence"] != self.sequence + 1
                 or row.get("decision") not in {"continue", "abort", "complete"}
                 or row.get("reason") not in {
@@ -360,7 +368,7 @@ class _RemoteMemoryWatcher:
         ]
         request = {
             "schema": 1, "run_id": self.run_id, "source_sha": self.source_sha,
-            "workload": WORKLOAD,
+            "workload": self.workload,
         }
         data = json.dumps(request, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
         self.process = subprocess.Popen(
@@ -454,16 +462,61 @@ class _RemoteMemoryWatcher:
         self._terminate()
 
 
-def profile_payload(concurrency: int) -> dict[str, Any]:
-    if type(concurrency) is not int or concurrency not in CONCURRENCY_PRESETS:
+def _profile_spec(workload: str) -> tuple[str, frozenset[int], int]:
+    if workload == WORKLOAD:
+        return FIXTURE_KIND, CONCURRENCY_PRESETS, 8
+    if workload == HTML_WORKLOAD:
+        return HTML_FIXTURE_KIND, HTML_CONCURRENCY_PRESETS, FIXTURE_USERS
+    raise ValueError("capacity workload rejected")
+
+
+def _capacity_error_code(result: Any) -> str:
+    """Reduce one request failure to a closed, identity-free error label."""
+
+    if isinstance(result.error_kind, str) and result.error_kind in {
+        "unexpected_content_type", "page_marker_missing",
+    }:
+        return result.error_kind
+    code = external_load.safe_error_class(
+        result.error_kind or "unexpected", status=result.status,
+    )
+    return code if code in CAPACITY_ERROR_CODES else "other"
+
+
+def _worker_counts_are_closed(payload: Mapping[str, Any]) -> bool:
+    statuses = payload.get("http_status_counts")
+    errors = payload.get("error_counts")
+    completed = payload.get("completed")
+    if (not isinstance(statuses, dict) or not isinstance(errors, dict)
+            or type(completed) is not int or completed < 0):
+        return False
+    if any(
+        not isinstance(key, str)
+        or re.fullmatch(r"(?:[1-5][0-9]{2}|unknown)", key) is None
+        or type(count) is not int or count < 0
+        for key, count in statuses.items()
+    ) or sum(statuses.values()) != completed:
+        return False
+    if any(
+        not isinstance(key, str) or key not in CAPACITY_ERROR_CODES
+        or type(count) is not int or count < 0
+        for key, count in errors.items()
+    ) or sum(errors.values()) > completed:
+        return False
+    return payload.get("status") != "complete" or not errors
+
+
+def profile_payload(concurrency: int, workload: str = WORKLOAD) -> dict[str, Any]:
+    fixture_kind, presets, actors = _profile_spec(workload)
+    if type(concurrency) is not int or concurrency not in presets:
         raise ValueError("capacity preset rejected")
     return {
         "schema": SCHEMA,
-        "workload": WORKLOAD,
-        "fixture_kind": FIXTURE_KIND,
+        "workload": workload,
+        "fixture_kind": fixture_kind,
         "fixture_tournaments": FIXTURE_TOURNAMENTS,
         "fixture_users": FIXTURE_USERS,
-        "actors": 8,
+        "actors": actors,
         "concurrency": concurrency,
         "max_inflight": concurrency,
         "load_model": "closed_loop_best_effort",
@@ -473,9 +526,9 @@ def profile_payload(concurrency: int) -> dict[str, Any]:
     }
 
 
-def profile_digest(concurrency: int) -> str:
+def profile_digest(concurrency: int, workload: str = WORKLOAD) -> str:
     raw = json.dumps(
-        profile_payload(concurrency), ensure_ascii=True, allow_nan=False,
+        profile_payload(concurrency, workload), ensure_ascii=True, allow_nan=False,
         sort_keys=True, separators=(",", ":"),
     ).encode("ascii")
     return hashlib.sha256(raw).hexdigest()
@@ -542,10 +595,11 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     }
     if (not isinstance(capacity, dict) or set(capacity) != expected_fields
             or type(capacity.get("schema")) is not int or capacity["schema"] != SCHEMA
-            or capacity.get("workload") != WORKLOAD
-            or capacity.get("fixture_kind") != FIXTURE_KIND
+            or not isinstance(capacity.get("workload"), str)
+            or capacity.get("workload") not in {WORKLOAD, HTML_WORKLOAD}
+            or capacity.get("fixture_kind") != _profile_spec(capacity["workload"])[0]
             or type(capacity.get("concurrency")) is not int
-            or capacity["concurrency"] not in CONCURRENCY_PRESETS
+            or capacity["concurrency"] not in _profile_spec(capacity["workload"])[1]
             or type(capacity.get("manifest_bytes")) is not int
             or not 0 < capacity["manifest_bytes"] <= 256 * 1024
             or type(capacity.get("on_start_ms")) is not int
@@ -565,7 +619,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             or not isinstance(binding.get("run_id"), str) or RUN_RE.fullmatch(binding["run_id"]) is None
             or not isinstance(binding.get("source_sha"), str) or SHA_RE.fullmatch(binding["source_sha"]) is None
             or not isinstance(binding.get("app_target_sha"), str) or SHA_RE.fullmatch(binding["app_target_sha"]) is None
-            or binding.get("profile_digest") != profile_digest(capacity["concurrency"])
+            or binding.get("profile_digest") != profile_digest(capacity["concurrency"], capacity["workload"])
             or not isinstance(binding.get("external_run_id"), str)
             or not binding["external_run_id"].isdecimal()
             or not isinstance(binding.get("external_run_attempt"), str)
@@ -584,8 +638,9 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             or any(item.get("user_count") != FIXTURE_USERS for item in tournaments)):
         raise ValueError("capacity fixture dimensions rejected")
     slug = tournaments[0].get("slug")
-    selected = [actor for actor in actors if actor.tournament_slug == slug][:8]
-    if len(selected) != 8:
+    actor_count = _profile_spec(capacity["workload"])[2]
+    selected = [actor for actor in actors if actor.tournament_slug == slug][:actor_count]
+    if len(selected) != actor_count:
         raise ValueError("capacity actor cohort rejected")
     worker_report = Path(str(config.get("worker_report_path", "")))
     control_path = Path(str(capacity["control_path"]))
@@ -623,6 +678,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             csrf_cookie_name=cookie_names[1],
             transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
             diagnostic_trace_run_id=binding["run_id"],
+            require_authenticated_html=capacity["workload"] == HTML_WORKLOAD,
         )
 
     off_results: list[Any] = []
@@ -633,6 +689,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             manifest["origin"], actor, "authenticated_workspace_capacity_warmup", 5.0,
             session_cookie_name=cookie_names[0], csrf_cookie_name=cookie_names[1],
             transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
+            require_authenticated_html=capacity["workload"] == HTML_WORKLOAD,
         )
 
     def marked_probe(actor: external_load.VirtualUser, barrier: threading.Barrier):
@@ -645,6 +702,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             session_cookie_name=cookie_names[0], csrf_cookie_name=cookie_names[1],
             transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
             diagnostic_trace_run_id=binding["run_id"],
+            require_authenticated_html=capacity["workload"] == HTML_WORKLOAD,
         )
 
     def fail_off(reason: str, *, submitted: int, completed: int) -> dict[str, Any]:
@@ -759,6 +817,11 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             timeout=5,
             request_builder=request_builder,
             stop_requested=timed_guard,
+            abort_on_result=(
+                (lambda result: "response_failure" if result.ok is not True else None)
+                if capacity["workload"] == HTML_WORKLOAD else None
+            ),
+            max_supported_concurrency=(64 if capacity["workload"] == HTML_WORKLOAD else 16),
             executor=capacity_executor,
         )
     except (external_load.ExternalLoadError, OSError, CapacityControlError):
@@ -781,15 +844,21 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         for item in results
     )
     errors = Counter(
-        external_load._safe_error(item.error_kind)
+        _capacity_error_code(item)
         for item in results if item.error_kind is not None
     )
     latencies = [float(item.elapsed_ms) for item in results if type(item.elapsed_ms) in (int, float)]
-    all_200 = len(results) == phase_result["submitted"] and all(item.ok is True and item.status == 200 for item in results)
+    all_200 = len(results) == phase_result["submitted"] and all(
+        item.ok is True and item.status == 200
+        and (capacity["workload"] != HTML_WORKLOAD or (
+            item.html_content_type_ok is True and item.html_page_marker_ok is True
+        ))
+        for item in results
+    )
     final_reason = phase_result["abort_reason"]
     status = "incomplete" if phase_result["aborted"] else "complete" if all_200 else "failed"
     return {
-        **profile_payload(capacity["concurrency"]),
+        **profile_payload(capacity["concurrency"], capacity["workload"]),
         "report_complete": True,
         "status": status,
         "passed": status == "complete" and final_reason in {None, "window_complete"},
@@ -804,7 +873,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         "fixture_manifest_sha256": capacity["manifest_sha256"],
         "fixture_tournaments": FIXTURE_TOURNAMENTS,
         "fixture_users": FIXTURE_USERS,
-        "actors": 8,
+        "actors": actor_count,
         "concurrency": capacity["concurrency"],
         "max_inflight": capacity["concurrency"],
         "fixture_manifest_bytes": len(manifest_raw),
@@ -852,7 +921,7 @@ def _incomplete_report(
     if type(observed_duration_ms) is not int or not 0 <= observed_duration_ms <= 30_000:
         raise ValueError("capacity incomplete duration is invalid")
     return {
-        **profile_payload(capacity["concurrency"]),
+        **profile_payload(capacity["concurrency"], capacity["workload"]),
         "report_complete": True,
         "status": "incomplete", "passed": False,
         "matrix_credit": False, "slo_credit": False, "diagnostic_credit": False,
@@ -862,7 +931,7 @@ def _incomplete_report(
         "run_id": binding["run_id"], "profile_digest": binding["profile_digest"],
         "fixture_manifest_sha256": manifest_sha256,
         "fixture_tournaments": FIXTURE_TOURNAMENTS, "fixture_users": FIXTURE_USERS,
-        "actors": 8, "concurrency": capacity["concurrency"],
+        "actors": _profile_spec(capacity["workload"])[2], "concurrency": capacity["concurrency"],
         "max_inflight": capacity["concurrency"],
         "fixture_manifest_bytes": capacity.get("manifest_bytes", 0),
         "on_window_start_ms": capacity["on_start_ms"],
@@ -1108,8 +1177,8 @@ def run_isolated_capacity_worker(
     outcome = {
         "schema": SCHEMA,
         "report_complete": True,
-        "workload": WORKLOAD,
-        "fixture_kind": FIXTURE_KIND,
+        "workload": capacity_config["workload"],
+        "fixture_kind": capacity_config["fixture_kind"],
         "status": "complete" if complete else (
             "resource_abort" if memory.get("terminal_decision") == "abort" else "incomplete"
         ),
@@ -1127,7 +1196,7 @@ def run_isolated_capacity_worker(
         "fixture_manifest_bytes": capacity_config["manifest_bytes"],
         "fixture_tournaments": FIXTURE_TOURNAMENTS,
         "fixture_users": FIXTURE_USERS,
-        "actors": 8,
+        "actors": _profile_spec(capacity_config["workload"])[2],
         "concurrency": capacity_config["concurrency"],
         "max_inflight": capacity_config["concurrency"],
         "load_model": "closed_loop_best_effort",
@@ -1188,8 +1257,8 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         )
         and payload.get("report_complete") is True
         and type(payload.get("schema")) is int and payload.get("schema") == SCHEMA
-        and payload.get("workload") == WORKLOAD
-        and payload.get("fixture_kind") == FIXTURE_KIND
+        and payload.get("workload") == capacity_config.get("workload")
+        and payload.get("fixture_kind") == capacity_config.get("fixture_kind")
         and payload.get("load_model") == "closed_loop_best_effort"
         and payload.get("window_ms") == ON_WINDOW_MS
         and payload.get("source_sha") == binding.get("source_sha")
@@ -1202,8 +1271,9 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         and payload.get("fixture_manifest_bytes") == capacity_config.get("manifest_bytes")
         and payload.get("concurrency") == capacity_config.get("concurrency")
         and payload.get("max_inflight") == capacity_config.get("concurrency")
-        and payload.get("actors") == 8
+        and payload.get("actors") == _profile_spec(capacity_config["workload"])[2]
         and payload.get("generator_cpu_evidence") == _generator_cpu_evidence_status(cpu_rows)
+        and _worker_counts_are_closed(payload)
         and payload.get("fixture_tournaments") == FIXTURE_TOURNAMENTS
         and payload.get("fixture_users") == FIXTURE_USERS
         and _valid_cpu_window_rows(cpu_rows)
@@ -1212,7 +1282,7 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         and isinstance(payload.get("off_probe"), dict)
         and set(payload["off_probe"]) == {"submitted", "completed", "http_status"}
         and type(payload["off_probe"].get("submitted")) is int
-        and 0 <= payload["off_probe"]["submitted"] <= 16
+        and 0 <= payload["off_probe"]["submitted"] <= 64
         and type(payload["off_probe"].get("completed")) is int
         and 0 <= payload["off_probe"]["completed"] <= payload["off_probe"]["submitted"]
         and (payload["off_probe"].get("http_status") is None
@@ -1344,6 +1414,7 @@ def _restore_parent_ssh_material(
 def _prepare_remote_capacity_plan(
     *, host: str, user: str, config: Path, key: Path, run_id: str,
     source_sha: str, now_ms: int, plan_created_monotonic: float,
+    workload: str = WORKLOAD,
     lifecycle: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
@@ -1353,7 +1424,7 @@ def _prepare_remote_capacity_plan(
     off_start = now_ms + 52_000
     plan = {
         "schema": 1, "operation": "prepare", "run_id": run_id,
-        "source_sha": source_sha, "workload": WORKLOAD,
+        "source_sha": source_sha, "workload": workload,
         "off_start_ms": off_start, "off_end_ms": off_start + 20_000,
         "on_start_ms": off_start + 25_000, "on_end_ms": off_start + 45_000,
     }
@@ -1468,12 +1539,13 @@ def _parent_failure_receipt(
     profile_digest_value: str, manifest_sha256: str | None, manifest_bytes: int | None,
     concurrency: int, prepare_lifecycle: Mapping[str, Any],
     cleanup_lifecycle: Mapping[str, Any], cleanup_ok: bool,
+    workload: str = WORKLOAD,
 ) -> dict[str, Any]:
     prepare_status = prepare_lifecycle.get("plan_prepare_status")
     refusal_class = prepare_lifecycle.get("plan_prepare_refusal_class")
     cleanup_status = cleanup_lifecycle.get("plan_cleanup_status")
     cleanup_refusal = cleanup_lifecycle.get("plan_cleanup_refusal_class")
-    return {
+    result = {
         "schema": 1, "report_complete": True, "failure_only": True,
         "status": "incomplete", "passed": False,
         "matrix_credit": False, "slo_credit": False, "diagnostic_credit": False,
@@ -1499,6 +1571,10 @@ def _parent_failure_receipt(
             else "failed"
         ),
     }
+    if workload != WORKLOAD:
+        fixture_kind, _presets, _actors = _profile_spec(workload)
+        result.update({"workload": workload, "fixture_kind": fixture_kind})
+    return result
 
 
 def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
@@ -1512,7 +1588,14 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
         "plan_cleanup_status", "plan_cleanup_refusal_class", "ssh_cleanup_transport",
         "remote_plan_cleanup",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    if not isinstance(value, dict) or set(value) not in (fields, fields | {"workload", "fixture_kind"}):
+        return None
+    workload = value.get("workload", WORKLOAD)
+    try:
+        expected_fixture_kind, expected_presets, _actor_count = _profile_spec(workload)
+    except ValueError:
+        return None
+    if set(value) == fields | {"workload", "fixture_kind"} and value.get("fixture_kind") != expected_fixture_kind:
         return None
     if (
         type(value.get("schema")) is not int or value["schema"] != 1
@@ -1525,7 +1608,7 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
         or not isinstance(value.get("external_run_attempt"), str) or ATTEMPT_RE.fullmatch(value["external_run_attempt"]) is None
         or not isinstance(value.get("run_id"), str) or RUN_RE.fullmatch(value["run_id"]) is None
         or not isinstance(value.get("profile_digest"), str) or re.fullmatch(r"[0-9a-f]{64}", value["profile_digest"]) is None
-        or type(value.get("concurrency")) is not int or value["concurrency"] not in CONCURRENCY_PRESETS
+        or type(value.get("concurrency")) is not int or value["concurrency"] not in expected_presets
         or value.get("namespace_closed") is not False
         or not isinstance(value.get("stage"), str) or value["stage"] not in PARENT_FAILURE_STAGES
         or not isinstance(value.get("error_class"), str) or value["error_class"] not in PARENT_ERROR_CLASSES
@@ -1558,7 +1641,14 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
                 or (transport.get("return_code") is not None
                     and (type(transport["return_code"]) is not int or not -255 <= transport["return_code"] <= 255))):
             return None
-    if value["profile_digest"] != profile_digest(value["concurrency"]):
+    try:
+        failure_presets = _profile_spec(value.get("workload", WORKLOAD))[1]
+    except ValueError:
+        return None
+    if (value["concurrency"] not in failure_presets
+            or value["profile_digest"] != profile_digest(
+                value["concurrency"], workload,
+            )):
         return None
     return value
 
@@ -1682,13 +1772,20 @@ def _parent_run(
         "external_run_id": args.external_run_id,
         "external_run_attempt": args.external_run_attempt,
         "concurrency": args.concurrency,
+        "workload": getattr(args, "workload", WORKLOAD),
     })
-    if type(args.concurrency) is int and args.concurrency in CONCURRENCY_PRESETS:
+    workload = getattr(args, "workload", WORKLOAD)
+    try:
+        _fixture_kind, workload_presets, _actor_count = _profile_spec(workload)
+    except ValueError:
+        workload_presets = frozenset()
+    if type(args.concurrency) is int and args.concurrency in workload_presets:
         state["run_id"] = os.urandom(16).hex()
-        state["profile_digest"] = profile_digest(args.concurrency)
+        state["profile_digest"] = profile_digest(args.concurrency, workload)
     if (SHA_RE.fullmatch(args.source_sha) is None or SHA_RE.fullmatch(args.app_target_sha) is None
             or not args.external_run_id.isdecimal() or ATTEMPT_RE.fullmatch(args.external_run_attempt) is None
-            or type(args.concurrency) is not int or args.concurrency not in CONCURRENCY_PRESETS):
+            or workload not in {WORKLOAD, HTML_WORKLOAD}
+            or type(args.concurrency) is not int or args.concurrency not in workload_presets):
         raise ValueError("capacity parent identity or preset rejected")
     report_path = Path(args.report)
     ssh_config, ssh_key = Path(args.ssh_config), Path(args.ssh_key)
@@ -1727,6 +1824,7 @@ def _parent_run(
             host=args.ssh_host, user=args.ssh_user, config=ssh_config, key=ssh_key,
             run_id=run_id, source_sha=args.app_target_sha,
             now_ms=plan_created_at_ms,
+            workload=workload,
             plan_created_monotonic=plan_created_monotonic, lifecycle=lifecycle,
         )
     except _RemoteCapacityPlanError as exc:
@@ -1796,6 +1894,7 @@ def _parent_run(
             manifest_bytes=len(raw), concurrency=args.concurrency,
             prepare_lifecycle=exc.lifecycle,
             cleanup_lifecycle=cleanup_lifecycle, cleanup_ok=cleanup_ok,
+            workload=workload,
         )
     state["plan_expiry_ms"] = planned["on_end_ms"]
     control_path: Path | None = None
@@ -1813,7 +1912,8 @@ def _parent_run(
         worker_report = private / "worker-report.json"
         supervisor_report = private / "supervisor-report.json"
         capacity_config = {
-            "schema": SCHEMA, "workload": WORKLOAD, "fixture_kind": FIXTURE_KIND,
+            "schema": SCHEMA, "workload": workload,
+            "fixture_kind": _profile_spec(workload)[0],
             "manifest_path": str(Path(args.manifest).resolve()),
             "manifest_sha256": manifest_sha,
             "manifest_bytes": len(raw),
@@ -1830,6 +1930,7 @@ def _parent_run(
             control_path=control_path, binding=binding,
             run_id=run_id, source_sha=args.app_target_sha,
             expected_plan=(planned["off_start_ms"], planned["on_start_ms"], planned["on_end_ms"]),
+            workload=workload,
         )
 
         def hide_material() -> None:
@@ -1935,7 +2036,7 @@ def _parent_run(
     if outcome is None:
         outcome = {
             "schema": SCHEMA, "report_complete": True,
-            "workload": WORKLOAD, "fixture_kind": FIXTURE_KIND,
+            "workload": workload, "fixture_kind": _profile_spec(workload)[0],
             "status": "incomplete", "passed": False,
             "matrix_credit": False, "slo_credit": False, "diagnostic_credit": False,
             "source_sha": args.source_sha, "app_target_sha": args.app_target_sha,
@@ -1945,7 +2046,7 @@ def _parent_run(
             "fixture_manifest_sha256": manifest_sha,
             "fixture_manifest_bytes": len(raw),
             "fixture_tournaments": FIXTURE_TOURNAMENTS,
-            "fixture_users": FIXTURE_USERS, "actors": 8,
+            "fixture_users": FIXTURE_USERS, "actors": _profile_spec(workload)[2],
             "concurrency": args.concurrency, "max_inflight": args.concurrency,
             "load_model": "closed_loop_best_effort", "window_ms": ON_WINDOW_MS,
             "namespace_closed": False,
@@ -1999,9 +2100,13 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
     }
     if not isinstance(value, dict) or set(value) != top_fields:
         return None
+    try:
+        expected_fixture_kind, expected_presets, expected_actor_count = _profile_spec(value.get("workload"))
+    except ValueError:
+        return None
     if (type(value.get("schema")) is not int or value["schema"] != SCHEMA
-            or value.get("report_complete") is not True or value.get("workload") != WORKLOAD
-            or value.get("fixture_kind") != FIXTURE_KIND
+            or value.get("report_complete") is not True
+            or value.get("fixture_kind") != expected_fixture_kind
             or value.get("status") not in {"complete", "resource_abort", "incomplete"}
             or type(value.get("passed")) is not bool
             or any(value.get(key) is not False for key in ("matrix_credit", "slo_credit", "diagnostic_credit"))
@@ -2019,9 +2124,9 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             or value.get("fixture_tournaments") != FIXTURE_TOURNAMENTS
             or type(value.get("fixture_users")) is not int
             or value.get("fixture_users") != FIXTURE_USERS
-            or type(value.get("actors")) is not int or value.get("actors") != 8
+            or type(value.get("actors")) is not int or value.get("actors") != expected_actor_count
             or type(value.get("concurrency")) is not int
-            or value.get("concurrency") not in CONCURRENCY_PRESETS
+            or value.get("concurrency") not in expected_presets
             or type(value.get("max_inflight")) is not int
             or value.get("max_inflight") != value.get("concurrency")
             or value.get("load_model") != "closed_loop_best_effort"
@@ -2094,7 +2199,7 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or type(count) is not int or count < 0
                 for key, count in worker["http_status_counts"].items())
                 or sum(worker["http_status_counts"].values()) != worker["completed"]
-                or any(not isinstance(key, str) or re.fullmatch(r"[a-z0-9_]{1,64}", key) is None
+                or any(not isinstance(key, str) or key not in CAPACITY_ERROR_CODES
                        or type(count) is not int or count < 0
                        for key, count in worker["error_counts"].items())):
             return None
@@ -2239,18 +2344,21 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
 
 def evaluate_capacity_report(
     value: Any, *, source_sha: str, app_target_sha: str, run_id: str,
-    attempt: str, manifest_sha256: str,
+    attempt: str, manifest_sha256: str, workload: str = WORKLOAD,
 ) -> str:
     if _project_parent_failure_receipt(value) is not None:
         return "INVALID"
     report = _project_capacity_report(value)
     if report is None or any((
+        report.get("workload") != workload,
         report.get("source_sha") != source_sha,
         report.get("app_target_sha") != app_target_sha,
         report.get("external_run_id") != run_id,
         report.get("external_run_attempt") != attempt,
         report.get("fixture_manifest_sha256") != manifest_sha256,
-        report.get("profile_digest") != profile_digest(report.get("concurrency")),
+        report.get("profile_digest") != profile_digest(
+            report.get("concurrency"), report.get("workload", WORKLOAD),
+        ),
     )):
         return "INVALID"
     if (report.get("status") != "complete" or report.get("passed") is not True
@@ -2507,7 +2615,10 @@ def _parent_outcome_fingerprint(
 def sanitize_capacity_report(
     *, input_path: Path, output_path: Path, manifest_path: Path,
     source_sha: str, app_target_sha: str, run_id: str, attempt: str,
+    workload: str = WORKLOAD,
 ) -> str:
+    if not isinstance(workload, str) or workload not in {WORKLOAD, HTML_WORKLOAD}:
+        raise _sanitization_failure("report_binding", "report_binding_rejected")
     try:
         manifest_raw, manifest, _actors = _read_manifest(manifest_path)
     except Exception:
@@ -2557,6 +2668,7 @@ def sanitize_capacity_report(
     failure_receipt = _project_parent_failure_receipt(value)
     if failure_receipt is not None:
         if any((
+            failure_receipt.get("workload", WORKLOAD) != workload,
             failure_receipt.get("source_sha") != source_sha,
             failure_receipt.get("app_target_sha") != app_target_sha,
             failure_receipt.get("external_run_id") != run_id,
@@ -2584,7 +2696,8 @@ def sanitize_capacity_report(
             raise _sanitization_failure("output_write", "output_write_failed") from None
         return "INVALID"
     projected = _project_capacity_report(value)
-    if (projected is None or projected.get("source_sha") != source_sha
+    if (projected is None or projected.get("workload") != workload
+            or projected.get("source_sha") != source_sha
             or projected.get("app_target_sha") != app_target_sha
             or projected.get("external_run_id") != run_id
             or projected.get("external_run_attempt") != attempt
@@ -2605,6 +2718,7 @@ def sanitize_capacity_report(
         projected, source_sha=source_sha, app_target_sha=app_target_sha,
         run_id=run_id, attempt=attempt,
         manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+        workload=workload,
     )
 
 
@@ -2619,7 +2733,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--app-target-sha")
     parser.add_argument("--external-run-id")
     parser.add_argument("--external-run-attempt")
-    parser.add_argument("--concurrency", type=int, choices=tuple(sorted(CONCURRENCY_PRESETS)))
+    parser.add_argument("--concurrency", type=int, choices=tuple(sorted(CONCURRENCY_PRESETS | HTML_CONCURRENCY_PRESETS)))
+    parser.add_argument("--workload", choices=(WORKLOAD, HTML_WORKLOAD), default=WORKLOAD)
     parser.add_argument("--ssh-host", default=os.environ.get("PROD_SSH_HOST", ""))
     parser.add_argument("--ssh-user", default=os.environ.get("PROD_SSH_USER", ""))
     parser.add_argument("--ssh-config")
@@ -2636,7 +2751,7 @@ def main(argv: list[str] | None = None) -> int:
                 input_path=Path(args.input), output_path=Path(args.output),
                 manifest_path=Path(args.manifest), source_sha=args.source_sha,
                 app_target_sha=args.app_target_sha, run_id=args.external_run_id,
-                attempt=args.external_run_attempt,
+                attempt=args.external_run_attempt, workload=args.workload,
             )
         except Exception as exc:
             if isinstance(exc, _CapacitySanitizationError):
@@ -2652,6 +2767,8 @@ def main(argv: list[str] | None = None) -> int:
     if (not args.manifest or not args.report or not args.source_sha or not args.app_target_sha
             or not args.external_run_id or not args.external_run_attempt
             or args.concurrency is None or not args.ssh_config or not args.ssh_key
+            or not isinstance(args.workload, str)
+            or args.workload not in {WORKLOAD, HTML_WORKLOAD}
             or re.fullmatch(r"[A-Za-z0-9.-]{1,253}", args.ssh_host) is None
             or re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", args.ssh_user) is None):
         parser.error("parent command arguments are incomplete")
@@ -2742,7 +2859,9 @@ def main(argv: list[str] | None = None) -> int:
             and isinstance(stage_state.get("profile_digest"), str)
             and re.fullmatch(r"[0-9a-f]{64}", stage_state["profile_digest"]) is not None
             and type(stage_state.get("concurrency", args.concurrency)) is int
-            and stage_state.get("concurrency", args.concurrency) in CONCURRENCY_PRESETS
+            and stage_state.get("concurrency", args.concurrency) in _profile_spec(
+                stage_state.get("workload", getattr(args, "workload", WORKLOAD)),
+            )[1]
         )
         if identity:
             receipt = _parent_failure_receipt(
@@ -2758,6 +2877,7 @@ def main(argv: list[str] | None = None) -> int:
                 concurrency=stage_state.get("concurrency", args.concurrency),
                 prepare_lifecycle=prepare_lifecycle,
                 cleanup_lifecycle=cleanup_lifecycle, cleanup_ok=cleanup_ok,
+                workload=stage_state.get("workload", getattr(args, "workload", WORKLOAD)),
             )
             try:
                 if not os.path.lexists(args.report):

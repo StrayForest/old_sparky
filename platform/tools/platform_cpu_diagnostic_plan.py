@@ -48,7 +48,9 @@ MIN_PLAN_LEAD_MS = 45_000
 MAX_PLAN_LEAD_MS = 60_000
 WORKLOAD = "authenticated_workspace_read_pair_v1"
 CAPACITY_WORKLOAD = "authenticated_workspace_read_capacity_v1"
-SUPPORTED_WORKLOADS = frozenset({WORKLOAD, CAPACITY_WORKLOAD})
+HTML_CAPACITY_WORKLOAD = "authenticated_html_ssr_capacity_v1"
+SUPPORTED_WORKLOADS = frozenset({WORKLOAD, CAPACITY_WORKLOAD, HTML_CAPACITY_WORKLOAD})
+MEMORY_WATCH_WORKLOADS = frozenset({CAPACITY_WORKLOAD, HTML_CAPACITY_WORKLOAD})
 OFF_WINDOW_MS = 20_000
 IDLE_WINDOW_MS = 5_000
 ON_WINDOW_MS = 20_000
@@ -118,7 +120,8 @@ def _read_request(command: str, stream: Any = None) -> argparse.Namespace:
     if command == "memory-watch-stdin":
         if (set(payload) != {"schema", "run_id", "source_sha", "workload"}
                 or type(payload.get("schema")) is not int or payload.get("schema") != 1
-                or payload.get("workload") != CAPACITY_WORKLOAD
+                or not isinstance(payload.get("workload"), str)
+                or payload.get("workload") not in MEMORY_WATCH_WORKLOADS
                 or not isinstance(payload.get("run_id"), str)
                 or RUN_RE.fullmatch(payload["run_id"]) is None
                 or not isinstance(payload.get("source_sha"), str)
@@ -1438,6 +1441,7 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                     or raw != _canonical_json(payload)
                     or payload.get("run_id") != args.run_id
                     or payload.get("schema") != 1
+                    or not isinstance(payload.get("workload"), str)
                     or payload.get("workload") not in SUPPORTED_WORKLOADS
                     or payload.get("expires_at_ms") != payload.get("on_end_ms")
                     or any(type(payload.get(key)) is not int for key in (
@@ -1616,7 +1620,8 @@ def _capacity_plan_identity(
     if (not isinstance(plan, dict) or raw != _canonical_json(plan)
             or plan.get("schema") != 1
             or plan.get("run_id") != run_id or plan.get("source_sha") != source_sha
-            or plan.get("workload") != CAPACITY_WORKLOAD
+            or not isinstance(plan.get("workload"), str)
+            or plan.get("workload") not in MEMORY_WATCH_WORKLOADS
             or plan.get("expires_at_ms") != plan.get("on_end_ms")
             or any(type(plan.get(key)) is not int for key in (
                 "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms", "expires_at_ms"
@@ -1643,6 +1648,8 @@ def watch_capacity_memory(args: argparse.Namespace):
     if os.geteuid() != 0:
         raise PlanError("root identity required")
     web_unit, target, plan = _capacity_plan_identity(args.run_id, args.source_sha)
+    if getattr(args, "workload", None) != plan.get("workload"):
+        raise PlanError("capacity watch workload binding changed")
     control_group = web_unit["ControlGroup"]
     if control_group != "/system.slice/deadlock-web.service":
         raise PlanError("capacity watch control group changed")
@@ -1723,7 +1730,7 @@ def watch_capacity_memory(args: argparse.Namespace):
             "schema": 1,
             "run_id": args.run_id,
             "source_sha": args.source_sha,
-            "workload": CAPACITY_WORKLOAD,
+            "workload": plan["workload"],
             "sequence": sequence,
             "elapsed_ms": max(0, now_ms - off_start_ms),
             "phase": phase,

@@ -230,6 +230,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "schema": 1,
             "workload": "authenticated_workspace_read_capacity_v1",
             "fixture_kind": "ssr_capacity_diagnostic_v1",
+            "source_sha": "a" * 40,
+            "app_target_sha": "b" * 40,
+            "external_run_id": "12345",
+            "external_run_attempt": "1",
             "report_complete": True,
             "namespace_closed": True,
             "matrix_credit": False,
@@ -241,6 +245,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         def evaluate(
             payload: dict[str, object], *, cpu_only: bool = False,
             capacity_only: bool = False,
+            capacity_workload: str = "authenticated_workspace_read_capacity_v1",
         ) -> dict[str, str]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp = Path(temp_dir)
@@ -260,6 +265,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     **os.environ,
                     "RUNNER_TEMP": str(temp),
                     "GITHUB_OUTPUT": str(output_file),
+                    "EXPECTED_SSR_WORKLOAD": capacity_workload,
+                    "EXPECTED_SOURCE_SHA": "a" * 40,
+                    "EXPECTED_APP_TARGET_SHA": "b" * 40,
+                    "EXPECTED_EXTERNAL_RUN_ID": "12345",
+                    "EXPECTED_EXTERNAL_RUN_ATTEMPT": "1",
                 }
                 result = subprocess.run(
                     [
@@ -317,6 +327,35 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             ],
             "1",
         )
+        html_capacity_report = {
+            **capacity_report,
+            "workload": "authenticated_html_ssr_capacity_v1",
+            "fixture_kind": "ssr_html_capacity_diagnostic_v1",
+        }
+        self.assertEqual(
+            evaluate(
+                html_capacity_report,
+                capacity_only=True,
+                capacity_workload="authenticated_html_ssr_capacity_v1",
+            )["namespace_closed_status"],
+            "0",
+        )
+        self.assertEqual(
+            evaluate(
+                {**html_capacity_report, "source_sha": "c" * 40},
+                capacity_only=True,
+                capacity_workload="authenticated_html_ssr_capacity_v1",
+            )["namespace_closed_status"],
+            "1",
+        )
+        self.assertEqual(
+            evaluate(
+                html_capacity_report,
+                capacity_only=True,
+                capacity_workload="authenticated_workspace_read_capacity_v1",
+            )["namespace_closed_status"],
+            "1",
+        )
 
     def test_capacity_dispatch_runs_only_the_typed_client_and_14_user_fixture(self) -> None:
         validate = self.jobs["validate-external-inputs"]
@@ -337,10 +376,20 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "Run the fixed authenticated workspace CPU pair", 1
         )[1])
         self.assertIn("ssr_capacity_concurrency:", self.source)
+        self.assertIn("ssr_capacity_workload:", self.source)
+        self.assertIn("authenticated_html_ssr_capacity_v1", self.source)
         self.assertIn('default: "8"', self.source)
-        self.assertIn('options:\n          - "8"\n          - "16"', self.source)
+        self.assertIn('options:\n          - "8"\n          - "16"\n          - "32"\n          - "64"', self.source)
         self.assertIn("--concurrency '${{ inputs.ssr_capacity_concurrency }}'", pair)
         self.assertIn('payload["ssr_capacity_concurrency"] = os.environ["SSR_CAPACITY_CONCURRENCY"]', validate)
+        self.assertIn('payload["ssr_capacity_workload"] = os.environ["SSR_CAPACITY_WORKLOAD"]', validate)
+        barrier = self.jobs["namespace-containment-barrier"]
+        self.assertIn('EXPECTED_SSR_WORKLOAD: ${{ inputs.ssr_capacity_workload }}', barrier)
+        self.assertIn('EXPECTED_SOURCE_SHA: ${{ github.sha }}', barrier)
+        self.assertIn('EXPECTED_APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}', barrier)
+        self.assertIn('payload.get("workload") != expected_workload', barrier)
+        self.assertIn('payload.get("fixture_kind") != expected_fixture', barrier)
+        self.assertIn('payload.get("source_sha") != os.environ.get("EXPECTED_SOURCE_SHA")', barrier)
         self.assertNotIn("platform_external_load.py", pair)
         self.assertIn('"tournament_count": "1" if diagnostic_only else tournaments', validate)
         self.assertIn('"users_per_tournament": "14" if diagnostic_only else users', validate)
@@ -352,6 +401,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "${{ inputs.ssr_capacity_diagnostic_only }}", "true"
         ).replace(
             "${{ inputs.ssr_capacity_concurrency }}", "8"
+        ).replace(
+            "${{ inputs.ssr_capacity_workload }}", "authenticated_workspace_read_capacity_v1"
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             env = {
@@ -376,6 +427,23 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 env=env, capture_output=True, text=True, check=False,
             )
             self.assertEqual(accepted_16.returncode, 0, accepted_16.stderr)
+            html_32_script = guard_script.replace(
+                "SSR_CAPACITY_WORKLOAD='authenticated_workspace_read_capacity_v1'",
+                "SSR_CAPACITY_WORKLOAD='authenticated_html_ssr_capacity_v1'",
+            ).replace("SSR_CAPACITY_CONCURRENCY='8'", "SSR_CAPACITY_CONCURRENCY='32'")
+            html_32 = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", html_32_script],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(html_32.returncode, 0, html_32.stderr)
+            workspace_32 = guard_script.replace(
+                "SSR_CAPACITY_CONCURRENCY='8'", "SSR_CAPACITY_CONCURRENCY='32'"
+            )
+            rejected_workspace_32 = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", workspace_32],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(rejected_workspace_32.returncode, 0)
             non_ssr_16_script = accepted_16_script.replace(
                 "SSR_CAPACITY_DIAGNOSTIC_ONLY='true'", "SSR_CAPACITY_DIAGNOSTIC_ONLY='false'"
             )
@@ -401,6 +469,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             job_env["SSR_CAPACITY_CONCURRENCY"],
             "${{ inputs.ssr_capacity_concurrency }}",
         )
+        self.assertEqual(
+            job_env["SSR_CAPACITY_WORKLOAD"],
+            "${{ inputs.ssr_capacity_workload }}",
+        )
 
         validate_step = _step_script(
             self.jobs["validate-external-inputs"],
@@ -414,6 +486,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         assert function is not None
         self.assertIn(
             'SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY"',
+            function.group(0),
+        )
+        self.assertIn(
+            'SSR_CAPACITY_WORKLOAD="$SSR_CAPACITY_WORKLOAD"',
             function.group(0),
         )
         self.assertIn(
@@ -439,6 +515,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     "APP_TARGET_SHA": "a" * 40,
                     "GITHUB_RUN_ID": "40118074720",
                     "SSR_CAPACITY_CONCURRENCY": "8",
+                    "SSR_CAPACITY_WORKLOAD": "authenticated_workspace_read_capacity_v1",
                 },
                 capture_output=True,
                 text=True,
@@ -1533,6 +1610,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "cpu_diagnostic_only": False,
             "ssr_capacity_diagnostic_only": False,
             "ssr_capacity_concurrency": "8",
+            "ssr_capacity_workload": "authenticated_workspace_read_capacity_v1",
         }
         invalid_payloads = (
             json.dumps({"inputs": {**valid_inputs, "unexpected": "value"}}),

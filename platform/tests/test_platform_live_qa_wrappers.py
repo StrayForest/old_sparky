@@ -3390,6 +3390,13 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "attestation_job_id": "654321",
         }
         valid_deploy = {**valid, "schema": 2, "host_tools": host_tools}
+        self.assertEqual(
+            validate_deployment_payload({
+                **valid_deploy,
+                "runtime_profile": "authenticated-read-admission-24x8-native",
+            })["runtime_profile"],
+            "authenticated-read-admission-24x8-native",
+        )
         for invalid_payload in (
             {**valid, "schema": 2},
             {**valid_deploy, "schema": 1},

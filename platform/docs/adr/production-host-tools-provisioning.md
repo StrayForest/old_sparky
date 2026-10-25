@@ -26,10 +26,10 @@ all 15 members, the isolated self-test and no bytecode. S10
 `b0ff2f0483c281538699b1a0104e071b9b319d89b2cf8512c4951f307d394ec7`, S9
 `7a9fe1286054dbe96221d2b428048c4212270cf5`, and recovery generation
 `d47ae6a278f76bb8a46cca0bbe9019427584c3d2861880e8a7365d87a627be66` remain
-preserved. SSR diagnostics use C `d2cb3b2ba0425e08d60904f442240400b199db12`
-and pin-only P `7c40b6fd5e035238c6d43ea206357eca8e6aa53a`; P records the exact
-15-member closure. Exact-P CI, preflight, signed-bundle verification, root
-provisioning and self-test remain required; the pin does not prove installation.
+preserved. Earlier SSR diagnostics used C `d2cb3b2ba0425e08d60904f442240400b199db12` and pin P `7c40b6fd5e035238c6d43ea206357eca8e6aa53a` for the exact 15-member closure.
+The current guarded authenticated HTML SSR diagnostic uses C `8af09bfe67dfd8cdb192c85c9300fb8842d9f37b` and pin-only P `fcc74008fd67b2bf6065adbf6c91e95fb31b826c`; P retains that closure and updates exactly four digests:
+`platform/tools/platform_configure_shared_env.py`, `platform/tools/platform_cpu_diagnostic_plan.py`, `platform/tools/platform_production_deploy_supervisor.sh`, and `platform/tools/platform_workflow_input_guard.py`.
+Pin resolution selects repository source only; it does not prove production build, provisioning or installation. Exact-P CI, signed preflight, approved provisioning and installed self-test remain required.
 The retained-load export-authority bump uses **C**
 `47551d9c9278da79234314aade6aa1ce55d7f979` and pin commit **P**
 `b806ff4f141b29d2d970ada36b2e3521cd2ce1e9`; the pin records C's exact

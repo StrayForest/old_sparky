@@ -18,6 +18,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
+from html.parser import HTMLParser
 import http.client
 import hashlib
 import json
@@ -1634,6 +1635,10 @@ class RequestResult:
     elapsed_ms: float
     ok: bool
     response_bytes: int
+    # Filled only by the zero-credit authenticated HTML capacity diagnostic;
+    # never serialize the header value or response body into a report.
+    html_content_type_ok: bool | None = None
+    html_page_marker_ok: bool | None = None
     time_to_first_byte_ms: float | None = None
     cf_ray: str | None = None
     cf_error_type: str | None = None
@@ -3152,10 +3157,13 @@ def _page_request(
     diagnostic_id: str | None = None,
     transport: str = DEFAULT_CLIENT_TRANSPORT,
     diagnostic_trace_run_id: str | None = None,
+    require_authenticated_html: bool = False,
     budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     """Measure the real Next.js HTML response, including server TTFB."""
 
+    if require_authenticated_html and transport != HTTP11_KEEPALIVE_TRANSPORT:
+        raise ExternalLoadError("authenticated HTML validation requires pinned HTTP/1.1 keep-alive")
     if transport == HTTP11_KEEPALIVE_TRANSPORT:
         return _page_request_http11_keepalive(
             origin,
@@ -3166,6 +3174,7 @@ def _page_request(
             csrf_cookie_name=csrf_cookie_name,
             diagnostic_id=diagnostic_id,
             diagnostic_trace_run_id=diagnostic_trace_run_id,
+            require_authenticated_html=require_authenticated_html,
             budget=budget,
         )
     if transport != DEFAULT_CLIENT_TRANSPORT:
@@ -3221,6 +3230,7 @@ def _page_request_http11_keepalive(
     csrf_cookie_name: str,
     diagnostic_id: str | None = None,
     diagnostic_trace_run_id: str | None = None,
+    require_authenticated_html: bool = False,
     budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     """Measure a page request over explicit HTTP/1.1 per-thread keep-alive."""
@@ -3268,7 +3278,17 @@ def _page_request_http11_keepalive(
             budget.check(phase, operation="body_complete")
         finished_at = time.monotonic()
         status = response.status
+        html_content_type_ok: bool | None = None
+        html_page_marker_ok: bool | None = None
+        if require_authenticated_html:
+            html_content_type_ok, html_page_marker_ok = _authenticated_html_markers(
+                response.headers.get("content-type", ""), response.body,
+            )
         error_kind = None if status == 200 else "unexpected_status"
+        if status == 200 and require_authenticated_html and not html_content_type_ok:
+            error_kind = "unexpected_content_type"
+        elif status == 200 and require_authenticated_html and not html_page_marker_ok:
+            error_kind = "page_marker_missing"
         cf_error_type = response.headers.get("cf-error-type") or None
         cf_error_origin = response.headers.get("cf-error-origin") or None
         retry_after = response.headers.get("retry-after") or None
@@ -3278,8 +3298,10 @@ def _page_request_http11_keepalive(
             path=path,
             status=status,
             elapsed_ms=float(response.timing.get("total_ms") or 0.0),
-            ok=status == 200,
+            ok=status == 200 and error_kind is None,
             response_bytes=len(response.body),
+            html_content_type_ok=html_content_type_ok,
+            html_page_marker_ok=html_page_marker_ok,
             time_to_first_byte_ms=(
                 float(response.timing["ttfb_ms"])
                 if isinstance(response.timing.get("ttfb_ms"), (int, float))
@@ -3327,6 +3349,55 @@ def _page_request_http11_keepalive(
             finished_at_monotonic=finished_at,
             user_observed_elapsed_ms=max(0.0, finished_at - started_at) * 1000,
         )
+
+
+class _AuthenticatedHtmlMarkerParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.lifecycle = False
+        self.ready_detail = False
+        self.authenticated_header = False
+
+    @property
+    def complete(self) -> bool:
+        return self.lifecycle and self.ready_detail and self.authenticated_header
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        classes = set((values.get("class") or "").split())
+        if tag == "span":
+            if values.get("data-testid") == "tournament-detail-lifecycle":
+                self.lifecycle = True
+            if "header-profile-avatar" in classes:
+                self.authenticated_header = True
+        elif tag == "section" and "top-detail-grid" in classes:
+            self.ready_detail = True
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+
+def _authenticated_html_markers(content_type: Any, body: Any) -> tuple[bool, bool]:
+    """Return closed authenticated-page flags without retaining body values."""
+
+    media_type = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else ""
+    content_type_ok = media_type == "text/html"
+    if not isinstance(body, bytes) or len(body) > RESPONSE_BODY_LIMIT:
+        return content_type_ok, False
+
+    parser = _AuthenticatedHtmlMarkerParser()
+    try:
+        # HTTP11KeepAliveClient assembles the bounded response chunks before
+        # returning. Re-feed small slices so tokenization adds bounded
+        # temporary memory; HTMLParser carries partial tags across slices.
+        for offset in range(0, len(body), 64 * 1024):
+            parser.feed(body[offset:offset + 64 * 1024].decode("utf-8", errors="replace"))
+            if parser.complete:
+                break
+        parser.close()
+    except (AssertionError, ValueError):
+        return content_type_ok, False
+    return content_type_ok, parser.complete
 
 
 def _route_for_read(index: int, slug: str) -> str:
@@ -3517,6 +3588,8 @@ def run_authenticated_workspace_capacity_phase(
     timeout: float,
     request_builder: Callable[[str, VirtualUser, str, float], Any],
     stop_requested: Callable[[], str | None],
+    abort_on_result: Callable[[Any], str | None] | None = None,
+    max_supported_concurrency: int = 16,
     progress_callback: Callable[[str, Any | None], None] | None = None,
     executor: ThreadPoolExecutor | None = None,
 ) -> dict[str, Any]:
@@ -3528,7 +3601,9 @@ def run_authenticated_workspace_capacity_phase(
     to finish under their request timeout.
     """
 
-    if (not actors or type(concurrency) is not int or not 1 <= concurrency <= 16
+    if (not actors or type(max_supported_concurrency) is not int
+            or not 1 <= max_supported_concurrency <= 64
+            or type(concurrency) is not int or not 1 <= concurrency <= max_supported_concurrency
             or type(duration_seconds) not in (int, float)
             or isinstance(duration_seconds, bool) or duration_seconds != 20
             or type(start_at_epoch_ms) is not int or type(end_at_epoch_ms) is not int
@@ -3604,18 +3679,51 @@ def run_authenticated_workspace_capacity_phase(
                 ),
                 return_when=FIRST_COMPLETED,
             )
-            for future in sorted(done, key=in_flight.__getitem__):
-                in_flight.pop(future, None)
-                result = future.result()
-                results.append(result)
-                if progress_callback is not None:
+            if abort_on_result is None:
+                # Preserve the established workspace-capacity scheduling path.
+                for future in sorted(done, key=in_flight.__getitem__):
+                    in_flight.pop(future, None)
+                    result = future.result()
+                    results.append(result)
+                    if progress_callback is not None:
+                        try:
+                            progress_callback("http", result)
+                        except Exception:
+                            pass
+                    _release_result_payload(result)
+                    if abort_reason is None and time.monotonic() < deadline:
+                        submit_one()
+            else:
+                completed_batch: list[Any] = []
+                for future in sorted(done, key=in_flight.__getitem__):
+                    in_flight.pop(future, None)
+                    result = future.result()
+                    results.append(result)
+                    completed_batch.append(result)
+                    if progress_callback is not None:
+                        try:
+                            progress_callback("http", result)
+                        except Exception:
+                            pass
+                    _release_result_payload(result)
+                # Inspect every already-completed response before submitting
+                # replacements, so a peer 5xx in the same wait batch cannot
+                # be hidden behind a successful response's refill.
+                for result in completed_batch:
                     try:
-                        progress_callback("http", result)
+                        result_reason = abort_on_result(result)
                     except Exception:
-                        pass
-                _release_result_payload(result)
+                        result_reason = "guard_unavailable"
+                    if result_reason is not None:
+                        abort_reason = (
+                            result_reason if result_reason == "response_failure"
+                            else "guard_unavailable"
+                        )
+                        break
                 if abort_reason is None and time.monotonic() < deadline:
-                    submit_one()
+                    for _result in completed_batch:
+                        if not submit_one():
+                            break
     except BaseException:
         for future in in_flight:
             future.cancel()
