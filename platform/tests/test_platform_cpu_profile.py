@@ -449,8 +449,15 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         same_read_failure = consume_terminal_then_tail([terminal_wire + same_read_marker])
         self.assertEqual(same_read_failure["status"], "incomplete")
         self.assertEqual(same_read_failure["failure_stage"], "terminal_drain")
-        self.assertEqual(same_read_failure["remote_failure_stage"], "unknown")
-        self.assertEqual(same_read_failure["remote_failure_reason"], "unexpected")
+        self.assertIsNone(same_read_failure["remote_failure_stage"])
+        self.assertIsNone(same_read_failure["remote_failure_reason"])
+
+        malformed_tail_failure = consume_terminal_then_tail([
+            terminal_wire + b"\xff",
+        ])
+        self.assertEqual(malformed_tail_failure["status"], "incomplete")
+        self.assertEqual(malformed_tail_failure["failure_stage"], "terminal_drain")
+        self.assertIsNone(malformed_tail_failure["remote_failure_stage"])
 
         later_read_payload = wire_prefix + b'{"sequence":2}\n'
         later_read_failure = consume_terminal_then_tail([
@@ -4060,13 +4067,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     + json.dumps({
                         "status": "expired_plans_removed", **cleanup_result,
                     }, sort_keys=True, separators=(",", ":"))
-                    + "\\n"
+                    + "\n"
                 )
                 fake_sudo.write_text(
-                    f"#!{sys.executable}\\n"
-                    "import sys\\n"
-                    "sys.stdin.buffer.read()\\n"
-                    f"sys.stdout.buffer.write({helper_line.encode('ascii')!r})\\n",
+                    f"#!{sys.executable}\n"
+                    "import sys\n"
+                    "sys.stdin.buffer.read()\n"
+                    f"sys.stdout.buffer.write({helper_line.encode('ascii')!r})\n",
                     encoding="ascii",
                 )
                 fake_sudo.chmod(0o700)

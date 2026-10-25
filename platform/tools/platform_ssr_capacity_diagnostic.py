@@ -373,6 +373,30 @@ class _RemoteMemoryWatcher:
             if len(trailing_fragment) > REMOTE_ROW_CAP:
                 raise ValueError("memory observer row cap exceeded")
 
+    def _drain_after_terminal(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        if self.selector is None:
+            raise ValueError("memory observer selector is unavailable")
+        if self.pending:
+            raise ValueError("memory observer emitted output after terminal row")
+        descriptor = self.process.stdout.fileno()
+        deadline = time.monotonic() + 5
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("memory observer terminal drain deadline exceeded")
+            ready = self.selector.select(min(remaining, 0.25))
+            if not ready:
+                continue
+            chunk = os.read(descriptor, min(4096, REMOTE_WATCH_CAP + 1 - self.total))
+            if not chunk:
+                self.selector.unregister(descriptor)
+                return
+            self.total += len(chunk)
+            if self.total > REMOTE_WATCH_CAP:
+                raise ValueError("memory observer output cap exceeded")
+            raise ValueError("memory observer emitted output after terminal row")
+
     def _accept(self, row: Mapping[str, Any]) -> None:
         expected_fields = {
             "schema", "run_id", "source_sha", "workload", "sequence", "elapsed_ms",
@@ -549,11 +573,7 @@ class _RemoteMemoryWatcher:
                 self._set_stage("row_accept")
                 self._accept(row)
             self._set_stage("terminal_drain")
-            while True:
-                trailing = self._read_row(5, allow_eof=True)
-                if trailing is None:
-                    break
-                raise ValueError("memory observer emitted output after terminal row")
+            self._drain_after_terminal()
             self._set_stage("terminal_wait")
             if self.process is None or self.process.wait(timeout=5) != 0:
                 raise ValueError("memory observer exit status rejected")
