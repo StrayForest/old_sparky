@@ -634,11 +634,17 @@ jobs:
 
       - name: Revalidate external handoff and exact target SHA
         shell: bash
+        env:
+          EXPECTED_CPU_DIAGNOSTIC_ONLY: ${{ inputs.cpu_diagnostic_only }}
+          EXPECTED_SSR_CAPACITY_DIAGNOSTIC_ONLY: ${{ inputs.ssr_capacity_diagnostic_only }}
+          EXPECTED_SSR_WORKLOAD: ${{ inputs.ssr_capacity_workload }}
+          EXPECTED_SSR_CONCURRENCY: ${{ inputs.ssr_capacity_concurrency }}
         run: |
           set -euo pipefail
           test -f "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" && test ! -L "$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
           /usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$TARGET_SHA" "$RUN_ID" "$APP_TARGET_SHA" <<'PY'
           import json
+          import os
           from pathlib import Path
           import re
           import sys
@@ -672,6 +678,23 @@ jobs:
           fixture_kind = payload.get("fixture_kind", "external_load")
           if fixture_kind not in {"external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
               raise SystemExit("external handoff fixture mode is invalid")
+          cpu_selected = os.environ.get("EXPECTED_CPU_DIAGNOSTIC_ONLY") == "true"
+          ssr_selected = os.environ.get("EXPECTED_SSR_CAPACITY_DIAGNOSTIC_ONLY") == "true"
+          if cpu_selected and fixture_kind != "cpu_diagnostic_only_v1":
+              raise SystemExit("CPU diagnostic handoff does not match the requested mode")
+          if not cpu_selected and fixture_kind == "cpu_diagnostic_only_v1":
+              raise SystemExit("unexpected CPU diagnostic handoff fixture")
+          expected_fixture_kind = {
+              "authenticated_workspace_read_capacity_v1": "ssr_capacity_diagnostic_v1",
+              "authenticated_html_ssr_capacity_v1": "ssr_html_capacity_diagnostic_v1",
+          }.get(os.environ.get("EXPECTED_SSR_WORKLOAD", ""))
+          if (
+              ssr_selected
+              and (expected_fixture_kind is None or fixture_kind != expected_fixture_kind)
+          ):
+              raise SystemExit("SSR capacity handoff does not match the requested mode")
+          if not ssr_selected and fixture_kind in capacity_kinds:
+              raise SystemExit("unexpected SSR capacity handoff fixture")
           if fixture_kind in {"cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"} and (
               payload.get("confirmation") != (
                   "RUN-PRODUCTION-CPU-DIAGNOSTIC" if fixture_kind == "cpu_diagnostic_only_v1"
@@ -690,6 +713,15 @@ jobs:
               fixture_kind not in capacity_kinds and (ssr_concurrency is not None or ssr_workload is not None)
           ):
               raise SystemExit("SSR capacity concurrency is invalid")
+          if ssr_selected:
+              expected_workload = os.environ.get("EXPECTED_SSR_WORKLOAD", "")
+              expected_concurrency = os.environ.get("EXPECTED_SSR_CONCURRENCY", "")
+              if (
+                  expected_concurrency not in ({"8", "16"} if fixture_kind == "ssr_capacity_diagnostic_v1" else {"8", "16", "32", "64"})
+                  or ssr_concurrency != expected_concurrency
+                  or (fixture_kind == "ssr_html_capacity_diagnostic_v1" and ssr_workload != expected_workload)
+              ):
+                  raise SystemExit("SSR capacity handoff does not match the requested diagnostic")
           if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None or re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None:
               raise SystemExit("external handoff exact target SHA is malformed")
           for key, maximum in (("setup_concurrency", 256), ("tournament_count", 40), ("users_per_tournament", 500)):
@@ -2283,6 +2315,8 @@ jobs:
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       CPU_DIAGNOSTIC_ONLY: ${{ inputs.cpu_diagnostic_only }}
       SSR_CAPACITY_DIAGNOSTIC_ONLY: ${{ inputs.ssr_capacity_diagnostic_only }}
+      SSR_CAPACITY_CONCURRENCY: ${{ inputs.ssr_capacity_concurrency }}
+      SSR_CAPACITY_WORKLOAD: ${{ inputs.ssr_capacity_workload }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
       CANDIDATE_ARTIFACT_ID: ${{ (inputs.cpu_diagnostic_only || inputs.ssr_capacity_diagnostic_only) && needs['cpu-diagnostic-pair'].outputs.candidate_artifact_id || needs.load-client.outputs.candidate_artifact_id }}
       HOST_TOOLS_SHA: ${{ needs.resolve-host-tools-pin.outputs.host_tools_sha }}
@@ -2630,16 +2664,51 @@ jobs:
             set +e
             /usr/bin/python3 - "$input_path" "$TARGET_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$RUNNER_TEMP/external-client/timeout-diagnostic-ids.json" "$RUNNER_TEMP/external-client/timeout-diagnostic-ids.remote.json" <<'PY'
           import json
+          import os
           from pathlib import Path
           import re
           import sys
           path, target_sha, app_target_sha, run_id, ids_path, remote_ids_path = sys.argv[1:]
           payload = json.loads(Path(path).read_text(encoding="utf-8"))
           base_keys = {"schema", "confirmation", "target_sha", "control_email", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics"}
+          fixture_kind = payload.get("fixture_kind")
+          if fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
+              base_keys.add("ssr_capacity_concurrency")
+          if fixture_kind == "ssr_html_capacity_diagnostic_v1":
+              base_keys.add("ssr_capacity_workload")
           binding = payload.get("source_binding")
           expected = base_keys | ({"fixture_kind"} if "fixture_kind" in payload else set()) | ({"source_binding"} if binding is not None else set())
           if set(payload) != expected or payload.get("schema") not in (1, "1", 2, "2") or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id:
               raise SystemExit("external finalizer handoff schema or exact target SHA mismatch")
+          capacity_mode = os.environ.get("SSR_CAPACITY_DIAGNOSTIC_ONLY") == "true"
+          if capacity_mode:
+              expected_workload = os.environ.get("SSR_CAPACITY_WORKLOAD")
+              expected_concurrency = os.environ.get("SSR_CAPACITY_CONCURRENCY")
+              expected_fixture_kind = {
+                  "authenticated_workspace_read_capacity_v1": "ssr_capacity_diagnostic_v1",
+                  "authenticated_html_ssr_capacity_v1": "ssr_html_capacity_diagnostic_v1",
+              }.get(expected_workload)
+              allowed_concurrency = (
+                  {"8", "16", "32", "64"}
+                  if expected_fixture_kind == "ssr_html_capacity_diagnostic_v1"
+                  else {"8", "16"}
+              )
+              if (
+                  fixture_kind != expected_fixture_kind
+                  or expected_concurrency not in allowed_concurrency
+                  or payload.get("ssr_capacity_concurrency") != expected_concurrency
+                  or (
+                      fixture_kind == "ssr_html_capacity_diagnostic_v1"
+                      and payload.get("ssr_capacity_workload") != expected_workload
+                  )
+                  or (
+                      fixture_kind == "ssr_capacity_diagnostic_v1"
+                      and "ssr_capacity_workload" in payload
+                  )
+              ):
+                  raise SystemExit("SSR capacity finalizer binding is invalid")
+          elif fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
+              raise SystemExit("unexpected SSR capacity finalizer fixture")
           if binding is None:
               if payload.get("schema") not in (1, "1") or app_target_sha != target_sha:
                   raise SystemExit("same-source finalizer handoff SHA mismatch")

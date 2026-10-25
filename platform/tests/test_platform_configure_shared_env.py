@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from tools import platform_configure_shared_env as configure
+from tools.platform_render_service_envs import render_service_env
 
 
 class PlatformConfigureSharedEnvTests(unittest.TestCase):
@@ -215,6 +216,41 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         )
         self.assertEqual(admission_profile["PLATFORM_WEB_SERVER_AUTH_TRANSPORT"], "fetch")
         self.assertEqual(native_profile["PLATFORM_WEB_SERVER_AUTH_TRANSPORT"], "node")
+        native_content, _changed = configure.merge_baseline(
+            ["PLATFORM_WEB_SERVER_AUTH_TRANSPORT=fetch"], baseline=native_profile,
+        )
+        native_values = {
+            key: f"{key}={value}"
+            for key, value in (
+                line.split("=", 1) for line in native_content.splitlines() if "=" in line
+            )
+        }
+        native_web_env = render_service_env("web", native_values)
+        self.assertIn("PLATFORM_WEB_SERVER_AUTH_TRANSPORT=node", native_web_env)
+
+        restored_content, _changed = configure.merge_baseline(
+            native_content.splitlines(), baseline=admission_profile,
+        )
+        restored_values = {
+            key: f"{key}={value}"
+            for key, value in (
+                line.split("=", 1) for line in restored_content.splitlines() if "=" in line
+            )
+        }
+        restored_web_env = render_service_env("web", restored_values)
+        self.assertIn("PLATFORM_WEB_SERVER_AUTH_TRANSPORT=fetch", restored_web_env)
+        self.assertEqual(
+            restored_values["PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY"],
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY=24",
+        )
+        self.assertEqual(
+            restored_values["PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS"],
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS=8",
+        )
+        self.assertEqual(
+            restored_values["PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS"],
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS=250",
+        )
         self.assertEqual(
             configure.RUNTIME_PROFILES["pool-pre-ping-off"],
             {"PLATFORM_DB_POOL_PRE_PING": "false"},

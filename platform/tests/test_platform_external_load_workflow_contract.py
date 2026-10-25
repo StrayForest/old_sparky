@@ -401,6 +401,185 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("ssr_capacity_concurrency:", self.source)
         self.assertIn("ssr_capacity_workload:", self.source)
         self.assertIn("authenticated_html_ssr_capacity_v1", self.source)
+        handoff_revalidation_steps = yaml.safe_load(self.source)["jobs"]["fixture-setup"]["steps"]
+        revalidation_step = next(
+            step for step in handoff_revalidation_steps
+            if step.get("name") == "Revalidate external handoff and exact target SHA"
+        )
+        handoff_revalidation = revalidation_step["run"]
+        self.assertEqual(
+            revalidation_step["env"]["EXPECTED_SSR_WORKLOAD"],
+            "$" + "{{ inputs.ssr_capacity_workload }}",
+        )
+        self.assertEqual(
+            revalidation_step["env"]["EXPECTED_SSR_CONCURRENCY"],
+            "$" + "{{ inputs.ssr_capacity_concurrency }}",
+        )
+        self.assertEqual(
+            revalidation_step["env"]["EXPECTED_CPU_DIAGNOSTIC_ONLY"],
+            "$" + "{{ inputs.cpu_diagnostic_only }}",
+        )
+        self.assertEqual(
+            revalidation_step["env"]["EXPECTED_SSR_CAPACITY_DIAGNOSTIC_ONLY"],
+            "$" + "{{ inputs.ssr_capacity_diagnostic_only }}",
+        )
+        finalizer_handoff = _step_script(
+            self.jobs["fixture-finalize"], "Revalidate finalizer handoffs",
+        )
+        finalizer_env = yaml.safe_load(self.source)["jobs"]["fixture-finalize"]["env"]
+        self.assertEqual(
+            finalizer_env["SSR_CAPACITY_CONCURRENCY"],
+            "${{ inputs.ssr_capacity_concurrency }}",
+        )
+        self.assertEqual(
+            finalizer_env["SSR_CAPACITY_WORKLOAD"],
+            "${{ inputs.ssr_capacity_workload }}",
+        )
+        command_prefix = (
+            '/usr/bin/python3 - "$input_path" "$TARGET_SHA" "$APP_TARGET_SHA" '
+            '"$GITHUB_RUN_ID" "$RUNNER_TEMP/external-client/timeout-diagnostic-ids.json" '
+            '"$RUNNER_TEMP/external-client/timeout-diagnostic-ids.remote.json" <<\'PY\'\n'
+        )
+        self.assertIn(command_prefix, finalizer_handoff)
+        finalizer_python = finalizer_handoff.split(command_prefix, 1)[1].split("\nPY", 1)[0]
+        target_sha = "a" * 40
+
+        def run_finalizer_handoff(payload: dict[str, object], *, workload: str, concurrency: str) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory(prefix="ssr-finalizer-handoff-") as temp_dir:
+                root = Path(temp_dir)
+                handoff_path = root / "handoff.json"
+                handoff_path.write_text(json.dumps(payload), encoding="utf-8")
+                ids_path = root / "ids.json"
+                remote_ids_path = root / "ids.remote.json"
+                return subprocess.run(
+                    [sys.executable, "-", str(handoff_path), target_sha, target_sha,
+                     "12345", str(ids_path), str(remote_ids_path)],
+                    input=finalizer_python, text=True, capture_output=True, check=False,
+                    env={
+                        **os.environ,
+                        "SSR_CAPACITY_DIAGNOSTIC_ONLY": "true",
+                        "SSR_CAPACITY_WORKLOAD": workload,
+                        "SSR_CAPACITY_CONCURRENCY": concurrency,
+                    },
+                )
+
+        html_handoff: dict[str, object] = {
+            "schema": "1", "confirmation": "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC",
+            "target_sha": target_sha, "control_email": "operator@example.test",
+            "setup_concurrency": "8", "run_id": "12345", "profile": "external-vote",
+            "tournament_count": "1", "users_per_tournament": "14",
+            "timeout_diagnostics": "false", "fixture_kind": "ssr_html_capacity_diagnostic_v1",
+            "ssr_capacity_concurrency": "8",
+            "ssr_capacity_workload": "authenticated_html_ssr_capacity_v1",
+        }
+        revalidation_command = (
+            '/usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" '
+            '"$TARGET_SHA" "$RUN_ID" "$APP_TARGET_SHA" <<\'PY\'\n'
+        )
+        self.assertIn(revalidation_command, handoff_revalidation)
+        revalidation_python = handoff_revalidation.split(
+            revalidation_command, 1,
+        )[1].split("\nPY", 1)[0]
+
+        def run_input_handoff(
+            payload: dict[str, object], *, workload: str, concurrency: str,
+            ssr_selected: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory(prefix="ssr-input-handoff-") as temp_dir:
+                handoff_path = Path(temp_dir) / "handoff.json"
+                handoff_path.write_text(json.dumps(payload), encoding="utf-8")
+                return subprocess.run(
+                    [sys.executable, "-", str(handoff_path), target_sha, "12345", target_sha],
+                    input=revalidation_python, text=True, capture_output=True, check=False,
+                    env={
+                        **os.environ,
+                        "EXPECTED_CPU_DIAGNOSTIC_ONLY": "false",
+                        "EXPECTED_SSR_CAPACITY_DIAGNOSTIC_ONLY": str(ssr_selected).lower(),
+                        "EXPECTED_SSR_WORKLOAD": workload,
+                        "EXPECTED_SSR_CONCURRENCY": concurrency,
+                    },
+                )
+
+        self.assertEqual(
+            run_input_handoff(
+                html_handoff, workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+            ).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            run_input_handoff(
+                html_handoff, workload="authenticated_workspace_read_capacity_v1", concurrency="8",
+            ).returncode,
+            0,
+        )
+        mismatched_workload = dict(html_handoff)
+        mismatched_workload["ssr_capacity_workload"] = "authenticated_workspace_read_capacity_v1"
+        self.assertNotEqual(
+            run_input_handoff(
+                mismatched_workload,
+                workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+            ).returncode,
+            0,
+        )
+        wrong_concurrency = dict(html_handoff)
+        wrong_concurrency["ssr_capacity_concurrency"] = "16"
+        self.assertNotEqual(
+            run_input_handoff(
+                wrong_concurrency, workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+            ).returncode,
+            0,
+        )
+        valid_external_handoff = {
+            key: value for key, value in html_handoff.items()
+            if key not in {"ssr_capacity_concurrency", "ssr_capacity_workload"}
+        }
+        valid_external_handoff["fixture_kind"] = "external_load"
+        self.assertNotEqual(
+            run_input_handoff(
+                valid_external_handoff,
+                workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+            ).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            run_input_handoff(
+                html_handoff,
+                workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+                ssr_selected=False,
+            ).returncode,
+            0,
+        )
+        accepted_html = run_finalizer_handoff(
+            html_handoff, workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+        )
+        self.assertEqual(accepted_html.returncode, 0, accepted_html.stderr)
+        mismatched_finalizer_concurrency = dict(html_handoff)
+        mismatched_finalizer_concurrency["ssr_capacity_concurrency"] = "16"
+        rejected_finalizer_concurrency = run_finalizer_handoff(
+            mismatched_finalizer_concurrency,
+            workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+        )
+        self.assertNotEqual(rejected_finalizer_concurrency.returncode, 0)
+        mismatched_finalizer_fixture = dict(html_handoff)
+        mismatched_finalizer_fixture["fixture_kind"] = "ssr_capacity_diagnostic_v1"
+        mismatched_finalizer_fixture.pop("ssr_capacity_workload")
+        rejected_finalizer_fixture = run_finalizer_handoff(
+            mismatched_finalizer_fixture,
+            workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+        )
+        self.assertNotEqual(rejected_finalizer_fixture.returncode, 0)
+        missing_html_binding = dict(html_handoff)
+        missing_html_binding.pop("ssr_capacity_workload")
+        rejected_missing_html_binding = run_finalizer_handoff(
+            missing_html_binding, workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+        )
+        self.assertNotEqual(rejected_missing_html_binding.returncode, 0)
+        mismatched_html_binding = dict(html_handoff)
+        mismatched_html_binding["ssr_capacity_workload"] = "authenticated_workspace_read_capacity_v1"
+        rejected_mismatched_html_binding = run_finalizer_handoff(
+            mismatched_html_binding, workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+        )
+        self.assertNotEqual(rejected_mismatched_html_binding.returncode, 0)
         self.assertIn('default: "8"', self.source)
         self.assertIn('options:\n          - "8"\n          - "16"\n          - "32"\n          - "64"', self.source)
         self.assertIn("--concurrency '${{ inputs.ssr_capacity_concurrency }}'", pair)

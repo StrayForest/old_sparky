@@ -56,8 +56,39 @@ FIXTURE_USERS = 14
 ON_WINDOW_MS = 20_000
 CONTROL_BASENAME = "capacity-control.json"
 REMOTE_WATCH_PREFIX = b"CAPACITY_MEMORY_GUARD "
-REMOTE_WATCH_CAP = 128 * 1024
+REMOTE_WATCH_ERROR_PREFIX = b"CAPACITY_MEMORY_GUARD_ERROR "
+# Match the dispatcher's fixed 130s cap: at most 522 sampled/terminal rows
+# at 250ms. The parent caps each complete prefixed wire line at 2048 bytes;
+# 522 lines plus newlines remain comfortably within this cumulative 2MiB cap.
+REMOTE_WATCH_CAP = 2 * 1024 * 1024
 REMOTE_ROW_CAP = 2_048
+MEMORY_OBSERVER_FAILURE_STAGES = frozenset({
+    "ssh_material_validation", "ssh_spawn", "input_write", "first_row_read",
+    "row_decode", "row_accept", "thread_start", "sample_loop",
+    "terminal_drain", "terminal_wait", "stop_join", "unknown",
+})
+MEMORY_OBSERVER_ERROR_CLASSES = frozenset({
+    "OSError", "TimeoutError", "ValueError", "TypeError",
+    "RuntimeError", "SubprocessError", "unexpected",
+})
+REMOTE_WATCH_FAILURE_STAGES = frozenset({
+    "helper_validation", "helper_spawn", "input_write", "watch_timeout",
+    "helper_read", "output_limit", "row_framing", "row_protocol",
+    "helper_exit", "unknown",
+})
+REMOTE_WATCH_FAILURE_REASONS = frozenset({
+    "none", "refused", "spawn_error", "write_error", "timeout",
+    "read_error", "limit", "malformed", "nonzero_exit", "missing_terminal",
+    "unexpected", "unknown",
+})
+REMOTE_WATCH_FAILURE_PAIRS = frozenset({
+    ("helper_validation", "refused"), ("helper_spawn", "spawn_error"),
+    ("input_write", "write_error"), ("watch_timeout", "timeout"),
+    ("helper_read", "read_error"), ("output_limit", "limit"),
+    ("row_framing", "malformed"), ("row_protocol", "malformed"),
+    ("helper_exit", "nonzero_exit"), ("helper_exit", "missing_terminal"),
+    ("helper_exit", "unexpected"), ("unknown", "unknown"),
+})
 CPU_EDGE_TOLERANCE_NS = 250_000_000
 CPU_WINDOW_TOLERANCE_NS = 500_000_000
 # The plan is accepted only when its +52s requested start is 45–60s ahead
@@ -138,6 +169,15 @@ SSH_STDOUT_SHAPES = frozenset({
 })
 
 
+class _RemoteWatchFailure(ValueError):
+    """One fixed, closed marker emitted by the remote memory observer."""
+
+    def __init__(self, stage: str, reason: str) -> None:
+        super().__init__("remote memory observer failed")
+        self.stage = stage
+        self.reason = reason
+
+
 class _RemoteCapacityPlanError(ValueError):
     """Closed remote-plan failure retaining only the helper's lifecycle frame."""
 
@@ -197,9 +237,73 @@ class _RemoteMemoryWatcher:
         self.current_max: int | None = None
         self.peak_max: int | None = None
         self.event_max: dict[str, int] = {}
-        self._lock = threading.Lock()
+        self._failure_lock = threading.Lock()
+        self.failure_stage: str | None = None
+        self.error_class: str | None = None
+        self.remote_failure_stage: str | None = None
+        self.remote_failure_reason: str | None = None
+        self._stage_local = threading.local()
+        self._set_stage("ssh_material_validation")
 
-    def _read_row(self, timeout_seconds: float) -> dict[str, Any]:
+    def _set_stage(self, stage: str) -> None:
+        self._stage_local.name = stage
+
+    def _stage(self) -> str:
+        stage = getattr(self._stage_local, "name", "unknown")
+        return stage if isinstance(stage, str) else "unknown"
+
+    @staticmethod
+    def _safe_error_class(error: BaseException) -> str:
+        if isinstance(error, TimeoutError):
+            return "TimeoutError"
+        if isinstance(error, OSError):
+            return "OSError"
+        if isinstance(error, ValueError):
+            return "ValueError"
+        if isinstance(error, TypeError):
+            return "TypeError"
+        if isinstance(error, RuntimeError):
+            return "RuntimeError"
+        if isinstance(error, subprocess.SubprocessError):
+            return "SubprocessError"
+        return "unexpected"
+
+    def _record_failure(self, stage: str, error: BaseException | None = None) -> None:
+        with self._failure_lock:
+            if self.failure_stage is not None:
+                return
+            self.failure_stage = stage if stage in MEMORY_OBSERVER_FAILURE_STAGES else "unknown"
+            if error is not None:
+                self.error_class = self._safe_error_class(error)
+
+    def _capture_remote_failure(self, error: _RemoteWatchFailure) -> None:
+        child_status = None
+        if self.process is not None:
+            try:
+                child_status = self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child_status = None
+        with self._failure_lock:
+            if child_status not in (None, 0):
+                self.remote_failure_stage = error.stage
+                self.remote_failure_reason = error.reason
+                return
+            self.remote_failure_stage = "unknown"
+            self.remote_failure_reason = "unexpected"
+
+    def start(self) -> None:
+        self._set_stage("ssh_material_validation")
+        try:
+            self._start()
+        except Exception as exc:
+            if isinstance(exc, _RemoteWatchFailure):
+                self._capture_remote_failure(exc)
+            self._record_failure(self._stage(), exc)
+            raise
+
+    def _read_row(
+        self, timeout_seconds: float, *, allow_eof: bool = False,
+    ) -> dict[str, Any] | None:
         assert self.process is not None and self.process.stdout is not None
         if self.selector is None:
             self.selector = selectors.DefaultSelector()
@@ -213,8 +317,29 @@ class _RemoteMemoryWatcher:
                 self.pending[:] = remainder
                 if (not line.startswith(REMOTE_WATCH_PREFIX)
                         or len(line) > REMOTE_ROW_CAP):
+                    if line.startswith(REMOTE_WATCH_ERROR_PREFIX) and len(line) <= REMOTE_ROW_CAP:
+                        marker_bytes = line[len(REMOTE_WATCH_ERROR_PREFIX):]
+                        try:
+                            marker = json.loads(marker_bytes.decode("ascii"))
+                        except (UnicodeError, json.JSONDecodeError):
+                            marker = None
+                        if isinstance(marker, dict):
+                            canonical = json.dumps(
+                                marker, ensure_ascii=True, allow_nan=False,
+                                sort_keys=True, separators=(",", ":"),
+                            ).encode("ascii")
+                        else:
+                            canonical = b""
+                        if (isinstance(marker, dict) and canonical == marker_bytes
+                                and set(marker) == {"schema", "stage", "reason"}
+                                and type(marker.get("schema")) is int and marker["schema"] == 1
+                                and isinstance(marker.get("stage"), str)
+                                and isinstance(marker.get("reason"), str)
+                                and (marker["stage"], marker["reason"]) in REMOTE_WATCH_FAILURE_PAIRS):
+                            raise _RemoteWatchFailure(marker["stage"], marker["reason"])
                     raise ValueError("memory observer row prefix or length rejected")
                 raw = bytes(line[len(REMOTE_WATCH_PREFIX):])
+                self._set_stage("row_decode")
                 value = json.loads(raw.decode("ascii"))
                 if (not isinstance(value, dict)
                         or json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True,
@@ -227,18 +352,50 @@ class _RemoteMemoryWatcher:
             ready = self.selector.select(min(remaining, 0.25))
             if not ready:
                 if self.process.poll() is not None:
+                    if allow_eof and not self.pending:
+                        return None
                     raise ValueError("memory observer exited without terminal row")
                 continue
             chunk = os.read(ready[0][0].fd, min(4096, REMOTE_WATCH_CAP + 1 - self.total))
             if not chunk:
                 self.selector.unregister(ready[0][0].fd)
+                if allow_eof and not self.pending:
+                    return None
                 raise ValueError("memory observer stream ended early")
             self.total += len(chunk)
             if self.total > REMOTE_WATCH_CAP:
                 raise ValueError("memory observer output cap exceeded")
             self.pending.extend(chunk)
-            if len(self.pending) > REMOTE_ROW_CAP:
+            # A single pipe read may contain several complete short rows.
+            # Bound the current record, not the aggregate buffered bytes;
+            # the cumulative stream cap above bounds the whole pending data.
+            trailing_fragment = self.pending.rsplit(b"\n", 1)[-1]
+            if len(trailing_fragment) > REMOTE_ROW_CAP:
                 raise ValueError("memory observer row cap exceeded")
+
+    def _drain_after_terminal(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        if self.selector is None:
+            raise ValueError("memory observer selector is unavailable")
+        if self.pending:
+            raise ValueError("memory observer emitted output after terminal row")
+        descriptor = self.process.stdout.fileno()
+        deadline = time.monotonic() + 5
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("memory observer terminal drain deadline exceeded")
+            ready = self.selector.select(min(remaining, 0.25))
+            if not ready:
+                continue
+            chunk = os.read(descriptor, min(4096, REMOTE_WATCH_CAP + 1 - self.total))
+            if not chunk:
+                self.selector.unregister(descriptor)
+                return
+            self.total += len(chunk)
+            if self.total > REMOTE_WATCH_CAP:
+                raise ValueError("memory observer output cap exceeded")
+            raise ValueError("memory observer emitted output after terminal row")
 
     def _accept(self, row: Mapping[str, Any]) -> None:
         expected_fields = {
@@ -352,12 +509,13 @@ class _RemoteMemoryWatcher:
             self.terminal_decision = decision
             self.terminal_reason = reason
 
-    def start(self) -> None:
+    def _start(self) -> None:
         try:
             from tools import platform_cpu_diagnostic_pair as cpu_pair
         except ModuleNotFoundError:  # direct execution from platform/tools
             import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
         ssh_dir = self.ssh_config.parent
+        self._set_stage("ssh_material_validation")
         if (ssh_dir.name != "external-ssh" or self.ssh_config.name != "config"
                 or self.ssh_key.parent != ssh_dir or self.ssh_key.name != "id_ed25519"
                 or cpu_pair.HOST_RE.fullmatch(self.ssh_host) is None
@@ -379,10 +537,12 @@ class _RemoteMemoryWatcher:
             "cpu-diagnostic-memory-watch",
         ]
         request = {
-            "schema": 1, "run_id": self.run_id, "source_sha": self.source_sha,
+            "schema": 1, "operation": "memory-watch",
+            "run_id": self.run_id, "source_sha": self.source_sha,
             "workload": self.workload,
         }
         data = json.dumps(request, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+        self._set_stage("ssh_spawn")
         self.process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TZ": "UTC"},
@@ -390,21 +550,42 @@ class _RemoteMemoryWatcher:
         )
         if self.process.stdin is None:
             raise OSError("memory observer stdin unavailable")
+        self._set_stage("input_write")
         self.process.stdin.write(data)
         self.process.stdin.flush()
         self.process.stdin.close()
-        self._accept(self._read_row(15))
+        self._set_stage("first_row_read")
+        first_row = self._read_row(15)
+        if first_row is None:
+            raise ValueError("memory observer ended before first row")
+        self._set_stage("row_accept")
+        self._accept(first_row)
+        self._set_stage("thread_start")
         self.thread = threading.Thread(target=self._consume, name="ssr-memory-watch", daemon=True)
         self.thread.start()
 
     def _consume(self) -> None:
         try:
             while not self.terminal:
-                self._accept(self._read_row(5))
+                self._set_stage("sample_loop")
+                row = self._read_row(5)
+                if row is None:
+                    raise ValueError("memory observer ended before terminal row")
+                self._set_stage("row_accept")
+                self._accept(row)
+            self._set_stage("terminal_drain")
+            self._drain_after_terminal()
+            self._set_stage("terminal_wait")
             if self.process is None or self.process.wait(timeout=5) != 0:
                 raise ValueError("memory observer exit status rejected")
-        except Exception:
-            self.failure = True
+        except Exception as exc:
+            if isinstance(exc, _RemoteWatchFailure):
+                self._capture_remote_failure(exc)
+                if self.remote_failure_stage in REMOTE_WATCH_FAILURE_STAGES:
+                    self._record_failure(self._stage(), ValueError())
+            self._record_failure(self._stage(), exc)
+            with self._failure_lock:
+                self.failure = True
             if self.process is not None and self.process.poll() is None:
                 self._terminate()
             try:
@@ -436,33 +617,51 @@ class _RemoteMemoryWatcher:
 
     def stop(self) -> dict[str, Any]:
         if self.thread is not None:
+            self._set_stage("stop_join")
             self.thread.join(timeout=3)
         if self.thread is not None and self.thread.is_alive():
-            self.failure = True
+            self._record_failure("stop_join", TimeoutError())
+            with self._failure_lock:
+                self.failure = True
             self._terminate()
+            self.thread.join(timeout=3)
         if not self.terminal and not self.failure:
-            self.failure = True
+            self._record_failure("terminal_wait", TimeoutError())
+            with self._failure_lock:
+                self.failure = True
         if self.selector is not None:
             self.selector.close()
         if self.process is not None and self.process.poll() is None:
             self._terminate()
+        with self._failure_lock:
+            failure = self.failure
+            failure_stage = self.failure_stage
+            error_class = self.error_class
+            remote_failure_stage = self.remote_failure_stage
+            remote_failure_reason = self.remote_failure_reason
         return {
-            "status": "incomplete" if self.failure or not self.terminal else "complete",
+            "status": "incomplete" if failure or not self.terminal else "complete",
             "samples": self.samples,
             "current_min_bytes": self.current_min,
             "current_max_bytes": self.current_max,
             "memory_peak_lifetime_max_bytes": self.peak_max,
             "memory_events_sampled_max_delta": dict(sorted(self.event_max.items())),
-            "target_identity_status": "complete" if self.expected_target is not None and not self.failure else "unknown",
+            "target_identity_status": "complete" if self.expected_target is not None and not failure else "unknown",
             "terminal_decision": self.terminal_decision,
-            "terminal_reason": "observer_failed" if self.failure else self.terminal_reason or "missing_terminal",
+            "terminal_reason": "observer_failed" if failure else self.terminal_reason or "missing_terminal",
             "ssh_material_restored": True,
+            "failure_stage": failure_stage,
+            "error_class": error_class,
+            "remote_failure_stage": remote_failure_stage,
+            "remote_failure_reason": remote_failure_reason,
         }
 
     def fail_closed(self, reason: str = "observer_failed") -> None:
         if reason not in {"observer_failed", "collection_error", "identity_changed"}:
             reason = "observer_failed"
-        self.failure = True
+        self._record_failure(self._stage(), RuntimeError())
+        with self._failure_lock:
+            self.failure = True
         self.sequence += 1
         try:
             write_control(self.control_path, {
@@ -1187,6 +1386,20 @@ def run_isolated_capacity_worker(
     namespace_closed = result.namespace_closed is True and reason == "none"
     valid_worker = _worker_report_matches(worker_payload, capacity_config)
     memory = watcher_summary[0]
+    observer_failure = {
+        "failure_stage": memory.get("failure_stage"),
+        "error_class": memory.get("error_class"),
+        "remote_failure_stage": memory.get("remote_failure_stage"),
+        "remote_failure_reason": memory.get("remote_failure_reason"),
+    }
+    if any(value is not None for value in observer_failure.values()):
+        stage_state["memory_observer_failure"] = observer_failure
+    memory = {
+        key: value for key, value in memory.items()
+        if key not in {
+            "failure_stage", "error_class", "remote_failure_stage", "remote_failure_reason",
+        }
+    }
     if memory.get("memory_events_sampled_max_delta") == {}:
         memory = {**memory, "memory_events_sampled_max_delta": None}
     worker_status = worker_payload.get("status") if valid_worker else "incomplete"
@@ -2773,6 +2986,23 @@ def _parent_failure_fingerprint(
     parent_error_class = outcome.get("error_class")
     if not isinstance(parent_error_class, str) or parent_error_class not in PARENT_ERROR_CLASSES:
         parent_error_class = None
+    observer = stage_state.get("memory_observer_failure")
+    if not isinstance(observer, Mapping):
+        observer = {}
+    observer_failure = {
+        "stage": observer.get("failure_stage")
+        if isinstance(observer.get("failure_stage"), str)
+        and observer.get("failure_stage") in MEMORY_OBSERVER_FAILURE_STAGES else "unknown",
+        "error_class": observer.get("error_class")
+        if isinstance(observer.get("error_class"), str)
+        and observer.get("error_class") in MEMORY_OBSERVER_ERROR_CLASSES else "unknown",
+        "remote_stage": observer.get("remote_failure_stage")
+        if isinstance(observer.get("remote_failure_stage"), str)
+        and observer.get("remote_failure_stage") in REMOTE_WATCH_FAILURE_STAGES else "unknown",
+        "remote_reason": observer.get("remote_failure_reason")
+        if isinstance(observer.get("remote_failure_reason"), str)
+        and observer.get("remote_failure_reason") in REMOTE_WATCH_FAILURE_REASONS else "unknown",
+    }
     return {
         "schema": 1,
         "event": "ssr_capacity_parent_fingerprint",
@@ -2809,6 +3039,7 @@ def _parent_failure_fingerprint(
             "reason": runner.get("reason") if isinstance(runner.get("reason"), str)
             and runner.get("reason") in RUNNER_CONTEXT_REASONS else "other",
         },
+        "memory_observer_failure": observer_failure,
         "cleanup": {
             "status": cleanup.get("plan_cleanup_status")
             if isinstance(cleanup.get("plan_cleanup_status"), str)
