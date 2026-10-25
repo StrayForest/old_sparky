@@ -2954,6 +2954,14 @@ def _external_fixture(
     ):
         return 2
     input_handoff_sha256 = hashlib.sha256(canonical_payload).hexdigest()
+    fixture_kind = payload.get("fixture_kind", "external_load")
+    if not isinstance(fixture_kind, str) or fixture_kind not in {
+        "external_load",
+        "cpu_diagnostic_only_v1",
+        "ssr_capacity_diagnostic_v1",
+        "ssr_html_capacity_diagnostic_v1",
+    }:
+        return 2
     arguments = [
         payload["confirmation"],
         payload["target_sha"],
@@ -2967,6 +2975,12 @@ def _external_fixture(
         "--run-attempt", run_attempt,
         "--input-handoff-sha256", input_handoff_sha256,
     ]
+    if fixture_kind in {
+        "cpu_diagnostic_only_v1",
+        "ssr_capacity_diagnostic_v1",
+        "ssr_html_capacity_diagnostic_v1",
+    }:
+        arguments.extend(("--fixture-kind", fixture_kind))
     if (
         EXTERNAL_HELPER.parent != ACTIVE_TOOLS_DIR
         or not EXTERNAL_HELPER.is_file()

@@ -530,12 +530,9 @@ preflight/deploy chain; do not edit `.env.platform` by hand or use unlimited
 overflow. The load gate must not start until the active API/worker processes
 report the reviewed pool values.
 
-Cancellation is a two-step operator action. Canceling the GitHub job stops the
-runner-side SSH client, but a detached remote process may continue until its
-server-side 180-minute ceiling. For an immediate, exact stop use the reviewed
-abort workflow with the canceled load workflow ID; it matches only that
-retained-load supervisor's process tree, checks the current release SHA and
-verifies that the shared load lock is free:
+Canceling GitHub stops the runner-side SSH client, but detached work can run to
+its 180-minute ceiling. The reviewed abort workflow stops only that load's
+supervisor tree and verifies active source and shared lock:
 
 ```bash
 gh workflow run platform-production-retained-load-abort.yml \
@@ -545,10 +542,13 @@ gh workflow run platform-production-retained-load-abort.yml \
 gh run watch <abort-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-If the canceled run has no final report, the cleanup supervisor rebuilds its
-report from the matching durable `PreprodTestRun.report`, validates marker,
-email, tournament ownership and graph boundaries before deletion, and never
-counts a recovered run as a passed measurement.
+Typed CPU/SSR abort evidence binds run, attempt, source, fixture kind and
+manifest; it proves the exact supervisor stopped and shared lock cleared,
+records `namespace_closed: false`, and grants no performance credit.
+
+If no final report exists, cleanup rebuilds from the matching durable
+`PreprodTestRun.report`, validates marker, email, tournament ownership and
+graph boundaries, and never counts recovered work as passed.
 
 Cleanup recovery rebuilds missing detail from exact `external-vote/external-vote.json` and validates it.
 External-vote is the transport directory; durable rows/manifests use `write-burst`, and rebuilt files keep that path.

@@ -414,12 +414,12 @@ jobs:
                       raise ValueError
                   proof_raw = bytes(chunks)
               except (OSError, UnicodeError, ValueError):
-                  raise SystemExit("CPU abort proof is unavailable")
+                  raise SystemExit("typed diagnostic abort proof is unavailable")
               finally:
                   if descriptor >= 0:
                       os.close(descriptor)
               if not proof_raw.endswith(b"\n"):
-                  raise SystemExit("CPU abort proof is not canonical")
+                  raise SystemExit("typed diagnostic abort proof is not canonical")
 
               def reject_duplicate_keys(pairs):
                   result = {}
@@ -438,9 +438,9 @@ jobs:
                       separators=(",", ":"),
                   ).encode("ascii") + b"\n"
               except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
-                  raise SystemExit("CPU abort proof is invalid")
+                  raise SystemExit("typed diagnostic abort proof is invalid")
               if canonical_proof != proof_raw:
-                  raise SystemExit("CPU abort proof is not canonical")
+                  raise SystemExit("typed diagnostic abort proof is not canonical")
               expected = {
                   "schema", "status", "fixture_kind", "external_run_id",
                   "external_run_attempt", "source_sha", "app_target_sha",
@@ -454,7 +454,12 @@ jobs:
                   or set(proof) != expected
                   or type(proof.get("schema")) is not int or proof["schema"] != 1
                   or proof.get("status") != "safe_for_exact_fixture_cleanup"
-                  or proof.get("fixture_kind") != "cpu_diagnostic_only_v1"
+                  or not isinstance(proof.get("fixture_kind"), str)
+                  or proof.get("fixture_kind") not in {
+                      "cpu_diagnostic_only_v1",
+                      "ssr_capacity_diagnostic_v1",
+                      "ssr_html_capacity_diagnostic_v1",
+                  }
                   or proof.get("external_run_id") != run_id
                   or proof.get("external_run_attempt") != attempt
                   or proof.get("source_sha") != target_sha
@@ -478,7 +483,7 @@ jobs:
                   or os.environ.get("ABORT_REMOTE_STATUS") != "0"
                   or os.environ.get("ABORT_SSH_CLEANUP_STEP") != "success"
               ):
-                  raise SystemExit("CPU abort proof binding or termination checks failed")
+                  raise SystemExit("typed diagnostic abort proof binding or termination checks failed")
           elif payload.get("status") not in {"passed", "failed", "unknown"}:
               raise SystemExit("required abort log evidence is incomplete")
           PY

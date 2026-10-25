@@ -308,10 +308,17 @@ def _closed_root_json(path: Path, *, maximum: int) -> dict[str, object] | None:
         return None
 
 
-def _cpu_abort_binding(
+ABORT_FIXTURE_KINDS = frozenset({
+    "cpu_diagnostic_only_v1",
+    "ssr_capacity_diagnostic_v1",
+    "ssr_html_capacity_diagnostic_v1",
+})
+
+
+def _diagnostic_abort_binding(
     run_id: str, run_attempt: str, target_sha: str
 ) -> dict[str, object] | None:
-    """Validate the exact CPU fixture's private source/run/manifest binding."""
+    """Validate a typed diagnostic fixture's private source/run/manifest binding."""
 
     run_root = RUN_ROOT_BASE / f"gha-{run_id}"
     root_meta = None
@@ -327,7 +334,7 @@ def _cpu_abort_binding(
         or stat.S_IMODE(root_meta.st_mode) != 0o700
     ):
         return None
-    marker = _closed_root_json(run_root / "cpu-abort-binding.json", maximum=4096)
+    marker = _closed_root_json(run_root / "diagnostic-abort-binding.json", maximum=4096)
     if not isinstance(marker, dict) or set(marker) != {
         "schema", "fixture_kind", "external_run_id", "external_run_attempt",
         "source_sha", "app_target_sha", "input_handoff_sha256",
@@ -337,7 +344,8 @@ def _cpu_abort_binding(
     if (
         type(marker.get("schema")) is not int
         or marker.get("schema") != 1
-        or marker.get("fixture_kind") != "cpu_diagnostic_only_v1"
+        or not isinstance(marker.get("fixture_kind"), str)
+        or marker.get("fixture_kind") not in ABORT_FIXTURE_KINDS
         or marker.get("external_run_id") != run_id
         or marker.get("external_run_attempt") != run_attempt
         or marker.get("source_sha") != target_sha
@@ -688,7 +696,7 @@ def main() -> int:
     roots_after, tree_after, scan_errors_after = _process_state(args.load_run_id)
     if roots_after:
         raise RuntimeError("an exact retained-load supervisor still exists after abort")
-    binding = _cpu_abort_binding(args.load_run_id, args.load_run_attempt, args.target_sha)
+    binding = _diagnostic_abort_binding(args.load_run_id, args.load_run_attempt, args.target_sha)
     exit_code = _supervisor_exit_code(args.load_run_id)
     lock_clear = _retained_lock_is_clear()
     abort_only = None
@@ -704,7 +712,7 @@ def main() -> int:
         abort_only = {
             "schema": 1,
             "status": "safe_for_exact_fixture_cleanup",
-            "fixture_kind": "cpu_diagnostic_only_v1",
+            "fixture_kind": binding["fixture_kind"],
             "external_run_id": args.load_run_id,
             "external_run_attempt": binding["external_run_attempt"],
             "source_sha": binding["source_sha"],

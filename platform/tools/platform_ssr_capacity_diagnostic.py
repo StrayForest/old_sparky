@@ -106,6 +106,11 @@ PARENT_ERROR_CLASSES = frozenset({
     "OSError", "ValueError", "KeyError", "TypeError", "RuntimeError",
     "PlanError", "UntrustedHelper", "unexpected",
 })
+SUPERVISOR_REPORT_ERROR_CLASSES = frozenset({
+    "AttributeError", "NamespaceCapabilityError", "NamespaceIntegrityError",
+    "OSError", "preflight_deadline_exceeded", "preflight_setup_deadline_exceeded",
+})
+SUPERVISOR_REPORT_PHASES = frozenset({"namespace_probe", "supervisor"})
 PLAN_PREPARE_STATUSES = frozenset({
     "not_attempted", "prepared", "refused", "transport_failed", "bad_protocol",
 })
@@ -1128,6 +1133,15 @@ def run_isolated_capacity_worker(
         on_namespace_init=on_namespace_init,
         on_namespace_exit=on_namespace_exit,
     )
+    supervisor_report = getattr(result, "report", None)
+    supervisor_runtime = (
+        supervisor_report.get("runtime_supervisor")
+        if isinstance(supervisor_report, Mapping) else None
+    )
+    runtime_budget = (
+        supervisor_report.get("runtime_budget")
+        if isinstance(supervisor_report, Mapping) else None
+    )
     reason = getattr(result, "reason", None)
     stage_state["supervisor_evidence"] = _project_supervisor_evidence({
         "reason": reason,
@@ -1145,6 +1159,14 @@ def run_isolated_capacity_worker(
         ),
         "watchdog_startup_failure_stage": getattr(
             result, "watchdog_startup_failure_stage", None,
+        ),
+        "report_error": (
+            supervisor_runtime.get("report_error")
+            if isinstance(supervisor_runtime, Mapping) else None
+        ),
+        "report_phase": (
+            runtime_budget.get("phase")
+            if isinstance(runtime_budget, Mapping) else None
         ),
     })
     if not watcher_summary:
@@ -1567,7 +1589,7 @@ def _parent_failure_receipt(
             "complete" if cleanup_ok
             else "not_attempted"
             if (cleanup_lifecycle.get("plan_cleanup_status") == "not_attempted"
-                and prepare_status == "not_attempted")
+                and prepare_status in {"not_attempted", "refused"})
             else "failed"
         ),
     }
@@ -2518,6 +2540,8 @@ def _project_supervisor_evidence(value: Any) -> dict[str, Any]:
     evidence = value if isinstance(value, Mapping) else {}
     reason = evidence.get("reason")
     startup_stage = evidence.get("startup_failure_stage")
+    report_error = evidence.get("report_error_class", evidence.get("report_error"))
+    report_phase = evidence.get("report_phase")
 
     def project_stage(name: str, allowed_stages: frozenset[str]) -> str | None:
         stage = evidence.get(name)
@@ -2557,11 +2581,23 @@ def _project_supervisor_evidence(value: Any) -> dict[str, Any]:
             "watchdog_startup_failure_stage",
             load_runtime.WATCHDOG_STARTUP_FAILURE_STAGES,
         ),
+        "report_error_class": (
+            report_error
+            if isinstance(report_error, str) and report_error in SUPERVISOR_REPORT_ERROR_CLASSES
+            else "other" if report_error is not None else None
+        ),
+        "report_phase": (
+            report_phase
+            if isinstance(report_phase, str) and report_phase in SUPERVISOR_REPORT_PHASES
+            else "other" if report_phase is not None else None
+        ),
     }
 
 
 def _parent_outcome_fingerprint(
     outcome: Mapping[str, Any], supervisor_evidence: Any = None,
+    parent_phase: Any = None, prepare_lifecycle: Any = None,
+    cleanup_lifecycle: Any = None,
 ) -> dict[str, Any]:
     worker = outcome.get("worker")
     worker_status = worker.get("status") if isinstance(worker, dict) else "missing"
@@ -2583,9 +2619,58 @@ def _parent_outcome_fingerprint(
     if (not isinstance(cleanup, str)
             or cleanup not in {"complete", "failed", "not_attempted"}):
         cleanup = "invalid"
+    failure_only = outcome.get("failure_only") is True
+    prepare_status = outcome.get("plan_prepare_status") if failure_only else None
+    if (not isinstance(prepare_status, str)
+            or prepare_status not in PLAN_PREPARE_STATUSES):
+        prepare_status = None
+    if prepare_status is None and isinstance(prepare_lifecycle, Mapping):
+        candidate = prepare_lifecycle.get("plan_prepare_status")
+        if isinstance(candidate, str) and candidate in PLAN_PREPARE_STATUSES:
+            prepare_status = candidate
+    if prepare_status is None:
+        prepare_status = "not_attempted"
+    cleanup_status = outcome.get("plan_cleanup_status") if failure_only else None
+    if (not isinstance(cleanup_status, str)
+            or cleanup_status not in PLAN_CLEANUP_STATUSES):
+        cleanup_status = None
+    if isinstance(cleanup_lifecycle, Mapping):
+        candidate_cleanup = cleanup_lifecycle.get("plan_cleanup_status")
+        if isinstance(candidate_cleanup, str) and candidate_cleanup in PLAN_CLEANUP_STATUSES:
+            cleanup_status = candidate_cleanup
+    if cleanup_status is None:
+        cleanup_status = "not_attempted"
+    elif cleanup_status == "complete":
+        cleanup = "complete"
+    elif cleanup_status in {"pending", "refused", "transport_failed", "bad_protocol", "failed"}:
+        cleanup = "failed"
+    elif prepare_status in {"not_attempted", "refused"}:
+        cleanup = "not_attempted"
+    else:
+        cleanup = "failed"
+    selected_parent_phase = outcome.get("stage") if failure_only else parent_phase
+    if (not isinstance(selected_parent_phase, str)
+            or selected_parent_phase not in PARENT_FAILURE_STAGES | {"report_write"}):
+        selected_parent_phase = "parent_outcome"
+    parent_error_class = outcome.get("error_class") if failure_only else None
+    if (not isinstance(parent_error_class, str)
+            or parent_error_class not in PARENT_ERROR_CLASSES):
+        parent_error_class = None
+    prepare_transport = outcome.get("ssh_prepare_transport") if failure_only else None
+    prepare_transport = _project_parent_ssh_transport(prepare_transport)
+    prepare_refusal_class = outcome.get("plan_prepare_refusal_class") if failure_only else None
+    if (not isinstance(prepare_refusal_class, str)
+            or prepare_refusal_class not in PLAN_REFUSAL_CLASSES):
+        prepare_refusal_class = "none"
     fingerprint = {
         "status": "incomplete",
         "stage": "parent_outcome",
+        "parent_phase": selected_parent_phase,
+        "parent_error_class": parent_error_class,
+        "parent_return_code": prepare_transport["return_code"],
+        "plan_prepare_status": prepare_status,
+        "plan_prepare_refusal_class": prepare_refusal_class,
+        "plan_cleanup_status": cleanup_status,
         "reason": "capacity_report_incomplete",
         "namespace_closed": namespace_closed,
         "worker_present": isinstance(worker, dict),
@@ -2607,6 +2692,8 @@ def _parent_outcome_fingerprint(
         ("namespace_ready_failure_stage", "supervisor_namespace_ready_failure_stage"),
         ("namespace_post_ready_failure_stage", "supervisor_namespace_post_ready_failure_stage"),
         ("watchdog_startup_failure_stage", "supervisor_watchdog_startup_failure_stage"),
+        ("report_phase", "supervisor_report_phase"),
+        ("report_error_class", "supervisor_report_error_class"),
     ):
         fingerprint[destination] = evidence[source]
     return fingerprint
@@ -2775,6 +2862,7 @@ def main(argv: list[str] | None = None) -> int:
     stage_state: dict[str, Any] = {}
     try:
         outcome = _parent_run(args, stage_state)
+        parent_phase = stage_state.get("stage")
         stage_state["stage"] = "report_write"
         _write_report(Path(args.report), outcome)
     except Exception as exc:
@@ -2914,6 +3002,9 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(
         _parent_outcome_fingerprint(
             outcome, stage_state.get("supervisor_evidence"),
+            parent_phase=parent_phase,
+            prepare_lifecycle=stage_state.get("prepare_lifecycle"),
+            cleanup_lifecycle=stage_state.get("cleanup_lifecycle"),
         ), sort_keys=True, separators=(",", ":"),
     ))
     return 2

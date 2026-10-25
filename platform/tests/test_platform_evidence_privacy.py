@@ -34,7 +34,7 @@ from tools.platform_external_load_observer import (
 )
 from tools.platform_abort_retained_load import (
     _closed_root_json,
-    _cpu_abort_binding,
+    _diagnostic_abort_binding,
     export_abort_evidence,
     main as abort_retained_load_main,
 )
@@ -2264,7 +2264,7 @@ class EvidencePrivacyTests(unittest.TestCase):
                 "input_handoff_sha256": "b" * 64,
                 "fixture_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
             }
-            binding_path = cpu_root / "cpu-abort-binding.json"
+            binding_path = cpu_root / "diagnostic-abort-binding.json"
             binding_path.write_bytes(
                 json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
             )
@@ -2304,10 +2304,39 @@ class EvidencePrivacyTests(unittest.TestCase):
                 mock.patch.object(os, "fstat", fstat_with_root_identity),
             ):
                 self.assertIsNone(_closed_root_json(marker, maximum=64))
-                self.assertEqual(_cpu_abort_binding("456", "2", source_sha), binding)
-                self.assertIsNone(_cpu_abort_binding("456", "1", source_sha))
+                self.assertEqual(_diagnostic_abort_binding("456", "2", source_sha), binding)
+                self.assertIsNone(_diagnostic_abort_binding("456", "2", "b" * 40))
+                for fixture_kind in (
+                    "ssr_capacity_diagnostic_v1",
+                    "ssr_html_capacity_diagnostic_v1",
+                ):
+                    typed_binding = {**binding, "fixture_kind": fixture_kind}
+                    binding_path.write_bytes(
+                        json.dumps(typed_binding, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+                    )
+                    self.assertEqual(
+                        _diagnostic_abort_binding("456", "2", source_sha), typed_binding
+                    )
+                binding_path.write_bytes(
+                    json.dumps(
+                        {**binding, "fixture_kind": "external_load"},
+                        sort_keys=True, separators=(",", ":"),
+                    ).encode("ascii") + b"\n"
+                )
+                self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
+                binding_path.write_bytes(
+                    json.dumps(
+                        {**binding, "fixture_kind": ["ssr_capacity_diagnostic_v1"]},
+                        sort_keys=True, separators=(",", ":"),
+                    ).encode("ascii") + b"\n"
+                )
+                self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
+                binding_path.write_bytes(
+                    json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+                )
+                self.assertIsNone(_diagnostic_abort_binding("456", "1", source_sha))
                 binding_path.write_bytes(b"7\n")
-                self.assertIsNone(_cpu_abort_binding("456", "2", source_sha))
+                self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
 
 
 if __name__ == "__main__":
