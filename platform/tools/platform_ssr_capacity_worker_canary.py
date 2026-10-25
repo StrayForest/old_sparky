@@ -251,6 +251,23 @@ def main() -> int:
                 and worker_report["off_probe"].get("submitted") == 0
                 and worker_report["off_probe"].get("completed") == 0
             ),
+            "runner_identity_proven": (
+                isinstance(outcome.get("runner_headroom"), dict)
+                and isinstance(outcome["runner_headroom"].get("identity"), dict)
+                and set(outcome["runner_headroom"]["identity"])
+                == set(capacity.external_load.RunnerCgroupSampler.IDENTITY_FIELDS)
+                and all(value is True for value in outcome["runner_headroom"]["identity"].values())
+            ),
+            "runner_phase_window_remains_unknown": (
+                isinstance(outcome.get("runner_headroom"), dict)
+                and outcome["runner_headroom"].get("status") == "unknown"
+                and outcome["runner_headroom"].get("reason") == "runner_phase_samples_incomplete"
+            ),
+            "runner_phase_has_no_capacity_claim": (
+                isinstance(outcome.get("runner_headroom"), dict)
+                and outcome["runner_headroom"].get("effective_cpu_capacity_cores") is None
+                and outcome["runner_headroom"].get("max_cgroup_cpu_usage_cores") is None
+            ),
             "no_capacity_credit": all(
                 outcome.get(key) is False
                 for key in ("matrix_credit", "slo_credit", "diagnostic_credit")
@@ -265,12 +282,24 @@ def main() -> int:
                 "status": outcome.get("status"),
                 "resource_abort_reason": worker_report.get("resource_abort_reason"),
                 "namespace_closed": outcome.get("namespace_closed"),
+                "runner_headroom": {
+                    key: outcome.get("runner_headroom", {}).get(key)
+                    for key in ("status", "reason", "sample_count", "identity")
+                } if isinstance(outcome.get("runner_headroom"), dict) else None,
             }
             raise SystemExit(
                 "synthetic SSR capacity worker-entry canary failed: "
                 + json.dumps(details, sort_keys=True)
             )
-        print(json.dumps({"checks": checks, "status": outcome["status"]}, sort_keys=True))
+        runner_headroom = outcome.get("runner_headroom")
+        print(json.dumps({
+            "checks": checks,
+            "status": outcome["status"],
+            "runner_headroom": {
+                key: runner_headroom.get(key)
+                for key in ("status", "reason", "sample_count", "identity")
+            } if isinstance(runner_headroom, dict) else None,
+        }, sort_keys=True))
 
     if temporary_root is not None and temporary_root.exists():
         raise SystemExit("synthetic SSR canary temporary directory was not cleaned")

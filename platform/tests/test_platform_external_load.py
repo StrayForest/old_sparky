@@ -926,12 +926,68 @@ class ExternalLoadTests(unittest.TestCase):
         membership = "0::/runner/load\n"
         mount_identity = (31, 17, "0:29", "/", "/sys/fs/cgroup", "rw")
         namespace_ids = {
-            "/proc/self/ns/pid": (1, 1), "/proc/1/ns/pid": (1, 1),
-            "/proc/self/ns/mnt": (1, 2), "/proc/1/ns/mnt": (1, 2),
-            "/proc/self/ns/cgroup": (1, 3), "/proc/1/ns/cgroup": (1, 3),
+            "/proc/self/ns/pid": (1, 1),
+            "/proc/self/ns/mnt": (1, 2),
+            "/proc/self/ns/cgroup": (1, 3),
             "/proc/4321/ns/pid": (1, 5), "/proc/4321/ns/mnt": (1, 4),
             "/proc/4321/ns/cgroup": (1, 3),
         }
+
+        stat_result = external_load.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"1:1\n1:2\n1:3\n", stderr=b""
+        )
+        with patch("tools.platform_external_load.subprocess.run", return_value=stat_result) as run:
+            proc1_ids = external_load._read_proc1_namespace_identities()
+        self.assertEqual(proc1_ids, {"pid": (1, 1), "mount": (1, 2), "cgroup": (1, 3)})
+        command = run.call_args.args[0]
+        self.assertEqual(command[:10], [
+            "/usr/bin/sudo", "-n", "/usr/bin/timeout", "--signal=TERM",
+            "--kill-after=0.2s", "1s", "/usr/bin/stat", "--dereference",
+            "--printf=%d:%i\\n", "--",
+        ])
+        self.assertEqual(command[10:], [
+            "/proc/1/ns/pid", "/proc/1/ns/mnt", "/proc/1/ns/cgroup",
+        ])
+        self.assertEqual(run.call_args.kwargs["timeout"], 3.0)
+        self.assertIs(run.call_args.kwargs["stdin"], external_load.subprocess.DEVNULL)
+
+        invalid_stat_results = (
+            external_load.subprocess.CompletedProcess(args=[], returncode=1, stdout=b"", stderr=b""),
+            external_load.subprocess.CompletedProcess(args=[], returncode=0, stdout=b"bad\n", stderr=b""),
+            external_load.subprocess.CompletedProcess(args=[], returncode=0, stdout=b"1:1\n1:2\n1:3\n4:4\n", stderr=b""),
+        )
+        for invalid_result in invalid_stat_results:
+            with self.subTest(returncode=invalid_result.returncode, stdout=invalid_result.stdout):
+                with patch("tools.platform_external_load.subprocess.run", return_value=invalid_result):
+                    with self.assertRaises(external_load._CgroupDiagnosticError) as raised:
+                        external_load._read_proc1_namespace_identities()
+                self.assertEqual(raised.exception.reason, "runner_snapshot_unavailable")
+        with patch(
+            "tools.platform_external_load.subprocess.run",
+            side_effect=external_load.subprocess.TimeoutExpired(command="fixed-stat", timeout=3.0),
+        ):
+            with self.assertRaises(external_load._CgroupDiagnosticError) as raised:
+                external_load._read_proc1_namespace_identities()
+        self.assertEqual(raised.exception.reason, "runner_snapshot_unavailable")
+
+        denied_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        with (
+            patch.object(denied_sampler, "_target_is_stable", return_value=True),
+            patch("tools.platform_external_load._read_bounded_ascii", return_value=membership),
+            patch("tools.platform_external_load._bounded_proc_text", return_value="mountinfo"),
+            patch("tools.platform_external_load._cgroup2_membership_mapping", return_value={
+                "root": Path("/"), "mountpoint": Path("/sys/fs/cgroup"),
+                "mount_identity": mount_identity,
+            }),
+            patch("tools.platform_external_load._read_proc1_namespace_identities", side_effect=external_load._CgroupDiagnosticError("runner_snapshot_unavailable")),
+            patch("tools.platform_load_runtime._read_process_starttime", return_value=77),
+        ):
+            denied_sampler.start(4321, 77)
+            denied = denied_sampler.stop()
+        self.assertEqual(denied["status"], "unknown")
+        self.assertEqual(denied["reason"], "runner_snapshot_unavailable")
+        self.assertEqual(denied["sample_count"], 0)
+        self.assertFalse(any(denied["identity"].values()))
         reads = [0]
 
         def snapshot(**_kwargs: object) -> dict[str, object]:
@@ -971,6 +1027,7 @@ class ExternalLoadTests(unittest.TestCase):
         with (
             patch.object(sampler, "_namespace_identity", side_effect=lambda path: namespace_ids[path]),
             patch.object(sampler, "_target_is_stable", return_value=True),
+            patch("tools.platform_external_load._read_proc1_namespace_identities", return_value=proc1_ids),
             patch("tools.platform_external_load._read_bounded_ascii", return_value=membership),
             patch("tools.platform_external_load._bounded_proc_text", return_value="mountinfo"),
             patch("tools.platform_external_load._cgroup2_membership_mapping", return_value=mapping),
@@ -989,6 +1046,30 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertGreater(result["window_seconds"], 0)
         self.assertEqual(result["max_visible_throttled_periods_delta"], 0)
         self.assertEqual(result["identity"]["global_cgroup2_mount"], True)
+
+        changed_proc1_ids = {**proc1_ids, "pid": (1, 99)}
+        changed_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        changed_sampler.SAMPLE_INTERVAL_SECONDS = 0.005
+        with (
+            patch.object(changed_sampler, "_namespace_identity", side_effect=lambda path: namespace_ids[path]),
+            patch.object(changed_sampler, "_target_is_stable", return_value=True),
+            patch("tools.platform_external_load._read_bounded_ascii", return_value=membership),
+            patch("tools.platform_external_load._bounded_proc_text", return_value="mountinfo"),
+            patch("tools.platform_external_load._cgroup2_membership_mapping", return_value=mapping),
+            patch("tools.platform_external_load._read_cgroup_diagnostic_snapshot", side_effect=snapshot),
+            patch("tools.platform_load_runtime._read_process_starttime", return_value=77),
+            patch.object(Path, "exists", return_value=True),
+            patch(
+                "tools.platform_external_load._read_proc1_namespace_identities",
+                side_effect=[proc1_ids, changed_proc1_ids],
+            ),
+        ):
+            changed_sampler.start(4321, 77)
+            time.sleep(0.02)
+            changed_identity = changed_sampler.stop()
+        self.assertEqual(changed_identity["status"], "unknown")
+        self.assertEqual(changed_identity["reason"], "runner_snapshot_invalid")
+        self.assertEqual(changed_identity["sample_count"], 1)
 
         started_at = "2026-10-18T10:00:00.000Z"
         finished_at = "2026-10-18T10:00:00.110Z"

@@ -29,6 +29,7 @@ from pathlib import Path
 import random
 import re
 import ssl
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -858,6 +859,73 @@ class _ProcessCpuSampler:
         }
 
 
+_RUNNER_PROC1_NAMESPACE_STAT_PATHS = (
+    ("pid", "/proc/1/ns/pid"),
+    ("mount", "/proc/1/ns/mnt"),
+    ("cgroup", "/proc/1/ns/cgroup"),
+)
+_RUNNER_PROC1_NAMESPACE_STAT_OUTPUT_LIMIT = 256
+
+
+def _read_proc1_namespace_identities() -> dict[str, tuple[int, int]]:
+    """Read only the fixed host PID 1 namespace links through read-only stat."""
+
+    command = [
+        "/usr/bin/sudo",
+        "-n",
+        "/usr/bin/timeout",
+        "--signal=TERM",
+        "--kill-after=0.2s",
+        "1s",
+        "/usr/bin/stat",
+        "--dereference",
+        "--printf=%d:%i\\n",
+        "--",
+        *(path for _name, path in _RUNNER_PROC1_NAMESPACE_STAT_PATHS),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            timeout=3.0,
+            check=False,
+            close_fds=True,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        raise _CgroupDiagnosticError("runner_snapshot_unavailable") from None
+    output = result.stdout
+    if (
+        type(result.returncode) is not int
+        or result.returncode != 0
+        or not isinstance(output, bytes)
+        or len(output) > _RUNNER_PROC1_NAMESPACE_STAT_OUTPUT_LIMIT
+        or not output.endswith(b"\n")
+    ):
+        raise _CgroupDiagnosticError("runner_snapshot_unavailable")
+    try:
+        lines = output.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        raise _CgroupDiagnosticError("runner_snapshot_unavailable") from None
+    if len(lines) != len(_RUNNER_PROC1_NAMESPACE_STAT_PATHS):
+        raise _CgroupDiagnosticError("runner_snapshot_unavailable")
+    identities: dict[str, tuple[int, int]] = {}
+    for (name, _path), line in zip(_RUNNER_PROC1_NAMESPACE_STAT_PATHS, lines, strict=True):
+        fields = line.split(":")
+        if len(fields) != 2 or any(
+            not field.isascii() or not field.isdigit() for field in fields
+        ):
+            raise _CgroupDiagnosticError("runner_snapshot_unavailable")
+        device, inode = (int(field) for field in fields)
+        if device > 2**64 - 1 or not 0 < inode <= 2**64 - 1:
+            raise _CgroupDiagnosticError("runner_snapshot_unavailable")
+        identities[name] = (device, inode)
+    return identities
+
+
 class RunnerCgroupSampler:
     """Observe the exact supervised load process from the trusted outer runner."""
 
@@ -938,11 +1006,7 @@ class RunnerCgroupSampler:
                 Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
             )
             mapping = _cgroup2_membership_mapping(self._membership, self._mountinfo)
-            pid1 = {
-                "pid": self._namespace_identity("/proc/1/ns/pid"),
-                "mount": self._namespace_identity("/proc/1/ns/mnt"),
-                "cgroup": self._namespace_identity("/proc/1/ns/cgroup"),
-            }
+            pid1 = _read_proc1_namespace_identities()
             outer = {
                 "pid": self._namespace_identity("/proc/self/ns/pid"),
                 "mount": self._namespace_identity("/proc/self/ns/mnt"),
@@ -993,6 +1057,7 @@ class RunnerCgroupSampler:
                 self._failure = "workload_identity_changed"
                 return
             try:
+                pid1 = _read_proc1_namespace_identities()
                 for name, path in (
                     ("pid", "/proc/self/ns/pid"),
                     ("mount", "/proc/self/ns/mnt"),
@@ -1000,7 +1065,7 @@ class RunnerCgroupSampler:
                 ):
                     if self._namespace_identity(path) != self._outer_identity.get(name):
                         raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
-                    if self._namespace_identity(path.replace("self", "1")) != self._outer_identity.get(name):
+                    if pid1[name] != self._outer_identity.get(name):
                         raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
                     target_namespace_name = "mnt" if name == "mount" else name
                     target_namespace = self._namespace_identity(
@@ -1074,6 +1139,7 @@ class RunnerCgroupSampler:
                 raise _CgroupDiagnosticError("workload_identity_changed")
             if _read_bounded_ascii(Path("/proc/self/cgroup")) != self._membership:
                 raise _CgroupDiagnosticError("runner_membership_changed")
+            pid1 = _read_proc1_namespace_identities()
             for name, path in (
                 ("pid", "/proc/self/ns/pid"),
                 ("mount", "/proc/self/ns/mnt"),
@@ -1081,7 +1147,7 @@ class RunnerCgroupSampler:
             ):
                 if self._namespace_identity(path) != self._outer_identity.get(name):
                     raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
-                if self._namespace_identity(path.replace("self", "1")) != self._outer_identity.get(name):
+                if pid1[name] != self._outer_identity.get(name):
                     raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
                 target_namespace_name = "mnt" if name == "mount" else name
                 if self._namespace_identity(
