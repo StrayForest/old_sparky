@@ -1159,6 +1159,7 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
     if not isinstance(binding, Mapping) or not isinstance(payload, dict):
         return False
     expected_fields = {
+        "worker_report_schema", "partial_work", "inflight_unknown",
         "schema", "workload", "fixture_kind", "fixture_tournaments", "fixture_users",
         "actors", "concurrency", "load_model", "window_ms", "matrix_credit", "slo_credit",
         "report_complete", "status", "passed", "source_sha", "app_target_sha",
@@ -1174,7 +1175,18 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         return False
     cpu_rows = payload.get("process_cpu_windows", _unknown_cpu_windows())
     return bool(
-        payload.get("report_complete") is True
+        type(payload.get("worker_report_schema")) is int
+        and payload.get("worker_report_schema") == load_runtime.WORKER_REPORT_SCHEMA
+        and type(payload.get("partial_work")) is bool
+        and type(payload.get("inflight_unknown")) is bool
+        and (
+            payload.get("status") != "complete"
+            or (
+                payload.get("partial_work") is False
+                and payload.get("inflight_unknown") is False
+            )
+        )
+        and payload.get("report_complete") is True
         and type(payload.get("schema")) is int and payload.get("schema") == SCHEMA
         and payload.get("workload") == WORKLOAD
         and payload.get("fixture_kind") == FIXTURE_KIND
@@ -1213,6 +1225,7 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         and payload.get("slo_credit") is False
         and payload.get("diagnostic_credit") is False
         and payload.get("namespace_closed") is False
+        and isinstance(payload.get("status"), str)
         and payload.get("status") in {"complete", "incomplete", "failed"}
         and type(payload.get("submitted")) is int
         and type(payload.get("completed")) is int

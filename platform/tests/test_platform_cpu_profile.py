@@ -302,8 +302,46 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "server_capacity_claim": None,
             "server_capacity_claim_reason": "resource_correlation_not_provided",
         }
+        def through_worker_entry(
+            callback_report: dict[str, object],
+        ) -> dict[str, object]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                report_path = root / "worker-report.json"
+                config_path = root / "worker-config.json"
+                config_path.write_text(
+                    json.dumps({"worker_report_path": str(report_path)}),
+                    encoding="utf-8",
+                )
+                with patch.object(
+                    capacity_diagnostic.load_runtime, "_set_parent_death_signal",
+                ):
+                    return_code = capacity_diagnostic.load_runtime.worker_entry(
+                        lambda _config: callback_report,
+                        config_path=config_path,
+                    )
+                self.assertEqual(
+                    return_code,
+                    0 if callback_report.get("passed") is True else 1,
+                )
+                return json.loads(report_path.read_text(encoding="utf-8"))
+
+        report = through_worker_entry(report)
         self.assertTrue(capacity_diagnostic._worker_report_matches(report, config))
-        pre_request_abort = capacity_diagnostic._incomplete_report(
+        for mutation in (
+            {**report, "worker_report_schema": 999},
+            {key: value for key, value in report.items() if key != "partial_work"},
+            {**report, "partial_work": 0},
+            {**report, "unknown_envelope_field": False},
+            {**report, "status": []},
+            {**report, "partial_work": True},
+            {**report, "inflight_unknown": True},
+        ):
+            with self.subTest(envelope=mutation):
+                self.assertFalse(
+                    capacity_diagnostic._worker_report_matches(mutation, config)
+                )
+        callback_abort = capacity_diagnostic._incomplete_report(
             {
                 "concurrency": 8,
                 "on_start_ms": 26_000,
@@ -317,6 +355,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             observed_duration_ms=0,
             manifest_sha256="e" * 64,
         )
+        self.assertFalse(capacity_diagnostic._worker_report_matches(callback_abort, config))
+        pre_request_abort = through_worker_entry(callback_abort)
         self.assertEqual(pre_request_abort["observed_duration_ms"], 0)
         self.assertTrue(
             capacity_diagnostic._worker_report_matches(pre_request_abort, config)
@@ -330,7 +370,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 malformed_pre_request_abort, config,
             )
         )
-        measured_abort = capacity_diagnostic._incomplete_report(
+        measured_abort = through_worker_entry(
+            capacity_diagnostic._incomplete_report(
             {
                 "concurrency": 8,
                 "on_start_ms": 26_000,
@@ -343,6 +384,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             completed=0,
             observed_duration_ms=1_234,
             manifest_sha256="e" * 64,
+            )
         )
         self.assertEqual(measured_abort["observed_duration_ms"], 1_234)
         self.assertTrue(capacity_diagnostic._worker_report_matches(measured_abort, config))
