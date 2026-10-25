@@ -19,6 +19,11 @@ import {
   cancelServerAuthFetchTerminalResponse,
   cancelServerFetchResponse
 } from "@/lib/server-fetch-response";
+import {
+  readServerAuthJsonResponse,
+  type ServerAuthJsonParseObserver,
+  type ServerJsonResponse,
+} from "@/lib/server-auth-http-response";
 
 export type ServerAuthSnapshot = {
   status: "authenticated" | "anonymous" | "unavailable";
@@ -33,7 +38,6 @@ const serverAuthTimeoutMs = 2_000;
 const serverAuthTransport = process.env.PLATFORM_WEB_SERVER_AUTH_TRANSPORT?.trim().toLowerCase() === "node"
   ? "node"
   : "fetch";
-const serverAuthResponseMaxBytes = 256 * 1024;
 const serverAuthHttpAgent = new http.Agent({
   keepAlive: true,
   maxFreeSockets: 16,
@@ -44,17 +48,6 @@ const serverAuthHttpsAgent = new https.Agent({
   maxFreeSockets: 16,
   maxSockets: 128,
 });
-
-type ServerJsonResponse = {
-  status: number;
-  ok: boolean;
-  json: () => Promise<unknown>;
-};
-
-type ServerAuthJsonParseObserver = (
-  durationMs: number,
-  outcome: "ok" | "error",
-) => void | Promise<void>;
 
 const serverAuthFetchControllers = new WeakMap<Response, AbortController>();
 
@@ -276,62 +269,6 @@ function requestServerJson(
       operation();
     };
 
-    function settleResponse(response: http.IncomingMessage): void {
-      const chunks: Buffer[] = [];
-      let totalBytes = 0;
-      const contentLength = Number(response.headers["content-length"]);
-      if (Number.isFinite(contentLength) && contentLength > serverAuthResponseMaxBytes) {
-        response.resume();
-        settle(() => reject(new Error("Server auth response exceeded its size limit.")));
-        return;
-      }
-      response.on("data", (chunk: Buffer | string) => {
-        const bytes = Buffer.byteLength(chunk);
-        totalBytes += bytes;
-        if (totalBytes > serverAuthResponseMaxBytes) {
-          response.destroy(new Error("Server auth response exceeded its size limit."));
-          settle(() => reject(new Error("Server auth response exceeded its size limit.")));
-          return;
-        }
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      });
-      response.on("end", () => {
-        settle(() => {
-          const status = response.statusCode ?? 0;
-          const bodyText = Buffer.concat(chunks).toString("utf8");
-          const ok = status >= 200 && status < 300;
-          // Preserve the native transport's historical eager parse on every
-          // status. Malformed 401/403 bodies map to unavailable, not anonymous.
-          const parseStartedAt = jsonParseObserver ? performance.now() : null;
-          let payload: unknown;
-          try {
-            payload = JSON.parse(bodyText) as unknown;
-          } catch (error) {
-            if (parseStartedAt !== null) {
-              notifyJsonParseObserver(
-                jsonParseObserver,
-                performance.now() - parseStartedAt,
-                "error",
-              );
-            }
-            reject(error instanceof Error ? error : new Error("Invalid server auth response."));
-            return;
-          }
-          if (parseStartedAt !== null) {
-            notifyJsonParseObserver(
-              jsonParseObserver,
-              performance.now() - parseStartedAt,
-              "ok",
-            );
-          }
-          resolve({ status, ok, json: async () => payload });
-        });
-      });
-      response.on("error", (error) => {
-        settle(() => reject(error));
-      });
-    }
-
     const requestHeaders: Record<string, string> = {};
     new Headers(headers).forEach((value, key) => {
       requestHeaders[key] = value;
@@ -345,27 +282,22 @@ function requestServerJson(
       headers: requestHeaders,
       signal: abortController.signal,
     };
+    const onResponse = (response: http.IncomingMessage) => {
+      void readServerAuthJsonResponse(response, jsonParseObserver).then(
+        (value) => settle(() => resolve(value)),
+        (error: unknown) => settle(() => reject(
+          error instanceof Error ? error : new Error("Server auth response failed."),
+        )),
+      );
+    };
     const request = url.protocol === "https:"
-      ? https.request({ ...requestOptions, agent: serverAuthHttpsAgent }, settleResponse)
-      : http.request({ ...requestOptions, agent: serverAuthHttpAgent }, settleResponse);
+      ? https.request({ ...requestOptions, agent: serverAuthHttpsAgent }, onResponse)
+      : http.request({ ...requestOptions, agent: serverAuthHttpAgent }, onResponse);
     request.on("error", (error) => {
       settle(() => reject(error));
     });
     request.end();
   });
-}
-
-function notifyJsonParseObserver(
-  observer: ServerAuthJsonParseObserver | undefined,
-  durationMs: number,
-  outcome: "ok" | "error",
-): void {
-  if (!observer) return;
-  try {
-    void Promise.resolve(observer(Math.max(0, durationMs), outcome)).catch(() => {});
-  } catch {
-    // Diagnostic failures must not change the auth response outcome.
-  }
 }
 
 function isPlatformAuthBootstrap(value: unknown): value is PlatformAuthBootstrap {
