@@ -94,11 +94,16 @@ still cannot be promoted to capacity evidence.
 Namespace exit 125 diagnostics use only fixed stage bytes across the watchdog
 pipe and namespace READY stream. The watchdog descriptor is close-on-exec before
 the system chain, and the inner helper's duplicated stream is close-on-exec
-before the worker; neither descriptor reaches sudo or the worker. Existing
-pidfd cleanup diagnostics retain priority if the bounded watchdog channel is
-ambiguous. `supervisor_process_started` means only that the watchdog process
-was launched; it does not mean the inner worker started. A missing, conflicting
-or malformed stage remains unknown and never changes containment status.
+before the worker; neither descriptor reaches sudo or the worker. Failure
+fingerprints preserve the aggregate stage and separately identify the
+pre-READY namespace stage, post-READY namespace stage, and watchdog stage.
+This keeps a secondary cleanup failure from erasing the bounded startup source;
+the aggregate remains `unknown` if sources conflict. A valid watchdog pidfd
+cleanup code may coexist with one startup stage, while duplicate, malformed or
+oversized channel data remains unknown. `supervisor_process_started` means only
+that the watchdog process was launched; it does not mean the inner worker
+started. These diagnostic fields never change containment status or award
+capacity credit.
 
 Use this procedure to separate authenticated HTML latency across direct
 Next.js, local Nginx and public Cloudflare. It is diagnostic evidence only; the
