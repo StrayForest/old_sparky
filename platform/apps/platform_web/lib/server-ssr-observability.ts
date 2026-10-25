@@ -5,6 +5,7 @@ import { headers } from "next/headers";
 import { cache } from "react";
 import { formatWorkspaceApiErrorDiagnostic } from "@/lib/ssr-error-diagnostic";
 import { current_diagnostic_run_id } from "@/lib/performance-diagnostic-plan";
+import type { ServerInternalReadAdmissionObserver } from "@/lib/server-internal-read-scheduler";
 
 type SsrTrace = {
   requestId: string;
@@ -36,6 +37,44 @@ const traceStorage = new AsyncLocalStorage<SsrTrace>();
 
 export function isSsrDiagnosticsEnabled(): boolean {
   return enabled;
+}
+
+export function isSsrObservabilityActive(): boolean {
+  return enabled || current_diagnostic_run_id() !== null;
+}
+
+export async function getSsrAdmissionStageObserver(): Promise<
+  ServerInternalReadAdmissionObserver | undefined
+> {
+  if (!isSsrObservabilityActive()) {
+    return undefined;
+  }
+  const trace = await getSsrTrace();
+  if (!trace?.sampled) {
+    return undefined;
+  }
+  return (waitMs, outcome) => recordSsrStage(
+    "internal_read_admission_wait",
+    waitMs,
+    outcome,
+  );
+}
+
+export async function getSsrAuthBodyParseObserver(): Promise<
+  ServerInternalReadAdmissionObserver | undefined
+> {
+  if (!isSsrObservabilityActive()) {
+    return undefined;
+  }
+  const trace = await getSsrTrace();
+  if (!trace?.sampled) {
+    return undefined;
+  }
+  return (durationMs, outcome) => recordSsrStage(
+    "auth_body_parse",
+    durationMs,
+    outcome,
+  );
 }
 
 export async function isSsrTraceSampled(): Promise<boolean> {

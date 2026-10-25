@@ -141,10 +141,17 @@ SAFE_STAGE_NAMES = frozenset(
         "http_request_start",
         "auth_bootstrap",
         "auth_bootstrap_fetch",
+        "auth_http_fetch",
+        "auth_body_parse",
+        "auth_projection",
         "auth_session",
         "tournament_detail",
         "tournament_detail_data_ready",
         "tournament_workspace",
+        "internal_read_admission_wait",
+        "workspace_http_fetch",
+        "workspace_body_parse",
+        "workspace_projection",
         "proxy_start",
         "proxy_to_root_layout_start",
         "request_to_proxy",
@@ -1429,6 +1436,19 @@ def _project_phase_metric_map(value: Any) -> dict[str, dict[str, Any]]:
         metric = _project_metric(raw_value)
         if metric:
             output[phase] = metric
+    return dict(sorted(output.items()))
+
+
+def _project_stage_metric_map(value: Any) -> dict[str, dict[str, Any]]:
+    source = _mapping(value)
+    output: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_value in source.items():
+        stage = safe_stage(raw_key)
+        if stage == "other" and raw_key != "other":
+            continue
+        metric = _project_metric(raw_value)
+        if metric:
+            output[stage] = metric
     return dict(sorted(output.items()))
 
 
@@ -3636,7 +3656,7 @@ def _project_ssr(value: Any) -> dict[str, Any]:
         if section == "ssr_stream":
             by_stage = _project_counter(section_source.get("by_stage"), SAFE_STAGE_NAMES)
         else:
-            by_stage = _project_phase_metric_map(section_source.get("by_stage"))
+            by_stage = _project_stage_metric_map(section_source.get("by_stage"))
         if by_stage:
             section_output["by_stage"] = by_stage
         integrity = _mapping(section_source.get("integrity"))
@@ -3688,7 +3708,7 @@ def _project_ssr(value: Any) -> dict[str, Any]:
         counters = _project_counter(correlated.get(key), SAFE_STAGE_NAMES)
         if counters:
             correlated_output[key] = counters
-    stage_ms = _project_phase_metric_map(correlated.get("stage_ms"))
+    stage_ms = _project_stage_metric_map(correlated.get("stage_ms"))
     if stage_ms:
         correlated_output["stage_ms"] = stage_ms
     joins = _project_counter(

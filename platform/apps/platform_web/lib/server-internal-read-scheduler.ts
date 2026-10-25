@@ -28,6 +28,12 @@ type QueuedPermit = {
   settled: boolean;
 };
 
+export type ServerInternalReadAdmissionOutcome = "ok" | "error";
+export type ServerInternalReadAdmissionObserver = (
+  waitMs: number,
+  outcome: ServerInternalReadAdmissionOutcome,
+) => void | Promise<void>;
+
 /** A process-local FIFO admission queue for internal, read-only SSR API calls. */
 export class ServerInternalReadScheduler {
   private active = 0;
@@ -53,12 +59,40 @@ export class ServerInternalReadScheduler {
     return this.active;
   }
 
-  async run<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-    const release = await this.acquire(signal);
+  async run<T>(
+    operation: () => Promise<T>,
+    signal?: AbortSignal,
+    admissionObserver?: ServerInternalReadAdmissionObserver,
+  ): Promise<T> {
+    const waitStartedAt = admissionObserver ? performance.now() : null;
+    let release: () => void;
     try {
+      release = await this.acquire(signal);
+    } catch (error) {
+      this.notifyAdmissionObserver(admissionObserver, waitStartedAt, "error");
+      throw error;
+    }
+    try {
+      this.notifyAdmissionObserver(admissionObserver, waitStartedAt, "ok");
       return await operation();
     } finally {
       release();
+    }
+  }
+
+  private notifyAdmissionObserver(
+    observer: ServerInternalReadAdmissionObserver | undefined,
+    startedAt: number | null,
+    outcome: ServerInternalReadAdmissionOutcome,
+  ): void {
+    if (!observer || startedAt === null) return;
+    try {
+      const notification = observer(Math.max(0, performance.now() - startedAt), outcome);
+      if (notification !== undefined) {
+        void Promise.resolve(notification).catch(() => {});
+      }
+    } catch {
+      // Diagnostics must not change admission, cancellation, or read outcomes.
     }
   }
 
@@ -179,6 +213,7 @@ function defaultScheduler(): ServerInternalReadScheduler {
 export function runWithServerInternalRead<T>(
   operation: () => Promise<T>,
   signal?: AbortSignal,
+  admissionObserver?: ServerInternalReadAdmissionObserver,
 ): Promise<T> {
-  return defaultScheduler().run(operation, signal);
+  return defaultScheduler().run(operation, signal, admissionObserver);
 }

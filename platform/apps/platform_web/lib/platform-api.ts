@@ -4,6 +4,7 @@ import {
   runWithServerInternalRead,
   ServerInternalReadQueueError
 } from "@/lib/server-internal-read-scheduler";
+import type { ServerInternalReadAdmissionObserver } from "@/lib/server-internal-read-scheduler";
 import { cancelServerFetchResponse } from "@/lib/server-fetch-response";
 import {
   normalizeVisibility,
@@ -110,6 +111,11 @@ type ApiTournamentWorkspace = {
   ready_check?: PlatformTournamentDeadlockReadyCheckState | null;
   auto_assignment?: PlatformTournamentDeadlockAutoAssignmentState | null;
   state_version?: number | null;
+};
+
+type SsrWorkspaceDiagnostics = {
+  measureStage: <T>(stage: string, operation: () => Promise<T>) => Promise<T>;
+  admissionObserver?: ServerInternalReadAdmissionObserver;
 };
 
 type ApiTeamMember = {
@@ -799,6 +805,7 @@ export async function getTournamentWorkspace(
     includeCurrentUser?: boolean;
     inviteCode?: string;
     signal?: AbortSignal;
+    ssrDiagnostics?: SsrWorkspaceDiagnostics;
   } = {}
 ): Promise<{ tournament: TournamentDetail; currentUser: PlatformUser | null } | null> {
   const serverRequest = typeof window === "undefined";
@@ -825,12 +832,18 @@ export async function getTournamentWorkspace(
   }
 
   const loadWorkspace = async () => {
-    const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/workspace?${params.toString()}`, {
-      headers,
-      credentials: "include",
-      cache: "no-store",
-      signal: fetchSignal
-    });
+    const fetchWorkspace = () => platformFetch(
+      `${apiBaseUrl}/tournaments/${slug}/workspace?${params.toString()}`,
+      {
+        headers,
+        credentials: "include",
+        cache: "no-store",
+        signal: fetchSignal
+      }
+    );
+    const response = options.ssrDiagnostics
+      ? await options.ssrDiagnostics.measureStage("workspace_http_fetch", fetchWorkspace)
+      : await fetchWorkspace();
     if (response.status === 404) {
       if (serverFetchController) {
         cancelServerFetchResponse(response, serverFetchController);
@@ -848,42 +861,56 @@ export async function getTournamentWorkspace(
       throw new PlatformApiError(response.statusText || "Failed to load tournament.", response.status);
     }
 
-    const workspace = await response.json() as ApiTournamentWorkspace;
-    const registrations = workspace.participants_available
-      ? dedupeRegistrations((workspace.participants ?? []).map(mapRegistration))
-      : [];
-    const assignmentState = workspace.auto_assignment ?? null;
-    const activeCommitment = workspace.current_user_active_commitment ?? null;
-    return {
-      tournament: mapTournamentDetail(
-        workspace.tournament,
-        registrations,
-        workspace.bracket ? mapBracket(workspace.bracket) : null,
-        {
-          serverTime: workspace.server_time,
-          readyCheckState: workspace.ready_check ?? null,
-          deadlockAssignment: assignmentState?.published_run ?? assignmentState?.latest_run ?? null,
-          activeCommitment: activeCommitment
-            ? {
-                id: activeCommitment.id,
-                tournamentId: activeCommitment.tournament_id,
-                tournamentSlug: activeCommitment.tournament_slug,
-                tournamentName: activeCommitment.tournament_name,
-                assignmentRunId: activeCommitment.assignment_run_id,
-                teamId: activeCommitment.team_id,
-                teamName: activeCommitment.team_name,
-                activatedAt: activeCommitment.activated_at
-              }
-            : null
-        }
-      ),
-      currentUser: workspace.current_user ?? null
+    const workspace = options.ssrDiagnostics
+      ? await options.ssrDiagnostics.measureStage(
+        "workspace_body_parse",
+        async () => await response.json() as ApiTournamentWorkspace
+      )
+      : await response.json() as ApiTournamentWorkspace;
+    const projectWorkspace = async () => {
+      const registrations = workspace.participants_available
+        ? dedupeRegistrations((workspace.participants ?? []).map(mapRegistration))
+        : [];
+      const assignmentState = workspace.auto_assignment ?? null;
+      const activeCommitment = workspace.current_user_active_commitment ?? null;
+      return {
+        tournament: mapTournamentDetail(
+          workspace.tournament,
+          registrations,
+          workspace.bracket ? mapBracket(workspace.bracket) : null,
+          {
+            serverTime: workspace.server_time,
+            readyCheckState: workspace.ready_check ?? null,
+            deadlockAssignment: assignmentState?.published_run ?? assignmentState?.latest_run ?? null,
+            activeCommitment: activeCommitment
+              ? {
+                  id: activeCommitment.id,
+                  tournamentId: activeCommitment.tournament_id,
+                  tournamentSlug: activeCommitment.tournament_slug,
+                  tournamentName: activeCommitment.tournament_name,
+                  assignmentRunId: activeCommitment.assignment_run_id,
+                  teamId: activeCommitment.team_id,
+                  teamName: activeCommitment.team_name,
+                  activatedAt: activeCommitment.activated_at
+                }
+              : null
+          }
+        ),
+        currentUser: workspace.current_user ?? null
+      };
     };
+    return options.ssrDiagnostics
+      ? options.ssrDiagnostics.measureStage("workspace_projection", projectWorkspace)
+      : projectWorkspace();
   };
 
   try {
     return serverRequest
-      ? await runWithServerInternalRead(loadWorkspace, options.signal)
+      ? await runWithServerInternalRead(
+        loadWorkspace,
+        options.signal,
+        options.ssrDiagnostics?.admissionObserver,
+      )
       : await loadWorkspace();
   } catch (error) {
     if (error instanceof ServerInternalReadQueueError) {

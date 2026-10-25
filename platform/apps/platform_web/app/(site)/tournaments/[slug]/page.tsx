@@ -3,6 +3,7 @@ import { cookies } from "next/headers";
 import { notFound } from "next/navigation";
 import { TournamentDetailClientPage } from "@/components/tournaments/tournament-detail-client-page";
 import {
+  getSsrAdmissionStageObserver,
   isSsrTraceSampled,
   getServerRequestCorrelationHeaders,
   measureSsrStage,
@@ -63,7 +64,15 @@ export default async function TournamentDetailPage({
         participantsLimit: 0,
         workspaceView: "detail" as const,
         includeCurrentUser: false,
-        inviteCode
+        inviteCode,
+        ...(ssrTraceSampled
+          ? {
+              ssrDiagnostics: {
+                measureStage: measureSsrStage,
+                admissionObserver: await getSsrAdmissionStageObserver()
+              }
+            }
+          : {})
       };
       const workspace = await (ssrTraceSampled
         ? measureSsrStage("tournament_workspace", () =>

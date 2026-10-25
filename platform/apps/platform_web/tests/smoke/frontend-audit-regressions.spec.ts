@@ -66,6 +66,40 @@ test("server internal reads share a bounded FIFO permit through body completion"
   expect(scheduler.pendingCount).toBe(0);
 });
 
+test("server internal read admission diagnostics measure queued and rejected waits", async () => {
+  const scheduler = new ServerInternalReadScheduler({
+    activeLimit: 1,
+    pendingLimit: 1,
+    queueDeadlineMs: 500,
+  });
+  const releaseFirst = deferred();
+  const firstStarted = deferred();
+  const observations: Array<{ waitMs: number; outcome: string }> = [];
+  const observe = (waitMs: number, outcome: string) => {
+    observations.push({ waitMs, outcome });
+  };
+
+  const first = scheduler.run(async () => {
+    firstStarted.resolve();
+    await releaseFirst.promise;
+  }, undefined, observe);
+  await firstStarted.promise;
+  const queued = scheduler.run(async () => undefined, undefined, observe);
+  await expect(scheduler.run(async () => undefined, undefined, observe)).rejects.toMatchObject({
+    name: "ServerInternalReadQueueError",
+    failure: "full",
+  } satisfies Partial<ServerInternalReadQueueError>);
+  expect(observations).toHaveLength(2);
+  expect(observations.map(({ outcome }) => outcome)).toEqual(["ok", "error"]);
+  expect(observations.every(({ waitMs }) => Number.isFinite(waitMs) && waitMs >= 0)).toBe(true);
+
+  releaseFirst.resolve();
+  await Promise.all([first, queued]);
+  expect(observations).toHaveLength(3);
+  expect(observations.map(({ outcome }) => outcome)).toEqual(["ok", "error", "ok"]);
+  expect(observations.every(({ waitMs }) => Number.isFinite(waitMs) && waitMs >= 0)).toBe(true);
+});
+
 test("terminal server workspace responses release the permit without waiting for body cancellation", async () => {
   const originalFetch = globalThis.fetch;
   const schedulerKey = "__oldsparkyServerInternalReadScheduler__";
@@ -155,6 +189,50 @@ test("terminal server workspace responses release the permit without waiting for
       }
     }
   }
+});
+
+test("workspace subspans preserve fetch and body-parse failure outcomes", async () => {
+  const originalFetch = globalThis.fetch;
+  const stages: Array<{ stage: string; outcome: string }> = [];
+  globalThis.fetch = async () => new Response("not-json", { status: 200 });
+  try {
+    await expect(getTournamentWorkspace("private-fixture", {}, {
+      workspaceView: "detail",
+      ssrDiagnostics: {
+        measureStage: async (stage, operation) => {
+          try {
+            const result = await operation();
+            stages.push({ stage, outcome: "ok" });
+            return result;
+          } catch (error) {
+            stages.push({ stage, outcome: "error" });
+            throw error;
+          }
+        },
+      },
+    })).rejects.toThrow();
+    expect(stages).toEqual([
+      { stage: "workspace_http_fetch", outcome: "ok" },
+      { stage: "workspace_body_parse", outcome: "error" },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("native auth transport keeps eager malformed non-success JSON semantics", () => {
+  const auth = source("lib/server-auth.ts");
+  const nodeTransport = auth.slice(auth.indexOf("function requestServerJson("));
+  const responseEnd = nodeTransport.slice(nodeTransport.indexOf('response.on("end"'));
+  const parseIndex = responseEnd.indexOf("JSON.parse(bodyText)");
+  const resolveIndex = responseEnd.indexOf("resolve({ status, ok, json: async () => payload })");
+
+  expect(parseIndex).toBeGreaterThanOrEqual(0);
+  expect(parseIndex).toBeLessThan(resolveIndex);
+  expect(responseEnd).toContain("historical eager parse on every");
+  expect(responseEnd).toContain("status. Malformed 401/403 bodies");
+  expect(responseEnd).toContain("reject(error instanceof Error ? error : new Error(\"Invalid server auth response.\"))");
+  expect(auth).toContain("response.status === 401 || response.status === 403");
 });
 
 test("terminal server auth fetch responses retain snapshots without awaiting body cancellation", async () => {
@@ -392,7 +470,11 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(detailPage).toContain("? measureSsrStage(");
   expect(detailPage).toContain(": getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));");
   expect(api).toContain("typeof window === \"undefined\"");
-  expect(api).toContain("runWithServerInternalRead(loadWorkspace, options.signal)");
+  expect(api).toContain("runWithServerInternalRead(");
+  expect(api).toContain('measureStage("workspace_http_fetch", fetchWorkspace)');
+  expect(api).toContain('"workspace_body_parse"');
+  expect(api).toContain('measureStage("workspace_projection", projectWorkspace)');
+  expect(api).toContain("options.ssrDiagnostics?.admissionObserver");
   expect(api).toContain("ServerInternalReadQueueError");
   expect(api).toContain('{ code: "server_read_capacity" }');
   expect(auth.match(/runWithServerInternalRead\(/gu)).toHaveLength(2);
@@ -403,9 +485,23 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(auth).toContain("cancelServerFetchResponse(response, controller);");
   expect(auth).toContain("return { status: \"anonymous\", user: null }");
   expect(auth).toContain("return { status: \"unavailable\", user: null }");
+  expect(auth).toContain('measureSsrStage("auth_http_fetch"');
+  expect(auth).toContain('measureSsrStage("auth_body_parse"');
+  expect(auth).toContain('measureSsrStage("auth_projection"');
+  expect(auth).toContain("getSsrAdmissionStageObserver");
+  const nodeAuthResponse = auth.slice(auth.indexOf("function requestServerJson("));
+  const nodeJsonEnd = nodeAuthResponse.slice(nodeAuthResponse.indexOf('response.on("end"'));
+  expect(nodeJsonEnd.indexOf("JSON.parse(bodyText)")).toBeGreaterThanOrEqual(0);
+  expect(nodeJsonEnd.indexOf("JSON.parse(bodyText)"))
+    .toBeLessThan(nodeJsonEnd.indexOf("resolve({ status, ok, json: async () => payload })"));
+  expect(nodeJsonEnd).toContain('reject(error instanceof Error ? error : new Error("Invalid server auth response."))');
   expect(scheduler).toContain("activeLimit: 24");
   expect(scheduler).toContain("pendingLimit: 128");
   expect(scheduler).toContain("queueDeadlineMs: 5_000");
+  expect(scheduler).toContain("notifyAdmissionObserver");
+  expect(source("lib/server-ssr-observability.ts")).toContain(
+    '"internal_read_admission_wait"',
+  );
 });
 
 test("workspace API error diagnostics emit only bounded status and correlation fields", () => {
