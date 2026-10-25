@@ -154,6 +154,111 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def test_authenticated_html_contract_requires_authenticated_ready_page_markers(self) -> None:
+        # These pieces are deliberately joined across arbitrary body-read
+        # boundaries; attributes also vary in order, quotes, and class tokens.
+        marker = b"".join((
+            b"<span data-testid='tournament-detail-lifecycle' hidden></span>",
+            b"<section class='extra top-detail-grid'></section>",
+            b"<span class='extra header-profile-avatar'></span>",
+        ))
+        body = b" " * (64 * 1024 - 11) + marker
+        self.assertEqual(
+            external_load._authenticated_html_markers("Text/Html; charset=utf-8", body),
+            (True, True),
+        )
+        self.assertEqual(
+            external_load._authenticated_html_markers("application/json", marker),
+            (False, True),
+        )
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                b'<section class="top-detail-grid"></section>'
+                b'<span class="header-profile-avatar"></span>',
+            ),
+            (True, True),
+        )
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                b'<section class="top-detail-grid"></section>',
+            ),
+            (True, False),
+        )
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                b'<!-- <span data-testid="tournament-detail-lifecycle"></span> '
+                b'<section class="top-detail-grid"></section> '
+                b'<span class="header-profile-avatar"></span> -->'
+                b'<script>"<span data-testid=\"tournament-detail-lifecycle\"></span>"</script>',
+            ),
+            (True, False),
+        )
+        self.assertEqual(
+            external_load._authenticated_html_markers("text/html", "not-bytes"),
+            (True, False),
+        )
+
+    def test_html_keepalive_request_retains_only_closed_marker_flags(self) -> None:
+        body = (
+            b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+            b'<section class="top-detail-grid"></section>'
+            b'<span class="header-profile-avatar"></span>'
+        )
+        client = Mock()
+        client.last_timing = {}
+        client.get.return_value = Mock(
+            status=200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            body=body,
+            timing={"total_ms": 12.0, "ttfb_ms": 4.0},
+        )
+        user = VirtualUser("actor", "fixture-slug", "s" * 32, "c" * 32)
+        with patch("tools.platform_external_load._http11_keepalive_client", return_value=client):
+            result = external_load._page_request_http11_keepalive(
+                "https://old-sparky.com", user, "html-capacity", 5.0,
+                session_cookie_name="session", csrf_cookie_name="csrf",
+                require_authenticated_html=True,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.html_content_type_ok, True)
+        self.assertEqual(result.html_page_marker_ok, True)
+        self.assertEqual(result.response_bytes, len(body))
+        self.assertNotIn(body.decode(), repr(result))
+        call = client.get.call_args
+        self.assertEqual(call.args[0], "/tournaments/fixture-slug")
+        self.assertIn("session=" + user.session_token, call.kwargs["headers"]["Cookie"])
+
+    def test_html_capacity_response_failure_stops_refill_and_keeps_partial_counts(self) -> None:
+        actors = [VirtualUser(f"actor-{index}", "fixture", "s" * 32, "c" * 32) for index in range(14)]
+        calls = 0
+        lock = threading.Lock()
+
+        def request(_origin: str, _user: VirtualUser, phase: str, _timeout: float) -> RequestResult:
+            nonlocal calls
+            with lock:
+                calls += 1
+            return RequestResult(phase, "GET", "/tournaments/fixture", 503, 3.0, False, 128)
+
+        start_at = time.time_ns() // 1_000_000 + 25
+        result = run_authenticated_workspace_capacity_phase(
+            "https://example.invalid", actors, phase="html-capacity",
+            duration_seconds=20, start_at_epoch_ms=start_at, end_at_epoch_ms=start_at + 20_000,
+            concurrency=2, timeout=5, request_builder=request, stop_requested=lambda: None,
+            abort_on_result=lambda item: "response_failure" if item.ok is not True else None,
+        )
+        self.assertTrue(result["aborted"])
+        self.assertEqual(result["abort_reason"], "response_failure")
+        self.assertEqual(result["submitted"], 2)
+        self.assertEqual(result["completed"], 2)
+        self.assertEqual(len(result["results"]), 2)
+        self.assertEqual(calls, 2)
+
     def test_capacity_closed_loop_guard_stops_refill_and_drains_inflight(self) -> None:
         actors = [VirtualUser(f"actor-{index}", "fixture", "s" * 32, "c" * 32) for index in range(2)]
         both_started = threading.Barrier(2)

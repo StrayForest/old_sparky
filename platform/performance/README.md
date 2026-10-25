@@ -169,9 +169,15 @@ artifact.
 
 The fixture producer and load-client consumer share a closed JSON handoff.
 `fixture_kind` is required and must be `external_load`,
-`cpu_diagnostic_only_v1` or `ssr_capacity_diagnostic_v1`; diagnostic kinds are
-bound to their confirmation and fixed fixture dimensions, and SSR capacity
-concurrency is present only for the SSR diagnostic. The consumer also binds
+`cpu_diagnostic_only_v1`, `ssr_capacity_diagnostic_v1`, or
+`ssr_html_capacity_diagnostic_v1`; diagnostic kinds are bound to their
+confirmation and fixed fixture dimensions. The typed HTML capacity workload
+also binds its workload ID and may use only its own 8/16/32/64 concurrency
+presets with a fixed 14-actor cohort; the existing workspace capacity profile
+uses eight actors and remains limited to concurrency 8/16. Both exercise the
+authenticated tournament document over HTTP/1.1 keep-alive, but have different
+acceptance semantics and are not comparable as performance A/B arms. SSR
+capacity concurrency is present only for those two SSR diagnostics. The consumer also binds
 the handoff to the exact target SHA, run ID and fixture source manifest before
 starting the candidate.
 

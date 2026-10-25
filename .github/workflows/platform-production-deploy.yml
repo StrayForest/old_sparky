@@ -35,6 +35,7 @@ on:
           - read-mix-cprofile
           - authenticated-read-admission-32
           - authenticated-read-admission-24x8
+          - authenticated-read-admission-24x8-native
           - pool-pre-ping-off
           - web-ssr-diagnostics
           - web-ssr-native-transport

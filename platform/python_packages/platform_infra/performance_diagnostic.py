@@ -29,6 +29,8 @@ PLAN_PATHS = {
 MAX_PLAN_BYTES = 4096
 MAX_CAPTURE_MS = 60_000
 WORKLOAD = "authenticated_workspace_read_pair_v1"
+WORKLOAD_SSR_CAPACITY = "authenticated_workspace_read_capacity_v1"
+WORKLOAD_HTML_SSR_CAPACITY = "authenticated_html_ssr_capacity_v1"
 OFF_WINDOW_MS = 20_000
 IDLE_WINDOW_MS = 5_000
 ON_WINDOW_MS = 20_000
@@ -119,7 +121,10 @@ def parse_plan_payload(raw: bytes, *, expected_service: str) -> DiagnosticPlan:
         raise ValueError("invalid source identity")
     if not isinstance(release_slug, str) or SLUG_RE.fullmatch(release_slug) is None:
         raise ValueError("invalid release identity")
-    if payload["workload"] != WORKLOAD:
+    if (not isinstance(payload["workload"], str)
+            or payload["workload"] not in {
+                WORKLOAD, WORKLOAD_SSR_CAPACITY, WORKLOAD_HTML_SSR_CAPACITY,
+            }):
         raise ValueError("invalid workload")
 
     times: list[int] = []
@@ -170,7 +175,7 @@ def parse_plan_payload(raw: bytes, *, expected_service: str) -> DiagnosticPlan:
         run_id=run_id,
         source_sha=source_sha,
         release_slug=release_slug,
-        workload=WORKLOAD,
+        workload=payload["workload"],
         off_start_ms=off_start_ms,
         off_end_ms=off_end_ms,
         on_start_ms=on_start_ms,
@@ -574,6 +579,11 @@ class ApiCpuDiagnostic:
         except RuntimeError:
             return plan, phase
         _start_cpu_usage_window(plan, phase, loop)
+        # HTML capacity diagnostics need the same run/phase correlation and
+        # low-cost CPU usage window, but never enable the expensive cProfile
+        # capture reserved for the dedicated CPU-pair workload.
+        if plan.workload != WORKLOAD:
+            return plan, phase
         if phase == "off" or plan.run_id in _consumed_run_ids or _active_profile is not None:
             return plan, phase
         remaining_seconds = max(0.0, (plan.on_end_ms - now_ms) / 1000)

@@ -64,6 +64,7 @@ DEPLOY_RUNTIME_PROFILES = frozenset(
         "read-mix-cprofile",
         "authenticated-read-admission-32",
         "authenticated-read-admission-24x8",
+        "authenticated-read-admission-24x8-native",
         "pool-pre-ping-off",
         "web-ssr-diagnostics",
         "web-ssr-native-transport",
@@ -102,6 +103,7 @@ HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 CPU_DIAGNOSTIC_RUN_RE = re.compile(r"^[0-9a-f]{32}$")
 CPU_DIAGNOSTIC_WORKLOAD = "authenticated_workspace_read_pair_v1"
 SSR_CAPACITY_DIAGNOSTIC_WORKLOAD = "authenticated_workspace_read_capacity_v1"
+SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD = "authenticated_html_ssr_capacity_v1"
 HOST_TOOLS_SIGNER_WORKFLOW = (
     "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml"
 )
@@ -410,6 +412,8 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     keys = base_keys | {"fixture_kind"}
     if fixture_kind == "ssr_capacity_diagnostic_v1":
         keys.add("ssr_capacity_concurrency")
+    elif fixture_kind == "ssr_html_capacity_diagnostic_v1":
+        keys.update({"ssr_capacity_concurrency", "ssr_capacity_workload"})
     if schema == 2:
         keys.add("source_binding")
     if set(payload) != keys and set(payload) != keys - {"fixture_kind"}:
@@ -437,9 +441,13 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise _invalid()
     if fixture_kind not in {
         "external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1",
+        "ssr_html_capacity_diagnostic_v1",
     }:
         raise _invalid()
-    if fixture_kind in {"cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1"}:
+    if fixture_kind in {
+        "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1",
+        "ssr_html_capacity_diagnostic_v1",
+    }:
         expected_confirmation = (
             CPU_DIAGNOSTIC_CONFIRMATION if fixture_kind == "cpu_diagnostic_only_v1"
             else SSR_CAPACITY_CONFIRMATION
@@ -451,9 +459,14 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             or users_per_tournament != "14"
         ):
             raise _invalid()
-    if fixture_kind == "ssr_capacity_diagnostic_v1":
+    if fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
         concurrency = _require_string(payload, "ssr_capacity_concurrency")
-        if concurrency not in {"8", "16"}:
+        presets = {"8", "16"} if fixture_kind == "ssr_capacity_diagnostic_v1" else {"8", "16", "32", "64"}
+        if concurrency not in presets:
+            raise _invalid()
+        if fixture_kind == "ssr_html_capacity_diagnostic_v1" and _require_string(
+            payload, "ssr_capacity_workload",
+        ) != SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD:
             raise _invalid()
     elif "ssr_capacity_concurrency" in payload:
         raise _invalid()
@@ -481,8 +494,10 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
     if "fixture_kind" in payload:
         result["fixture_kind"] = fixture_kind
-    if fixture_kind == "ssr_capacity_diagnostic_v1":
+    if fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
         result["ssr_capacity_concurrency"] = concurrency
+    if fixture_kind == "ssr_html_capacity_diagnostic_v1":
+        result["ssr_capacity_workload"] = SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD
     if source_binding is not None:
         result["source_binding"] = source_binding
     return result
@@ -516,9 +531,12 @@ def validate_cpu_diagnostic_payload(payload: Mapping[str, Any]) -> dict[str, Any
         raise _invalid()
     if not isinstance(source_sha, str) or SHA_RE.fullmatch(source_sha) is None:
         raise _invalid()
-    if payload.get("workload") not in {
-        CPU_DIAGNOSTIC_WORKLOAD, SSR_CAPACITY_DIAGNOSTIC_WORKLOAD,
-    }:
+    if (not isinstance(payload.get("workload"), str)
+            or payload.get("workload") not in {
+                CPU_DIAGNOSTIC_WORKLOAD,
+                SSR_CAPACITY_DIAGNOSTIC_WORKLOAD,
+                SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD,
+            }):
         raise _invalid()
     times = [payload.get(name) for name in (
         "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms"
@@ -544,7 +562,11 @@ def validate_ssr_capacity_memory_watch_payload(payload: Mapping[str, Any]) -> di
     _require_exact_keys(payload, {"schema", "operation", "run_id", "source_sha", "workload"})
     if (type(payload.get("schema")) is not int or payload["schema"] != 1
             or payload.get("operation") != "memory-watch"
-            or payload.get("workload") != SSR_CAPACITY_DIAGNOSTIC_WORKLOAD):
+            or not isinstance(payload.get("workload"), str)
+            or payload.get("workload") not in {
+                SSR_CAPACITY_DIAGNOSTIC_WORKLOAD,
+                SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD,
+            }):
         raise _invalid()
     run_id = payload.get("run_id")
     source_sha = payload.get("source_sha")

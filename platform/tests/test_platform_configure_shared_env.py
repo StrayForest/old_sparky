@@ -192,6 +192,30 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
             },
         )
         self.assertEqual(
+            configure.RUNTIME_PROFILES["authenticated-read-admission-24x8-native"],
+            {
+                **configure.RUNTIME_PROFILES["authenticated-read-admission-24x8"],
+                "PLATFORM_WEB_SERVER_AUTH_TRANSPORT": "node",
+            },
+        )
+        admission_profile = dict(configure.PUBLIC_BASELINE)
+        admission_profile.update(
+            configure.RUNTIME_PROFILES["authenticated-read-admission-24x8"]
+        )
+        native_profile = dict(configure.PUBLIC_BASELINE)
+        native_profile.update(
+            configure.RUNTIME_PROFILES["authenticated-read-admission-24x8-native"]
+        )
+        self.assertEqual(
+            {
+                key for key in admission_profile
+                if admission_profile[key] != native_profile[key]
+            },
+            {"PLATFORM_WEB_SERVER_AUTH_TRANSPORT"},
+        )
+        self.assertEqual(admission_profile["PLATFORM_WEB_SERVER_AUTH_TRANSPORT"], "fetch")
+        self.assertEqual(native_profile["PLATFORM_WEB_SERVER_AUTH_TRANSPORT"], "node")
+        self.assertEqual(
             configure.RUNTIME_PROFILES["pool-pre-ping-off"],
             {"PLATFORM_DB_POOL_PRE_PING": "false"},
         )

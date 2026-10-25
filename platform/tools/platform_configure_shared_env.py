@@ -157,6 +157,12 @@ PUBLIC_BASELINE = {
     "PLATFORM_SSR_PERF_SAMPLE_RATE": "0.01",
     "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
 }
+AUTHENTICATED_READ_ADMISSION_24X8 = {
+    "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED": "true",
+    "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "24",
+    "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "8",
+    "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "250",
+}
 RUNTIME_PROFILES = {
     "baseline": {},
     # Static Ready Vote profiles are deliberately limited to the reviewed
@@ -210,11 +216,10 @@ RUNTIME_PROFILES = {
     # move the excess burst into a small, connection-free queue. The total
     # admitted-plus-waiting envelope remains 32; this is a TTFB/pool-contention
     # candidate, not a capacity increase.
-    "authenticated-read-admission-24x8": {
-        "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED": "true",
-        "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "24",
-        "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "8",
-        "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "250",
+    "authenticated-read-admission-24x8": AUTHENTICATED_READ_ADMISSION_24X8,
+    "authenticated-read-admission-24x8-native": {
+        **AUTHENTICATED_READ_ADMISSION_24X8,
+        "PLATFORM_WEB_SERVER_AUTH_TRANSPORT": "node",
     },
     "pool-pre-ping-off": {
         "PLATFORM_DB_POOL_PRE_PING": "false",

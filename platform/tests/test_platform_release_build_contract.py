@@ -3322,9 +3322,29 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
 
     def test_ssr_runtime_profiles_restart_the_web_process(self) -> None:
         workflow = DEPLOY_SUPERVISOR.read_text()
+        deploy_workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text()
+        self.assertIn("          - authenticated-read-admission-24x8-native\n", deploy_workflow)
         self.assertIn("restart_web_and_wait()", workflow)
         self.assertIn(
             'baseline|ready-vote-static-*|ready-vote-cprofile|ready-vote-adaptive-v2',
+            workflow,
+        )
+        self.assertIn(
+            "authenticated-read-admission-24x8-native",
+            workflow[workflow.index('case "$runtime_profile" in', workflow.index("# SSR diagnostics are read")):],
+        )
+        self.assertIn(
+            'if [[ "$runtime_profile" == authenticated-read-admission-24x8',
+            workflow,
+        )
+        self.assertIn(
+            '|| "$runtime_profile" == authenticated-read-admission-24x8-native ]]; then',
+            workflow,
+        )
+        self.assertIn(
+            "candidate_profile_args+=(--only PLATFORM_WEB_SERVER_AUTH_TRANSPORT)",
             workflow,
         )
         self.assertIn("deadlock-web did not recover after runtime profile", workflow)

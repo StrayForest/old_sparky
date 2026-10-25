@@ -21,8 +21,10 @@ from tools.platform_workflow_input_guard import (  # noqa: E402
     EXTERNAL_CONFIRMATION,
     WorkflowInputError,
     validate_cleanup_payload,
+    validate_cpu_diagnostic_payload,
     validate_external_payload,
     validate_live_payload,
+    validate_ssr_capacity_memory_watch_payload,
 )
 from tools.platform_autodeploy_freshness_guard import (  # noqa: E402
     main as freshness_guard_main,
@@ -120,6 +122,70 @@ def _external_payload(schema: int = 2) -> dict[str, object]:
 
 
 class SourceBindingDispatchTests(unittest.TestCase):
+    def test_html_capacity_workload_crosses_both_cpu_plan_dispatch_guards(self) -> None:
+        html_plan = {
+            "schema": 1,
+            "operation": "prepare",
+            "run_id": "a" * 32,
+            "source_sha": APP_SHA,
+            "workload": "authenticated_html_ssr_capacity_v1",
+            "off_start_ms": 1_000_000,
+            "off_end_ms": 1_020_000,
+            "on_start_ms": 1_025_000,
+            "on_end_ms": 1_045_000,
+        }
+        self.assertEqual(
+            validate_cpu_diagnostic_payload(html_plan)["workload"],
+            "authenticated_html_ssr_capacity_v1",
+        )
+        html_watch = {
+            "schema": 1,
+            "operation": "memory-watch",
+            "run_id": html_plan["run_id"],
+            "source_sha": APP_SHA,
+            "workload": html_plan["workload"],
+        }
+        self.assertEqual(
+            validate_ssr_capacity_memory_watch_payload(html_watch)["workload"],
+            "authenticated_html_ssr_capacity_v1",
+        )
+        for validator, payload in (
+            (validate_cpu_diagnostic_payload, {**html_plan, "workload": []}),
+            (validate_ssr_capacity_memory_watch_payload, {**html_watch, "workload": []}),
+        ):
+            with self.subTest(validator=validator.__name__):
+                with self.assertRaises(WorkflowInputError):
+                    validator(payload)
+
+    def test_ssr_memory_watch_accepts_only_the_two_typed_capacity_workloads(self) -> None:
+        payload = {
+            "schema": 1,
+            "operation": "memory-watch",
+            "run_id": "a" * 32,
+            "source_sha": APP_SHA,
+            "workload": "authenticated_workspace_read_capacity_v1",
+        }
+        self.assertEqual(
+            validate_ssr_capacity_memory_watch_payload(payload)["workload"],
+            "authenticated_workspace_read_capacity_v1",
+        )
+        html = {
+            **payload,
+            "workload": "authenticated_html_ssr_capacity_v1",
+        }
+        self.assertEqual(
+            validate_ssr_capacity_memory_watch_payload(html)["workload"],
+            "authenticated_html_ssr_capacity_v1",
+        )
+        for mutation in (
+            {**payload, "workload": "authenticated_workspace_read_pair_v1"},
+            {**payload, "workload": []},
+            {**html, "unexpected": True},
+        ):
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(WorkflowInputError):
+                    validate_ssr_capacity_memory_watch_payload(mutation)
+
     def test_autodeploy_freshness_guard_binds_exact_live_dev_sha(self) -> None:
         tested_sha = "a" * 40
         exact_response = json.dumps(
@@ -277,6 +343,20 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 with self.assertRaises(WorkflowInputError):
                     validate_external_payload(mutation)
 
+        cpu_payload = _external_payload()
+        cpu_payload.update(
+            confirmation="RUN-PRODUCTION-CPU-DIAGNOSTIC",
+            fixture_kind="cpu_diagnostic_only_v1",
+            tournament_count="1", users_per_tournament="14",
+        )
+        self.assertEqual(
+            validate_external_payload(cpu_payload)["fixture_kind"],
+            "cpu_diagnostic_only_v1",
+        )
+        ordinary = _external_payload()
+        with self.assertRaises(WorkflowInputError):
+            validate_external_payload({**ordinary, "ssr_capacity_concurrency": "16"})
+
     def test_ssr_capacity_fixture_is_a_separate_fixed_zero_credit_route(self) -> None:
         payload = _external_payload()
         payload.update(
@@ -310,19 +390,38 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 with self.assertRaises(WorkflowInputError):
                     validate_external_payload(mutation)
 
-        cpu_payload = _external_payload()
-        cpu_payload.update(
-            confirmation="RUN-PRODUCTION-CPU-DIAGNOSTIC",
-            fixture_kind="cpu_diagnostic_only_v1",
-            tournament_count="1", users_per_tournament="14",
+    def test_html_ssr_capacity_is_separately_typed_and_reuses_only_14_fixture_actors(self) -> None:
+        payload = _external_payload()
+        payload.update(
+            confirmation="RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC",
+            fixture_kind="ssr_html_capacity_diagnostic_v1",
+            ssr_capacity_workload="authenticated_html_ssr_capacity_v1",
+            ssr_capacity_concurrency="8",
+            tournament_count="1",
+            users_per_tournament="14",
         )
-        self.assertEqual(
-            validate_external_payload(cpu_payload)["fixture_kind"],
-            "cpu_diagnostic_only_v1",
-        )
-        ordinary = _external_payload()
-        with self.assertRaises(WorkflowInputError):
-            validate_external_payload({**ordinary, "ssr_capacity_concurrency": "16"})
+        validated = validate_external_payload(payload)
+        self.assertEqual(validated["ssr_capacity_workload"], "authenticated_html_ssr_capacity_v1")
+        self.assertEqual(validated["ssr_capacity_concurrency"], "8")
+        for concurrency in ("8", "16", "32", "64"):
+            self.assertEqual(
+                validate_external_payload({**payload, "ssr_capacity_concurrency": concurrency})[
+                    "ssr_capacity_concurrency"
+                ],
+                concurrency,
+            )
+        for mutation in (
+            {**payload, "ssr_capacity_workload": "authenticated_workspace_read_capacity_v1"},
+            {**payload, "ssr_capacity_concurrency": "128"},
+            {**payload, "tournament_count": "2"},
+            {**payload, "users_per_tournament": "15"},
+            {**payload, "timeout_diagnostics": "true"},
+            {**payload, "fixture_kind": "ssr_capacity_diagnostic_v1"},
+            {**payload, "fixture_kind": "external_load"},
+        ):
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(WorkflowInputError):
+                    validate_external_payload(mutation)
 
     def test_legacy_schema_one_preserves_same_source_shape(self) -> None:
         payload = _external_payload(schema=1)

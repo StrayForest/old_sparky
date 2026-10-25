@@ -337,10 +337,14 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "Run the fixed authenticated workspace CPU pair", 1
         )[1])
         self.assertIn("ssr_capacity_concurrency:", self.source)
+        self.assertIn("ssr_capacity_workload:", self.source)
+        self.assertIn("authenticated_html_ssr_capacity_v1", self.source)
         self.assertIn('default: "8"', self.source)
-        self.assertIn('options:\n          - "8"\n          - "16"', self.source)
+        self.assertIn('options:\n          - "8"\n          - "16"\n          - "32"\n          - "64"', self.source)
         self.assertIn("--concurrency '${{ inputs.ssr_capacity_concurrency }}'", pair)
         self.assertIn('payload["ssr_capacity_concurrency"] = os.environ["SSR_CAPACITY_CONCURRENCY"]', validate)
+        self.assertIn('payload["ssr_capacity_workload"] = os.environ["SSR_CAPACITY_WORKLOAD"]', validate)
+        self.assertIn("payload.get(\"workload\") != handoff.get(\"ssr_capacity_workload\"", self.jobs["namespace-containment-barrier"])
         self.assertNotIn("platform_external_load.py", pair)
         self.assertIn('"tournament_count": "1" if diagnostic_only else tournaments', validate)
         self.assertIn('"users_per_tournament": "14" if diagnostic_only else users', validate)
@@ -352,6 +356,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "${{ inputs.ssr_capacity_diagnostic_only }}", "true"
         ).replace(
             "${{ inputs.ssr_capacity_concurrency }}", "8"
+        ).replace(
+            "${{ inputs.ssr_capacity_workload }}", "authenticated_workspace_read_capacity_v1"
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             env = {
@@ -376,6 +382,23 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 env=env, capture_output=True, text=True, check=False,
             )
             self.assertEqual(accepted_16.returncode, 0, accepted_16.stderr)
+            html_32_script = guard_script.replace(
+                "SSR_CAPACITY_WORKLOAD='authenticated_workspace_read_capacity_v1'",
+                "SSR_CAPACITY_WORKLOAD='authenticated_html_ssr_capacity_v1'",
+            ).replace("SSR_CAPACITY_CONCURRENCY='8'", "SSR_CAPACITY_CONCURRENCY='32'")
+            html_32 = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", html_32_script],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(html_32.returncode, 0, html_32.stderr)
+            workspace_32 = guard_script.replace(
+                "SSR_CAPACITY_CONCURRENCY='8'", "SSR_CAPACITY_CONCURRENCY='32'"
+            )
+            rejected_workspace_32 = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", workspace_32],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(rejected_workspace_32.returncode, 0)
             non_ssr_16_script = accepted_16_script.replace(
                 "SSR_CAPACITY_DIAGNOSTIC_ONLY='true'", "SSR_CAPACITY_DIAGNOSTIC_ONLY='false'"
             )
@@ -401,6 +424,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             job_env["SSR_CAPACITY_CONCURRENCY"],
             "${{ inputs.ssr_capacity_concurrency }}",
         )
+        self.assertEqual(
+            job_env["SSR_CAPACITY_WORKLOAD"],
+            "${{ inputs.ssr_capacity_workload }}",
+        )
 
         validate_step = _step_script(
             self.jobs["validate-external-inputs"],
@@ -414,6 +441,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         assert function is not None
         self.assertIn(
             'SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY"',
+            function.group(0),
+        )
+        self.assertIn(
+            'SSR_CAPACITY_WORKLOAD="$SSR_CAPACITY_WORKLOAD"',
             function.group(0),
         )
         self.assertIn(
@@ -439,6 +470,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     "APP_TARGET_SHA": "a" * 40,
                     "GITHUB_RUN_ID": "40118074720",
                     "SSR_CAPACITY_CONCURRENCY": "8",
+                    "SSR_CAPACITY_WORKLOAD": "authenticated_workspace_read_capacity_v1",
                 },
                 capture_output=True,
                 text=True,
@@ -1533,6 +1565,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "cpu_diagnostic_only": False,
             "ssr_capacity_diagnostic_only": False,
             "ssr_capacity_concurrency": "8",
+            "ssr_capacity_workload": "authenticated_workspace_read_capacity_v1",
         }
         invalid_payloads = (
             json.dumps({"inputs": {**valid_inputs, "unexpected": "value"}}),

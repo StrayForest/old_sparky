@@ -62,6 +62,71 @@ def _canonical_payload(payload: dict[str, object]) -> bytes:
 
 
 class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
+    def test_html_ssr_profile_is_distinct_and_only_extends_concurrency_for_html(self) -> None:
+        self.assertEqual(
+            capacity_diagnostic.profile_payload(8),
+            {
+                "schema": capacity_diagnostic.SCHEMA,
+                "workload": capacity_diagnostic.WORKLOAD,
+                "fixture_kind": capacity_diagnostic.FIXTURE_KIND,
+                "fixture_tournaments": 1,
+                "fixture_users": 14,
+                "actors": 8,
+                "concurrency": 8,
+                "max_inflight": 8,
+                "load_model": "closed_loop_best_effort",
+                "window_ms": 20_000,
+                "matrix_credit": False,
+                "slo_credit": False,
+            },
+        )
+        html = capacity_diagnostic.profile_payload(
+            64, capacity_diagnostic.HTML_WORKLOAD,
+        )
+        self.assertEqual(html["fixture_kind"], capacity_diagnostic.HTML_FIXTURE_KIND)
+        self.assertEqual(html["actors"], 14)
+        self.assertEqual(html["concurrency"], 64)
+        self.assertNotEqual(
+            capacity_diagnostic.profile_digest(8),
+            capacity_diagnostic.profile_digest(8, capacity_diagnostic.HTML_WORKLOAD),
+        )
+        with self.assertRaises(ValueError):
+            capacity_diagnostic.profile_payload(32, capacity_diagnostic.WORKLOAD)
+        self.assertIn(
+            capacity_diagnostic.HTML_WORKLOAD,
+            diagnostic_plan_tool.SUPPORTED_WORKLOADS,
+        )
+        self.assertIn(
+            capacity_diagnostic.HTML_WORKLOAD,
+            diagnostic_plan_tool.MEMORY_WATCH_WORKLOADS,
+        )
+
+    def test_capacity_response_errors_use_closed_codes_without_untrusted_text(self) -> None:
+        cases = (
+            ("unexpected_content_type", 200, "unexpected_content_type"),
+            ("page_marker_missing", 200, "page_marker_missing"),
+            ("unexpected_status", 503, "server_error"),
+            ("TimeoutError", 0, "timeout"),
+            ("private header leaked", 200, "other"),
+        )
+        for error_kind, status, expected in cases:
+            with self.subTest(error_kind=error_kind):
+                code = capacity_diagnostic._capacity_error_code(
+                    SimpleNamespace(error_kind=error_kind, status=status),
+                )
+                self.assertEqual(code, expected)
+                self.assertIn(code, capacity_diagnostic.CAPACITY_ERROR_CODES)
+        self.assertTrue(capacity_diagnostic._worker_counts_are_closed({
+            "status": "incomplete", "completed": 2,
+            "http_status_counts": {"200": 1, "503": 1},
+            "error_counts": {"page_marker_missing": 1},
+        }))
+        self.assertFalse(capacity_diagnostic._worker_counts_are_closed({
+            "status": "incomplete", "completed": 1,
+            "http_status_counts": {"200": 1},
+            "error_counts": {"private identity leaked": 1},
+        }))
+
     def test_ssr_capacity_control_is_bound_atomic_fresh_and_accepts_complete(self) -> None:
         expected = {
             "run_id": "a" * 32,
@@ -148,6 +213,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         plan = {
             "off_start_ms": 2_000, "off_end_ms": 22_000,
             "on_start_ms": 27_000, "on_end_ms": 47_000,
+            "workload": diagnostic_plan_tool.CAPACITY_WORKLOAD,
         }
         unit = {
             "ActiveState": "active", "InvocationID": "f" * 32,
@@ -159,21 +225,27 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "memory.max": str(diagnostic_plan_tool.SSR_CAPACITY_MEMORY_MAX_BYTES),
             "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
         }
-        with (
-            patch.object(diagnostic_plan_tool.os, "geteuid", return_value=0),
-            patch.object(diagnostic_plan_tool, "_capacity_plan_identity", return_value=(unit, target, plan)),
-            patch.object(diagnostic_plan_tool, "_systemd_memory_max", return_value=diagnostic_plan_tool.SSR_CAPACITY_MEMORY_MAX_BYTES),
-            patch.object(diagnostic_plan_tool, "_systemd_unit", return_value=unit),
-            patch.object(diagnostic_plan_tool, "_service_targets", return_value=[target]),
-            patch.object(diagnostic_plan_tool, "_read_cgroup_pseudo", side_effect=lambda path, maximum: values[path.name]),
-            patch.object(diagnostic_plan_tool.time, "time_ns", side_effect=[1_000_000_000, 22_000_000_000, 47_000_000_000]),
-            patch.object(diagnostic_plan_tool.time, "sleep"),
-        ):
-            rows = list(diagnostic_plan_tool.watch_capacity_memory(Namespace(run_id="a" * 32, source_sha="b" * 40)))
-        self.assertEqual([row["decision"] for row in rows], ["continue", "continue", "complete"])
-        self.assertEqual([row["phase"] for row in rows], ["off", "idle", "complete"])
-        self.assertEqual([row["elapsed_ms"] for row in rows], [0, 20_000, 45_000])
-        self.assertTrue(all(row["plan_on_start_ms"] == 27_000 for row in rows))
+        for workload in (diagnostic_plan_tool.CAPACITY_WORKLOAD, diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD):
+            with self.subTest(workload=workload):
+                bound_plan = {**plan, "workload": workload}
+                with (
+                    patch.object(diagnostic_plan_tool.os, "geteuid", return_value=0),
+                    patch.object(diagnostic_plan_tool, "_capacity_plan_identity", return_value=(unit, target, bound_plan)),
+                    patch.object(diagnostic_plan_tool, "_systemd_memory_max", return_value=diagnostic_plan_tool.SSR_CAPACITY_MEMORY_MAX_BYTES),
+                    patch.object(diagnostic_plan_tool, "_systemd_unit", return_value=unit),
+                    patch.object(diagnostic_plan_tool, "_service_targets", return_value=[target]),
+                    patch.object(diagnostic_plan_tool, "_read_cgroup_pseudo", side_effect=lambda path, maximum: values[path.name]),
+                    patch.object(diagnostic_plan_tool.time, "time_ns", side_effect=[1_000_000_000, 22_000_000_000, 47_000_000_000]),
+                    patch.object(diagnostic_plan_tool.time, "sleep"),
+                ):
+                    rows = list(diagnostic_plan_tool.watch_capacity_memory(Namespace(
+                        run_id="a" * 32, source_sha="b" * 40, workload=workload,
+                    )))
+                self.assertEqual([row["decision"] for row in rows], ["continue", "continue", "complete"])
+                self.assertEqual([row["phase"] for row in rows], ["off", "idle", "complete"])
+                self.assertEqual([row["elapsed_ms"] for row in rows], [0, 20_000, 45_000])
+                self.assertTrue(all(row["workload"] == workload for row in rows))
+                self.assertTrue(all(row["plan_on_start_ms"] == 27_000 for row in rows))
 
     def test_ssr_capacity_watch_rejects_non_root_before_reading_plan(self) -> None:
         with (
@@ -185,6 +257,25 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     Namespace(run_id="a" * 32, source_sha="b" * 40),
                 ))
         plan_identity.assert_not_called()
+
+    def test_ssr_capacity_watch_rejects_cross_workload_memory_request(self) -> None:
+        plan = {
+            "off_start_ms": 2_000, "off_end_ms": 22_000,
+            "on_start_ms": 27_000, "on_end_ms": 47_000,
+            "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+        }
+        with (
+            patch.object(diagnostic_plan_tool.os, "geteuid", return_value=0),
+            patch.object(
+                diagnostic_plan_tool, "_capacity_plan_identity",
+                return_value=({}, {}, plan),
+            ),
+        ):
+            with self.assertRaisesRegex(PlanError, "workload binding changed"):
+                list(diagnostic_plan_tool.watch_capacity_memory(Namespace(
+                    run_id="a" * 32, source_sha="b" * 40,
+                    workload=diagnostic_plan_tool.CAPACITY_WORKLOAD,
+                )))
 
     def test_ssr_capacity_remote_observation_maps_only_bound_abort_to_worker_control(self) -> None:
         binding = {
@@ -326,6 +417,33 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 )
                 return json.loads(report_path.read_text(encoding="utf-8"))
 
+        html_binding = {
+            **binding,
+            "profile_digest": capacity_diagnostic.profile_digest(
+                64, capacity_diagnostic.HTML_WORKLOAD,
+            ),
+        }
+        html_config = {
+            **config,
+            "binding": html_binding,
+            "workload": capacity_diagnostic.HTML_WORKLOAD,
+            "fixture_kind": capacity_diagnostic.HTML_FIXTURE_KIND,
+            "concurrency": 64,
+        }
+        html_report = through_worker_entry({
+            **report,
+            **capacity_diagnostic.profile_payload(64, capacity_diagnostic.HTML_WORKLOAD),
+            **html_binding,
+            "actors": 14,
+            "concurrency": 64,
+            "max_inflight": 64,
+            "off_probe": {"submitted": 64, "completed": 64, "http_status": 200},
+        })
+        self.assertTrue(capacity_diagnostic._worker_report_matches(html_report, html_config))
+        self.assertFalse(capacity_diagnostic._worker_report_matches(
+            {**html_report, "workload": capacity_diagnostic.WORKLOAD}, html_config,
+        ))
+
         report = through_worker_entry(report)
         self.assertTrue(capacity_diagnostic._worker_report_matches(report, config))
         for mutation in (
@@ -334,6 +452,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             {**report, "partial_work": 0},
             {**report, "unknown_envelope_field": False},
             {**report, "status": []},
+            {**report, "error_counts": {"private identity leaked": 1}},
+            {**report, "http_status_counts": {"200": 39}},
             {**report, "partial_work": True},
             {**report, "inflight_unknown": True},
         ):
@@ -1134,6 +1254,41 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             report, source_sha="b" * 40, app_target_sha="c" * 40,
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
         ), "PASS")
+        html_report = json.loads(json.dumps(report))
+        manifest_raw = json.dumps({
+            "runner_sha": "b" * 40, "app_target_sha": "c" * 40,
+        }, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+        html_report.update({
+            "workload": capacity_diagnostic.HTML_WORKLOAD,
+            "fixture_kind": capacity_diagnostic.HTML_FIXTURE_KIND,
+            "profile_digest": capacity_diagnostic.profile_digest(
+                8, capacity_diagnostic.HTML_WORKLOAD,
+            ),
+            "fixture_manifest_sha256": manifest_sha,
+            "fixture_manifest_bytes": len(manifest_raw),
+            "actors": 14,
+        })
+        html_report["worker"]["fixture_manifest_bytes"] = len(manifest_raw)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "html-report.json"
+            output_path = root / "html-sanitized.json"
+            manifest_path = root / "manifest.json"
+            capacity_diagnostic._write_report(input_path, html_report)
+            manifest_path.write_bytes(manifest_raw)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, {
+                    "runner_sha": "b" * 40, "app_target_sha": "c" * 40,
+                }, []),
+            ):
+                self.assertEqual(capacity_diagnostic.sanitize_capacity_report(
+                    input_path=input_path, output_path=output_path,
+                    manifest_path=manifest_path, source_sha="b" * 40,
+                    app_target_sha="c" * 40, run_id="12345", attempt="1",
+                    workload=capacity_diagnostic.HTML_WORKLOAD,
+                ), "PASS")
         incomplete_window_report = json.loads(json.dumps(report))
         incomplete_window_report["worker"]["process_cpu_windows"][1] = {
             "window": "on", "status": "incomplete", "cpu_ns": None,
@@ -2278,6 +2433,28 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         with self.assertRaises(PlanError):
             _read_request("cleanup-stdin", io.BytesIO(raw))
 
+    def test_html_ssr_memory_watch_binding_is_a_separate_closed_workload(self) -> None:
+        for workload in (
+            diagnostic_plan_tool.CAPACITY_WORKLOAD,
+            diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+        ):
+            payload = {
+                "schema": 1, "run_id": "a" * 32, "source_sha": "b" * 40,
+                "workload": workload,
+            }
+            raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+            parsed = _read_request("memory-watch-stdin", io.BytesIO(raw))
+            self.assertEqual(parsed.workload, workload)
+        invalid = {
+            "schema": 1, "run_id": "a" * 32, "source_sha": "b" * 40,
+            "workload": "authenticated_workspace_read_pair_v1",
+        }
+        with self.assertRaises(PlanError):
+            _read_request(
+                "memory-watch-stdin",
+                io.BytesIO(json.dumps(invalid, sort_keys=True, separators=(",", ":")).encode() + b"\n"),
+            )
+
         targets = {
             "api": [
                 {"service": "api", "pid": 101, "start_ticks": 11, "invocation_id": "c" * 32},
@@ -2569,6 +2746,107 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(plan.phase_at(26_000), "on")
         self.assertEqual(plan.phase_at(45_999), "on")
         self.assertIsNone(plan.phase_at(46_000))
+
+    def test_capacity_plans_bind_api_usage_without_enabling_cprofile(self) -> None:
+        import python_packages.platform_infra.performance_diagnostic as diagnostic_module
+
+        scope = {
+            "type": "http", "method": "GET",
+            "path": "/api/v1/tournaments/safe-slug/workspace",
+            "headers": [(b"x-platform-ssr-trace", b"a" * 32)],
+        }
+        for workload in (
+            capacity_diagnostic.WORKLOAD,
+            capacity_diagnostic.HTML_WORKLOAD,
+        ):
+            with self.subTest(workload=workload):
+                payload = _diagnostic_payload()
+                payload["workload"] = workload
+                plan = parse_plan_payload(_canonical_payload(payload), expected_service="api")
+                self.assertEqual(plan.workload, workload)
+                with (
+                    patch.object(diagnostic_module, "read_process_plan", return_value=plan),
+                    patch.object(diagnostic_module.time, "time_ns", return_value=30_000_000_000),
+                    patch.object(diagnostic_module, "_start_cpu_usage_window") as usage_window,
+                    patch.object(diagnostic_module, "_active_profile", None),
+                    patch("asyncio.get_running_loop", return_value=object()),
+                ):
+                    bound_plan, phase = ApiCpuDiagnostic.activate_for_scope(scope)
+                self.assertIs(bound_plan, plan)
+                self.assertEqual(phase, "on")
+                usage_window.assert_called_once()
+                self.assertEqual(usage_window.call_args.args[:2], (plan, "on"))
+                self.assertIsNone(diagnostic_module._active_profile)
+
+    def test_capacity_api_usage_summary_requires_both_workers_in_both_phases(self) -> None:
+        targets = {
+            "api": [
+                {"service": "api", "pid": 101, "start_ticks": 11, "invocation_id": "c" * 32},
+                {"service": "api", "pid": 102, "start_ticks": 12, "invocation_id": "c" * 32},
+            ],
+            "web": [
+                {"service": "web", "pid": 201, "start_ticks": 21, "invocation_id": "d" * 32},
+            ],
+        }
+        for workload in (capacity_diagnostic.WORKLOAD, capacity_diagnostic.HTML_WORKLOAD):
+            with self.subTest(workload=workload):
+                plans = {
+                    service: {
+                        **_diagnostic_payload(service=service),
+                        "workload": workload,
+                        "targets": service_targets,
+                    }
+                    for service, service_targets in targets.items()
+                }
+                records: list[dict[str, str]] = []
+                for service, service_targets in targets.items():
+                    for target in service_targets:
+                        for phase in ("off", "on"):
+                            message = (
+                                "cpu_diagnostic_usage "
+                                f"service={service} run_id={'a' * 32} phase={phase} "
+                                "window_ms=20000 cpu_ns=4000000000 "
+                                "cpu_capacity_cpus=2.000000 start_lag_ms=10 "
+                                "end_lag_ms=5 timing_complete=true"
+                            )
+                            records.append({
+                                "MESSAGE": json.dumps({"message": message}) if service == "api" else message,
+                                "_PID": str(target["pid"]),
+                                "_SYSTEMD_UNIT": f"deadlock-{service}.service",
+                                "_SYSTEMD_INVOCATION_ID": str(target["invocation_id"]),
+                                "_SYSTEMD_CGROUP": f"/system.slice/deadlock-{service}.service",
+                                "__REALTIME_TIMESTAMP": "1000000" if phase == "off" else "26000000",
+                            })
+                service_rows = {
+                    service: [{**target} for target in service_targets]
+                    for service, service_targets in targets.items()
+                }
+
+                def systemd_unit(service: str, *, timeout_seconds: int = 3) -> dict[str, str]:
+                    self.assertEqual(timeout_seconds, 3)
+                    return {
+                        "ActiveState": "active",
+                        "InvocationID": str(targets[service][0]["invocation_id"]),
+                        "MainPID": "100",
+                        "ControlGroup": f"/system.slice/deadlock-{service}.service",
+                    }
+
+                with (
+                    patch.object(diagnostic_plan_tool, "_release_identity", return_value=("b" * 40, "release-bbbbbbbbbbbb")),
+                    patch.object(diagnostic_plan_tool, "_systemd_unit", side_effect=systemd_unit),
+                    patch.object(diagnostic_plan_tool, "_service_targets", side_effect=lambda service, _unit: service_rows[service]),
+                    patch.object(diagnostic_plan_tool, "_process_start_ticks", side_effect={101: 11, 102: 12, 201: 21}.get),
+                    patch.object(diagnostic_plan_tool, "_journal_rows", return_value=("complete", records)),
+                ):
+                    summary = diagnostic_plan_tool._usage_summary(plans)
+
+                self.assertEqual(summary["usage_status"], "complete", summary)
+                self.assertEqual(len(summary["usage_rows"]), 4)
+                self.assertEqual(
+                    [row["observed_targets"] for row in summary["usage_rows"]],
+                    [2, 2, 1, 1],
+                )
+                self.assertTrue(all(row["timing_complete"] for row in summary["usage_rows"]))
 
     def test_cpu_plan_process_environment_is_allowlisted_and_identity_checked(self) -> None:
         marker = b"SENTINEL_PRIVATE_ENV_MUST_NOT_ESCAPE"

@@ -80,6 +80,59 @@ cgroup, or any positive memory event); an abort is an incomplete diagnostic,
 never a performance pass. These measurements can support workload-specific analysis,
 but do not claim the server's maximum capacity or physical-host headroom.
 
+The separately typed `authenticated_html_ssr_capacity_v1` workload measures
+the authenticated `GET /tournaments/<fixture-slug>` document over pinned
+HTTP/1.1 keep-alive. It reuses the existing capacity runner and page route;
+its distinct contract requires authenticated ready-page semantics. The legacy
+workspace workload uses eight actors at concurrency 8 or 16, while this
+workload cycles a fixed cohort of 14 actors, so do not compare throughput
+between these workload IDs. A
+runtime-profile A/B must keep this HTML workload, source, fixture, observer
+settings, and concurrency fixed and change only the runtime profile. Arm A is
+`authenticated-read-admission-24x8` (`fetch`); arm B is
+`authenticated-read-admission-24x8-native` (`node`). Both preserve the 24/8/
+250 ms admission tuple and the same worker/pool settings. Before A1, verify
+and record one web worker, compression enabled, API worker/pool values, and
+the exact active profile; verify these values remain fixed after each switch.
+A
+completed response must be HTTP 200, `text/html`, and
+contain the existing `tournament-detail-lifecycle` marker and ready-view
+`top-detail-grid` marker, plus the existing server-rendered
+`header-profile-avatar` marker. The lifecycle marker alone can also appear on
+loading or invite HTML; the detail grid alone can also appear for an anonymous
+viewer of a public tournament. Requiring all three rejects those shells. The
+check retains only booleans and never records identity text. A bad status,
+content type, marker, memory guard, restart, or unknown watcher stops new
+submissions; in-flight requests drain under the existing timeout, partial
+counts remain visible, and every credit stays false. Response bodies are read
+within the existing byte bound and are never retained in reports. This typed
+mode uses 14 fixture actors cyclically. Presets 8 and 16 are the initial
+steps; 32 and 64 are available only to this HTML workload and deliberately
+reuse those 14 actors, so an actor may have multiple concurrent requests.
+That closed-loop workload has no fixed offered arrival rate and is not
+equivalent to the 20,000-user authenticated-page-load profile. Treat each
+concurrency as a distinct diagnostic step. Step 8, 16, 32, then 64, stopping
+when admitted request count per nominal 20-second window plateaus or a safety
+guard fires. `submitted` counts executor submissions while that window is open;
+the runner drains in-flight requests afterward, so `completed` can include
+post-window responses. `observed_duration_ms` includes that drain and is not a
+20-second completion-throughput denominator. The report has no count of
+responses completed before the window edge; do not label `completed / 20s` as
+in-window throughput. Compare fetch/native arms at
+the same selected concurrency with the same final app tree and observer
+settings in A/B/A order; if results are close or noisy, repeat B before
+selection. Keep a runtime candidate only for repeatable throughput or tail
+latency improvement with no semantic, error, guard, or restart regression.
+Baseline drift makes the comparison inconclusive. Without complete aligned
+CPU and runner-headroom evidence, do not infer a hardware ceiling from
+throughput. Both OFF and ON windows carry the same SSR request-stage
+traces, per-process CPU usage windows, and Node memory/GC sampling; they do not
+enable cProfile (reserved for the separate CPU-pair workload). Compare only
+runs with this same observer configuration, and do not add nested SSR spans as
+if they were disjoint durations. Observer overhead is not isolated by this
+diagnostic, so its HTTP rate and latency are instrumented results rather than
+an estimate of an uninstrumented production ceiling.
+
 Any incomplete parent outcome is surfaced as a bounded JSON job-log fingerprint
 with namespace closure, worker/runner states, allowlisted runner and supervisor
 reasons, a closed startup-failure stage when available, process lifecycle

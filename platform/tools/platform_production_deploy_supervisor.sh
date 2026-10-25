@@ -232,7 +232,7 @@ case "$deploy_mode" in
   *) invalid_input ;;
 esac
 case "$runtime_profile" in
-  baseline|ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-cprofile|ready-vote-static-12|ready-vote-static-16|ready-vote-adaptive-v2|api-3x16|api-1x48|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|web-ssr-diagnostics|web-ssr-native-transport|web-ssr-workers-2|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24) ;;
+  baseline|ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-cprofile|ready-vote-static-12|ready-vote-static-16|ready-vote-adaptive-v2|api-3x16|api-1x48|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|authenticated-read-admission-24x8-native|pool-pre-ping-off|web-ssr-diagnostics|web-ssr-native-transport|web-ssr-workers-2|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24) ;;
   *) invalid_input ;;
 esac
 
@@ -1574,7 +1574,7 @@ case "$runtime_profile" in
       --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT
     restart_web_and_wait
     ;;
-  read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24)
+  read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|authenticated-read-admission-24x8-native|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24)
     candidate_profile_args=(
       --only PLATFORM_API_WORKERS
       --only PLATFORM_UVICORN_LOOP
@@ -1598,6 +1598,10 @@ case "$runtime_profile" in
       --only PLATFORM_SSR_PERF_SAMPLE_RATE
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
     )
+    if [[ "$runtime_profile" == authenticated-read-admission-24x8 \
+          || "$runtime_profile" == authenticated-read-admission-24x8-native ]]; then
+      candidate_profile_args+=(--only PLATFORM_WEB_SERVER_AUTH_TRANSPORT)
+    fi
     apply_shared_env_profile \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
@@ -1748,7 +1752,7 @@ esac
 # their own limits, so a successful API restart alone can leave the
 # web process on the previous diagnostic state.
 case "$runtime_profile" in
-  baseline|ready-vote-static-*|ready-vote-cprofile|ready-vote-adaptive-v2|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-*)
+  baseline|ready-vote-static-*|ready-vote-cprofile|ready-vote-adaptive-v2|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|authenticated-read-admission-24x8-native|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-*)
     restart_web_and_wait
     ;;
 esac
