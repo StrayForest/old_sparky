@@ -387,6 +387,7 @@ class ExternalLoadTests(unittest.TestCase):
             body=body,
             timing={"total_ms": 12.0, "ttfb_ms": 4.0},
             content_encoding="identity",
+            content_type_is_html=True,
         )
         user = VirtualUser("actor", "fixture-slug", "s" * 32, "c" * 32)
         with patch("tools.platform_external_load._http11_keepalive_client", return_value=client):
@@ -448,12 +449,18 @@ class ExternalLoadTests(unittest.TestCase):
                 session_cookie_name="session", csrf_cookie_name="csrf",
                 require_authenticated_html=True,
             )
-            self.assertTrue(ready_result.ok)
+            self.assertEqual(ready_result.status, 200)
+            self.assertTrue(ready_result.html_content_type_ok)
             self.assertEqual(ready_result.html_content_encoding, "identity")
             self.assertEqual(ready_result.html_marker_flags, {
                 "lifecycle": True, "authenticated_header": True,
                 "workspace_ready": True, "detail_fallback": True,
             })
+            self.assertTrue(ready_result.ok, (
+                f"status={ready_result.status} content_type_ok={ready_result.html_content_type_ok} "
+                f"marker_flags={ready_result.html_marker_flags} "
+                f"coding={ready_result.html_content_encoding} error={ready_result.error_kind}"
+            ))
             state["gzip"] = True
             gzip_result = external_load._page_request_http11_keepalive(
                 origin, user, "html-capacity", 2.0,

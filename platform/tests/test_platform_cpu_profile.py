@@ -2349,9 +2349,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 successful_report = json.loads(
                     success_report_path.read_text(encoding="ascii"),
                 )
-                self.assertEqual(
-                    successful_report["worker"]["resource_abort_reason"], "memory_event",
-                )
+                self.assertEqual(successful_report["worker"]["resource_abort_reason"], "memory_event", (
+                    "all-valid loopback warmup was rejected: "
+                    + json.dumps(successful_report["worker"], sort_keys=True)
+                ))
                 self.assertNotIn("warmup_failure", successful_report["worker"])
                 self.assertEqual(successful_report["worker"]["off_probe"], {
                     "submitted": 0, "completed": 0, "http_status": None,

@@ -3529,12 +3529,15 @@ def _page_request_http11_keepalive(
         html_content_encoding: str | None = None
         html_marker_flags: dict[str, bool] | None = None
         if require_authenticated_html:
+            content_type_is_html = getattr(response, "content_type_is_html", None)
+            if type(content_type_is_html) is not bool:
+                content_type_is_html = False
             (
                 html_content_type_ok,
                 html_page_marker_ok,
                 html_marker_flags,
             ) = _authenticated_html_marker_details(
-                response.headers.get("content-type", ""), response.body,
+                "", response.body, content_type_is_html=content_type_is_html,
             )
             html_content_encoding = _closed_html_content_encoding(
                 getattr(response, "content_encoding", None),
@@ -3654,12 +3657,15 @@ class _AuthenticatedHtmlMarkerParser(HTMLParser):
 
 
 def _authenticated_html_marker_details(
-    content_type: Any, body: Any,
+    content_type: Any, body: Any, *, content_type_is_html: bool | None = None,
 ) -> tuple[bool, bool, dict[str, bool] | None]:
     """Return closed marker flags from one bounded parse; never retain content."""
 
-    media_type = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else ""
-    content_type_ok = media_type == "text/html"
+    if type(content_type_is_html) is bool:
+        content_type_ok = content_type_is_html
+    else:
+        media_type = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else ""
+        content_type_ok = media_type == "text/html"
     if not isinstance(body, bytes) or len(body) > RESPONSE_BODY_LIMIT:
         return content_type_ok, False, None
 

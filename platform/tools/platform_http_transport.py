@@ -51,6 +51,7 @@ class TransportResponse:
     timing: dict[str, Any]
     # Closed projection only; never include the raw response header value.
     content_encoding: str | None = None
+    content_type_is_html: bool | None = None
 
 
 def _closed_content_encoding(value: Any) -> str:
@@ -60,6 +61,11 @@ def _closed_content_encoding(value: Any) -> str:
         return "other"
     normalized = value.strip().lower()
     return normalized if normalized in {"identity", "gzip", "deflate", "br"} else "other"
+
+
+def _closed_content_type_is_html(value: Any) -> bool:
+    media_type = value.split(";", 1)[0].strip().lower() if isinstance(value, str) else ""
+    return media_type == "text/html"
 
 
 class _TimedHTTPConnection(http.client.HTTPConnection):
@@ -331,6 +337,9 @@ class HTTP11KeepAliveClient:
             content_encoding = _closed_content_encoding(
                 response.headers.get("content-encoding"),
             )
+            content_type_is_html = _closed_content_type_is_html(
+                response.headers.get("content-type"),
+            )
             if response.will_close or safe_headers.get("connection", "").lower() == "close":
                 self.close()
             elif not self._reuse_connection:
@@ -345,6 +354,7 @@ class HTTP11KeepAliveClient:
                 connection_reused=reused,
                 timing=timing,
                 content_encoding=content_encoding,
+                content_type_is_html=content_type_is_html,
             )
         except BaseException:
             timing.update(connection.phase_timing)
