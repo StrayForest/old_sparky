@@ -480,6 +480,8 @@ The CPU diagnostic evidence follow-up uses **C8** `f0f4b460ea56075febab9b53ce42c
 
 The bounded memory-observer and typed-handoff correction uses **C11** `d6ba6ce0826242047494919ba3faf50274f09e7a` and pin-only **P11** `9c0838086d4415ff8cb443312f8edc2381b9bf44`. C11 changes only the dispatcher in the 15-member closure; P11 updates that digest and `host_tools_sha`, while retaining C10's renderer digest. Relative to P9, the cumulative closure changes only the renderer and dispatcher. C11 bounds memory-watch duration/output, fixes row framing and cleanup projection, and adds typed mode binding plus bounded failure evidence without granting diagnostic credit. Exact-P11 CI, signed preflight, approved provisioning and installed self-test remain required; source pins do not prove provisioning or active host behavior.
 
+The SSR memory-row framing correction uses **C12** `fd190e146c81cd90e361dbdc64eaca50c4271de5` and pin-only **P12** `4e7534a6960919706b9df4c5c221948a0a4ff888`. C12 changes only the dispatcher within the 15-member closure: it validates and strips the fixed helper row prefix before parsing, while malformed rows remain fail-closed. P12 changes only that member digest and `host_tools_sha`; the exact 15-member closure and C10 renderer digest remain. C12/P12 select source only and do not establish installation or active host behavior; exact-P12 CI, signed preflight, approved provisioning and installed self-test are still required.
+
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
    blocked.
