@@ -963,10 +963,26 @@ def worker_entrypoint() -> int:
     return load_runtime.worker_entry(_worker_callback)
 
 
+def _namespace_worker_binding(
+    *, source_sha: str, app_target_sha: str, external_run_id: str,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Carry the already-validated manifest attestation into the launcher config."""
+
+    return {
+        "source_git_sha": source_sha,
+        "app_target_sha": app_target_sha,
+        "source_binding": manifest.get("source_binding"),
+        "source_binding_sha256": manifest.get("source_binding_sha256"),
+        "external_run_id": external_run_id,
+    }
+
+
 def run_isolated_capacity_worker(
     *,
     stage_state: dict[str, Any],
     capacity_config: Mapping[str, Any],
+    worker_binding: Mapping[str, Any],
     worker_report_path: Path,
     supervisor_report_path: Path,
     source_sha: str,
@@ -1022,7 +1038,10 @@ def run_isolated_capacity_worker(
         worker_report_path=worker_report_path,
         max_duration_seconds=maximum_runtime_seconds,
         max_runner_minutes=4,
-        worker_config={"capacity_diagnostic": dict(capacity_config)},
+        worker_config={
+            "binding": dict(worker_binding),
+            "capacity_diagnostic": dict(capacity_config),
+        },
         clear_worker_environment=True,
         env={"SOURCE_GIT_SHA": source_sha},
         on_namespace_init=on_namespace_init,
@@ -1801,6 +1820,12 @@ def _parent_run(
         try:
             outcome = run_isolated_capacity_worker(
                 capacity_config=capacity_config,
+                worker_binding=_namespace_worker_binding(
+                    source_sha=args.source_sha,
+                    app_target_sha=args.app_target_sha,
+                    external_run_id=args.external_run_id,
+                    manifest=manifest,
+                ),
                 stage_state=state,
                 worker_report_path=worker_report,
                 supervisor_report_path=supervisor_report,

@@ -19,12 +19,30 @@ import tempfile
 import time
 
 import platform_ssr_capacity_diagnostic as capacity
-from platform_load_runtime import run_supervised
 from platform_ssr_capacity_control import write_control
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_NUMBER_RE = re.compile(r"^[1-9][0-9]{0,19}$")
+
+
+class _SyntheticWatcher:
+    """Keep the parent callback path local and deterministic in this canary."""
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> dict[str, object]:
+        return {
+            "status": "incomplete",
+            "terminal_decision": "abort",
+            "ssh_material_restored": True,
+            "memory_events_sampled_max_delta": None,
+            "samples": 0,
+        }
+
+    def fail_closed(self) -> None:
+        return None
 
 
 def _synthetic_manifest(source_sha: str) -> bytes:
@@ -67,13 +85,6 @@ def main() -> int:
     if os.geteuid() == 0:
         raise SystemExit("synthetic SSR canary must run as the non-root runner")
 
-    namespace_binding = {
-        "source_git_sha": source_sha,
-        "app_target_sha": source_sha,
-        "source_binding": None,
-        "source_binding_sha256": None,
-        "external_run_id": external_run_id,
-    }
     capacity_binding = {
         "run_id": os.urandom(16).hex(),
         "source_sha": source_sha,
@@ -90,6 +101,13 @@ def main() -> int:
         os.chmod(root, 0o700)
         manifest_path = root / "synthetic-manifest.json"
         manifest_raw = _synthetic_manifest(source_sha)
+        manifest, _actors = capacity.external_load.load_manifest_bytes(manifest_raw)
+        namespace_binding = capacity._namespace_worker_binding(
+            source_sha=source_sha,
+            app_target_sha=source_sha,
+            external_run_id=external_run_id,
+            manifest=manifest,
+        )
         manifest_path.write_bytes(manifest_raw)
         os.chmod(manifest_path, 0o600)
         control_path = root / capacity.CONTROL_BASENAME
@@ -124,56 +142,53 @@ def main() -> int:
             "on_end_ms": capacity.ON_WINDOW_MS * 2 + 5_000,
         }
 
-        result = run_supervised(
-            worker_command=(
-                sys.executable,
-                str(Path(capacity.__file__).resolve()),
-                "worker-entry",
-            ),
-            report_path=report_path,
+        stage_state: dict[str, object] = {}
+        outcome = capacity.run_isolated_capacity_worker(
+            stage_state=stage_state,
+            capacity_config=capacity_config,
+            worker_binding=namespace_binding,
             worker_report_path=worker_report_path,
-            max_duration_seconds=12.0,
-            max_runner_minutes=0.5,
-            worker_config={
-                "binding": namespace_binding,
-                "capacity_diagnostic": capacity_config,
-            },
-            term_grace_seconds=0.5,
-            poll_seconds=0.01,
-            env={
-                "SOURCE_GIT_SHA": source_sha,
-                "APP_TARGET_SHA": source_sha,
-                "GITHUB_RUN_ID": external_run_id,
-            },
-            clear_worker_environment=True,
+            supervisor_report_path=report_path,
+            source_sha=source_sha,
+            watcher=_SyntheticWatcher(),
+            hide_ssh_material=lambda: None,
+            restore_ssh_material=lambda: None,
+            maximum_runtime_seconds=12.0,
+            on_start_ms=capacity.ON_WINDOW_MS + 5_000,
+            on_end_ms=capacity.ON_WINDOW_MS * 2 + 5_000,
         )
 
         child_report = json.loads(worker_report_path.read_text(encoding="utf-8"))
-        final_report = result.report
+        supervisor = stage_state.get("supervisor_evidence")
+        if not isinstance(supervisor, dict):
+            raise SystemExit("synthetic SSR canary omitted supervisor evidence")
+        worker_report = outcome.get("worker")
+        if not isinstance(worker_report, dict):
+            raise SystemExit("synthetic SSR canary omitted worker report")
         checks = {
-            "supervisor_reason_none": result.reason == "none",
-            "worker_started": result.worker_started,
-            "worker_exited": result.worker_exited,
-            "worker_exit_one_for_incomplete": result.returncode == 1,
-            "namespace_closed": result.namespace_closed is True,
-            "descendants_reaped": result.descendants_reaped is True,
+            "supervisor_reason_none": supervisor.get("reason") == "none",
+            "worker_started": supervisor.get("worker_started") is True,
+            "worker_exited": supervisor.get("worker_exited") is True,
+            "worker_exit_one_for_incomplete": supervisor.get("return_code") == 1,
+            "namespace_closed": outcome.get("namespace_closed") is True,
+            "descendants_reaped": outcome.get("namespace_closed") is True,
             "child_report_complete": child_report.get("report_complete") is True,
             "parent_proved_child_not_closed": child_report.get("namespace_closed") is False,
-            "final_report_closed": final_report.get("namespace_closed") is True,
-            "incomplete_status": final_report.get("status") == "incomplete",
-            "abort_reason": final_report.get("resource_abort_reason") == "observer_failed",
-            "zero_submissions": final_report.get("submitted") == 0,
-            "zero_completions": final_report.get("completed") == 0,
-            "zero_response_bytes": final_report.get("response_bytes_total") == 0,
-            "no_http_statuses": final_report.get("http_status_counts") == {},
-            "no_http_errors": final_report.get("error_counts") == {},
+            "final_report_closed": outcome.get("namespace_closed") is True,
+            "incomplete_status": outcome.get("status") == "resource_abort",
+            "abort_reason": worker_report.get("resource_abort_reason") == "observer_failed",
+            "zero_submissions": worker_report.get("submitted") == 0,
+            "zero_completions": worker_report.get("completed") == 0,
+            "zero_response_bytes": worker_report.get("response_bytes_total") == 0,
+            "no_http_statuses": worker_report.get("http_status_counts") == {},
+            "no_http_errors": worker_report.get("error_counts") == {},
             "zero_off_probe_submissions": (
-                isinstance(final_report.get("off_probe"), dict)
-                and final_report["off_probe"].get("submitted") == 0
-                and final_report["off_probe"].get("completed") == 0
+                isinstance(worker_report.get("off_probe"), dict)
+                and worker_report["off_probe"].get("submitted") == 0
+                and worker_report["off_probe"].get("completed") == 0
             ),
             "no_capacity_credit": all(
-                final_report.get(key) is False
+                outcome.get(key) is False
                 for key in ("matrix_credit", "slo_credit", "diagnostic_credit")
             ),
         }
@@ -181,18 +196,17 @@ def main() -> int:
             # Emit only closed, non-sensitive booleans and bounded status fields.
             details = {
                 "checks": checks,
-                "reason": result.reason,
-                "returncode": result.returncode,
-                "status": final_report.get("status"),
-                "resource_abort_reason": final_report.get("resource_abort_reason"),
-                "namespace_closed": result.namespace_closed,
-                "report_error": final_report.get("report_error"),
+                "reason": supervisor.get("reason"),
+                "returncode": supervisor.get("return_code"),
+                "status": outcome.get("status"),
+                "resource_abort_reason": worker_report.get("resource_abort_reason"),
+                "namespace_closed": outcome.get("namespace_closed"),
             }
             raise SystemExit(
                 "synthetic SSR capacity worker-entry canary failed: "
                 + json.dumps(details, sort_keys=True)
             )
-        print(json.dumps({"checks": checks, "status": final_report["status"]}, sort_keys=True))
+        print(json.dumps({"checks": checks, "status": outcome["status"]}, sort_keys=True))
 
     if temporary_root is not None and temporary_root.exists():
         raise SystemExit("synthetic SSR canary temporary directory was not cleaned")
