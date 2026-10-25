@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ast
+import gzip
 import os
 import json
 import hashlib
 import io
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import subprocess
 import sys
 import tempfile
@@ -2029,10 +2031,98 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
     def test_parent_html_incomplete_report_reaches_sanitizer_cli(self) -> None:
         source_sha = "a" * 40
         runner_identity_fields = external_load.RunnerCgroupSampler.IDENTITY_FIELDS
+        ready_html = (
+            b'<span data-testid="tournament-detail-lifecycle" '
+            b'data-ssr-workspace-ready="true" hidden></span>'
+            b'<span class="header-profile-avatar"></span>'
+            b'<h1 class="hero-title" aria-label="fixture"></h1>'
+            b'<section class="route-loading-shell"></section>'
+        )
+        self.assertNotIn(b"avatar_media", ready_html)
+        self.assertNotIn(b"avatar_url", ready_html)
+        request_encodings: list[str | None] = []
+        request_paths: list[str] = []
+        request_count_lock = threading.Lock()
+        requests_complete = threading.Event()
+        warmup_state = {"all_ready": False, "request_count": 0}
+
+        class WarmupHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                request_encodings.append(self.headers.get("Accept-Encoding"))
+                request_paths.append(self.path)
+                session_value = next((
+                    part.partition("=")[2]
+                    for part in (item.strip() for item in self.headers.get("Cookie", "").split(";"))
+                    if part.startswith("session=")
+                ), "")
+                try:
+                    actor_index = int(session_value[:2])
+                except ValueError:
+                    actor_index = -1
+                status = 200
+                content_type = "text/html; charset=utf-8"
+                body = ready_html
+                coding: str | None = None
+                if warmup_state["all_ready"]:
+                    pass
+                elif actor_index == 0:
+                    status = 503
+                elif actor_index == 1:
+                    content_type = "application/json"
+                elif actor_index == 2:
+                    body = ready_html.replace(
+                        b'<span data-testid="tournament-detail-lifecycle" '
+                        b'data-ssr-workspace-ready="true" hidden></span>', b"",
+                    )
+                elif actor_index == 3:
+                    body = ready_html.replace(
+                        b'<span class="header-profile-avatar"></span>', b"",
+                    )
+                elif actor_index == 4:
+                    body = ready_html.replace(
+                        b'data-ssr-workspace-ready="true"',
+                        b'data-ssr-workspace-ready="false"',
+                    )
+                elif actor_index == 5:
+                    body = ready_html.replace(
+                        b'<section class="route-loading-shell"></section>', b"",
+                    )
+                elif actor_index in {6, 7}:
+                    body = gzip.compress(ready_html)
+                    coding = "gzip"
+                    if actor_index == 7:
+                        self.connection.close()
+                        return
+                else:
+                    status = 500
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                if coding is not None:
+                    self.send_header("Content-Encoding", coding)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                with request_count_lock:
+                    warmup_state["request_count"] += 1
+                    if warmup_state["all_ready"] and warmup_state["request_count"] == 8:
+                        requests_complete.set()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), WarmupHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        self.addCleanup(server_thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        loopback_origin = f"http://127.0.0.1:{server.server_port}"
         manifest = {
             "schema": 2,
             "purpose": "external_ready_vote",
-            "origin": "https://old-sparky.com",
+            "origin": loopback_origin,
             "session_cookie_name": "session",
             "csrf_cookie_name": "csrf",
             "marker": "preprod261025120154ed2c",
@@ -2105,19 +2195,46 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             pid, starttime = os.getpid(), 1
             on_namespace_init(pid, starttime)
             capacity_control.write_control(Path(capacity["control_path"]), {
-                "schema": 1, **binding, "decision": "abort",
-                "reason": "observer_failed", "sequence": 0,
+                "schema": 1, **binding, "decision": "continue",
+                "reason": "none", "sequence": 0,
                 "updated_monotonic_ns": time.monotonic_ns(),
             }, expected=binding)
-            with patch.dict(os.environ, {
-                "SOURCE_GIT_SHA": binding["source_sha"],
-                "APP_TARGET_SHA": binding["app_target_sha"],
-                "SOURCE_BINDING_BASE64": "",
-                "SOURCE_BINDING_SHA256": "",
-            }):
-                child_rc = capacity_diagnostic.load_runtime.worker_entry(
-                    capacity_diagnostic._worker_callback, config_path=config_path,
-                )
+            worker_result: dict[str, int] = {}
+            worker_errors: list[BaseException] = []
+
+            def run_worker_entry() -> None:
+                try:
+                    with patch.dict(os.environ, {
+                        "SOURCE_GIT_SHA": binding["source_sha"],
+                        "APP_TARGET_SHA": binding["app_target_sha"],
+                        "SOURCE_BINDING_BASE64": "",
+                        "SOURCE_BINDING_SHA256": "",
+                    }):
+                        worker_result["returncode"] = capacity_diagnostic.load_runtime.worker_entry(
+                            capacity_diagnostic._worker_callback, config_path=config_path,
+                        )
+                except BaseException as exc:
+                    worker_errors.append(exc)
+
+            if warmup_state["all_ready"]:
+                worker_thread = threading.Thread(target=run_worker_entry, daemon=True)
+                worker_thread.start()
+                requests_finished = requests_complete.wait(timeout=2)
+                capacity_control.write_control(Path(capacity["control_path"]), {
+                    "schema": 1, **binding, "decision": "abort",
+                    "reason": "memory_event", "sequence": 1,
+                    "updated_monotonic_ns": time.monotonic_ns(),
+                }, expected=binding)
+                worker_thread.join(timeout=5)
+                if worker_thread.is_alive():
+                    raise AssertionError("valid warmup callback did not stop after control abort")
+                if not requests_finished:
+                    raise AssertionError("valid warmup cohort did not finish promptly")
+            else:
+                run_worker_entry()
+            if worker_errors:
+                raise worker_errors[0]
+            child_rc = worker_result["returncode"]
             on_namespace_exit(pid, starttime)
             child_payload, read_error = capacity_diagnostic.load_runtime._read_closed_report(
                 Path(worker_report_path),
@@ -2198,6 +2315,15 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "--ssh-key", str(ssh_dir / "id_ed25519"),
                 "--ssh-host", "example.invalid", "--ssh-user", "tester",
             ]
+            successful_root = root / "all-valid"
+            successful_root.mkdir(mode=0o700)
+            success_report_path = successful_root / "report.json"
+            success_fingerprint_path = successful_root / "failure-fingerprint.json"
+            success_args = list(args)
+            success_args[success_args.index("--report") + 1] = str(success_report_path)
+            success_args[success_args.index("--failure-report") + 1] = str(
+                success_fingerprint_path,
+            )
             with patch.dict(os.environ, {
                 "SOURCE_GIT_SHA": source_sha, "APP_TARGET_SHA": source_sha,
                 "SOURCE_BINDING_BASE64": "", "SOURCE_BINDING_SHA256": "",
@@ -2213,39 +2339,120 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 capacity_diagnostic.external_load, "RunnerCgroupSampler", FakeRunner,
             ), patch.object(
                 capacity_diagnostic.load_runtime, "run_supervised", side_effect=fake_supervised,
+            ), patch.object(
+                capacity_diagnostic.external_load, "EXPECTED_ORIGIN", loopback_origin,
             ):
+                warmup_state["all_ready"] = True
+                warmup_state["request_count"] = 0
+                requests_complete.clear()
+                self.assertEqual(capacity_diagnostic.main(success_args), 2)
+                successful_report = json.loads(
+                    success_report_path.read_text(encoding="ascii"),
+                )
+                self.assertEqual(
+                    successful_report["worker"]["resource_abort_reason"], "memory_event",
+                )
+                self.assertNotIn("warmup_failure", successful_report["worker"])
+                self.assertEqual(successful_report["worker"]["off_probe"], {
+                    "submitted": 0, "completed": 0, "http_status": None,
+                })
+                self.assertFalse(successful_report["diagnostic_credit"])
+                warmup_state["all_ready"] = False
+                warmup_state["request_count"] = 0
                 self.assertEqual(capacity_diagnostic.main(args), 2)
 
             raw_report = json.loads(report_path.read_text(encoding="ascii"))
             self.assertEqual(raw_report["workload"], capacity_diagnostic.HTML_WORKLOAD)
             self.assertEqual(raw_report["worker"]["status"], "incomplete")
-            self.assertEqual(raw_report["worker"]["resource_abort_reason"], "observer_failed")
+            self.assertEqual(raw_report["worker"]["resource_abort_reason"], "off_warmup_failed")
             self.assertEqual(raw_report["worker"]["off_probe"], {
                 "submitted": 0, "completed": 0, "http_status": None,
             })
+            warmup = raw_report["worker"]["warmup_failure"]
+            self.assertEqual(
+                capacity_diagnostic._project_warmup_failure(warmup, concurrency=8), warmup,
+            )
+            extra_warmup_field = {**warmup, "untrusted": "private-value"}
+            self.assertIsNone(capacity_diagnostic._project_warmup_failure(
+                extra_warmup_field, concurrency=8,
+            ))
+            oversized_count = {
+                **warmup,
+                "failure_counts": {
+                    **warmup["failure_counts"], "non_200": 9,
+                },
+            }
+            self.assertIsNone(capacity_diagnostic._project_warmup_failure(
+                oversized_count, concurrency=8,
+            ))
+            unavailable_markers = capacity_diagnostic._new_warmup_failure(1)
+            capacity_diagnostic._record_warmup_result(
+                unavailable_markers,
+                external_load.RequestResult(
+                    "warmup", "GET", "/tournaments/fixture", 200, 10.0,
+                    False, 128, html_content_type_ok=True,
+                    html_page_marker_ok=False, html_content_encoding="identity",
+                    html_marker_flags=None,
+                ),
+            )
+            projected_unavailable = capacity_diagnostic._project_warmup_failure(
+                unavailable_markers, concurrency=1,
+            )
+            self.assertIsNotNone(projected_unavailable)
+            self.assertEqual(unavailable_markers["marker_parsed_results"], 0)
+            self.assertEqual(unavailable_markers["failure_counts"]["marker_parse_unavailable"], 1)
+            self.assertEqual(unavailable_markers["failure_counts"]["page_marker_missing"], 0)
+            self.assertEqual(unavailable_markers["failure_counts"]["marker_lifecycle_missing"], 0)
+            self.assertEqual(warmup["submitted"], 8)
+            self.assertEqual(warmup["results"], 8)
+            self.assertEqual(warmup["future_exceptions"], 0)
+            self.assertEqual(warmup["future_timeouts"], 0)
+            self.assertEqual(warmup["http_status_counts"], {"200": 6, "503": 1})
+            self.assertEqual(warmup["content_encoding_counts"], {
+                "br": 0, "deflate": 0, "gzip": 1,
+                "identity": 6, "other": 0, "unknown": 1,
+            })
+            self.assertEqual(warmup["failure_counts"]["request_exception"], 1)
+            self.assertEqual(warmup["exception_class_counts"]["HTTPException"], 1)
+            self.assertEqual(sum(warmup["exception_class_counts"].values()), 1)
+            self.assertEqual(warmup["failure_counts"]["non_200"], 1)
+            self.assertEqual(warmup["failure_counts"]["content_type_mismatch"], 1)
+            self.assertGreaterEqual(warmup["failure_counts"]["page_marker_missing"], 4)
+            self.assertGreaterEqual(warmup["failure_counts"]["marker_lifecycle_missing"], 1)
+            self.assertGreaterEqual(warmup["failure_counts"]["marker_authenticated_header_missing"], 1)
+            self.assertGreaterEqual(warmup["failure_counts"]["marker_workspace_not_ready"], 2)
+            self.assertGreaterEqual(warmup["failure_counts"]["marker_detail_fallback_missing"], 1)
+            self.assertEqual(len(request_encodings), 16)
+            self.assertEqual(set(request_encodings), {"identity"})
+            self.assertEqual(
+                set(request_paths), {"/tournaments/ssr-fixture-0001"},
+            )
             self.assertTrue(raw_report["namespace_closed"])
             self.assertEqual(raw_report["remote_plan_cleanup"], "complete")
             self.assertFalse(raw_report["diagnostic_credit"])
 
+            sanitizer_stdout = io.StringIO()
             with patch.dict(os.environ, {
                 "SOURCE_GIT_SHA": source_sha, "APP_TARGET_SHA": source_sha,
                 "SOURCE_BINDING_BASE64": "", "SOURCE_BINDING_SHA256": "",
-            }):
-                sanitizer = subprocess.run([
-                    sys.executable, str(Path(capacity_diagnostic.__file__)),
+            }), patch.object(
+                capacity_diagnostic.external_load, "EXPECTED_ORIGIN", loopback_origin,
+            ), redirect_stdout(sanitizer_stdout):
+                sanitizer_returncode = capacity_diagnostic.main([
                     "sanitize-report", "--input", str(report_path),
                     "--output", str(output_path), "--manifest", str(manifest_path),
                     "--source-sha", source_sha, "--app-target-sha", source_sha,
                     "--external-run-id", "40191312869", "--external-run-attempt", "1",
                     "--workload", capacity_diagnostic.HTML_WORKLOAD,
-                ], capture_output=True, text=True, check=False)
-            self.assertEqual(sanitizer.returncode, 0, sanitizer.stdout + sanitizer.stderr)
-            self.assertEqual(sanitizer.stdout.strip(), "INVALID")
+                ])
+            self.assertEqual(sanitizer_returncode, 0, sanitizer_stdout.getvalue())
+            self.assertEqual(sanitizer_stdout.getvalue().strip(), "INVALID")
             sanitized_report = json.loads(output_path.read_text(encoding="ascii"))
             self.assertEqual(sanitized_report["status"], "incomplete")
             self.assertEqual(sanitized_report["worker"]["off_probe"], {
                 "submitted": 0, "completed": 0, "http_status": None,
             })
+            self.assertEqual(sanitized_report["worker"]["warmup_failure"], warmup)
             self.assertFalse(sanitized_report["passed"])
             self.assertFalse(sanitized_report["matrix_credit"])
             self.assertFalse(sanitized_report["slo_credit"])
@@ -2256,9 +2463,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(fingerprint["workload"], capacity_diagnostic.HTML_WORKLOAD)
             self.assertFalse(fingerprint["passed"])
             self.assertFalse(fingerprint["diagnostic_credit"])
-            self.assertEqual(fingerprint["worker"]["reason"], "observer_failed")
+            self.assertEqual(fingerprint["worker"]["reason"], "off_warmup_failed")
             self.assertEqual(fingerprint["worker"]["submitted"], 0)
             self.assertEqual(fingerprint["worker"]["completed"], 0)
+            self.assertEqual(fingerprint["worker"]["warmup_failure"], warmup)
             self.assertEqual(fingerprint["runner"]["reason"], "runner_snapshot_unavailable")
             self.assertEqual(fingerprint["cleanup"]["transport"], {
                 "stage": "complete", "return_code": 0,
@@ -2268,8 +2476,19 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             fingerprint_text = json.dumps(fingerprint, sort_keys=True)
             self.assertNotIn("ssr-fixture-0001", fingerprint_text)
             self.assertNotIn("fixture-user-", fingerprint_text)
-            self.assertNotIn("example.invalid", fingerprint_text)
+            self.assertNotIn(loopback_origin, fingerprint_text)
             self.assertNotIn(str(root), fingerprint_text)
+            raw_report_text = report_path.read_text(encoding="ascii")
+            sanitized_text = output_path.read_text(encoding="ascii")
+            tokens = ("00" + "s" * 62, "00" + "c" * 62)
+            self.assertFalse(any(token in raw_report_text for token in tokens))
+            self.assertFalse(any(token in sanitized_text for token in tokens))
+            self.assertNotIn("ssr-fixture-0001", raw_report_text)
+            self.assertNotIn("fixture-user-", raw_report_text)
+            self.assertNotIn(loopback_origin, raw_report_text)
+            self.assertNotIn("ssr-fixture-0001", sanitized_text)
+            self.assertNotIn("fixture-user-", sanitized_text)
+            self.assertNotIn(loopback_origin, sanitized_text)
 
     def test_capacity_closed_loop_reuses_warmed_executor_and_never_zero_waits(self) -> None:
         local = threading.local()
