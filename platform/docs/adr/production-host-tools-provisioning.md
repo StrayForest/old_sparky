@@ -593,6 +593,17 @@ app-side capability before accepting runner/application mismatch.
 
 ## Consequences
 
+The guarded authenticated HTML SSR capacity diagnostic is source **C**
+`8af09bfe67dfd8cdb192c85c9300fb8842d9f37b`, selected by pin-only **P**
+`fcc74008fd67b2bf6065adbf6c91e95fb31b826c`. The pin keeps the existing
+15-member host-tools closure and updates the SHA-256 entries for exactly
+`platform/tools/platform_configure_shared_env.py`,
+`platform/tools/platform_cpu_diagnostic_plan.py`,
+`platform/tools/platform_production_deploy_supervisor.sh`, and
+`platform/tools/platform_workflow_input_guard.py`; `host_tools_sha` resolves
+to **C**. This records repository source selection only. It is not a receipt
+that this generation was built, provisioned, or installed on a production host.
+
 Source **C** `5849001b78aed824527f474c4c3586108019c402` updates the 15-member v4 pin with the dispatcher’s bounded Python-helper launch and export-removal status protocol. Application workflow and CPU-pair changes remain app-side. This is provenance, not installation proof; production requires exact-target CI, signed preflight/provenance, approved provisioning and installed self-test.
 
 The host-control trust boundary is independent of application releases and cannot be repaired by candidate code in a secret-bearing job. A host image or operator must provision each reviewed generation before deployment; this is the rollback/supply-chain trade-off for preventing candidate source from becoming production authority.

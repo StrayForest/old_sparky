@@ -230,6 +230,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "schema": 1,
             "workload": "authenticated_workspace_read_capacity_v1",
             "fixture_kind": "ssr_capacity_diagnostic_v1",
+            "source_sha": "a" * 40,
+            "app_target_sha": "b" * 40,
+            "external_run_id": "12345",
+            "external_run_attempt": "1",
             "report_complete": True,
             "namespace_closed": True,
             "matrix_credit": False,
@@ -241,6 +245,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         def evaluate(
             payload: dict[str, object], *, cpu_only: bool = False,
             capacity_only: bool = False,
+            capacity_workload: str = "authenticated_workspace_read_capacity_v1",
         ) -> dict[str, str]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp = Path(temp_dir)
@@ -260,6 +265,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     **os.environ,
                     "RUNNER_TEMP": str(temp),
                     "GITHUB_OUTPUT": str(output_file),
+                    "EXPECTED_SSR_WORKLOAD": capacity_workload,
+                    "EXPECTED_SOURCE_SHA": "a" * 40,
+                    "EXPECTED_APP_TARGET_SHA": "b" * 40,
+                    "EXPECTED_EXTERNAL_RUN_ID": "12345",
+                    "EXPECTED_EXTERNAL_RUN_ATTEMPT": "1",
                 }
                 result = subprocess.run(
                     [
@@ -315,6 +325,35 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             evaluate({**capacity_report, "matrix_credit": True}, capacity_only=True)[
                 "namespace_closed_status"
             ],
+            "1",
+        )
+        html_capacity_report = {
+            **capacity_report,
+            "workload": "authenticated_html_ssr_capacity_v1",
+            "fixture_kind": "ssr_html_capacity_diagnostic_v1",
+        }
+        self.assertEqual(
+            evaluate(
+                html_capacity_report,
+                capacity_only=True,
+                capacity_workload="authenticated_html_ssr_capacity_v1",
+            )["namespace_closed_status"],
+            "0",
+        )
+        self.assertEqual(
+            evaluate(
+                {**html_capacity_report, "source_sha": "c" * 40},
+                capacity_only=True,
+                capacity_workload="authenticated_html_ssr_capacity_v1",
+            )["namespace_closed_status"],
+            "1",
+        )
+        self.assertEqual(
+            evaluate(
+                html_capacity_report,
+                capacity_only=True,
+                capacity_workload="authenticated_workspace_read_capacity_v1",
+            )["namespace_closed_status"],
             "1",
         )
 
