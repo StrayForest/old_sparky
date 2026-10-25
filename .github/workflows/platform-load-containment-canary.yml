@@ -7,6 +7,10 @@ on:
       - .github/workflows/platform-load-containment-canary.yml
       - platform/tools/platform_load_runtime.py
       - platform/tools/platform_load_namespace.py
+      - platform/tools/platform_ssr_capacity_control.py
+      - platform/tools/platform_ssr_capacity_diagnostic.py
+      - platform/tools/platform_ssr_capacity_worker_canary.py
+      - platform/tools/platform_external_load.py
 
 permissions:
   contents: read
@@ -197,3 +201,11 @@ jobs:
                           raise SystemExit(f"captured descendant still alive: {record}")
               print(json.dumps({"probe": probe, "reason": result.reason, "namespace_closed": result.namespace_closed, "descendants": sorted(roles)}, sort_keys=True))
           PY
+      - name: Run synthetic SSR capacity worker-entry canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd platform
+          env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            SOURCE_GIT_SHA="$GITHUB_SHA" APP_TARGET_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            /usr/bin/python3 tools/platform_ssr_capacity_worker_canary.py
