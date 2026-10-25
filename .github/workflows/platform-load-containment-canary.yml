@@ -203,9 +203,11 @@ jobs:
           PY
       - name: Run synthetic SSR capacity worker-entry canary
         shell: bash
+        env:
+          PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           set -euo pipefail
           cd platform
           env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-            SOURCE_GIT_SHA="$GITHUB_SHA" APP_TARGET_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            PLATFORM_RUNNER_ENVIRONMENT="$PLATFORM_RUNNER_ENVIRONMENT" SOURCE_GIT_SHA="$GITHUB_SHA" APP_TARGET_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
             /usr/bin/python3 tools/platform_ssr_capacity_worker_canary.py

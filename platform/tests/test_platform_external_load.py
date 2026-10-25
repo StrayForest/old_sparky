@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import http.client
 import json
 import os
@@ -47,6 +48,29 @@ RSS_DEADLINES = {"live": RSS_DEADLINE_SECONDS, "accumulator": 30.0, "hostile": 0
 LIVE_HWM_LIMIT_BYTES = 192 * 1024 * 1024
 ACCUMULATOR_HWM_LIMIT_BYTES = 24 * 1024 * 1024
 PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
+
+
+def lifecycle_marker(workspace_ready: bool | None) -> bytes:
+    readiness_attribute = (
+        b""
+        if workspace_ready is None
+        else b' data-ssr-workspace-ready="'
+        + (b"true" if workspace_ready else b"false")
+        + b'"'
+    )
+    return (
+        b'<span data-testid="tournament-detail-lifecycle"'
+        + readiness_attribute
+        + b' hidden></span>'
+    )
+
+
+def raw_heading(aria_label: str) -> bytes:
+    return (
+        b'<h1 class="hero-title" aria-label="'
+        + aria_label.encode("utf-8")
+        + b'"></h1>'
+    )
 
 
 def _run_rss_probe(mode: str) -> dict[str, object]:
@@ -155,18 +179,63 @@ def load_manifest_from_payload(
 
 class ExternalLoadTests(unittest.TestCase):
     def test_authenticated_html_contract_requires_authenticated_ready_page_markers(self) -> None:
-        # These pieces are deliberately joined across arbitrary body-read
-        # boundaries; attributes also vary in order, quotes, and class tokens.
+        # Match the route's raw SSR shape: the workspace-seeded Hero and
+        # authenticated header are rendered, while the detail view's
+        # ssr:false boundary contributes its generic loading panel.
         marker = b"".join((
-            b"<span data-testid='tournament-detail-lifecycle' hidden></span>",
-            b"<section class='extra top-detail-grid'></section>",
+            lifecycle_marker(True),
             b"<span class='extra header-profile-avatar'></span>",
+            b'<section class="hero-wrap">'
+            + raw_heading("Fixture title")
+            + b'</section>',
+            b'<section class="panel panel-pad route-loading-shell" aria-busy="true"></section>',
         ))
         body = b" " * (64 * 1024 - 11) + marker
         self.assertEqual(
             external_load._authenticated_html_markers("Text/Html; charset=utf-8", body),
             (True, True),
         )
+        chunk_boundary = 64 * 1024
+        boundary_leading = (
+            lifecycle_marker(True)
+            + b'<span class="header-profile-avatar"></span><div class="breadcrumbs">'
+        )
+        breadcrumb_text = "Турниры / Fixture title"
+        breadcrumb = breadcrumb_text.encode("utf-8")
+        # Place the first byte of the two-byte Cyrillic `Т` at index 65535,
+        # so its second byte lands in the next 64 KiB production feed slice.
+        padding_size = chunk_boundary - 1 - len(boundary_leading)
+        self.assertGreaterEqual(padding_size, 0)
+        split_character_body = (
+            boundary_leading
+            + b" " * padding_size
+            + breadcrumb
+            + b'</div>'
+            + raw_heading("Fixture title")
+            + b'<section class="route-loading-shell"></section>'
+        )
+        self.assertEqual(split_character_body.find(breadcrumb), chunk_boundary - 1)
+
+        recorded_parsers = []
+
+        class RecordingMarkerParser(external_load._AuthenticatedHtmlMarkerParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.text_nodes: list[str] = []
+                recorded_parsers.append(self)
+
+            def handle_data(self, data: str) -> None:
+                super().handle_data(data)
+                self.text_nodes.append(data)
+
+        with patch.object(external_load, "_AuthenticatedHtmlMarkerParser", RecordingMarkerParser):
+            self.assertEqual(
+                external_load._authenticated_html_markers("text/html", split_character_body),
+                (True, True),
+            )
+        parsed_breadcrumb = "".join(recorded_parsers[0].text_nodes)
+        self.assertIn(breadcrumb_text, parsed_breadcrumb)
+        self.assertNotIn("\ufffd", parsed_breadcrumb)
         self.assertEqual(
             external_load._authenticated_html_markers("application/json", marker),
             (False, True),
@@ -174,27 +243,120 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(
             external_load._authenticated_html_markers(
                 "text/html",
-                b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
-                b'<section class="top-detail-grid"></section>'
-                b'<span class="header-profile-avatar"></span>',
+                (
+                    lifecycle_marker(True)
+                    + b'<span class="header-profile-avatar"></span>'
+                    + '<div class="breadcrumbs">Турниры / Fixture</div>'.encode("utf-8")
+                    + raw_heading("Fixture")
+                    + b'<section class="route-loading-shell"></section>'
+                ),
             ),
             (True, True),
         )
+        # The workspace seed is absent on the route-level loading response,
+        # even though it has the same lifecycle/header markers.
         self.assertEqual(
             external_load._authenticated_html_markers(
                 "text/html",
-                b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
-                b'<section class="top-detail-grid"></section>',
+                (
+                    lifecycle_marker(False)
+                    + b'<span class="header-profile-avatar"></span>'
+                    + b'<h1 aria-label="Arbitrary error title"></h1>'
+                    + b'<section class="route-loading-shell route-loading-tournament-detail"></section>'
+                ),
+            ),
+            (True, False),
+        )
+        # Missing or false seed markers cannot pass even if the rest of the
+        # authenticated raw page looks ready.
+        for marker_without_seed in (lifecycle_marker(None), lifecycle_marker(False)):
+            self.assertEqual(
+                external_load._authenticated_html_markers(
+                    "text/html",
+                    marker_without_seed
+                    + b'<span class="header-profile-avatar"></span>'
+                    + raw_heading("Fixture title")
+                    + b'<section class="route-loading-shell"></section>',
+                ),
+                (True, False),
+            )
+        # Public guest HTML has a ready workspace seed and expected fallback,
+        # but must not satisfy the authenticated-header requirement.
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                (
+                    lifecycle_marker(True)
+                    + raw_heading("Fixture")
+                    + b'<section class="route-loading-shell"></section>'
+                ),
+            ),
+            (True, False),
+        )
+        # A seeded title paired with the route-level loading variant is not
+        # the expected ssr:false detail-boundary fallback.
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                (
+                    lifecycle_marker(True)
+                    + b'<span class="header-profile-avatar"></span>'
+                    + raw_heading("Fixture")
+                    + b'<section class="route-loading-shell route-loading-tournament-detail"></section>'
+                ),
             ),
             (True, False),
         )
         self.assertEqual(
             external_load._authenticated_html_markers(
                 "text/html",
-                b'<!-- <span data-testid="tournament-detail-lifecycle"></span> '
-                b'<section class="top-detail-grid"></section> '
-                b'<span class="header-profile-avatar"></span> -->'
-                b'<script>"<span data-testid=\"tournament-detail-lifecycle\"></span>"</script>',
+                (
+                    b'<span class="header-profile-avatar"></span>'
+                    + raw_heading("Fixture title")
+                    + b'<section class="route-loading-shell"></section>'
+                ),
+            ),
+            (True, False),
+        )
+        # A ready seed without the expected server fallback is not the
+        # documented raw-SSR shape for this detail route.
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                (
+                    lifecycle_marker(True)
+                    + b'<span class="header-profile-avatar"></span>'
+                    + raw_heading("Fixture")
+                ),
+            ),
+            (True, False),
+        )
+        # The hydrated detail grid is not a valid raw-SSR substitute for the
+        # seeded heading and expected dynamic-boundary fallback.
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                (
+                    lifecycle_marker(True)
+                    + b'<span class="header-profile-avatar"></span>'
+                    + b'<section class="top-detail-grid"></section>'
+                ),
+            ),
+            (True, False),
+        )
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                (
+                    b'<!-- <span data-testid="tournament-detail-lifecycle" '
+                    b'data-ssr-workspace-ready="true"></span> '
+                    b'<section class="top-detail-grid"></section> '
+                    b'<span class="header-profile-avatar"></span> '
+                    + raw_heading("Fake")
+                    + b' '
+                    b'<section class="route-loading-shell"></section> -->'
+                    b'<script>"<span data-testid=\"tournament-detail-lifecycle\"></span>"</script>'
+                ),
             ),
             (True, False),
         )
@@ -205,9 +367,11 @@ class ExternalLoadTests(unittest.TestCase):
 
     def test_html_keepalive_request_retains_only_closed_marker_flags(self) -> None:
         body = (
-            b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
-            b'<section class="top-detail-grid"></section>'
-            b'<span class="header-profile-avatar"></span>'
+            lifecycle_marker(True)
+            + b'<span class="header-profile-avatar"></span>'
+            + b'<h1 class="hero-title" aria-label="'
+            + b'Fixture"></h1>'
+            + b'<section class="route-loading-shell"></section>'
         )
         client = Mock()
         client.last_timing = {}
@@ -751,7 +915,7 @@ class ExternalLoadTests(unittest.TestCase):
                 self.assertIsNone(external_load._parse_effective_cpu_set(invalid))
         sampler = external_load.RunnerCgroupSampler(runner_environment="self-hosted")
         sampler.start(2, 1)
-        result = sampler.stop()
+        result = sampler.stop(namespace_pid=2, namespace_starttime=1)
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(result["reason"], "trusted_runner_context_unavailable")
         self.assertEqual(set(result["identity"]), set(sampler.IDENTITY_FIELDS))
@@ -763,12 +927,153 @@ class ExternalLoadTests(unittest.TestCase):
         membership = "0::/runner/load\n"
         mount_identity = (31, 17, "0:29", "/", "/sys/fs/cgroup", "rw")
         namespace_ids = {
-            "/proc/self/ns/pid": (1, 1), "/proc/1/ns/pid": (1, 1),
-            "/proc/self/ns/mnt": (1, 2), "/proc/1/ns/mnt": (1, 2),
-            "/proc/self/ns/cgroup": (1, 3), "/proc/1/ns/cgroup": (1, 3),
+            "/proc/self/ns/pid": (1, 1),
+            "/proc/self/ns/mnt": (1, 2),
+            "/proc/self/ns/cgroup": (1, 3),
             "/proc/4321/ns/pid": (1, 5), "/proc/4321/ns/mnt": (1, 4),
             "/proc/4321/ns/cgroup": (1, 3),
         }
+
+        stat_result = external_load.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"1:1\n1:2\n1:3\n", stderr=b""
+        )
+        with patch("tools.platform_external_load.subprocess.run", return_value=stat_result) as run:
+            proc1_ids = external_load._read_proc1_namespace_identities()
+        self.assertEqual(proc1_ids, {"pid": (1, 1), "mount": (1, 2), "cgroup": (1, 3)})
+        command = run.call_args.args[0]
+        self.assertEqual(command[:10], [
+            "/usr/bin/sudo", "-n", "/usr/bin/timeout", "--signal=TERM",
+            "--kill-after=0.2s", "1s", "/usr/bin/stat", "--dereference",
+            "--printf=%d:%i\\n", "--",
+        ])
+        self.assertEqual(command[10:], [
+            "/proc/1/ns/pid", "/proc/1/ns/mnt", "/proc/1/ns/cgroup",
+        ])
+        self.assertEqual(run.call_args.kwargs["timeout"], 3.0)
+        self.assertIs(run.call_args.kwargs["stdin"], external_load.subprocess.DEVNULL)
+
+        pidfd_read, pidfd_write = os.pipe()
+        try:
+            self.assertEqual(external_load.RunnerCgroupSampler._pidfd_state(pidfd_read), "live")
+
+            class FakePoll:
+                def __init__(self, events: object) -> None:
+                    self.events = events
+
+                def register(self, _fd: int, _events: int) -> None:
+                    return None
+
+                def poll(self, _timeout: int) -> object:
+                    return self.events
+
+            for poll_events, expected_state in (
+                ([(pidfd_read, external_load.select.POLLHUP)], "exited"),
+                ([(pidfd_read, external_load.select.POLLIN | external_load.select.POLLHUP)], "exited"),
+                ([(pidfd_read, external_load.select.POLLIN | external_load.select.POLLERR)], "unknown"),
+                ([(pidfd_read, external_load.select.POLLHUP | external_load.select.POLLERR)], "unknown"),
+                ([(pidfd_read, external_load.select.POLLNVAL)], "unknown"),
+                ([(pidfd_read + 1, external_load.select.POLLHUP)], "unknown"),
+                ([(pidfd_read, external_load.select.POLLHUP), (pidfd_read, external_load.select.POLLHUP)], "unknown"),
+                ([pidfd_read], "unknown"),
+            ):
+                with self.subTest(poll_events=poll_events):
+                    with patch(
+                        "tools.platform_external_load.select.poll",
+                        return_value=FakePoll(poll_events),
+                    ):
+                        self.assertEqual(
+                            external_load.RunnerCgroupSampler._pidfd_state(pidfd_read),
+                            expected_state,
+                        )
+            os.write(pidfd_write, b"x")
+            self.assertEqual(external_load.RunnerCgroupSampler._pidfd_state(pidfd_read), "exited")
+            with patch("tools.platform_external_load.select.poll", side_effect=OSError("poll")):
+                self.assertEqual(external_load.RunnerCgroupSampler._pidfd_state(pidfd_read), "unknown")
+            os.close(pidfd_read)
+            pidfd_read = -1
+            self.assertEqual(external_load.RunnerCgroupSampler._pidfd_state(pidfd_read), "unknown")
+        finally:
+            if pidfd_read >= 0:
+                os.close(pidfd_read)
+            os.close(pidfd_write)
+
+        invalid_stat_results = (
+            external_load.subprocess.CompletedProcess(args=[], returncode=1, stdout=b"", stderr=b""),
+            external_load.subprocess.CompletedProcess(args=[], returncode=0, stdout=b"bad\n", stderr=b""),
+            external_load.subprocess.CompletedProcess(args=[], returncode=0, stdout=b"1:1\n1:2\n1:3\n4:4\n", stderr=b""),
+        )
+        for invalid_result in invalid_stat_results:
+            with self.subTest(returncode=invalid_result.returncode, stdout=invalid_result.stdout):
+                with patch("tools.platform_external_load.subprocess.run", return_value=invalid_result):
+                    with self.assertRaises(external_load._CgroupDiagnosticError) as raised:
+                        external_load._read_proc1_namespace_identities()
+                self.assertEqual(raised.exception.reason, "runner_snapshot_unavailable")
+        with patch(
+            "tools.platform_external_load.subprocess.run",
+            side_effect=external_load.subprocess.TimeoutExpired(cmd="fixed-stat", timeout=3.0),
+        ):
+            with self.assertRaises(external_load._CgroupDiagnosticError) as raised:
+                external_load._read_proc1_namespace_identities()
+        self.assertEqual(raised.exception.reason, "runner_snapshot_unavailable")
+
+        mapping = {
+            "root": Path("/"), "mountpoint": Path("/sys/fs/cgroup"),
+            "mount_identity": mount_identity,
+        }
+
+        def common_patches(
+            target_sampler: external_load.RunnerCgroupSampler,
+            target_pidfd_read: int,
+            snapshot_fn: object,
+            proc1_reader: object = lambda: proc1_ids,
+        ) -> ExitStack:
+            stack = ExitStack()
+            stack.enter_context(patch.object(
+                target_sampler, "_namespace_identity", side_effect=lambda path: namespace_ids[path],
+            ))
+            stack.enter_context(patch.object(target_sampler, "_target_is_stable", return_value=True))
+            stack.enter_context(patch(
+                "tools.platform_external_load.os.pidfd_open",
+                side_effect=lambda *_args: os.dup(target_pidfd_read),
+            ))
+            stack.enter_context(patch(
+                "tools.platform_external_load._read_proc1_namespace_identities",
+                side_effect=proc1_reader,
+            ))
+            stack.enter_context(patch(
+                "tools.platform_external_load._read_bounded_ascii", return_value=membership,
+            ))
+            stack.enter_context(patch(
+                "tools.platform_external_load._bounded_proc_text", return_value="mountinfo",
+            ))
+            stack.enter_context(patch(
+                "tools.platform_external_load._cgroup2_membership_mapping", return_value=mapping,
+            ))
+            stack.enter_context(patch(
+                "tools.platform_external_load._read_cgroup_diagnostic_snapshot",
+                side_effect=snapshot_fn,
+            ))
+            stack.enter_context(patch(
+                "tools.platform_load_runtime._read_process_starttime", return_value=77,
+            ))
+            return stack
+
+        denied_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        denied_pipe_read, denied_pipe_write = os.pipe()
+        with common_patches(
+            denied_sampler, denied_pipe_read, lambda **_kwargs: {},
+            proc1_reader=lambda: (_ for _ in ()).throw(
+                external_load._CgroupDiagnosticError("runner_snapshot_unavailable")
+            ),
+        ):
+            denied_sampler.start(4321, 77)
+            denied = denied_sampler.stop()
+        os.close(denied_pipe_read)
+        os.close(denied_pipe_write)
+        self.assertEqual(denied["status"], "unknown")
+        self.assertEqual(denied["reason"], "runner_snapshot_unavailable")
+        self.assertEqual(denied["sample_count"], 0)
+        self.assertFalse(any(denied["identity"].values()))
         reads = [0]
 
         def snapshot(**_kwargs: object) -> dict[str, object]:
@@ -801,23 +1106,18 @@ class ExternalLoadTests(unittest.TestCase):
                 ],
             }
 
-        mapping = {
-            "root": Path("/"), "mountpoint": Path("/sys/fs/cgroup"),
-            "mount_identity": mount_identity,
-        }
-        with (
-            patch.object(sampler, "_namespace_identity", side_effect=lambda path: namespace_ids[path]),
-            patch.object(sampler, "_target_is_stable", return_value=True),
-            patch("tools.platform_external_load._read_bounded_ascii", return_value=membership),
-            patch("tools.platform_external_load._bounded_proc_text", return_value="mountinfo"),
-            patch("tools.platform_external_load._cgroup2_membership_mapping", return_value=mapping),
-            patch("tools.platform_external_load._read_cgroup_diagnostic_snapshot", side_effect=snapshot),
-            patch("tools.platform_load_runtime._read_process_starttime", return_value=77),
-            patch.object(Path, "exists", return_value=True),
-        ):
+        sampler_pipe_read, sampler_pipe_write = os.pipe()
+        with common_patches(sampler, sampler_pipe_read, snapshot):
             sampler.start(4321, 77)
             time.sleep(0.13)
+            sampler_owned_pidfd = sampler._pidfd
             result = sampler.stop()
+        os.close(sampler_pipe_read)
+        os.close(sampler_pipe_write)
+        self.assertIsNone(sampler._pidfd)
+        self.assertIsNotNone(sampler_owned_pidfd)
+        with self.assertRaises(OSError):
+            os.fstat(sampler_owned_pidfd)
 
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["reason"], "none")
@@ -826,6 +1126,100 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertGreater(result["window_seconds"], 0)
         self.assertEqual(result["max_visible_throttled_periods_delta"], 0)
         self.assertEqual(result["identity"]["global_cgroup2_mount"], True)
+
+        changed_proc1_ids = {**proc1_ids, "pid": (1, 99)}
+        changed_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        changed_sampler.SAMPLE_INTERVAL_SECONDS = 0.005
+        changed_proc1_reads = [0]
+
+        def changed_proc1_reader() -> dict[str, tuple[int, int]]:
+            changed_proc1_reads[0] += 1
+            return proc1_ids if changed_proc1_reads[0] == 1 else changed_proc1_ids
+
+        changed_pipe_read, changed_pipe_write = os.pipe()
+        with common_patches(
+            changed_sampler, changed_pipe_read, snapshot,
+            proc1_reader=changed_proc1_reader,
+        ):
+            changed_sampler.start(4321, 77)
+            time.sleep(0.02)
+            changed_identity = changed_sampler.stop()
+        os.close(changed_pipe_read)
+        os.close(changed_pipe_write)
+        self.assertEqual(changed_identity["status"], "unknown")
+        self.assertEqual(changed_identity["reason"], "runner_snapshot_invalid")
+        self.assertEqual(changed_identity["sample_count"], 1)
+
+        reused_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        reuse_read, reuse_write = os.pipe()
+        reuse_pidfds: list[int] = []
+
+        def reused_pidfd(*_args: object) -> int:
+            value = os.dup(reuse_read)
+            reuse_pidfds.append(value)
+            return value
+
+        with ExitStack() as stack:
+            stack.enter_context(patch(
+                "tools.platform_external_load.os.pidfd_open", side_effect=reused_pidfd,
+            ))
+            stack.enter_context(patch(
+                "tools.platform_load_runtime._read_process_starttime", side_effect=[77, 78],
+            ))
+            reused_sampler.start(4321, 77)
+            reused = reused_sampler.stop()
+        os.close(reuse_read)
+        os.close(reuse_write)
+        self.assertEqual(reused["status"], "unknown")
+        self.assertEqual(reused["reason"], "workload_identity_changed")
+        self.assertEqual(len(reuse_pidfds), 1)
+        with self.assertRaises(OSError):
+            os.fstat(reuse_pidfds[0])
+
+        exit_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        exit_sampler.SAMPLE_INTERVAL_SECONDS = 10.0
+        exit_reads = [0]
+
+        def exit_snapshot(**kwargs: object) -> dict[str, object]:
+            exit_reads[0] += 1
+            return snapshot(**kwargs)
+
+        exit_pipe_read, exit_pipe_write = os.pipe()
+        with common_patches(exit_sampler, exit_pipe_read, exit_snapshot):
+            exit_sampler.start(4321, 77)
+            os.write(exit_pipe_write, b"x")
+            exited = exit_sampler.stop()
+        os.close(exit_pipe_read)
+        os.close(exit_pipe_write)
+        self.assertEqual(exited["status"], "unknown")
+        self.assertEqual(exited["reason"], "runner_samples_incomplete")
+        self.assertEqual(exited["sample_count"], 1)
+        self.assertEqual(exit_reads[0], 1, "confirmed exit must discard the final counter snapshot")
+
+        raced_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        raced_sampler.SAMPLE_INTERVAL_SECONDS = 0.001
+        raced_reads = [0]
+        raced_snapshot_done = threading.Event()
+        raced_pipe_read, raced_pipe_write = os.pipe()
+
+        def race_snapshot(**kwargs: object) -> dict[str, object]:
+            raced_reads[0] += 1
+            value = snapshot(**kwargs)
+            if raced_reads[0] == 2:
+                os.write(raced_pipe_write, b"x")
+                raced_snapshot_done.set()
+            return value
+
+        with common_patches(raced_sampler, raced_pipe_read, race_snapshot):
+            raced_sampler.start(4321, 77)
+            self.assertTrue(raced_snapshot_done.wait(1.0))
+            raced = raced_sampler.stop()
+        os.close(raced_pipe_read)
+        os.close(raced_pipe_write)
+        self.assertEqual(raced["status"], "unknown")
+        self.assertEqual(raced["reason"], "runner_samples_incomplete")
+        self.assertEqual(raced["sample_count"], 1)
+        self.assertEqual(raced_reads[0], 2, "sample racing with exit must not be retained")
 
         started_at = "2026-10-18T10:00:00.000Z"
         finished_at = "2026-10-18T10:00:00.110Z"

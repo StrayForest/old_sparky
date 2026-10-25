@@ -3497,6 +3497,178 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertNotIn("private key", report_path.read_text(encoding="ascii"))
             self.assertNotIn("root plan prepare failed", stdout.getvalue() + stderr.getvalue())
 
+        def cleanup_fixture(
+            services: tuple[str, ...], *, summary_raises: bool = False,
+        ) -> dict[str, object]:
+            with tempfile.TemporaryDirectory() as temporary_dir:
+                plan_dir = Path(temporary_dir)
+                for service in services:
+                    plan = {
+                        "schema": 1,
+                        "run_id": "d" * 32,
+                        "source_sha": "e" * 40,
+                        "release_slug": "release-eeeeeeeeeeee",
+                        "workload": diagnostic_plan_tool.CAPACITY_WORKLOAD,
+                        "off_start_ms": 1,
+                        "off_end_ms": 1,
+                        "on_start_ms": 1,
+                        "on_end_ms": 1,
+                        "expires_at_ms": 1,
+                        "targets": [{
+                            "service": service,
+                            "pid": 123,
+                            "start_ticks": 456,
+                            "invocation_id": "f" * 32,
+                        }],
+                    }
+                    path = plan_dir / diagnostic_plan_tool.PLAN_NAMES[service]
+                    path.write_bytes(diagnostic_plan_tool._canonical_json(plan))
+                    os.chmod(path, 0o440)
+
+                def open_plan_dir(*, create: bool) -> int:
+                    self.assertFalse(create)
+                    return os.open(plan_dir, os.O_RDONLY | os.O_DIRECTORY)
+
+                def read_plan(_directory_fd: int, name: str, maximum: int):
+                    self.assertIn(name, diagnostic_plan_tool.PLAN_NAMES.values())
+                    self.assertEqual(maximum, diagnostic_plan_tool.MAX_PLAN_BYTES)
+                    path = plan_dir / name
+                    raw = path.read_bytes()
+                    self.assertLessEqual(len(raw), maximum)
+                    return raw, os.stat(path, follow_symlinks=False)
+
+                patches = [
+                    patch.object(diagnostic_plan_tool.os, "geteuid", return_value=0),
+                    patch.object(
+                        diagnostic_plan_tool,
+                        "_validate_plan_directory",
+                        side_effect=open_plan_dir,
+                    ),
+                    patch.object(
+                        diagnostic_plan_tool,
+                        "_read_bounded_at",
+                        side_effect=read_plan,
+                    ),
+                    patch.object(
+                        diagnostic_plan_tool.grp,
+                        "getgrnam",
+                        side_effect=lambda name: SimpleNamespace(
+                            gr_gid=os.stat(
+                                plan_dir
+                                / diagnostic_plan_tool.PLAN_NAMES[
+                                    name.removeprefix("oldsparky-")
+                                ]
+                            ).st_gid
+                        ),
+                    ),
+                ]
+                if summary_raises:
+                    patches.append(
+                        patch.object(
+                            diagnostic_plan_tool,
+                            "_usage_summary",
+                            side_effect=RuntimeError("bounded summary unavailable"),
+                        )
+                    )
+                with patches[0], patches[1], patches[2], patches[3]:
+                    if summary_raises:
+                        with patches[4]:
+                            result = diagnostic_plan_tool.cleanup(
+                                Namespace(run_id="d" * 32)
+                            )
+                    else:
+                        result = diagnostic_plan_tool.cleanup(
+                            Namespace(run_id="d" * 32)
+                        )
+                self.assertFalse(
+                    any(
+                        (plan_dir / name).exists()
+                        for name in diagnostic_plan_tool.PLAN_NAMES.values()
+                    )
+                )
+                return result
+
+        partial_cleanup = cleanup_fixture(("api",))
+        self.assertEqual(partial_cleanup["service_count"], 1)
+        self.assertEqual(partial_cleanup["usage_status"], "unavailable")
+        validated_partial = cpu_pair._validate_usage_summary(
+            {"status": "expired_plans_removed", **partial_cleanup}
+        )
+        self.assertIsNotNone(validated_partial)
+        self.assertEqual(validated_partial["service_count"], 1)
+        self.assertIsNone(cpu_pair._usage_delta_percentage_points(validated_partial))
+
+        fallback_cleanup = cleanup_fixture(("api", "web"), summary_raises=True)
+        self.assertEqual(fallback_cleanup["service_count"], 2)
+        self.assertEqual(fallback_cleanup["profile_status"], "incomplete")
+        validated_fallback = cpu_pair._validate_usage_summary(
+            {"status": "expired_plans_removed", **fallback_cleanup}
+        )
+        self.assertIsNotNone(validated_fallback)
+        self.assertEqual(validated_fallback["profile_status"], "incomplete")
+        self.assertTrue(
+            all(
+                row[field] is None
+                for row in validated_fallback["profile_rows"]
+                for field in (
+                    "start_lag_ms_min", "start_lag_ms_max", "elapsed_ms_min",
+                    "elapsed_ms_max", "end_lag_ms_min", "end_lag_ms_max",
+                )
+            )
+        )
+        partial_pair_as_single = {
+            "status": "expired_plans_removed",
+            **fallback_cleanup,
+            "service_count": 1,
+        }
+        self.assertTrue(partial_pair_as_single["usage_rows"])
+        self.assertIsNone(cpu_pair._validate_usage_summary(partial_pair_as_single))
+
+        complete_pair_as_single = json.loads(json.dumps(fallback_cleanup))
+        complete_pair_as_single["usage_status"] = "complete"
+        complete_pair_as_single["usage_reason"] = "none"
+        for row in complete_pair_as_single["usage_rows"]:
+            row.update({
+                "observed_targets": row["expected_targets"],
+                "event_count": row["expected_targets"],
+                "cpu_ns": 1_000_000_000,
+                "window_ms_min": 20_000,
+                "window_ms_max": 20_000,
+                "start_lag_ms_min": 0,
+                "start_lag_ms_max": 0,
+                "end_lag_ms_min": 0,
+                "end_lag_ms_max": 0,
+                "duplicate_count": 0,
+                "timing_complete": True,
+            })
+        complete_pair_as_single["profile_status"] = "complete"
+        complete_pair_as_single["profile_reason"] = "none"
+        for row in complete_pair_as_single["profile_rows"]:
+            row.update({
+                "observed_targets": row["expected_targets"],
+                "event_count": row["expected_targets"],
+                "start_lag_ms_min": 0,
+                "start_lag_ms_max": 0,
+                "elapsed_ms_min": 20_000,
+                "elapsed_ms_max": 20_000,
+                "end_lag_ms_min": 0,
+                "end_lag_ms_max": 0,
+                "total_cpu_us": 100,
+                "sample_count": 1 if row["service"] == "web" else None,
+                "categories": [{
+                    "category": "other", "cpu_us": 100, "observations": 1,
+                }],
+            })
+        self.assertIsNotNone(cpu_pair._validate_usage_summary({
+            "status": "expired_plans_removed",
+            **complete_pair_as_single,
+            "service_count": 2,
+        }))
+        complete_pair_as_single["service_count"] = 1
+        self.assertIsNone(cpu_pair._validate_usage_summary({
+            "status": "expired_plans_removed", **complete_pair_as_single,
+        }))
+
     def test_api_release_identity_uses_real_released_platform_layout(self) -> None:
         import python_packages.platform_infra.performance_diagnostic as diagnostic_module
 

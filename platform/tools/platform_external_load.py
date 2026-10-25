@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from array import array
 import base64
+import codecs
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -27,7 +28,9 @@ import os
 from pathlib import Path
 import random
 import re
+import select
 import ssl
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -857,6 +860,73 @@ class _ProcessCpuSampler:
         }
 
 
+_RUNNER_PROC1_NAMESPACE_STAT_PATHS = (
+    ("pid", "/proc/1/ns/pid"),
+    ("mount", "/proc/1/ns/mnt"),
+    ("cgroup", "/proc/1/ns/cgroup"),
+)
+_RUNNER_PROC1_NAMESPACE_STAT_OUTPUT_LIMIT = 256
+
+
+def _read_proc1_namespace_identities() -> dict[str, tuple[int, int]]:
+    """Read only the fixed host PID 1 namespace links through read-only stat."""
+
+    command = [
+        "/usr/bin/sudo",
+        "-n",
+        "/usr/bin/timeout",
+        "--signal=TERM",
+        "--kill-after=0.2s",
+        "1s",
+        "/usr/bin/stat",
+        "--dereference",
+        "--printf=%d:%i\\n",
+        "--",
+        *(path for _name, path in _RUNNER_PROC1_NAMESPACE_STAT_PATHS),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            timeout=3.0,
+            check=False,
+            close_fds=True,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        raise _CgroupDiagnosticError("runner_snapshot_unavailable") from None
+    output = result.stdout
+    if (
+        type(result.returncode) is not int
+        or result.returncode != 0
+        or not isinstance(output, bytes)
+        or len(output) > _RUNNER_PROC1_NAMESPACE_STAT_OUTPUT_LIMIT
+        or not output.endswith(b"\n")
+    ):
+        raise _CgroupDiagnosticError("runner_snapshot_unavailable")
+    try:
+        lines = output.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        raise _CgroupDiagnosticError("runner_snapshot_unavailable") from None
+    if len(lines) != len(_RUNNER_PROC1_NAMESPACE_STAT_PATHS):
+        raise _CgroupDiagnosticError("runner_snapshot_unavailable")
+    identities: dict[str, tuple[int, int]] = {}
+    for (name, _path), line in zip(_RUNNER_PROC1_NAMESPACE_STAT_PATHS, lines, strict=True):
+        fields = line.split(":")
+        if len(fields) != 2 or any(
+            not field.isascii() or not field.isdigit() for field in fields
+        ):
+            raise _CgroupDiagnosticError("runner_snapshot_unavailable")
+        device, inode = (int(field) for field in fields)
+        if device > 2**64 - 1 or not 0 < inode <= 2**64 - 1:
+            raise _CgroupDiagnosticError("runner_snapshot_unavailable")
+        identities[name] = (device, inode)
+    return identities
+
+
 class RunnerCgroupSampler:
     """Observe the exact supervised load process from the trusted outer runner."""
 
@@ -882,6 +952,7 @@ class RunnerCgroupSampler:
         self._failure: str | None = None
         self._pid: int | None = None
         self._starttime: int | None = None
+        self._pidfd: int | None = None
         self._membership: str | None = None
         self._mountinfo: str | None = None
         self._cgroup_namespace: tuple[int, int] | None = None
@@ -912,6 +983,58 @@ class RunnerCgroupSampler:
         except (OSError, UnicodeError, ValueError, RuntimeError):
             return False
 
+    @staticmethod
+    def _pidfd_state(pidfd: int) -> str:
+        """Distinguish a live target from confirmed exit without reopening its PID."""
+
+        try:
+            os.fstat(pidfd)
+            poller = select.poll()
+            poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            events = poller.poll(0)
+        except (OSError, ValueError):
+            return "unknown"
+        if not events:
+            return "live"
+        if len(events) != 1 or not isinstance(events[0], tuple) or len(events[0]) != 2:
+            return "unknown"
+        event_fd, mask = events[0]
+        if type(event_fd) is not int or event_fd != pidfd or type(mask) is not int or mask <= 0:
+            return "unknown"
+        exit_bits = select.POLLIN | select.POLLHUP
+        if mask & exit_bits and (mask & ~exit_bits) == 0:
+            return "exited"
+        return "unknown"
+
+    def _target_binding_state(self, pidfd: int) -> str:
+        """Check target liveness and its captured membership/namespaces twice."""
+
+        state = self._pidfd_state(pidfd)
+        if state != "live":
+            return state
+        try:
+            stable = self._target_is_stable()
+            namespaces_match = all(
+                self._namespace_identity(f"/proc/{self._pid}/ns/{'mnt' if name == 'mount' else name}")
+                == self._target_namespaces.get(name)
+                for name in ("pid", "mount", "cgroup")
+            )
+        except (OSError, UnicodeError, ValueError, RuntimeError):
+            return "exited" if self._pidfd_state(pidfd) == "exited" else "invalid"
+        state = self._pidfd_state(pidfd)
+        if state != "live":
+            return state
+        return "live" if stable and namespaces_match else "changed"
+
+    def _close_pidfd(self) -> None:
+        pidfd = self._pidfd
+        self._pidfd = None
+        if pidfd is not None:
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
+
     def start(self, pid: int, starttime: int) -> None:
         """Start only after the supervisor has captured PID and starttime."""
 
@@ -929,6 +1052,16 @@ class RunnerCgroupSampler:
                 from platform_load_runtime import _read_process_starttime  # type: ignore[no-redef]
             if _read_process_starttime(pid) != starttime:
                 raise _CgroupDiagnosticError("workload_identity_changed")
+            try:
+                self._pidfd = os.pidfd_open(pid, 0)
+                os.set_inheritable(self._pidfd, False)
+            except (AttributeError, OSError, ValueError):
+                raise _CgroupDiagnosticError("runner_snapshot_unavailable") from None
+            if (
+                _read_process_starttime(pid) != starttime
+                or self._pidfd_state(self._pidfd) != "live"
+            ):
+                raise _CgroupDiagnosticError("workload_identity_changed")
             self._membership = _read_bounded_ascii(Path(f"/proc/{pid}/cgroup"))
             parent_membership = _read_bounded_ascii(Path("/proc/self/cgroup"))
             if self._membership != parent_membership:
@@ -937,11 +1070,7 @@ class RunnerCgroupSampler:
                 Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
             )
             mapping = _cgroup2_membership_mapping(self._membership, self._mountinfo)
-            pid1 = {
-                "pid": self._namespace_identity("/proc/1/ns/pid"),
-                "mount": self._namespace_identity("/proc/1/ns/mnt"),
-                "cgroup": self._namespace_identity("/proc/1/ns/cgroup"),
-            }
+            pid1 = _read_proc1_namespace_identities()
             outer = {
                 "pid": self._namespace_identity("/proc/self/ns/pid"),
                 "mount": self._namespace_identity("/proc/self/ns/mnt"),
@@ -968,30 +1097,59 @@ class RunnerCgroupSampler:
             self._cgroup_namespace = target_cgroup_ns
             if not all(self._identity.values()):
                 raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
-            self._initial = _read_cgroup_diagnostic_snapshot(
+            target_state = self._target_binding_state(self._pidfd)
+            if target_state != "live":
+                raise _CgroupDiagnosticError(
+                    "workload_identity_changed"
+                    if target_state in {"changed", "exited"}
+                    else "runner_snapshot_unavailable"
+                )
+            initial = _read_cgroup_diagnostic_snapshot(
                 cgroup_text=self._membership,
                 mountinfo_text=self._mountinfo,
                 namespace_identity=target_cgroup_ns,
                 process_pid=pid,
             )
-            if not self._initial.get("mount_root_is_global") or self._initial.get("reasons"):
+            initial_timestamp = time.monotonic()
+            if not initial.get("mount_root_is_global") or initial.get("reasons"):
                 raise _CgroupDiagnosticError("runner_cgroup_snapshot_incomplete")
-            self._samples = [(time.monotonic(), self._initial)]
-            self._thread = threading.Thread(
-                target=self._sample_loop, name="runner-cgroup-sampler", daemon=True
-            )
-            self._thread.start()
+            target_state = self._target_binding_state(self._pidfd)
+            if target_state != "live":
+                raise _CgroupDiagnosticError(
+                    "workload_identity_changed"
+                    if target_state in {"changed", "exited"}
+                    else "runner_snapshot_unavailable"
+                )
+            self._initial = initial
+            self._samples = [(initial_timestamp, initial)]
+            thread_pidfd = os.dup(self._pidfd)
+            try:
+                os.set_inheritable(thread_pidfd, False)
+                self._thread = threading.Thread(
+                    target=self._sample_loop, args=(thread_pidfd,),
+                    name="runner-cgroup-sampler", daemon=True,
+                )
+                self._thread.start()
+            except (OSError, RuntimeError):
+                os.close(thread_pidfd)
+                self._thread = None
+                self._failure = "runner_snapshot_unavailable"
         except (OSError, UnicodeError, ValueError, _CgroupDiagnosticError) as exc:
             self._failure = getattr(exc, "reason", "runner_snapshot_unavailable")
 
-    def _sample_loop(self) -> None:
-        while not self._stop.wait(self.SAMPLE_INTERVAL_SECONDS):
-            if not Path(f"/proc/{self._pid}").exists():
-                return
-            if not self._target_is_stable():
-                self._failure = "workload_identity_changed"
-                return
-            try:
+    def _sample_loop(self, pidfd: int) -> None:
+        try:
+            while not self._stop.wait(self.SAMPLE_INTERVAL_SECONDS):
+                target_state = self._target_binding_state(pidfd)
+                if target_state == "exited":
+                    return
+                if target_state != "live":
+                    self._failure = (
+                        "workload_identity_changed"
+                        if target_state == "changed" else "runner_snapshot_invalid"
+                    )
+                    return
+                pid1 = _read_proc1_namespace_identities()
                 for name, path in (
                     ("pid", "/proc/self/ns/pid"),
                     ("mount", "/proc/self/ns/mnt"),
@@ -999,14 +1157,8 @@ class RunnerCgroupSampler:
                 ):
                     if self._namespace_identity(path) != self._outer_identity.get(name):
                         raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
-                    if self._namespace_identity(path.replace("self", "1")) != self._outer_identity.get(name):
+                    if pid1[name] != self._outer_identity.get(name):
                         raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
-                    target_namespace_name = "mnt" if name == "mount" else name
-                    target_namespace = self._namespace_identity(
-                        f"/proc/{self._pid}/ns/{target_namespace_name}"
-                    )
-                    if target_namespace != self._target_namespaces.get(name):
-                        raise _CgroupDiagnosticError("workload_identity_changed")
                 mountinfo = _bounded_proc_text(
                     Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
                 )
@@ -1023,6 +1175,7 @@ class RunnerCgroupSampler:
                     namespace_identity=self._cgroup_namespace,
                     process_pid=self._pid,
                 )
+                sample_timestamp = time.monotonic()
                 if (
                     snapshot.get("membership") != self._initial.get("membership")
                     or snapshot.get("mount_identity") != self._initial.get("mount_identity")
@@ -1031,14 +1184,27 @@ class RunnerCgroupSampler:
                 ):
                     self._failure = "runner_cgroup_identity_changed"
                     return
+                target_state = self._target_binding_state(pidfd)
+                if target_state == "exited":
+                    return
+                if target_state != "live":
+                    self._failure = (
+                        "workload_identity_changed"
+                        if target_state == "changed" else "runner_snapshot_invalid"
+                    )
+                    return
                 with self._lock:
                     if len(self._samples) >= self.SAMPLE_LIMIT:
                         self._failure = "runner_sample_limit"
                         return
-                    self._samples.append((time.monotonic(), snapshot))
-            except (OSError, UnicodeError, ValueError, _CgroupDiagnosticError):
-                self._failure = "runner_snapshot_invalid"
-                return
+                    self._samples.append((sample_timestamp, snapshot))
+        except (OSError, UnicodeError, ValueError, _CgroupDiagnosticError):
+            self._failure = "runner_snapshot_invalid"
+        finally:
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
 
     def stop(
         self,
@@ -1054,7 +1220,27 @@ class RunnerCgroupSampler:
             self._thread.join(2.0)
             if self._thread.is_alive():
                 self._failure = "runner_sampler_join_timeout"
-        if namespace_pid is not None or namespace_starttime is not None:
+        try:
+            return self._finish_stop(
+                namespace_pid=namespace_pid,
+                namespace_starttime=namespace_starttime,
+                phase_window_monotonic=phase_window_monotonic,
+            )
+        finally:
+            self._close_pidfd()
+
+    def _finish_stop(
+        self,
+        *,
+        namespace_pid: int | None,
+        namespace_starttime: int | None,
+        phase_window_monotonic: tuple[float, float] | None,
+    ) -> dict[str, Any]:
+        if (
+            self._pid is not None
+            and self._starttime is not None
+            and (namespace_pid is not None or namespace_starttime is not None)
+        ):
             if (
                 namespace_pid != self._pid
                 or namespace_starttime != self._starttime
@@ -1068,11 +1254,34 @@ class RunnerCgroupSampler:
                 "identity": self._identity,
                 "sample_count": len(self._samples),
             }
+        if self._pidfd is None:
+            self._failure = "runner_snapshot_unavailable"
+            return {
+                "schema": 1, "status": "unknown", "reason": self._failure,
+                "runner_environment": "github-hosted", "identity": self._identity,
+                "sample_count": len(self._samples),
+            }
+        target_state = self._pidfd_state(self._pidfd)
+        if target_state == "unknown":
+            return {
+                "schema": 1, "status": "unknown", "reason": "runner_snapshot_unavailable",
+                "runner_environment": "github-hosted", "identity": self._identity,
+                "sample_count": len(self._samples),
+            }
+        if target_state == "live":
+            target_state = self._target_binding_state(self._pidfd)
+            if target_state not in {"live", "exited"}:
+                return {
+                    "schema": 1, "status": "unknown",
+                    "reason": "workload_identity_changed"
+                    if target_state == "changed" else "runner_snapshot_invalid",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(self._samples),
+                }
         try:
-            if not self._target_is_stable():
-                raise _CgroupDiagnosticError("workload_identity_changed")
             if _read_bounded_ascii(Path("/proc/self/cgroup")) != self._membership:
                 raise _CgroupDiagnosticError("runner_membership_changed")
+            pid1 = _read_proc1_namespace_identities()
             for name, path in (
                 ("pid", "/proc/self/ns/pid"),
                 ("mount", "/proc/self/ns/mnt"),
@@ -1080,13 +1289,8 @@ class RunnerCgroupSampler:
             ):
                 if self._namespace_identity(path) != self._outer_identity.get(name):
                     raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
-                if self._namespace_identity(path.replace("self", "1")) != self._outer_identity.get(name):
+                if pid1[name] != self._outer_identity.get(name):
                     raise _CgroupDiagnosticError("runner_namespace_binding_invalid")
-                target_namespace_name = "mnt" if name == "mount" else name
-                if self._namespace_identity(
-                    f"/proc/{self._pid}/ns/{target_namespace_name}"
-                ) != self._target_namespaces.get(name):
-                    raise _CgroupDiagnosticError("workload_identity_changed")
             final_mountinfo = _bounded_proc_text(
                 Path("/proc/self/mountinfo"), CLIENT_CGROUP_MOUNTINFO_LIMIT
             )
@@ -1097,19 +1301,57 @@ class RunnerCgroupSampler:
                 or final_mapping["mountpoint"] != Path("/sys/fs/cgroup")
             ):
                 raise _CgroupDiagnosticError("runner_cgroup_identity_changed")
-            final = _read_cgroup_diagnostic_snapshot(
-                cgroup_text=self._membership,
-                mountinfo_text=final_mountinfo,
-                namespace_identity=self._cgroup_namespace,
-            )
         except (OSError, UnicodeError, ValueError, _CgroupDiagnosticError):
             return {
-                "schema": 1, "status": "unknown", "reason": "runner_final_snapshot_invalid",
+                "schema": 1, "status": "unknown", "reason": "runner_snapshot_invalid",
                 "runner_environment": "github-hosted", "identity": self._identity,
                 "sample_count": len(self._samples),
             }
-        samples = [*self._samples, (time.monotonic(), final)]
-        if len(samples) < 3 or final.get("reasons"):
+
+        samples = list(self._samples)
+        if target_state == "live":
+            target_state = self._target_binding_state(self._pidfd)
+            if target_state not in {"live", "exited"}:
+                return {
+                    "schema": 1, "status": "unknown",
+                    "reason": "workload_identity_changed"
+                    if target_state == "changed" else "runner_snapshot_invalid",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples),
+                }
+        if target_state == "live":
+            try:
+                final = _read_cgroup_diagnostic_snapshot(
+                    cgroup_text=self._membership,
+                    mountinfo_text=final_mountinfo,
+                    namespace_identity=self._cgroup_namespace,
+                )
+                final_timestamp = time.monotonic()
+            except (OSError, UnicodeError, ValueError, _CgroupDiagnosticError):
+                return {
+                    "schema": 1, "status": "unknown", "reason": "runner_snapshot_invalid",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples),
+                }
+            target_state = self._target_binding_state(self._pidfd)
+            if target_state == "live":
+                if final.get("reasons"):
+                    return {
+                        "schema": 1, "status": "unknown", "reason": "runner_snapshot_invalid",
+                        "runner_environment": "github-hosted", "identity": self._identity,
+                        "sample_count": len(samples),
+                    }
+                samples.append((final_timestamp, final))
+            elif target_state != "exited":
+                return {
+                    "schema": 1, "status": "unknown",
+                    "reason": "workload_identity_changed"
+                    if target_state == "changed" else "runner_snapshot_invalid",
+                    "runner_environment": "github-hosted", "identity": self._identity,
+                    "sample_count": len(samples),
+                }
+
+        if len(samples) < 3:
             return {
                 "schema": 1, "status": "unknown", "reason": "runner_samples_incomplete",
                 "runner_environment": "github-hosted", "identity": self._identity,
@@ -3355,12 +3597,18 @@ class _AuthenticatedHtmlMarkerParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.lifecycle = False
-        self.ready_detail = False
         self.authenticated_header = False
+        self.ssr_workspace_ready = False
+        self.expected_detail_fallback = False
 
     @property
     def complete(self) -> bool:
-        return self.lifecycle and self.ready_detail and self.authenticated_header
+        return (
+            self.lifecycle
+            and self.authenticated_header
+            and self.ssr_workspace_ready
+            and self.expected_detail_fallback
+        )
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
@@ -3368,10 +3616,15 @@ class _AuthenticatedHtmlMarkerParser(HTMLParser):
         if tag == "span":
             if values.get("data-testid") == "tournament-detail-lifecycle":
                 self.lifecycle = True
+                self.ssr_workspace_ready = values.get("data-ssr-workspace-ready") == "true"
             if "header-profile-avatar" in classes:
                 self.authenticated_header = True
-        elif tag == "section" and "top-detail-grid" in classes:
-            self.ready_detail = True
+        elif tag == "section" and "route-loading-shell" in classes:
+            # The detail view intentionally has ssr:false. Its generic loading
+            # panel is therefore expected in seeded raw SSR, while the
+            # route-level no-seed shell carries the tournament-detail variant.
+            if "route-loading-tournament-detail" not in classes:
+                self.expected_detail_fallback = True
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
@@ -3389,11 +3642,16 @@ def _authenticated_html_markers(content_type: Any, body: Any) -> tuple[bool, boo
     try:
         # HTTP11KeepAliveClient assembles the bounded response chunks before
         # returning. Re-feed small slices so tokenization adds bounded
-        # temporary memory; HTMLParser carries partial tags across slices.
+        # temporary memory. Keep UTF-8 decoder state across slices so a
+        # multibyte character at a boundary is not replaced; HTMLParser also
+        # carries partial tags across slices.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         for offset in range(0, len(body), 64 * 1024):
-            parser.feed(body[offset:offset + 64 * 1024].decode("utf-8", errors="replace"))
+            parser.feed(decoder.decode(body[offset:offset + 64 * 1024], final=False))
             if parser.complete:
                 break
+        else:
+            parser.feed(decoder.decode(b"", final=True))
         parser.close()
     except (AssertionError, ValueError):
         return content_type_ok, False
