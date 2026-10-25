@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import json
 import hashlib
@@ -471,7 +472,15 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertIsNone(later_read_failure["remote_failure_stage"])
 
         with self.subTest(first_fault="startup_timeout_preserved"):
-            preserved = watcher_with_chunk()
+            preserved = capacity_diagnostic._RemoteMemoryWatcher(
+                ssh_host="example.invalid", ssh_user="tester",
+                ssh_config=Path("/tmp/external-ssh/config"),
+                ssh_key=Path("/tmp/external-ssh/id_ed25519"),
+                control_path=Path("/tmp/capacity-control.json"), binding={},
+                run_id="a" * 32, source_sha="b" * 40,
+                expected_plan=(0, 25_000, 45_000),
+                workload=diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            )
             def fail_initial_read() -> None:
                 preserved._set_stage("first_row_read")
                 raise TimeoutError()
@@ -482,8 +491,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     self.assertRaises(TimeoutError),
                 ):
                     preserved.start()
-                # The patched start fails before any child process is created.
-                preserved.process = None
+                # A real startup refusal occurs before child or selector creation.
                 preserved.fail_closed()
                 preserved_summary = preserved.stop()
             self.assertEqual(preserved_summary["failure_stage"], "first_row_read")
@@ -512,7 +520,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
         }
         request = {
-            "schema": 1, "run_id": run_id, "source_sha": source_sha,
+            "schema": 1, "operation": "memory-watch", "run_id": run_id, "source_sha": source_sha,
             "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
         }
         request_bytes = json.dumps(
@@ -534,8 +542,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 path.chmod(0o600)
 
             helper_path = root / "fake-sudo"
-            helper_source = textwrap.dedent(f"""\
-                #!{sys.executable}
+            helper_source = f"#!{sys.executable}\n" + textwrap.dedent(f"""\
                 import sys
                 import time
                 sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
@@ -561,11 +568,12 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 plan_tool.time.sleep = fast_forward
                 raise SystemExit(plan_tool.main(["memory-watch-stdin"]))
             """)
+            ast.parse(helper_source, filename="generated-fake-sudo-helper.py")
             helper_path.write_text(helper_source, encoding="utf-8")
             helper_path.chmod(0o700)
 
             def dispatcher_source(*, timeout_seconds: int, output_cap: int) -> str:
-                return textwrap.dedent(f"""\
+                source = textwrap.dedent(f"""\
                     import sys
                     import time
                     sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
@@ -579,6 +587,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP = {output_cap}
                     raise SystemExit(dispatch.main(["cpu-diagnostic-memory-watch"]))
                 """)
+                ast.parse(source, filename="generated-memory-watch-dispatcher.py")
+                return source
 
             def run_dispatcher_direct(*, timeout_seconds: int, output_cap: int):
                 return subprocess.run(
@@ -593,6 +603,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 short_timeout = run_dispatcher_direct(
                     timeout_seconds=55,
                     output_cap=remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP,
+                )
+                self.assertTrue(
+                    short_timeout.stdout,
+                    "generated dispatcher produced no diagnostic stdout; "
+                    f"rc={short_timeout.returncode} stderr={short_timeout.stderr[:1000]!r}",
                 )
                 self.assertEqual(short_timeout.returncode, 2)
                 timeout_marker_line = short_timeout.stdout.splitlines()[-1]
@@ -610,6 +625,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             with self.subTest(dispatcher_bound="old_output_cap"):
                 old_output_cap = run_dispatcher_direct(
                     timeout_seconds=130, output_cap=131_072,
+                )
+                self.assertTrue(
+                    old_output_cap.stdout,
+                    "generated dispatcher produced no diagnostic stdout; "
+                    f"rc={old_output_cap.returncode} stderr={old_output_cap.stderr[:1000]!r}",
                 )
                 self.assertEqual(old_output_cap.returncode, 2)
                 self.assertLessEqual(len(old_output_cap.stdout), 131_072)
@@ -659,7 +679,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         self.assertGreaterEqual(watcher.samples, 1)
                     finally:
                         memory_result = watcher.stop()
-                    self.assertEqual(memory_result["status"], "complete")
+                    self.assertEqual(
+                        memory_result["status"], "complete",
+                        f"parent report={memory_result!r}; child_rc="
+                        f"{watcher.process.poll() if watcher.process is not None else None}",
+                    )
                     self.assertEqual(memory_result["terminal_decision"], "complete")
                     self.assertEqual(memory_result["terminal_reason"], "none")
                     self.assertGreaterEqual(memory_result["samples"], 180)
@@ -685,7 +709,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         old_parent_watcher.start()
                     finally:
                         old_parent_result = old_parent_watcher.stop()
-                self.assertEqual(old_parent_result["status"], "incomplete")
+                self.assertEqual(
+                    old_parent_result["status"], "incomplete",
+                    f"parent report={old_parent_result!r}; child_rc="
+                    f"{old_parent_watcher.process.poll() if old_parent_watcher.process is not None else None}",
+                )
                 self.assertEqual(old_parent_result["terminal_reason"], "observer_failed")
                 fixture_row_bound = (
                     plan["on_end_ms"] - (plan["off_start_ms"] - 60_000) + 249

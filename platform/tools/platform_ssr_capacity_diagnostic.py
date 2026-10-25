@@ -537,7 +537,8 @@ class _RemoteMemoryWatcher:
             "cpu-diagnostic-memory-watch",
         ]
         request = {
-            "schema": 1, "run_id": self.run_id, "source_sha": self.source_sha,
+            "schema": 1, "operation": "memory-watch",
+            "run_id": self.run_id, "source_sha": self.source_sha,
             "workload": self.workload,
         }
         data = json.dumps(request, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
