@@ -609,6 +609,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     if initial_reason is not None:
         return _incomplete_report(
             capacity, binding, initial_reason, submitted=0, completed=0,
+            observed_duration_ms=0,
             manifest_sha256=capacity["manifest_sha256"],
         )
     capacity_executor = ThreadPoolExecutor(
@@ -650,6 +651,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         capacity_executor.shutdown(wait=True, cancel_futures=True)
         return _incomplete_report(
             capacity, binding, reason, submitted=0, completed=0,
+            observed_duration_ms=0,
             off_probe_submitted=submitted, off_probe_completed=completed,
             off_probe_status=None, manifest_sha256=capacity["manifest_sha256"],
         )
@@ -681,6 +683,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             capacity_executor.shutdown(wait=True, cancel_futures=True)
             return _incomplete_report(
                 capacity, binding, initial, submitted=0, completed=0,
+                observed_duration_ms=0,
                 manifest_sha256=capacity["manifest_sha256"],
             )
         now_ms = time.time_ns() // 1_000_000
@@ -728,6 +731,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             capacity_executor.shutdown(wait=True, cancel_futures=True)
             return _incomplete_report(
                 capacity, binding, reason, submitted=0, completed=0,
+                observed_duration_ms=0,
                 off_probe_submitted=probe_count, off_probe_completed=probe_count,
                 off_probe_status=200,
                 manifest_sha256=capacity["manifest_sha256"],
@@ -760,6 +764,9 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     except (external_load.ExternalLoadError, OSError, CapacityControlError):
         return _incomplete_report(
             capacity, binding, "worker_error", submitted=0, completed=0,
+            observed_duration_ms=max(
+                0, min(30_000, round((time.monotonic() - on_start_monotonic) * 1000)),
+            ),
             off_probe_submitted=probe_count, off_probe_completed=probe_count,
             off_probe_status=200,
             manifest_sha256=capacity["manifest_sha256"],
@@ -837,10 +844,13 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _incomplete_report(
     capacity: Mapping[str, Any], binding: Mapping[str, Any], reason: str,
-    *, submitted: int, completed: int, manifest_sha256: str,
+    *, submitted: int, completed: int, observed_duration_ms: int,
+    manifest_sha256: str,
     off_probe_submitted: int = 0, off_probe_completed: int = 0,
     off_probe_status: int | None = None,
 ) -> dict[str, Any]:
+    if type(observed_duration_ms) is not int or not 0 <= observed_duration_ms <= 30_000:
+        raise ValueError("capacity incomplete duration is invalid")
     return {
         **profile_payload(capacity["concurrency"]),
         "report_complete": True,
@@ -857,6 +867,8 @@ def _incomplete_report(
         "fixture_manifest_bytes": capacity.get("manifest_bytes", 0),
         "on_window_start_ms": capacity["on_start_ms"],
         "on_window_end_ms": capacity["on_end_ms"],
+        # This field measures the ON window; pre-ON aborts pass zero explicitly.
+        "observed_duration_ms": observed_duration_ms,
         "submitted": submitted, "completed": completed,
         "response_bytes_total": 0,
         "http_status_counts": {}, "error_counts": {},

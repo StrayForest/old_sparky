@@ -303,6 +303,49 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "server_capacity_claim_reason": "resource_correlation_not_provided",
         }
         self.assertTrue(capacity_diagnostic._worker_report_matches(report, config))
+        pre_request_abort = capacity_diagnostic._incomplete_report(
+            {
+                "concurrency": 8,
+                "on_start_ms": 26_000,
+                "on_end_ms": 46_000,
+                "manifest_bytes": 2048,
+            },
+            binding,
+            "observer_failed",
+            submitted=0,
+            completed=0,
+            observed_duration_ms=0,
+            manifest_sha256="e" * 64,
+        )
+        self.assertEqual(pre_request_abort["observed_duration_ms"], 0)
+        self.assertTrue(
+            capacity_diagnostic._worker_report_matches(pre_request_abort, config)
+        )
+        malformed_pre_request_abort = {
+            key: value for key, value in pre_request_abort.items()
+            if key != "observed_duration_ms"
+        }
+        self.assertFalse(
+            capacity_diagnostic._worker_report_matches(
+                malformed_pre_request_abort, config,
+            )
+        )
+        measured_abort = capacity_diagnostic._incomplete_report(
+            {
+                "concurrency": 8,
+                "on_start_ms": 26_000,
+                "on_end_ms": 46_000,
+                "manifest_bytes": 2048,
+            },
+            binding,
+            "worker_error",
+            submitted=0,
+            completed=0,
+            observed_duration_ms=1_234,
+            manifest_sha256="e" * 64,
+        )
+        self.assertEqual(measured_abort["observed_duration_ms"], 1_234)
+        self.assertTrue(capacity_diagnostic._worker_report_matches(measured_abort, config))
         self.assertEqual(
             capacity_diagnostic._generator_cpu_evidence_status(report["process_cpu_windows"]),
             "measured",

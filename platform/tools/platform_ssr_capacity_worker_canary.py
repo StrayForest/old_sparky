@@ -164,12 +164,76 @@ def main() -> int:
             raise SystemExit("synthetic SSR canary omitted supervisor evidence")
         worker_report = outcome.get("worker")
         if not isinstance(worker_report, dict):
-            raise SystemExit("synthetic SSR canary omitted worker report")
+            child_failure = (
+                child_report.get("worker_failure")
+                if isinstance(child_report, dict)
+                else None
+            )
+            safe_failure = child_failure if isinstance(child_failure, dict) else {}
+            details = {
+                "worker_present": False,
+                "child_report_complete": (
+                    child_report.get("report_complete") is True
+                    if isinstance(child_report, dict) else False
+                ),
+                "child_status": (
+                    child_report.get("status")
+                    if isinstance(child_report, dict)
+                    and child_report.get("status") in {"complete", "incomplete", "failed"}
+                    else "unknown"
+                ),
+                "child_namespace_closed": (
+                    child_report.get("namespace_closed")
+                    if isinstance(child_report, dict)
+                    and type(child_report.get("namespace_closed")) is bool
+                    else None
+                ),
+                "child_observer_failed_abort": (
+                    isinstance(child_report, dict)
+                    and child_report.get("resource_abort_reason") == "observer_failed"
+                ),
+                "child_duration_ms": (
+                    child_report.get("observed_duration_ms")
+                    if isinstance(child_report, dict)
+                    and type(child_report.get("observed_duration_ms")) is int
+                    and 0 <= child_report["observed_duration_ms"] <= 30_000
+                    else None
+                ),
+                "child_failure_stage": (
+                    safe_failure.get("stage")
+                    if safe_failure.get("stage") in {
+                        "worker_config_read", "worker_config_validate",
+                        "worker_identity", "worker_callback", "worker_report_write",
+                    }
+                    else "none"
+                ),
+                "supervisor": {
+                    key: supervisor.get(key)
+                    for key in (
+                        "reason", "worker_started", "worker_exited",
+                        "namespace_closed", "return_code", "signal",
+                        "startup_failure_stage", "namespace_ready_failure_stage",
+                        "namespace_post_ready_failure_stage",
+                        "watchdog_startup_failure_stage",
+                    )
+                },
+            }
+            raise SystemExit(
+                "synthetic SSR canary parent rejected worker report: "
+                + json.dumps(details, sort_keys=True)
+            )
         checks = {
             "supervisor_reason_none": supervisor.get("reason") == "none",
             "worker_started": supervisor.get("worker_started") is True,
             "worker_exited": supervisor.get("worker_exited") is True,
             "worker_exit_one_for_incomplete": supervisor.get("return_code") == 1,
+            "no_supervisor_startup_failure": all(
+                supervisor.get(key) is None for key in (
+                    "startup_failure_stage", "namespace_ready_failure_stage",
+                    "namespace_post_ready_failure_stage",
+                    "watchdog_startup_failure_stage",
+                )
+            ),
             "namespace_closed": outcome.get("namespace_closed") is True,
             "descendants_reaped": outcome.get("namespace_closed") is True,
             "child_report_complete": child_report.get("report_complete") is True,
@@ -180,6 +244,7 @@ def main() -> int:
             "zero_submissions": worker_report.get("submitted") == 0,
             "zero_completions": worker_report.get("completed") == 0,
             "zero_response_bytes": worker_report.get("response_bytes_total") == 0,
+            "zero_observed_duration": worker_report.get("observed_duration_ms") == 0,
             "no_http_statuses": worker_report.get("http_status_counts") == {},
             "no_http_errors": worker_report.get("error_counts") == {},
             "zero_off_probe_submissions": (
