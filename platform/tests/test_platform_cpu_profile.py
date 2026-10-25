@@ -363,6 +363,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "binding": binding, "manifest_sha256": "e" * 64,
             "manifest_bytes": 2048,
             "concurrency": 8, "on_start_ms": 26_000, "on_end_ms": 46_000,
+            "workload": capacity_diagnostic.WORKLOAD,
+            "fixture_kind": capacity_diagnostic.FIXTURE_KIND,
         }
         report = {
             "report_complete": True, "schema": 1,
@@ -462,12 +464,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     capacity_diagnostic._worker_report_matches(mutation, config)
                 )
         callback_abort = capacity_diagnostic._incomplete_report(
-            {
-                "concurrency": 8,
-                "on_start_ms": 26_000,
-                "on_end_ms": 46_000,
-                "manifest_bytes": 2048,
-            },
+            config,
             binding,
             "observer_failed",
             submitted=0,
@@ -492,18 +489,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         )
         measured_abort = through_worker_entry(
             capacity_diagnostic._incomplete_report(
-            {
-                "concurrency": 8,
-                "on_start_ms": 26_000,
-                "on_end_ms": 46_000,
-                "manifest_bytes": 2048,
-            },
-            binding,
-            "worker_error",
-            submitted=0,
-            completed=0,
-            observed_duration_ms=1_234,
-            manifest_sha256="e" * 64,
+                config,
+                binding,
+                "worker_error",
+                submitted=0,
+                completed=0,
+                observed_duration_ms=1_234,
+                manifest_sha256="e" * 64,
             )
         )
         self.assertEqual(measured_abort["observed_duration_ms"], 1_234)
