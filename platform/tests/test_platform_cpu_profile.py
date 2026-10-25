@@ -446,42 +446,48 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             capacity_diagnostic.REMOTE_WATCH_ERROR_PREFIX
             + b'{"reason":"missing_terminal","schema":1,"stage":"helper_exit"}\n'
         )
-        same_read_failure = consume_terminal_then_tail([terminal_wire + same_read_marker])
-        self.assertEqual(same_read_failure["status"], "incomplete")
-        self.assertEqual(same_read_failure["failure_stage"], "terminal_drain")
-        self.assertIsNone(same_read_failure["remote_failure_stage"])
-        self.assertIsNone(same_read_failure["remote_failure_reason"])
+        with self.subTest(terminal_tail="same_read_marker"):
+            same_read_failure = consume_terminal_then_tail([terminal_wire + same_read_marker])
+            self.assertEqual(same_read_failure["status"], "incomplete")
+            self.assertEqual(same_read_failure["failure_stage"], "terminal_drain")
+            self.assertIsNone(same_read_failure["remote_failure_stage"])
+            self.assertIsNone(same_read_failure["remote_failure_reason"])
 
-        malformed_tail_failure = consume_terminal_then_tail([
-            terminal_wire + b"\xff",
-        ])
-        self.assertEqual(malformed_tail_failure["status"], "incomplete")
-        self.assertEqual(malformed_tail_failure["failure_stage"], "terminal_drain")
-        self.assertIsNone(malformed_tail_failure["remote_failure_stage"])
+        with self.subTest(terminal_tail="malformed_bytes"):
+            malformed_tail_failure = consume_terminal_then_tail([
+                terminal_wire + b"\xff",
+            ])
+            self.assertEqual(malformed_tail_failure["status"], "incomplete")
+            self.assertEqual(malformed_tail_failure["failure_stage"], "terminal_drain")
+            self.assertIsNone(malformed_tail_failure["remote_failure_stage"])
 
-        later_read_payload = wire_prefix + b'{"sequence":2}\n'
-        later_read_failure = consume_terminal_then_tail([
-            terminal_wire, later_read_payload,
-        ])
-        self.assertEqual(later_read_failure["status"], "incomplete")
-        self.assertEqual(later_read_failure["failure_stage"], "terminal_drain")
-        self.assertIsNone(later_read_failure["remote_failure_stage"])
+        with self.subTest(terminal_tail="later_read_payload"):
+            later_read_payload = wire_prefix + b'{"sequence":2}\n'
+            later_read_failure = consume_terminal_then_tail([
+                terminal_wire, later_read_payload,
+            ])
+            self.assertEqual(later_read_failure["status"], "incomplete")
+            self.assertEqual(later_read_failure["failure_stage"], "terminal_drain")
+            self.assertIsNone(later_read_failure["remote_failure_stage"])
 
-        preserved = watcher_with_chunk()
-        def fail_initial_read() -> None:
-            preserved._set_stage("first_row_read")
-            raise TimeoutError()
+        with self.subTest(first_fault="startup_timeout_preserved"):
+            preserved = watcher_with_chunk()
+            def fail_initial_read() -> None:
+                preserved._set_stage("first_row_read")
+                raise TimeoutError()
 
-        with patch.object(capacity_diagnostic, "write_control"):
-            with (
-                patch.object(preserved, "_start", side_effect=fail_initial_read),
-                self.assertRaises(TimeoutError),
-            ):
-                preserved.start()
-            preserved.fail_closed()
-            preserved_summary = preserved.stop()
-        self.assertEqual(preserved_summary["failure_stage"], "first_row_read")
-        self.assertEqual(preserved_summary["error_class"], "TimeoutError")
+            with patch.object(capacity_diagnostic, "write_control"):
+                with (
+                    patch.object(preserved, "_start", side_effect=fail_initial_read),
+                    self.assertRaises(TimeoutError),
+                ):
+                    preserved.start()
+                # The patched start fails before any child process is created.
+                preserved.process = None
+                preserved.fail_closed()
+                preserved_summary = preserved.stop()
+            self.assertEqual(preserved_summary["failure_stage"], "first_row_read")
+            self.assertEqual(preserved_summary["error_class"], "TimeoutError")
 
         # Exercise the no-HTTP memory chain against temporary cgroup/systemd
         # fixtures. The child producer advances the real fixed 250ms sampling
@@ -583,41 +589,43 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
                 )
 
-            short_timeout = run_dispatcher_direct(
-                timeout_seconds=55,
-                output_cap=remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP,
-            )
-            self.assertEqual(short_timeout.returncode, 2)
-            timeout_marker_line = short_timeout.stdout.splitlines()[-1]
-            self.assertTrue(timeout_marker_line.startswith(
-                remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii"),
-            ))
-            timeout_marker = json.loads(
-                timeout_marker_line[
-                    len(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii")):
-                ],
-            )
-            self.assertEqual(timeout_marker, {
-                "schema": 1, "stage": "watch_timeout", "reason": "timeout",
-            })
-            old_output_cap = run_dispatcher_direct(
-                timeout_seconds=130, output_cap=131_072,
-            )
-            self.assertEqual(old_output_cap.returncode, 2)
-            self.assertLessEqual(len(old_output_cap.stdout), 131_072)
-            self.assertTrue(old_output_cap.stdout.startswith(b"CAPACITY_MEMORY_GUARD "))
-            output_cap_marker_line = old_output_cap.stdout.splitlines()[-1]
-            self.assertTrue(output_cap_marker_line.startswith(
-                remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii"),
-            ))
-            output_cap_marker = json.loads(
-                output_cap_marker_line[
-                    len(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii")):
-                ],
-            )
-            self.assertEqual(output_cap_marker, {
-                "schema": 1, "stage": "output_limit", "reason": "limit",
-            })
+            with self.subTest(dispatcher_bound="old_timeout"):
+                short_timeout = run_dispatcher_direct(
+                    timeout_seconds=55,
+                    output_cap=remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP,
+                )
+                self.assertEqual(short_timeout.returncode, 2)
+                timeout_marker_line = short_timeout.stdout.splitlines()[-1]
+                self.assertTrue(timeout_marker_line.startswith(
+                    remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii"),
+                ))
+                timeout_marker = json.loads(
+                    timeout_marker_line[
+                        len(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii")):
+                    ],
+                )
+                self.assertEqual(timeout_marker, {
+                    "schema": 1, "stage": "watch_timeout", "reason": "timeout",
+                })
+            with self.subTest(dispatcher_bound="old_output_cap"):
+                old_output_cap = run_dispatcher_direct(
+                    timeout_seconds=130, output_cap=131_072,
+                )
+                self.assertEqual(old_output_cap.returncode, 2)
+                self.assertLessEqual(len(old_output_cap.stdout), 131_072)
+                self.assertTrue(old_output_cap.stdout.startswith(b"CAPACITY_MEMORY_GUARD "))
+                output_cap_marker_line = old_output_cap.stdout.splitlines()[-1]
+                self.assertTrue(output_cap_marker_line.startswith(
+                    remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii"),
+                ))
+                output_cap_marker = json.loads(
+                    output_cap_marker_line[
+                        len(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii")):
+                    ],
+                )
+                self.assertEqual(output_cap_marker, {
+                    "schema": 1, "stage": "output_limit", "reason": "limit",
+                })
 
             full_dispatcher = dispatcher_source(
                 timeout_seconds=130,
@@ -643,15 +651,19 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 expected_plan=(plan["off_start_ms"], plan["on_start_ms"], plan["on_end_ms"]),
                 workload=diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
             )
+            memory_result = None
             with patch.object(capacity_diagnostic.subprocess, "Popen", side_effect=fake_ssh_popen):
-                watcher.start()
-                self.assertGreaterEqual(watcher.samples, 1)
-                memory_result = watcher.stop()
-            self.assertEqual(memory_result["status"], "complete")
-            self.assertEqual(memory_result["terminal_decision"], "complete")
-            self.assertEqual(memory_result["terminal_reason"], "none")
-            self.assertGreaterEqual(memory_result["samples"], 180)
-            self.assertLessEqual(watcher.total, capacity_diagnostic.REMOTE_WATCH_CAP)
+                with self.subTest(memory_chain="full"):
+                    try:
+                        watcher.start()
+                        self.assertGreaterEqual(watcher.samples, 1)
+                    finally:
+                        memory_result = watcher.stop()
+                    self.assertEqual(memory_result["status"], "complete")
+                    self.assertEqual(memory_result["terminal_decision"], "complete")
+                    self.assertEqual(memory_result["terminal_reason"], "none")
+                    self.assertGreaterEqual(memory_result["samples"], 180)
+                    self.assertLessEqual(watcher.total, capacity_diagnostic.REMOTE_WATCH_CAP)
 
             # The parent reader has the same cumulative-stream bound. Prove
             # the previous bound rejects this actual full stream, while the
@@ -664,26 +676,34 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 expected_plan=(plan["off_start_ms"], plan["on_start_ms"], plan["on_end_ms"]),
                 workload=diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
             )
-            with (
-                patch.object(capacity_diagnostic, "REMOTE_WATCH_CAP", 131_072),
-                patch.object(capacity_diagnostic.subprocess, "Popen", side_effect=fake_ssh_popen),
-            ):
-                old_parent_watcher.start()
-                old_parent_result = old_parent_watcher.stop()
-            self.assertEqual(old_parent_result["status"], "incomplete")
-            self.assertEqual(old_parent_result["terminal_reason"], "observer_failed")
-            self.assertLess(old_parent_result["samples"], memory_result["samples"])
-            maximum_rows = (130_000 + 249) // 250 + 2
-            parent_stream_bound = maximum_rows * (capacity_diagnostic.REMOTE_ROW_CAP + 1)
-            helper_stream_bound = maximum_rows * (
-                remote_dispatch.CAPACITY_MEMORY_WATCH_LINE_CAP + 1
-            )
-            self.assertGreaterEqual(
-                remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP, helper_stream_bound,
-            )
-            self.assertGreaterEqual(
-                capacity_diagnostic.REMOTE_WATCH_CAP, parent_stream_bound,
-            )
+            with self.subTest(parent_bound="old_output_cap"):
+                with (
+                    patch.object(capacity_diagnostic, "REMOTE_WATCH_CAP", 131_072),
+                    patch.object(capacity_diagnostic.subprocess, "Popen", side_effect=fake_ssh_popen),
+                ):
+                    try:
+                        old_parent_watcher.start()
+                    finally:
+                        old_parent_result = old_parent_watcher.stop()
+                self.assertEqual(old_parent_result["status"], "incomplete")
+                self.assertEqual(old_parent_result["terminal_reason"], "observer_failed")
+                fixture_row_bound = (
+                    plan["on_end_ms"] - (plan["off_start_ms"] - 60_000) + 249
+                ) // 250 + 2
+                self.assertLessEqual(old_parent_result["samples"], fixture_row_bound)
+                maximum_rows = (130_000 + 249) // 250 + 2
+                parent_stream_bound = maximum_rows * (capacity_diagnostic.REMOTE_ROW_CAP + 1)
+                helper_stream_bound = maximum_rows * (
+                    remote_dispatch.CAPACITY_MEMORY_WATCH_LINE_CAP + 1
+                )
+                self.assertGreaterEqual(
+                    remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP, helper_stream_bound,
+                )
+                self.assertGreaterEqual(
+                    capacity_diagnostic.REMOTE_WATCH_CAP, parent_stream_bound,
+                )
+                if memory_result is not None and memory_result.get("status") == "complete":
+                    self.assertLess(old_parent_result["samples"], memory_result["samples"])
 
     def test_ssr_capacity_watch_rejects_non_root_before_reading_plan(self) -> None:
         with (
