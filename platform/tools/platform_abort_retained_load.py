@@ -26,8 +26,20 @@ sys.path.insert(0, str(TOOLS_ROOT))
 
 try:
     from tools.platform_evidence_sanitizer import project_public_artifact, sanitize_log_file
+    from tools.platform_retained_load_export_executor import (
+        ExportCleanupError,
+        LOAD_PREFIX,
+        TMP_ROOT,
+        resolve_artifact_identity,
+    )
 except ModuleNotFoundError:  # Direct execution from platform/tools.
     from platform_evidence_sanitizer import project_public_artifact, sanitize_log_file
+    from platform_retained_load_export_executor import (
+        ExportCleanupError,
+        LOAD_PREFIX,
+        TMP_ROOT,
+        resolve_artifact_identity,
+    )
 
 SCRIPT_PATHS = {
     "/opt/oldsparky/platform/current/tools/platform_production_external_fixture_qa.sh",
@@ -37,6 +49,7 @@ CONFIRMATION = "ABORT-PRODUCTION-RETAINED-LOAD"
 RELEASE_PATH = "/opt/oldsparky/platform/current/RELEASE.json"
 RUN_ROOT_BASE = Path("/opt/oldsparky/platform/shared/production-retained-matrix")
 ABORT_EXPORT_BASE = Path("/tmp")
+SUPERVISOR_EXPORT_BASE = TMP_ROOT
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 
 
@@ -474,18 +487,17 @@ def _retained_lock_is_clear() -> bool:
 
 
 def _supervisor_exit_code(run_id: str) -> int | None:
-    directory = Path("/tmp") / f"old-sparky-production-retained-load-{run_id}"
+    directory = SUPERVISOR_EXPORT_BASE / f"{LOAD_PREFIX}{run_id}"
     path = directory / "supervisor.exit"
     try:
-        expected_uid = int(os.environ.get("SUDO_UID", "0"))
-        expected_gid = int(os.environ.get("SUDO_GID", "0"))
+        artifact_identity = resolve_artifact_identity(require_root=True)
+        expected_uid = artifact_identity.uid
+        expected_gid = artifact_identity.gid
         parent = directory.lstat()
         before = path.lstat()
         if (
             not stat.S_ISDIR(parent.st_mode)
             or stat.S_ISLNK(parent.st_mode)
-            or expected_uid <= 0
-            or expected_gid <= 0
             or parent.st_uid != expected_uid
             or parent.st_gid != expected_gid
             or parent.st_nlink < 2
@@ -515,7 +527,7 @@ def _supervisor_exit_code(run_id: str) -> int | None:
             return None
         status = int(raw[:-1])
         return status if status <= 255 else None
-    except OSError:
+    except (OSError, ExportCleanupError):
         return None
 
 

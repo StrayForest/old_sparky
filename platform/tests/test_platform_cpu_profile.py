@@ -656,6 +656,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertFalse(receipt["passed"])
             self.assertFalse(receipt["diagnostic_credit"])
             refusal_report_path = root / "parent-refusal-report.json"
+            refusal_fingerprint_path = root / "failure-fingerprint.json"
             refusal_stdout = io.StringIO()
             with (
                 patch.object(
@@ -668,6 +669,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.assertEqual(capacity_diagnostic.main([
                     "parent", "--manifest", str(manifest_path),
                     "--report", str(refusal_report_path),
+                    "--failure-report", str(refusal_fingerprint_path),
                     "--source-sha", "a" * 40, "--app-target-sha", "b" * 40,
                     "--external-run-id", "12345", "--external-run-attempt", "1",
                     "--concurrency", "8", "--ssh-config", str(ssh_dir / "config"),
@@ -686,6 +688,17 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(refusal_marker["remote_plan_cleanup"], "not_attempted")
             self.assertFalse(refusal_marker["namespace_closed"])
             self.assertFalse(refusal_marker["diagnostic_credit"])
+            refusal_fingerprint = json.loads(
+                refusal_fingerprint_path.read_text(encoding="ascii")
+            )
+            self.assertEqual(refusal_fingerprint["parent_error_class"], "ValueError")
+            self.assertEqual(refusal_fingerprint["parent_exit_code"], 2)
+            self.assertEqual(
+                refusal_fingerprint["parent_exit_code_basis"],
+                "derived_from_passed_outcome",
+            )
+            self.assertFalse(refusal_fingerprint["passed"])
+            self.assertFalse(refusal_fingerprint["diagnostic_credit"])
             self.assertNotIn("example.test", refusal_stdout.getvalue())
             self.assertNotIn(str(root), refusal_stdout.getvalue())
             self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
@@ -1336,6 +1349,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             report, source_sha="b" * 40, app_target_sha="c" * 40,
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
         ), "PASS")
+        complete_without_full_probe = json.loads(json.dumps(report))
+        complete_without_full_probe["worker"]["off_probe"] = {
+            "submitted": 0, "completed": 0, "http_status": None,
+        }
+        self.assertIsNone(capacity_diagnostic._project_capacity_report(
+            complete_without_full_probe,
+        ))
         html_report = json.loads(json.dumps(report))
         manifest_raw = json.dumps({
             "runner_sha": "b" * 40, "app_target_sha": "c" * 40,
@@ -1402,6 +1422,251 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             missing_api_target, source_sha="b" * 40, app_target_sha="c" * 40,
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
         ), "INVALID")
+
+    def test_parent_html_incomplete_report_reaches_sanitizer_cli(self) -> None:
+        source_sha = "a" * 40
+        runner_identity_fields = external_load.RunnerCgroupSampler.IDENTITY_FIELDS
+        manifest = {
+            "schema": 2,
+            "purpose": "external_ready_vote",
+            "origin": "https://old-sparky.com",
+            "session_cookie_name": "session",
+            "csrf_cookie_name": "csrf",
+            "marker": "preprod261025120154ed2c",
+            "created_at": "2026-10-25T12:00:00Z",
+            "tournaments": [{"id": "fixture-0001", "slug": "ssr-fixture-0001", "user_count": 14}],
+            "users": [
+                {
+                    "user_id": f"fixture-user-{index:04d}",
+                    "tournament_slug": "ssr-fixture-0001",
+                    "session_token": f"{index:02d}" + "s" * 62,
+                    "csrf_token": f"{index:02d}" + "c" * 62,
+                }
+                for index in range(14)
+            ],
+            "runner_sha": source_sha,
+            "app_target_sha": source_sha,
+            "source_binding": None,
+            "source_binding_sha256": None,
+        }
+
+        class FakeRunner:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self, _pid, _starttime):
+                pass
+
+            def stop(self, **_kwargs):
+                return {
+                    "schema": 1, "status": "unknown",
+                    "reason": "runner_snapshot_unavailable",
+                    "runner_environment": "github-hosted",
+                    "identity": {key: False for key in runner_identity_fields},
+                    "sample_count": 0, "window_scope": "on_window",
+                    "window_seconds": None, "effective_cpu_capacity_cores": None,
+                    "max_cgroup_cpu_usage_cores": None,
+                    "max_visible_throttled_periods_delta": None,
+                    "window_start_offset_ms": None, "window_end_offset_ms": None,
+                }
+
+        class FakeWatcher:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def fail_closed(self, *_args, **_kwargs):
+                pass
+
+            def stop(self):
+                return {
+                    "status": "incomplete", "samples": 0,
+                    "current_min_bytes": None, "current_max_bytes": None,
+                    "memory_peak_lifetime_max_bytes": None,
+                    "memory_events_sampled_max_delta": None,
+                    "target_identity_status": "unknown", "terminal_decision": None,
+                    "terminal_reason": "observer_failed", "ssh_material_restored": True,
+                }
+
+        def fake_supervised(
+            *, report_path, worker_report_path, worker_config,
+            on_namespace_init, on_namespace_exit, **_kwargs,
+        ):
+            capacity = worker_config["capacity_diagnostic"]
+            binding = capacity["binding"]
+            config_path = Path(worker_report_path).with_name("worker-config.json")
+            config = {**worker_config, "worker_report_path": str(worker_report_path)}
+            capacity_diagnostic.load_runtime._write_json_atomic(config_path, config)
+            pid, starttime = os.getpid(), 1
+            on_namespace_init(pid, starttime)
+            capacity_control.write_control(Path(capacity["control_path"]), {
+                "schema": 1, **binding, "decision": "abort",
+                "reason": "observer_failed", "sequence": 0,
+                "updated_monotonic_ns": time.monotonic_ns(),
+            }, expected=binding)
+            with patch.dict(os.environ, {
+                "SOURCE_GIT_SHA": binding["source_sha"],
+                "APP_TARGET_SHA": binding["app_target_sha"],
+                "SOURCE_BINDING_BASE64": "",
+                "SOURCE_BINDING_SHA256": "",
+            }):
+                child_rc = capacity_diagnostic.load_runtime.worker_entry(
+                    capacity_diagnostic._worker_callback, config_path=config_path,
+                )
+            on_namespace_exit(pid, starttime)
+            child_payload, read_error = capacity_diagnostic.load_runtime._read_closed_report(
+                Path(worker_report_path),
+            )
+            self.assertIsNone(read_error)
+            final_payload = capacity_diagnostic.load_runtime._close_reaped_worker_report(
+                child_payload, returncode=child_rc,
+            )
+            capacity_diagnostic.load_runtime._write_json_atomic(Path(report_path), final_payload)
+            return SimpleNamespace(
+                returncode=child_rc, report=final_payload,
+                worker_started=True, worker_exited=True, killed=False, signal=None,
+                reason="none", partial_work=True, inflight_unknown=False,
+                descendants_reaped=True,
+                isolation=capacity_diagnostic.load_runtime.PID_NAMESPACE_ISOLATION,
+                namespace_closed=True, namespace_init_pid=pid,
+                startup_failure_stage=None, namespace_ready_failure_stage=None,
+                namespace_post_ready_failure_stage=None, watchdog_startup_failure_stage=None,
+            )
+
+        def fake_prepare(**kwargs):
+            now_ms = time.time_ns() // 1_000_000
+            off_start = now_ms + 52_000
+            lifecycle = kwargs["lifecycle"]
+            lifecycle.update({
+                "closed": True, "plan_prepare_status": "prepared",
+                "plan_prepare_refusal_class": "none",
+                "prepare_transport": {
+                    "stage": "complete", "return_code": 0,
+                    "stdout_shape": "prepared_marker", "child_state": "reaped",
+                },
+            })
+            return ({
+                "off_start_ms": off_start, "off_end_ms": off_start + 20_000,
+                "on_start_ms": off_start + 25_000, "on_end_ms": off_start + 45_000,
+                "release_slug": "test-release",
+            }, lifecycle)
+
+        def fake_cleanup(**kwargs):
+            kwargs["lifecycle"].update({
+                "plan_cleanup_status": "complete", "plan_cleanup_refusal_class": "none",
+                "cleanup_transport": {
+                    "stage": "complete", "return_code": 0,
+                    "stdout_shape": "summary_marker", "child_state": "reaped",
+                },
+            })
+            return True, None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            os.chmod(root, 0o700)
+            manifest_path = root / "manifest.json"
+            manifest_raw = json.dumps(
+                manifest, sort_keys=True, separators=(",", ":"),
+            ).encode("ascii") + b"\n"
+            manifest_path.write_bytes(manifest_raw)
+            manifest_path.chmod(0o600)
+            ssh_dir = root / "external-ssh"
+            ssh_dir.mkdir(mode=0o700)
+            for name, value in (
+                ("config", b"ssh config"),
+                ("id_ed25519", b"private key"),
+                ("known_hosts", b"host key"),
+            ):
+                path = ssh_dir / name
+                path.write_bytes(value)
+                path.chmod(0o600)
+            report_path = root / "report.json"
+            fingerprint_path = root / "failure-fingerprint.json"
+            output_path = root / "ssr-capacity.json"
+            args = [
+                "parent", "--manifest", str(manifest_path), "--report", str(report_path),
+                "--failure-report", str(fingerprint_path),
+                "--source-sha", source_sha, "--app-target-sha", source_sha,
+                "--external-run-id", "40191312869", "--external-run-attempt", "1",
+                "--concurrency", "8", "--workload", capacity_diagnostic.HTML_WORKLOAD,
+                "--ssh-config", str(ssh_dir / "config"),
+                "--ssh-key", str(ssh_dir / "id_ed25519"),
+                "--ssh-host", "example.invalid", "--ssh-user", "tester",
+            ]
+            with patch.dict(os.environ, {
+                "SOURCE_GIT_SHA": source_sha, "APP_TARGET_SHA": source_sha,
+                "SOURCE_BINDING_BASE64": "", "SOURCE_BINDING_SHA256": "",
+            }), patch.object(
+                capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare,
+            ), patch.object(
+                capacity_diagnostic, "_cleanup_remote_capacity_plan", side_effect=fake_cleanup,
+            ), patch.object(
+                capacity_diagnostic, "_wait_for_remote_plan_expiry", return_value=None,
+            ), patch.object(
+                capacity_diagnostic, "_RemoteMemoryWatcher", FakeWatcher,
+            ), patch.object(
+                capacity_diagnostic.external_load, "RunnerCgroupSampler", FakeRunner,
+            ), patch.object(
+                capacity_diagnostic.load_runtime, "run_supervised", side_effect=fake_supervised,
+            ):
+                self.assertEqual(capacity_diagnostic.main(args), 2)
+
+            raw_report = json.loads(report_path.read_text(encoding="ascii"))
+            self.assertEqual(raw_report["workload"], capacity_diagnostic.HTML_WORKLOAD)
+            self.assertEqual(raw_report["worker"]["status"], "incomplete")
+            self.assertEqual(raw_report["worker"]["resource_abort_reason"], "observer_failed")
+            self.assertEqual(raw_report["worker"]["off_probe"], {
+                "submitted": 0, "completed": 0, "http_status": None,
+            })
+            self.assertTrue(raw_report["namespace_closed"])
+            self.assertEqual(raw_report["remote_plan_cleanup"], "complete")
+            self.assertFalse(raw_report["diagnostic_credit"])
+
+            with patch.dict(os.environ, {
+                "SOURCE_GIT_SHA": source_sha, "APP_TARGET_SHA": source_sha,
+                "SOURCE_BINDING_BASE64": "", "SOURCE_BINDING_SHA256": "",
+            }):
+                sanitizer = subprocess.run([
+                    sys.executable, str(Path(capacity_diagnostic.__file__)),
+                    "sanitize-report", "--input", str(report_path),
+                    "--output", str(output_path), "--manifest", str(manifest_path),
+                    "--source-sha", source_sha, "--app-target-sha", source_sha,
+                    "--external-run-id", "40191312869", "--external-run-attempt", "1",
+                    "--workload", capacity_diagnostic.HTML_WORKLOAD,
+                ], capture_output=True, text=True, check=False)
+            self.assertEqual(sanitizer.returncode, 0, sanitizer.stdout + sanitizer.stderr)
+            self.assertEqual(sanitizer.stdout.strip(), "INVALID")
+            sanitized_report = json.loads(output_path.read_text(encoding="ascii"))
+            self.assertEqual(sanitized_report["status"], "incomplete")
+            self.assertEqual(sanitized_report["worker"]["off_probe"], {
+                "submitted": 0, "completed": 0, "http_status": None,
+            })
+            self.assertFalse(sanitized_report["passed"])
+            self.assertFalse(sanitized_report["matrix_credit"])
+            self.assertFalse(sanitized_report["slo_credit"])
+            self.assertFalse(sanitized_report["diagnostic_credit"])
+
+            fingerprint = json.loads(fingerprint_path.read_text(encoding="ascii"))
+            self.assertEqual(fingerprint["event"], "ssr_capacity_parent_fingerprint")
+            self.assertEqual(fingerprint["workload"], capacity_diagnostic.HTML_WORKLOAD)
+            self.assertFalse(fingerprint["passed"])
+            self.assertFalse(fingerprint["diagnostic_credit"])
+            self.assertEqual(fingerprint["worker"]["reason"], "observer_failed")
+            self.assertEqual(fingerprint["worker"]["submitted"], 0)
+            self.assertEqual(fingerprint["worker"]["completed"], 0)
+            self.assertEqual(fingerprint["runner"]["reason"], "runner_snapshot_unavailable")
+            self.assertEqual(fingerprint["cleanup"]["transport"], {
+                "stage": "complete", "return_code": 0,
+                "stdout_shape": "summary_marker", "child_state": "reaped",
+            })
+            self.assertIsNone(capacity_diagnostic._project_capacity_report(fingerprint))
+            fingerprint_text = json.dumps(fingerprint, sort_keys=True)
+            self.assertNotIn("ssr-fixture-0001", fingerprint_text)
+            self.assertNotIn("fixture-user-", fingerprint_text)
+            self.assertNotIn("example.invalid", fingerprint_text)
+            self.assertNotIn(str(root), fingerprint_text)
 
     def test_capacity_closed_loop_reuses_warmed_executor_and_never_zero_waits(self) -> None:
         local = threading.local()

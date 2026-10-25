@@ -356,6 +356,19 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             )["namespace_closed_status"],
             "1",
         )
+        self.assertEqual(
+            evaluate({
+                "schema": 1,
+                "event": "ssr_capacity_parent_fingerprint",
+                "diagnostic_only": True,
+                "status": "incomplete",
+                "passed": False,
+                "matrix_credit": False,
+                "slo_credit": False,
+                "diagnostic_credit": False,
+            }, capacity_only=True)["namespace_closed_status"],
+            "1",
+        )
 
     def test_capacity_dispatch_runs_only_the_typed_client_and_14_user_fixture(self) -> None:
         validate = self.jobs["validate-external-inputs"]
@@ -372,6 +385,16 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("inputs.ssr_capacity_diagnostic_only != true", load)
         self.assertIn("inputs.ssr_capacity_diagnostic_only == true", pair)
         self.assertIn("Run only the guarded SSR capacity diagnostic", pair)
+        capacity_step = _step_script(pair, "Run only the guarded SSR capacity diagnostic")
+        self.assertIn("--workload '${{ inputs.ssr_capacity_workload }}'", capacity_step)
+        self.assertIn("--failure-report \"$RUNNER_TEMP/ssr-capacity-report/failure-fingerprint.json\"", capacity_step)
+        self.assertIn("Publish the bound SSR capacity diagnostic fingerprint", pair)
+        self.assertIn("platform-production-ssr-capacity-fingerprint-${{ github.run_id }}-${{ github.run_attempt }}", pair)
+        self.assertIn("steps.ssr-capacity.outputs.capacity_status != '0'", pair)
+        self.assertIn("steps.sanitize-ssr-capacity.outcome == 'failure'", pair)
+        self.assertIn("if-no-files-found: ignore", pair)
+        barrier = self.jobs["namespace-containment-barrier"]
+        self.assertNotIn("ssr-capacity-fingerprint", barrier)
         self.assertIn("inputs.ssr_capacity_diagnostic_only != true", pair.split(
             "Run the fixed authenticated workspace CPU pair", 1
         )[1])

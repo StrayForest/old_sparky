@@ -89,6 +89,13 @@ RUNNER_CONTEXT_REASONS = frozenset({
     "runner_throttle_evidence_unavailable", "runner_phase_window_invalid",
     "runner_phase_samples_incomplete", "runner_membership_changed",
     "runner_sample_limit", "runner_sampler_join_timeout", "runner_snapshot_invalid",
+    "runner_snapshot_unavailable",
+})
+CAPACITY_ABORT_REASONS = frozenset({
+    "none", "window_complete", "off_warmup_failed", "off_probe_window_missed",
+    "off_probe_failed", "response_failure", "worker_error", "guard_unavailable",
+    "control_file_invalid", "memory_floor", "memory_event", "identity_changed",
+    "collection_error", "observer_failed",
 })
 SUPERVISOR_REASONS = frozenset({
     "none", "max_duration_seconds", "max_runner_minutes", "namespace_unavailable",
@@ -2194,9 +2201,16 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or not isinstance(worker.get("off_probe"), dict)
                 or set(worker["off_probe"]) != {"submitted", "completed", "http_status"}
                 or type(worker["off_probe"].get("submitted")) is not int
-                or worker["off_probe"]["submitted"] != value.get("concurrency")
+                or not 0 <= worker["off_probe"]["submitted"] <= value.get("concurrency", 0)
                 or type(worker["off_probe"].get("completed")) is not int
-                or worker["off_probe"]["completed"] != worker["off_probe"]["submitted"]
+                or not 0 <= worker["off_probe"]["completed"] <= worker["off_probe"]["submitted"]
+                or (worker.get("status") == "complete" and (
+                    worker["off_probe"]["submitted"] != value.get("concurrency")
+                    or worker["off_probe"]["completed"] != worker["off_probe"]["submitted"]
+                ))
+                or (worker["off_probe"].get("http_status") is not None
+                    and (type(worker["off_probe"]["http_status"]) is not int
+                         or not 100 <= worker["off_probe"]["http_status"] <= 599))
                 or (worker.get("status") == "complete" and worker["off_probe"] != {
                     "submitted": value.get("concurrency"),
                     "completed": value.get("concurrency"), "http_status": 200,
@@ -2699,6 +2713,127 @@ def _parent_outcome_fingerprint(
     return fingerprint
 
 
+def _parent_failure_fingerprint(
+    outcome: Mapping[str, Any], *, args: argparse.Namespace,
+    stage_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project a capacity attempt into a bound, identity-free fingerprint."""
+
+    worker = outcome.get("worker")
+    worker_summary: dict[str, Any] | None = None
+    if isinstance(worker, Mapping):
+        worker_status = worker.get("status")
+        if not isinstance(worker_status, str) or worker_status not in {"complete", "incomplete", "failed"}:
+            worker_status = "invalid"
+        submitted = worker.get("submitted")
+        completed = worker.get("completed")
+        counts_valid = _worker_counts_are_closed(worker)
+        statuses = worker.get("http_status_counts")
+        errors = worker.get("error_counts")
+        off_probe = worker.get("off_probe")
+        worker_summary = {
+            "status": worker_status,
+            "reason": (
+                worker.get("resource_abort_reason")
+                if isinstance(worker.get("resource_abort_reason"), str)
+                and worker.get("resource_abort_reason") in CAPACITY_ABORT_REASONS
+                else "other"
+            ),
+            "submitted": submitted if type(submitted) is int and 0 <= submitted <= 100_000 else None,
+            "completed": completed if type(completed) is int and 0 <= completed <= 100_000 else None,
+            "counts_valid": counts_valid,
+            "http_status_counts": dict(sorted(statuses.items())) if counts_valid else {},
+            "error_counts": dict(sorted(errors.items())) if counts_valid else {},
+            "off_probe": {
+                "submitted": off_probe.get("submitted"),
+                "completed": off_probe.get("completed"),
+                "http_status": off_probe.get("http_status"),
+            } if isinstance(off_probe, Mapping)
+                and set(off_probe) == {"submitted", "completed", "http_status"}
+                and type(off_probe.get("submitted")) is int
+                and 0 <= off_probe["submitted"] <= args.concurrency
+                and type(off_probe.get("completed")) is int
+                and 0 <= off_probe["completed"] <= off_probe["submitted"]
+                and (off_probe.get("http_status") is None
+                     or type(off_probe.get("http_status")) is int
+                     and 100 <= off_probe["http_status"] <= 599)
+                else None,
+        }
+    cleanup = stage_state.get("cleanup_lifecycle")
+    cleanup = cleanup if isinstance(cleanup, Mapping) else {}
+    runner = outcome.get("runner_headroom")
+    runner = runner if isinstance(runner, Mapping) else {}
+    stage = stage_state.get("parent_phase", stage_state.get("stage"))
+    parent_status = outcome.get("status")
+    if not isinstance(parent_status, str) or parent_status not in {
+        "complete", "resource_abort", "incomplete",
+    }:
+        parent_status = "incomplete"
+    parent_passed = outcome.get("passed") is True and parent_status == "complete"
+    parent_error_class = outcome.get("error_class")
+    if not isinstance(parent_error_class, str) or parent_error_class not in PARENT_ERROR_CLASSES:
+        parent_error_class = None
+    return {
+        "schema": 1,
+        "event": "ssr_capacity_parent_fingerprint",
+        "diagnostic_only": True,
+        "status": "diagnostic_only",
+        "parent_status": parent_status,
+        "parent_passed": parent_passed,
+        "parent_error_class": parent_error_class,
+        # This is derived from the same pass predicate as the CLI return path;
+        # it is not a separately observed process exit code.
+        "parent_exit_code": 0 if parent_passed else 2,
+        "parent_exit_code_basis": "derived_from_passed_outcome",
+        "passed": False,
+        "matrix_credit": False,
+        "slo_credit": False,
+        "diagnostic_credit": False,
+        "source_sha": args.source_sha,
+        "app_target_sha": args.app_target_sha,
+        "external_run_id": args.external_run_id,
+        "external_run_attempt": args.external_run_attempt,
+        "workload": getattr(args, "workload", WORKLOAD),
+        "fixture_kind": _profile_spec(getattr(args, "workload", WORKLOAD))[0],
+        "run_id": outcome.get("run_id") if isinstance(outcome.get("run_id"), str)
+        and RUN_RE.fullmatch(outcome["run_id"]) is not None else stage_state.get("run_id"),
+        "profile_digest": stage_state.get("profile_digest"),
+        "fixture_manifest_sha256": stage_state.get("manifest_sha256"),
+        "concurrency": args.concurrency,
+        "namespace_closed": outcome.get("namespace_closed") is True,
+        "parent_phase": stage if isinstance(stage, str) and stage in PARENT_FAILURE_STAGES else "parent_outcome",
+        "worker": worker_summary,
+        "runner": {
+            "status": runner.get("status") if isinstance(runner.get("status"), str)
+            and runner.get("status") in {"complete", "unknown"} else "missing",
+            "reason": runner.get("reason") if isinstance(runner.get("reason"), str)
+            and runner.get("reason") in RUNNER_CONTEXT_REASONS else "other",
+        },
+        "cleanup": {
+            "status": cleanup.get("plan_cleanup_status")
+            if isinstance(cleanup.get("plan_cleanup_status"), str)
+            and cleanup.get("plan_cleanup_status") in PLAN_CLEANUP_STATUSES else "not_attempted",
+            "refusal_class": cleanup.get("plan_cleanup_refusal_class")
+            if isinstance(cleanup.get("plan_cleanup_refusal_class"), str)
+            and cleanup.get("plan_cleanup_refusal_class") in PLAN_REFUSAL_CLASSES else "none",
+            "transport": _project_parent_ssh_transport(cleanup.get("cleanup_transport")),
+        },
+        "supervisor": _project_supervisor_evidence(stage_state.get("supervisor_evidence")),
+    }
+
+
+def _write_parent_failure_fingerprint(
+    path: Path, payload: Mapping[str, Any],
+) -> None:
+    raw = json.dumps(
+        dict(payload), ensure_ascii=True, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii") + b"\n"
+    if len(raw) > 16 * 1024:
+        raise ValueError("capacity failure fingerprint exceeds bound")
+    _write_report(path, payload)
+
+
 def sanitize_capacity_report(
     *, input_path: Path, output_path: Path, manifest_path: Path,
     source_sha: str, app_target_sha: str, run_id: str, attempt: str,
@@ -2814,6 +2949,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=("worker-entry", "parent", "sanitize-report"))
     parser.add_argument("--manifest")
     parser.add_argument("--report")
+    parser.add_argument("--failure-report")
     parser.add_argument("--input")
     parser.add_argument("--output")
     parser.add_argument("--source-sha")
@@ -2859,12 +2995,28 @@ def main(argv: list[str] | None = None) -> int:
             or re.fullmatch(r"[A-Za-z0-9.-]{1,253}", args.ssh_host) is None
             or re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", args.ssh_user) is None):
         parser.error("parent command arguments are incomplete")
+    if args.failure_report is not None:
+        report_path = Path(args.report)
+        failure_path = Path(args.failure_report)
+        if failure_path.name != "failure-fingerprint.json" or failure_path.parent != report_path.parent:
+            parser.error("parent failure report path is invalid")
     stage_state: dict[str, Any] = {}
     try:
         outcome = _parent_run(args, stage_state)
         parent_phase = stage_state.get("stage")
+        stage_state["parent_phase"] = parent_phase
         stage_state["stage"] = "report_write"
         _write_report(Path(args.report), outcome)
+        if args.failure_report is not None:
+            try:
+                _write_parent_failure_fingerprint(
+                    Path(args.failure_report),
+                    _parent_failure_fingerprint(outcome, args=args, stage_state=stage_state),
+                )
+            except Exception:
+                # This diagnostic artifact must not change the capacity
+                # outcome or the existing namespace/credit decision.
+                pass
     except Exception as exc:
         stage = stage_state.get("stage", "identity")
         if not isinstance(stage, str) or stage not in PARENT_FAILURE_STAGES:
@@ -2972,6 +3124,14 @@ def main(argv: list[str] | None = None) -> int:
                     _write_report(Path(args.report), receipt)
             except Exception:
                 pass
+            if args.failure_report is not None:
+                try:
+                    _write_parent_failure_fingerprint(
+                        Path(args.failure_report),
+                        _parent_failure_fingerprint(receipt, args=args, stage_state=stage_state),
+                    )
+                except Exception:
+                    pass
         failure_fingerprint = {
             "status": "incomplete", "error_class": error_class, "stage": stage,
         }
