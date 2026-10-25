@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import http.client
 import json
 import os
@@ -951,6 +952,21 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 3.0)
         self.assertIs(run.call_args.kwargs["stdin"], external_load.subprocess.DEVNULL)
 
+        pidfd_read, pidfd_write = os.pipe()
+        try:
+            self.assertEqual(external_load.RunnerCgroupSampler._pidfd_state(pidfd_read), "live")
+            os.write(pidfd_write, b"x")
+            self.assertEqual(external_load.RunnerCgroupSampler._pidfd_state(pidfd_read), "exited")
+            with patch("tools.platform_external_load.select.poll", side_effect=OSError("poll")):
+                self.assertEqual(external_load.RunnerCgroupSampler._pidfd_state(pidfd_read), "unknown")
+            os.close(pidfd_read)
+            pidfd_read = -1
+            self.assertEqual(external_load.RunnerCgroupSampler._pidfd_state(pidfd_read), "unknown")
+        finally:
+            if pidfd_read >= 0:
+                os.close(pidfd_read)
+            os.close(pidfd_write)
+
         invalid_stat_results = (
             external_load.subprocess.CompletedProcess(args=[], returncode=1, stdout=b"", stderr=b""),
             external_load.subprocess.CompletedProcess(args=[], returncode=0, stdout=b"bad\n", stderr=b""),
@@ -970,20 +986,60 @@ class ExternalLoadTests(unittest.TestCase):
                 external_load._read_proc1_namespace_identities()
         self.assertEqual(raised.exception.reason, "runner_snapshot_unavailable")
 
+        mapping = {
+            "root": Path("/"), "mountpoint": Path("/sys/fs/cgroup"),
+            "mount_identity": mount_identity,
+        }
+
+        def common_patches(
+            target_sampler: external_load.RunnerCgroupSampler,
+            target_pidfd_read: int,
+            snapshot_fn: object,
+            proc1_reader: object = lambda: proc1_ids,
+        ) -> ExitStack:
+            stack = ExitStack()
+            stack.enter_context(patch.object(
+                target_sampler, "_namespace_identity", side_effect=lambda path: namespace_ids[path],
+            ))
+            stack.enter_context(patch.object(target_sampler, "_target_is_stable", return_value=True))
+            stack.enter_context(patch(
+                "tools.platform_external_load.os.pidfd_open",
+                side_effect=lambda *_args: os.dup(target_pidfd_read),
+            ))
+            stack.enter_context(patch(
+                "tools.platform_external_load._read_proc1_namespace_identities",
+                side_effect=proc1_reader,
+            ))
+            stack.enter_context(patch(
+                "tools.platform_external_load._read_bounded_ascii", return_value=membership,
+            ))
+            stack.enter_context(patch(
+                "tools.platform_external_load._bounded_proc_text", return_value="mountinfo",
+            ))
+            stack.enter_context(patch(
+                "tools.platform_external_load._cgroup2_membership_mapping", return_value=mapping,
+            ))
+            stack.enter_context(patch(
+                "tools.platform_external_load._read_cgroup_diagnostic_snapshot",
+                side_effect=snapshot_fn,
+            ))
+            stack.enter_context(patch(
+                "tools.platform_load_runtime._read_process_starttime", return_value=77,
+            ))
+            return stack
+
         denied_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
-        with (
-            patch.object(denied_sampler, "_target_is_stable", return_value=True),
-            patch("tools.platform_external_load._read_bounded_ascii", return_value=membership),
-            patch("tools.platform_external_load._bounded_proc_text", return_value="mountinfo"),
-            patch("tools.platform_external_load._cgroup2_membership_mapping", return_value={
-                "root": Path("/"), "mountpoint": Path("/sys/fs/cgroup"),
-                "mount_identity": mount_identity,
-            }),
-            patch("tools.platform_external_load._read_proc1_namespace_identities", side_effect=external_load._CgroupDiagnosticError("runner_snapshot_unavailable")),
-            patch("tools.platform_load_runtime._read_process_starttime", return_value=77),
+        denied_pipe_read, denied_pipe_write = os.pipe()
+        with common_patches(
+            denied_sampler, denied_pipe_read, lambda **_kwargs: {},
+            proc1_reader=lambda: (_ for _ in ()).throw(
+                external_load._CgroupDiagnosticError("runner_snapshot_unavailable")
+            ),
         ):
             denied_sampler.start(4321, 77)
             denied = denied_sampler.stop()
+        os.close(denied_pipe_read)
+        os.close(denied_pipe_write)
         self.assertEqual(denied["status"], "unknown")
         self.assertEqual(denied["reason"], "runner_snapshot_unavailable")
         self.assertEqual(denied["sample_count"], 0)
@@ -1020,24 +1076,18 @@ class ExternalLoadTests(unittest.TestCase):
                 ],
             }
 
-        mapping = {
-            "root": Path("/"), "mountpoint": Path("/sys/fs/cgroup"),
-            "mount_identity": mount_identity,
-        }
-        with (
-            patch.object(sampler, "_namespace_identity", side_effect=lambda path: namespace_ids[path]),
-            patch.object(sampler, "_target_is_stable", return_value=True),
-            patch("tools.platform_external_load._read_proc1_namespace_identities", return_value=proc1_ids),
-            patch("tools.platform_external_load._read_bounded_ascii", return_value=membership),
-            patch("tools.platform_external_load._bounded_proc_text", return_value="mountinfo"),
-            patch("tools.platform_external_load._cgroup2_membership_mapping", return_value=mapping),
-            patch("tools.platform_external_load._read_cgroup_diagnostic_snapshot", side_effect=snapshot),
-            patch("tools.platform_load_runtime._read_process_starttime", return_value=77),
-            patch.object(Path, "exists", return_value=True),
-        ):
+        sampler_pipe_read, sampler_pipe_write = os.pipe()
+        with common_patches(sampler, sampler_pipe_read, snapshot):
             sampler.start(4321, 77)
             time.sleep(0.13)
+            sampler_owned_pidfd = sampler._pidfd
             result = sampler.stop()
+        os.close(sampler_pipe_read)
+        os.close(sampler_pipe_write)
+        self.assertIsNone(sampler._pidfd)
+        self.assertIsNotNone(sampler_owned_pidfd)
+        with self.assertRaises(OSError):
+            os.fstat(sampler_owned_pidfd)
 
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["reason"], "none")
@@ -1050,26 +1100,96 @@ class ExternalLoadTests(unittest.TestCase):
         changed_proc1_ids = {**proc1_ids, "pid": (1, 99)}
         changed_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
         changed_sampler.SAMPLE_INTERVAL_SECONDS = 0.005
-        with (
-            patch.object(changed_sampler, "_namespace_identity", side_effect=lambda path: namespace_ids[path]),
-            patch.object(changed_sampler, "_target_is_stable", return_value=True),
-            patch("tools.platform_external_load._read_bounded_ascii", return_value=membership),
-            patch("tools.platform_external_load._bounded_proc_text", return_value="mountinfo"),
-            patch("tools.platform_external_load._cgroup2_membership_mapping", return_value=mapping),
-            patch("tools.platform_external_load._read_cgroup_diagnostic_snapshot", side_effect=snapshot),
-            patch("tools.platform_load_runtime._read_process_starttime", return_value=77),
-            patch.object(Path, "exists", return_value=True),
-            patch(
-                "tools.platform_external_load._read_proc1_namespace_identities",
-                side_effect=[proc1_ids, changed_proc1_ids],
-            ),
+        changed_proc1_reads = [0]
+
+        def changed_proc1_reader() -> dict[str, tuple[int, int]]:
+            changed_proc1_reads[0] += 1
+            return proc1_ids if changed_proc1_reads[0] == 1 else changed_proc1_ids
+
+        changed_pipe_read, changed_pipe_write = os.pipe()
+        with common_patches(
+            changed_sampler, changed_pipe_read, snapshot,
+            proc1_reader=changed_proc1_reader,
         ):
             changed_sampler.start(4321, 77)
             time.sleep(0.02)
             changed_identity = changed_sampler.stop()
+        os.close(changed_pipe_read)
+        os.close(changed_pipe_write)
         self.assertEqual(changed_identity["status"], "unknown")
         self.assertEqual(changed_identity["reason"], "runner_snapshot_invalid")
         self.assertEqual(changed_identity["sample_count"], 1)
+
+        reused_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        reuse_read, reuse_write = os.pipe()
+        reuse_pidfds: list[int] = []
+
+        def reused_pidfd(*_args: object) -> int:
+            value = os.dup(reuse_read)
+            reuse_pidfds.append(value)
+            return value
+
+        with ExitStack() as stack:
+            stack.enter_context(patch(
+                "tools.platform_external_load.os.pidfd_open", side_effect=reused_pidfd,
+            ))
+            stack.enter_context(patch(
+                "tools.platform_load_runtime._read_process_starttime", side_effect=[77, 78],
+            ))
+            reused_sampler.start(4321, 77)
+            reused = reused_sampler.stop()
+        os.close(reuse_read)
+        os.close(reuse_write)
+        self.assertEqual(reused["status"], "unknown")
+        self.assertEqual(reused["reason"], "workload_identity_changed")
+        self.assertEqual(len(reuse_pidfds), 1)
+        with self.assertRaises(OSError):
+            os.fstat(reuse_pidfds[0])
+
+        exit_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        exit_sampler.SAMPLE_INTERVAL_SECONDS = 10.0
+        exit_reads = [0]
+
+        def exit_snapshot(**kwargs: object) -> dict[str, object]:
+            exit_reads[0] += 1
+            return snapshot(**kwargs)
+
+        exit_pipe_read, exit_pipe_write = os.pipe()
+        with common_patches(exit_sampler, exit_pipe_read, exit_snapshot):
+            exit_sampler.start(4321, 77)
+            os.write(exit_pipe_write, b"x")
+            exited = exit_sampler.stop()
+        os.close(exit_pipe_read)
+        os.close(exit_pipe_write)
+        self.assertEqual(exited["status"], "unknown")
+        self.assertEqual(exited["reason"], "runner_samples_incomplete")
+        self.assertEqual(exited["sample_count"], 1)
+        self.assertEqual(exit_reads[0], 1, "confirmed exit must discard the final counter snapshot")
+
+        raced_sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
+        raced_sampler.SAMPLE_INTERVAL_SECONDS = 0.001
+        raced_reads = [0]
+        raced_snapshot_done = threading.Event()
+        raced_pipe_read, raced_pipe_write = os.pipe()
+
+        def race_snapshot(**kwargs: object) -> dict[str, object]:
+            raced_reads[0] += 1
+            value = snapshot(**kwargs)
+            if raced_reads[0] == 2:
+                os.write(raced_pipe_write, b"x")
+                raced_snapshot_done.set()
+            return value
+
+        with common_patches(raced_sampler, raced_pipe_read, race_snapshot):
+            raced_sampler.start(4321, 77)
+            self.assertTrue(raced_snapshot_done.wait(1.0))
+            raced = raced_sampler.stop()
+        os.close(raced_pipe_read)
+        os.close(raced_pipe_write)
+        self.assertEqual(raced["status"], "unknown")
+        self.assertEqual(raced["reason"], "runner_samples_incomplete")
+        self.assertEqual(raced["sample_count"], 1)
+        self.assertEqual(raced_reads[0], 2, "sample racing with exit must not be retained")
 
         started_at = "2026-10-18T10:00:00.000Z"
         finished_at = "2026-10-18T10:00:00.110Z"

@@ -261,12 +261,17 @@ def main() -> int:
             "runner_phase_window_remains_unknown": (
                 isinstance(outcome.get("runner_headroom"), dict)
                 and outcome["runner_headroom"].get("status") == "unknown"
-                and outcome["runner_headroom"].get("reason") == "runner_phase_samples_incomplete"
+                and outcome["runner_headroom"].get("reason") in {
+                    "runner_samples_incomplete", "runner_phase_samples_incomplete",
+                }
             ),
             "runner_phase_has_no_capacity_claim": (
                 isinstance(outcome.get("runner_headroom"), dict)
-                and outcome["runner_headroom"].get("effective_cpu_capacity_cores") is None
-                and outcome["runner_headroom"].get("max_cgroup_cpu_usage_cores") is None
+                and all(outcome["runner_headroom"].get(key) is None for key in (
+                    "window_seconds", "window_start_offset_ms", "window_end_offset_ms",
+                    "effective_cpu_capacity_cores", "max_cgroup_cpu_usage_cores",
+                    "max_visible_throttled_periods_delta",
+                ))
             ),
             "no_capacity_credit": all(
                 outcome.get(key) is False
