@@ -489,6 +489,8 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(auth).toContain('measureSsrStage("auth_body_parse"');
   expect(auth).toContain('measureSsrStage("auth_projection"');
   expect(auth).toContain("getSsrAdmissionStageObserver");
+  expect(auth.match(/serverAuthTransport === "node" && isSsrObservabilityActive\(\)/gu))
+    .toHaveLength(2);
   const nodeAuthResponse = auth.slice(auth.indexOf("function requestServerJson("));
   const nodeJsonEnd = nodeAuthResponse.slice(nodeAuthResponse.indexOf('response.on("end"'));
   expect(nodeJsonEnd.indexOf("JSON.parse(bodyText)")).toBeGreaterThanOrEqual(0);

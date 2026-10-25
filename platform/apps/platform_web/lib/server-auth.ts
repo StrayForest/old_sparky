@@ -107,7 +107,7 @@ export const getServerCurrentUser = cache(async (
           requestHeaders.set("accept", "application/json");
           requestHeaders.set("cookie", cookieHeader);
         }
-        const jsonParseObserver = serverAuthTransport === "node"
+        const jsonParseObserver = serverAuthTransport === "node" && isSsrObservabilityActive()
           ? await getSsrAuthBodyParseObserver()
           : undefined;
         const response = await measureSsrStage("auth_http_fetch", () =>
@@ -168,7 +168,7 @@ export const getServerAuthBootstrap = cache(async (
           requestHeaders.set("accept", "application/json");
           requestHeaders.set("cookie", cookieHeader);
         }
-        const jsonParseObserver = serverAuthTransport === "node"
+        const jsonParseObserver = serverAuthTransport === "node" && isSsrObservabilityActive()
           ? await getSsrAuthBodyParseObserver()
           : undefined;
         const response = await measureSsrStage("auth_http_fetch", () =>
