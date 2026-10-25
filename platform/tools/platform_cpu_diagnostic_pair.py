@@ -1002,7 +1002,7 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
         or set(value) != top_fields
         or value.get("status") != "expired_plans_removed"
         or type(value.get("service_count")) is not int
-        or value["service_count"] not in {0, 2}
+        or value["service_count"] not in {0, 1, 2}
         or value.get("usage_status") not in {"complete", "incomplete", "unavailable"}
         or value.get("usage_reason") not in {
             "none", "missing", "duplicate", "identity_changed", "journal_failed",
@@ -1027,7 +1027,7 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
     rows = value["usage_rows"]
     if not rows:
         if not (
-            value["service_count"] == 0
+            value["service_count"] in {0, 1}
             and value["usage_status"] == "unavailable"
             and value["usage_reason"] == "missing"
             and value["profile_status"] == "unavailable"
@@ -1041,7 +1041,7 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
         ):
             return None
         return {
-            "status": value["status"], "service_count": 0,
+            "status": value["status"], "service_count": value["service_count"],
             "usage_status": "unavailable", "usage_reason": "missing", "usage_rows": [],
             "profile_status": "unavailable", "profile_reason": "missing", "profile_rows": [],
             "memory_status": "unavailable", "memory_reason": "unavailable",
