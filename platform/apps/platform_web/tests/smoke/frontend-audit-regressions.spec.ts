@@ -228,7 +228,7 @@ test("workspace subspans preserve fetch and body-parse failure outcomes", async 
 test("native auth transport keeps eager malformed non-success JSON semantics", () => {
   const auth = source("lib/server-auth.ts");
   const responseSource = source("lib/server-auth-http-response.ts");
-  const responseEnd = responseSource.slice(responseSource.indexOf('response.on("end"'));
+  const responseEnd = responseSource.slice(responseSource.indexOf("function responseEnd(): void"));
   const parseIndex = responseEnd.indexOf("JSON.parse(bodyText)");
   const resolveIndex = responseEnd.indexOf("resolve({ status, ok, json: async () => payload })");
 
@@ -553,6 +553,7 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
   const api = source("lib/platform-api.ts");
   const auth = source("lib/server-auth.ts");
+  const authResponse = source("lib/server-auth-http-response.ts");
   const scheduler = source("lib/server-internal-read-scheduler.ts");
   const workspaceCalls = detailPage.match(/\bgetTournamentWorkspace\s*\(/gu) ?? [];
 
@@ -595,8 +596,7 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(auth).toContain("getSsrAdmissionStageObserver");
   expect(auth.match(/serverAuthTransport === "node" && isSsrObservabilityActive\(\)/gu))
     .toHaveLength(2);
-  const nodeAuthResponse = auth.slice(auth.indexOf("function requestServerJson("));
-  const nodeJsonEnd = nodeAuthResponse.slice(nodeAuthResponse.indexOf('response.on("end"'));
+  const nodeJsonEnd = authResponse.slice(authResponse.indexOf("function responseEnd(): void"));
   expect(nodeJsonEnd.indexOf("JSON.parse(bodyText)")).toBeGreaterThanOrEqual(0);
   expect(nodeJsonEnd.indexOf("JSON.parse(bodyText)"))
     .toBeLessThan(nodeJsonEnd.indexOf("resolve({ status, ok, json: async () => payload })"));

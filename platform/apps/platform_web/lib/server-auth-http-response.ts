@@ -52,8 +52,8 @@ export function readServerAuthJsonResponse(
     const contentLength = Number(response.headers["content-length"]);
     if (Number.isFinite(contentLength) && contentLength > SERVER_AUTH_RESPONSE_MAX_BYTES) {
       const error = new Error("Server auth response exceeded its size limit.");
-      response.destroy();
       settle(() => reject(error));
+      response.destroy();
       return;
     }
 
@@ -63,8 +63,8 @@ export function readServerAuthJsonResponse(
       totalBytes += bytes;
       if (totalBytes > SERVER_AUTH_RESPONSE_MAX_BYTES) {
         const error = new Error("Server auth response exceeded its size limit.");
-        response.destroy();
         settle(() => reject(error));
+        response.destroy();
         return;
       }
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
