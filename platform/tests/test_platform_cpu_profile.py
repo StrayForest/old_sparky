@@ -634,7 +634,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "worker": {}, "runner_headroom": {},
                 }
 
-            def fake_wait(expiry_ms: int, **_clock_anchor: Any) -> None:
+            def fake_wait(expiry_ms: int, **_clock_anchor) -> None:
                 events.append(("wait", expiry_ms))
 
             def fake_exact_cleanup(*, run_id, lifecycle, **_kwargs):
