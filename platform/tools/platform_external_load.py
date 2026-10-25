@@ -3353,15 +3353,11 @@ def _page_request_http11_keepalive(
 
 
 class _AuthenticatedHtmlMarkerParser(HTMLParser):
-    # TournamentDetailClientPage's seeded ready branch renders its Hero with
-    # this fixed prefix; the no-seed route shell instead says "Загрузка турнира".
-    WORKSPACE_SEED_PREFIX = "Турниры / "
-
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.lifecycle = False
         self.authenticated_header = False
-        self.workspace_seed = False
+        self.ssr_workspace_ready = False
         self.expected_detail_fallback = False
 
     @property
@@ -3369,7 +3365,7 @@ class _AuthenticatedHtmlMarkerParser(HTMLParser):
         return (
             self.lifecycle
             and self.authenticated_header
-            and self.workspace_seed
+            and self.ssr_workspace_ready
             and self.expected_detail_fallback
         )
 
@@ -3379,15 +3375,9 @@ class _AuthenticatedHtmlMarkerParser(HTMLParser):
         if tag == "span":
             if values.get("data-testid") == "tournament-detail-lifecycle":
                 self.lifecycle = True
+                self.ssr_workspace_ready = values.get("data-ssr-workspace-ready") == "true"
             if "header-profile-avatar" in classes:
                 self.authenticated_header = True
-        elif tag == "h1" and "hero-title" in classes:
-            aria_label = values.get("aria-label")
-            if (
-                isinstance(aria_label, str)
-                and aria_label.startswith(self.WORKSPACE_SEED_PREFIX)
-            ):
-                self.workspace_seed = True
         elif tag == "section" and "route-loading-shell" in classes:
             # The detail view intentionally has ssr:false. Its generic loading
             # panel is therefore expected in seeded raw SSR, while the

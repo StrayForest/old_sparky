@@ -97,17 +97,20 @@ the exact active profile; verify these values remain fixed after each switch.
 A
 completed response must be HTTP 200, `text/html`, and
 contain the existing `tournament-detail-lifecycle` marker, a server-rendered
-`h1.hero-title` whose `aria-label` begins with `Турниры / ` (the route's
-populated SSR workspace seed), the generic `route-loading-shell` from the
-detail view's intentional `ssr: false` boundary (without the
+`data-ssr-workspace-ready="true"` attribute on that lifecycle marker, the
+server-rendered `h1.hero-title` with the tournament title, the generic
+`route-loading-shell` from the detail view's intentional `ssr: false` boundary (without the
 `route-loading-tournament-detail` route-shell variant), and the server-rendered
 `header-profile-avatar` marker. This validates authenticated raw HTML with a
-ready workspace seed; it does not measure the hydrated tournament detail view.
+ready initial workspace seed. The boolean attribute reflects whether the
+server passed a non-null `initialTournament` prop; it is `false` when that prop
+is null or undefined. Authentication is checked independently through the
+header marker, since public anonymous pages can also receive a workspace seed.
+This does not measure the hydrated tournament detail view.
 The raw document correctly has no `top-detail-grid`, which is rendered only
 after hydration. The lifecycle marker alone can also appear on loading or
-invite HTML; a populated title alone can also appear for an anonymous viewer
-of a public tournament. Requiring the authenticated header, seeded title and
-expected fallback together rejects those cases. The check retains only
+invite HTML. Requiring its true seed attribute, authenticated header and
+expected fallback rejects those cases. The check retains only
 booleans and never records identity text. A bad status, content type, marker,
 memory guard, restart, or unknown watcher stops new submissions; in-flight
 requests drain under the existing timeout, partial counts remain visible, and

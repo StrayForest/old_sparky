@@ -14,7 +14,7 @@ import type { TournamentDetail } from "@/lib/types";
 type TournamentDetailClientPageProps = {
   slug: string;
   inviteCode?: string;
-  initialTournament?: TournamentDetail;
+  initialTournament?: TournamentDetail | null;
 };
 
 type DetailState =
@@ -36,7 +36,7 @@ type InitialRequest = {
 type ServerSeed = {
   slug: string;
   inviteCode: string | null;
-  payload: TournamentDetail | undefined;
+  payload: TournamentDetail | null | undefined;
 };
 
 type DetailContext = {
@@ -66,16 +66,19 @@ function nextLifecycleGeneration(current: number): number {
 
 function TournamentDetailLifecycleMarker({
   generation,
-  settled
+  settled,
+  ssrWorkspaceReady
 }: {
   generation: number;
   settled: boolean;
+  ssrWorkspaceReady: boolean;
 }) {
   return (
     <span
       aria-hidden="true"
       data-generation={generation}
       data-settled={settled ? "true" : "false"}
+      data-ssr-workspace-ready={ssrWorkspaceReady ? "true" : "false"}
       data-testid="tournament-detail-lifecycle"
       hidden
     />
@@ -87,6 +90,7 @@ export function TournamentDetailClientPage({
   inviteCode,
   initialTournament
 }: TournamentDetailClientPageProps) {
+  const ssrWorkspaceReady = Boolean(initialTournament);
   const { status: authStatus, user } = useAuth();
   const { t } = useI18n();
   const sessionIdentity = `${authStatus}:${user?.id ?? "anonymous"}`;
@@ -279,7 +283,11 @@ export function TournamentDetailClientPage({
   if (displayState.status === "loading") {
     return (
       <>
-        <TournamentDetailLifecycleMarker generation={lifecycleGeneration} settled={lifecycleSettled} />
+        <TournamentDetailLifecycleMarker
+          generation={lifecycleGeneration}
+          settled={lifecycleSettled}
+          ssrWorkspaceReady={ssrWorkspaceReady}
+        />
         <RouteLoadingShell variant="tournament-detail" />
       </>
     );
@@ -288,7 +296,11 @@ export function TournamentDetailClientPage({
   if (displayState.status === "invite") {
     return (
       <>
-        <TournamentDetailLifecycleMarker generation={lifecycleGeneration} settled={lifecycleSettled} />
+        <TournamentDetailLifecycleMarker
+          generation={lifecycleGeneration}
+          settled={lifecycleSettled}
+          ssrWorkspaceReady={ssrWorkspaceReady}
+        />
         <div className="page-noise" aria-hidden="true" />
         <main className="main">
           <TournamentInviteGate slug={slug} />
@@ -300,7 +312,11 @@ export function TournamentDetailClientPage({
   if (displayState.status === "not-found") {
     return (
       <>
-        <TournamentDetailLifecycleMarker generation={lifecycleGeneration} settled={lifecycleSettled} />
+        <TournamentDetailLifecycleMarker
+          generation={lifecycleGeneration}
+          settled={lifecycleSettled}
+          ssrWorkspaceReady={ssrWorkspaceReady}
+        />
         <DetailErrorShell title={t("tournament.notFoundTitle")} copy={t("tournament.notFoundCopy")} />
       </>
     );
@@ -309,7 +325,11 @@ export function TournamentDetailClientPage({
   if (displayState.status === "error") {
     return (
       <>
-        <TournamentDetailLifecycleMarker generation={lifecycleGeneration} settled={lifecycleSettled} />
+        <TournamentDetailLifecycleMarker
+          generation={lifecycleGeneration}
+          settled={lifecycleSettled}
+          ssrWorkspaceReady={ssrWorkspaceReady}
+        />
         <DetailErrorShell
           title={t("tournament.loadFailedTitle")}
           copy={t("tournament.loadFailedCopy")}
@@ -329,7 +349,11 @@ export function TournamentDetailClientPage({
 
   return (
     <>
-      <TournamentDetailLifecycleMarker generation={lifecycleGeneration} settled={lifecycleSettled} />
+      <TournamentDetailLifecycleMarker
+        generation={lifecycleGeneration}
+        settled={lifecycleSettled}
+        ssrWorkspaceReady={ssrWorkspaceReady}
+      />
       <div className="page-noise" aria-hidden="true" />
       <Hero
         eyebrow={`Турниры / ${displayState.tournament.title}`}

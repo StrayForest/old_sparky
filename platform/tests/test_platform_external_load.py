@@ -49,6 +49,29 @@ ACCUMULATOR_HWM_LIMIT_BYTES = 24 * 1024 * 1024
 PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
 
 
+def lifecycle_marker(workspace_ready: bool | None) -> bytes:
+    readiness_attribute = (
+        b""
+        if workspace_ready is None
+        else b' data-ssr-workspace-ready="'
+        + (b"true" if workspace_ready else b"false")
+        + b'"'
+    )
+    return (
+        b'<span data-testid="tournament-detail-lifecycle"'
+        + readiness_attribute
+        + b' hidden></span>'
+    )
+
+
+def raw_heading(aria_label: str) -> bytes:
+    return (
+        b'<h1 class="hero-title" aria-label="'
+        + aria_label.encode("utf-8")
+        + b'"></h1>'
+    )
+
+
 def _run_rss_probe(mode: str) -> dict[str, object]:
     with tempfile.TemporaryDirectory() as directory:
         stdout_path, stderr_path = Path(directory) / "out", Path(directory) / "err"
@@ -155,21 +178,14 @@ def load_manifest_from_payload(
 
 class ExternalLoadTests(unittest.TestCase):
     def test_authenticated_html_contract_requires_authenticated_ready_page_markers(self) -> None:
-        def raw_heading(aria_label: str) -> bytes:
-            return (
-                b'<h1 class="hero-title" aria-label="'
-                + aria_label.encode("utf-8")
-                + b'"></h1>'
-            )
-
         # Match the route's raw SSR shape: the workspace-seeded Hero and
         # authenticated header are rendered, while the detail view's
         # ssr:false boundary contributes its generic loading panel.
         marker = b"".join((
-            b"<span data-testid='tournament-detail-lifecycle' hidden></span>",
+            lifecycle_marker(True),
             b"<span class='extra header-profile-avatar'></span>",
             b'<section class="hero-wrap">'
-            + raw_heading("Турниры / Fixture title")
+            + raw_heading("Fixture title")
             + b'</section>',
             b'<section class="panel panel-pad route-loading-shell" aria-busy="true"></section>',
         ))
@@ -178,27 +194,47 @@ class ExternalLoadTests(unittest.TestCase):
             external_load._authenticated_html_markers("Text/Html; charset=utf-8", body),
             (True, True),
         )
-        chunk_boundary = 64 * 1024 - 1
+        chunk_boundary = 64 * 1024
         boundary_leading = (
-            b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
-            b'<span class="header-profile-avatar"></span>'
+            lifecycle_marker(True)
+            + b'<span class="header-profile-avatar"></span><div class="breadcrumbs">'
         )
-        heading_open = b'<h1 class="hero-title" aria-label="'
-        title = "Турниры / Fixture title".encode("utf-8")
-        padding_size = chunk_boundary - len(boundary_leading) - len(heading_open)
+        breadcrumb_text = "Турниры / Fixture title"
+        breadcrumb = breadcrumb_text.encode("utf-8")
+        # Place the first byte of the two-byte Cyrillic `Т` at index 65535,
+        # so its second byte lands in the next 64 KiB production feed slice.
+        padding_size = chunk_boundary - 1 - len(boundary_leading)
         self.assertGreaterEqual(padding_size, 0)
         split_character_body = (
             boundary_leading
             + b" " * padding_size
-            + heading_open
-            + title
-            + b'"></h1><section class="route-loading-shell"></section>'
+            + breadcrumb
+            + b'</div>'
+            + raw_heading("Fixture title")
+            + b'<section class="route-loading-shell"></section>'
         )
-        self.assertEqual(split_character_body.find("Т".encode("utf-8")), chunk_boundary)
-        self.assertEqual(
-            external_load._authenticated_html_markers("text/html", split_character_body),
-            (True, True),
-        )
+        self.assertEqual(split_character_body.find(breadcrumb), chunk_boundary - 1)
+
+        recorded_parsers = []
+
+        class RecordingMarkerParser(external_load._AuthenticatedHtmlMarkerParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.text_nodes: list[str] = []
+                recorded_parsers.append(self)
+
+            def handle_data(self, data: str) -> None:
+                super().handle_data(data)
+                self.text_nodes.append(data)
+
+        with patch.object(external_load, "_AuthenticatedHtmlMarkerParser", RecordingMarkerParser):
+            self.assertEqual(
+                external_load._authenticated_html_markers("text/html", split_character_body),
+                (True, True),
+            )
+        parsed_breadcrumb = "".join(recorded_parsers[0].text_nodes)
+        self.assertIn(breadcrumb_text, parsed_breadcrumb)
+        self.assertNotIn("\ufffd", parsed_breadcrumb)
         self.assertEqual(
             external_load._authenticated_html_markers("application/json", marker),
             (False, True),
@@ -207,9 +243,10 @@ class ExternalLoadTests(unittest.TestCase):
             external_load._authenticated_html_markers(
                 "text/html",
                 (
-                    b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                    lifecycle_marker(True)
                     + b'<span class="header-profile-avatar"></span>'
-                    + raw_heading("Турниры / Fixture")
+                    + '<div class="breadcrumbs">Турниры / Fixture</div>'.encode("utf-8")
+                    + raw_heading("Fixture")
                     + b'<section class="route-loading-shell"></section>'
                 ),
             ),
@@ -221,22 +258,35 @@ class ExternalLoadTests(unittest.TestCase):
             external_load._authenticated_html_markers(
                 "text/html",
                 (
-                    b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                    lifecycle_marker(False)
                     + b'<span class="header-profile-avatar"></span>'
-                    + raw_heading("Загрузка турнира")
+                    + b'<h1 aria-label="Arbitrary error title"></h1>'
                     + b'<section class="route-loading-shell route-loading-tournament-detail"></section>'
                 ),
             ),
             (True, False),
         )
+        # Missing or false seed markers cannot pass even if the rest of the
+        # authenticated raw page looks ready.
+        for marker_without_seed in (lifecycle_marker(None), lifecycle_marker(False)):
+            self.assertEqual(
+                external_load._authenticated_html_markers(
+                    "text/html",
+                    marker_without_seed
+                    + b'<span class="header-profile-avatar"></span>'
+                    + raw_heading("Fixture title")
+                    + b'<section class="route-loading-shell"></section>',
+                ),
+                (True, False),
+            )
         # Public guest HTML has a ready workspace seed and expected fallback,
         # but must not satisfy the authenticated-header requirement.
         self.assertEqual(
             external_load._authenticated_html_markers(
                 "text/html",
                 (
-                    b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
-                    + raw_heading("Турниры / Fixture")
+                    lifecycle_marker(True)
+                    + raw_heading("Fixture")
                     + b'<section class="route-loading-shell"></section>'
                 ),
             ),
@@ -248,10 +298,21 @@ class ExternalLoadTests(unittest.TestCase):
             external_load._authenticated_html_markers(
                 "text/html",
                 (
-                    b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                    lifecycle_marker(True)
                     + b'<span class="header-profile-avatar"></span>'
-                    + raw_heading("Турниры / Fixture")
+                    + raw_heading("Fixture")
                     + b'<section class="route-loading-shell route-loading-tournament-detail"></section>'
+                ),
+            ),
+            (True, False),
+        )
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                (
+                    b'<span class="header-profile-avatar"></span>'
+                    + raw_heading("Fixture title")
+                    + b'<section class="route-loading-shell"></section>'
                 ),
             ),
             (True, False),
@@ -262,9 +323,9 @@ class ExternalLoadTests(unittest.TestCase):
             external_load._authenticated_html_markers(
                 "text/html",
                 (
-                    b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                    lifecycle_marker(True)
                     + b'<span class="header-profile-avatar"></span>'
-                    + raw_heading("Турниры / Fixture")
+                    + raw_heading("Fixture")
                 ),
             ),
             (True, False),
@@ -274,9 +335,11 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(
             external_load._authenticated_html_markers(
                 "text/html",
-                b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
-                b'<span class="header-profile-avatar"></span>'
-                b'<section class="top-detail-grid"></section>',
+                (
+                    lifecycle_marker(True)
+                    + b'<span class="header-profile-avatar"></span>'
+                    + b'<section class="top-detail-grid"></section>'
+                ),
             ),
             (True, False),
         )
@@ -284,10 +347,11 @@ class ExternalLoadTests(unittest.TestCase):
             external_load._authenticated_html_markers(
                 "text/html",
                 (
-                    b'<!-- <span data-testid="tournament-detail-lifecycle"></span> '
+                    b'<!-- <span data-testid="tournament-detail-lifecycle" '
+                    b'data-ssr-workspace-ready="true"></span> '
                     b'<section class="top-detail-grid"></section> '
                     b'<span class="header-profile-avatar"></span> '
-                    + raw_heading("Турниры / Fake")
+                    + raw_heading("Fake")
                     + b' '
                     b'<section class="route-loading-shell"></section> -->'
                     b'<script>"<span data-testid=\"tournament-detail-lifecycle\"></span>"</script>'
@@ -302,11 +366,10 @@ class ExternalLoadTests(unittest.TestCase):
 
     def test_html_keepalive_request_retains_only_closed_marker_flags(self) -> None:
         body = (
-            b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
-            b'<span class="header-profile-avatar"></span>'
+            lifecycle_marker(True)
+            + b'<span class="header-profile-avatar"></span>'
             + b'<h1 class="hero-title" aria-label="'
-            + "Турниры / Fixture".encode("utf-8")
-            + b'"></h1>'
+            + b'Fixture"></h1>'
             + b'<section class="route-loading-shell"></section>'
         )
         client = Mock()
