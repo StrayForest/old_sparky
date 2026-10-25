@@ -996,10 +996,13 @@ class RunnerCgroupSampler:
             return "unknown"
         if not events:
             return "live"
-        if len(events) != 1 or events[0][0] != pidfd:
+        if len(events) != 1 or not isinstance(events[0], tuple) or len(events[0]) != 2:
             return "unknown"
-        mask = events[0][1]
-        if mask == select.POLLIN:
+        event_fd, mask = events[0]
+        if type(event_fd) is not int or event_fd != pidfd or type(mask) is not int or mask <= 0:
+            return "unknown"
+        exit_bits = select.POLLIN | select.POLLHUP
+        if mask & exit_bits and (mask & ~exit_bits) == 0:
             return "exited"
         return "unknown"
 

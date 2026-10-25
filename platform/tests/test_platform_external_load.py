@@ -955,6 +955,36 @@ class ExternalLoadTests(unittest.TestCase):
         pidfd_read, pidfd_write = os.pipe()
         try:
             self.assertEqual(external_load.RunnerCgroupSampler._pidfd_state(pidfd_read), "live")
+
+            class FakePoll:
+                def __init__(self, events: object) -> None:
+                    self.events = events
+
+                def register(self, _fd: int, _events: int) -> None:
+                    return None
+
+                def poll(self, _timeout: int) -> object:
+                    return self.events
+
+            for poll_events, expected_state in (
+                ([(pidfd_read, external_load.select.POLLHUP)], "exited"),
+                ([(pidfd_read, external_load.select.POLLIN | external_load.select.POLLHUP)], "exited"),
+                ([(pidfd_read, external_load.select.POLLIN | external_load.select.POLLERR)], "unknown"),
+                ([(pidfd_read, external_load.select.POLLHUP | external_load.select.POLLERR)], "unknown"),
+                ([(pidfd_read, external_load.select.POLLNVAL)], "unknown"),
+                ([(pidfd_read + 1, external_load.select.POLLHUP)], "unknown"),
+                ([(pidfd_read, external_load.select.POLLHUP), (pidfd_read, external_load.select.POLLHUP)], "unknown"),
+                ([pidfd_read], "unknown"),
+            ):
+                with self.subTest(poll_events=poll_events):
+                    with patch(
+                        "tools.platform_external_load.select.poll",
+                        return_value=FakePoll(poll_events),
+                    ):
+                        self.assertEqual(
+                            external_load.RunnerCgroupSampler._pidfd_state(pidfd_read),
+                            expected_state,
+                        )
             os.write(pidfd_write, b"x")
             self.assertEqual(external_load.RunnerCgroupSampler._pidfd_state(pidfd_read), "exited")
             with patch("tools.platform_external_load.select.poll", side_effect=OSError("poll")):
