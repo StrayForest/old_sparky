@@ -1909,6 +1909,10 @@ class RequestResult:
     # Internal submission order used only to make bounded diagnostics
     # deterministic.  It is never serialized into a report.
     submission_index: int | None = None
+    # Warmup-only closed diagnostics; ordinary load reports never serialize
+    # these fields. The coding value is normalized before assignment.
+    html_content_encoding: str | None = None
+    html_marker_flags: dict[str, bool] | None = None
 
 
 @dataclass(slots=True)
@@ -3522,9 +3526,21 @@ def _page_request_http11_keepalive(
         status = response.status
         html_content_type_ok: bool | None = None
         html_page_marker_ok: bool | None = None
+        html_content_encoding: str | None = None
+        html_marker_flags: dict[str, bool] | None = None
         if require_authenticated_html:
-            html_content_type_ok, html_page_marker_ok = _authenticated_html_markers(
-                response.headers.get("content-type", ""), response.body,
+            content_type_is_html = getattr(response, "content_type_is_html", None)
+            if type(content_type_is_html) is not bool:
+                content_type_is_html = False
+            (
+                html_content_type_ok,
+                html_page_marker_ok,
+                html_marker_flags,
+            ) = _authenticated_html_marker_details(
+                "", response.body, content_type_is_html=content_type_is_html,
+            )
+            html_content_encoding = _closed_html_content_encoding(
+                getattr(response, "content_encoding", None),
             )
         error_kind = None if status == 200 else "unexpected_status"
         if status == 200 and require_authenticated_html and not html_content_type_ok:
@@ -3544,6 +3560,8 @@ def _page_request_http11_keepalive(
             response_bytes=len(response.body),
             html_content_type_ok=html_content_type_ok,
             html_page_marker_ok=html_page_marker_ok,
+            html_content_encoding=html_content_encoding,
+            html_marker_flags=html_marker_flags,
             time_to_first_byte_ms=(
                 float(response.timing["ttfb_ms"])
                 if isinstance(response.timing.get("ttfb_ms"), (int, float))
@@ -3610,6 +3628,14 @@ class _AuthenticatedHtmlMarkerParser(HTMLParser):
             and self.expected_detail_fallback
         )
 
+    def closed_flags(self) -> dict[str, bool]:
+        return {
+            "lifecycle": self.lifecycle,
+            "authenticated_header": self.authenticated_header,
+            "workspace_ready": self.ssr_workspace_ready,
+            "detail_fallback": self.expected_detail_fallback,
+        }
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
         classes = set((values.get("class") or "").split())
@@ -3630,13 +3656,18 @@ class _AuthenticatedHtmlMarkerParser(HTMLParser):
         self.handle_starttag(tag, attrs)
 
 
-def _authenticated_html_markers(content_type: Any, body: Any) -> tuple[bool, bool]:
-    """Return closed authenticated-page flags without retaining body values."""
+def _authenticated_html_marker_details(
+    content_type: Any, body: Any, *, content_type_is_html: bool | None = None,
+) -> tuple[bool, bool, dict[str, bool] | None]:
+    """Return closed marker flags from one bounded parse; never retain content."""
 
-    media_type = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else ""
-    content_type_ok = media_type == "text/html"
+    if type(content_type_is_html) is bool:
+        content_type_ok = content_type_is_html
+    else:
+        media_type = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else ""
+        content_type_ok = media_type == "text/html"
     if not isinstance(body, bytes) or len(body) > RESPONSE_BODY_LIMIT:
-        return content_type_ok, False
+        return content_type_ok, False, None
 
     parser = _AuthenticatedHtmlMarkerParser()
     try:
@@ -3654,8 +3685,25 @@ def _authenticated_html_markers(content_type: Any, body: Any) -> tuple[bool, boo
             parser.feed(decoder.decode(b"", final=True))
         parser.close()
     except (AssertionError, ValueError):
-        return content_type_ok, False
-    return content_type_ok, parser.complete
+        return content_type_ok, False, None
+    return content_type_ok, parser.complete, parser.closed_flags()
+
+
+def _authenticated_html_markers(content_type: Any, body: Any) -> tuple[bool, bool]:
+    """Return the existing authenticated-page predicate without body values."""
+
+    content_type_ok, page_marker_ok, _marker_flags = _authenticated_html_marker_details(
+        content_type, body,
+    )
+    return content_type_ok, page_marker_ok
+
+
+def _closed_html_content_encoding(value: Any) -> str:
+    """Accept only the transport's closed coding enum; never raw headers."""
+
+    if isinstance(value, str) and value in {"identity", "gzip", "deflate", "br", "other"}:
+        return value
+    return "unknown"
 
 
 def _route_for_read(index: int, slug: str) -> str:

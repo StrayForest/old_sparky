@@ -128,6 +128,40 @@ CAPACITY_ABORT_REASONS = frozenset({
     "control_file_invalid", "memory_floor", "memory_event", "identity_changed",
     "collection_error", "observer_failed",
 })
+WARMUP_FAILURE_FIELDS = frozenset({
+    "schema", "submitted", "results", "future_exceptions", "future_timeouts",
+    "marker_parsed_results", "max_elapsed_ms", "http_status_counts", "content_encoding_counts",
+    "failure_counts", "exception_class_counts",
+})
+WARMUP_FAILURE_CATEGORIES = frozenset({
+    "request_exception", "non_200", "content_type_mismatch", "page_marker_missing",
+    "marker_lifecycle_missing", "marker_authenticated_header_missing",
+    "marker_workspace_not_ready", "marker_detail_fallback_missing",
+    "marker_parse_unavailable", "elapsed_limit",
+    "future_timeout", "unexpected_worker_exception", "unclassified_result_failure",
+    "invalid_timing", "invalid_result_status",
+})
+WARMUP_EXCEPTION_CLASSES = frozenset({
+    "TimeoutError", "OSError", "HTTPException", "ValueError", "TypeError",
+    "RuntimeError", "SubprocessError", "other",
+})
+WARMUP_CONTENT_ENCODINGS = frozenset({
+    "identity", "gzip", "deflate", "br", "other", "unknown",
+})
+WARMUP_MARKER_FIELDS = {
+    "lifecycle": "marker_lifecycle_missing",
+    "authenticated_header": "marker_authenticated_header_missing",
+    "workspace_ready": "marker_workspace_not_ready",
+    "detail_fallback": "marker_detail_fallback_missing",
+}
+WARMUP_HTTP_EXCEPTION_NAMES = frozenset({
+    "HTTPException", "RemoteDisconnected", "IncompleteRead", "BadStatusLine",
+    "ResponseNotReady",
+})
+WARMUP_OS_ERROR_NAMES = frozenset({
+    "OSError", "ConnectionError", "ConnectionResetError", "ConnectionAbortedError",
+    "BrokenPipeError",
+})
 SUPERVISOR_REASONS = frozenset({
     "none", "max_duration_seconds", "max_runner_minutes", "namespace_unavailable",
     "namespace_start_failed", "external_signal", "worker_failed", "worker_signal",
@@ -717,6 +751,228 @@ def _worker_counts_are_closed(payload: Mapping[str, Any]) -> bool:
     return payload.get("status") != "complete" or not errors
 
 
+def _warmup_exception_class(value: Any) -> str:
+    name = type(value).__name__ if isinstance(value, BaseException) else value
+    if not isinstance(name, str):
+        return "other"
+    if name == "TimeoutError":
+        return "TimeoutError"
+    if name in WARMUP_HTTP_EXCEPTION_NAMES:
+        return "HTTPException"
+    if name in WARMUP_OS_ERROR_NAMES:
+        return "OSError"
+    if name == "ValueError":
+        return "ValueError"
+    if name == "TypeError":
+        return "TypeError"
+    if name == "RuntimeError":
+        return "RuntimeError"
+    if name == "SubprocessError":
+        return "SubprocessError"
+    return "other"
+
+
+def _new_warmup_failure(submitted: int) -> dict[str, Any]:
+    """Start bounded counters; result counts stop at the existing aggregate deadline."""
+
+    return {
+        "schema": 1,
+        "submitted": submitted,
+        "results": 0,
+        "future_exceptions": 0,
+        "future_timeouts": 0,
+        # Counts consumed results whose bounded marker parse completed.
+        "marker_parsed_results": 0,
+        "max_elapsed_ms": None,
+        "http_status_counts": {},
+        "content_encoding_counts": {key: 0 for key in sorted(WARMUP_CONTENT_ENCODINGS)},
+        "failure_counts": {key: 0 for key in sorted(WARMUP_FAILURE_CATEGORIES)},
+        "exception_class_counts": {key: 0 for key in sorted(WARMUP_EXCEPTION_CLASSES)},
+    }
+
+
+def _record_warmup_result(summary: dict[str, Any], result: Any) -> bool:
+    """Project one warmup RequestResult into bounded, identity-free counters."""
+
+    if not isinstance(result, external_load.RequestResult):
+        raise TypeError("warmup future returned an invalid request result")
+    summary["results"] += 1
+    encoding = result.html_content_encoding
+    if not isinstance(encoding, str) or encoding not in WARMUP_CONTENT_ENCODINGS:
+        encoding = "unknown"
+    summary["content_encoding_counts"][encoding] += 1
+    failures = summary["failure_counts"]
+    prior_failures = dict(failures)
+    status = result.status
+    if type(status) is int and 100 <= status <= 599:
+        status_key = str(status)
+        status_counts = summary["http_status_counts"]
+        status_counts[status_key] = status_counts.get(status_key, 0) + 1
+        if status != 200:
+            failures["non_200"] += 1
+    elif type(status) is int and status == 0:
+        failures["request_exception"] += 1
+        summary["exception_class_counts"][_warmup_exception_class(result.error_kind)] += 1
+    else:
+        failures["invalid_result_status"] += 1
+
+    if result.html_content_type_ok is False:
+        failures["content_type_mismatch"] += 1
+    flags = result.html_marker_flags
+    flags_valid = (
+        isinstance(flags, Mapping)
+        and set(flags) == set(WARMUP_MARKER_FIELDS)
+        and all(type(flags[key]) is bool for key in WARMUP_MARKER_FIELDS)
+    )
+    if flags_valid:
+        summary["marker_parsed_results"] += 1
+        marker_missing = result.html_page_marker_ok is False or any(
+            flags[marker_name] is False for marker_name in WARMUP_MARKER_FIELDS
+        )
+        if marker_missing:
+            failures["page_marker_missing"] += 1
+        for marker_name, category in WARMUP_MARKER_FIELDS.items():
+            if flags[marker_name] is False:
+                failures[category] += 1
+    elif result.html_page_marker_ok is False:
+        failures["marker_parse_unavailable"] += 1
+
+    elapsed = result.elapsed_ms
+    elapsed_type_ok = type(elapsed) in (int, float) and not isinstance(elapsed, bool)
+    elapsed_finite = elapsed_type_ok and (
+        type(elapsed) is int or math.isfinite(elapsed)
+    )
+    if elapsed_finite and elapsed >= 0:
+        bounded_elapsed = min(30_000.0, elapsed)
+        prior = summary["max_elapsed_ms"]
+        summary["max_elapsed_ms"] = math.ceil(max(prior or 0.0, bounded_elapsed) * 1000) / 1000
+        if elapsed > 5_000:
+            failures["elapsed_limit"] += 1
+    else:
+        failures["invalid_timing"] += 1
+
+    success = (
+        result.ok is True and status == 200
+        and elapsed_finite and elapsed <= 5_000
+    )
+    if result.ok is not True and not any(
+        failures[key] > prior_failures[key] for key in (
+            "request_exception", "non_200", "content_type_mismatch",
+            "page_marker_missing", "elapsed_limit", "invalid_timing",
+            "marker_lifecycle_missing", "marker_authenticated_header_missing",
+            "marker_workspace_not_ready", "marker_detail_fallback_missing",
+            "marker_parse_unavailable",
+        )
+    ):
+        failures["unclassified_result_failure"] += 1
+    return success
+
+
+def _warmup_failure_is_closed(value: Any, *, concurrency: int) -> bool:
+    if (not isinstance(value, dict) or set(value) != WARMUP_FAILURE_FIELDS
+            or type(value.get("schema")) is not int or value["schema"] != 1
+            or type(concurrency) is not int or not 1 <= concurrency <= 64
+            or type(value.get("submitted")) is not int or value["submitted"] != concurrency
+            or type(value.get("results")) is not int or not 0 <= value["results"] <= concurrency
+            or type(value.get("marker_parsed_results")) is not int
+            or not 0 <= value["marker_parsed_results"] <= value["results"]
+            or type(value.get("future_exceptions")) is not int
+            or not 0 <= value["future_exceptions"] <= concurrency
+            or type(value.get("future_timeouts")) is not int
+            or not 0 <= value["future_timeouts"] <= concurrency
+            or value["results"] + value["future_exceptions"] + value["future_timeouts"] != concurrency
+            or (value["future_timeouts"] and value["future_exceptions"] + value["results"] >= concurrency)):
+        return False
+    maximum = value.get("max_elapsed_ms")
+    if (maximum is not None and (type(maximum) not in (int, float)
+            or isinstance(maximum, bool) or not 0 <= maximum <= 30_000
+            or (type(maximum) is float and not math.isfinite(maximum)))):
+        return False
+    statuses = value.get("http_status_counts")
+    if (not isinstance(statuses, dict) or len(statuses) > concurrency
+            or any(not isinstance(key, str) or re.fullmatch(r"[1-5][0-9]{2}", key) is None
+                   or type(count) is not int or not 0 <= count <= concurrency
+                   for key, count in statuses.items())
+            or sum(statuses.values()) > value["results"]):
+        return False
+    encodings = value.get("content_encoding_counts")
+    if (not isinstance(encodings, dict) or set(encodings) != WARMUP_CONTENT_ENCODINGS
+            or any(type(count) is not int or not 0 <= count <= concurrency
+                   for count in encodings.values())
+            or sum(encodings.values()) != value["results"]):
+        return False
+    failures = value.get("failure_counts")
+    if (not isinstance(failures, dict) or set(failures) != WARMUP_FAILURE_CATEGORIES
+            or any(type(count) is not int or not 0 <= count <= concurrency
+                   for count in failures.values())
+            or any(failures[key] > value["results"] for key in (
+                "request_exception", "non_200", "content_type_mismatch",
+                "page_marker_missing", "marker_lifecycle_missing",
+                "marker_authenticated_header_missing", "marker_workspace_not_ready",
+                "marker_detail_fallback_missing", "marker_parse_unavailable", "elapsed_limit",
+                "unclassified_result_failure", "invalid_timing", "invalid_result_status",
+            ))
+            or failures["future_timeout"] != value["future_timeouts"]
+            or failures["unexpected_worker_exception"] != value["future_exceptions"]
+            or sum(statuses.values()) + failures["request_exception"]
+            + failures["invalid_result_status"] != value["results"]
+            or failures["non_200"] != sum(
+                count for status, count in statuses.items() if status != "200"
+            )
+            or any(failures[marker] > failures["page_marker_missing"] for marker in (
+                "marker_lifecycle_missing", "marker_authenticated_header_missing",
+                "marker_workspace_not_ready", "marker_detail_fallback_missing",
+            ))
+            or failures["page_marker_missing"] > value["marker_parsed_results"]
+            or failures["marker_parse_unavailable"] > (
+                value["results"] - value["marker_parsed_results"]
+            )
+            or (failures["elapsed_limit"] > 0) != (
+                maximum is not None and maximum > 5_000
+            )):
+        return False
+    classes = value.get("exception_class_counts")
+    if (not isinstance(classes, dict) or set(classes) != WARMUP_EXCEPTION_CLASSES
+            or any(type(count) is not int or not 0 <= count <= concurrency
+                   for count in classes.values())
+            or sum(classes.values()) != value["future_exceptions"] + failures["request_exception"]):
+        return False
+    if not any(failures.values()):
+        return False
+    if (value["results"] == 0 and (maximum is not None or statuses)):
+        return False
+    return True
+
+
+def _project_warmup_failure(value: Any, *, concurrency: int) -> dict[str, Any] | None:
+    if not _warmup_failure_is_closed(value, concurrency=concurrency):
+        return None
+    assert isinstance(value, dict)
+    maximum = value["max_elapsed_ms"]
+    return {
+        "schema": 1,
+        "submitted": concurrency,
+        "results": value["results"],
+        "future_exceptions": value["future_exceptions"],
+        "future_timeouts": value["future_timeouts"],
+        "marker_parsed_results": value["marker_parsed_results"],
+        "max_elapsed_ms": round(float(maximum), 3) if maximum is not None else None,
+        "http_status_counts": dict(sorted(value["http_status_counts"].items())),
+        "content_encoding_counts": {
+            key: value["content_encoding_counts"][key]
+            for key in sorted(WARMUP_CONTENT_ENCODINGS)
+        },
+        "failure_counts": {
+            key: value["failure_counts"][key]
+            for key in sorted(WARMUP_FAILURE_CATEGORIES)
+        },
+        "exception_class_counts": {
+            key: value["exception_class_counts"][key]
+            for key in sorted(WARMUP_EXCEPTION_CLASSES)
+        },
+    }
+
+
 def profile_payload(concurrency: int, workload: str = WORKLOAD) -> dict[str, Any]:
     fixture_kind, presets, actors = _profile_spec(workload)
     if type(concurrency) is not int or concurrency not in presets:
@@ -916,32 +1172,55 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             require_authenticated_html=capacity["workload"] == HTML_WORKLOAD,
         )
 
-    def fail_off(reason: str, *, submitted: int, completed: int) -> dict[str, Any]:
+    def fail_off(
+        reason: str, *, submitted: int, completed: int,
+        warmup_failure: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         capacity_executor.shutdown(wait=True, cancel_futures=True)
         return _incomplete_report(
             capacity, binding, reason, submitted=0, completed=0,
             observed_duration_ms=0,
             off_probe_submitted=submitted, off_probe_completed=completed,
             off_probe_status=None, manifest_sha256=capacity["manifest_sha256"],
+            warmup_failure=warmup_failure,
         )
 
     warm_futures = [
         capacity_executor.submit(untraced_warmup, selected[index % len(selected)])
         for index in range(probe_count)
     ]
+    warmup_failure = _new_warmup_failure(probe_count)
     try:
         for future in as_completed(warm_futures, timeout=5.5):
             try:
                 result = future.result()
-            except Exception:
+            except Exception as exc:
                 off_failed = True
+                warmup_failure["future_exceptions"] += 1
+                warmup_failure["failure_counts"]["unexpected_worker_exception"] += 1
+                warmup_failure["exception_class_counts"][_warmup_exception_class(exc)] += 1
                 continue
-            if result.ok is not True or result.status != 200 or result.elapsed_ms > 5_000:
+            if not isinstance(result, external_load.RequestResult):
+                off_failed = True
+                warmup_failure["future_exceptions"] += 1
+                warmup_failure["failure_counts"]["unexpected_worker_exception"] += 1
+                warmup_failure["exception_class_counts"]["TypeError"] += 1
+                continue
+            if not _record_warmup_result(warmup_failure, result):
                 off_failed = True
     except TimeoutError:
         off_failed = True
+        # shutdown() may later drain these futures, but they had no result at
+        # the existing 5.5s observation deadline and remain timeouts here.
+        warmup_failure["future_timeouts"] = (
+            probe_count - warmup_failure["results"] - warmup_failure["future_exceptions"]
+        )
+        warmup_failure["failure_counts"]["future_timeout"] = warmup_failure["future_timeouts"]
     if off_failed:
-        return fail_off("off_warmup_failed", submitted=0, completed=0)
+        return fail_off(
+            "off_warmup_failed", submitted=0, completed=0,
+            warmup_failure=warmup_failure,
+        )
 
     # Warm the same thread-local HTTP/1.1 clients before the plan's OFF
     # boundary. The marked cohort is synchronized to the immutable plan time;
@@ -1128,10 +1407,11 @@ def _incomplete_report(
     manifest_sha256: str,
     off_probe_submitted: int = 0, off_probe_completed: int = 0,
     off_probe_status: int | None = None,
+    warmup_failure: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if type(observed_duration_ms) is not int or not 0 <= observed_duration_ms <= 30_000:
         raise ValueError("capacity incomplete duration is invalid")
-    return {
+    report = {
         **profile_payload(capacity["concurrency"], capacity["workload"]),
         "report_complete": True,
         "status": "incomplete", "passed": False,
@@ -1164,6 +1444,14 @@ def _incomplete_report(
         "server_capacity_claim_reason": "resource_correlation_not_provided",
         "namespace_closed": False,
     }
+    if warmup_failure is not None:
+        if (reason != "off_warmup_failed"
+                or not _warmup_failure_is_closed(
+                    dict(warmup_failure), concurrency=capacity["concurrency"],
+                )):
+            raise ValueError("capacity warmup failure projection rejected")
+        report["warmup_failure"] = dict(warmup_failure)
+    return report
 
 
 def _unknown_cpu_windows() -> list[dict[str, Any]]:
@@ -1462,6 +1750,10 @@ def run_isolated_capacity_worker(
         "server_capacity_claim": None,
         "server_capacity_claim_reason": "resource_correlation_not_provided",
     }
+    if (valid_worker and isinstance(outcome.get("worker"), dict)
+            and isinstance(worker_payload, Mapping)
+            and "warmup_failure" in worker_payload):
+        outcome["worker"]["warmup_failure"] = worker_payload["warmup_failure"]
     return outcome
 
 
@@ -1482,7 +1774,21 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         "generator_cpu_evidence", "server_capacity_claim", "server_capacity_claim_reason",
         "diagnostic_credit", "namespace_closed",
     }
-    if set(payload) not in (expected_fields, expected_fields - {"process_cpu_windows"}):
+    warmup_fields = expected_fields | {"warmup_failure"}
+    if set(payload) not in (
+        expected_fields, expected_fields - {"process_cpu_windows"},
+        warmup_fields, warmup_fields - {"process_cpu_windows"},
+    ):
+        return False
+    has_warmup_failure = "warmup_failure" in payload
+    if (has_warmup_failure != (payload.get("resource_abort_reason") == "off_warmup_failed")
+            or (has_warmup_failure and (
+                payload.get("status") != "incomplete"
+                or not _warmup_failure_is_closed(
+                    payload.get("warmup_failure"),
+                    concurrency=capacity_config.get("concurrency"),
+                )
+            ))):
         return False
     cpu_rows = payload.get("process_cpu_windows", _unknown_cpu_windows())
     return bool(
@@ -2387,13 +2693,34 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             "on_window_end_ms", "observed_duration_ms", "off_probe", "max_inflight",
             "fixture_manifest_bytes", "response_bytes_total", "process_cpu_windows",
         }
+        warmup_worker = expected_worker | {"warmup_failure"}
         if (not isinstance(worker, dict)
-                or set(worker) not in (expected_worker, expected_worker - {"process_cpu_windows"})):
+                or set(worker) not in (
+                    expected_worker, expected_worker - {"process_cpu_windows"},
+                    warmup_worker, warmup_worker - {"process_cpu_windows"},
+                )):
             return None
+        has_warmup_failure = "warmup_failure" in worker
+        if (has_warmup_failure != (worker.get("resource_abort_reason") == "off_warmup_failed")
+                or (has_warmup_failure and _project_warmup_failure(
+                    worker.get("warmup_failure"), concurrency=value.get("concurrency"),
+                ) is None)):
+            return None
+        expected_final_worker = expected_worker | (
+            {"warmup_failure"} if has_warmup_failure else set()
+        )
+        if has_warmup_failure:
+            worker = {
+                **worker,
+                "warmup_failure": _project_warmup_failure(
+                    worker["warmup_failure"], concurrency=value["concurrency"],
+                ),
+            }
+            value["worker"] = worker
         if "process_cpu_windows" not in worker:
             worker = {**worker, "process_cpu_windows": _unknown_cpu_windows()}
             value["worker"] = worker
-        if (set(worker) != expected_worker
+        if (set(worker) != expected_final_worker
                 or worker.get("status") not in {"complete", "incomplete", "failed"}
                 or type(worker.get("submitted")) is not int
                 or type(worker.get("completed")) is not int
@@ -2972,6 +3299,12 @@ def _parent_failure_fingerprint(
                      and 100 <= off_probe["http_status"] <= 599)
                 else None,
         }
+        if worker.get("resource_abort_reason") == "off_warmup_failed":
+            warmup_failure = _project_warmup_failure(
+                worker.get("warmup_failure"), concurrency=args.concurrency,
+            )
+            if warmup_failure is not None:
+                worker_summary["warmup_failure"] = warmup_failure
     cleanup = stage_state.get("cleanup_lifecycle")
     cleanup = cleanup if isinstance(cleanup, Mapping) else {}
     runner = outcome.get("runner_headroom")

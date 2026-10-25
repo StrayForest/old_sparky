@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 import http.client
+import gzip
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import signal
@@ -364,6 +366,10 @@ class ExternalLoadTests(unittest.TestCase):
             external_load._authenticated_html_markers("text/html", "not-bytes"),
             (True, False),
         )
+        self.assertEqual(
+            external_load._authenticated_html_marker_details("text/html", "not-bytes"),
+            (True, False, None),
+        )
 
     def test_html_keepalive_request_retains_only_closed_marker_flags(self) -> None:
         body = (
@@ -380,6 +386,8 @@ class ExternalLoadTests(unittest.TestCase):
             headers={"content-type": "text/html; charset=utf-8"},
             body=body,
             timing={"total_ms": 12.0, "ttfb_ms": 4.0},
+            content_encoding="identity",
+            content_type_is_html=True,
         )
         user = VirtualUser("actor", "fixture-slug", "s" * 32, "c" * 32)
         with patch("tools.platform_external_load._http11_keepalive_client", return_value=client):
@@ -392,11 +400,98 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.html_content_type_ok, True)
         self.assertEqual(result.html_page_marker_ok, True)
+        self.assertEqual(result.html_marker_flags, {
+            "lifecycle": True, "authenticated_header": True,
+            "workspace_ready": True, "detail_fallback": True,
+        })
+        self.assertEqual(result.html_content_encoding, "identity")
         self.assertEqual(result.response_bytes, len(body))
         self.assertNotIn(body.decode(), repr(result))
         call = client.get.call_args
         self.assertEqual(call.args[0], "/tournaments/fixture-slug")
         self.assertIn("session=" + user.session_token, call.kwargs["headers"]["Cookie"])
+
+        state = {"gzip": False, "delay": False, "accept_encoding": []}
+
+        class LoopbackHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                state["accept_encoding"].append(self.headers.get("Accept-Encoding"))
+                if state["delay"]:
+                    time.sleep(0.2)
+                response_body = gzip.compress(body) if state["gzip"] else body
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                if state["gzip"]:
+                    self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(response_body)
+                except OSError:
+                    return
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), LoopbackHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        origin = f"http://127.0.0.1:{server.server_port}"
+        external_load._page_transport_local.client = None
+        try:
+            ready_result = external_load._page_request_http11_keepalive(
+                origin, user, "html-capacity", 2.0,
+                session_cookie_name="session", csrf_cookie_name="csrf",
+                require_authenticated_html=True,
+            )
+            self.assertEqual(ready_result.status, 200)
+            self.assertTrue(ready_result.html_content_type_ok)
+            self.assertEqual(ready_result.html_content_encoding, "identity")
+            self.assertEqual(ready_result.html_marker_flags, {
+                "lifecycle": True, "authenticated_header": True,
+                "workspace_ready": True, "detail_fallback": True,
+            })
+            self.assertTrue(ready_result.ok, (
+                f"status={ready_result.status} content_type_ok={ready_result.html_content_type_ok} "
+                f"marker_flags={ready_result.html_marker_flags} "
+                f"coding={ready_result.html_content_encoding} error={ready_result.error_kind}"
+            ))
+            state["gzip"] = True
+            gzip_result = external_load._page_request_http11_keepalive(
+                origin, user, "html-capacity", 2.0,
+                session_cookie_name="session", csrf_cookie_name="csrf",
+                require_authenticated_html=True,
+            )
+            state["gzip"] = False
+            state["delay"] = True
+            delayed_result = external_load._page_request_http11_keepalive(
+                origin, user, "html-capacity", 0.05,
+                session_cookie_name="session", csrf_cookie_name="csrf",
+                require_authenticated_html=True,
+            )
+            time.sleep(0.25)
+        finally:
+            external_load._page_transport_local.client.close()
+            external_load._page_transport_local.client = None
+        self.assertEqual(state["accept_encoding"], ["identity", "identity", "identity"])
+        self.assertFalse(gzip_result.ok)
+        self.assertEqual(gzip_result.html_content_encoding, "gzip")
+        self.assertFalse(gzip_result.html_page_marker_ok)
+        self.assertTrue(
+            gzip_result.html_marker_flags is None
+            or all(value is False for value in gzip_result.html_marker_flags.values())
+        )
+        self.assertNotIn(body.decode("ascii"), repr(gzip_result))
+        self.assertFalse(delayed_result.ok)
+        self.assertEqual(delayed_result.status, 0)
+        self.assertEqual(delayed_result.error_kind, "TimeoutError")
+        self.assertIsNone(delayed_result.html_marker_flags)
+        self.assertIsNone(delayed_result.html_content_encoding)
 
     def test_html_capacity_response_failure_stops_refill_and_keeps_partial_counts(self) -> None:
         actors = [VirtualUser(f"actor-{index}", "fixture", "s" * 32, "c" * 32) for index in range(14)]
