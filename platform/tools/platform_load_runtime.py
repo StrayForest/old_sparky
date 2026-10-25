@@ -75,6 +75,13 @@ WATCHDOG_STARTUP_STAGE_CODES = {
 WATCHDOG_STARTUP_CODE_STAGES = {
     code: stage for stage, code in WATCHDOG_STARTUP_STAGE_CODES.items()
 }
+WATCHDOG_STARTUP_FAILURE_STAGES = frozenset(WATCHDOG_STARTUP_STAGE_CODES) | {
+    "unknown",
+}
+SUPERVISOR_STARTUP_FAILURE_STAGES = (
+    frozenset(NAMESPACE_STARTUP_FAILURE_STAGES)
+    | frozenset(WATCHDOG_STARTUP_STAGE_CODES)
+)
 DEFAULT_TERM_GRACE_SECONDS = 1.0
 DEFAULT_POLL_SECONDS = 0.02
 DEFAULT_NAMESPACE_PROBE_TIMEOUT_SECONDS = 5.0
@@ -874,6 +881,9 @@ class SupervisorResult:
     namespace_init_pid: int | None
     # Private in-memory evidence; deliberately absent from runtime report schema.
     startup_failure_stage: str | None = None
+    namespace_ready_failure_stage: str | None = None
+    namespace_post_ready_failure_stage: str | None = None
+    watchdog_startup_failure_stage: str | None = None
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1664,23 +1674,52 @@ def _decode_watchdog_startup_diagnostics(raw: bytes) -> tuple[str | None, str | 
         b"\x02": "pidfd_signal_eperm_unclassified",
     }
     raw_codes = [raw[index:index + 1] for index in range(len(raw))]
+    kill_codes = [code for code in raw_codes if code in kill_errors]
     startup_codes = [code for code in raw_codes if code in WATCHDOG_STARTUP_CODE_STAGES]
     known_codes = set(kill_errors) | set(WATCHDOG_STARTUP_CODE_STAGES)
     has_unknown = (
         any(code not in known_codes for code in raw_codes)
-        or len(raw) > 3
-        or len(raw_codes) > 1
+        or len(raw_codes) > 2
+        or len(kill_codes) > 1
+        or len(startup_codes) > 1
     )
     watchdog_error = (
         "pidfd_signal_eperm_unclassified" if b"\x02" in raw
         else "pidfd_signal_eperm_trusted_mediator_skipped" if b"\x01" in raw
         else None
     )
-    if has_unknown or len(startup_codes) > 1 or (watchdog_error is not None and startup_codes):
+    if has_unknown:
         return watchdog_error, "unknown"
     if not startup_codes:
         return watchdog_error, None
     return watchdog_error, WATCHDOG_STARTUP_CODE_STAGES[startup_codes[0]]
+
+
+def _aggregate_startup_failure_stage(
+    *,
+    namespace_ready_stage: str | None,
+    namespace_post_ready_stage: str | None,
+    watchdog_stage: str | None,
+    returncode: int | None,
+) -> str | None:
+    """Keep the aggregate conservative while source stages remain separate."""
+
+    observed = [
+        stage if stage in SUPERVISOR_STARTUP_FAILURE_STAGES else "unknown"
+        for stage in (
+            namespace_ready_stage,
+            namespace_post_ready_stage,
+            watchdog_stage,
+        )
+        if stage is not None
+    ]
+    if len(observed) > 1:
+        return "unknown"
+    if observed:
+        return observed[0]
+    if returncode == 125:
+        return "exec_chain_exit_125"
+    return None
 
 
 def _read_process_descendants(pid: int) -> tuple[int, ...]:
@@ -2216,6 +2255,9 @@ def run_supervised(
     watchdog_diagnostic_write_fd: int | None = None
     watchdog_diagnostic: str | None = None
     startup_failure_stage: str | None = None
+    namespace_ready_failure_stage: str | None = None
+    namespace_post_ready_failure_stage: str | None = None
+    watchdog_startup_failure_stage: str | None = None
     wrapper_pidfd: int | None = None
     wrapper_starttime: int | None = None
     namespace_init_pid: int | None = None
@@ -2349,7 +2391,7 @@ def run_supervised(
                 startup_failure=startup_marker,
             ):
                 if startup_marker:
-                    startup_failure_stage = startup_marker[0]
+                    namespace_ready_failure_stage = startup_marker[0]
                 raise NamespaceIntegrityError("namespace PID 1 readiness handshake failed")
             while namespace_init_pid is None:
                 if external_signal is not None:
@@ -2573,10 +2615,7 @@ def run_supervised(
             if process.stdout is not None and process.poll() is not None:
                 post_ready_stage = _read_post_ready_startup_failure(process.stdout)
                 if post_ready_stage is not None:
-                    startup_failure_stage = (
-                        post_ready_stage if startup_failure_stage is None
-                        else "unknown"
-                    )
+                    namespace_post_ready_failure_stage = post_ready_stage
             for stream in (process.stdin, process.stdout):
                 if stream is not None:
                     try:
@@ -2590,10 +2629,7 @@ def run_supervised(
                     diagnostic_bytes,
                 )
                 if watchdog_stage is not None:
-                    startup_failure_stage = (
-                        watchdog_stage if startup_failure_stage is None
-                        else "unknown"
-                    )
+                    watchdog_startup_failure_stage = watchdog_stage
             except OSError:
                 pass
             finally:
@@ -2608,8 +2644,12 @@ def run_supervised(
         except FileNotFoundError:
             pass
 
-    if returncode == 125 and startup_failure_stage is None:
-        startup_failure_stage = "exec_chain_exit_125"
+    startup_failure_stage = _aggregate_startup_failure_stage(
+        namespace_ready_stage=namespace_ready_failure_stage,
+        namespace_post_ready_stage=namespace_post_ready_failure_stage,
+        watchdog_stage=watchdog_startup_failure_stage,
+        returncode=returncode,
+    )
 
     if progress_checkpoint is not None and namespace_closed and namespace_reaped:
         try:
@@ -2717,6 +2757,9 @@ def run_supervised(
                     namespace_closed=True,
                     namespace_init_pid=namespace_init_pid,
                     startup_failure_stage=startup_failure_stage,
+                    namespace_ready_failure_stage=namespace_ready_failure_stage,
+                    namespace_post_ready_failure_stage=namespace_post_ready_failure_stage,
+                    watchdog_startup_failure_stage=watchdog_startup_failure_stage,
                 )
 
     partial_work = worker_started
@@ -2771,6 +2814,9 @@ def run_supervised(
         namespace_closed=namespace_closed,
         namespace_init_pid=namespace_init_pid,
         startup_failure_stage=startup_failure_stage,
+        namespace_ready_failure_stage=namespace_ready_failure_stage,
+        namespace_post_ready_failure_stage=namespace_post_ready_failure_stage,
+        watchdog_startup_failure_stage=watchdog_startup_failure_stage,
     )
 
 

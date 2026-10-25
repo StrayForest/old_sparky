@@ -5,11 +5,16 @@ import * as https from "node:https";
 import { cache } from "react";
 import type { PlatformAuthBootstrap, PlatformUser } from "@/lib/platform-types";
 import {
+  getSsrAdmissionStageObserver,
+  getSsrAuthBodyParseObserver,
   getServerRequestCorrelationHeaders,
   isSsrDiagnosticsEnabled,
+  isSsrObservabilityActive,
   measureSsrStage
 } from "@/lib/server-ssr-observability";
-import { runWithServerInternalRead } from "@/lib/server-internal-read-scheduler";
+import {
+  runWithServerInternalRead
+} from "@/lib/server-internal-read-scheduler";
 import {
   cancelServerAuthFetchTerminalResponse,
   cancelServerFetchResponse
@@ -45,6 +50,11 @@ type ServerJsonResponse = {
   ok: boolean;
   json: () => Promise<unknown>;
 };
+
+type ServerAuthJsonParseObserver = (
+  durationMs: number,
+  outcome: "ok" | "error",
+) => void | Promise<void>;
 
 const serverAuthFetchControllers = new WeakMap<Response, AbortController>();
 
@@ -84,8 +94,11 @@ export const getServerCurrentUser = cache(async (
   if (!baseUrl) {
     return { status: "unavailable", user: null };
   }
-  return measureSsrStage("auth_current_user_fetch", () =>
-    runWithServerInternalRead(async (): Promise<ServerAuthSnapshot> => {
+  return measureSsrStage("auth_current_user_fetch", async () => {
+    const admissionObserver = isSsrObservabilityActive()
+      ? await getSsrAdmissionStageObserver()
+      : undefined;
+    return runWithServerInternalRead(async (): Promise<ServerAuthSnapshot> => {
       try {
         const requestHeaders = isSsrDiagnosticsEnabled()
           ? await getServerRequestCorrelationHeaders()
@@ -94,7 +107,12 @@ export const getServerCurrentUser = cache(async (
           requestHeaders.set("accept", "application/json");
           requestHeaders.set("cookie", cookieHeader);
         }
-        const response = await requestServerAuthJson(`${baseUrl}/users/me`, requestHeaders);
+        const jsonParseObserver = serverAuthTransport === "node" && isSsrObservabilityActive()
+          ? await getSsrAuthBodyParseObserver()
+          : undefined;
+        const response = await measureSsrStage("auth_http_fetch", () =>
+          requestServerAuthJson(`${baseUrl}/users/me`, requestHeaders, jsonParseObserver)
+        );
         const fetchController = getServerAuthFetchController(response);
         const fetchTerminal = fetchController
           ? cancelServerAuthFetchTerminalResponse(response as Response, fetchController)
@@ -108,18 +126,23 @@ export const getServerCurrentUser = cache(async (
           await cancelServerAuthBody(response);
           return { status: "unavailable", user: null };
         }
-        const user = await response.json() as unknown;
-        if (!isPlatformUser(user)) {
-          return { status: "unavailable", user: null };
-        }
-        return { status: "authenticated", user };
+        const user = response instanceof Response
+          ? await measureSsrStage("auth_body_parse", async () =>
+            await response.json() as unknown
+          )
+          : await response.json() as unknown;
+        return measureSsrStage("auth_projection", async () =>
+          isPlatformUser(user)
+            ? { status: "authenticated", user }
+            : { status: "unavailable", user: null }
+        );
       } catch {
         // Public pages remain available during a transient internal API failure;
         // protected APIs still enforce the session independently.
         return { status: "unavailable", user: null };
       }
-    }).catch((): ServerAuthSnapshot => ({ status: "unavailable", user: null }))
-  );
+    }, undefined, admissionObserver).catch((): ServerAuthSnapshot => ({ status: "unavailable", user: null }));
+  });
 });
 
 export const getServerAuthBootstrap = cache(async (
@@ -132,8 +155,11 @@ export const getServerAuthBootstrap = cache(async (
   if (!baseUrl) {
     return { status: "unavailable", user: null };
   }
-  return measureSsrStage("auth_bootstrap_fetch", () =>
-    runWithServerInternalRead(async (): Promise<ServerAuthSnapshot> => {
+  return measureSsrStage("auth_bootstrap_fetch", async () => {
+    const admissionObserver = isSsrObservabilityActive()
+      ? await getSsrAdmissionStageObserver()
+      : undefined;
+    return runWithServerInternalRead(async (): Promise<ServerAuthSnapshot> => {
       try {
         const requestHeaders = isSsrDiagnosticsEnabled()
           ? await getServerRequestCorrelationHeaders()
@@ -142,7 +168,12 @@ export const getServerAuthBootstrap = cache(async (
           requestHeaders.set("accept", "application/json");
           requestHeaders.set("cookie", cookieHeader);
         }
-        const response = await requestServerAuthJson(`${baseUrl}/auth/bootstrap`, requestHeaders);
+        const jsonParseObserver = serverAuthTransport === "node" && isSsrObservabilityActive()
+          ? await getSsrAuthBodyParseObserver()
+          : undefined;
+        const response = await measureSsrStage("auth_http_fetch", () =>
+          requestServerAuthJson(`${baseUrl}/auth/bootstrap`, requestHeaders, jsonParseObserver)
+        );
         const fetchController = getServerAuthFetchController(response);
         const fetchTerminal = fetchController
           ? cancelServerAuthFetchTerminalResponse(response as Response, fetchController)
@@ -156,16 +187,21 @@ export const getServerAuthBootstrap = cache(async (
           await cancelServerAuthBody(response);
           return { status: "unavailable", user: null };
         }
-        const bootstrap = await response.json() as unknown;
-        if (!isPlatformAuthBootstrap(bootstrap)) {
-          return { status: "unavailable", user: null };
-        }
-        return { status: "authenticated", user: bootstrap };
+        const bootstrap = response instanceof Response
+          ? await measureSsrStage("auth_body_parse", async () =>
+            await response.json() as unknown
+          )
+          : await response.json() as unknown;
+        return measureSsrStage("auth_projection", async () =>
+          isPlatformAuthBootstrap(bootstrap)
+            ? { status: "authenticated", user: bootstrap }
+            : { status: "unavailable", user: null }
+        );
       } catch {
         return { status: "unavailable", user: null };
       }
-    }).catch((): ServerAuthSnapshot => ({ status: "unavailable", user: null }))
-  );
+    }, undefined, admissionObserver).catch((): ServerAuthSnapshot => ({ status: "unavailable", user: null }));
+  });
 });
 
 function getServerAuthFetchController(
@@ -196,9 +232,10 @@ async function cancelServerAuthBody(
 function requestServerAuthJson(
   input: string,
   headers: HeadersInit,
+  jsonParseObserver?: ServerAuthJsonParseObserver,
 ): Promise<Response | ServerJsonResponse> {
   if (serverAuthTransport === "node") {
-    return requestServerJson(input, headers);
+    return requestServerJson(input, headers, jsonParseObserver);
   }
   const controller = new AbortController();
   const timeout = AbortSignal.timeout(serverAuthTimeoutMs);
@@ -215,6 +252,7 @@ function requestServerAuthJson(
 function requestServerJson(
   input: string,
   headers: HeadersInit,
+  jsonParseObserver?: ServerAuthJsonParseObserver,
 ): Promise<ServerJsonResponse> {
   const url = new URL(input);
   if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -259,17 +297,34 @@ function requestServerJson(
       });
       response.on("end", () => {
         settle(() => {
+          const status = response.statusCode ?? 0;
+          const bodyText = Buffer.concat(chunks).toString("utf8");
+          const ok = status >= 200 && status < 300;
+          // Preserve the native transport's historical eager parse on every
+          // status. Malformed 401/403 bodies map to unavailable, not anonymous.
+          const parseStartedAt = jsonParseObserver ? performance.now() : null;
+          let payload: unknown;
           try {
-            const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
-            const status = response.statusCode ?? 0;
-            resolve({
-              status,
-              ok: status >= 200 && status < 300,
-              json: async () => payload,
-            });
+            payload = JSON.parse(bodyText) as unknown;
           } catch (error) {
+            if (parseStartedAt !== null) {
+              notifyJsonParseObserver(
+                jsonParseObserver,
+                performance.now() - parseStartedAt,
+                "error",
+              );
+            }
             reject(error instanceof Error ? error : new Error("Invalid server auth response."));
+            return;
           }
+          if (parseStartedAt !== null) {
+            notifyJsonParseObserver(
+              jsonParseObserver,
+              performance.now() - parseStartedAt,
+              "ok",
+            );
+          }
+          resolve({ status, ok, json: async () => payload });
         });
       });
       response.on("error", (error) => {
@@ -298,6 +353,19 @@ function requestServerJson(
     });
     request.end();
   });
+}
+
+function notifyJsonParseObserver(
+  observer: ServerAuthJsonParseObserver | undefined,
+  durationMs: number,
+  outcome: "ok" | "error",
+): void {
+  if (!observer) return;
+  try {
+    void Promise.resolve(observer(Math.max(0, durationMs), outcome)).catch(() => {});
+  } catch {
+    // Diagnostic failures must not change the auth response outcome.
+  }
 }
 
 function isPlatformAuthBootstrap(value: unknown): value is PlatformAuthBootstrap {

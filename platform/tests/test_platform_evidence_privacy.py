@@ -65,6 +65,48 @@ def serialized(value: object) -> str:
 
 
 class EvidencePrivacyTests(unittest.TestCase):
+    def test_ssr_substage_metrics_keep_only_closed_stage_names(self) -> None:
+        public = project_public_artifact(
+            "server_observability",
+            {
+                "server_ssr_observability": {
+                    "ssr_stages": {
+                        "logged_stages": 4,
+                        "sampled_requests": 1,
+                        "by_stage": {
+                            "internal_read_admission_wait": {"p50_ms": 0.0, "p95_ms": 0.4},
+                            "workspace_http_fetch": {"p50_ms": 40.0, "p95_ms": 80.0},
+                            "private_slug": {"p95_ms": 999.0},
+                        },
+                    },
+                    "correlated_html": {
+                        "requests": 1,
+                        "stage_ms": {
+                            "workspace_body_parse": {"p50_ms": 3.0},
+                            "workspace_projection": {"p50_ms": 1.0},
+                            "private_slug": {"p95_ms": 999.0},
+                        },
+                    },
+                }
+            },
+        )
+        ssr = public["server_ssr_observability"]
+        self.assertEqual(
+            ssr["ssr_stages"]["by_stage"],
+            {
+                "internal_read_admission_wait": {"p50_ms": 0.0, "p95_ms": 0.4},
+                "workspace_http_fetch": {"p50_ms": 40.0, "p95_ms": 80.0},
+            },
+        )
+        self.assertEqual(
+            ssr["correlated_html"]["stage_ms"],
+            {
+                "workspace_body_parse": {"p50_ms": 3.0},
+                "workspace_projection": {"p50_ms": 1.0},
+            },
+        )
+        self.assertNotIn("private_slug", serialized(public))
+
     def test_abort_cli_help_starts_under_isolated_python_from_unrelated_cwd(self) -> None:
         script = (
             Path(__file__).resolve().parents[1]

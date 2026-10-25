@@ -94,11 +94,16 @@ still cannot be promoted to capacity evidence.
 Namespace exit 125 diagnostics use only fixed stage bytes across the watchdog
 pipe and namespace READY stream. The watchdog descriptor is close-on-exec before
 the system chain, and the inner helper's duplicated stream is close-on-exec
-before the worker; neither descriptor reaches sudo or the worker. Existing
-pidfd cleanup diagnostics retain priority if the bounded watchdog channel is
-ambiguous. `supervisor_process_started` means only that the watchdog process
-was launched; it does not mean the inner worker started. A missing, conflicting
-or malformed stage remains unknown and never changes containment status.
+before the worker; neither descriptor reaches sudo or the worker. Failure
+fingerprints preserve the aggregate stage and separately identify the
+pre-READY namespace stage, post-READY namespace stage, and watchdog stage.
+This keeps a secondary cleanup failure from erasing the bounded startup source;
+the aggregate remains `unknown` if sources conflict. A valid watchdog pidfd
+cleanup code may coexist with one startup stage, while duplicate, malformed or
+oversized channel data remains unknown. `supervisor_process_started` means only
+that the watchdog process was launched; it does not mean the inner worker
+started. These diagnostic fields never change containment status or award
+capacity credit.
 
 Use this procedure to separate authenticated HTML latency across direct
 Next.js, local Nginx and public Cloudflare. It is diagnostic evidence only; the
@@ -177,6 +182,27 @@ log value.
   the surrounding Node SSR path. Compare their gaps with event-loop p95/p99,
   ELU, process CPU and GC duration to identify scheduling/queueing.
 
+Sampled authenticated-page traces also expose bounded inner spans:
+`internal_read_admission_wait` covers the process-local SSR read permit wait;
+`auth_http_fetch`/`workspace_http_fetch` cover the request until a response is
+available; `auth_body_parse`/`workspace_body_parse` cover body consumption and
+JSON parsing;
+and `auth_projection`/`workspace_projection` cover validation and mapping into
+web types. Queue failures are marked `outcome=error`; an immediate admission
+is a measured zero/near-zero wait. These names are closed by the evidence
+sanitizer and the spans contain no route, slug, cookie, body or identity data.
+They are nested inside the existing outer `auth_bootstrap_fetch`,
+`auth_current_user_fetch` and `tournament_workspace` spans, so do not add their
+durations as if they were disjoint end-to-end components. With the native Node
+auth transport, `auth_http_fetch` includes request, body collection and eager
+JSON parsing; `auth_body_parse` is a separate parser-local timer nested inside
+that total and overlaps it. This eager parse on every status preserves the
+existing malformed-body behavior. With fetch transport, `auth_http_fetch`
+ends when `fetch` returns its response, while `auth_body_parse` includes body
+consumption and JSON parsing. Compare only like transport profiles. All spans
+remain disabled with the SSR diagnostic flag off; the bounded capacity plan
+may still explicitly enable its request-local trace.
+
 Run this only as one explicitly reviewed `web-ssr-diagnostics` window using the
 canonical external authenticated-page profile. It leaves compression,
 database pools, API admission and capacity limits unchanged; its selected web
@@ -207,26 +233,14 @@ boolean values count as unknown, and sampled counts must not be extrapolated
 to the full client population.
 
 The separate `PLATFORM_SSR_HEAP_METRICS_ENABLED` selector is false in the
-public baseline and is carried only to the web process. The reviewed
-`ready-vote-static-8` runtime profile enables it for process-level memory
-diagnosis without enabling request-level SSR tracing. The deployment
-supervisor selects this key whenever it applies a managed runtime profile, so
-baseline restoration also writes `false` instead of retaining a prior
-diagnostic value. The service-env renderer keeps the selector in `web.env` and
-omits it from `api.env`. It emits a fixed
-`ssr_heap schema=1` line every five seconds with RSS, V8 heap total/used/limit,
-external and array-buffer bytes, and interval GC count/duration. The stream
-contains no request, identity, route or URL fields and stops after 5,760
-samples or eight hours; its timer is unreferenced and disposed on process
-exit. This is a temporary override in the reviewed diagnostic release only:
-do not apply runtime-profile changes during its observation window, and do not
-treat the eight-hour sampler cap as a reset of its startup flag. The next
-reviewed normal release removes the override and restores the false baseline
-without changing the existing static-8 restore procedure. The lines are not
-part of the request-stage summary above; collect them only through the approved
-bounded memory-only journal projection, which retains fixed numeric fields and
-omits raw log text. Do not overlap this contour with request-level SSR or
-other performance diagnostic profiles.
+public baseline and every current managed runtime profile. The deploy
+supervisor explicitly selects this key on each profile application, and the
+shared-env profile defaults it to `false`; applying or restoring a profile
+therefore leaves no heap-only sampler running. The service-env renderer keeps
+the selector in `web.env` and omits it from `api.env`. If a future reviewed
+profile enables it, use a separately documented memory-only window and do not
+overlap it with request-level SSR or other profiling. Missing `ssr_heap` rows
+in the current profiles mean the sampler is off, not that a collection failed.
 
 ## Timeout-path diagnostic window
 

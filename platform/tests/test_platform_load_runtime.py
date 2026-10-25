@@ -1785,7 +1785,10 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 os.close(marker_read)
 
     def test_watchdog_diagnostic_decoder_preserves_kill_precedence(self) -> None:
-        from tools.platform_load_runtime import _decode_watchdog_startup_diagnostics
+        from tools.platform_load_runtime import (
+            _aggregate_startup_failure_stage,
+            _decode_watchdog_startup_diagnostics,
+        )
 
         self.assertEqual(
             _decode_watchdog_startup_diagnostics(b"\x22"),
@@ -1793,11 +1796,11 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
         )
         self.assertEqual(
             _decode_watchdog_startup_diagnostics(b"\x02\x22"),
-            ("pidfd_signal_eperm_unclassified", "unknown"),
+            ("pidfd_signal_eperm_unclassified", "watchdog_pdeathsig"),
         )
         self.assertEqual(
             _decode_watchdog_startup_diagnostics(b"\x01\x22"),
-            ("pidfd_signal_eperm_trusted_mediator_skipped", "unknown"),
+            ("pidfd_signal_eperm_trusted_mediator_skipped", "watchdog_pdeathsig"),
         )
         self.assertEqual(
             _decode_watchdog_startup_diagnostics(b"\xff"),
@@ -1806,6 +1809,37 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
         self.assertEqual(
             _decode_watchdog_startup_diagnostics(b"\x22\x23"),
             (None, "unknown"),
+        )
+        self.assertEqual(
+            _decode_watchdog_startup_diagnostics(b"\x01\x02\x22"),
+            ("pidfd_signal_eperm_unclassified", "unknown"),
+        )
+        self.assertEqual(
+            _aggregate_startup_failure_stage(
+                namespace_ready_stage="namespace_config_read",
+                namespace_post_ready_stage=None,
+                watchdog_stage="watchdog_supervision",
+                returncode=125,
+            ),
+            "unknown",
+        )
+        self.assertEqual(
+            _aggregate_startup_failure_stage(
+                namespace_ready_stage=None,
+                namespace_post_ready_stage=None,
+                watchdog_stage="watchdog_supervision",
+                returncode=125,
+            ),
+            "watchdog_supervision",
+        )
+        self.assertEqual(
+            _aggregate_startup_failure_stage(
+                namespace_ready_stage=None,
+                namespace_post_ready_stage=None,
+                watchdog_stage=None,
+                returncode=125,
+            ),
+            "exec_chain_exit_125",
         )
 
     def test_namespace_bootstrap_rejects_pid_reuse_and_closed_pidfd(self) -> None:

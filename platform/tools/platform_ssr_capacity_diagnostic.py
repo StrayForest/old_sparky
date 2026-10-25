@@ -1037,6 +1037,15 @@ def run_isolated_capacity_worker(
         "return_code": getattr(result, "returncode", None),
         "signal": getattr(result, "signal", None),
         "startup_failure_stage": getattr(result, "startup_failure_stage", None),
+        "namespace_ready_failure_stage": getattr(
+            result, "namespace_ready_failure_stage", None,
+        ),
+        "namespace_post_ready_failure_stage": getattr(
+            result, "namespace_post_ready_failure_stage", None,
+        ),
+        "watchdog_startup_failure_stage": getattr(
+            result, "watchdog_startup_failure_stage", None,
+        ),
     })
     if not watcher_summary:
         watcher_summary.append(watcher.stop())
@@ -2351,6 +2360,16 @@ def _project_supervisor_evidence(value: Any) -> dict[str, Any]:
     evidence = value if isinstance(value, Mapping) else {}
     reason = evidence.get("reason")
     startup_stage = evidence.get("startup_failure_stage")
+
+    def project_stage(name: str, allowed_stages: frozenset[str]) -> str | None:
+        stage = evidence.get(name)
+        if stage is None:
+            return None
+        return (
+            stage if isinstance(stage, str) and stage in allowed_stages
+            else "unknown"
+        )
+
     return {
         "reason": reason if isinstance(reason, str) and reason in SUPERVISOR_REASONS else "other",
         "worker_started": evidence.get("worker_started")
@@ -2365,8 +2384,20 @@ def _project_supervisor_evidence(value: Any) -> dict[str, Any]:
         if type(evidence.get("signal")) is int and 1 <= evidence["signal"] <= 255 else None,
         "startup_failure_stage": (
             startup_stage if isinstance(startup_stage, str)
-            and startup_stage in load_runtime.NAMESPACE_STARTUP_FAILURE_STAGES
+            and startup_stage in load_runtime.SUPERVISOR_STARTUP_FAILURE_STAGES
             else "unknown" if startup_stage is not None else None
+        ),
+        "namespace_ready_failure_stage": project_stage(
+            "namespace_ready_failure_stage",
+            frozenset(load_runtime.NAMESPACE_STARTUP_FAILURE_STAGES),
+        ),
+        "namespace_post_ready_failure_stage": project_stage(
+            "namespace_post_ready_failure_stage",
+            frozenset(load_runtime.NAMESPACE_STARTUP_FAILURE_STAGES),
+        ),
+        "watchdog_startup_failure_stage": project_stage(
+            "watchdog_startup_failure_stage",
+            load_runtime.WATCHDOG_STARTUP_FAILURE_STAGES,
         ),
     }
 
@@ -2415,6 +2446,9 @@ def _parent_outcome_fingerprint(
         ("namespace_closed", "supervisor_namespace_closed"),
         ("return_code", "supervisor_return_code"), ("signal", "supervisor_signal"),
         ("startup_failure_stage", "supervisor_startup_failure_stage"),
+        ("namespace_ready_failure_stage", "supervisor_namespace_ready_failure_stage"),
+        ("namespace_post_ready_failure_stage", "supervisor_namespace_post_ready_failure_stage"),
+        ("watchdog_startup_failure_stage", "supervisor_watchdog_startup_failure_stage"),
     ):
         fingerprint[destination] = evidence[source]
     return fingerprint
@@ -2693,6 +2727,15 @@ def main(argv: list[str] | None = None) -> int:
                 "supervisor_return_code": evidence["return_code"],
                 "supervisor_signal": evidence["signal"],
                 "supervisor_startup_failure_stage": evidence["startup_failure_stage"],
+                "supervisor_namespace_ready_failure_stage": evidence[
+                    "namespace_ready_failure_stage"
+                ],
+                "supervisor_namespace_post_ready_failure_stage": evidence[
+                    "namespace_post_ready_failure_stage"
+                ],
+                "supervisor_watchdog_startup_failure_stage": evidence[
+                    "watchdog_startup_failure_stage"
+                ],
             })
         print(json.dumps(failure_fingerprint, sort_keys=True, separators=(",", ":")))
         return 2

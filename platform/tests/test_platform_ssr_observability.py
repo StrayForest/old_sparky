@@ -194,7 +194,14 @@ class SsrObservabilityTests(unittest.TestCase):
     def test_ssr_summary_correlates_sampled_stages_without_serializing_ids_or_uris(self) -> None:
         web_lines = [
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=auth_bootstrap_fetch duration_ms=12.000 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=internal_read_admission_wait duration_ms=0.025 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=auth_http_fetch duration_ms=7.000 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=auth_body_parse duration_ms=0.250 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=auth_projection duration_ms=0.050 outcome=ok",
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=tournament_workspace duration_ms=80.000 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=workspace_http_fetch duration_ms=60.000 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=workspace_body_parse duration_ms=4.000 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=workspace_projection duration_ms=2.000 outcome=ok",
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=tournament_detail_data_ready duration_ms=90.000 outcome=ok",
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=page_component duration_ms=110.000 outcome=ok",
             "ssr_event_loop p50_ms=1.000 p95_ms=4.000 max_ms=8.000 mean_ms=2.000",
@@ -230,6 +237,13 @@ class SsrObservabilityTests(unittest.TestCase):
             correlated["stage_ms"]["tournament_workspace"]["p50_ms"],
             80.0,
         )
+        self.assertEqual(
+            correlated["stage_ms"]["internal_read_admission_wait"]["p50_ms"],
+            0.025,
+        )
+        self.assertEqual(correlated["stage_ms"]["workspace_http_fetch"]["p50_ms"], 60.0)
+        self.assertEqual(correlated["stage_ms"]["workspace_body_parse"]["p50_ms"], 4.0)
+        self.assertEqual(correlated["stage_ms"]["workspace_projection"]["p50_ms"], 2.0)
         self.assertEqual(correlated["stage_ms"]["page_component"]["p50_ms"], 110.0)
         self.assertEqual(
             correlated["unattributed_upstream_after_data_ms"]["p50_ms"],
