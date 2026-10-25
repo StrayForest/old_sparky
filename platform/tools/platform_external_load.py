@@ -861,6 +861,16 @@ class RunnerCgroupSampler:
 
     SAMPLE_INTERVAL_SECONDS = 5.0
     SAMPLE_LIMIT = 4096
+    IDENTITY_FIELDS = (
+        "outer_pid_namespace_matches_pid1",
+        "outer_mount_namespace_matches_pid1",
+        "outer_cgroup_namespace_matches_pid1",
+        "target_cgroup_namespace_matches_outer",
+        "target_mount_namespace_is_isolated",
+        "target_pid_namespace_is_isolated",
+        "global_cgroup2_mount",
+        "workload_membership_matches_outer",
+    )
 
     def __init__(self, *, runner_environment: str | None) -> None:
         self._runner_environment = runner_environment
@@ -877,7 +887,9 @@ class RunnerCgroupSampler:
         self._target_namespaces: dict[str, tuple[int, int]] = {}
         self._initial: dict[str, Any] | None = None
         self._outer_identity: dict[str, tuple[int, int]] = {}
-        self._identity: dict[str, bool] = {}
+        # Keep even an early-stop / pre-init report inside the closed schema.
+        # start() replaces these unknown measurements with observed booleans.
+        self._identity: dict[str, bool] = {field: False for field in self.IDENTITY_FIELDS}
 
     @staticmethod
     def _namespace_identity(path: str) -> tuple[int, int]:

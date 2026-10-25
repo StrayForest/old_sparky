@@ -60,6 +60,34 @@ CPU_WINDOW_TOLERANCE_NS = 500_000_000
 PLAN_EXPIRY_SKEW_MARGIN_MS = 9_000
 PLAN_EXPIRY_HORIZON_MS = 97_000
 PLAN_EXPIRY_WAIT_LIMIT_MS = 107_000
+SANITIZER_FAILURE_STAGES = frozenset({
+    "manifest_read", "report_read", "report_projection", "report_binding", "output_write",
+})
+SANITIZER_FAILURE_REASONS = frozenset({
+    "manifest_unavailable", "report_unavailable", "report_metadata_rejected",
+    "report_changed", "report_noncanonical", "report_parse_rejected",
+    "report_projection_rejected", "runner_identity_shape", "report_binding_rejected",
+    "output_write_failed", "unexpected",
+})
+RUNNER_CONTEXT_REASONS = frozenset({
+    "missing", "none",
+    "trusted_runner_context_unavailable", "workload_identity_changed",
+    "workload_cgroup_mismatch", "runner_namespace_binding_invalid",
+    "runner_cgroup_snapshot_incomplete", "runner_cgroup_identity_changed",
+    "runner_context_unavailable", "runner_final_snapshot_invalid",
+    "runner_samples_incomplete", "runner_hierarchy_changed",
+    "runner_cpuset_incomplete", "runner_cpu_quota_changed",
+    "runner_cpu_quota_incomplete", "runner_sample_clock_invalid",
+    "runner_cpu_stat_incomplete", "runner_cpu_counter_reset",
+    "runner_throttle_evidence_unavailable", "runner_phase_window_invalid",
+    "runner_phase_samples_incomplete", "runner_membership_changed",
+    "runner_sample_limit", "runner_sampler_join_timeout", "runner_snapshot_invalid",
+})
+SUPERVISOR_REASONS = frozenset({
+    "none", "max_duration_seconds", "max_runner_minutes", "namespace_unavailable",
+    "namespace_start_failed", "external_signal", "worker_failed", "worker_signal",
+    "namespace_unclosed", "supervisor_error",
+})
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_RE = re.compile(r"^[0-9a-f]{32}$")
 ATTEMPT_RE = re.compile(r"^[1-9][0-9]{0,8}$")
@@ -106,6 +134,14 @@ class _RemoteCapacityPlanError(ValueError):
         self.expires_at_ms = expires_at_ms
         self.plan_created_at_ms = plan_created_at_ms
         self.plan_created_monotonic = plan_created_monotonic
+
+
+class _CapacitySanitizationError(ValueError):
+    """A closed sanitizer failure record; never carries untrusted text."""
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        super().__init__("capacity report validation failed")
+        self.payload = dict(payload)
 
 
 class _RemoteMemoryWatcher:
@@ -929,6 +965,7 @@ def worker_entrypoint() -> int:
 
 def run_isolated_capacity_worker(
     *,
+    stage_state: dict[str, Any],
     capacity_config: Mapping[str, Any],
     worker_report_path: Path,
     supervisor_report_path: Path,
@@ -991,6 +1028,15 @@ def run_isolated_capacity_worker(
         on_namespace_init=on_namespace_init,
         on_namespace_exit=on_namespace_exit,
     )
+    reason = getattr(result, "reason", None)
+    stage_state["supervisor_evidence"] = _project_supervisor_evidence({
+        "reason": reason,
+        "worker_started": getattr(result, "worker_started", None),
+        "worker_exited": getattr(result, "worker_exited", None),
+        "namespace_closed": getattr(result, "namespace_closed", None),
+        "return_code": getattr(result, "returncode", None),
+        "signal": getattr(result, "signal", None),
+    })
     if not watcher_summary:
         watcher_summary.append(watcher.stop())
     if not runner_summary:
@@ -999,7 +1045,7 @@ def run_isolated_capacity_worker(
         worker_payload, _worker_report_error = load_runtime._read_closed_report(worker_report_path)
     except (OSError, UnicodeError, json.JSONDecodeError):
         worker_payload = None
-    namespace_closed = result.namespace_closed is True and result.reason == "none"
+    namespace_closed = result.namespace_closed is True and reason == "none"
     valid_worker = _worker_report_matches(worker_payload, capacity_config)
     memory = watcher_summary[0]
     if memory.get("memory_events_sampled_max_delta") == {}:
@@ -1745,6 +1791,7 @@ def _parent_run(
         try:
             outcome = run_isolated_capacity_worker(
                 capacity_config=capacity_config,
+                stage_state=state,
                 worker_report_path=worker_report,
                 supervisor_report_path=supervisor_report,
                 source_sha=args.source_sha,
@@ -2225,17 +2272,166 @@ def evaluate_capacity_report(
     return "PASS"
 
 
+def _safe_json_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "boolean"
+    if type(value) is int:
+        return "integer"
+    if type(value) is float:
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "other"
+
+
+def _sanitization_failure(
+    stage: str, reason: str, *, value: Any = None,
+) -> _CapacitySanitizationError:
+    """Describe only allowlisted structure, never values or unexpected keys."""
+
+    stage = stage if stage in SANITIZER_FAILURE_STAGES else "report_projection"
+    reason = reason if reason in SANITIZER_FAILURE_REASONS else "unexpected"
+    section = "report"
+    field = "report_shape"
+    observed: Any = value
+    present = value is not None
+    if reason == "runner_identity_shape" and isinstance(value, dict):
+        section = "runner_headroom"
+        field = "identity"
+        runner = value.get("runner_headroom")
+        present = isinstance(runner, dict) and "identity" in runner
+        observed = runner.get("identity") if isinstance(runner, dict) else None
+    return _CapacitySanitizationError({
+        "status": "invalid",
+        "stage": stage,
+        "reason": reason,
+        "section": section,
+        "field": field,
+        "present": present,
+        "value_type": _safe_json_type(observed),
+        "binding_status": "unknown",
+        "matrix_credit": False,
+        "slo_credit": False,
+        "diagnostic_credit": False,
+    })
+
+
+def _projection_rejection_reason(value: Any) -> str:
+    """Recognize one known producer mismatch without relaxing projection."""
+
+    if isinstance(value, dict):
+        runner = value.get("runner_headroom")
+        if isinstance(runner, dict) and set(runner) == {
+            "schema", "status", "reason", "runner_environment", "identity", "sample_count",
+            "window_seconds", "effective_cpu_capacity_cores", "max_cgroup_cpu_usage_cores",
+            "max_visible_throttled_periods_delta", "window_scope",
+            "window_start_offset_ms", "window_end_offset_ms",
+        }:
+            identity = runner.get("identity")
+            expected_identity = {
+                "outer_pid_namespace_matches_pid1", "outer_mount_namespace_matches_pid1",
+                "outer_cgroup_namespace_matches_pid1", "target_cgroup_namespace_matches_outer",
+                "target_mount_namespace_is_isolated", "target_pid_namespace_is_isolated",
+                "global_cgroup2_mount", "workload_membership_matches_outer",
+            }
+            if (not isinstance(identity, dict) or set(identity) != expected_identity
+                    or any(type(item) is not bool for item in identity.values())):
+                return "runner_identity_shape"
+    return "report_projection_rejected"
+
+
+def _project_supervisor_evidence(value: Any) -> dict[str, Any]:
+    evidence = value if isinstance(value, Mapping) else {}
+    reason = evidence.get("reason")
+    return {
+        "reason": reason if isinstance(reason, str) and reason in SUPERVISOR_REASONS else "other",
+        "worker_started": evidence.get("worker_started")
+        if type(evidence.get("worker_started")) is bool else None,
+        "worker_exited": evidence.get("worker_exited")
+        if type(evidence.get("worker_exited")) is bool else None,
+        "namespace_closed": evidence.get("namespace_closed")
+        if type(evidence.get("namespace_closed")) is bool else None,
+        "return_code": evidence.get("return_code")
+        if type(evidence.get("return_code")) is int and -255 <= evidence["return_code"] <= 255 else None,
+        "signal": evidence.get("signal")
+        if type(evidence.get("signal")) is int and 1 <= evidence["signal"] <= 255 else None,
+    }
+
+
+def _parent_outcome_fingerprint(
+    outcome: Mapping[str, Any], supervisor_evidence: Any = None,
+) -> dict[str, Any]:
+    worker = outcome.get("worker")
+    worker_status = worker.get("status") if isinstance(worker, dict) else "missing"
+    if (not isinstance(worker_status, str)
+            or worker_status not in {"complete", "incomplete", "failed", "missing"}):
+        worker_status = "invalid"
+    runner = outcome.get("runner_headroom")
+    runner_status = runner.get("status") if isinstance(runner, dict) else "missing"
+    if (not isinstance(runner_status, str)
+            or runner_status not in {"complete", "unknown", "missing"}):
+        runner_status = "invalid"
+    runner_reason = runner.get("reason") if isinstance(runner, dict) else "missing"
+    if not isinstance(runner_reason, str) or runner_reason not in RUNNER_CONTEXT_REASONS:
+        runner_reason = "other"
+    namespace_closed = outcome.get("namespace_closed")
+    if type(namespace_closed) is not bool:
+        namespace_closed = None
+    cleanup = outcome.get("remote_plan_cleanup")
+    if (not isinstance(cleanup, str)
+            or cleanup not in {"complete", "failed", "not_attempted"}):
+        cleanup = "invalid"
+    fingerprint = {
+        "status": "incomplete",
+        "stage": "parent_outcome",
+        "reason": "capacity_report_incomplete",
+        "namespace_closed": namespace_closed,
+        "worker_present": isinstance(worker, dict),
+        "worker_status": worker_status,
+        "runner_status": runner_status,
+        "runner_context_reason": runner_reason,
+        "remote_plan_cleanup": cleanup,
+        "matrix_credit": False,
+        "slo_credit": False,
+        "diagnostic_credit": False,
+    }
+    evidence = _project_supervisor_evidence(supervisor_evidence)
+    for source, destination in (
+        ("reason", "supervisor_reason"), ("worker_started", "supervisor_worker_started"),
+        ("worker_exited", "supervisor_worker_exited"),
+        ("namespace_closed", "supervisor_namespace_closed"),
+        ("return_code", "supervisor_return_code"), ("signal", "supervisor_signal"),
+    ):
+        fingerprint[destination] = evidence[source]
+    return fingerprint
+
+
 def sanitize_capacity_report(
     *, input_path: Path, output_path: Path, manifest_path: Path,
     source_sha: str, app_target_sha: str, run_id: str, attempt: str,
 ) -> str:
-    manifest_raw, manifest, _actors = _read_manifest(manifest_path)
-    before = input_path.lstat()
+    try:
+        manifest_raw, manifest, _actors = _read_manifest(manifest_path)
+    except Exception:
+        raise _sanitization_failure("manifest_read", "manifest_unavailable") from None
+    try:
+        before = input_path.lstat()
+    except OSError:
+        raise _sanitization_failure("report_read", "report_unavailable") from None
     if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
             or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600
             or before.st_size <= 0 or before.st_size > 256 * 1024):
-        raise ValueError("capacity report input metadata rejected")
-    fd = os.open(input_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        raise _sanitization_failure("report_read", "report_metadata_rejected")
+    try:
+        fd = os.open(input_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError:
+        raise _sanitization_failure("report_read", "report_unavailable") from None
     try:
         opened = os.fstat(fd)
         raw = os.read(fd, 256 * 1024 + 1)
@@ -2248,7 +2444,7 @@ def sanitize_capacity_report(
             != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
             or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
             != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)):
-        raise ValueError("capacity report input changed")
+        raise _sanitization_failure("report_read", "report_changed")
     def reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, item in pairs:
@@ -2257,11 +2453,15 @@ def sanitize_capacity_report(
             result[key] = item
         return result
 
-    value = json.loads(raw[:-1].decode("ascii"), object_pairs_hook=reject_duplicate_pairs)
-    if json.dumps(
-        value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"),
-    ).encode("ascii") + b"\n" != bytes(raw):
-        raise ValueError("capacity report is not canonical")
+    try:
+        value = json.loads(raw[:-1].decode("ascii"), object_pairs_hook=reject_duplicate_pairs)
+        canonical = json.dumps(
+            value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"),
+        ).encode("ascii") + b"\n"
+    except Exception:
+        raise _sanitization_failure("report_read", "report_parse_rejected") from None
+    if canonical != bytes(raw):
+        raise _sanitization_failure("report_read", "report_noncanonical")
     failure_receipt = _project_parent_failure_receipt(value)
     if failure_receipt is not None:
         if any((
@@ -2272,7 +2472,9 @@ def sanitize_capacity_report(
             manifest.get("runner_sha") != source_sha,
             manifest.get("app_target_sha") != app_target_sha,
         )):
-            raise ValueError("capacity failure receipt binding rejected")
+            failure = _sanitization_failure("report_binding", "report_binding_rejected")
+            failure.payload["binding_status"] = "rejected"
+            raise failure
         actual_manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
         if failure_receipt["fixture_manifest_sha256"] is None:
             failure_receipt = {
@@ -2281,8 +2483,13 @@ def sanitize_capacity_report(
                 "fixture_manifest_bytes": len(manifest_raw),
             }
         elif failure_receipt["fixture_manifest_sha256"] != actual_manifest_sha:
-            raise ValueError("capacity failure receipt manifest binding rejected")
-        _write_report(output_path, failure_receipt)
+            failure = _sanitization_failure("report_binding", "report_binding_rejected")
+            failure.payload["binding_status"] = "rejected"
+            raise failure
+        try:
+            _write_report(output_path, failure_receipt)
+        except Exception:
+            raise _sanitization_failure("output_write", "output_write_failed") from None
         return "INVALID"
     projected = _project_capacity_report(value)
     if (projected is None or projected.get("source_sha") != source_sha
@@ -2292,8 +2499,16 @@ def sanitize_capacity_report(
             or projected.get("fixture_manifest_sha256") != hashlib.sha256(manifest_raw).hexdigest()
             or manifest.get("runner_sha") != source_sha
             or manifest.get("app_target_sha") != app_target_sha):
-        raise ValueError("capacity report binding rejected")
-    _write_report(output_path, projected)
+        if projected is None:
+            reason = _projection_rejection_reason(value)
+            raise _sanitization_failure("report_projection", reason, value=value)
+        failure = _sanitization_failure("report_binding", "report_binding_rejected")
+        failure.payload["binding_status"] = "rejected"
+        raise failure
+    try:
+        _write_report(output_path, projected)
+    except Exception:
+        raise _sanitization_failure("output_write", "output_write_failed") from None
     return evaluate_capacity_report(
         projected, source_sha=source_sha, app_target_sha=app_target_sha,
         run_id=run_id, attempt=attempt,
@@ -2332,7 +2547,13 @@ def main(argv: list[str] | None = None) -> int:
                 attempt=args.external_run_attempt,
             )
         except Exception as exc:
-            print(json.dumps({"status": "invalid", "error_class": type(exc).__name__}, sort_keys=True))
+            if isinstance(exc, _CapacitySanitizationError):
+                diagnostic = exc.payload
+            else:
+                diagnostic = _sanitization_failure(
+                    "report_read", "unexpected",
+                ).payload
+            print(json.dumps(diagnostic, sort_keys=True, separators=(",", ":")))
             return 2
         print(decision)
         return 0
@@ -2451,11 +2672,24 @@ def main(argv: list[str] | None = None) -> int:
                     _write_report(Path(args.report), receipt)
             except Exception:
                 pass
-        print(json.dumps({
+        failure_fingerprint = {
             "status": "incomplete", "error_class": error_class, "stage": stage,
-        }, sort_keys=True))
+        }
+        if isinstance(stage_state.get("supervisor_evidence"), Mapping):
+            evidence = _project_supervisor_evidence(stage_state["supervisor_evidence"])
+            failure_fingerprint.update({
+                f"supervisor_{key}": value for key, value in evidence.items()
+            })
+        print(json.dumps(failure_fingerprint, sort_keys=True, separators=(",", ":")))
         return 2
-    return 0 if outcome.get("passed") is True else 2
+    if outcome.get("passed") is True:
+        return 0
+    print(json.dumps(
+        _parent_outcome_fingerprint(
+            outcome, stage_state.get("supervisor_evidence"),
+        ), sort_keys=True, separators=(",", ":"),
+    ))
+    return 2
 
 
 if __name__ == "__main__":

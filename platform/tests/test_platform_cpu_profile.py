@@ -692,51 +692,136 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 )
             no_sleep.assert_not_called()
 
-            class FakeRunnerSampler:
-                def __init__(self, **_kwargs):
-                    pass
-
-                def start(self, *_args):
-                    raise AssertionError("namespace callback must not run")
-
-                def stop(self, **_kwargs):
-                    return {
-                        "schema": 1, "status": "unknown", "reason": "parent_error",
-                        "runner_environment": "unknown",
-                        "identity": {key: False for key in (
-                            "outer_pid_namespace_matches_pid1", "outer_mount_namespace_matches_pid1",
-                            "outer_cgroup_namespace_matches_pid1", "target_cgroup_namespace_matches_outer",
-                            "target_mount_namespace_is_isolated", "target_pid_namespace_is_isolated",
-                            "global_cgroup2_mount", "workload_membership_matches_outer",
-                        )},
-                        "sample_count": 0, "window_seconds": None,
-                        "effective_cpu_capacity_cores": None,
-                        "max_cgroup_cpu_usage_cores": None,
-                        "max_visible_throttled_periods_delta": None,
-                        "window_scope": "on_window", "window_start_offset_ms": None,
-                        "window_end_offset_ms": None,
-                    }
-
             producer_report = root / "namespace-open-parent-report.json"
             sanitized_report = root / "namespace-open-sanitized.json"
             with (
                 patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
                 patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
-                patch.object(capacity_diagnostic.external_load, "RunnerCgroupSampler", FakeRunnerSampler),
                 patch.object(
                     capacity_diagnostic.load_runtime, "run_supervised",
-                    return_value=SimpleNamespace(namespace_closed=False, reason="namespace_not_closed"),
+                    return_value=SimpleNamespace(
+                        namespace_closed=False, reason="namespace_unavailable",
+                        worker_started=False, worker_exited=False,
+                        returncode=None, signal=None,
+                    ),
                 ),
                 patch.object(capacity_diagnostic, "_cleanup_remote_capacity_plan") as no_namespace_cleanup,
             ):
-                composed = capacity_diagnostic._parent_run(Namespace(**vars(args)))
+                stage_state: dict[str, object] = {}
+                composed = capacity_diagnostic._parent_run(
+                    Namespace(**vars(args)), stage_state,
+                )
             no_namespace_cleanup.assert_not_called()
             self.assertFalse(composed["namespace_closed"])
             self.assertFalse(composed["passed"])
             self.assertEqual(composed["remote_plan_cleanup"], "failed")
+            self.assertEqual(composed["runner_headroom"]["status"], "unknown")
+            self.assertEqual(composed["runner_headroom"]["reason"], "runner_context_unavailable")
+            self.assertEqual(set(composed["runner_headroom"]["identity"]), set(
+                external_load.RunnerCgroupSampler.IDENTITY_FIELDS
+            ))
+            self.assertFalse(any(composed["runner_headroom"]["identity"].values()))
             self.assertEqual(composed["memory_guard"]["memory_events_sampled_max_delta"], None)
             self.assertEqual(composed["server_telemetry"]["node_memory_reason"], "unavailable")
             self.assertIsNotNone(capacity_diagnostic._project_capacity_report(composed))
+            self.assertEqual(stage_state["supervisor_evidence"], {
+                "reason": "namespace_unavailable", "worker_started": False,
+                "worker_exited": False, "namespace_closed": False,
+                "return_code": None, "signal": None,
+            })
+            preinit_fingerprint = capacity_diagnostic._parent_outcome_fingerprint(
+                composed, stage_state["supervisor_evidence"],
+            )
+            started_fingerprint = capacity_diagnostic._parent_outcome_fingerprint(
+                composed, {
+                    "reason": "namespace_unclosed", "worker_started": True,
+                    "worker_exited": True, "namespace_closed": False,
+                    "return_code": 2, "signal": None,
+                },
+            )
+            self.assertFalse(preinit_fingerprint["supervisor_worker_started"])
+            self.assertTrue(started_fingerprint["supervisor_worker_started"])
+            self.assertEqual(started_fingerprint["supervisor_reason"], "namespace_unclosed")
+            self.assertNotEqual(preinit_fingerprint, started_fingerprint)
+            self.assertEqual(capacity_diagnostic._project_supervisor_evidence({
+                "reason": "supervisor_error",
+            })["reason"], "supervisor_error")
+            fingerprint_text = json.dumps(preinit_fingerprint, sort_keys=True)
+            self.assertNotIn("private worker detail", fingerprint_text)
+            self.assertNotIn(str(root), fingerprint_text)
+
+            parent_cli_report = root / "parent-cli-report.json"
+            parent_cli_stdout = io.StringIO()
+            with (
+                patch.object(
+                    capacity_diagnostic, "_read_manifest",
+                    return_value=(manifest_raw, manifest, actors),
+                ),
+                patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
+                patch.object(
+                    capacity_diagnostic.load_runtime, "run_supervised",
+                    return_value=SimpleNamespace(
+                        namespace_closed=False, reason="namespace_unclosed",
+                        worker_started=True, worker_exited=True,
+                        returncode=7, signal=None,
+                    ),
+                ),
+                redirect_stdout(parent_cli_stdout),
+            ):
+                self.assertEqual(capacity_diagnostic.main([
+                    "parent", "--manifest", str(manifest_path),
+                    "--report", str(parent_cli_report),
+                    "--source-sha", "a" * 40, "--app-target-sha", "b" * 40,
+                    "--external-run-id", "12345", "--external-run-attempt", "1",
+                    "--concurrency", "8", "--ssh-config", str(ssh_dir / "config"),
+                    "--ssh-key", str(ssh_dir / "id_ed25519"),
+                    "--ssh-host", "example.test", "--ssh-user", "deploy",
+                ]), 2)
+            parent_cli_marker = json.loads(parent_cli_stdout.getvalue())
+            self.assertEqual(parent_cli_marker["supervisor_reason"], "namespace_unclosed")
+            self.assertTrue(parent_cli_marker["supervisor_worker_started"])
+            self.assertTrue(parent_cli_marker["supervisor_worker_exited"])
+            self.assertEqual(parent_cli_marker["supervisor_return_code"], 7)
+            self.assertFalse(parent_cli_marker["supervisor_namespace_closed"])
+            self.assertNotIn(str(root), parent_cli_stdout.getvalue())
+            self.assertNotIn("example.test", parent_cli_stdout.getvalue())
+            self.assertNotIn("id_ed25519", parent_cli_stdout.getvalue())
+            self.assertNotIn("private worker detail", parent_cli_stdout.getvalue())
+
+            def fail_after_supervisor(*, stage_state, **_kwargs):
+                stage_state["supervisor_evidence"] = {
+                    "reason": "worker_failed", "worker_started": True,
+                    "worker_exited": True, "namespace_closed": False,
+                    "return_code": 3, "signal": None,
+                }
+                raise RuntimeError("private worker detail")
+
+            exception_report = root / "exception-report.json"
+            exception_stdout = io.StringIO()
+            with (
+                patch.object(
+                    capacity_diagnostic, "_read_manifest",
+                    return_value=(manifest_raw, manifest, actors),
+                ),
+                patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
+                patch.object(capacity_diagnostic, "run_isolated_capacity_worker", side_effect=fail_after_supervisor),
+                redirect_stdout(exception_stdout),
+            ):
+                self.assertEqual(capacity_diagnostic.main([
+                    "parent", "--manifest", str(manifest_path),
+                    "--report", str(exception_report),
+                    "--source-sha", "a" * 40, "--app-target-sha", "b" * 40,
+                    "--external-run-id", "12345", "--external-run-attempt", "1",
+                    "--concurrency", "8", "--ssh-config", str(ssh_dir / "config"),
+                    "--ssh-key", str(ssh_dir / "id_ed25519"),
+                    "--ssh-host", "example.test", "--ssh-user", "deploy",
+                ]), 2)
+            exception_marker = json.loads(exception_stdout.getvalue())
+            self.assertEqual(exception_marker["supervisor_reason"], "worker_failed")
+            self.assertEqual(exception_marker["supervisor_return_code"], 3)
+            self.assertNotIn("private worker detail", exception_stdout.getvalue())
+            self.assertNotIn(str(root), exception_stdout.getvalue())
+
             capacity_diagnostic._write_report(producer_report, composed)
             with patch.object(
                 capacity_diagnostic, "_read_manifest",
@@ -754,6 +839,47 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertFalse(closed_failure["matrix_credit"])
             self.assertFalse(closed_failure["slo_credit"])
             self.assertFalse(closed_failure["diagnostic_credit"])
+
+            rejected_report = root / "rejected-report.json"
+            rejected_output = root / "rejected-public.json"
+            malformed = dict(composed)
+            malformed["runner_headroom"] = {
+                **composed["runner_headroom"], "identity": {},
+            }
+            capacity_diagnostic._write_report(rejected_report, malformed)
+            rejection_stdout = io.StringIO()
+            with (
+                patch.object(
+                    capacity_diagnostic, "_read_manifest",
+                    return_value=(manifest_raw, manifest, actors),
+                ),
+                redirect_stdout(rejection_stdout),
+            ):
+                self.assertEqual(capacity_diagnostic.main([
+                    "sanitize-report", "--input", str(rejected_report),
+                    "--output", str(rejected_output), "--manifest", str(manifest_path),
+                    "--source-sha", "a" * 40, "--app-target-sha", "b" * 40,
+                    "--external-run-id", "12345", "--external-run-attempt", "1",
+                ]), 2)
+            rejection = json.loads(rejection_stdout.getvalue())
+            self.assertEqual(rejection, {
+                "status": "invalid", "stage": "report_projection",
+                "reason": "runner_identity_shape", "section": "runner_headroom",
+                "field": "identity", "present": True, "value_type": "object",
+                "binding_status": "unknown", "matrix_credit": False,
+                "slo_credit": False, "diagnostic_credit": False,
+            })
+            self.assertFalse(rejected_output.exists())
+            self.assertNotIn(str(root), rejection_stdout.getvalue())
+            self.assertNotIn("example.test", rejection_stdout.getvalue())
+            self.assertNotIn("id_ed25519", rejection_stdout.getvalue())
+
+            parent_fingerprint = capacity_diagnostic._parent_outcome_fingerprint(composed)
+            self.assertEqual(parent_fingerprint["stage"], "parent_outcome")
+            self.assertFalse(parent_fingerprint["namespace_closed"])
+            self.assertFalse(parent_fingerprint["worker_present"])
+            self.assertEqual(parent_fingerprint["runner_context_reason"], "runner_context_unavailable")
+            self.assertEqual(parent_fingerprint["remote_plan_cleanup"], "failed")
 
     def test_ssr_capacity_evaluator_requires_complete_bound_zero_credit_evidence(self) -> None:
         report = {

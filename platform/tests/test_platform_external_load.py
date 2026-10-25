@@ -649,6 +649,8 @@ class ExternalLoadTests(unittest.TestCase):
         result = sampler.stop()
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(result["reason"], "trusted_runner_context_unavailable")
+        self.assertEqual(set(result["identity"]), set(sampler.IDENTITY_FIELDS))
+        self.assertFalse(any(result["identity"].values()))
 
     def test_runner_cgroup_sampler_requires_and_aggregates_stable_host_binding(self) -> None:
         sampler = external_load.RunnerCgroupSampler(runner_environment="github-hosted")
