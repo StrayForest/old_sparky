@@ -423,9 +423,6 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             revalidation_step["env"]["EXPECTED_SSR_CAPACITY_DIAGNOSTIC_ONLY"],
             "$" + "{{ inputs.ssr_capacity_diagnostic_only }}",
         )
-        self.assertIn("expected_fixture_kind != fixture_kind", handoff_revalidation)
-        self.assertIn("ssr_concurrency != expected_concurrency", handoff_revalidation)
-        self.assertIn("ssr_workload != expected_workload", handoff_revalidation)
         finalizer_handoff = _step_script(
             self.jobs["fixture-finalize"], "Revalidate finalizer handoffs",
         )
@@ -438,11 +435,6 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             finalizer_env["SSR_CAPACITY_WORKLOAD"],
             "${{ inputs.ssr_capacity_workload }}",
         )
-        self.assertIn('base_keys.add("ssr_capacity_concurrency")', finalizer_handoff)
-        self.assertIn('base_keys.add("ssr_capacity_workload")', finalizer_handoff)
-        self.assertIn('payload.get("ssr_capacity_concurrency") != expected_concurrency', finalizer_handoff)
-        self.assertIn('payload.get("ssr_capacity_workload") != expected_workload', finalizer_handoff)
-        self.assertIn('fixture_kind != expected_fixture_kind', finalizer_handoff)
         command_prefix = (
             '/usr/bin/python3 - "$input_path" "$TARGET_SHA" "$APP_TARGET_SHA" '
             '"$GITHUB_RUN_ID" "$RUNNER_TEMP/external-client/timeout-diagnostic-ids.json" '
@@ -520,6 +512,15 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             ).returncode,
             0,
         )
+        mismatched_workload = dict(html_handoff)
+        mismatched_workload["ssr_capacity_workload"] = "authenticated_workspace_read_capacity_v1"
+        self.assertNotEqual(
+            run_input_handoff(
+                mismatched_workload,
+                workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+            ).returncode,
+            0,
+        )
         wrong_concurrency = dict(html_handoff)
         wrong_concurrency["ssr_capacity_concurrency"] = "16"
         self.assertNotEqual(
@@ -552,6 +553,21 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             html_handoff, workload="authenticated_html_ssr_capacity_v1", concurrency="8",
         )
         self.assertEqual(accepted_html.returncode, 0, accepted_html.stderr)
+        mismatched_finalizer_concurrency = dict(html_handoff)
+        mismatched_finalizer_concurrency["ssr_capacity_concurrency"] = "16"
+        rejected_finalizer_concurrency = run_finalizer_handoff(
+            mismatched_finalizer_concurrency,
+            workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+        )
+        self.assertNotEqual(rejected_finalizer_concurrency.returncode, 0)
+        mismatched_finalizer_fixture = dict(html_handoff)
+        mismatched_finalizer_fixture["fixture_kind"] = "ssr_capacity_diagnostic_v1"
+        mismatched_finalizer_fixture.pop("ssr_capacity_workload")
+        rejected_finalizer_fixture = run_finalizer_handoff(
+            mismatched_finalizer_fixture,
+            workload="authenticated_html_ssr_capacity_v1", concurrency="8",
+        )
+        self.assertNotEqual(rejected_finalizer_fixture.returncode, 0)
         missing_html_binding = dict(html_handoff)
         missing_html_binding.pop("ssr_capacity_workload")
         rejected_missing_html_binding = run_finalizer_handoff(
