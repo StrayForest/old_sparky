@@ -482,6 +482,8 @@ The bounded memory-observer and typed-handoff correction uses **C11** `d6ba6ce08
 
 The SSR memory-row framing correction uses **C12** `fd190e146c81cd90e361dbdc64eaca50c4271de5` and pin-only **P12** `4e7534a6960919706b9df4c5c221948a0a4ff888`. C12 changes only the dispatcher within the 15-member closure: it validates and strips the fixed helper row prefix before parsing, while malformed rows remain fail-closed. P12 changes only that member digest and `host_tools_sha`; the exact 15-member closure and C10 renderer digest remain. C12/P12 select source only and do not establish installation or active host behavior; exact-P12 CI, signed preflight, approved provisioning and installed self-test are still required.
 
+The bounded SSR memory-watch lead heartbeat uses **C13** `eaac4337dab1ab75ce50eb160fafb37007630e3d` and pin-only **P13** `1449b0c18937bd6ebf81a641e0dd59e8eb5802a6`. C13 keeps the 250ms guard cadence through the pre-OFF lead; P13 updates only the CPU-plan digest and `host_tools_sha` in the unchanged 15-member closure. Source selection does not prove installation or active host behavior; exact-P13 CI, signed preflight, approved provisioning and installed self-test remain required.
+
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
    blocked.
