@@ -137,8 +137,24 @@ EXPORT_REMOVE_ERROR_CLASSES = frozenset({
     "worker_descriptors_unavailable", "worker_identity_malformed", "worker_identity_mismatch",
     "worker_identity_unavailable",
 })
-CAPACITY_MEMORY_WATCH_OUTPUT_CAP = 131_072
+# The fixed 130-second observer horizon at 250ms/sample admits at most 520
+# intervals; allow two framing/terminal rows. Both raw helper bytes and the
+# separately counted projected stream are bounded by this cap; projection
+# reserves a fixed marker allowance and the parent has its own stream cap.
+CAPACITY_MEMORY_WATCH_OUTPUT_CAP = 2 * 1024 * 1024
 CAPACITY_MEMORY_WATCH_LINE_CAP = 2048
+CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS = 130
+CAPACITY_MEMORY_WATCH_ERROR_RESERVE = 256
+CAPACITY_MEMORY_WATCH_ROW_PREFIX = "CAPACITY_MEMORY_GUARD "
+CAPACITY_MEMORY_WATCH_ERROR_PREFIX = "CAPACITY_MEMORY_GUARD_ERROR "
+CAPACITY_MEMORY_WATCH_FAILURE_PAIRS = frozenset({
+    ("helper_validation", "refused"), ("helper_spawn", "spawn_error"),
+    ("input_write", "write_error"), ("watch_timeout", "timeout"),
+    ("helper_read", "read_error"), ("output_limit", "limit"),
+    ("row_framing", "malformed"), ("row_protocol", "malformed"),
+    ("helper_exit", "nonzero_exit"), ("helper_exit", "missing_terminal"),
+    ("helper_exit", "unexpected"), ("unknown", "unknown"),
+})
 CPU_USAGE_ROW_FIELDS = {
     "service", "phase", "expected_targets", "observed_targets", "event_count",
     "cpu_ns", "window_ms_min", "window_ms_max", "start_lag_ms_min",
@@ -944,7 +960,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 or set(result) != expected_keys
                 or result.get("status") != "expired_plans_removed"
                 or type(result.get("service_count")) is not int
-                or result["service_count"] not in {0, 2}
+                or result["service_count"] not in {0, 1, 2}
                 or result.get("usage_status") not in {"complete", "incomplete", "unavailable"}
                 or result.get("usage_reason") not in {
                     "none", "missing", "duplicate", "identity_changed", "journal_failed",
@@ -968,17 +984,30 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 or not isinstance(result.get("memory_rows"), list)
                 or len(result["memory_rows"]) not in {0, 2}
                 or (len(result["usage_rows"]) == 0 and not (
-                    result["service_count"] == 0
+                    result["service_count"] in {0, 1}
                     and result["usage_status"] == "unavailable"
                     and result["usage_reason"] == "missing"
                 ))
                 or (len(result["usage_rows"]) == 4 and result["service_count"] != 2)
                 or (len(result["profile_rows"]) == 0 and not (
-                    result["service_count"] == 0
+                    result["service_count"] in {0, 1}
                     and result["profile_status"] == "unavailable"
                     and result["profile_reason"] == "missing"
                 ))
                 or (len(result["profile_rows"]) == 2 and result["service_count"] != 2)
+                or (result["service_count"] in {0, 1} and not (
+                    result["usage_status"] == "unavailable"
+                    and result["usage_reason"] == "missing"
+                    and result["usage_rows"] == []
+                    and result["profile_status"] == "unavailable"
+                    and result["profile_reason"] == "missing"
+                    and result["profile_rows"] == []
+                    and result["memory_status"] == "unavailable"
+                    and result["memory_reason"] == "unavailable"
+                    and result["memory_rows"] == []
+                    and result["cgroup_memory_status"] == "unknown"
+                    and result["cgroup_memory_reason"] == "hierarchy_unavailable"
+                ))
             ):
                 return 2
             expected_rows = (
@@ -1224,9 +1253,23 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
 def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
     """Stream only the fixed, validated SSR cgroup memory-watch projection."""
 
-    if not _trusted_python_helper(CPU_DIAGNOSTIC_PLAN_HELPER):
-        print("CPU_DIAGNOSTIC_PLAN status=refused class=UntrustedHelper")
+    def emit_failure(stage: str, reason: str, process=None) -> int:
+        if process is not None and process.poll() is None:
+            _terminate_process_group(process)
+        if (stage, reason) not in CAPACITY_MEMORY_WATCH_FAILURE_PAIRS:
+            stage, reason = "unknown", "unknown"
+        marker = {"schema": 1, "stage": stage, "reason": reason}
+        marker_line = (
+            CAPACITY_MEMORY_WATCH_ERROR_PREFIX
+            + json.dumps(marker, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        )
+        if len(marker_line.encode("ascii")) + 1 > CAPACITY_MEMORY_WATCH_ERROR_RESERVE:
+            marker_line = CAPACITY_MEMORY_WATCH_ERROR_PREFIX + "{\"schema\":1,\"stage\":\"helper_exit\",\"reason\":\"malformed\"}"
+        print(marker_line, flush=True)
         return 2
+
+    if not _trusted_python_helper(CPU_DIAGNOSTIC_PLAN_HELPER):
+        return emit_failure("helper_validation", "refused")
     helper_payload = {
         "schema": payload["schema"], "run_id": payload["run_id"],
         "source_sha": payload["source_sha"], "workload": payload["workload"],
@@ -1242,14 +1285,20 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
             start_new_session=True, close_fds=True, umask=0o077,
         )
     except OSError:
-        return 2
+        return emit_failure("helper_spawn", "spawn_error")
     assert process.stdin is not None and process.stdout is not None
     selector = selectors.DefaultSelector()
     pending = bytearray()
     total = 0
+    projected_total = 0
     expected_sequence = 1
     terminal_seen = False
-    deadline = time.monotonic() + 55
+    # Plans permit up to a 60-second lead before the 20-second OFF window,
+    # followed by a 5-second idle gap and 20-second ON window. Keep a fixed
+    # bounded margin beyond that 105-second maximum horizon; the parent
+    # namespace supervisor still has its shorter 150-second hard deadline.
+    deadline = time.monotonic() + CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS
+    stage = "input_write"
     try:
         process.stdin.write(child_input)
         process.stdin.flush()
@@ -1258,32 +1307,39 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
         os.set_blocking(descriptor, False)
         selector.register(descriptor, selectors.EVENT_READ)
         eof = False
+        stage = "helper_read"
         while process.poll() is None or not eof:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _terminate_process_group(process)
-                return 124
-            for key, _mask in selector.select(min(remaining, 0.1)):
+                return emit_failure("watch_timeout", "timeout", process)
+            try:
+                ready = selector.select(min(remaining, 0.1))
+            except OSError:
+                return emit_failure("helper_read", "read_error", process)
+            for key, _mask in ready:
                 try:
                     chunk = os.read(key.fd, min(4096, CAPACITY_MEMORY_WATCH_OUTPUT_CAP + 1 - total))
                 except BlockingIOError:
                     continue
+                except OSError:
+                    return emit_failure("helper_read", "read_error", process)
                 if not chunk:
                     selector.unregister(key.fd)
                     eof = True
                     continue
                 total += len(chunk)
                 if total > CAPACITY_MEMORY_WATCH_OUTPUT_CAP:
-                    _terminate_process_group(process)
-                    return 2
+                    return emit_failure("output_limit", "limit", process)
                 pending.extend(chunk)
                 while b"\n" in pending:
                     line, _, rest = pending.partition(b"\n")
                     pending[:] = rest
                     if not line or len(line) > CAPACITY_MEMORY_WATCH_LINE_CAP:
-                        _terminate_process_group(process)
-                        return 2
-                    sample = _strict_baseline_json(line)
+                        return emit_failure("row_framing", "malformed", process)
+                    try:
+                        sample = _strict_baseline_json(line)
+                    except (ValueError, TypeError, UnicodeError):
+                        return emit_failure("row_protocol", "malformed", process)
                     expected_fields = {
                         "schema", "run_id", "source_sha", "workload", "sequence", "elapsed_ms",
                         "phase", "sampled_at_ms", "plan_off_start_ms", "plan_on_start_ms", "plan_on_end_ms",
@@ -1323,21 +1379,18 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
                             or type(sample.get("target_start_ticks")) is not int or sample["target_start_ticks"] <= 0
                             or not isinstance(sample.get("target_invocation_id"), str)
                             or re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f-]{36})", sample["target_invocation_id"]) is None):
-                        _terminate_process_group(process)
-                        return 2
+                        return emit_failure("row_protocol", "malformed", process)
                     for name in ("memory_current_bytes", "memory_peak_bytes", "memory_max_bytes"):
                         value = sample[name]
                         if value is not None and (type(value) is not int or value < 0):
-                            _terminate_process_group(process)
-                            return 2
+                            return emit_failure("row_protocol", "malformed", process)
                     events = sample.get("memory_events_delta")
                     if events is not None and (
                         not isinstance(events, dict)
                         or set(events) != {"low", "high", "max", "oom", "oom_kill", "oom_group_kill"}
                         or any(type(value) is not int or value < 0 for value in events.values())
                     ):
-                        _terminate_process_group(process)
-                        return 2
+                        return emit_failure("row_protocol", "malformed", process)
                     if ((sample["decision"] == "continue" and sample["reason"] != "none")
                             or (sample["decision"] == "complete" and (
                                 sample["reason"] != "none" or sample["identity_status"] != "complete"
@@ -1345,21 +1398,39 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
                             or (sample["decision"] == "abort" and sample["reason"] == "none")
                             or (sample["identity_status"] != "complete" and sample["decision"] != "abort")
                             or terminal_seen):
-                        _terminate_process_group(process)
-                        return 2
+                        return emit_failure("row_protocol", "malformed", process)
                     if sample["decision"] in {"abort", "complete"}:
                         terminal_seen = True
-                    print(
-                        "CAPACITY_MEMORY_GUARD "
-                        + json.dumps(sample, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
-                        flush=True,
+                    projected_line = (
+                        CAPACITY_MEMORY_WATCH_ROW_PREFIX
+                        + json.dumps(sample, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
                     )
+                    projected_bytes = projected_line.encode("ascii") + b"\n"
+                    if (projected_total + len(projected_bytes)
+                            + CAPACITY_MEMORY_WATCH_ERROR_RESERVE > CAPACITY_MEMORY_WATCH_OUTPUT_CAP):
+                        return emit_failure("output_limit", "limit", process)
+                    projected_total += len(projected_bytes)
+                    print(projected_line, flush=True)
                     expected_sequence += 1
-        return 0 if process.wait(timeout=0) == 0 and not pending and terminal_seen else 2
+        stage = "helper_exit"
+        try:
+            child_status = process.wait(timeout=0)
+        except subprocess.SubprocessError:
+            return emit_failure("helper_exit", "nonzero_exit", process)
+        if child_status != 0:
+            return emit_failure("helper_exit", "nonzero_exit")
+        if pending or not terminal_seen:
+            return emit_failure("helper_exit", "missing_terminal")
+        return 0
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
-        if process.poll() is None:
-            _terminate_process_group(process)
-        return 2
+        return emit_failure(
+            stage,
+            "write_error" if stage == "input_write"
+            else "read_error" if stage == "helper_read"
+            else "unexpected" if stage == "helper_exit"
+            else "malformed",
+            process,
+        )
     finally:
         selector.close()
         try:

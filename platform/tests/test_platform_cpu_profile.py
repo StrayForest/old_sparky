@@ -9,6 +9,7 @@ import sys
 import tempfile
 import stat
 import threading
+import textwrap
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import Future, ThreadPoolExecutor
 from argparse import Namespace
@@ -246,6 +247,436 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.assertEqual([row["elapsed_ms"] for row in rows], [0, 20_000, 45_000])
                 self.assertTrue(all(row["workload"] == workload for row in rows))
                 self.assertTrue(all(row["plan_on_start_ms"] == 27_000 for row in rows))
+
+        # One pipe read can contain several valid records whose aggregate
+        # size exceeds the per-record cap. Split before applying that cap,
+        # but still reject an oversized unterminated record.
+        def watcher_with_chunk() -> capacity_diagnostic._RemoteMemoryWatcher:
+            watcher = capacity_diagnostic._RemoteMemoryWatcher(
+                ssh_host="example.invalid", ssh_user="tester",
+                ssh_config=Path("/tmp/external-ssh/config"),
+                ssh_key=Path("/tmp/external-ssh/id_ed25519"),
+                control_path=Path("/tmp/capacity-control.json"), binding={},
+                run_id="a" * 32, source_sha="b" * 40,
+                expected_plan=(0, 25_000, 45_000),
+                workload=diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            )
+            watcher.process = SimpleNamespace(
+                stdout=SimpleNamespace(fileno=lambda: 47), poll=lambda: None,
+            )
+            watcher.selector = SimpleNamespace(
+                select=lambda _timeout: [(SimpleNamespace(fd=47), 1)],
+                unregister=lambda _fd: None,
+            )
+            return watcher
+
+        wire_prefix = capacity_diagnostic.REMOTE_WATCH_PREFIX
+        first_wire = wire_prefix + json.dumps(
+            {"sequence": 1, "padding": "x" * 1100}, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii") + b"\n"
+        second_wire = wire_prefix + json.dumps(
+            {"sequence": 2, "padding": "y" * 1100}, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii") + b"\n"
+        combined_wire = first_wire + second_wire
+        self.assertGreater(len(combined_wire), capacity_diagnostic.REMOTE_ROW_CAP)
+        coalesced = watcher_with_chunk()
+        with (
+            patch.object(capacity_diagnostic.os, "set_blocking"),
+            patch.object(capacity_diagnostic.os, "read", return_value=combined_wire),
+        ):
+            self.assertEqual(coalesced._read_row(1)["sequence"], 1)
+            self.assertEqual(coalesced._read_row(1)["sequence"], 2)
+
+        oversized_wire = wire_prefix + b"x" * (capacity_diagnostic.REMOTE_ROW_CAP + 1)
+        oversized_tail = watcher_with_chunk()
+        with (
+            patch.object(capacity_diagnostic.os, "set_blocking"),
+            patch.object(capacity_diagnostic.os, "read", return_value=oversized_wire),
+            self.assertRaisesRegex(ValueError, "row cap"),
+        ):
+            oversized_tail._read_row(1)
+
+        remote_error = {
+            "schema": 1, "stage": "helper_spawn", "reason": "spawn_error",
+        }
+        error_wire = (
+            capacity_diagnostic.REMOTE_WATCH_ERROR_PREFIX
+            + json.dumps(remote_error, sort_keys=True, separators=(",", ":")).encode("ascii")
+            + b"\n"
+        )
+        remote_failed = watcher_with_chunk()
+        remote_failed.process.wait = lambda timeout=None: 2
+        remote_failed.process.poll = lambda: 2
+        remote_failed.selector.close = lambda: None
+        with (
+            patch.object(capacity_diagnostic.os, "set_blocking"),
+            patch.object(capacity_diagnostic.os, "read", return_value=error_wire),
+            patch.object(capacity_diagnostic, "write_control"),
+        ):
+            remote_failed._consume()
+            remote_summary = remote_failed.stop()
+        self.assertEqual(remote_summary["status"], "incomplete")
+        self.assertEqual(remote_summary["failure_stage"], "sample_loop")
+        self.assertEqual(remote_summary["error_class"], "ValueError")
+        self.assertEqual(remote_summary["remote_failure_stage"], "helper_spawn")
+        self.assertEqual(remote_summary["remote_failure_reason"], "spawn_error")
+        self.assertNotIn("stderr", json.dumps(remote_summary))
+        self.assertNotIn("exception", json.dumps(remote_summary))
+
+        remote_refusal_output = io.StringIO()
+        with (
+            patch.object(remote_dispatch, "_trusted_python_helper", return_value=False),
+            redirect_stdout(remote_refusal_output),
+        ):
+            refusal_status = remote_dispatch._run_cpu_diagnostic_memory_watch({
+                "schema": 1, "run_id": "a" * 32, "source_sha": "b" * 40,
+                "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            })
+        self.assertEqual(refusal_status, 2)
+        refusal_line = remote_refusal_output.getvalue().strip()
+        self.assertTrue(refusal_line.startswith(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX))
+        refusal_marker = json.loads(
+            refusal_line[len(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX):],
+        )
+        self.assertEqual(refusal_marker, {
+            "schema": 1, "stage": "helper_validation", "reason": "refused",
+        })
+        self.assertNotIn("ssh", refusal_line.lower())
+        self.assertNotIn(str(Path("/")), refusal_line)
+
+        fallback_output = io.StringIO()
+        with (
+            patch.object(remote_dispatch, "_trusted_python_helper", return_value=False),
+            patch.object(remote_dispatch, "CAPACITY_MEMORY_WATCH_FAILURE_PAIRS", frozenset()),
+            redirect_stdout(fallback_output),
+        ):
+            fallback_status = remote_dispatch._run_cpu_diagnostic_memory_watch({
+                "schema": 1, "run_id": "a" * 32, "source_sha": "b" * 40,
+                "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            })
+        self.assertEqual(fallback_status, 2)
+        fallback_line = fallback_output.getvalue().strip()
+        self.assertTrue(fallback_line.startswith(
+            remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX,
+        ))
+        fallback_marker = json.loads(
+            fallback_line[len(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX):],
+        )
+        self.assertEqual(fallback_marker, {
+            "schema": 1, "stage": "unknown", "reason": "unknown",
+        })
+        fallback_watcher = watcher_with_chunk()
+        fallback_watcher.process.wait = lambda timeout=None: 2
+        fallback_watcher.process.poll = lambda: 2
+        fallback_watcher.selector.close = lambda: None
+        with (
+            patch.object(capacity_diagnostic.os, "set_blocking"),
+            patch.object(capacity_diagnostic.os, "read", return_value=(fallback_line + "\n").encode("ascii")),
+            patch.object(capacity_diagnostic, "write_control"),
+        ):
+            fallback_watcher._consume()
+            fallback_summary = fallback_watcher.stop()
+        self.assertEqual(fallback_summary["status"], "incomplete")
+        self.assertEqual(fallback_summary["remote_failure_stage"], "unknown")
+        self.assertEqual(fallback_summary["remote_failure_reason"], "unknown")
+
+        malformed_error = {
+            **remote_error, "private": "must-not-project",
+        }
+        malformed_wire = (
+            capacity_diagnostic.REMOTE_WATCH_ERROR_PREFIX
+            + json.dumps(malformed_error, sort_keys=True, separators=(",", ":")).encode("ascii")
+            + b"\n"
+        )
+        malformed_remote = watcher_with_chunk()
+        malformed_remote.process.wait = lambda timeout=None: 2
+        malformed_remote.process.poll = lambda: 2
+        malformed_remote.selector.close = lambda: None
+        with (
+            patch.object(capacity_diagnostic.os, "set_blocking"),
+            patch.object(capacity_diagnostic.os, "read", return_value=malformed_wire),
+            patch.object(capacity_diagnostic, "write_control"),
+        ):
+            malformed_remote._consume()
+            malformed_summary = malformed_remote.stop()
+        self.assertEqual(malformed_summary["status"], "incomplete")
+        self.assertIsNone(malformed_summary["remote_failure_stage"])
+        self.assertIsNone(malformed_summary["remote_failure_reason"])
+        self.assertNotIn("must-not-project", json.dumps(malformed_summary))
+
+        terminal_sample = {
+            "schema": 1, "run_id": "a" * 32, "source_sha": "b" * 40,
+            "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            "sequence": 1, "elapsed_ms": 45_000, "phase": "complete",
+            "sampled_at_ms": 45_000, "plan_off_start_ms": 0,
+            "plan_on_start_ms": 25_000, "plan_on_end_ms": 45_000,
+            "decision": "complete", "reason": "none",
+            "memory_current_bytes": 1024, "memory_peak_bytes": 2048,
+            "memory_max_bytes": diagnostic_plan_tool.SSR_CAPACITY_MEMORY_MAX_BYTES,
+            "memory_events_delta": {
+                "low": 0, "high": 0, "max": 0, "oom": 0,
+                "oom_kill": 0, "oom_group_kill": 0,
+            },
+            "target_pid": 345, "target_start_ticks": 123,
+            "target_invocation_id": "f" * 32, "identity_status": "complete",
+        }
+        terminal_wire = (
+            wire_prefix
+            + json.dumps(terminal_sample, sort_keys=True, separators=(",", ":")).encode("ascii")
+            + b"\n"
+        )
+
+        def consume_terminal_then_tail(chunks: list[bytes]):
+            trailing = watcher_with_chunk()
+            trailing.expected_plan = (0, 25_000, 45_000)
+            trailing.process.poll = lambda: 0
+            trailing.process.wait = lambda timeout=None: 0
+            trailing.selector.close = lambda: None
+            with (
+                patch.object(capacity_diagnostic.os, "set_blocking"),
+                patch.object(capacity_diagnostic.os, "read", side_effect=chunks),
+                patch.object(capacity_diagnostic, "write_control"),
+            ):
+                trailing._consume()
+                return trailing.stop()
+
+        same_read_marker = (
+            capacity_diagnostic.REMOTE_WATCH_ERROR_PREFIX
+            + b'{"reason":"missing_terminal","schema":1,"stage":"helper_exit"}\n'
+        )
+        same_read_failure = consume_terminal_then_tail([terminal_wire + same_read_marker])
+        self.assertEqual(same_read_failure["status"], "incomplete")
+        self.assertEqual(same_read_failure["failure_stage"], "terminal_drain")
+        self.assertEqual(same_read_failure["remote_failure_stage"], "unknown")
+        self.assertEqual(same_read_failure["remote_failure_reason"], "unexpected")
+
+        later_read_payload = wire_prefix + b'{"sequence":2}\n'
+        later_read_failure = consume_terminal_then_tail([
+            terminal_wire, later_read_payload,
+        ])
+        self.assertEqual(later_read_failure["status"], "incomplete")
+        self.assertEqual(later_read_failure["failure_stage"], "terminal_drain")
+        self.assertIsNone(later_read_failure["remote_failure_stage"])
+
+        preserved = watcher_with_chunk()
+        def fail_initial_read() -> None:
+            preserved._set_stage("first_row_read")
+            raise TimeoutError()
+
+        with patch.object(capacity_diagnostic, "write_control"):
+            with (
+                patch.object(preserved, "_start", side_effect=fail_initial_read),
+                self.assertRaises(TimeoutError),
+            ):
+                preserved.start()
+            preserved.fail_closed()
+            preserved_summary = preserved.stop()
+        self.assertEqual(preserved_summary["failure_stage"], "first_row_read")
+        self.assertEqual(preserved_summary["error_class"], "TimeoutError")
+
+        # Exercise the no-HTTP memory chain against temporary cgroup/systemd
+        # fixtures. The child producer advances the real fixed 250ms sampling
+        # loop with a controlled wall clock; the dispatcher uses a scaled
+        # monotonic clock so its actual deadline path sees the full horizon.
+        source_sha = "b" * 40
+        run_id = "a" * 32
+        off_start_ms = time.time_ns() // 1_000_000 + 60_000
+        plan = {
+            "off_start_ms": off_start_ms, "off_end_ms": off_start_ms + 20_000,
+            "on_start_ms": off_start_ms + 25_000, "on_end_ms": off_start_ms + 45_000,
+            "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+        }
+        unit = {
+            "ActiveState": "active", "InvocationID": "f" * 32,
+            "MainPID": "345", "ControlGroup": "/system.slice/deadlock-web.service",
+        }
+        target = {"pid": 345, "start_ticks": 1234567890, "invocation_id": "f" * 32}
+        pseudo_values = {
+            "memory.current": "1024", "memory.peak": "2048",
+            "memory.max": str(diagnostic_plan_tool.SSR_CAPACITY_MEMORY_MAX_BYTES),
+            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+        }
+        request = {
+            "schema": 1, "run_id": run_id, "source_sha": source_sha,
+            "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+        }
+        request_bytes = json.dumps(
+            request, sort_keys=True, separators=(",", ":"),
+        ).encode("ascii") + b"\n"
+
+        with tempfile.TemporaryDirectory(prefix="ssr-memory-chain-") as temporary:
+            root = Path(temporary)
+            os.chmod(root, 0o700)
+            ssh_dir = root / "external-ssh"
+            ssh_dir.mkdir(mode=0o700)
+            for name, content in (
+                ("config", b"fixed ssh config"),
+                ("id_ed25519", b"fixed test key"),
+                ("known_hosts", b"fixed host key"),
+            ):
+                path = ssh_dir / name
+                path.write_bytes(content)
+                path.chmod(0o600)
+
+            helper_path = root / "fake-sudo"
+            helper_source = textwrap.dedent(f"""\
+                #!{sys.executable}
+                import sys
+                import time
+                sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
+                from tools import platform_cpu_diagnostic_plan as plan_tool
+                plan = {plan!r}
+                unit = {unit!r}
+                target = {target!r}
+                values = {pseudo_values!r}
+                clock = {{"ms": plan["off_start_ms"] - 60_000}}
+                real_sleep = time.sleep
+                plan_tool.os.geteuid = lambda: 0
+                plan_tool._capacity_plan_identity = lambda _run, _sha: (unit, target, plan)
+                plan_tool._systemd_memory_max = lambda: plan_tool.SSR_CAPACITY_MEMORY_MAX_BYTES
+                plan_tool._systemd_unit = lambda _service, **_kw: unit
+                plan_tool._service_targets = lambda _service, _unit: [target]
+                plan_tool._read_cgroup_pseudo = lambda path, **_kw: values[path.name]
+                plan_tool.time.time_ns = lambda: clock["ms"] * 1_000_000
+                def fast_forward(seconds):
+                    clock["ms"] = min(plan["on_end_ms"], clock["ms"] + round(seconds * 1000))
+                    # 4.5ms real × the dispatcher's 60× monotonic scale
+                    # keeps the 105s virtual plan inside 130s but beyond 55s.
+                    real_sleep(0.0045)
+                plan_tool.time.sleep = fast_forward
+                raise SystemExit(plan_tool.main(["memory-watch-stdin"]))
+            """)
+            helper_path.write_text(helper_source, encoding="utf-8")
+            helper_path.chmod(0o700)
+
+            def dispatcher_source(*, timeout_seconds: int, output_cap: int) -> str:
+                return textwrap.dedent(f"""\
+                    import sys
+                    import time
+                    sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
+                    from tools import platform_workflow_remote_dispatch as dispatch
+                    real_monotonic = time.monotonic
+                    clock_start = real_monotonic()
+                    dispatch.time.monotonic = lambda: (real_monotonic() - clock_start) * 60
+                    dispatch.SUDO = {str(helper_path)!r}
+                    dispatch._trusted_python_helper = lambda _path: True
+                    dispatch.CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS = {timeout_seconds}
+                    dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP = {output_cap}
+                    raise SystemExit(dispatch.main(["cpu-diagnostic-memory-watch"]))
+                """)
+
+            def run_dispatcher_direct(*, timeout_seconds: int, output_cap: int):
+                return subprocess.run(
+                    [sys.executable, "-c", dispatcher_source(
+                        timeout_seconds=timeout_seconds, output_cap=output_cap,
+                    )],
+                    input=request_bytes, capture_output=True, check=False,
+                    env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+                )
+
+            short_timeout = run_dispatcher_direct(
+                timeout_seconds=55,
+                output_cap=remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP,
+            )
+            self.assertEqual(short_timeout.returncode, 2)
+            timeout_marker_line = short_timeout.stdout.splitlines()[-1]
+            self.assertTrue(timeout_marker_line.startswith(
+                remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii"),
+            ))
+            timeout_marker = json.loads(
+                timeout_marker_line[
+                    len(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii")):
+                ],
+            )
+            self.assertEqual(timeout_marker, {
+                "schema": 1, "stage": "watch_timeout", "reason": "timeout",
+            })
+            old_output_cap = run_dispatcher_direct(
+                timeout_seconds=130, output_cap=131_072,
+            )
+            self.assertEqual(old_output_cap.returncode, 2)
+            self.assertLessEqual(len(old_output_cap.stdout), 131_072)
+            self.assertTrue(old_output_cap.stdout.startswith(b"CAPACITY_MEMORY_GUARD "))
+            output_cap_marker_line = old_output_cap.stdout.splitlines()[-1]
+            self.assertTrue(output_cap_marker_line.startswith(
+                remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii"),
+            ))
+            output_cap_marker = json.loads(
+                output_cap_marker_line[
+                    len(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii")):
+                ],
+            )
+            self.assertEqual(output_cap_marker, {
+                "schema": 1, "stage": "output_limit", "reason": "limit",
+            })
+
+            full_dispatcher = dispatcher_source(
+                timeout_seconds=130,
+                output_cap=remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP,
+            )
+            real_popen = subprocess.Popen
+
+            def fake_ssh_popen(command, **kwargs):
+                self.assertEqual(command[-1], "cpu-diagnostic-memory-watch")
+                return real_popen([sys.executable, "-c", full_dispatcher], **kwargs)
+
+            binding = {
+                "run_id": run_id, "source_sha": source_sha, "app_target_sha": source_sha,
+                "profile_digest": capacity_diagnostic.profile_digest(8),
+                "external_run_id": "12345", "external_run_attempt": "1",
+            }
+            control_path = root / "capacity-control.json"
+            watcher = capacity_diagnostic._RemoteMemoryWatcher(
+                ssh_host="example.invalid", ssh_user="tester",
+                ssh_config=ssh_dir / "config", ssh_key=ssh_dir / "id_ed25519",
+                control_path=control_path, binding=binding,
+                run_id=run_id, source_sha=source_sha,
+                expected_plan=(plan["off_start_ms"], plan["on_start_ms"], plan["on_end_ms"]),
+                workload=diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            )
+            with patch.object(capacity_diagnostic.subprocess, "Popen", side_effect=fake_ssh_popen):
+                watcher.start()
+                self.assertGreaterEqual(watcher.samples, 1)
+                memory_result = watcher.stop()
+            self.assertEqual(memory_result["status"], "complete")
+            self.assertEqual(memory_result["terminal_decision"], "complete")
+            self.assertEqual(memory_result["terminal_reason"], "none")
+            self.assertGreaterEqual(memory_result["samples"], 180)
+            self.assertLessEqual(watcher.total, capacity_diagnostic.REMOTE_WATCH_CAP)
+
+            # The parent reader has the same cumulative-stream bound. Prove
+            # the previous bound rejects this actual full stream, while the
+            # line cap remains independently enforced by _read_row.
+            old_parent_watcher = capacity_diagnostic._RemoteMemoryWatcher(
+                ssh_host="example.invalid", ssh_user="tester",
+                ssh_config=ssh_dir / "config", ssh_key=ssh_dir / "id_ed25519",
+                control_path=root / "capacity-control-old-cap.json", binding=binding,
+                run_id=run_id, source_sha=source_sha,
+                expected_plan=(plan["off_start_ms"], plan["on_start_ms"], plan["on_end_ms"]),
+                workload=diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            )
+            with (
+                patch.object(capacity_diagnostic, "REMOTE_WATCH_CAP", 131_072),
+                patch.object(capacity_diagnostic.subprocess, "Popen", side_effect=fake_ssh_popen),
+            ):
+                old_parent_watcher.start()
+                old_parent_result = old_parent_watcher.stop()
+            self.assertEqual(old_parent_result["status"], "incomplete")
+            self.assertEqual(old_parent_result["terminal_reason"], "observer_failed")
+            self.assertLess(old_parent_result["samples"], memory_result["samples"])
+            maximum_rows = (130_000 + 249) // 250 + 2
+            parent_stream_bound = maximum_rows * (capacity_diagnostic.REMOTE_ROW_CAP + 1)
+            helper_stream_bound = maximum_rows * (
+                remote_dispatch.CAPACITY_MEMORY_WATCH_LINE_CAP + 1
+            )
+            self.assertGreaterEqual(
+                remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP, helper_stream_bound,
+            )
+            self.assertGreaterEqual(
+                capacity_diagnostic.REMOTE_WATCH_CAP, parent_stream_bound,
+            )
 
     def test_ssr_capacity_watch_rejects_non_root_before_reading_plan(self) -> None:
         with (
@@ -699,6 +1130,34 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             )
             self.assertFalse(refusal_fingerprint["passed"])
             self.assertFalse(refusal_fingerprint["diagnostic_credit"])
+            observer_fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+                {
+                    "status": "incomplete", "passed": False,
+                    "namespace_closed": False, "runner_headroom": {
+                        "status": "unknown", "reason": "runner_snapshot_unavailable",
+                    },
+                },
+                args=Namespace(
+                    source_sha="a" * 40, app_target_sha="b" * 40,
+                    external_run_id="12345", external_run_attempt="1",
+                    concurrency=8, workload=capacity_diagnostic.HTML_WORKLOAD,
+                ),
+                stage_state={
+                    "memory_observer_failure": {
+                        "failure_stage": "first_row_read",
+                        "error_class": "TimeoutError",
+                        "remote_failure_stage": "helper_spawn",
+                        "remote_failure_reason": "spawn_error",
+                    },
+                },
+            )
+            self.assertEqual(observer_fingerprint["memory_observer_failure"], {
+                "stage": "first_row_read", "error_class": "TimeoutError",
+                "remote_stage": "helper_spawn", "remote_reason": "spawn_error",
+            })
+            self.assertFalse(observer_fingerprint["namespace_closed"])
+            self.assertFalse(observer_fingerprint["diagnostic_credit"])
+            self.assertNotIn("example.test", json.dumps(observer_fingerprint))
             self.assertNotIn("example.test", refusal_stdout.getvalue())
             self.assertNotIn(str(root), refusal_stdout.getvalue())
             self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
@@ -3588,23 +4047,69 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 )
                 return result
 
+        def cleanup_dispatch_roundtrip(
+            cleanup_result: dict[str, object],
+            *, expected_dispatch_status: int = 0,
+        ) -> dict[str, object] | None:
+            """Run producer output through dispatcher and outer closed decoder."""
+            with tempfile.TemporaryDirectory() as temporary_dir:
+                root = Path(temporary_dir)
+                fake_sudo = root / "sudo-fixture"
+                helper_line = (
+                    "CPU_DIAGNOSTIC_PLAN "
+                    + json.dumps({
+                        "status": "expired_plans_removed", **cleanup_result,
+                    }, sort_keys=True, separators=(",", ":"))
+                    + "\\n"
+                )
+                fake_sudo.write_text(
+                    f"#!{sys.executable}\\n"
+                    "import sys\\n"
+                    "sys.stdin.buffer.read()\\n"
+                    f"sys.stdout.buffer.write({helper_line.encode('ascii')!r})\\n",
+                    encoding="ascii",
+                )
+                fake_sudo.chmod(0o700)
+                dispatcher_stdout = io.StringIO()
+                with (
+                    patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
+                    patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+                    redirect_stdout(dispatcher_stdout),
+                ):
+                    dispatch_status = remote_dispatch._run_cpu_diagnostic_plan({
+                        "operation": "cleanup", "schema": 1, "run_id": "d" * 32,
+                    })
+                self.assertEqual(
+                    dispatch_status, expected_dispatch_status, dispatcher_stdout.getvalue(),
+                )
+                if expected_dispatch_status != 0:
+                    self.assertEqual(dispatcher_stdout.getvalue(), "")
+                    return None
+                projected_line = dispatcher_stdout.getvalue().encode("ascii").strip()
+                prefix = b"CPU_DIAGNOSTIC_PLAN "
+                self.assertTrue(projected_line.startswith(prefix))
+                projected = cpu_pair._decode_canonical(
+                    projected_line[len(prefix):], cap=cpu_pair.ROOT_USAGE_OUTPUT_CAP,
+                )
+                validated = cpu_pair._validate_usage_summary(projected)
+                self.assertIsNotNone(validated)
+                return validated
+
+        empty_cleanup = cleanup_fixture(())
+        empty_validated = cleanup_dispatch_roundtrip(empty_cleanup)
+        self.assertEqual(empty_cleanup["service_count"], 0)
+        self.assertEqual(empty_validated["service_count"], 0)
         partial_cleanup = cleanup_fixture(("api",))
         self.assertEqual(partial_cleanup["service_count"], 1)
         self.assertEqual(partial_cleanup["usage_status"], "unavailable")
-        validated_partial = cpu_pair._validate_usage_summary(
-            {"status": "expired_plans_removed", **partial_cleanup}
-        )
-        self.assertIsNotNone(validated_partial)
+        validated_partial = cleanup_dispatch_roundtrip(partial_cleanup)
         self.assertEqual(validated_partial["service_count"], 1)
         self.assertIsNone(cpu_pair._usage_delta_percentage_points(validated_partial))
 
         fallback_cleanup = cleanup_fixture(("api", "web"), summary_raises=True)
         self.assertEqual(fallback_cleanup["service_count"], 2)
         self.assertEqual(fallback_cleanup["profile_status"], "incomplete")
-        validated_fallback = cpu_pair._validate_usage_summary(
-            {"status": "expired_plans_removed", **fallback_cleanup}
-        )
-        self.assertIsNotNone(validated_fallback)
+        validated_fallback = cleanup_dispatch_roundtrip(fallback_cleanup)
         self.assertEqual(validated_fallback["profile_status"], "incomplete")
         self.assertTrue(
             all(
@@ -3623,6 +4128,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         }
         self.assertTrue(partial_pair_as_single["usage_rows"])
         self.assertIsNone(cpu_pair._validate_usage_summary(partial_pair_as_single))
+        self.assertIsNone(cleanup_dispatch_roundtrip(
+            partial_pair_as_single, expected_dispatch_status=2,
+        ))
 
         complete_pair_as_single = json.loads(json.dumps(fallback_cleanup))
         complete_pair_as_single["usage_status"] = "complete"
@@ -3665,9 +4173,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "service_count": 2,
         }))
         complete_pair_as_single["service_count"] = 1
-        self.assertIsNone(cpu_pair._validate_usage_summary({
+        malformed_complete_single = {
             "status": "expired_plans_removed", **complete_pair_as_single,
-        }))
+        }
+        self.assertIsNone(cpu_pair._validate_usage_summary(malformed_complete_single))
+        self.assertIsNone(cleanup_dispatch_roundtrip(
+            malformed_complete_single, expected_dispatch_status=2,
+        ))
 
     def test_api_release_identity_uses_real_released_platform_layout(self) -> None:
         import python_packages.platform_infra.performance_diagnostic as diagnostic_module
