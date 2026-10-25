@@ -26,6 +26,77 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
+      - name: Read-only proc namespace permission probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def safe_namespace_stat(proc_root: str, namespace: str) -> dict[str, object]:
+              try:
+                  result = os.stat(Path(proc_root) / "ns" / namespace)
+              except OSError as exc:
+                  error_number = exc.errno if type(exc.errno) is int and exc.errno > 0 else None
+                  return {"status": "error", "errno": error_number}
+              return {
+                  "status": "ok",
+                  "device": result.st_dev,
+                  "inode": result.st_ino,
+                  "errno": None,
+              }
+
+          proc1_owner_uid = None
+          proc1_owner_errno = None
+          try:
+              proc1_owner_uid = os.stat("/proc/1").st_uid
+          except OSError as exc:
+              proc1_owner_errno = exc.errno if type(exc.errno) is int and exc.errno > 0 else None
+
+          cap_effective = None
+          try:
+              with Path("/proc/self/status").open("rb") as status_file:
+                  status_raw = status_file.read(64 * 1024 + 1)
+              if len(status_raw) > 64 * 1024:
+                  raise ValueError("status record exceeded bound")
+              for line in status_raw.decode("ascii").splitlines():
+                  key, separator, value = line.partition(":")
+                  if separator and key == "CapEff":
+                      cap_effective = int(value.strip(), 16)
+                      break
+          except (OSError, UnicodeError, ValueError):
+              cap_effective = None
+          cap_sys_ptrace = (
+              bool(cap_effective & (1 << 19)) if type(cap_effective) is int else None
+          )
+
+          namespaces = ("cgroup", "mnt", "pid")
+          report = {
+              "schema": 1,
+              "runner_environment": "github-hosted",
+              "runner_image_label": "ubuntu-24.04",
+              "effective_uid": os.geteuid(),
+              "effective_gid": os.getegid(),
+              "proc1_owner_uid": proc1_owner_uid,
+              "proc1_owner_errno": proc1_owner_errno,
+              "effective_cap_sys_ptrace": cap_sys_ptrace,
+              "capability_status": "available" if cap_sys_ptrace is not None else "unavailable",
+              "namespace_stats": {
+                  "self": {
+                      namespace: safe_namespace_stat("/proc/self", namespace)
+                      for namespace in namespaces
+                  },
+                  "proc1": {
+                      namespace: safe_namespace_stat("/proc/1", namespace)
+                      for namespace in namespaces
+                  },
+              },
+          }
+          print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+          PY
       - name: Run capability probe and synthetic descendant canary
         shell: bash
         run: |
