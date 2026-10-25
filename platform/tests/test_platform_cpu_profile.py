@@ -764,6 +764,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     try:
                         watcher.start()
                         self.assertGreaterEqual(watcher.samples, 1)
+                        self.assertIsNotNone(watcher.thread)
+                        watcher.thread.join(timeout=10)
+                        self.assertFalse(watcher.thread.is_alive())
                     finally:
                         memory_result = watcher.stop()
                     self.assertEqual(
