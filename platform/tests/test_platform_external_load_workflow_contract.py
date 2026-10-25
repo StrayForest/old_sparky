@@ -401,14 +401,12 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("ssr_capacity_concurrency:", self.source)
         self.assertIn("ssr_capacity_workload:", self.source)
         self.assertIn("authenticated_html_ssr_capacity_v1", self.source)
-        handoff_revalidation = _step_script(
-            validate, "Revalidate external handoff and exact target SHA",
-        )
         input_validation_steps = yaml.safe_load(self.source)["jobs"]["validate-external-inputs"]["steps"]
         revalidation_step = next(
             step for step in input_validation_steps
             if step.get("name") == "Revalidate external handoff and exact target SHA"
         )
+        handoff_revalidation = revalidation_step["run"]
         self.assertEqual(
             revalidation_step["env"]["EXPECTED_SSR_WORKLOAD"],
             "$" + "{{ inputs.ssr_capacity_workload }}",
