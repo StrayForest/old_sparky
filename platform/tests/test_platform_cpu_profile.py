@@ -599,6 +599,52 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
                 )
 
+            def write_helper_output(output: bytes) -> None:
+                fixture_source = f"#!{sys.executable}\n" + textwrap.dedent(f"""\
+                    import sys
+                    sys.stdin.buffer.read(4097)
+                    sys.stdout.buffer.write({output!r})
+                    sys.stdout.buffer.flush()
+                """)
+                ast.parse(fixture_source, filename="generated-malformed-memory-helper.py")
+                helper_path.write_text(fixture_source, encoding="utf-8")
+                helper_path.chmod(0o700)
+
+            helper_row_prefix = remote_dispatch.CAPACITY_MEMORY_WATCH_ROW_PREFIX.encode("ascii")
+            for helper_output_case, helper_output in (
+                ("bare_json", b'{"schema":1}\n'),
+                ("double_prefix", helper_row_prefix + helper_row_prefix + b'{"schema":1}\n'),
+                ("malformed_prefixed_json", helper_row_prefix + b"not-json\n"),
+            ):
+                with self.subTest(helper_row=helper_output_case):
+                    write_helper_output(helper_output)
+                    malformed_child = run_dispatcher_direct(
+                        timeout_seconds=130,
+                        output_cap=remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP,
+                    )
+                    self.assertTrue(
+                        malformed_child.stdout,
+                        "malformed child produced no dispatcher marker; "
+                        f"rc={malformed_child.returncode} stderr={malformed_child.stderr[:1000]!r}",
+                    )
+                    self.assertEqual(
+                        malformed_child.returncode, 2,
+                        f"generated dispatcher stderr={malformed_child.stderr[:1000]!r}",
+                    )
+                    marker_line = malformed_child.stdout.splitlines()[-1]
+                    self.assertTrue(marker_line.startswith(
+                        remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii"),
+                    ))
+                    marker = json.loads(
+                        marker_line[len(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX.encode("ascii")):],
+                    )
+                    self.assertEqual(marker, {
+                        "schema": 1, "stage": "row_protocol", "reason": "malformed",
+                    })
+
+            helper_path.write_text(helper_source, encoding="utf-8")
+            helper_path.chmod(0o700)
+
             with self.subTest(dispatcher_bound="old_timeout"):
                 short_timeout = run_dispatcher_direct(
                     timeout_seconds=55,

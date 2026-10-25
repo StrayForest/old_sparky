@@ -1336,9 +1336,12 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
                     pending[:] = rest
                     if not line or len(line) > CAPACITY_MEMORY_WATCH_LINE_CAP:
                         return emit_failure("row_framing", "malformed", process)
+                    helper_row_prefix = CAPACITY_MEMORY_WATCH_ROW_PREFIX.encode("ascii")
+                    if not line.startswith(helper_row_prefix):
+                        return emit_failure("row_protocol", "malformed", process)
                     try:
-                        sample = _strict_baseline_json(line)
-                    except (ValueError, TypeError, UnicodeError):
+                        sample = _strict_baseline_json(line[len(helper_row_prefix):])
+                    except (OSError, ValueError, TypeError, UnicodeError):
                         return emit_failure("row_protocol", "malformed", process)
                     expected_fields = {
                         "schema", "run_id", "source_sha", "workload", "sequence", "elapsed_ms",
