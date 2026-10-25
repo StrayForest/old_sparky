@@ -45,6 +45,36 @@ SYSTEM_PYTHON = "/usr/bin/python3"
 NAMESPACE_READY = b"READY\n"
 NAMESPACE_ACK = b"ACK\n"
 NAMESPACE_PROBE_OK = b"PROBE_OK\n"
+NAMESPACE_STARTUP_FAILURE_PREFIX = b"\x00N"
+NAMESPACE_STARTUP_FAILURE_STAGES = (
+    "watchdog_parent_pidfd_close", "watchdog_diagnostic_cloexec",
+    "watchdog_pdeathsig", "watchdog_exec", "namespace_failure_channel",
+    "namespace_pdeathsig", "namespace_config_read", "namespace_config_validate",
+    "namespace_worker_identity", "namespace_ready_write", "namespace_ack",
+    "namespace_stdio_redirect", "namespace_binding_restore", "namespace_worker_exec",
+    "exec_chain_exit_125", "unknown",
+)
+NAMESPACE_STARTUP_STAGE_CODES = {
+    stage: bytes((index + 1,))
+    for index, stage in enumerate(NAMESPACE_STARTUP_FAILURE_STAGES)
+}
+NAMESPACE_STARTUP_CODE_STAGES = {
+    code: stage for stage, code in NAMESPACE_STARTUP_STAGE_CODES.items()
+}
+WATCHDOG_STARTUP_STAGE_CODES = {
+    "watchdog_parent_pidfd_close": b"\x20",
+    "watchdog_diagnostic_cloexec": b"\x21",
+    "watchdog_pdeathsig": b"\x22",
+    "watchdog_exec": b"\x23",
+    "watchdog_parent_identity": b"\x24",
+    "watchdog_config": b"\x25",
+    "watchdog_command": b"\x26",
+    "watchdog_fork": b"\x27",
+    "watchdog_supervision": b"\x28",
+}
+WATCHDOG_STARTUP_CODE_STAGES = {
+    code: stage for stage, code in WATCHDOG_STARTUP_STAGE_CODES.items()
+}
 DEFAULT_TERM_GRACE_SECONDS = 1.0
 DEFAULT_POLL_SECONDS = 0.02
 DEFAULT_NAMESPACE_PROBE_TIMEOUT_SECONDS = 5.0
@@ -842,6 +872,8 @@ class SupervisorResult:
     isolation: str
     namespace_closed: bool
     namespace_init_pid: int | None
+    # Private in-memory evidence; deliberately absent from runtime report schema.
+    startup_failure_stage: str | None = None
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1537,21 +1569,22 @@ def _await_namespace_ready(
     process: subprocess.Popen[bytes],
     *,
     deadline: float,
+    startup_failure: list[str] | None = None,
 ) -> bool:
-    """Read exactly ``READY`` from stdio without consuming the post-ACK data."""
+    """Read READY or one fixed pre-READY startup-failure marker."""
 
     descriptor = stdout.fileno()
     poller = select.poll()
     poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
     received = bytearray()
     while len(received) < len(NAMESPACE_READY):
-        if process.poll() is not None:
-            return False
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
         events = poller.poll(max(1, int(min(remaining, 0.1) * 1000)))
         if not events:
+            if process.poll() is not None:
+                return False
             continue
         for _fd, mask in events:
             if mask & select.POLLIN:
@@ -1562,11 +1595,92 @@ def _await_namespace_ready(
                 if not chunk:
                     return False
                 received.extend(chunk)
+                if received == NAMESPACE_STARTUP_FAILURE_PREFIX[:1]:
+                    marker = bytearray(received)
+                    while len(marker) < len(NAMESPACE_STARTUP_FAILURE_PREFIX) + 1:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            if startup_failure is not None:
+                                startup_failure.append("unknown")
+                            return False
+                        events = poller.poll(max(1, int(min(remaining, 0.1) * 1000)))
+                        if not events or not any(mask & select.POLLIN for _fd, mask in events):
+                            if process.poll() is not None:
+                                if startup_failure is not None:
+                                    startup_failure.append("unknown")
+                                return False
+                            continue
+                        try:
+                            part = os.read(descriptor, 1)
+                        except OSError:
+                            if startup_failure is not None:
+                                startup_failure.append("unknown")
+                            return False
+                        if not part:
+                            if startup_failure is not None:
+                                startup_failure.append("unknown")
+                            return False
+                        marker.extend(part)
+                    prefix = bytes(marker[:len(NAMESPACE_STARTUP_FAILURE_PREFIX)])
+                    code = bytes(marker[len(NAMESPACE_STARTUP_FAILURE_PREFIX):])
+                    if startup_failure is not None:
+                        startup_failure.append(
+                            NAMESPACE_STARTUP_CODE_STAGES.get(code, "unknown")
+                            if prefix == NAMESPACE_STARTUP_FAILURE_PREFIX else "unknown"
+                        )
+                    return False
                 if not NAMESPACE_READY.startswith(received):
                     return False
             elif mask & (select.POLLHUP | select.POLLERR):
                 return False
     return bytes(received) == NAMESPACE_READY
+
+
+def _read_post_ready_startup_failure(stdout: Any) -> str | None:
+    """Read only the fixed marker tail after the wrapper process is reaped."""
+
+    try:
+        marker = os.read(stdout.fileno(), len(NAMESPACE_STARTUP_FAILURE_PREFIX) + 2)
+    except (AttributeError, OSError):
+        # A few hermetic supervisor tests use a stream double without an OS
+        # descriptor. Production Popen streams always expose fileno().
+        if not hasattr(stdout, "fileno"):
+            return None
+        return "unknown"
+    if not marker:
+        return None
+    if (len(marker) != len(NAMESPACE_STARTUP_FAILURE_PREFIX) + 1
+            or marker[:len(NAMESPACE_STARTUP_FAILURE_PREFIX)] != NAMESPACE_STARTUP_FAILURE_PREFIX):
+        return "unknown"
+    code = marker[len(NAMESPACE_STARTUP_FAILURE_PREFIX):]
+    return NAMESPACE_STARTUP_CODE_STAGES.get(code, "unknown")
+
+
+def _decode_watchdog_startup_diagnostics(raw: bytes) -> tuple[str | None, str | None]:
+    """Return the legacy kill diagnostic and one closed startup stage."""
+
+    kill_errors = {
+        b"\x01": "pidfd_signal_eperm_trusted_mediator_skipped",
+        b"\x02": "pidfd_signal_eperm_unclassified",
+    }
+    raw_codes = [raw[index:index + 1] for index in range(len(raw))]
+    startup_codes = [code for code in raw_codes if code in WATCHDOG_STARTUP_CODE_STAGES]
+    known_codes = set(kill_errors) | set(WATCHDOG_STARTUP_CODE_STAGES)
+    has_unknown = (
+        any(code not in known_codes for code in raw_codes)
+        or len(raw) > 3
+        or len(raw_codes) > 1
+    )
+    watchdog_error = (
+        "pidfd_signal_eperm_unclassified" if b"\x02" in raw
+        else "pidfd_signal_eperm_trusted_mediator_skipped" if b"\x01" in raw
+        else None
+    )
+    if has_unknown or len(startup_codes) > 1 or (watchdog_error is not None and startup_codes):
+        return watchdog_error, "unknown"
+    if not startup_codes:
+        return watchdog_error, None
+    return watchdog_error, WATCHDOG_STARTUP_CODE_STAGES[startup_codes[0]]
 
 
 def _read_process_descendants(pid: int) -> tuple[int, ...]:
@@ -2101,6 +2215,7 @@ def run_supervised(
     watchdog_diagnostic_read_fd: int | None = None
     watchdog_diagnostic_write_fd: int | None = None
     watchdog_diagnostic: str | None = None
+    startup_failure_stage: str | None = None
     wrapper_pidfd: int | None = None
     wrapper_starttime: int | None = None
     namespace_init_pid: int | None = None
@@ -2226,11 +2341,15 @@ def run_supervised(
             if process.stdout is None or process.stdin is None:
                 raise NamespaceIntegrityError("namespace stdio protocol is unavailable")
             emit_progress("namespace_handshake")
+            startup_marker: list[str] = []
             if not _await_namespace_ready(
                 process.stdout,
                 process,
                 deadline=capture_deadline,
+                startup_failure=startup_marker,
             ):
+                if startup_marker:
+                    startup_failure_stage = startup_marker[0]
                 raise NamespaceIntegrityError("namespace PID 1 readiness handshake failed")
             while namespace_init_pid is None:
                 if external_signal is not None:
@@ -2451,6 +2570,13 @@ def run_supervised(
                 except OSError:
                     pass
         if process is not None:
+            if process.stdout is not None and process.poll() is not None:
+                post_ready_stage = _read_post_ready_startup_failure(process.stdout)
+                if post_ready_stage is not None:
+                    startup_failure_stage = (
+                        post_ready_stage if startup_failure_stage is None
+                        else "unknown"
+                    )
             for stream in (process.stdin, process.stdout):
                 if stream is not None:
                     try:
@@ -2459,11 +2585,15 @@ def run_supervised(
                         pass
         if watchdog_diagnostic_read_fd is not None:
             try:
-                diagnostic_code = os.read(watchdog_diagnostic_read_fd, 1)
-                watchdog_diagnostic = {
-                    b"\x01": "pidfd_signal_eperm_trusted_mediator_skipped",
-                    b"\x02": "pidfd_signal_eperm_unclassified",
-                }.get(diagnostic_code)
+                diagnostic_bytes = os.read(watchdog_diagnostic_read_fd, 4)
+                watchdog_diagnostic, watchdog_stage = _decode_watchdog_startup_diagnostics(
+                    diagnostic_bytes,
+                )
+                if watchdog_stage is not None:
+                    startup_failure_stage = (
+                        watchdog_stage if startup_failure_stage is None
+                        else "unknown"
+                    )
             except OSError:
                 pass
             finally:
@@ -2477,6 +2607,9 @@ def run_supervised(
             config_path.unlink()
         except FileNotFoundError:
             pass
+
+    if returncode == 125 and startup_failure_stage is None:
+        startup_failure_stage = "exec_chain_exit_125"
 
     if progress_checkpoint is not None and namespace_closed and namespace_reaped:
         try:
@@ -2583,6 +2716,7 @@ def run_supervised(
                     isolation=PID_NAMESPACE_ISOLATION,
                     namespace_closed=True,
                     namespace_init_pid=namespace_init_pid,
+                    startup_failure_stage=startup_failure_stage,
                 )
 
     partial_work = worker_started
@@ -2636,6 +2770,7 @@ def run_supervised(
         isolation=PID_NAMESPACE_ISOLATION,
         namespace_closed=namespace_closed,
         namespace_init_pid=namespace_init_pid,
+        startup_failure_stage=startup_failure_stage,
     )
 
 

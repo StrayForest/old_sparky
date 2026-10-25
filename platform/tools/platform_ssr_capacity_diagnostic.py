@@ -1036,6 +1036,7 @@ def run_isolated_capacity_worker(
         "namespace_closed": getattr(result, "namespace_closed", None),
         "return_code": getattr(result, "returncode", None),
         "signal": getattr(result, "signal", None),
+        "startup_failure_stage": getattr(result, "startup_failure_stage", None),
     })
     if not watcher_summary:
         watcher_summary.append(watcher.stop())
@@ -2349,6 +2350,7 @@ def _projection_rejection_reason(value: Any) -> str:
 def _project_supervisor_evidence(value: Any) -> dict[str, Any]:
     evidence = value if isinstance(value, Mapping) else {}
     reason = evidence.get("reason")
+    startup_stage = evidence.get("startup_failure_stage")
     return {
         "reason": reason if isinstance(reason, str) and reason in SUPERVISOR_REASONS else "other",
         "worker_started": evidence.get("worker_started")
@@ -2361,6 +2363,11 @@ def _project_supervisor_evidence(value: Any) -> dict[str, Any]:
         if type(evidence.get("return_code")) is int and -255 <= evidence["return_code"] <= 255 else None,
         "signal": evidence.get("signal")
         if type(evidence.get("signal")) is int and 1 <= evidence["signal"] <= 255 else None,
+        "startup_failure_stage": (
+            startup_stage if isinstance(startup_stage, str)
+            and startup_stage in load_runtime.NAMESPACE_STARTUP_FAILURE_STAGES
+            else "unknown" if startup_stage is not None else None
+        ),
     }
 
 
@@ -2403,10 +2410,11 @@ def _parent_outcome_fingerprint(
     }
     evidence = _project_supervisor_evidence(supervisor_evidence)
     for source, destination in (
-        ("reason", "supervisor_reason"), ("worker_started", "supervisor_worker_started"),
-        ("worker_exited", "supervisor_worker_exited"),
+        ("reason", "supervisor_reason"), ("worker_started", "supervisor_process_started"),
+        ("worker_exited", "supervisor_process_exited"),
         ("namespace_closed", "supervisor_namespace_closed"),
         ("return_code", "supervisor_return_code"), ("signal", "supervisor_signal"),
+        ("startup_failure_stage", "supervisor_startup_failure_stage"),
     ):
         fingerprint[destination] = evidence[source]
     return fingerprint
@@ -2678,7 +2686,13 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(stage_state.get("supervisor_evidence"), Mapping):
             evidence = _project_supervisor_evidence(stage_state["supervisor_evidence"])
             failure_fingerprint.update({
-                f"supervisor_{key}": value for key, value in evidence.items()
+                "supervisor_reason": evidence["reason"],
+                "supervisor_process_started": evidence["worker_started"],
+                "supervisor_process_exited": evidence["worker_exited"],
+                "supervisor_namespace_closed": evidence["namespace_closed"],
+                "supervisor_return_code": evidence["return_code"],
+                "supervisor_signal": evidence["signal"],
+                "supervisor_startup_failure_stage": evidence["startup_failure_stage"],
             })
         print(json.dumps(failure_fingerprint, sort_keys=True, separators=(",", ":")))
         return 2

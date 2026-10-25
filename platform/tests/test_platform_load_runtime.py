@@ -534,11 +534,13 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                         patch.object(namespace, "_set_parent_death_signal"),
                         patch.object(namespace, "_assert_namespace_worker_identity"),
                         patch.object(namespace.os, "write") as write,
+                        patch.object(namespace, "_write_namespace_failure_marker") as failure_marker,
                         patch.object(namespace.os, "execv") as rejected_exec,
                     ):
                         with self.assertRaises(NamespaceIntegrityError):
                             namespace._namespace_worker(config_path)
                     write.assert_not_called()
+                    failure_marker.assert_called_once()
                     rejected_exec.assert_not_called()
 
             write_config(valid_payload, mode=0o644)
@@ -547,11 +549,13 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 patch.object(namespace, "_set_parent_death_signal"),
                 patch.object(namespace, "_assert_namespace_worker_identity"),
                 patch.object(namespace.os, "write") as write,
+                patch.object(namespace, "_write_namespace_failure_marker") as failure_marker,
                 patch.object(namespace.os, "execv") as rejected_exec,
             ):
                 with self.assertRaises(NamespaceIntegrityError):
                     namespace._namespace_worker(config_path)
             write.assert_not_called()
+            failure_marker.assert_called_once()
             rejected_exec.assert_not_called()
 
             write_config(valid_payload)
@@ -561,11 +565,13 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 patch.object(namespace, "_set_parent_death_signal"),
                 patch.object(namespace, "_assert_namespace_worker_identity"),
                 patch.object(namespace.os, "write") as write,
+                patch.object(namespace, "_write_namespace_failure_marker") as failure_marker,
                 patch.object(namespace.os, "execv") as rejected_exec,
             ):
                 with self.assertRaises(NamespaceIntegrityError):
                     namespace._namespace_worker(config_path)
             write.assert_not_called()
+            failure_marker.assert_called_once()
             rejected_exec.assert_not_called()
             config_path.with_name("worker.config.link").unlink()
 
@@ -623,11 +629,13 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 patch.object(namespace, "_set_parent_death_signal"),
                 patch.object(namespace, "_assert_namespace_worker_identity"),
                 patch.object(namespace.os, "write") as write,
+                patch.object(namespace, "_write_namespace_failure_marker") as failure_marker,
                 patch.object(namespace.os, "execv") as rejected_exec,
             ):
                 with self.assertRaises(NamespaceIntegrityError):
                     namespace._namespace_worker(config_path)
             write.assert_not_called()
+            failure_marker.assert_called_once()
             rejected_exec.assert_not_called()
 
     def test_containment_canary_passes_validated_same_source_binding(self) -> None:
@@ -1613,6 +1621,192 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             )
         finally:
             stream.close()
+
+    def test_startup_failure_markers_are_closed_and_fd_safe(self) -> None:
+        from types import SimpleNamespace
+        from tools import platform_load_namespace as namespace
+        from tools.platform_load_runtime import (
+            NAMESPACE_STARTUP_FAILURE_PREFIX,
+            NAMESPACE_STARTUP_STAGE_CODES,
+            _read_post_ready_startup_failure,
+        )
+
+        read_fd, write_fd = os.pipe()
+        inheritable_states: list[bool] = []
+        original_set_inheritable = os.set_inheritable
+
+        def set_inheritable(descriptor: int, inheritable: bool) -> None:
+            original_set_inheritable(descriptor, inheritable)
+            inheritable_states.append(os.get_inheritable(descriptor))
+
+        try:
+            with (
+                patch.object(namespace.os, "dup", return_value=write_fd),
+                patch.object(namespace.os, "set_inheritable", side_effect=set_inheritable),
+                patch.object(
+                    namespace, "_set_parent_death_signal",
+                    side_effect=NamespaceCapabilityError("private startup failure"),
+                ),
+            ):
+                with self.assertRaises(namespace._NamespaceBootstrapFailure) as raised:
+                    namespace._namespace_worker(Path("/unused/config"))
+            write_fd = -1
+            self.assertEqual(raised.exception.startup_stage, "namespace_pdeathsig")
+            self.assertEqual(inheritable_states, [False])
+            marker = os.read(read_fd, 16)
+            self.assertEqual(
+                marker,
+                NAMESPACE_STARTUP_FAILURE_PREFIX
+                + NAMESPACE_STARTUP_STAGE_CODES["namespace_pdeathsig"],
+            )
+
+            post_read, post_write = os.pipe()
+            real_write = os.write
+
+            def write_only_failure_channel(descriptor: int, data: bytes) -> int:
+                if descriptor == 1:
+                    return len(data)
+                return real_write(descriptor, data)
+
+            try:
+                with (
+                    patch.object(namespace.os, "dup", return_value=post_write),
+                    patch.object(namespace, "_set_parent_death_signal"),
+                    patch.object(namespace, "_config", return_value={"worker_command": ["/unused"]}),
+                    patch.object(namespace.os, "write", side_effect=write_only_failure_channel),
+                    patch.object(namespace.os, "read", return_value=b"ACK\n"),
+                    patch.object(namespace.os, "dup2"),
+                    patch.object(
+                        namespace, "_restore_worker_binding_environment",
+                        side_effect=NamespaceIntegrityError("private binding failure"),
+                    ),
+                ):
+                    with self.assertRaises(namespace._NamespaceBootstrapFailure) as post_failure:
+                        namespace._namespace_worker(Path("/unused/config"))
+                post_write = -1
+                self.assertEqual(post_failure.exception.startup_stage, "namespace_binding_restore")
+                self.assertEqual(
+                    os.read(post_read, 16),
+                    NAMESPACE_STARTUP_FAILURE_PREFIX
+                    + NAMESPACE_STARTUP_STAGE_CODES["namespace_binding_restore"],
+                )
+            finally:
+                os.close(post_read)
+                if post_write >= 0:
+                    os.close(post_write)
+
+            marker_read, marker_write = os.pipe()
+            try:
+                os.write(
+                    marker_write,
+                    NAMESPACE_STARTUP_FAILURE_PREFIX
+                    + NAMESPACE_STARTUP_STAGE_CODES["namespace_worker_exec"],
+                )
+                os.close(marker_write)
+                marker_write = -1
+                with os.fdopen(marker_read, "rb") as marker_stream:
+                    marker_read = -1
+                    self.assertEqual(
+                        _read_post_ready_startup_failure(marker_stream),
+                        "namespace_worker_exec",
+                    )
+            finally:
+                if marker_write >= 0:
+                    os.close(marker_write)
+                if marker_read >= 0:
+                    os.close(marker_read)
+
+            # The outer failure writer runs in its own child process. The
+            # pdeathsig failure injection verifies CLOEXEC was set before the
+            # safe closed code was written and status 125 was preserved.
+            outer_read, outer_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+            parent_fd = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+            pid = os.fork()
+            if pid == 0:
+                def fail_after_cloexec() -> None:
+                    if os.get_inheritable(outer_write):
+                        os.write(outer_write, b"\xff")
+                        raise AssertionError("diagnostic fd must be close-on-exec")
+                    raise OSError("private pdeathsig failure")
+
+                with patch.object(namespace, "_set_parent_death_signal", side_effect=fail_after_cloexec):
+                    namespace._exec_watchdog_child(
+                        parent_pidfd=parent_fd, diagnostic_fd=outer_write,
+                        command=["/not-executed"],
+                    )
+                os._exit(0)
+            os.close(outer_write)
+            outer_write = -1
+            os.close(parent_fd)
+            _, child_status = os.waitpid(pid, 0)
+            self.assertTrue(os.WIFEXITED(child_status))
+            self.assertEqual(os.WEXITSTATUS(child_status), 125)
+            self.assertEqual(os.read(outer_read, 8), namespace.WATCHDOG_STARTUP_STAGE_CODES[
+                "watchdog_pdeathsig"
+            ])
+            os.close(outer_read)
+            outer_read = -1
+        finally:
+            os.close(read_fd)
+            if write_fd >= 0:
+                os.close(write_fd)
+            if 'outer_read' in locals() and outer_read >= 0:
+                os.close(outer_read)
+            if 'outer_write' in locals() and outer_write >= 0:
+                os.close(outer_write)
+
+        # The helper can write and exit between the parent's spawn and its
+        # first poll; the parser must drain the complete marker before using
+        # this already-exited status.
+        process = SimpleNamespace(poll=lambda: 125)
+        marker_read, marker_write = os.pipe()
+        try:
+            from tools.platform_load_runtime import _await_namespace_ready
+
+            os.write(
+                marker_write,
+                NAMESPACE_STARTUP_FAILURE_PREFIX
+                + NAMESPACE_STARTUP_STAGE_CODES["namespace_config_read"],
+            )
+            os.close(marker_write)
+            marker_write = -1
+            stage: list[str] = []
+            with os.fdopen(marker_read, "rb") as marker_stream:
+                marker_read = -1
+                self.assertFalse(_await_namespace_ready(
+                    marker_stream, process,
+                    deadline=time.monotonic() + 0.2, startup_failure=stage,
+                ))
+            self.assertEqual(stage, ["namespace_config_read"])
+        finally:
+            if marker_write >= 0:
+                os.close(marker_write)
+            if marker_read >= 0:
+                os.close(marker_read)
+
+    def test_watchdog_diagnostic_decoder_preserves_kill_precedence(self) -> None:
+        from tools.platform_load_runtime import _decode_watchdog_startup_diagnostics
+
+        self.assertEqual(
+            _decode_watchdog_startup_diagnostics(b"\x22"),
+            (None, "watchdog_pdeathsig"),
+        )
+        self.assertEqual(
+            _decode_watchdog_startup_diagnostics(b"\x02\x22"),
+            ("pidfd_signal_eperm_unclassified", "unknown"),
+        )
+        self.assertEqual(
+            _decode_watchdog_startup_diagnostics(b"\x01\x22"),
+            ("pidfd_signal_eperm_trusted_mediator_skipped", "unknown"),
+        )
+        self.assertEqual(
+            _decode_watchdog_startup_diagnostics(b"\xff"),
+            (None, "unknown"),
+        )
+        self.assertEqual(
+            _decode_watchdog_startup_diagnostics(b"\x22\x23"),
+            (None, "unknown"),
+        )
 
     def test_namespace_bootstrap_rejects_pid_reuse_and_closed_pidfd(self) -> None:
         from tools.platform_load_runtime import (

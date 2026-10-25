@@ -33,13 +33,12 @@ belong in the linked owner documents below.
   unpinned releases, maintenance [40140934751](https://github.com/StrayForest/old_sparky/actions/runs/40140934751)
   completed successfully: its `127,972,590`-byte backup checksum and restore
   were verified, Alembic verification passed, protected retention passed, and
-  20 canonical rotation entries were removed. Free space is now
-  `8,653,447,168` bytes (`21.65%`); current, previous and all protected pins
-  are unchanged, services are active, endpoints returned HTTP 200, and no
-  jobs, locks or release transaction remain. The timer is enabled, active and
-  waiting with source-unit parity; its next trigger is
-  `2026-10-25T04:27:13` Helsinki time. This proves one successful automatic
-  maintenance pass, not a long-term cadence or capacity guarantee.
+  20 canonical rotation entries were removed. The later canonical maintenance
+  [40150735297](https://github.com/StrayForest/old_sparky/actions/runs/40150735297)
+  also passed; latest measured free space is `8,628,334,592` bytes (about
+  `21.6%`). Current, previous and protected pins remain intact, and all SSR
+  fixtures and plans are closed. This proves successful bounded maintenance,
+  not a long-term cadence or capacity guarantee.
 - Bounded storage work reclaimed `276,296,431` bytes from exact duplicate
   shared build artifacts and about `1.15 GB` from an unreferenced LiveQA
   provider payload. The protected raw recovery archive, pinned backups, and
@@ -53,23 +52,16 @@ belong in the linked owner documents below.
   returned `20,000/20,000` HTTP 200 responses but failed its logical SLO.
   Fixture cleanup passed; exact profile and comparison evidence live in the
   [performance reference](../performance/README.md#authenticated-page-load-comparison-2026-10-24).
-- SSR run [40143438718](https://github.com/StrayForest/old_sparky/actions/runs/40143438718)
-  was refused at remote-plan preparation because an expired API/web plan pair
-  from e920 remained; cleanup under a new run ID was correctly refused. Exact
-  fixture cleanup [40143901154](https://github.com/StrayForest/old_sparky/actions/runs/40143901154)
-  passed, and canonical cleanup of the expired pair removed both plans. Abort
-  [40143759494](https://github.com/StrayForest/old_sparky/actions/runs/40143759494)
-  stopped the exact process tree, but normalization did not produce CPU proof.
-  Retry [40144108246](https://github.com/StrayForest/old_sparky/actions/runs/40144108246)
-  terminated in the guarded step with exit 2; report sanitization failed with
-  `ValueError`, so no sanitized artifact or primary marker was produced. Its
-  precise cause is unproven. Exact fixture cleanup
-  [40144546228](https://github.com/StrayForest/old_sparky/actions/runs/40144546228)
-  passed, removing 14 users, 1 tournament and 1 marker while preserving control
-  state; the expired pair was canonically removed and both plans are absent.
-  Activity is clear. No capacity credit is awarded. See the
-  [performance reference](../performance/README.md) for expiry, cleanup
-  ownership and failure-report closure.
+- Latest SSR attempt
+  [40150133773](https://github.com/StrayForest/old_sparky/actions/runs/40150133773)
+  stopped at namespace startup with exit 125 before the inner worker or client
+  ran. It retained a valid sanitized `INVALID` report; namespace closure was
+  not proven and no capacity credit is awarded. Exact fixture cleanup
+  [40150496519](https://github.com/StrayForest/old_sparky/actions/runs/40150496519)
+  passed, and canonical cleanup removed the expired plans; the site is healthy.
+  The precise startup cause remains unproven. See the
+  [performance reference](../performance/README.md) for cleanup ownership,
+  expiry, and bounded failure evidence.
 - The installed canonical content sample on e920 exited successfully. This is
   not a new full GitHub content-diagnostics result; details were lost from its
   bounded prefix. Earlier full diagnostic [40113453588](https://github.com/StrayForest/old_sparky/actions/runs/40113453588)

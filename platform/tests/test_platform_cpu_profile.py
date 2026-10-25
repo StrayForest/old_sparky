@@ -703,6 +703,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         namespace_closed=False, reason="namespace_unavailable",
                         worker_started=False, worker_exited=False,
                         returncode=None, signal=None,
+                        startup_failure_stage="namespace_config_read",
                     ),
                 ),
                 patch.object(capacity_diagnostic, "_cleanup_remote_capacity_plan") as no_namespace_cleanup,
@@ -728,6 +729,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "reason": "namespace_unavailable", "worker_started": False,
                 "worker_exited": False, "namespace_closed": False,
                 "return_code": None, "signal": None,
+                "startup_failure_stage": "namespace_config_read",
             })
             preinit_fingerprint = capacity_diagnostic._parent_outcome_fingerprint(
                 composed, stage_state["supervisor_evidence"],
@@ -739,8 +741,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "return_code": 2, "signal": None,
                 },
             )
-            self.assertFalse(preinit_fingerprint["supervisor_worker_started"])
-            self.assertTrue(started_fingerprint["supervisor_worker_started"])
+            self.assertFalse(preinit_fingerprint["supervisor_process_started"])
+            self.assertTrue(started_fingerprint["supervisor_process_started"])
             self.assertEqual(started_fingerprint["supervisor_reason"], "namespace_unclosed")
             self.assertNotEqual(preinit_fingerprint, started_fingerprint)
             self.assertEqual(capacity_diagnostic._project_supervisor_evidence({
@@ -764,6 +766,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         namespace_closed=False, reason="namespace_unclosed",
                         worker_started=True, worker_exited=True,
                         returncode=7, signal=None,
+                        startup_failure_stage="namespace_config_read",
                     ),
                 ),
                 redirect_stdout(parent_cli_stdout),
@@ -779,10 +782,12 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 ]), 2)
             parent_cli_marker = json.loads(parent_cli_stdout.getvalue())
             self.assertEqual(parent_cli_marker["supervisor_reason"], "namespace_unclosed")
-            self.assertTrue(parent_cli_marker["supervisor_worker_started"])
-            self.assertTrue(parent_cli_marker["supervisor_worker_exited"])
+            self.assertTrue(parent_cli_marker["supervisor_process_started"])
+            self.assertTrue(parent_cli_marker["supervisor_process_exited"])
             self.assertEqual(parent_cli_marker["supervisor_return_code"], 7)
             self.assertFalse(parent_cli_marker["supervisor_namespace_closed"])
+            self.assertEqual(parent_cli_marker["supervisor_startup_failure_stage"], "namespace_config_read")
+            self.assertNotIn("supervisor_worker_started", parent_cli_marker)
             self.assertNotIn(str(root), parent_cli_stdout.getvalue())
             self.assertNotIn("example.test", parent_cli_stdout.getvalue())
             self.assertNotIn("id_ed25519", parent_cli_stdout.getvalue())

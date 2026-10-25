@@ -82,7 +82,8 @@ but do not claim the server's maximum capacity or physical-host headroom.
 
 Any incomplete parent outcome is surfaced as a bounded JSON job-log fingerprint
 with namespace closure, worker/runner states, allowlisted runner and supervisor
-reasons, worker lifecycle booleans, bounded exit status and plan cleanup state;
+reasons, a closed startup-failure stage when available, process lifecycle
+booleans, bounded exit status and plan cleanup state;
 these fields never award credit. The sanitizer keeps the report
 projector strict. If projection fails, its invalid marker reports only a closed
 stage/reason, section/field label, type and presence bit, with all credits false;
@@ -90,6 +91,14 @@ it does not echo report values, paths, raw exception text or unexpected keys.
 An early runner-sampler stop uses the complete all-false namespace identity map
 and remains UNKNOWN, so its failure report can pass structural projection but
 still cannot be promoted to capacity evidence.
+Namespace exit 125 diagnostics use only fixed stage bytes across the watchdog
+pipe and namespace READY stream. The watchdog descriptor is close-on-exec before
+the system chain, and the inner helper's duplicated stream is close-on-exec
+before the worker; neither descriptor reaches sudo or the worker. Existing
+pidfd cleanup diagnostics retain priority if the bounded watchdog channel is
+ambiguous. `supervisor_process_started` means only that the watchdog process
+was launched; it does not mean the inner worker started. A missing, conflicting
+or malformed stage remains unknown and never changes containment status.
 
 Use this procedure to separate authenticated HTML latency across direct
 Next.js, local Nginx and public Cloudflare. It is diagnostic evidence only; the
