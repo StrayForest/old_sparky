@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from array import array
 import base64
+import codecs
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -3352,15 +3353,25 @@ def _page_request_http11_keepalive(
 
 
 class _AuthenticatedHtmlMarkerParser(HTMLParser):
+    # TournamentDetailClientPage's seeded ready branch renders its Hero with
+    # this fixed prefix; the no-seed route shell instead says "Загрузка турнира".
+    WORKSPACE_SEED_PREFIX = "Турниры / "
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.lifecycle = False
-        self.ready_detail = False
         self.authenticated_header = False
+        self.workspace_seed = False
+        self.expected_detail_fallback = False
 
     @property
     def complete(self) -> bool:
-        return self.lifecycle and self.ready_detail and self.authenticated_header
+        return (
+            self.lifecycle
+            and self.authenticated_header
+            and self.workspace_seed
+            and self.expected_detail_fallback
+        )
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
@@ -3370,8 +3381,19 @@ class _AuthenticatedHtmlMarkerParser(HTMLParser):
                 self.lifecycle = True
             if "header-profile-avatar" in classes:
                 self.authenticated_header = True
-        elif tag == "section" and "top-detail-grid" in classes:
-            self.ready_detail = True
+        elif tag == "h1" and "hero-title" in classes:
+            aria_label = values.get("aria-label")
+            if (
+                isinstance(aria_label, str)
+                and aria_label.startswith(self.WORKSPACE_SEED_PREFIX)
+            ):
+                self.workspace_seed = True
+        elif tag == "section" and "route-loading-shell" in classes:
+            # The detail view intentionally has ssr:false. Its generic loading
+            # panel is therefore expected in seeded raw SSR, while the
+            # route-level no-seed shell carries the tournament-detail variant.
+            if "route-loading-tournament-detail" not in classes:
+                self.expected_detail_fallback = True
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
@@ -3389,11 +3411,16 @@ def _authenticated_html_markers(content_type: Any, body: Any) -> tuple[bool, boo
     try:
         # HTTP11KeepAliveClient assembles the bounded response chunks before
         # returning. Re-feed small slices so tokenization adds bounded
-        # temporary memory; HTMLParser carries partial tags across slices.
+        # temporary memory. Keep UTF-8 decoder state across slices so a
+        # multibyte character at a boundary is not replaced; HTMLParser also
+        # carries partial tags across slices.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         for offset in range(0, len(body), 64 * 1024):
-            parser.feed(body[offset:offset + 64 * 1024].decode("utf-8", errors="replace"))
+            parser.feed(decoder.decode(body[offset:offset + 64 * 1024], final=False))
             if parser.complete:
                 break
+        else:
+            parser.feed(decoder.decode(b"", final=True))
         parser.close()
     except (AssertionError, ValueError):
         return content_type_ok, False

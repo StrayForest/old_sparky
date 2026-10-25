@@ -1273,7 +1273,14 @@ test("authenticated tournament hydrates from one SSR workspace request", async (
 
   const detailNavigation = await page.goto("/tournaments/night-veil-open-5");
   await expectRawRobotsResponse(detailNavigation, 200, null);
+  const rawDocument = await detailNavigation?.text();
+  expect(rawDocument).toContain('data-testid="tournament-detail-lifecycle"');
+  expect(rawDocument).toContain('class="header-profile-avatar"');
+  expect(rawDocument).toContain('aria-label="Турниры / Night Veil Open #5"');
+  expect(rawDocument).toContain("route-loading-shell");
+  expect(rawDocument).not.toContain('class="top-detail-grid"');
   await expect(page.getByRole("heading", { name: "Night Veil Open #5", level: 1 })).toBeVisible();
+  await expect(page.locator(".top-detail-grid")).toBeVisible();
 
   const bootstrapCount = await readSsrRequestCount(page, countScope, "/api/v1/auth/bootstrap");
   const usersMeCount = await readSsrRequestCount(page, countScope, "/api/v1/users/me");

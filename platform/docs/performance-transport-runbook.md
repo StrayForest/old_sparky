@@ -96,17 +96,24 @@ and record one web worker, compression enabled, API worker/pool values, and
 the exact active profile; verify these values remain fixed after each switch.
 A
 completed response must be HTTP 200, `text/html`, and
-contain the existing `tournament-detail-lifecycle` marker and ready-view
-`top-detail-grid` marker, plus the existing server-rendered
-`header-profile-avatar` marker. The lifecycle marker alone can also appear on
-loading or invite HTML; the detail grid alone can also appear for an anonymous
-viewer of a public tournament. Requiring all three rejects those shells. The
-check retains only booleans and never records identity text. A bad status,
-content type, marker, memory guard, restart, or unknown watcher stops new
-submissions; in-flight requests drain under the existing timeout, partial
-counts remain visible, and every credit stays false. Response bodies are read
-within the existing byte bound and are never retained in reports. This typed
-mode uses 14 fixture actors cyclically. Presets 8 and 16 are the initial
+contain the existing `tournament-detail-lifecycle` marker, a server-rendered
+`h1.hero-title` whose `aria-label` begins with `Турниры / ` (the route's
+populated SSR workspace seed), the generic `route-loading-shell` from the
+detail view's intentional `ssr: false` boundary (without the
+`route-loading-tournament-detail` route-shell variant), and the server-rendered
+`header-profile-avatar` marker. This validates authenticated raw HTML with a
+ready workspace seed; it does not measure the hydrated tournament detail view.
+The raw document correctly has no `top-detail-grid`, which is rendered only
+after hydration. The lifecycle marker alone can also appear on loading or
+invite HTML; a populated title alone can also appear for an anonymous viewer
+of a public tournament. Requiring the authenticated header, seeded title and
+expected fallback together rejects those cases. The check retains only
+booleans and never records identity text. A bad status, content type, marker,
+memory guard, restart, or unknown watcher stops new submissions; in-flight
+requests drain under the existing timeout, partial counts remain visible, and
+every credit stays false. Response bodies are read within the existing byte
+bound and are never retained in reports. This typed mode uses 14 fixture
+actors cyclically. Presets 8 and 16 are the initial
 steps; 32 and 64 are available only to this HTML workload and deliberately
 reuse those 14 actors, so an actor may have multiple concurrent requests.
 That closed-loop workload has no fixed offered arrival rate and is not

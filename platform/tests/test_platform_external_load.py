@@ -155,16 +155,40 @@ def load_manifest_from_payload(
 
 class ExternalLoadTests(unittest.TestCase):
     def test_authenticated_html_contract_requires_authenticated_ready_page_markers(self) -> None:
-        # These pieces are deliberately joined across arbitrary body-read
-        # boundaries; attributes also vary in order, quotes, and class tokens.
+        # Match the route's raw SSR shape: the workspace-seeded Hero and
+        # authenticated header are rendered, while the detail view's
+        # ssr:false boundary contributes its generic loading panel.
         marker = b"".join((
             b"<span data-testid='tournament-detail-lifecycle' hidden></span>",
-            b"<section class='extra top-detail-grid'></section>",
             b"<span class='extra header-profile-avatar'></span>",
+            b'<section class="hero-wrap"><h1 aria-label="Турниры / Fixture title" '
+            b'class="hero-title">Турниры / Fixture title</h1></section>',
+            b'<section class="panel panel-pad route-loading-shell" aria-busy="true"></section>',
         ))
         body = b" " * (64 * 1024 - 11) + marker
         self.assertEqual(
             external_load._authenticated_html_markers("Text/Html; charset=utf-8", body),
+            (True, True),
+        )
+        chunk_boundary = 64 * 1024 - 1
+        boundary_leading = (
+            b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+            b'<span class="header-profile-avatar"></span>'
+        )
+        heading_open = b'<h1 class="hero-title" aria-label="'
+        title = "Турниры / Fixture title".encode("utf-8")
+        padding_size = chunk_boundary - len(boundary_leading) - len(heading_open)
+        self.assertGreaterEqual(padding_size, 0)
+        split_character_body = (
+            boundary_leading
+            + b" " * padding_size
+            + heading_open
+            + title
+            + b'"></h1><section class="route-loading-shell"></section>'
+        )
+        self.assertEqual(split_character_body.find("Т".encode("utf-8")), chunk_boundary)
+        self.assertEqual(
+            external_load._authenticated_html_markers("text/html", split_character_body),
             (True, True),
         )
         self.assertEqual(
@@ -175,15 +199,65 @@ class ExternalLoadTests(unittest.TestCase):
             external_load._authenticated_html_markers(
                 "text/html",
                 b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
-                b'<section class="top-detail-grid"></section>'
-                b'<span class="header-profile-avatar"></span>',
+                b'<span class="header-profile-avatar"></span>'
+                b'<h1 class="hero-title" aria-label="Турниры / Fixture"></h1>'
+                b'<section class="route-loading-shell"></section>',
             ),
             (True, True),
         )
+        # The workspace seed is absent on the route-level loading response,
+        # even though it has the same lifecycle/header markers.
         self.assertEqual(
             external_load._authenticated_html_markers(
                 "text/html",
                 b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                b'<span class="header-profile-avatar"></span>'
+                b'<h1 class="hero-title" aria-label="Загрузка турнира"></h1>'
+                b'<section class="route-loading-shell route-loading-tournament-detail"></section>',
+            ),
+            (True, False),
+        )
+        # Public guest HTML has a ready workspace seed and expected fallback,
+        # but must not satisfy the authenticated-header requirement.
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                b'<h1 class="hero-title" aria-label="Турниры / Fixture"></h1>'
+                b'<section class="route-loading-shell"></section>',
+            ),
+            (True, False),
+        )
+        # A seeded title paired with the route-level loading variant is not
+        # the expected ssr:false detail-boundary fallback.
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                b'<span class="header-profile-avatar"></span>'
+                b'<h1 class="hero-title" aria-label="Турниры / Fixture"></h1>'
+                b'<section class="route-loading-shell route-loading-tournament-detail"></section>',
+            ),
+            (True, False),
+        )
+        # A ready seed without the expected server fallback is not the
+        # documented raw-SSR shape for this detail route.
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                b'<span class="header-profile-avatar"></span>'
+                b'<h1 class="hero-title" aria-label="Турниры / Fixture"></h1>',
+            ),
+            (True, False),
+        )
+        # The hydrated detail grid is not a valid raw-SSR substitute for the
+        # seeded heading and expected dynamic-boundary fallback.
+        self.assertEqual(
+            external_load._authenticated_html_markers(
+                "text/html",
+                b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
+                b'<span class="header-profile-avatar"></span>'
                 b'<section class="top-detail-grid"></section>',
             ),
             (True, False),
@@ -193,7 +267,9 @@ class ExternalLoadTests(unittest.TestCase):
                 "text/html",
                 b'<!-- <span data-testid="tournament-detail-lifecycle"></span> '
                 b'<section class="top-detail-grid"></section> '
-                b'<span class="header-profile-avatar"></span> -->'
+                b'<span class="header-profile-avatar"></span> '
+                b'<h1 class="hero-title" aria-label="Турниры / Fake"></h1> '
+                b'<section class="route-loading-shell"></section> -->'
                 b'<script>"<span data-testid=\"tournament-detail-lifecycle\"></span>"</script>',
             ),
             (True, False),
@@ -206,8 +282,9 @@ class ExternalLoadTests(unittest.TestCase):
     def test_html_keepalive_request_retains_only_closed_marker_flags(self) -> None:
         body = (
             b'<span data-testid="tournament-detail-lifecycle" hidden></span>'
-            b'<section class="top-detail-grid"></section>'
             b'<span class="header-profile-avatar"></span>'
+            b'<h1 class="hero-title" aria-label="Турниры / Fixture"></h1>'
+            b'<section class="route-loading-shell"></section>'
         )
         client = Mock()
         client.last_timing = {}
