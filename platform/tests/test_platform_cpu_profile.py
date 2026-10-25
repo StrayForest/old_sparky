@@ -651,10 +651,43 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "stdout_shape": "refusal_marker", "child_state": "reaped",
             })
             self.assertEqual(receipt["plan_cleanup_status"], "not_attempted")
-            self.assertEqual(receipt["remote_plan_cleanup"], "failed")
+            self.assertEqual(receipt["remote_plan_cleanup"], "not_attempted")
             self.assertFalse(receipt["namespace_closed"])
             self.assertFalse(receipt["passed"])
             self.assertFalse(receipt["diagnostic_credit"])
+            refusal_report_path = root / "parent-refusal-report.json"
+            refusal_stdout = io.StringIO()
+            with (
+                patch.object(
+                    capacity_diagnostic, "_read_manifest",
+                    return_value=(manifest_raw, manifest, actors),
+                ),
+                patch.object(cpu_pair, "_ssh_plan", side_effect=fake_ssh_plan),
+                redirect_stdout(refusal_stdout),
+            ):
+                self.assertEqual(capacity_diagnostic.main([
+                    "parent", "--manifest", str(manifest_path),
+                    "--report", str(refusal_report_path),
+                    "--source-sha", "a" * 40, "--app-target-sha", "b" * 40,
+                    "--external-run-id", "12345", "--external-run-attempt", "1",
+                    "--concurrency", "8", "--ssh-config", str(ssh_dir / "config"),
+                    "--ssh-key", str(ssh_dir / "id_ed25519"),
+                    "--ssh-host", "example.test", "--ssh-user", "deploy",
+                ]), 2)
+            refusal_marker = json.loads(refusal_stdout.getvalue())
+            self.assertEqual(refusal_marker["parent_phase"], "remote_plan_prepare")
+            self.assertEqual(refusal_marker["parent_error_class"], "ValueError")
+            self.assertEqual(refusal_marker["parent_return_code"], 2)
+            self.assertEqual(refusal_marker["plan_prepare_status"], "refused")
+            self.assertEqual(refusal_marker["plan_cleanup_status"], "not_attempted")
+            self.assertEqual(
+                refusal_marker["plan_prepare_refusal_class"], "ValueError",
+            )
+            self.assertEqual(refusal_marker["remote_plan_cleanup"], "not_attempted")
+            self.assertFalse(refusal_marker["namespace_closed"])
+            self.assertFalse(refusal_marker["diagnostic_credit"])
+            self.assertNotIn("example.test", refusal_stdout.getvalue())
+            self.assertNotIn(str(root), refusal_stdout.getvalue())
             self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
                 receipt, source_sha="a" * 40, app_target_sha="b" * 40,
                 run_id="12345", attempt="1",
@@ -912,6 +945,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         namespace_ready_failure_stage="namespace_config_read",
                         namespace_post_ready_failure_stage=None,
                         watchdog_startup_failure_stage="watchdog_supervision",
+                        report={
+                            "runtime_supervisor": {
+                                "reason": "namespace_unavailable",
+                                "report_error": "NamespaceCapabilityError",
+                            },
+                            "runtime_budget": {"phase": "namespace_probe"},
+                        },
                     ),
                 ),
                 patch.object(capacity_diagnostic, "_cleanup_remote_capacity_plan") as no_namespace_cleanup,
@@ -920,7 +960,36 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 composed = capacity_diagnostic._parent_run(
                     Namespace(**vars(args)), stage_state,
                 )
+                preflight_stdout = io.StringIO()
+                with redirect_stdout(preflight_stdout):
+                    self.assertEqual(capacity_diagnostic.main([
+                        "parent", "--manifest", str(manifest_path),
+                        "--report", str(root / "namespace-preflight-cli.json"),
+                        "--source-sha", "a" * 40, "--app-target-sha", "b" * 40,
+                        "--external-run-id", "12345", "--external-run-attempt", "1",
+                        "--concurrency", "8", "--ssh-config", str(ssh_dir / "config"),
+                        "--ssh-key", str(ssh_dir / "id_ed25519"),
+                        "--ssh-host", "example.test", "--ssh-user", "deploy",
+                    ]), 2)
             no_namespace_cleanup.assert_not_called()
+            preflight_marker = json.loads(preflight_stdout.getvalue())
+            self.assertEqual(preflight_marker["parent_phase"], "worker_supervision")
+            self.assertEqual(preflight_marker["supervisor_report_phase"], "namespace_probe")
+            self.assertEqual(
+                preflight_marker["supervisor_report_error_class"],
+                "NamespaceCapabilityError",
+            )
+            self.assertIsNone(preflight_marker["supervisor_return_code"])
+            self.assertEqual(preflight_marker["supervisor_reason"], "namespace_unavailable")
+            self.assertFalse(preflight_marker["supervisor_process_started"])
+            self.assertFalse(preflight_marker["supervisor_namespace_closed"])
+            self.assertEqual(preflight_marker["remote_plan_cleanup"], "failed")
+            self.assertEqual(preflight_marker["plan_cleanup_status"], "not_attempted")
+            self.assertFalse(preflight_marker["matrix_credit"])
+            self.assertFalse(preflight_marker["slo_credit"])
+            self.assertFalse(preflight_marker["diagnostic_credit"])
+            self.assertNotIn("example.test", preflight_stdout.getvalue())
+            self.assertNotIn(str(root), preflight_stdout.getvalue())
             self.assertFalse(composed["namespace_closed"])
             self.assertFalse(composed["passed"])
             self.assertEqual(composed["remote_plan_cleanup"], "failed")
@@ -941,9 +1010,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "namespace_ready_failure_stage": "namespace_config_read",
                 "namespace_post_ready_failure_stage": None,
                 "watchdog_startup_failure_stage": "watchdog_supervision",
+                "report_error_class": "NamespaceCapabilityError",
+                "report_phase": "namespace_probe",
             })
             preinit_fingerprint = capacity_diagnostic._parent_outcome_fingerprint(
                 composed, stage_state["supervisor_evidence"],
+                parent_phase=stage_state["stage"],
+                prepare_lifecycle=stage_state["prepare_lifecycle"],
+                cleanup_lifecycle=stage_state["cleanup_lifecycle"],
             )
             started_fingerprint = capacity_diagnostic._parent_outcome_fingerprint(
                 composed, {
@@ -953,6 +1027,17 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 },
             )
             self.assertFalse(preinit_fingerprint["supervisor_process_started"])
+            self.assertEqual(preinit_fingerprint["parent_phase"], "worker_supervision")
+            self.assertEqual(
+                preinit_fingerprint["supervisor_report_phase"], "namespace_probe",
+            )
+            self.assertEqual(
+                preinit_fingerprint["supervisor_report_error_class"],
+                "NamespaceCapabilityError",
+            )
+            self.assertIsNone(preinit_fingerprint["supervisor_return_code"])
+            self.assertEqual(preinit_fingerprint["plan_cleanup_status"], "not_attempted")
+            self.assertEqual(preinit_fingerprint["remote_plan_cleanup"], "failed")
             self.assertEqual(
                 preinit_fingerprint["supervisor_startup_failure_stage"], "unknown",
             )
@@ -1114,12 +1199,17 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertNotIn("example.test", rejection_stdout.getvalue())
             self.assertNotIn("id_ed25519", rejection_stdout.getvalue())
 
-            parent_fingerprint = capacity_diagnostic._parent_outcome_fingerprint(composed)
+            parent_fingerprint = capacity_diagnostic._parent_outcome_fingerprint(
+                composed,
+                prepare_lifecycle=stage_state["prepare_lifecycle"],
+                cleanup_lifecycle=stage_state["cleanup_lifecycle"],
+            )
             self.assertEqual(parent_fingerprint["stage"], "parent_outcome")
             self.assertFalse(parent_fingerprint["namespace_closed"])
             self.assertFalse(parent_fingerprint["worker_present"])
             self.assertEqual(parent_fingerprint["runner_context_reason"], "runner_context_unavailable")
             self.assertEqual(parent_fingerprint["remote_plan_cleanup"], "failed")
+            self.assertEqual(parent_fingerprint["plan_cleanup_status"], "not_attempted")
 
     def test_ssr_capacity_evaluator_requires_complete_bound_zero_credit_evidence(self) -> None:
         report = {

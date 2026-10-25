@@ -1198,7 +1198,14 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 stdin = Pipe()
             def popen(command, **kwargs):
                 Path(os.environ["POpen_MARKER"]).write_text("yes", encoding="ascii")
-                Path(os.environ["HELPER_ATTEMPT"]).write_text(command[-3], encoding="ascii")
+                attempt_index = command.index("--run-attempt")
+                Path(os.environ["HELPER_ATTEMPT"]).write_text(command[attempt_index + 1], encoding="ascii")
+                fixture_index = command.index("--fixture-kind") if "--fixture-kind" in command else None
+                fixture_value = command[fixture_index + 1] if fixture_index is not None else "external_load"
+                Path(os.environ["HELPER_FIXTURE_KIND"]).write_text(fixture_value, encoding="ascii")
+                Path(os.environ["HELPER_FIXTURE_KIND_OPTION"]).write_text(
+                    "present" if fixture_index is not None else "absent", encoding="ascii"
+                )
                 return Process()
             dispatcher.subprocess.Popen = popen
             dispatcher._terminate_process_group = lambda process: None
@@ -1209,6 +1216,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 "run_id": remote[6] if len(remote) > 6 else None,
                 "run_attempt": remote[8] if len(remote) > 8 else None,
                 "payload_run_id_matches": payload.get("run_id") == (remote[6] if len(remote) > 6 else None),
+                "helper_fixture_kind": Path(os.environ["HELPER_FIXTURE_KIND"]).read_text(encoding="ascii") if Path(os.environ["HELPER_FIXTURE_KIND"]).exists() else None,
+                "helper_fixture_kind_option": Path(os.environ["HELPER_FIXTURE_KIND_OPTION"]).read_text(encoding="ascii") if Path(os.environ["HELPER_FIXTURE_KIND_OPTION"]).exists() else None,
                 "rc": rc,
                 "popen_called": Path(os.environ["POpen_MARKER"]).exists(),
             }
@@ -1240,6 +1249,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "setup_concurrency": "8", "run_id": "123456", "profile": "external-vote",
             "tournament_count": "1", "users_per_tournament": "14",
             "timeout_diagnostics": "false",
+            "fixture_kind": "external_load",
         }
 
         with tempfile.TemporaryDirectory(prefix="external-fixture-transport-") as temporary:
@@ -1281,6 +1291,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     "MOCK_BROKEN_PIPE": "1" if pipe else "0", "MOCK_MARKER": marker,
                     "POpen_MARKER": str(case / "popen-called"),
                     "HELPER_ATTEMPT": str(case / "helper-attempt"),
+                    "HELPER_FIXTURE_KIND": str(case / "helper-fixture-kind"),
+                    "HELPER_FIXTURE_KIND_OPTION": str(case / "helper-fixture-kind-option"),
                     "SSH_CAPTURE": str(case / "ssh-capture.json"),
                     "SCP_REQUESTS": str(case / "scp-requests"),
                 }
@@ -1300,6 +1312,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertEqual(capture["mode"], "external-fixture")
             self.assertEqual(capture["run_id"], "123456")
             self.assertEqual(capture["run_attempt"], "1")
+            self.assertEqual(capture["helper_fixture_kind"], "external_load")
+            self.assertEqual(capture["helper_fixture_kind_option"], "absent")
             self.assertTrue(capture["payload_run_id_matches"])
             self.assertEqual(capture["rc"], 0)
             self.assertTrue(capture["popen_called"])

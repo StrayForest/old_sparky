@@ -1809,6 +1809,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             helper_source = (
                 PLATFORM_ROOT / "tools" / "platform_production_external_fixture_qa.sh"
             ).read_text(encoding="utf-8")
+            self.assertIn('"fixture_kind": fixture_kind', helper_source)
+            self.assertIn('destination = run_root / "diagnostic-abort-binding.json"', helper_source)
             confirmation_function = re.search(
                 r"(?ms)^validate_fixture_confirmation\(\) \{\n.*?^\}\n",
                 helper_source,
@@ -1846,6 +1848,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         "progress_enabled=0",
                         "trap write_supervisor_exit EXIT",
                         'confirmation="$CPU_DIAGNOSTIC_CONFIRMATION"',
+                        'fixture_kind="cpu_diagnostic_only_v1"',
                         'timeout_diagnostics=false',
                         'external_vote_tournament_count=2',
                         'external_vote_users_per_tournament=14',
@@ -1875,7 +1878,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertFalse(Path(rejected_environment["TEST_DB_PREPARED"]).exists())
 
             def run_confirmation(
-                confirmation: str, timeout: str, tournaments: str, users: str
+                confirmation: str, timeout: str, tournaments: str, users: str,
+                fixture_kind: str,
             ) -> int:
                 environment = {
                     **os.environ,
@@ -1884,6 +1888,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     "CPU_DIAGNOSTIC_CONFIRMATION": "RUN-PRODUCTION-CPU-DIAGNOSTIC",
                     "SSR_CAPACITY_CONFIRMATION": "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC",
                     "confirmation": confirmation,
+                    "fixture_kind": fixture_kind,
                     "timeout_diagnostics": timeout,
                     "external_vote_tournament_count": tournaments,
                     "external_vote_users_per_tournament": users,
@@ -1898,31 +1903,43 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 return completed.returncode
 
             self.assertEqual(
-                run_confirmation("RUN-PRODUCTION-EXTERNAL-LOAD", "false", "1", "14"),
+                run_confirmation("RUN-PRODUCTION-EXTERNAL-LOAD", "false", "1", "14", "external_load"),
                 0,
             )
             self.assertEqual(
-                run_confirmation("RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS", "true", "1", "14"),
+                run_confirmation("RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS", "true", "1", "14", "external_load"),
                 0,
             )
             self.assertEqual(
-                run_confirmation("RUN-PRODUCTION-CPU-DIAGNOSTIC", "false", "1", "14"),
+                run_confirmation("RUN-PRODUCTION-CPU-DIAGNOSTIC", "false", "1", "14", "cpu_diagnostic_only_v1"),
                 0,
             )
             self.assertEqual(
-                run_confirmation("RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC", "false", "1", "14"),
+                run_confirmation("RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC", "false", "1", "14", "ssr_capacity_diagnostic_v1"),
+                0,
+            )
+            self.assertEqual(
+                run_confirmation("RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC", "false", "1", "14", "ssr_html_capacity_diagnostic_v1"),
                 0,
             )
             self.assertNotEqual(
-                run_confirmation("RUN-PRODUCTION-CPU-DIAGNOSTIC", "false", "2", "14"),
+                run_confirmation("RUN-PRODUCTION-CPU-DIAGNOSTIC", "false", "1", "14", "ssr_html_capacity_diagnostic_v1"),
                 0,
             )
             self.assertNotEqual(
-                run_confirmation("RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC", "true", "1", "14"),
+                run_confirmation("RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC", "false", "1", "14", "cpu_diagnostic_only_v1"),
                 0,
             )
             self.assertNotEqual(
-                run_confirmation("RUN-PRODUCTION-CPU-DIAGNOSTIC", "false", "1", "15"),
+                run_confirmation("RUN-PRODUCTION-CPU-DIAGNOSTIC", "false", "2", "14", "cpu_diagnostic_only_v1"),
+                0,
+            )
+            self.assertNotEqual(
+                run_confirmation("RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC", "true", "1", "14", "ssr_capacity_diagnostic_v1"),
+                0,
+            )
+            self.assertNotEqual(
+                run_confirmation("RUN-PRODUCTION-CPU-DIAGNOSTIC", "false", "1", "15", "cpu_diagnostic_only_v1"),
                 0,
             )
 
@@ -6830,12 +6847,32 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
         unavailable = {"schema": 1, "status": "unavailable", "truncated": False}
         passed = {"schema": 1, "status": "passed", "truncated": False}
-        self.assertEqual(execute(unavailable, proof).returncode, 0)
+        for fixture_kind in (
+            "cpu_diagnostic_only_v1",
+            "ssr_capacity_diagnostic_v1",
+            "ssr_html_capacity_diagnostic_v1",
+        ):
+            with self.subTest(fixture_kind=fixture_kind):
+                self.assertEqual(
+                    execute(unavailable, {**proof, "fixture_kind": fixture_kind}).returncode,
+                    0,
+                )
+        self.assertNotEqual(
+            execute(unavailable, {**proof, "fixture_kind": "external_load"}).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            execute(unavailable, {**proof, "fixture_kind": []}).returncode,
+            0,
+        )
         self.assertEqual(execute(passed, {"schema": 1, "status": "not_applicable"}).returncode, 0)
         self.assertNotEqual(execute(unavailable, None).returncode, 0)
         self.assertNotEqual(execute(unavailable, proof, selected_attempt="2").returncode, 0)
         self.assertNotEqual(execute(unavailable, proof, remote_status="1").returncode, 0)
         self.assertNotEqual(execute(unavailable, proof, ssh_cleanup="failure").returncode, 0)
+        self.assertNotEqual(
+            execute(unavailable, {**proof, "namespace_closed": True}).returncode, 0
+        )
         self.assertNotEqual(execute(unavailable, 7).returncode, 0)
         malformed = {**proof, "supervisor_exit_code": True}
         self.assertNotEqual(execute(unavailable, malformed).returncode, 0)

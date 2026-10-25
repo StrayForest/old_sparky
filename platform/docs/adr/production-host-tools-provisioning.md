@@ -27,8 +27,8 @@ all 15 members, the isolated self-test and no bytecode. S10
 `7a9fe1286054dbe96221d2b428048c4212270cf5`, and recovery generation
 `d47ae6a278f76bb8a46cca0bbe9019427584c3d2861880e8a7365d87a627be66` remain
 preserved. Earlier SSR diagnostics used C `d2cb3b2ba0425e08d60904f442240400b199db12` and pin P `7c40b6fd5e035238c6d43ea206357eca8e6aa53a` for the exact 15-member closure.
-The current guarded authenticated HTML SSR diagnostic uses C `8af09bfe67dfd8cdb192c85c9300fb8842d9f37b` and pin-only P `fcc74008fd67b2bf6065adbf6c91e95fb31b826c`; P retains that closure and updates exactly four digests:
-`platform/tools/platform_configure_shared_env.py`, `platform/tools/platform_cpu_diagnostic_plan.py`, `platform/tools/platform_production_deploy_supervisor.sh`, and `platform/tools/platform_workflow_input_guard.py`.
+The latest SSR abort/parent diagnostics use C2 `b3ab2d020845214c882abcd4d668dd52632836cb` and pin-only P2 `7fdd58ccf46c3ba69768df209075e3f38691a6df`; P2 updates only the dispatcher digest (`d7b58f26ebfb55b403cab8962d36f87f061e3d5d4cd135ec941d1fdfff519ed8`) in the exact 15-member closure.
+C2 adds typed fixture-bound abort evidence and bounded preworker failure diagnostics; it grants no performance credit.
 Pin resolution selects repository source only; it does not prove production build, provisioning or installation. Exact-P CI, signed preflight, approved provisioning and installed self-test remain required.
 The retained-load export-authority bump uses **C**
 `47551d9c9278da79234314aade6aa1ce55d7f979` and pin commit **P**

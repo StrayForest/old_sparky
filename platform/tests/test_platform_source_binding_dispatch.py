@@ -468,6 +468,31 @@ class SourceBindingDispatchTests(unittest.TestCase):
                         payload, run_id="567890", run_attempt="3"
                     ), 0
                 )
+            for fixture_kind in (
+                "cpu_diagnostic_only_v1",
+                "ssr_capacity_diagnostic_v1",
+                "ssr_html_capacity_diagnostic_v1",
+            ):
+                typed_payload = {**payload, "fixture_kind": fixture_kind}
+                typed_child = FakeProcess()
+                with (
+                    patch.object(dispatcher, "ACTIVE_TOOLS_DIR", root),
+                    patch.object(dispatcher, "EXTERNAL_HELPER", helper),
+                    patch.object(dispatcher, "SUDO", "/usr/bin/sudo"),
+                    patch.object(
+                        dispatcher.subprocess, "Popen", return_value=typed_child,
+                    ) as typed_popen,
+                ):
+                    self.assertEqual(
+                        dispatcher._external_fixture(
+                            typed_payload, run_id="567890", run_attempt="3"
+                        ),
+                        0,
+                    )
+                self.assertEqual(
+                    typed_popen.call_args.args[0][-2:],
+                    ["--fixture-kind", fixture_kind],
+                )
         command = popen.call_args.args[0]
         self.assertEqual(command[:4], ["/usr/bin/sudo", "-n", "--", str(helper)])
         self.assertEqual(
@@ -489,6 +514,7 @@ class SourceBindingDispatchTests(unittest.TestCase):
         self.assertEqual(command[14:16], ["--run-attempt", "3"])
         self.assertEqual(command[16], "--input-handoff-sha256")
         self.assertRegex(command[17], r"^[0-9a-f]{64}$")
+        self.assertEqual(command[18:], [])
         self.assertNotIn("shell", popen.call_args.kwargs)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
 

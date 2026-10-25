@@ -57,8 +57,9 @@ trap platform_retained_load_lock_close EXIT
 source_binding_b64=""
 run_attempt=""
 input_handoff_sha256=""
-if (( $# < 7 || $# > 14 )); then
-  echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path]" >&2
+fixture_kind=""
+if (( $# < 7 || $# > 16 )); then
+  echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path] [typed options]" >&2
   exit 2
 fi
 
@@ -99,6 +100,13 @@ while (( $# >= next_extra_arg )); do
       }
       input_handoff_sha256="$value"
       ;;
+    --fixture-kind)
+      [[ -z "$fixture_kind" && -n "$value" ]] || {
+        echo "Fixture kind option is invalid." >&2
+        exit 2
+      }
+      fixture_kind="$value"
+      ;;
     *)
       echo "Unexpected external-load fixture option." >&2
       exit 2
@@ -110,6 +118,9 @@ while (( $# >= next_extra_arg )); do
   }
   next_extra_arg=$((next_extra_arg + 2))
 done
+if [[ -z "$fixture_kind" ]]; then
+  fixture_kind="external_load"
+fi
 [[ "$profile" == "external-vote" ]] || {
   echo "External-load fixture supports only the external-vote profile." >&2
   exit 1
@@ -157,6 +168,13 @@ if [[ -n "$run_attempt" && ! "$run_attempt" =~ ^[1-9][0-9]{0,8}$ ]]; then
 fi
 if [[ -n "$input_handoff_sha256" && ! "$input_handoff_sha256" =~ ^[0-9a-f]{64}$ ]]; then
   echo "Input handoff digest is invalid." >&2
+  exit 1
+fi
+if [[ -n "$fixture_kind" && "$fixture_kind" != "external_load" \
+  && "$fixture_kind" != "cpu_diagnostic_only_v1" \
+  && "$fixture_kind" != "ssr_capacity_diagnostic_v1" \
+  && "$fixture_kind" != "ssr_html_capacity_diagnostic_v1" ]]; then
+  echo "Fixture kind is invalid." >&2
   exit 1
 fi
 if [[ ! "$external_vote_tournament_count" =~ ^[1-9][0-9]?$ ]] \
@@ -253,6 +271,16 @@ write_supervisor_exit() {
 }
 trap write_supervisor_exit EXIT
 validate_fixture_confirmation() {
+  case "$confirmation:$fixture_kind" in
+    "$EXTERNAL_CONFIRMATION:external_load"|"$TIMEOUT_DIAGNOSTICS_CONFIRMATION:external_load"|\
+      "$CPU_DIAGNOSTIC_CONFIRMATION:cpu_diagnostic_only_v1"|\
+      "$SSR_CAPACITY_CONFIRMATION:ssr_capacity_diagnostic_v1"|\
+      "$SSR_CAPACITY_CONFIRMATION:ssr_html_capacity_diagnostic_v1") ;;
+    *)
+      echo "Fixture kind does not match its diagnostic confirmation." >&2
+      return 1
+      ;;
+  esac
   if [[ "$timeout_diagnostics" == "true" ]]; then
     [[ "$confirmation" == "$TIMEOUT_DIAGNOSTICS_CONFIRMATION" ]] || {
       echo "Timeout diagnostics require the dedicated timeout-diagnostics confirmation." >&2
@@ -323,9 +351,11 @@ install -d -o root -g root -m 0700 "$run_root"
 export_dir_identity="$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h' -- "$export_dir")"
 export_created=1
 validate_fixture_confirmation || exit 1
-if [[ "$confirmation" == "$CPU_DIAGNOSTIC_CONFIRMATION" ]] \
+if [[ "$fixture_kind" == "cpu_diagnostic_only_v1" \
+  || "$fixture_kind" == "ssr_capacity_diagnostic_v1" \
+  || "$fixture_kind" == "ssr_html_capacity_diagnostic_v1" ]] \
   && [[ -z "$run_attempt" || -z "$input_handoff_sha256" ]]; then
-  echo "CPU diagnostic fixture binding is incomplete." >&2
+  echo "Typed diagnostic fixture binding is incomplete." >&2
   exit 1
 fi
 log_path="$run_root/canonical.log"
@@ -468,10 +498,12 @@ if [[ "$qa_status" == "0" && -s "$external_vote_manifest" ]]; then
   # Actions artifact.
   install -o "$export_uid" -g "$export_gid" -m 0600 \
     "$external_vote_manifest" "$export_dir/manifest.json"
-  if [[ "$confirmation" == "$CPU_DIAGNOSTIC_CONFIRMATION" ]]; then
+  if [[ "$fixture_kind" == "cpu_diagnostic_only_v1" \
+    || "$fixture_kind" == "ssr_capacity_diagnostic_v1" \
+    || "$fixture_kind" == "ssr_html_capacity_diagnostic_v1" ]]; then
     /usr/bin/python3.12 -I -B - \
       "$run_root" "$external_vote_manifest" "$run_id" "$run_attempt" \
-      "$target_sha" "$app_target_sha" "$input_handoff_sha256" <<'PY' || {
+      "$target_sha" "$app_target_sha" "$input_handoff_sha256" "$fixture_kind" <<'PY' || {
 import hashlib
 import json
 import os
@@ -481,13 +513,18 @@ import stat
 import sys
 
 run_root, manifest_path = (Path(value) for value in sys.argv[1:3])
-run_id, attempt, source_sha, app_sha, input_sha = sys.argv[3:]
+run_id, attempt, source_sha, app_sha, input_sha, fixture_kind = sys.argv[3:]
 if (
     re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None
     or re.fullmatch(r"[1-9][0-9]{0,8}", attempt) is None
     or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
     or re.fullmatch(r"[0-9a-f]{40}", app_sha) is None
     or re.fullmatch(r"[0-9a-f]{64}", input_sha) is None
+    or fixture_kind not in {
+        "cpu_diagnostic_only_v1",
+        "ssr_capacity_diagnostic_v1",
+        "ssr_html_capacity_diagnostic_v1",
+    }
 ):
     raise SystemExit(1)
 root_meta = run_root.lstat()
@@ -509,7 +546,7 @@ finally:
     os.close(fd)
 record = {
     "schema": 1,
-    "fixture_kind": "cpu_diagnostic_only_v1",
+    "fixture_kind": fixture_kind,
     "external_run_id": run_id,
     "external_run_attempt": attempt,
     "source_sha": source_sha,
@@ -517,7 +554,7 @@ record = {
     "input_handoff_sha256": input_sha,
     "fixture_manifest_sha256": digest.hexdigest(),
 }
-destination = run_root / "cpu-abort-binding.json"
+destination = run_root / "diagnostic-abort-binding.json"
 data = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
 create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
 out = os.open(destination, create_flags, 0o600)
