@@ -18,10 +18,6 @@ The candidate completed `20,000/20,000` HTTP requests with status 200 at `36.078
 
 Exact cleanup removed all 20,000 synthetic users and 40 tournaments, preserved the control sentinel, and passed namespace/origin-boundary checks. The run earns no passing SLO credit.
 
-## Latest authenticated SSR attempt (2026-10-25)
-
-The latest [SSR diagnostic run `40154266667/1`](https://github.com/StrayForest/old_sparky/actions/runs/40154266667), on source `4df479c728b02a3ee92585572e28c1cb96890f80`, stopped during namespace startup with exit 125, `startup_failure_stage=unknown` and `runner_context_unavailable`. The inner worker and client did not run; every capacity credit is false, and the actual startup cause is unproven. Exact stop passed in [run `40154578267/1`](https://github.com/StrayForest/old_sparky/actions/runs/40154578267); its normalization step could not prove a CPU report because no client ran. Exact fixture cleanup [run `40154775260/1`](https://github.com/StrayForest/old_sparky/actions/runs/40154775260) removed 14 fixture users and one tournament while preserving the control account. Canonical plan cleanup removed both expired plans and confirmed both plan files absent. Do not infer a performance result, server-capacity limit, or resolved startup cause from this attempt.
-
 The pre-separation v1 contracts and retired saturation sweeps remain under
 [`profiles/retained-v1/`](profiles/retained-v1/README.md) solely as historical
 semantics for interpreting retained evidence. That directory is outside the
