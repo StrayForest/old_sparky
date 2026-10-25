@@ -685,12 +685,20 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertLessEqual(simulated_wait, capacity_diagnostic.PLAN_EXPIRY_WAIT_LIMIT_MS / 1000)
 
             fake_monotonic[0] = 157.0
-            with patch.object(capacity_diagnostic.time, "sleep") as no_sleep:
+            with (
+                patch.object(capacity_diagnostic.time, "time_ns", return_value=0) as wall_clock,
+                patch.object(
+                    capacity_diagnostic.time, "monotonic",
+                    side_effect=lambda: fake_monotonic[0],
+                ),
+                patch.object(capacity_diagnostic.time, "sleep") as no_sleep,
+            ):
                 capacity_diagnostic._wait_for_remote_plan_expiry(
                     1_097_000, plan_created_at_ms=1_000_000,
                     plan_created_monotonic=50.0,
                 )
             no_sleep.assert_not_called()
+            wall_clock.assert_not_called()
 
             producer_report = root / "namespace-open-parent-report.json"
             sanitized_report = root / "namespace-open-sanitized.json"
