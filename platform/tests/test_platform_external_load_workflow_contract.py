@@ -2381,6 +2381,21 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         upload_step = next(
             step for step in cpu_steps if step.get("name") == "Publish only the bounded diagnostic summary"
         )
+        capacity_fingerprint_upload = next(
+            step
+            for step in cpu_steps
+            if step.get("name") == "Publish the bound SSR capacity diagnostic fingerprint"
+        )
+        capacity_ssh_cleanup = next(
+            step
+            for step in cpu_steps
+            if step.get("name") == "Remove SSR capacity SSH material"
+        )
+        capacity_sanitize = next(
+            step
+            for step in cpu_steps
+            if step.get("name") == "Project the SSR capacity report through its closed schema"
+        )
         self.assertLess(
             cpu_step_indexes["Run the fixed authenticated workspace CPU pair"],
             cpu_step_indexes["Remove diagnostic SSH material"],
@@ -2403,6 +2418,28 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("steps.cpu-pair.outcome", upload_step["if"])
         self.assertNotIn("steps.remove-diagnostic-ssh-material.outcome", upload_step["if"])
         self.assertIn("steps.sanitize-cpu-report.outcome == 'success'", upload_step["if"])
+        self.assertEqual(capacity_ssh_cleanup.get("id"), "remove-ssr-capacity-ssh")
+        self.assertIn(
+            "steps.remove-ssr-capacity-ssh.outcome == 'success'",
+            capacity_sanitize["if"],
+        )
+        self.assertIn("always()", capacity_fingerprint_upload["if"])
+        self.assertIn(
+            "inputs.ssr_capacity_diagnostic_only == true",
+            capacity_fingerprint_upload["if"],
+        )
+        self.assertIn(
+            "steps.remove-diagnostic-ssh-material.outcome == 'success'",
+            capacity_fingerprint_upload["if"],
+        )
+        self.assertIn(
+            "steps.remove-ssr-capacity-ssh.outcome == 'success'",
+            capacity_fingerprint_upload["if"],
+        )
+        self.assertIn(
+            "steps.ssr-capacity.outputs.capacity_status != '0'",
+            capacity_fingerprint_upload["if"],
+        )
         cpu_configure = _step_script(
             cpu_job, "Configure pinned production SSH for the trusted parent"
         )
