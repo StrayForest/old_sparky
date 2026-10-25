@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
+from tools import platform_abort_retained_load as retained_abort
 from tools import platform_retained_load_export_executor as executor
 from tools import platform_capture_retained_recovery_stderr as recovery_capture
 
@@ -691,7 +692,76 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             + script.split("write_supervisor_exit() {", 1)[1].split("\n}", 1)[0]
             + "\n}"
         )
+        run_id = "40190000001"
+        artifact_uid, artifact_gid = 45678, 45679
+        sudo_uid, sudo_gid = 56780, 56781
         with tempfile.TemporaryDirectory(prefix="load-export-trap-") as parent:
+            base = Path(parent)
+            owned_export_dir = base / f"old-sparky-production-retained-load-{run_id}"
+            owned_export_dir.mkdir(mode=0o700)
+            os.chown(owned_export_dir, artifact_uid, artifact_gid)
+            owned_export_dir.chmod(0o700)
+            owned_receipt = owned_export_dir / "supervisor.exit"
+            owner_bound_command = "\n".join(
+                (
+                    "set +e",
+                    f"export_dir={shlex.quote(str(owned_export_dir))}",
+                    f"supervisor_exit_path={shlex.quote(str(owned_receipt))}",
+                    "export_dir_identity=\"$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h' -- \"$export_dir\")\"",
+                    "export_created=1",
+                    f"export_uid={artifact_uid}",
+                    f"export_gid={artifact_gid}",
+                    "progress_enabled=0",
+                    "platform_retained_load_lock_close() { :; }",
+                    function,
+                    "(exit 143)",
+                    "write_supervisor_exit",
+                )
+            )
+            trapped = subprocess.run(
+                ["/bin/bash", "-c", owner_bound_command],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(
+                trapped.returncode,
+                143,
+                trapped.stderr.decode("utf-8", "replace"),
+            )
+            receipt_metadata = owned_receipt.stat(follow_symlinks=False)
+            self.assertEqual(
+                (receipt_metadata.st_uid, receipt_metadata.st_gid),
+                (artifact_uid, artifact_gid),
+            )
+            self.assertEqual(
+                (receipt_metadata.st_nlink, stat.S_IMODE(receipt_metadata.st_mode)),
+                (1, 0o600),
+            )
+            self.assertEqual(owned_receipt.read_bytes(), b"143\n")
+            with (
+                patch.object(retained_abort, "SUPERVISOR_EXPORT_BASE", base),
+                patch.object(
+                    retained_abort,
+                    "resolve_artifact_identity",
+                    return_value=SimpleNamespace(uid=artifact_uid, gid=artifact_gid),
+                ) as resolve_owner,
+                patch.dict(
+                    os.environ,
+                    {"SUDO_UID": str(sudo_uid), "SUDO_GID": str(sudo_gid)},
+                ),
+            ):
+                self.assertEqual(retained_abort._supervisor_exit_code(run_id), 143)
+                resolve_owner.assert_called_once_with(require_root=True)
+                with patch.object(
+                    retained_abort,
+                    "resolve_artifact_identity",
+                    return_value=SimpleNamespace(uid=artifact_uid + 1, gid=artifact_gid),
+                ):
+                    self.assertIsNone(retained_abort._supervisor_exit_code(run_id))
+
             export_dir = Path(parent) / "existing"
             export_dir.mkdir(mode=0o700)
             receipt = export_dir / "supervisor.exit"

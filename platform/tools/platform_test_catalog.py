@@ -74,6 +74,11 @@ TEST_ENVIRONMENT_REQUIREMENTS: Mapping[str, Mapping[str, str]] = {
         "RUNNER_OS": "Linux",
         "RUNNER_ENVIRONMENT": "github-hosted",
     },
+    "tests.test_platform_retained_load_export_executor.RetainedLoadExportExecutorTests.test_fixture_trap_collision_leaves_preexisting_export_unchanged": {
+        "GITHUB_ACTIONS": "true",
+        "RUNNER_OS": "Linux",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+    },
 }
 
 # These cases execute the real PID-namespace supervisor and require the
@@ -629,6 +634,11 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
         "HostToolsBundleTests",
         "test_active_release_baseline_reader_returns_stable_closed_tuple",
     ): "backend-privileged",
+    (
+        "test_platform_retained_load_export_executor",
+        "RetainedLoadExportExecutorTests",
+        "test_fixture_trap_collision_leaves_preexisting_export_unchanged",
+    ): "backend-privileged",
 }
 
 # Filled after the implementation snapshot is stable.  The contract compares
@@ -637,10 +647,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 172,
     "module_digest": "6b5ea2f0545b8a998f2dc9019ebffa0dc1bb76e145b12666fedb06d2abf0948a",
-    "test_count": 2211,
-    "test_id_digest": "1d8ea7daabf60a6f751a7f6dab97d744014c59beaa90eaa76b16648ed24b4221",
-    "backend_test_count": 2133,
-    "backend_test_id_digest": "a1ea0c18656a0a5c6edd30e291944c2320e4875cae9921dd032c34760250cbf6",
+    "test_count": 2212,
+    "test_id_digest": "e2f87d18ba18f65e559af71690418b568f5710284d88e6d6858656822f40baff",
+    "backend_test_count": 2134,
+    "backend_test_id_digest": "a2de796e270851895f2869a3fe3c8fa2621b412c52495ceb812f137e747a939f",
     "verification_test_count": 78,
     "verification_test_id_digest": "3d9621c245877a188d3768cb835b85ddf3055971e4d5ee6b949aadd5d9fd0008",
     "verification_classifier_test_count": 41,
@@ -687,8 +697,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "performance-contract": {
         "module_count": 11,
         "module_digest": "ac879f1b292f00df28f399af5e34ed8995b39878e1961386b8eb055bb1d025e0",
-        "test_count": 252,
-        "test_id_digest": "87986feef25dc2c293359db8446cfff2e612a17e0432ad2265eb1411cf38ed35",
+        "test_count": 253,
+        "test_id_digest": "24dad1ae2639fb94dc48bd4d51efaf4f1e4a25486a359eeb3bfc06aaa8a0cc36",
     },
     VERIFICATION_CONTOUR: {
         "module_count": 3,

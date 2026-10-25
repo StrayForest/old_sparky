@@ -1901,6 +1901,8 @@ jobs:
             --source-sha "$TARGET_SHA" --app-target-sha "$APP_TARGET_SHA" \
             --external-run-id "$GITHUB_RUN_ID" --external-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --concurrency '${{ inputs.ssr_capacity_concurrency }}' \
+            --workload '${{ inputs.ssr_capacity_workload }}' \
+            --failure-report "$RUNNER_TEMP/ssr-capacity-report/failure-fingerprint.json" \
             --ssh-config "$RUNNER_TEMP/external-ssh/config" \
             --ssh-key "$RUNNER_TEMP/external-ssh/id_ed25519"
           capacity_status="$?"
@@ -2204,7 +2206,7 @@ jobs:
 
       - name: Project the SSR capacity report through its closed schema
         id: sanitize-ssr-capacity
-        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true && steps.ssr-capacity.outputs.capacity_status != '' && steps.remove-ssr-capacity-ssh.outcome != '' }}
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true && steps.ssr-capacity.outputs.capacity_status != '' && steps.remove-ssr-capacity-ssh.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -2224,6 +2226,16 @@ jobs:
           name: platform-production-ssr-capacity-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ssr-capacity-report/ssr-capacity.json
           if-no-files-found: error
+          retention-days: 1
+
+      - name: Publish the bound SSR capacity diagnostic fingerprint
+        id: publish-ssr-capacity-fingerprint
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true && steps.remove-diagnostic-ssh-material.outcome == 'success' && steps.remove-ssr-capacity-ssh.outcome == 'success' && (steps.ssr-capacity.outputs.capacity_status != '0' || steps.sanitize-ssr-capacity.outcome == 'failure') }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-ssr-capacity-fingerprint-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ssr-capacity-report/failure-fingerprint.json
+          if-no-files-found: ignore
           retention-days: 1
 
   fixture-finalize:
