@@ -1757,9 +1757,11 @@ def watch_capacity_memory(args: argparse.Namespace):
         }
         if decision in {"abort", "complete"}:
             return
+        # Keep the guard observable during plan lead time too; the parent
+        # requires a bounded heartbeat and must be able to stop the workload.
         next_boundary_ms = min(
             on_end_ms,
-            max(off_start_ms, now_ms + round(SSR_CAPACITY_WATCH_INTERVAL_SECONDS * 1000)),
+            now_ms + round(SSR_CAPACITY_WATCH_INTERVAL_SECONDS * 1000),
         )
         time.sleep(max(0.0, (next_boundary_ms - now_ms) / 1000))
 

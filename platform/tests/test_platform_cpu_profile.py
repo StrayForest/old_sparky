@@ -499,8 +499,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
         # Exercise the no-HTTP memory chain against temporary cgroup/systemd
         # fixtures. The child producer advances the real fixed 250ms sampling
-        # loop with a controlled wall clock; the dispatcher uses a scaled
-        # monotonic clock so its actual deadline path sees the full horizon.
+        # loop with a controlled wall clock; producer sleeps and dispatcher
+        # monotonic time use one shared acceleration ratio over the full horizon.
         source_sha = "b" * 40
         run_id = "a" * 32
         off_start_ms = time.time_ns() // 1_000_000 + 60_000
@@ -509,6 +509,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "on_start_ms": off_start_ms + 25_000, "on_end_ms": off_start_ms + 45_000,
             "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
         }
+        interval_ms = round(diagnostic_plan_tool.SSR_CAPACITY_WATCH_INTERVAL_SECONDS * 1000)
+        self.assertEqual(interval_ms, 250)
+        full_horizon_ms = plan["on_end_ms"] - (plan["off_start_ms"] - 60_000)
+        expected_full_rows = full_horizon_ms // interval_ms + 1
         unit = {
             "ActiveState": "active", "InvocationID": "f" * 32,
             "MainPID": "345", "ControlGroup": "/system.slice/deadlock-web.service",
@@ -562,9 +566,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 plan_tool.time.time_ns = lambda: clock["ms"] * 1_000_000
                 def fast_forward(seconds):
                     clock["ms"] = min(plan["on_end_ms"], clock["ms"] + round(seconds * 1000))
-                    # 4.5ms real × the dispatcher's 60× monotonic scale
-                    # keeps the 105s virtual plan inside 130s but beyond 55s.
-                    real_sleep(0.0045)
+                    # Apply the same 30× acceleration to the producer's
+                    # sleep and the dispatcher's monotonic clock.
+                    real_sleep(seconds / 30)
                 plan_tool.time.sleep = fast_forward
                 raise SystemExit(plan_tool.main(["memory-watch-stdin"]))
             """)
@@ -580,7 +584,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     from tools import platform_workflow_remote_dispatch as dispatch
                     real_monotonic = time.monotonic
                     clock_start = real_monotonic()
-                    dispatch.time.monotonic = lambda: (real_monotonic() - clock_start) * 60
+                    dispatch.time.monotonic = lambda: (real_monotonic() - clock_start) * 30
                     dispatch.SUDO = {str(helper_path)!r}
                     dispatch._trusted_python_helper = lambda _path: True
                     dispatch.CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS = {timeout_seconds}
@@ -645,6 +649,34 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             helper_path.write_text(helper_source, encoding="utf-8")
             helper_path.chmod(0o700)
 
+            full_dispatch = run_dispatcher_direct(
+                timeout_seconds=130,
+                output_cap=remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP,
+            )
+            self.assertEqual(
+                full_dispatch.returncode, 0,
+                f"full dispatcher stderr={full_dispatch.stderr[:1000]!r}",
+            )
+            prefixed_rows = [
+                line for line in full_dispatch.stdout.splitlines()
+                if line.startswith(helper_row_prefix)
+            ]
+            self.assertEqual(len(prefixed_rows), expected_full_rows)
+            self.assertEqual(len(prefixed_rows), len(full_dispatch.stdout.splitlines()))
+            full_rows = [json.loads(line[len(helper_row_prefix):]) for line in prefixed_rows]
+            sample_times = [row["sampled_at_ms"] for row in full_rows]
+            self.assertEqual(sample_times[0], plan["off_start_ms"] - 60_000)
+            self.assertEqual(sample_times[-1], plan["on_end_ms"])
+            self.assertTrue(all(
+                0 < later - earlier <= 250
+                for earlier, later in zip(sample_times, sample_times[1:])
+            ))
+            full_dispatch_bytes = len(full_dispatch.stdout)
+            self.assertGreater(full_dispatch_bytes, 131_072)
+            self.assertLessEqual(
+                full_dispatch_bytes, remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP,
+            )
+
             with self.subTest(dispatcher_bound="old_timeout"):
                 short_timeout = run_dispatcher_direct(
                     timeout_seconds=55,
@@ -668,6 +700,15 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.assertEqual(timeout_marker, {
                     "schema": 1, "stage": "watch_timeout", "reason": "timeout",
                 })
+                timed_rows = [
+                    json.loads(line[len(helper_row_prefix):])
+                    for line in short_timeout.stdout.splitlines()
+                    if line.startswith(helper_row_prefix)
+                ]
+                self.assertTrue(timed_rows)
+                timed_span_ms = timed_rows[-1]["sampled_at_ms"] - timed_rows[0]["sampled_at_ms"]
+                self.assertGreater(timed_span_ms, 50_000)
+                self.assertLess(timed_span_ms, 56_000)
             with self.subTest(dispatcher_bound="old_output_cap"):
                 old_output_cap = run_dispatcher_direct(
                     timeout_seconds=130, output_cap=131_072,
@@ -732,7 +773,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     )
                     self.assertEqual(memory_result["terminal_decision"], "complete")
                     self.assertEqual(memory_result["terminal_reason"], "none")
-                    self.assertGreaterEqual(memory_result["samples"], 180)
+                    self.assertEqual(memory_result["samples"], len(full_rows))
+                    self.assertEqual(watcher.total, full_dispatch_bytes)
+                    self.assertGreater(watcher.total, 131_072)
                     self.assertLessEqual(watcher.total, capacity_diagnostic.REMOTE_WATCH_CAP)
 
             # The parent reader has the same cumulative-stream bound. Prove
@@ -761,11 +804,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     f"{old_parent_watcher.process.poll() if old_parent_watcher.process is not None else None}",
                 )
                 self.assertEqual(old_parent_result["terminal_reason"], "observer_failed")
-                fixture_row_bound = (
-                    plan["on_end_ms"] - (plan["off_start_ms"] - 60_000) + 249
-                ) // 250 + 2
-                self.assertLessEqual(old_parent_result["samples"], fixture_row_bound)
-                maximum_rows = (130_000 + 249) // 250 + 2
+                self.assertGreater(old_parent_watcher.total, 131_072)
+                maximum_rows = expected_full_rows
                 parent_stream_bound = maximum_rows * (capacity_diagnostic.REMOTE_ROW_CAP + 1)
                 helper_stream_bound = maximum_rows * (
                     remote_dispatch.CAPACITY_MEMORY_WATCH_LINE_CAP + 1
