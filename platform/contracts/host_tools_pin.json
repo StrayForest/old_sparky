@@ -43,7 +43,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_render_service_envs.py",
-      "sha256": "b3f851f807f31e37d42e508f57fab2c61dab1d6ca4e43ae547d3d64d4d4bb16e"
+      "sha256": "8882faaed29b459b60f8ff19f33700e34e4a8d334faa84895028408457da52b0"
     },
     {
       "mode": 420,
@@ -76,7 +76,7 @@
       "sha256": "8bdc7866e2ba1a7dbb160c6406d5519238febca18e107778993b73848eb7574a"
     }
   ],
-  "host_tools_sha": "c47001f296857f2c64c44336bdeb777a289048d0",
+  "host_tools_sha": "ce3b53b995ba046e4e1b2f64c61fbcfa39308732",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }
