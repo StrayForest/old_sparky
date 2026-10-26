@@ -201,7 +201,8 @@ SSH_TRANSPORT_STAGES = frozenset({
 })
 SSH_CHILD_STATES = frozenset({"not_started", "running", "reaped", "unknown"})
 SSH_STDOUT_SHAPES = frozenset({
-    "none", "single_line", "prepared_marker", "refusal_marker", "summary_marker", "malformed",
+    "none", "single_line", "prepared_marker", "refusal_marker", "summary_marker",
+    "failure_marker", "malformed",
 })
 
 
@@ -2148,6 +2149,14 @@ def _parent_failure_receipt(
             else "failed"
         ),
     }
+    raw_cleanup_failure_detail = cleanup_lifecycle.get("plan_cleanup_failure_detail")
+    cleanup_failure_detail = _project_cpu_plan_failure_detail(raw_cleanup_failure_detail)
+    if raw_cleanup_failure_detail is not None and (
+        cleanup_failure_detail is None or cleanup_status not in {"bad_protocol", "failed"}
+    ):
+        raise ValueError("cleanup failure detail rejected")
+    if cleanup_failure_detail is not None:
+        result["plan_cleanup_failure_detail"] = cleanup_failure_detail
     if workload != WORKLOAD:
         fixture_kind, _presets, _actors = _profile_spec(workload)
         result.update({"workload": workload, "fixture_kind": fixture_kind})
@@ -2165,14 +2174,19 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
         "plan_cleanup_status", "plan_cleanup_refusal_class", "ssh_cleanup_transport",
         "remote_plan_cleanup",
     }
-    if not isinstance(value, dict) or set(value) not in (fields, fields | {"workload", "fixture_kind"}):
+    allowed_fields = {
+        frozenset(fields), frozenset(fields | {"workload", "fixture_kind"}),
+        frozenset(fields | {"plan_cleanup_failure_detail"}),
+        frozenset(fields | {"workload", "fixture_kind", "plan_cleanup_failure_detail"}),
+    }
+    if not isinstance(value, dict) or frozenset(value) not in allowed_fields:
         return None
     workload = value.get("workload", WORKLOAD)
     try:
         expected_fixture_kind, expected_presets, _actor_count = _profile_spec(workload)
     except ValueError:
         return None
-    if set(value) == fields | {"workload", "fixture_kind"} and value.get("fixture_kind") != expected_fixture_kind:
+    if {"workload", "fixture_kind"} <= set(value) and value.get("fixture_kind") != expected_fixture_kind:
         return None
     if (
         type(value.get("schema")) is not int or value["schema"] != 1
@@ -2208,6 +2222,13 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
         manifest_missing and value["stage"] in {"identity", "manifest_read"}
     ):
         return None
+    if "plan_cleanup_failure_detail" in value:
+        if value["plan_cleanup_status"] not in {"bad_protocol", "failed"} or value["remote_plan_cleanup"] != "failed":
+            return None
+        detail = _project_cpu_plan_failure_detail(value["plan_cleanup_failure_detail"])
+        if detail is None:
+            return None
+        value = {**value, "plan_cleanup_failure_detail": detail}
     for key in ("ssh_prepare_transport", "ssh_cleanup_transport"):
         transport = value.get(key)
         if (not isinstance(transport, dict)
@@ -2228,6 +2249,14 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
             )):
         return None
     return value
+
+
+def _project_cpu_plan_failure_detail(value: Any) -> dict[str, Any] | None:
+    try:
+        from tools import platform_cpu_diagnostic_pair as cpu_pair
+    except ModuleNotFoundError:  # direct execution from platform/tools
+        import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
+    return cpu_pair._project_cpu_plan_failure_detail(value)
 
 
 def _project_server_telemetry(summary: Any) -> dict[str, Any]:
@@ -2656,6 +2685,12 @@ def _parent_run(
             "server_capacity_claim_reason": "resource_correlation_not_provided",
         }
     outcome["remote_plan_cleanup"] = "complete" if cleanup_ok else "failed"
+    raw_cleanup_failure_detail = cleanup_lifecycle.get("plan_cleanup_failure_detail")
+    if raw_cleanup_failure_detail is not None:
+        cleanup_failure_detail = _project_cpu_plan_failure_detail(raw_cleanup_failure_detail)
+        if cleanup_failure_detail is None or cleanup_ok:
+            raise ValueError("cleanup failure detail rejected")
+        outcome["plan_cleanup_failure_detail"] = cleanup_failure_detail
     if not cleanup_ok:
         outcome["status"] = "incomplete"
         outcome["passed"] = False
@@ -2675,7 +2710,7 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         "server_capacity_claim_reason", "remote_plan_cleanup", "server_telemetry",
         "generator_cpu_evidence",
     }
-    if not isinstance(value, dict) or set(value) != top_fields:
+    if not isinstance(value, dict) or set(value) not in (top_fields, top_fields | {"plan_cleanup_failure_detail"}):
         return None
     try:
         expected_fixture_kind, expected_presets, expected_actor_count = _profile_spec(value.get("workload"))
@@ -2956,6 +2991,17 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 if value.get("worker") else _unknown_cpu_windows())
     if value.get("generator_cpu_evidence") != _generator_cpu_evidence_status(cpu_rows):
         return None
+    if "plan_cleanup_failure_detail" in value:
+        detail = _project_cpu_plan_failure_detail(value["plan_cleanup_failure_detail"])
+        if (
+            detail is None
+            or value.get("status") != "incomplete"
+            or value.get("passed") is not False
+            or value.get("remote_plan_cleanup") != "failed"
+            or value.get("diagnostic_credit") is not False
+        ):
+            return None
+        value = {**value, "plan_cleanup_failure_detail": detail}
     return value
 
 
@@ -3277,6 +3323,17 @@ def _parent_outcome_fingerprint(
         "slo_credit": False,
         "diagnostic_credit": False,
     }
+    raw_cleanup_failure_detail = (
+        cleanup_lifecycle.get("plan_cleanup_failure_detail")
+        if isinstance(cleanup_lifecycle, Mapping) else None
+    )
+    cleanup_failure_detail = _project_cpu_plan_failure_detail(raw_cleanup_failure_detail)
+    if raw_cleanup_failure_detail is not None and (
+        cleanup_failure_detail is None or cleanup_status not in {"bad_protocol", "failed"}
+    ):
+        raise ValueError("cleanup failure detail rejected")
+    if cleanup_failure_detail is not None:
+        fingerprint["plan_cleanup_failure_detail"] = cleanup_failure_detail
     evidence = _project_supervisor_evidence(supervisor_evidence)
     for source, destination in (
         ("reason", "supervisor_reason"), ("worker_started", "supervisor_process_started"),
@@ -3384,7 +3441,7 @@ def _parent_failure_fingerprint(
         if isinstance(observer.get("remote_failure_reason"), str)
         and observer.get("remote_failure_reason") in REMOTE_WATCH_FAILURE_REASONS else "unknown",
     }
-    return {
+    payload = {
         "schema": 1,
         "event": "ssr_capacity_parent_fingerprint",
         "diagnostic_only": True,
@@ -3432,6 +3489,18 @@ def _parent_failure_fingerprint(
         },
         "supervisor": _project_supervisor_evidence(stage_state.get("supervisor_evidence")),
     }
+    raw_cleanup_failure_detail = (
+        cleanup.get("plan_cleanup_failure_detail") if isinstance(cleanup, Mapping) else None
+    )
+    cleanup_failure_detail = _project_cpu_plan_failure_detail(raw_cleanup_failure_detail)
+    if raw_cleanup_failure_detail is not None and (
+        cleanup_failure_detail is None
+        or cleanup.get("plan_cleanup_status") not in {"bad_protocol", "failed"}
+    ):
+        raise ValueError("cleanup failure detail rejected")
+    if cleanup_failure_detail is not None:
+        payload["cleanup"]["failure_detail"] = cleanup_failure_detail
+    return payload
 
 
 def _write_parent_failure_fingerprint(

@@ -4398,6 +4398,292 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(stderr.getvalue(), "")
         self.assertNotIn("private detail", stdout.getvalue() + stderr.getvalue())
 
+        real_popen = subprocess.Popen
+
+        def invoke_cleanup_child(raw_output: bytes, exit_code: int) -> tuple[int, bytes]:
+            def fake_child(_command, **kwargs):
+                self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+                script = (
+                    "import sys; sys.stdin.buffer.read(); "
+                    f"sys.stdout.buffer.write({raw_output!r}); sys.exit({exit_code})"
+                )
+                return real_popen([sys.executable, "-c", script], **kwargs)
+
+            captured = io.StringIO()
+            with (
+                patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+                patch.object(remote_dispatch.subprocess, "Popen", side_effect=fake_child),
+                redirect_stdout(captured),
+            ):
+                status = remote_dispatch._run_cpu_diagnostic_plan({
+                    "operation": "cleanup", "schema": 1, "run_id": "a" * 32,
+                })
+            return status, captured.getvalue().encode("ascii")
+
+        private_child_output = b"PRIVATE_SENTINEL\n"
+        dispatch_status, failure_line = invoke_cleanup_child(private_child_output, 0)
+        self.assertEqual(dispatch_status, 2)
+        self.assertTrue(failure_line.endswith(b"\n"))
+        self.assertNotIn(b"PRIVATE_SENTINEL", failure_line)
+        self.assertLessEqual(len(failure_line), remote_dispatch.CPU_DIAGNOSTIC_FAILURE_CAP)
+        failure_detail = cpu_pair._decode_cpu_plan_failure(failure_line)
+        self.assertEqual(failure_detail, {
+            "schema": 1, "stage": "response_summary", "child_return_code": 0,
+            "child_stdout_shape": "single_line", "child_stdout_bytes": len(private_child_output),
+        })
+        self.assertEqual(remote_dispatch.CPU_DIAGNOSTIC_FAILURE_STAGES, cpu_pair.CPU_PLAN_FAILURE_STAGES)
+        self.assertEqual(cpu_pair.CPU_PLAN_FAILURE_STAGES, frozenset({
+            "helper_spawn", "helper_io", "helper_timeout", "helper_output_limit",
+            "unrecognized_rc2", "inner_exit", "response_framing", "response_parse",
+            "response_summary", "usage_rows", "usage_aggregate", "profile_rows",
+            "profile_categories", "profile_aggregate", "memory_rows", "memory_metrics",
+            "memory_aggregate", "cgroup_aggregate", "summary_bound",
+        }))
+        self.assertIsNone(cpu_pair._decode_cpu_plan_failure(
+            failure_line.replace(b'"schema":1', b'"schema":true')
+        ))
+        for raw_output, exit_code, expected_stage in (
+            (b"PRIVATE_SENTINEL\n", 2, "unrecognized_rc2"),
+            (b"PRIVATE_SENTINEL", 7, "inner_exit"),
+            (b"no newline", 0, "response_framing"),
+            (b"wrong response prefix\n", 0, "response_summary"),
+            (b"CPU_DIAGNOSTIC_PLAN {broken}\n", 0, "response_parse"),
+        ):
+            status, line = invoke_cleanup_child(raw_output, exit_code)
+            self.assertEqual(status, 2)
+            parsed = cpu_pair._decode_cpu_plan_failure(line)
+            self.assertIsNotNone(parsed)
+            self.assertEqual(parsed["stage"], expected_stage)
+        output_limit_status, output_limit_line = invoke_cleanup_child(
+            b"X" * (remote_dispatch.CPU_DIAGNOSTIC_OUTPUT_CAP + 1), 0,
+        )
+        self.assertEqual(output_limit_status, 2)
+        output_limit_detail = cpu_pair._decode_cpu_plan_failure(output_limit_line)
+        self.assertEqual(output_limit_detail["stage"], "helper_output_limit")
+        self.assertEqual(
+            output_limit_detail["child_stdout_bytes"],
+            remote_dispatch.CPU_DIAGNOSTIC_OUTPUT_CAP + 1,
+        )
+        self.assertNotIn(b"X" * 256, output_limit_line)
+
+        class FakePipe:
+            def __init__(self, *, fail_write: bool = False):
+                self.fail_write = fail_write
+
+            def write(self, _data):
+                if self.fail_write:
+                    raise BrokenPipeError
+                return 1
+
+            def flush(self):
+                return None
+
+            def close(self):
+                return None
+
+            def fileno(self):
+                return 91
+
+        class FakeSelector:
+            def register(self, *_args):
+                return None
+
+            def select(self, _timeout):
+                return []
+
+            def close(self):
+                return None
+
+        class FakeProcess:
+            pid = 100
+
+            def __init__(self, *, fail_write: bool = False):
+                self.stdin = FakePipe(fail_write=fail_write)
+                self.stdout = FakePipe()
+
+            def poll(self):
+                return None
+
+        def invoke_fake_process(process, *, monotonic_values=()):
+            captured = io.StringIO()
+            with (
+                patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+                patch.object(remote_dispatch.subprocess, "Popen", return_value=process),
+                patch.object(remote_dispatch, "_terminate_process_group"),
+                patch.object(remote_dispatch.os, "set_blocking"),
+                patch.object(remote_dispatch.selectors, "DefaultSelector", FakeSelector),
+                patch.object(remote_dispatch.time, "monotonic", side_effect=monotonic_values),
+                redirect_stdout(captured),
+            ):
+                status = remote_dispatch._run_cpu_diagnostic_plan({
+                    "operation": "cleanup", "schema": 1, "run_id": "a" * 32,
+                })
+            return status, captured.getvalue().encode("ascii")
+
+        io_status, io_line = invoke_fake_process(FakeProcess(fail_write=True))
+        self.assertEqual(io_status, 2)
+        self.assertEqual(cpu_pair._decode_cpu_plan_failure(io_line)["stage"], "helper_io")
+        timeout_status, timeout_line = invoke_fake_process(
+            FakeProcess(), monotonic_values=(0.0, 31.0),
+        )
+        self.assertEqual(timeout_status, 2)
+        timeout_detail = cpu_pair._decode_cpu_plan_failure(timeout_line)
+        self.assertEqual(timeout_detail["stage"], "helper_timeout")
+        self.assertIsNone(timeout_detail["child_return_code"])
+
+        spawn_stdout = io.StringIO()
+        with (
+            patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+            patch.object(remote_dispatch.subprocess, "Popen", side_effect=OSError("PRIVATE_PATH")),
+            redirect_stdout(spawn_stdout),
+        ):
+            self.assertEqual(remote_dispatch._run_cpu_diagnostic_plan({
+                "operation": "cleanup", "schema": 1, "run_id": "a" * 32,
+            }), 2)
+        self.assertEqual(cpu_pair._decode_cpu_plan_failure(
+            spawn_stdout.getvalue().encode("ascii")
+        ), {
+            "schema": 1, "stage": "helper_spawn", "child_return_code": None,
+            "child_stdout_shape": "none", "child_stdout_bytes": 0,
+        })
+        self.assertNotIn("PRIVATE_PATH", spawn_stdout.getvalue())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ssh_dir = Path(temporary)
+            config_path = ssh_dir / "config"
+            key_path = ssh_dir / "id_ed25519"
+            config_path.write_text("synthetic ssh config", encoding="ascii")
+            key_path.write_text("synthetic key", encoding="ascii")
+            real_ssh_popen = subprocess.Popen
+
+            def run_ssh_result(stdout_bytes: bytes, exit_code: int):
+                def fake_ssh(_command, **kwargs):
+                    script = (
+                        "import sys; sys.stdin.buffer.read(); "
+                        f"sys.stdout.buffer.write({stdout_bytes!r}); sys.exit({exit_code})"
+                    )
+                    return real_ssh_popen([sys.executable, "-c", script], **kwargs)
+
+                lifecycle = {}
+                with patch.object(cpu_pair.subprocess, "Popen", side_effect=fake_ssh):
+                    result = cpu_pair._ssh_plan(
+                        Namespace(), "example.test", "tester", config_path, key_path,
+                        {"operation": "cleanup"}, lifecycle,
+                        allow_noop_cleanup=True,
+                    )
+                return result, lifecycle
+
+            parsed_result, parsed_lifecycle = run_ssh_result(
+                failure_line, 2,
+            )
+            self.assertEqual(parsed_result, (False, None, None))
+            self.assertEqual(parsed_lifecycle["plan_cleanup_status"], "bad_protocol")
+            self.assertEqual(parsed_lifecycle["plan_cleanup_failure_detail"], failure_detail)
+            self.assertEqual(parsed_lifecycle["cleanup_transport"]["stdout_shape"], "failure_marker")
+            legacy_result, legacy_lifecycle = run_ssh_result(b"", 2)
+            self.assertEqual(legacy_result, (False, None, None))
+            self.assertEqual(legacy_lifecycle["plan_cleanup_status"], "bad_protocol")
+            self.assertIsNone(legacy_lifecycle["plan_cleanup_failure_detail"])
+            malformed_result, malformed_lifecycle = run_ssh_result(
+                failure_line.replace(b'"stage":"response_summary"', b'"stage":"unknown"'), 2,
+            )
+            self.assertEqual(malformed_result, (False, None, None))
+            self.assertEqual(malformed_lifecycle["plan_cleanup_status"], "bad_protocol")
+            self.assertIsNone(malformed_lifecycle["plan_cleanup_failure_detail"])
+
+        failure_report = {
+            "status": "incomplete", "plan_cleanup_status": "bad_protocol",
+            "plan_cleanup_failure_detail": failure_detail,
+        }
+        failure_public = cpu_pair._public_report(failure_report)
+        self.assertEqual(failure_public["plan_cleanup_failure_detail"], failure_detail)
+        with self.assertRaises(cpu_pair.PairError):
+            cpu_pair._public_report({
+                **failure_report, "status": "complete", "diagnostic_credit": True,
+            })
+
+        self.assertEqual(
+            capacity_diagnostic._project_cpu_plan_failure_detail(failure_detail),
+            failure_detail,
+        )
+        for section_stage in (
+            "response_summary", "usage_rows", "usage_aggregate", "profile_rows",
+            "profile_categories", "profile_aggregate", "memory_rows", "memory_metrics",
+            "memory_aggregate", "cgroup_aggregate",
+        ):
+            section_detail = {
+                "schema": 1, "stage": section_stage, "child_return_code": 0,
+                "child_stdout_shape": "single_line", "child_stdout_bytes": 1,
+            }
+            section_line = (
+                remote_dispatch.CPU_DIAGNOSTIC_FAILURE_PREFIX
+                + json.dumps(section_detail, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode("ascii")
+            self.assertEqual(cpu_pair._decode_cpu_plan_failure(section_line), section_detail)
+        self.assertIsNone(cpu_pair._project_cpu_plan_failure_detail({
+            "schema": 1, "stage": "helper_io", "child_return_code": None,
+            "child_stdout_shape": "malformed", "child_stdout_bytes": 32_769,
+        }))
+        self.assertIsNone(capacity_diagnostic._project_cpu_plan_failure_detail({
+            **failure_detail, "untrusted": "private",
+        }))
+        receipt = capacity_diagnostic._parent_failure_receipt(
+            error_class="ValueError", stage="remote_plan_prepare",
+            source_sha="a" * 40, app_target_sha="b" * 40,
+            external_run_id="12345", external_run_attempt="1", run_id="c" * 32,
+            profile_digest_value=capacity_diagnostic.profile_digest(8),
+            manifest_sha256="d" * 64, manifest_bytes=128, concurrency=8,
+            prepare_lifecycle={
+                "plan_prepare_status": "prepared", "plan_prepare_refusal_class": "none",
+                "prepare_transport": {
+                    "stage": "complete", "return_code": 0,
+                    "stdout_shape": "prepared_marker", "child_state": "reaped",
+                },
+            },
+            cleanup_lifecycle={
+                "plan_cleanup_status": "bad_protocol", "plan_cleanup_refusal_class": "none",
+                "plan_cleanup_failure_detail": failure_detail,
+                "cleanup_transport": {
+                    "stage": "protocol", "return_code": 2,
+                    "stdout_shape": "failure_marker", "child_state": "reaped",
+                },
+            },
+            cleanup_ok=False,
+        )
+        self.assertEqual(receipt["plan_cleanup_failure_detail"], failure_detail)
+        self.assertIsNotNone(capacity_diagnostic._project_parent_failure_receipt(receipt))
+        invalid_success_receipt = {
+            **receipt, "plan_cleanup_status": "complete", "remote_plan_cleanup": "complete",
+        }
+        self.assertIsNone(capacity_diagnostic._project_parent_failure_receipt(invalid_success_receipt))
+
+        failure_fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+            {
+                "status": "incomplete", "passed": False,
+                "namespace_closed": False, "remote_plan_cleanup": "failed",
+                "plan_cleanup_status": "bad_protocol",
+                "runner_headroom": {"status": "unknown", "reason": "runner_snapshot_unavailable"},
+            },
+            args=Namespace(
+                source_sha="a" * 40, app_target_sha="b" * 40,
+                external_run_id="12345", external_run_attempt="1",
+                concurrency=8, workload=capacity_diagnostic.WORKLOAD,
+            ),
+            stage_state={
+                "cleanup_lifecycle": {
+                    "plan_cleanup_status": "bad_protocol",
+                    "plan_cleanup_failure_detail": failure_detail,
+                    "cleanup_transport": {
+                        "stage": "protocol", "return_code": 2,
+                        "stdout_shape": "failure_marker", "child_state": "reaped",
+                    },
+                },
+            },
+        )
+        self.assertEqual(failure_fingerprint["cleanup"]["failure_detail"], failure_detail)
+        self.assertFalse(failure_fingerprint["diagnostic_credit"])
+
         report = {
             "status": "incomplete",
             "failure_stage": "preflight",

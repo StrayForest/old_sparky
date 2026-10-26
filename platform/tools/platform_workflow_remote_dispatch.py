@@ -116,6 +116,16 @@ LIVE_HELPER = ACTIVE_TOOLS_DIR / "platform_live_launch_supervisor.sh"
 LIVE_USER_QA_HELPER = ACTIVE_TOOLS_DIR / "platform_live_user_qa_dispatch.py"
 CPU_DIAGNOSTIC_PLAN_HELPER = ACTIVE_TOOLS_DIR / "platform_cpu_diagnostic_plan.py"
 CPU_DIAGNOSTIC_OUTPUT_CAP = 32_768
+CPU_DIAGNOSTIC_FAILURE_CAP = 512
+CPU_DIAGNOSTIC_FAILURE_PREFIX = "CPU_DIAGNOSTIC_PLAN_FAILURE "
+CPU_DIAGNOSTIC_FAILURE_STAGES = frozenset({
+    "helper_spawn", "helper_io", "helper_timeout",
+    "helper_output_limit", "unrecognized_rc2", "inner_exit",
+    "response_framing", "response_parse", "response_summary",
+    "usage_rows", "usage_aggregate", "profile_rows", "profile_categories",
+    "profile_aggregate", "memory_rows", "memory_metrics", "memory_aggregate",
+    "cgroup_aggregate", "summary_bound",
+})
 EXPORT_REMOVE_STDOUT_CAP = 128
 EXPORT_REMOVE_ERROR_CLASSES = frozenset({
     "dispatcher_preflight", "dispatcher_spawn_failed", "dispatcher_protocol",
@@ -853,10 +863,46 @@ def _run_sudo(
 def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
     """Cross the pinned root boundary for one fixed, bounded plan operation."""
 
+    operation = payload.get("operation")
+
+    def emit_failure(
+        stage: str, *, process: subprocess.Popen[bytes] | None = None,
+        output: bytes | bytearray = b"",
+    ) -> int:
+        if operation != "cleanup":
+            return 2
+        if stage not in CPU_DIAGNOSTIC_FAILURE_STAGES:
+            stage = "helper_io"
+        raw_output = bytes(output)
+        child_code = process.poll() if process is not None else None
+        if type(child_code) is not int or not -255 <= child_code <= 255:
+            child_code = None
+        shape = (
+            "none" if not raw_output
+            else "single_line" if raw_output.endswith(b"\n") and raw_output.count(b"\n") == 1
+            else "malformed"
+        )
+        value = {
+            "child_return_code": child_code,
+            "child_stdout_bytes": min(len(raw_output), CPU_DIAGNOSTIC_OUTPUT_CAP + 1),
+            "child_stdout_shape": shape,
+            "schema": 1,
+            "stage": stage,
+        }
+        marker = CPU_DIAGNOSTIC_FAILURE_PREFIX + json.dumps(
+            value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+        )
+        if len(marker.encode("ascii")) + 1 > CPU_DIAGNOSTIC_FAILURE_CAP:
+            value["stage"] = "helper_io"
+            marker = CPU_DIAGNOSTIC_FAILURE_PREFIX + json.dumps(
+                value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+            )
+        print(marker, flush=True)
+        return 2
+
     if not _trusted_python_helper(CPU_DIAGNOSTIC_PLAN_HELPER):
         print("CPU_DIAGNOSTIC_PLAN status=refused class=UntrustedHelper")
         return 2
-    operation = payload.get("operation")
     if operation == "prepare":
         helper_command = "prepare-stdin"
         expected_keys = {"status", "api_target_count", "web_target_count", "release_slug"}
@@ -889,14 +935,15 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
             umask=0o077,
         )
     except OSError:
-        return 2
+        return emit_failure("helper_spawn")
     assert process.stdin is not None and process.stdout is not None
+    output = bytearray()
+    failure_stage = "helper_io"
     try:
         process.stdin.write(child_input)
         process.stdin.flush()
         process.stdin.close()
         deadline = time.monotonic() + 30
-        output = bytearray()
         descriptor = process.stdout.fileno()
         os.set_blocking(descriptor, False)
         selector = selectors.DefaultSelector()
@@ -906,7 +953,9 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_process_group(process)
-                return 124
+                if operation != "cleanup":
+                    return 124
+                return emit_failure("helper_timeout", process=process, output=output)
             for key, _mask in selector.select(min(remaining, 0.1)):
                 try:
                     chunk = os.read(key.fd, CPU_DIAGNOSTIC_OUTPUT_CAP + 1 - len(output))
@@ -919,25 +968,30 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 output.extend(chunk)
                 if len(output) > CPU_DIAGNOSTIC_OUTPUT_CAP:
                     _terminate_process_group(process)
-                    return 2
+                    return emit_failure("helper_output_limit", process=process, output=output)
         child_status = process.wait(timeout=0)
-        if not output.endswith(b"\n") or output.count(b"\n") != 1:
-            return 2
         if child_status == 2:
             refusal = re.fullmatch(
                 rb"CPU_DIAGNOSTIC_PLAN status=refused class=(PlanError|OSError|ValueError|KeyError|unexpected)\n",
                 bytes(output),
             )
             if refusal is None:
-                return 2
+                return emit_failure("unrecognized_rc2", process=process, output=output)
             print(bytes(output[:-1]).decode("ascii"))
             return 2
         if child_status != 0:
-            return 2
+            return emit_failure("inner_exit", process=process, output=output)
+        failure_stage = "response_framing"
+        if not output.endswith(b"\n") or output.count(b"\n") != 1:
+            return emit_failure("response_framing", process=process, output=output)
         helper_prefix = b"CPU_DIAGNOSTIC_PLAN "
         if not output.startswith(helper_prefix):
-            return 2
-        result = _strict_baseline_json(output[len(helper_prefix):-1])
+            return emit_failure("response_summary", process=process, output=output)
+        failure_stage = "response_parse"
+        try:
+            result = _strict_baseline_json(output[len(helper_prefix):-1])
+        except (OSError, ValueError, TypeError):
+            return emit_failure("response_parse", process=process, output=output)
         if operation == "prepare":
             if (
                 not isinstance(result, dict)
@@ -955,6 +1009,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 f"release_slug={result['release_slug']}"
             )
         else:
+            failure_stage = "response_summary"
             if (
                 not isinstance(result, dict)
                 or set(result) != expected_keys
@@ -1009,7 +1064,8 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     and result["cgroup_memory_reason"] == "hierarchy_unavailable"
                 ))
             ):
-                return 2
+                return emit_failure("response_summary", process=process, output=output)
+            failure_stage = "usage_rows"
             expected_rows = (
                 ("api", "off", 2), ("api", "on", 2),
                 ("web", "off", 1), ("web", "on", 1),
@@ -1030,16 +1086,16 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     or not 0 <= row["duplicate_count"] <= 8
                     or type(row.get("timing_complete")) is not bool
                 ):
-                    return 2
+                    return emit_failure("usage_rows", process=process, output=output)
                 for name in (
                     "cpu_ns", "window_ms_min", "window_ms_max", "start_lag_ms_min",
                     "start_lag_ms_max", "end_lag_ms_min", "end_lag_ms_max",
                 ):
                     value = row.get(name)
                     if value is not None and (type(value) is not int or abs(value) > 10**13):
-                        return 2
+                        return emit_failure("usage_rows", process=process, output=output)
                 if row["cpu_ns"] is not None and row["cpu_ns"] < 0:
-                    return 2
+                    return emit_failure("usage_rows", process=process, output=output)
                 projected_rows.append({key: row[key] for key in (
                     "service", "phase", "expected_targets", "observed_targets", "event_count",
                     "cpu_ns", "window_ms_min", "window_ms_max", "start_lag_ms_min",
@@ -1067,7 +1123,8 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     for row in projected_rows
                 )
             ):
-                return 2
+                return emit_failure("usage_aggregate", process=process, output=output)
+            failure_stage = "profile_rows"
             expected_profiles = (("api", 2, "thread_cpu", "calls"), ("web", 1, "v8_cpu", "samples"))
             projected_profiles: list[dict[str, Any]] = []
             for row, (service, expected_targets, timer, observation_unit) in zip(
@@ -1087,16 +1144,17 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     or not isinstance(row.get("categories"), list)
                     or len(row["categories"]) > 16
                 ):
-                    return 2
+                    return emit_failure("profile_rows", process=process, output=output)
                 for numeric in (
                     "total_cpu_us", "sample_count", "start_lag_ms_min", "start_lag_ms_max",
                     "elapsed_ms_min", "elapsed_ms_max", "end_lag_ms_min", "end_lag_ms_max",
                 ):
                     value = row.get(numeric)
                     if value is not None and (type(value) is not int or not 0 <= value <= 10**10):
-                        return 2
+                        return emit_failure("profile_rows", process=process, output=output)
                 categories: list[dict[str, Any]] = []
                 category_names: list[str] = []
+                failure_stage = "profile_categories"
                 for category in row["categories"]:
                     if (
                         not isinstance(category, dict)
@@ -1107,7 +1165,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                         or type(category.get("observations")) is not int
                         or not 0 <= category["observations"] <= 10**10
                     ):
-                        return 2
+                        return emit_failure("profile_categories", process=process, output=output)
                     category_names.append(category["category"])
                     categories.append({
                         "category": category["category"],
@@ -1115,7 +1173,8 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                         "observations": category["observations"],
                     })
                 if category_names != sorted(category_names) or len(set(category_names)) != len(category_names):
-                    return 2
+                    return emit_failure("profile_categories", process=process, output=output)
+                failure_stage = "profile_rows"
                 projected_profiles.append({
                     "service": service,
                     "expected_targets": expected_targets,
@@ -1158,12 +1217,14 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     for row in projected_profiles
                 )
             ):
-                return 2
+                return emit_failure("profile_aggregate", process=process, output=output)
+            failure_stage = "memory_rows"
             projected_memory: list[dict[str, Any]] = []
             memory_phases = (("off",), ("on",))
             if result["memory_rows"] and len(result["memory_rows"]) != 2:
-                return 2
+                return emit_failure("memory_rows", process=process, output=output)
             for row, (phase,) in zip(result["memory_rows"], memory_phases):
+                failure_stage = "memory_rows"
                 if (
                     not isinstance(row, dict)
                     or set(row) != CPU_MEMORY_ROW_FIELDS
@@ -1186,27 +1247,30 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                         "none", "hierarchy_unavailable", "file_unavailable", "invalid_snapshot",
                     }
                 ):
-                    return 2
+                    return emit_failure("memory_rows", process=process, output=output)
                 clean = {key: row[key] for key in CPU_MEMORY_ROW_FIELDS
                          if key not in {"service", "phase"}}
                 clean.update({"service": "web", "phase": phase})
+                failure_stage = "memory_metrics"
                 for field in CPU_MEMORY_METRIC_FIELDS:
                     item = row[field]
                     if item is not None and (type(item) is not int or not 0 <= item <= 10**16):
-                        return 2
+                        return emit_failure("memory_metrics", process=process, output=output)
                 duration = row["gc_duration_ms"]
                 if (duration is not None and
                         (type(duration) not in {int, float} or isinstance(duration, bool)
                          or not 0 <= duration <= 20_000)):
-                    return 2
+                    return emit_failure("memory_metrics", process=process, output=output)
                 projected_memory.append(clean)
+            failure_stage = "memory_aggregate"
             if result["memory_status"] == "complete" and (
                 result["memory_reason"] != "none" or len(projected_memory) != 2
                 or any(row["status"] != "complete" or row["sample_count"] != 5
                        or row["gc_status"] != "complete" or row["gc_overflow"]
                        for row in projected_memory)
             ):
-                return 2
+                return emit_failure("memory_aggregate", process=process, output=output)
+            failure_stage = "cgroup_aggregate"
             if result["cgroup_memory_status"] == "complete" and (
                 result["cgroup_memory_reason"] != "none"
                 or len(projected_memory) != 2
@@ -1215,7 +1279,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                        or row["cgroup_sample_count"] != 5
                        for row in projected_memory)
             ):
-                return 2
+                return emit_failure("cgroup_aggregate", process=process, output=output)
             target_count = result["service_count"]
             cleanup_projection = {
                 "status": "expired_plans_removed",
@@ -1237,12 +1301,12 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 sort_keys=True, separators=(",", ":"),
             )
             if len(marker.encode("ascii")) > CPU_DIAGNOSTIC_OUTPUT_CAP - 1:
-                return 2
+                return emit_failure("summary_bound", process=process, output=output)
         print(marker)
         return 0
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         _terminate_process_group(process)
-        return 2
+        return emit_failure(failure_stage, process=process, output=output)
     finally:
         try:
             process.stdout.close()
