@@ -4,11 +4,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { constants as fsConstants, openSync, closeSync, fstatSync, lstatSync, readFileSync, readSync } from "node:fs";
 import { availableParallelism } from "node:os";
 import { constants as performanceConstants, PerformanceObserver } from "node:perf_hooks";
-import { resolve } from "node:path";
 import inspector from "node:inspector";
 import { getHeapStatistics } from "node:v8";
 import { headers } from "next/headers";
 import { hasAuthorizedDiagnosticRunMarker } from "./performance-diagnostic-marker";
+import { releaseMetadataPathFromStandaloneCwd } from "./release-identity-path.mjs";
 import {
   appendBoundedSample,
   classifyCgroupReadFailure,
@@ -214,7 +214,7 @@ function currentProcessStartTicks(): number | null {
 function currentReleaseIdentity(): { sourceSha: string; slug: string } | null {
   let fd: number | null = null;
   try {
-    const releasePath = resolve(process.cwd(), "../../..", "RELEASE.json");
+    const releasePath = releaseMetadataPathFromStandaloneCwd(process.cwd());
     const info = lstatSync(releasePath);
     if (!info.isFile() || info.isSymbolicLink() || info.uid !== 0 || info.nlink !== 1
         || info.size <= 0 || info.size > 16_384) return null;
