@@ -9,10 +9,13 @@ import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import subprocess
 import sys
+import socket
+import struct
 import tempfile
 import stat
 import threading
 import textwrap
+import signal
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import Future, ThreadPoolExecutor
 from argparse import Namespace
@@ -4295,16 +4298,188 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             patch.object(diagnostic_module.time, "time_ns", side_effect=[1_000_000_000, 21_000_000_000]),
             patch.object(diagnostic_module.time, "monotonic_ns", side_effect=[0, 20_000_000_000]),
             patch.object(diagnostic_module.time, "process_time_ns", side_effect=[100, 3_000_000_100]),
-            patch.object(diagnostic_module.logger, "info") as usage_log,
+            patch.object(diagnostic_module, "_emit_cpu_diagnostic_message") as usage_event,
         ):
             diagnostic_module._start_cpu_usage_window(counter_plan, "off", loop)
             self.assertAlmostEqual(loop.delay, 20.0)
             self.assertTrue(callable(loop.callback))
             loop.callback()
-        self.assertIn("cpu_diagnostic_usage service=api", usage_log.call_args.args[0])
-        self.assertEqual(usage_log.call_args.args[4], 3_000_000_000)
-        self.assertEqual(usage_log.call_args.args[-1], "true")
-        self.assertNotIn("pid", usage_log.call_args.args[0])
+        usage_message = usage_event.call_args.args[0]
+        self.assertIn("cpu_diagnostic_usage service=api", usage_message)
+        self.assertIn("cpu_ns=3000000000", usage_message)
+        self.assertIn("timing_complete=true", usage_message)
+        self.assertNotIn("pid", usage_message)
+        usage_event.assert_called_once_with(usage_message)
+        self._assert_api_diagnostic_native_journal_datagram_is_bounded()
+        self._assert_api_diagnostic_native_journal_failure_does_not_fallback_or_retry()
+        self._assert_api_diagnostic_native_journal_datagram_uses_child_kernel_pid()
+
+    def _assert_api_diagnostic_native_journal_datagram_is_bounded(self) -> None:
+        import python_packages.platform_infra.performance_diagnostic as diagnostic_module
+
+        message = (
+            "cpu_diagnostic_usage service=api run_id=" + "a" * 32
+            + " phase=off window_ms=20000 cpu_ns=100 cpu_capacity_cpus=2.000000 "
+            "start_lag_ms=1 end_lag_ms=0 timing_complete=true"
+        )
+        self.assertIsNotNone(diagnostic_plan_tool.USAGE_MESSAGE_RE.fullmatch(message))
+
+        class FakeSocket:
+            def __init__(self, *, result: int | None = None, error: OSError | None = None) -> None:
+                self.result = result
+                self.error = error
+                self.blocking_values: list[bool] = []
+                self.payloads: list[tuple[bytes, str]] = []
+                self.closed = False
+
+            def setblocking(self, value: bool) -> None:
+                self.blocking_values.append(value)
+
+            def sendto(self, payload: bytes, path: str) -> int:
+                self.payloads.append((payload, path))
+                if self.error is not None:
+                    raise self.error
+                return len(payload) if self.result is None else self.result
+
+            def close(self) -> None:
+                self.closed = True
+
+        sender = FakeSocket()
+        with patch.object(diagnostic_module.socket, "socket", return_value=sender):
+            self.assertTrue(diagnostic_module._emit_cpu_diagnostic_message(message))
+        self.assertEqual(sender.blocking_values, [False])
+        self.assertEqual(len(sender.payloads), 1)
+        payload, path = sender.payloads[0]
+        self.assertEqual(path, diagnostic_module.JOURNAL_SOCKET_PATH)
+        self.assertLessEqual(len(payload), diagnostic_module.MAX_CPU_DIAGNOSTIC_DATAGRAM_BYTES)
+        wrapped_message = json.dumps({"message": message}, ensure_ascii=True, separators=(",", ":"))
+        self.assertIn(b"MESSAGE=" + wrapped_message.encode("ascii") + b"\n", payload)
+        self.assertIn(b"PRIORITY=6\n", payload)
+        self.assertIn(b"SYSLOG_IDENTIFIER=old-sparky-platform-api\n", payload)
+        self.assertNotIn(b"_PID=", payload)
+        self.assertNotIn(b"_SYSTEMD_", payload)
+        self.assertTrue(sender.closed)
+
+        with patch.object(diagnostic_module.socket, "socket") as create_socket, patch.object(
+            diagnostic_module.logging.getLogger("platform.performance.transport"), "warning",
+        ) as warning, patch.object(diagnostic_module.json, "dumps") as dumps:
+            self.assertFalse(diagnostic_module._emit_cpu_diagnostic_message(message + "\nBAD=1"))
+            self.assertFalse(diagnostic_module._emit_cpu_diagnostic_message(
+                message + "x" * diagnostic_module.MAX_CPU_DIAGNOSTIC_DATAGRAM_BYTES,
+            ))
+        create_socket.assert_not_called()
+        dumps.assert_not_called()
+        self.assertEqual(warning.call_count, 2)
+        self.assertEqual(
+            [call.args for call in warning.call_args_list],
+            [
+                ("API CPU diagnostic journal delivery failed reason=%s", "message_rejected"),
+                ("API CPU diagnostic journal delivery failed reason=%s", "message_rejected"),
+            ],
+        )
+
+    def _assert_api_diagnostic_native_journal_failure_does_not_fallback_or_retry(self) -> None:
+        import python_packages.platform_infra.performance_diagnostic as diagnostic_module
+
+        message = (
+            "cpu_diagnostic_complete service=api run_id=" + "a" * 32
+            + " timer=thread_cpu start_lag_ms=0 elapsed_ms=20000 "
+            "total_self_cpu_us=1 functions=other:1:1"
+        )
+        self.assertIsNotNone(diagnostic_plan_tool.PROFILE_API_MESSAGE_RE.fullmatch(message))
+
+        class FailedSocket:
+            def __init__(self, *, result: int | None = None) -> None:
+                self.result = result
+                self.send_calls = 0
+                self.closed = False
+
+            def setblocking(self, _value: bool) -> None:
+                pass
+
+            def sendto(self, _payload: bytes, _path: str) -> int:
+                self.send_calls += 1
+                if self.result is None:
+                    raise BlockingIOError
+                return self.result
+
+            def close(self) -> None:
+                self.closed = True
+
+        for result in (None, 1):
+            with self.subTest(result=result):
+                sender = FailedSocket(result=result)
+                with patch.object(diagnostic_module.socket, "socket", return_value=sender), patch.object(
+                    diagnostic_module.logging.getLogger("platform.performance.transport"), "warning",
+                ) as warning, patch.object(diagnostic_module.logger, "info") as inherited_stream:
+                    self.assertFalse(diagnostic_module._emit_cpu_diagnostic_message(message))
+                self.assertEqual(sender.send_calls, 1)
+                self.assertTrue(sender.closed)
+                inherited_stream.assert_not_called()
+                warning.assert_called_once_with(
+                    "API CPU diagnostic journal delivery failed reason=%s", "transport_failed",
+                )
+
+    def _assert_api_diagnostic_native_journal_datagram_uses_child_kernel_pid(self) -> None:
+        import python_packages.platform_infra.performance_diagnostic as diagnostic_module
+
+        if not (hasattr(os, "fork") and hasattr(socket, "SO_PASSCRED")
+                and hasattr(socket, "SCM_CREDENTIALS")):
+            self.skipTest("Linux Unix datagram credentials are required")
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            receiver_path = Path(temporary_dir) / "journal.sock"
+            receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            receiver.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            receiver.bind(str(receiver_path))
+            receiver.settimeout(3)
+            message = (
+                "cpu_diagnostic_usage service=api run_id=" + "a" * 32
+                + " phase=on window_ms=20000 cpu_ns=200 cpu_capacity_cpus=1.000000 "
+                "start_lag_ms=0 end_lag_ms=0 timing_complete=true"
+            )
+            wrapped_message = json.dumps(
+                {"message": message}, ensure_ascii=True, separators=(",", ":"),
+            )
+            with patch.object(diagnostic_module, "JOURNAL_SOCKET_PATH", str(receiver_path)):
+                child_pid = os.fork()
+                if child_pid == 0:
+                    try:
+                        result = diagnostic_module._emit_cpu_diagnostic_message(message)
+                        os._exit(0 if result else 1)
+                    except BaseException:
+                        os._exit(2)
+                try:
+                    payload, ancillary, _flags, _address = receiver.recvmsg(
+                        diagnostic_module.MAX_CPU_DIAGNOSTIC_DATAGRAM_BYTES,
+                        socket.CMSG_SPACE(struct.calcsize("3i")),
+                    )
+                    credentials = [
+                        struct.unpack("3i", data[:struct.calcsize("3i")])
+                        for level, kind, data in ancillary
+                        if level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS
+                        and len(data) >= struct.calcsize("3i")
+                    ]
+                    _pid, status = os.waitpid(child_pid, 0)
+                    self.assertTrue(os.WIFEXITED(status))
+                    self.assertEqual(os.WEXITSTATUS(status), 0)
+                    self.assertEqual(len(credentials), 1)
+                    self.assertEqual(credentials[0][0], child_pid)
+                    self.assertEqual(credentials[0][1], os.getuid())
+                    self.assertIn(b"MESSAGE=" + wrapped_message.encode("ascii") + b"\n", payload)
+                finally:
+                    try:
+                        waited, _status = os.waitpid(child_pid, os.WNOHANG)
+                        if waited == 0:
+                            os.kill(child_pid, signal.SIGKILL)
+                            os.waitpid(child_pid, 0)
+                    except ChildProcessError:
+                        pass
+                    except ProcessLookupError:
+                        try:
+                            os.waitpid(child_pid, 0)
+                        except ChildProcessError:
+                            pass
+                    receiver.close()
 
     def test_diagnostic_plan_is_closed_per_service_and_phase_bounded(self) -> None:
         plan = parse_plan_payload(_canonical_payload(_diagnostic_payload()), expected_service="api")
@@ -5249,7 +5424,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary_dir:
             release_root = Path(temporary_dir) / "releases" / "release-bbbbbbbbbbbb"
             module_path = (
-                release_root / "platform" / "python_packages" / "platform_infra"
+                release_root / "python_packages" / "platform_infra"
                 / "performance_diagnostic.py"
             )
             module_path.parent.mkdir(parents=True)
@@ -5258,6 +5433,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 json.dumps({
                     "source_git_commit": "b" * 40,
                     "release_slug": "release-bbbbbbbbbbbb",
+                }),
+                encoding="ascii",
+            )
+            # A wrong ancestor receipt must not be accepted as a fallback.
+            (release_root.parent / "RELEASE.json").write_text(
+                json.dumps({
+                    "source_git_commit": "c" * 40,
+                    "release_slug": "release-cccccccccccc",
                 }),
                 encoding="ascii",
             )
@@ -5371,7 +5554,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         ), patch(
             "python_packages.platform_infra.performance_diagnostic.time.time_ns",
             return_value=30_000_000_000,
-        ):
+        ), patch.object(
+            diagnostic_module, "_emit_cpu_diagnostic_message",
+        ) as emit_event:
             bound_plan, phase = ApiCpuDiagnostic.activate_for_scope(scope)
             self.assertIs(bound_plan, plan)
             self.assertEqual(phase, "on")
@@ -5387,6 +5572,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             active.stop()
             self.assertTrue(active.stopped)
             self.assertIsNone(diagnostic_module._active_profile)
+        self.assertEqual(emit_event.call_count, 1)
+        self.assertTrue(emit_event.call_args.args[0].startswith("cpu_diagnostic_complete service=api "))
 
     async def test_profiler_is_disabled_without_explicit_output_directory(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

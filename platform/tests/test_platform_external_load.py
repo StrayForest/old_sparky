@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
@@ -522,6 +522,7 @@ class ExternalLoadTests(unittest.TestCase):
         actors = [VirtualUser(f"actor-{index}", "fixture", "s" * 32, "c" * 32) for index in range(2)]
         both_started = threading.Barrier(2)
         guard_tripped = threading.Event()
+        end_callbacks: list[None] = []
 
         def request(_origin: str, _user: VirtualUser, phase: str, _timeout: float) -> RequestResult:
             both_started.wait(timeout=1)
@@ -537,6 +538,7 @@ class ExternalLoadTests(unittest.TestCase):
             duration_seconds=20, start_at_epoch_ms=start_at, end_at_epoch_ms=start_at + 20_000,
             concurrency=2, timeout=1,
             request_builder=request, stop_requested=guard,
+            window_end_callback=lambda: end_callbacks.append(None),
         )
         self.assertEqual(result["submitted"], 2)
         self.assertEqual(result["completed"], 2)
@@ -545,6 +547,121 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(result["window_start_at_ms"], start_at)
         self.assertEqual(result["window_end_at_ms"], start_at + 20_000)
         self.assertEqual([item.status for item in result["results"]], [200, 200])
+        self.assertEqual(end_callbacks, [])
+
+        def run_scheduled_window(*, pending_through_deadline: bool, control_complete: bool):
+            class FakeClock:
+                def __init__(self) -> None:
+                    self.current = 100.0
+                    self.start_epoch_ms = 1_000_000
+
+                def monotonic(self) -> float:
+                    return self.current
+
+                def time_ns(self) -> int:
+                    elapsed_ms = round((self.current - 100.0) * 1000)
+                    return (self.start_epoch_ms + elapsed_ms) * 1_000_000
+
+                def sleep(self, seconds: float) -> None:
+                    self.current += seconds
+
+            class FakeExecutor:
+                _max_workers = 1
+
+                def __init__(self) -> None:
+                    self.futures: list[Future[RequestResult]] = []
+
+                def submit(self, *_args: object, **_kwargs: object) -> Future[RequestResult]:
+                    future: Future[RequestResult] = Future()
+                    self.futures.append(future)
+                    if not pending_through_deadline:
+                        future.set_result(RequestResult(
+                            "ssr-capacity", "GET", "/workspace", 200, 1.0, True, 0,
+                        ))
+                    return future
+
+            clock = FakeClock()
+            fake_executor = FakeExecutor()
+            deadline = clock.current + 20.0
+            edge_callbacks: list[tuple[float, bool]] = []
+            wait_count = 0
+
+            def fake_wait(futures, *, timeout, return_when):
+                nonlocal wait_count
+                wait_count += 1
+                pending = {future for future in futures if not future.done()}
+                if pending and clock.current < deadline:
+                    clock.current = min(deadline, clock.current + timeout)
+                    return set(), set(futures)
+                if pending:
+                    # The end edge callback must run before the overdue request
+                    # is released and before the phase drains it.
+                    self.assertEqual(edge_callbacks, [(deadline, False)])
+                    clock.current = deadline + 0.376
+                    for future in pending:
+                        future.set_result(RequestResult(
+                            "ssr-capacity", "GET", "/workspace", 200, 1.0, True, 0,
+                        ))
+                    return pending, set()
+                done = {future for future in futures if future.done()}
+                if done and clock.current < deadline:
+                    clock.current = deadline
+                return done, set()
+
+            def request(*_args: object) -> RequestResult:
+                raise AssertionError("fake executor does not run submitted callables")
+
+            def stop_requested() -> str | None:
+                if not control_complete or clock.current < deadline:
+                    return None
+                return "window_complete"
+
+            def capture_end() -> None:
+                edge_callbacks.append((clock.current, bool(fake_executor.futures[0].done())))
+
+            with patch.object(external_load, "time", clock), patch.object(
+                external_load, "wait", fake_wait,
+            ):
+                outcome = run_authenticated_workspace_capacity_phase(
+                    "https://example.invalid", actors[:1], phase="ssr-capacity",
+                    duration_seconds=20, start_at_epoch_ms=clock.start_epoch_ms,
+                    end_at_epoch_ms=clock.start_epoch_ms + 20_000,
+                    concurrency=1, timeout=5, request_builder=request,
+                    stop_requested=stop_requested,
+                    window_end_callback=capture_end,
+                    executor=fake_executor,
+                )
+            self.assertGreater(wait_count, 0)
+            self.assertEqual(len(edge_callbacks), 1)
+            self.assertFalse(outcome["aborted"])
+            if pending_through_deadline:
+                self.assertEqual(
+                    outcome["abort_reason"],
+                    "window_complete" if control_complete else None,
+                )
+                self.assertEqual(outcome["duration_ms"], 20_376)
+                self.assertEqual(outcome["completed"], 1)
+            else:
+                self.assertIsNone(outcome["abort_reason"])
+                self.assertEqual(outcome["duration_ms"], 20_000)
+                self.assertEqual(outcome["completed"], 1)
+            return edge_callbacks
+
+        # A control-file completion at the deadline must snapshot before the
+        # 376ms in-flight drain; a local deadline with no in-flight work must
+        # also invoke the callback once before the loop exits.
+        self.assertEqual(
+            run_scheduled_window(pending_through_deadline=True, control_complete=True),
+            [(120.0, False)],
+        )
+        self.assertEqual(
+            run_scheduled_window(pending_through_deadline=True, control_complete=False),
+            [(120.0, False)],
+        )
+        self.assertEqual(
+            run_scheduled_window(pending_through_deadline=False, control_complete=False),
+            [(120.0, True)],
+        )
 
     @staticmethod
     def _cgroup_diagnostic_snapshot(

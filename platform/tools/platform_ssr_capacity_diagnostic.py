@@ -1294,6 +1294,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         time.sleep(min(0.025, on_start_monotonic - time.monotonic()))
 
     on_start_edge = _capture_cpu_edge(capacity["on_start_ms"])
+    on_end_edge: dict[str, int] | None = None
 
     local_window_end_monotonic = on_start_monotonic + ON_WINDOW_MS / 1000
 
@@ -1302,6 +1303,12 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             guard(), local_window_end_monotonic=local_window_end_monotonic,
             now_monotonic=time.monotonic(),
         )
+
+    def capture_on_window_end() -> None:
+        nonlocal on_end_edge
+        if on_end_edge is not None:
+            raise CapacityControlError("ON CPU edge was captured more than once")
+        on_end_edge = _capture_cpu_edge(capacity["on_end_ms"])
 
     try:
         phase_result = external_load.run_authenticated_workspace_capacity_phase(
@@ -1319,6 +1326,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
                 if capacity["workload"] == HTML_WORKLOAD else None
             ),
             max_supported_concurrency=(64 if capacity["workload"] == HTML_WORKLOAD else 16),
+            window_end_callback=capture_on_window_end,
             executor=capacity_executor,
         )
     except (external_load.ExternalLoadError, OSError, CapacityControlError):
@@ -1333,7 +1341,8 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         )
     finally:
         capacity_executor.shutdown(wait=True, cancel_futures=True)
-    on_end_edge = _capture_cpu_edge(capacity["on_end_ms"])
+    if on_end_edge is None:
+        on_end_edge = _capture_cpu_edge(capacity["on_end_ms"])
     on_cpu_window = _cpu_window_row("on", on_start_edge, on_end_edge)
     results = phase_result["results"]
     statuses = Counter(

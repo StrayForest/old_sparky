@@ -15,6 +15,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import socket
 import stat
 import time
 from typing import Any
@@ -28,6 +29,8 @@ PLAN_PATHS = {
 }
 MAX_PLAN_BYTES = 4096
 MAX_CAPTURE_MS = 60_000
+JOURNAL_SOCKET_PATH = "/run/systemd/journal/socket"
+MAX_CPU_DIAGNOSTIC_DATAGRAM_BYTES = 8192
 WORKLOAD = "authenticated_workspace_read_pair_v1"
 WORKLOAD_SSR_CAPACITY = "authenticated_workspace_read_capacity_v1"
 WORKLOAD_HTML_SSR_CAPACITY = "authenticated_html_ssr_capacity_v1"
@@ -40,6 +43,67 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
 INVOCATION_RE = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f-]{36})$")
 CPU_CGROUP_RE = re.compile(r"^0::(?P<path>/[A-Za-z0-9._/-]{0,512})$")
 CPU_WINDOW_TOLERANCE_MS = 250
+
+
+def _warn_cpu_diagnostic_journal_failure(reason: str) -> None:
+    if reason not in {"message_rejected", "transport_failed"}:
+        reason = "transport_failed"
+    logging.getLogger("platform.performance.transport").warning(
+        "API CPU diagnostic journal delivery failed reason=%s", reason,
+    )
+
+
+def _emit_cpu_diagnostic_message(message: str) -> bool:
+    """Send one bounded API diagnostic marker with the worker's journal PID."""
+
+    if (type(message) is not str
+            or not message.startswith((
+                "cpu_diagnostic_usage service=api ",
+                "cpu_diagnostic_complete service=api ",
+            ))):
+        _warn_cpu_diagnostic_journal_failure("message_rejected")
+        return False
+    if len(message) > MAX_CPU_DIAGNOSTIC_DATAGRAM_BYTES:
+        _warn_cpu_diagnostic_journal_failure("message_rejected")
+        return False
+    if any(not 0x20 <= ord(character) <= 0x7E for character in message):
+        _warn_cpu_diagnostic_journal_failure("message_rejected")
+        return False
+    try:
+        message.encode("ascii")
+    except UnicodeEncodeError:
+        _warn_cpu_diagnostic_journal_failure("message_rejected")
+        return False
+    wrapped_message = json.dumps(
+        {"message": message}, ensure_ascii=True, separators=(",", ":"),
+    ).encode("ascii")
+    payload = (
+        b"MESSAGE=" + wrapped_message + b"\n"
+        b"PRIORITY=6\n"
+        b"SYSLOG_IDENTIFIER=old-sparky-platform-api\n"
+    )
+    if len(payload) > MAX_CPU_DIAGNOSTIC_DATAGRAM_BYTES:
+        _warn_cpu_diagnostic_journal_failure("message_rejected")
+        return False
+
+    sender: socket.socket | None = None
+    try:
+        sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sender.setblocking(False)
+        sent = sender.sendto(payload, JOURNAL_SOCKET_PATH)
+        if sent != len(payload):
+            _warn_cpu_diagnostic_journal_failure("transport_failed")
+            return False
+        return True
+    except OSError:
+        _warn_cpu_diagnostic_journal_failure("transport_failed")
+        return False
+    finally:
+        if sender is not None:
+            try:
+                sender.close()
+            except OSError:
+                pass
 
 
 class _DuplicateJsonKey(ValueError):
@@ -290,18 +354,19 @@ def _start_cpu_usage_window(plan: DiagnosticPlan, phase: str, loop: Any) -> None
             <= window_ms
             <= 20_000 + 2 * CPU_WINDOW_TOLERANCE_MS
         )
-        logger.info(
+        _emit_cpu_diagnostic_message(
             "cpu_diagnostic_usage service=api run_id=%s phase=%s window_ms=%s "
             "cpu_ns=%s cpu_capacity_cpus=%s start_lag_ms=%s end_lag_ms=%s "
-            "timing_complete=%s",
-            plan.run_id,
-            phase,
-            window_ms,
-            cpu_ns,
-            f"{capacity:.6f}" if capacity is not None else "unknown",
-            start_lag_ms,
-            end_lag_ms,
-            str(timing_complete).lower(),
+            "timing_complete=%s" % (
+                plan.run_id,
+                phase,
+                window_ms,
+                cpu_ns,
+                f"{capacity:.6f}" if capacity is not None else "unknown",
+                start_lag_ms,
+                end_lag_ms,
+                str(timing_complete).lower(),
+            )
         )
 
     delay_seconds = max(0.0, (end_ms_target - start_ms) / 1000)
@@ -319,9 +384,9 @@ def _header_from_scope(scope: dict[str, Any], name: bytes) -> str | None:
 def _read_release_identity() -> tuple[str, str] | None:
     """Read source/release identity from this process' immutable release root."""
 
-    # This module lives under <release>/platform/python_packages/...; the
-    # immutable release receipt is one parent above the platform tree.
-    release_file = Path(__file__).resolve().parents[3] / "RELEASE.json"
+    # Release staging strips the repository's `platform/` prefix, so this
+    # module lives under <release>/python_packages/....
+    release_file = Path(__file__).resolve().parents[2] / "RELEASE.json"
     try:
         descriptor = os.open(
             release_file,
@@ -617,12 +682,13 @@ class ApiCpuDiagnostic:
         if self.started_monotonic is not None:
             elapsed_ms = min(MAX_CAPTURE_MS, int((time.monotonic() - self.started_monotonic) * 1000))
         categories = ",".join(f"{name}:{cpu_us}:{calls}" for name, cpu_us, calls in rows)
-        logger.info(
+        _emit_cpu_diagnostic_message(
             "cpu_diagnostic_complete service=api run_id=%s timer=thread_cpu "
-            "start_lag_ms=%s elapsed_ms=%s total_self_cpu_us=%s functions=%s",
-            self.plan.run_id,
-            self.start_lag_ms,
-            elapsed_ms,
-            total_self_us,
-            categories[:6000],
+            "start_lag_ms=%s elapsed_ms=%s total_self_cpu_us=%s functions=%s" % (
+                self.plan.run_id,
+                self.start_lag_ms,
+                elapsed_ms,
+                total_self_us,
+                categories[:6000],
+            )
         )
