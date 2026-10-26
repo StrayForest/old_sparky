@@ -1334,6 +1334,119 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertFalse(capacity_diagnostic._worker_report_matches(
             {**control_abort, "resource_abort_reason": "memory_event"}, config,
         ))
+        classified_off_results = (
+            (external_load.RequestResult(
+                "off", "GET", "/fixture", 200, 50.0, True, 1,
+                html_content_type_ok=True, html_page_marker_ok=True,
+            ), "success", "2xx"),
+            (external_load.RequestResult(
+                "off", "GET", "/fixture", 503, 50.0, False, 1,
+                error_kind="unexpected_status",
+            ), "http_status", "5xx"),
+            (external_load.RequestResult(
+                "off", "GET", "/fixture", 200, 50.0, False, 1,
+                html_content_type_ok=False, html_page_marker_ok=True,
+            ), "content_type", "2xx"),
+            (external_load.RequestResult(
+                "off", "GET", "/fixture", 200, 50.0, False, 1,
+                html_content_type_ok=True, html_page_marker_ok=False,
+            ), "page_marker", "2xx"),
+            (external_load.RequestResult(
+                "off", "GET", "/fixture", 0, 5_100.0, False, 0,
+                error_kind="TimeoutError",
+            ), "request_error", "unknown"),
+            (external_load.RequestResult(
+                "off", "GET", "/fixture", 200, 5_001.0, True, 1,
+                html_content_type_ok=True, html_page_marker_ok=True,
+            ), "response_over_5s", "2xx"),
+            (external_load.RequestResult(
+                "off", "GET", "/fixture", 200, float("nan"), True, 1,
+                html_content_type_ok=True, html_page_marker_ok=True,
+            ), "invalid_result", None),
+            (external_load.RequestResult(
+                "off", "GET", "/fixture", 200, float("inf"), True, 1,
+                html_content_type_ok=True, html_page_marker_ok=True,
+            ), "invalid_result", None),
+            (external_load.RequestResult(
+                "off", "GET", "/fixture", 503, float("inf"), False, 1,
+                error_kind="unexpected_status",
+            ), "invalid_result", None),
+            (external_load.RequestResult(
+                "off", "GET", "/fixture", 200, 10**1000, True, 1,
+                html_content_type_ok=True, html_page_marker_ok=True,
+            ), "invalid_result", None),
+        )
+        for result, expected_reason, expected_status_class in classified_off_results:
+            with self.subTest(reason=expected_reason):
+                reason, status_class, _elapsed = capacity_diagnostic._classify_off_probe_result(
+                    result,
+                )
+                self.assertEqual((reason, status_class), (expected_reason, expected_status_class))
+        self.assertEqual(
+            capacity_diagnostic._classify_off_probe_result(None),
+            ("invalid_result", None, None),
+        )
+        invalid_timing_projection = {
+            "submitted": 1, "completed": 0, "http_status": None,
+            "diagnostics": {
+                "reason_counts": {
+                    "success": 0, "request_error": 0, "http_status": 0,
+                    "content_type": 0, "page_marker": 0, "response_over_5s": 0,
+                    "future_timeout": 0, "future_exception": 0,
+                    "barrier_failed": 0, "invalid_result": 1,
+                },
+                "status_classes": {
+                    "1xx": 0, "2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "unknown": 0,
+                },
+                "max_elapsed_ms": None, "batch_elapsed_ms": 1,
+                "batch_over_11s": 0,
+            },
+        }
+        self.assertTrue(capacity_diagnostic._valid_off_probe(
+            invalid_timing_projection, submitted_limit=1, status="incomplete",
+            resource_abort_reason="off_probe_failed",
+        ))
+        invalid_timing_projection["diagnostics"]["status_classes"]["2xx"] = 1
+        self.assertFalse(capacity_diagnostic._valid_off_probe(
+            invalid_timing_projection, submitted_limit=1, status="incomplete",
+            resource_abort_reason="off_probe_failed",
+        ))
+        off_probe_diagnostics = {
+            "reason_counts": {
+                "success": 7, "request_error": 0, "http_status": 1,
+                "content_type": 0, "page_marker": 0, "response_over_5s": 0,
+                "future_timeout": 0, "future_exception": 0,
+                "barrier_failed": 0, "invalid_result": 0,
+            },
+            "status_classes": {
+                "1xx": 0, "2xx": 7, "3xx": 0, "4xx": 0, "5xx": 1, "unknown": 0,
+            },
+            "max_elapsed_ms": 5_020, "batch_elapsed_ms": 6_200,
+            "batch_over_11s": 0,
+        }
+        failed_off_probe = through_worker_entry({
+            **report, "status": "incomplete", "passed": False,
+            "resource_abort_reason": "off_probe_failed",
+            "off_probe": {
+                "submitted": 8, "completed": 8, "http_status": None,
+                "diagnostics": off_probe_diagnostics,
+            },
+        })
+        self.assertTrue(capacity_diagnostic._worker_report_matches(failed_off_probe, config))
+        bad_off_probe_diagnostics = {
+            **off_probe_diagnostics,
+            "reason_counts": {**off_probe_diagnostics["reason_counts"], "http_status": 0},
+        }
+        self.assertFalse(capacity_diagnostic._worker_report_matches(
+            {**failed_off_probe, "off_probe": {
+                **failed_off_probe["off_probe"], "diagnostics": bad_off_probe_diagnostics,
+            }}, config,
+        ))
+        self.assertFalse(capacity_diagnostic._worker_report_matches(
+            {**report, "off_probe": {
+                **report["off_probe"], "diagnostics": off_probe_diagnostics,
+            }}, config,
+        ))
         for mutation in (
             {**report, "worker_report_schema": 999},
             {key: value for key, value in report.items() if key != "partial_work"},
@@ -2286,6 +2399,54 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(
             fingerprint["worker"]["control_failure_reason"], "snapshot_replaced",
         )
+        off_probe_diagnostic_report = json.loads(json.dumps(report))
+        off_probe_diagnostic_report["status"] = "incomplete"
+        off_probe_diagnostic_report["passed"] = False
+        off_probe_diagnostic_report["worker"]["status"] = "incomplete"
+        off_probe_diagnostic_report["worker"]["resource_abort_reason"] = "off_probe_failed"
+        off_probe_diagnostic_report["worker"]["off_probe"] = {
+            "submitted": 8, "completed": 8, "http_status": None,
+            "diagnostics": {
+                "reason_counts": {
+                    "success": 7, "request_error": 0, "http_status": 1,
+                    "content_type": 0, "page_marker": 0, "response_over_5s": 0,
+                    "future_timeout": 0, "future_exception": 0,
+                    "barrier_failed": 0, "invalid_result": 0,
+                },
+                "status_classes": {
+                    "1xx": 0, "2xx": 7, "3xx": 0, "4xx": 0,
+                    "5xx": 1, "unknown": 0,
+                },
+                "max_elapsed_ms": 5_020, "batch_elapsed_ms": 6_200,
+                "batch_over_11s": 0,
+            },
+        }
+        projected_off_failure = capacity_diagnostic._project_capacity_report(
+            off_probe_diagnostic_report,
+        )
+        self.assertIsNotNone(projected_off_failure)
+        self.assertEqual(
+            projected_off_failure["worker"]["off_probe"]["diagnostics"],
+            off_probe_diagnostic_report["worker"]["off_probe"]["diagnostics"],
+        )
+        off_failure_fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+            projected_off_failure,
+            args=Namespace(
+                concurrency=8, source_sha="b" * 40, app_target_sha="c" * 40,
+                external_run_id="12345", external_run_attempt="1",
+                workload=capacity_diagnostic.WORKLOAD,
+            ),
+            stage_state={},
+        )
+        self.assertEqual(
+            off_failure_fingerprint["worker"]["off_probe"]["diagnostics"],
+            off_probe_diagnostic_report["worker"]["off_probe"]["diagnostics"],
+        )
+        malformed_off_diagnostics = json.loads(json.dumps(off_probe_diagnostic_report))
+        malformed_off_diagnostics["worker"]["off_probe"]["diagnostics"]["reason_counts"][
+            "http_status"
+        ] = 0
+        self.assertIsNone(capacity_diagnostic._project_capacity_report(malformed_off_diagnostics))
         invalid_control_diagnostic = json.loads(json.dumps(control_diagnostic))
         invalid_control_diagnostic["worker"]["control_failure_reason"] = "raw path"
         self.assertIsNone(capacity_diagnostic._project_capacity_report(
