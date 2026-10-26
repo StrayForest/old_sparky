@@ -5036,6 +5036,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         def cleanup_dispatch_roundtrip(
             cleanup_result: dict[str, object],
             *, expected_dispatch_status: int = 0,
+            forbidden_output: bytes | None = None,
         ) -> dict[str, object] | None:
             """Run producer output through dispatcher and outer closed decoder."""
             with tempfile.TemporaryDirectory() as temporary_dir:
@@ -5069,8 +5070,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     dispatch_status, expected_dispatch_status, dispatcher_stdout.getvalue(),
                 )
                 if expected_dispatch_status != 0:
-                    self.assertEqual(dispatcher_stdout.getvalue(), "")
-                    return None
+                    failure_line = dispatcher_stdout.getvalue().encode("ascii")
+                    self.assertTrue(failure_line.startswith(b"CPU_DIAGNOSTIC_PLAN_FAILURE "))
+                    self.assertTrue(failure_line.endswith(b"\n"))
+                    failure_detail = cpu_pair._decode_cpu_plan_failure(failure_line)
+                    self.assertIsNotNone(failure_detail)
+                    if forbidden_output is not None:
+                        self.assertNotIn(forbidden_output, failure_line)
+                    return failure_detail
                 projected_line = dispatcher_stdout.getvalue().encode("ascii").strip()
                 prefix = b"CPU_DIAGNOSTIC_PLAN "
                 self.assertTrue(projected_line.startswith(prefix))
@@ -5114,9 +5121,12 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         }
         self.assertTrue(partial_pair_as_single["usage_rows"])
         self.assertIsNone(cpu_pair._validate_usage_summary(partial_pair_as_single))
-        self.assertIsNone(cleanup_dispatch_roundtrip(
+        failed_partial_cleanup = cleanup_dispatch_roundtrip(
             partial_pair_as_single, expected_dispatch_status=2,
-        ))
+        )
+        self.assertEqual(failed_partial_cleanup["stage"], "response_summary")
+        self.assertEqual(failed_partial_cleanup["child_return_code"], 0)
+        self.assertEqual(failed_partial_cleanup["child_stdout_shape"], "single_line")
 
         complete_pair_as_single = json.loads(json.dumps(fallback_cleanup))
         complete_pair_as_single["usage_status"] = "complete"
@@ -5163,9 +5173,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "status": "expired_plans_removed", **complete_pair_as_single,
         }
         self.assertIsNone(cpu_pair._validate_usage_summary(malformed_complete_single))
-        self.assertIsNone(cleanup_dispatch_roundtrip(
+        malformed_complete_single["private_detail"] = "PRIVATE_CLEANUP_SENTINEL"
+        failed_complete_cleanup = cleanup_dispatch_roundtrip(
             malformed_complete_single, expected_dispatch_status=2,
-        ))
+            forbidden_output=b"PRIVATE_CLEANUP_SENTINEL",
+        )
+        self.assertEqual(failed_complete_cleanup["stage"], "response_summary")
+        self.assertEqual(failed_complete_cleanup["child_return_code"], 0)
+        self.assertEqual(failed_complete_cleanup["child_stdout_shape"], "single_line")
 
     def test_api_release_identity_uses_real_released_platform_layout(self) -> None:
         import python_packages.platform_infra.performance_diagnostic as diagnostic_module
