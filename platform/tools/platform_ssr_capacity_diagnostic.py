@@ -188,12 +188,13 @@ def _valid_off_probe(
     if (status != "incomplete" or resource_abort_reason != "off_probe_failed"
             or not isinstance(diagnostics, dict)
             or set(diagnostics) != {
-                "reason_counts", "status_classes", "max_elapsed_ms",
+                "reason_counts", "status_classes", "http_status_counts", "max_elapsed_ms",
                 "batch_elapsed_ms", "batch_over_11s",
             }):
         return False
     reasons = diagnostics.get("reason_counts")
     statuses = diagnostics.get("status_classes")
+    http_statuses = diagnostics.get("http_status_counts")
     if (not isinstance(reasons, dict) or set(reasons) != set(OFF_PROBE_REASON_COUNTS)
             or any(type(count) is not int or not 0 <= count <= value["submitted"]
                    for count in reasons.values())
@@ -202,7 +203,21 @@ def _valid_off_probe(
             or set(statuses) != set(OFF_PROBE_STATUS_CLASSES)
             or any(type(count) is not int or not 0 <= count <= value["completed"]
                    for count in statuses.values())
-            or sum(statuses.values()) != value["completed"]):
+            or sum(statuses.values()) != value["completed"]
+            or not isinstance(http_statuses, dict)
+            or len(http_statuses) > value["completed"]
+            or any(not isinstance(code, str) or re.fullmatch(r"[1-5][0-9]{2}", code) is None
+                   or str(int(code)) != code
+                   or type(count) is not int or not 0 < count <= value["completed"]
+                   for code, count in http_statuses.items())
+            or sum(http_statuses.values()) != value["completed"] - statuses["unknown"]
+            or {
+                f"{hundreds}xx": sum(
+                    count for code, count in http_statuses.items()
+                    if int(code) // 100 == hundreds
+                )
+                for hundreds in range(1, 6)
+            } != {key: statuses[key] for key in OFF_PROBE_STATUS_CLASSES[:-1]}):
         return False
     max_elapsed = diagnostics.get("max_elapsed_ms")
     batch_elapsed = diagnostics.get("batch_elapsed_ms")
@@ -1360,6 +1375,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     barrier = threading.Barrier(probe_count)
     off_probe_reason_counts = Counter()
     off_probe_status_classes = Counter()
+    off_probe_http_statuses = Counter()
     off_probe_elapsed_values: list[float] = []
     probe_futures = [
         capacity_executor.submit(marked_probe, selected[index % len(selected)], barrier)
@@ -1381,6 +1397,8 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             if isinstance(result, external_load.RequestResult) and status_class is not None:
                 off_results.append(result)
                 off_probe_status_classes[status_class] += 1
+                if type(result.status) is int and result.status != 0:
+                    off_probe_http_statuses[str(result.status)] += 1
                 if elapsed_ms is not None:
                     off_probe_elapsed_values.append(elapsed_ms)
             off_probe_reason_counts[result_reason] += 1
@@ -1404,6 +1422,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
                 name: int(off_probe_status_classes.get(name, 0))
                 for name in OFF_PROBE_STATUS_CLASSES
             },
+            "http_status_counts": dict(sorted(off_probe_http_statuses.items())),
             "max_elapsed_ms": (
                 min(OFF_PROBE_DIAGNOSTIC_MAX_MS, int(math.ceil(max(off_probe_elapsed_values))))
                 if off_probe_elapsed_values else None

@@ -1398,6 +1398,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "status_classes": {
                     "1xx": 0, "2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "unknown": 0,
                 },
+                "http_status_counts": {},
                 "max_elapsed_ms": None, "batch_elapsed_ms": 1,
                 "batch_over_11s": 0,
             },
@@ -1413,14 +1414,15 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         ))
         off_probe_diagnostics = {
             "reason_counts": {
-                "success": 7, "request_error": 0, "http_status": 1,
+                "success": 6, "request_error": 0, "http_status": 2,
                 "content_type": 0, "page_marker": 0, "response_over_5s": 0,
                 "future_timeout": 0, "future_exception": 0,
                 "barrier_failed": 0, "invalid_result": 0,
             },
             "status_classes": {
-                "1xx": 0, "2xx": 7, "3xx": 0, "4xx": 0, "5xx": 1, "unknown": 0,
+                "1xx": 0, "2xx": 6, "3xx": 0, "4xx": 1, "5xx": 1, "unknown": 0,
             },
+            "http_status_counts": {"200": 6, "401": 1, "503": 1},
             "max_elapsed_ms": 5_020, "batch_elapsed_ms": 6_200,
             "batch_over_11s": 0,
         }
@@ -1441,6 +1443,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             {**failed_off_probe, "off_probe": {
                 **failed_off_probe["off_probe"], "diagnostics": bad_off_probe_diagnostics,
             }}, config,
+        ))
+        bad_http_status_counts = json.loads(json.dumps(failed_off_probe))
+        bad_http_status_counts["off_probe"]["diagnostics"]["http_status_counts"] = {
+            "200": 8,
+        }
+        self.assertFalse(capacity_diagnostic._worker_report_matches(
+            bad_http_status_counts, config,
         ))
         self.assertFalse(capacity_diagnostic._worker_report_matches(
             {**report, "off_probe": {
@@ -2408,15 +2417,16 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "submitted": 8, "completed": 8, "http_status": None,
             "diagnostics": {
                 "reason_counts": {
-                    "success": 7, "request_error": 0, "http_status": 1,
+                    "success": 6, "request_error": 0, "http_status": 2,
                     "content_type": 0, "page_marker": 0, "response_over_5s": 0,
                     "future_timeout": 0, "future_exception": 0,
                     "barrier_failed": 0, "invalid_result": 0,
                 },
                 "status_classes": {
-                    "1xx": 0, "2xx": 7, "3xx": 0, "4xx": 0,
+                    "1xx": 0, "2xx": 6, "3xx": 0, "4xx": 1,
                     "5xx": 1, "unknown": 0,
                 },
+                "http_status_counts": {"200": 6, "401": 1, "503": 1},
                 "max_elapsed_ms": 5_020, "batch_elapsed_ms": 6_200,
                 "batch_over_11s": 0,
             },
@@ -2446,6 +2456,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         malformed_off_diagnostics["worker"]["off_probe"]["diagnostics"]["reason_counts"][
             "http_status"
         ] = 0
+        self.assertIsNone(capacity_diagnostic._project_capacity_report(malformed_off_diagnostics))
+        malformed_off_diagnostics = json.loads(json.dumps(off_probe_diagnostic_report))
+        malformed_off_diagnostics["worker"]["off_probe"]["diagnostics"][
+            "http_status_counts"
+        ] = {"200": 7, "503": 1}
         self.assertIsNone(capacity_diagnostic._project_capacity_report(malformed_off_diagnostics))
         invalid_control_diagnostic = json.loads(json.dumps(control_diagnostic))
         invalid_control_diagnostic["worker"]["control_failure_reason"] = "raw path"
