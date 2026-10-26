@@ -178,6 +178,34 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 ),
                 ("window_complete", 2),
             )
+            self.assertEqual(
+                capacity_control.stop_reason_from_control_diagnostic(
+                    path, expected={**expected, "source_sha": "e" * 40},
+                    previous_sequence=1, now_monotonic_ns=10_000_000_003,
+                ),
+                ("control_file_invalid", 1, "binding"),
+            )
+            self.assertEqual(
+                capacity_control.stop_reason_from_control_diagnostic(
+                    path, expected=expected, previous_sequence=1,
+                    now_monotonic_ns=10_000_000_001,
+                ),
+                ("control_file_invalid", 1, "future"),
+            )
+            self.assertEqual(
+                capacity_control.stop_reason_from_control_diagnostic(
+                    path, expected=expected, previous_sequence=1,
+                    now_monotonic_ns=12_000_000_000,
+                ),
+                ("control_file_invalid", 1, "stale"),
+            )
+            self.assertEqual(
+                capacity_control.stop_reason_from_control_diagnostic(
+                    path, expected=expected, previous_sequence=3,
+                    now_monotonic_ns=10_000_000_003,
+                ),
+                ("control_file_invalid", 3, "sequence"),
+            )
             with self.assertRaises(capacity_control.CapacityControlError):
                 capacity_control.read_control(
                     path, expected={**expected, "source_sha": "e" * 40},
@@ -297,10 +325,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 return original_open(candidate, flags, *args, **kwargs)
 
             with patch.object(capacity_control.os, "open", side_effect=replace_before_every_open):
-                with self.assertRaises(capacity_control.CapacityControlError):
+                with self.assertRaises(capacity_control.CapacityControlError) as context:
                     capacity_control.read_control(
                         path, expected=expected, now_monotonic_ns=base_ns + 100,
                     )
+            self.assertEqual(context.exception.reason, "snapshot_replaced")
             self.assertEqual(replace_count, capacity_control.CONTROL_READ_ATTEMPTS)
 
             capacity_control.write_control(
@@ -310,11 +339,12 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             with patch.object(
                 capacity_control, "_read_control_once", wraps=original_reader,
             ) as reader:
-                with self.assertRaises(capacity_control.CapacityControlError):
+                with self.assertRaises(capacity_control.CapacityControlError) as context:
                     capacity_control.read_control(
                         path, expected=expected, previous_sequence=4,
                         now_monotonic_ns=base_ns + 200,
                     )
+                self.assertEqual(context.exception.reason, "sequence")
                 with self.assertRaises(capacity_control.CapacityControlError):
                     capacity_control.read_control(
                         path, expected={**expected, "source_sha": "e" * 40},
@@ -325,6 +355,74 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         path, expected=expected, now_monotonic_ns=base_ns + 1_600_000_000,
                     )
                 self.assertEqual(reader.call_count, 3)
+
+            self.assertEqual(
+                capacity_control.stop_reason_from_control_diagnostic(
+                    Path(directory) / "missing-control.json", expected=expected,
+                    previous_sequence=3, now_monotonic_ns=base_ns + 200,
+                ),
+                ("control_file_invalid", 3, "unavailable"),
+            )
+            with patch.object(capacity_control, "read_control", side_effect=RuntimeError):
+                self.assertEqual(
+                    capacity_control.stop_reason_from_control_diagnostic(
+                        path, expected=expected, previous_sequence=3,
+                        now_monotonic_ns=base_ns + 200,
+                    ),
+                    ("control_file_invalid", 3, "unexpected"),
+                )
+
+            os.chmod(path, 0o640)
+            self.assertEqual(
+                capacity_control.stop_reason_from_control_diagnostic(
+                    path, expected=expected, previous_sequence=3,
+                    now_monotonic_ns=base_ns + 200,
+                ),
+                ("control_file_invalid", 3, "metadata"),
+            )
+            os.chmod(path, 0o600)
+            path.write_bytes(b"{}\n")
+            self.assertEqual(
+                capacity_control.stop_reason_from_control_diagnostic(
+                    path, expected=expected, previous_sequence=3,
+                    now_monotonic_ns=base_ns + 200,
+                ),
+                ("control_file_invalid", 3, "schema"),
+            )
+
+            capacity_control.write_control(
+                path, record(5), expected=expected, now_monotonic_ns=base_ns + 200,
+            )
+            original_open = capacity_control.os.open
+            original_read = capacity_control.os.read
+            control_fd = None
+            touched = False
+
+            def capture_control_fd(candidate, flags, *args, **kwargs):
+                nonlocal control_fd
+                fd = original_open(candidate, flags, *args, **kwargs)
+                if Path(candidate) == path:
+                    control_fd = fd
+                return fd
+
+            def touch_snapshot(fd, size):
+                nonlocal touched
+                chunk = original_read(fd, size)
+                if fd == control_fd and chunk and not touched:
+                    touched = True
+                    metadata = path.stat()
+                    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1))
+                return chunk
+
+            with patch.object(capacity_control.os, "open", side_effect=capture_control_fd), \
+                    patch.object(capacity_control.os, "read", side_effect=touch_snapshot):
+                self.assertEqual(
+                    capacity_control.stop_reason_from_control_diagnostic(
+                        path, expected=expected, previous_sequence=4,
+                        now_monotonic_ns=base_ns + 300,
+                    ),
+                    ("control_file_invalid", 4, "snapshot_changed"),
+                )
 
     def test_ssr_capacity_control_rejects_symlink_destination(self) -> None:
         expected = {
@@ -1162,6 +1260,20 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
         report = through_worker_entry(report)
         self.assertTrue(capacity_diagnostic._worker_report_matches(report, config))
+        control_abort = {
+            **report,
+            "status": "incomplete",
+            "passed": False,
+            "resource_abort_reason": "control_file_invalid",
+            "control_failure_reason": "stale",
+        }
+        self.assertTrue(capacity_diagnostic._worker_report_matches(control_abort, config))
+        self.assertFalse(capacity_diagnostic._worker_report_matches(
+            {**control_abort, "control_failure_reason": "untrusted text"}, config,
+        ))
+        self.assertFalse(capacity_diagnostic._worker_report_matches(
+            {**control_abort, "resource_abort_reason": "memory_event"}, config,
+        ))
         for mutation in (
             {**report, "worker_report_schema": 999},
             {key: value for key, value in report.items() if key != "partial_work"},
@@ -2091,6 +2203,34 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             report, source_sha="b" * 40, app_target_sha="c" * 40,
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
         ), "PASS")
+        control_diagnostic = json.loads(json.dumps(report))
+        control_diagnostic["status"] = "incomplete"
+        control_diagnostic["passed"] = False
+        control_diagnostic["worker"]["status"] = "incomplete"
+        control_diagnostic["worker"]["resource_abort_reason"] = "control_file_invalid"
+        control_diagnostic["worker"]["control_failure_reason"] = "snapshot_replaced"
+        projected_control = capacity_diagnostic._project_capacity_report(control_diagnostic)
+        self.assertIsNotNone(projected_control)
+        self.assertEqual(
+            projected_control["worker"]["control_failure_reason"], "snapshot_replaced",
+        )
+        fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+            projected_control,
+            args=Namespace(
+                concurrency=8, source_sha="b" * 40, app_target_sha="c" * 40,
+                external_run_id="12345", external_run_attempt="1",
+                workload=capacity_diagnostic.WORKLOAD,
+            ),
+            stage_state={},
+        )
+        self.assertEqual(
+            fingerprint["worker"]["control_failure_reason"], "snapshot_replaced",
+        )
+        invalid_control_diagnostic = json.loads(json.dumps(control_diagnostic))
+        invalid_control_diagnostic["worker"]["control_failure_reason"] = "raw path"
+        self.assertIsNone(capacity_diagnostic._project_capacity_report(
+            invalid_control_diagnostic,
+        ))
         complete_without_full_probe = json.loads(json.dumps(report))
         complete_without_full_probe["worker"]["off_probe"] = {
             "submitted": 0, "completed": 0, "http_status": None,
