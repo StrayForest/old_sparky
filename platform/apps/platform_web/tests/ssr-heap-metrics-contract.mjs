@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   appendBoundedSample,
   classifyCgroupReadFailure,
@@ -10,6 +13,29 @@ import {
   startHeapMetrics,
 } from "../lib/server-ssr-heap-metrics.mjs";
 import { openSync, closeSync, fstatSync, readSync, readFileSync, constants as fsConstants } from "node:fs";
+import { releaseMetadataPathFromStandaloneCwd } from "../lib/release-identity-path.mjs";
+
+{
+  const releaseRoot = mkdtempSync(join(tmpdir(), "platform-standalone-release-"));
+  const standaloneCwd = join(releaseRoot, "apps", "platform_web", ".next", "standalone");
+  const releaseMetadata = '{"source_git_commit":"a"}\n';
+  const decoyMetadata = '{"source_git_commit":"b"}\n';
+  try {
+    mkdirSync(standaloneCwd, { recursive: true });
+    mkdirSync(join(releaseRoot, "apps"), { recursive: true });
+    writeFileSync(join(releaseRoot, "RELEASE.json"), releaseMetadata);
+    writeFileSync(join(releaseRoot, "apps", "RELEASE.json"), decoyMetadata);
+    const path = releaseMetadataPathFromStandaloneCwd(standaloneCwd);
+    assert.equal(path, join(releaseRoot, "RELEASE.json"));
+    assert.equal(readFileSync(path, "utf8"), releaseMetadata);
+    const planSource = readFileSync(
+      new URL("../lib/performance-diagnostic-plan.ts", import.meta.url), "utf8",
+    );
+    assert.match(planSource, /releaseMetadataPathFromStandaloneCwd\(process\.cwd\(\)\)/u);
+  } finally {
+    rmSync(releaseRoot, { recursive: true, force: true });
+  }
+}
 
 {
   const tokens = ["service=web", `run_id=${"a".repeat(32)}`, "phase=off", "sample_count=5", "status=complete"];

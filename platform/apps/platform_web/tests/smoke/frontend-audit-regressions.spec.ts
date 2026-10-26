@@ -522,7 +522,7 @@ test("workspace CPU diagnostics require an exact private run marker", () => {
     expect(hasAuthorizedDiagnosticRunMarker(value, runId)).toBe(false);
   }
   const planModule = source("lib/performance-diagnostic-plan.ts");
-  expect(planModule).toContain('resolve(process.cwd(), "../../..", "RELEASE.json")');
+  expect(planModule).toContain("releaseMetadataPathFromStandaloneCwd(process.cwd())");
   expect(planModule).toContain('const WORKLOAD_HTML_SSR_CAPACITY = "authenticated_html_ssr_capacity_v1";');
   expect(planModule).toContain("plan.workload !== WORKLOAD_HTML_SSR_CAPACITY");
   expect(planModule).toContain("&& plan.workload !== WORKLOAD_HTML_SSR_CAPACITY");

@@ -4200,6 +4200,67 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(capacity_telemetry["cgroup_memory_status"], "unknown")
             self.assertEqual(capacity_telemetry["node_memory_rows"][1]["gc_count"], 0)
 
+            # No parsed Web memory samples must still produce the closed,
+            # incomplete row shape accepted by the remote cleanup projection.
+            no_memory_journal = [
+                row for row in journal_rows
+                if not (
+                    isinstance(row.get("MESSAGE"), str)
+                    and row["MESSAGE"].startswith("cpu_diagnostic_memory ")
+                )
+            ]
+            with (
+                patch.object(diagnostic_plan_tool, "_release_identity", return_value=("b" * 40, "release-bbbbbbbbbbbb")),
+                patch.object(diagnostic_plan_tool, "_systemd_unit", side_effect=systemd_unit),
+                patch.object(diagnostic_plan_tool, "_service_targets", side_effect=lambda service, _unit: service_rows[service]),
+                patch.object(diagnostic_plan_tool, "_process_start_ticks", side_effect={101: 11, 102: 12, 201: 21}.get),
+                patch.object(diagnostic_plan_tool, "_journal_rows", return_value=("complete", no_memory_journal)),
+            ):
+                no_memory_summary = diagnostic_plan_tool._usage_summary(plans)
+            self.assertEqual(no_memory_summary["memory_status"], "incomplete")
+            self.assertEqual(no_memory_summary["memory_reason"], "incomplete")
+            self.assertEqual(no_memory_summary["cgroup_memory_status"], "unknown")
+            self.assertEqual(no_memory_summary["cgroup_memory_reason"], "hierarchy_unavailable")
+            self.assertEqual(
+                [row["phase"] for row in no_memory_summary["memory_rows"]], ["off", "on"]
+            )
+            for row in no_memory_summary["memory_rows"]:
+                self.assertEqual(set(row), remote_dispatch.CPU_MEMORY_ROW_FIELDS)
+                self.assertEqual(row["status"], "incomplete")
+                self.assertEqual(row["observed_targets"], 0)
+                self.assertEqual(row["event_count"], 0)
+                self.assertEqual(row["gc_status"], "unavailable")
+                self.assertIs(row["gc_overflow"], False)
+                self.assertIsNone(row["sample_count"])
+
+            summary_path.write_text(json.dumps({
+                "status": "expired_plans_removed", "service_count": 2,
+                **no_memory_summary,
+            }, sort_keys=True), encoding="ascii")
+            no_memory_stdout = io.StringIO()
+            with (
+                patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+                patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
+                redirect_stdout(no_memory_stdout),
+            ):
+                self.assertEqual(remote_dispatch._run_cpu_diagnostic_plan({
+                    "operation": "cleanup", "schema": 1, "run_id": "a" * 32,
+                }), 0)
+            no_memory_value = json.loads(
+                no_memory_stdout.getvalue().strip().removeprefix("CPU_DIAGNOSTIC_PLAN ")
+            )
+            no_memory_cleanup = cpu_pair._validate_usage_summary(no_memory_value)
+            self.assertIsNotNone(no_memory_cleanup)
+            no_memory_telemetry = capacity_diagnostic._project_server_telemetry(no_memory_cleanup)
+            self.assertEqual(no_memory_telemetry["node_memory_status"], "incomplete")
+            self.assertEqual(no_memory_telemetry["cgroup_memory_status"], "unknown")
+            self.assertEqual(len(no_memory_telemetry["node_memory_rows"]), 2)
+            self.assertTrue(all(
+                row["status"] == "incomplete" and row["sample_count"] is None
+                and row["gc_status"] == "incomplete" and row["gc_overflow"] is False
+                for row in no_memory_telemetry["node_memory_rows"]
+            ))
+
         with (
             patch.object(diagnostic_plan_tool, "_release_identity", return_value=("b" * 40, "release-bbbbbbbbbbbb")),
             patch.object(diagnostic_plan_tool, "_systemd_unit", side_effect=systemd_unit),
