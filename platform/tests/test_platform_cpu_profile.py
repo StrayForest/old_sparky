@@ -189,6 +189,143 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     now_monotonic_ns=12_000_000_000,
                 )
 
+    def test_ssr_capacity_control_retries_atomic_replace_at_each_snapshot_boundary(self) -> None:
+        expected = {
+            "run_id": "a" * 32,
+            "source_sha": "b" * 40,
+            "app_target_sha": "c" * 40,
+            "profile_digest": "d" * 64,
+            "external_run_id": "12345",
+            "external_run_attempt": "1",
+        }
+        now = 10_000_000_100
+
+        def record(sequence: int) -> dict[str, object]:
+            return {
+                "schema": 1, **expected, "decision": "continue", "reason": "none",
+                "sequence": sequence, "updated_monotonic_ns": 10_000_000_000 + sequence,
+            }
+
+        for boundary in ("before_open", "before_final_path_check"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "capacity-control.json"
+                capacity_control.write_control(
+                    path, record(1), expected=expected,
+                    now_monotonic_ns=10_000_000_001,
+                )
+                replacement = path.with_name("capacity-control.next")
+
+                def replace_control() -> None:
+                    replacement.write_bytes(capacity_control.canonical_json(record(2)))
+                    os.chmod(replacement, 0o600)
+                    os.replace(replacement, path)
+
+                if boundary == "before_open":
+                    original_open = capacity_control.os.open
+                    replaced = False
+
+                    def replace_before_open(candidate, flags, *args, **kwargs):
+                        nonlocal replaced
+                        if Path(candidate) == path and not replaced:
+                            replaced = True
+                            replace_control()
+                        return original_open(candidate, flags, *args, **kwargs)
+
+                    with patch.object(
+                        capacity_control.os, "open", side_effect=replace_before_open,
+                    ):
+                        observed = capacity_control.read_control(
+                            path, expected=expected, now_monotonic_ns=now,
+                        )
+                else:
+                    original_lstat = Path.lstat
+                    target_lstat_calls = 0
+                    replaced = False
+
+                    def replace_before_final_check(candidate):
+                        nonlocal target_lstat_calls, replaced
+                        if candidate == path:
+                            target_lstat_calls += 1
+                            if target_lstat_calls == 2 and not replaced:
+                                replaced = True
+                                replace_control()
+                        return original_lstat(candidate)
+
+                    with patch.object(Path, "lstat", new=replace_before_final_check):
+                        observed = capacity_control.read_control(
+                            path, expected=expected, now_monotonic_ns=now,
+                        )
+
+                self.assertTrue(replaced)
+                self.assertEqual(observed["sequence"], 2)
+
+    def test_ssr_capacity_control_exhaustion_and_invalid_records_fail_closed(self) -> None:
+        expected = {
+            "run_id": "a" * 32,
+            "source_sha": "b" * 40,
+            "app_target_sha": "c" * 40,
+            "profile_digest": "d" * 64,
+            "external_run_id": "12345",
+            "external_run_attempt": "1",
+        }
+        base_ns = 10_000_000_000
+
+        def record(sequence: int) -> dict[str, object]:
+            return {
+                "schema": 1, **expected, "decision": "continue", "reason": "none",
+                "sequence": sequence, "updated_monotonic_ns": base_ns + sequence,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capacity-control.json"
+            capacity_control.write_control(
+                path, record(1), expected=expected, now_monotonic_ns=base_ns + 10,
+            )
+            replacement = path.with_name("capacity-control.next")
+            replace_count = 0
+            original_open = capacity_control.os.open
+
+            def replace_before_every_open(candidate, flags, *args, **kwargs):
+                nonlocal replace_count
+                if Path(candidate) == path:
+                    replace_count += 1
+                    replacement.write_bytes(
+                        capacity_control.canonical_json(record(replace_count + 1)),
+                    )
+                    os.chmod(replacement, 0o600)
+                    os.replace(replacement, path)
+                return original_open(candidate, flags, *args, **kwargs)
+
+            with patch.object(capacity_control.os, "open", side_effect=replace_before_every_open):
+                with self.assertRaises(capacity_control.CapacityControlError):
+                    capacity_control.read_control(
+                        path, expected=expected, now_monotonic_ns=base_ns + 100,
+                    )
+            self.assertEqual(replace_count, capacity_control.CONTROL_READ_ATTEMPTS)
+
+            capacity_control.write_control(
+                path, record(3), expected=expected, now_monotonic_ns=base_ns + 100,
+            )
+            original_reader = capacity_control._read_control_once
+            with patch.object(
+                capacity_control, "_read_control_once", wraps=original_reader,
+            ) as reader:
+                with self.assertRaises(capacity_control.CapacityControlError):
+                    capacity_control.read_control(
+                        path, expected=expected, previous_sequence=4,
+                        now_monotonic_ns=base_ns + 200,
+                    )
+                with self.assertRaises(capacity_control.CapacityControlError):
+                    capacity_control.read_control(
+                        path, expected={**expected, "source_sha": "e" * 40},
+                        now_monotonic_ns=base_ns + 200,
+                    )
+                with self.assertRaises(capacity_control.CapacityControlError):
+                    capacity_control.read_control(
+                        path, expected=expected, now_monotonic_ns=base_ns + 1_600_000_000,
+                    )
+                self.assertEqual(reader.call_count, 3)
+
     def test_ssr_capacity_control_rejects_symlink_destination(self) -> None:
         expected = {
             "run_id": "a" * 32,
