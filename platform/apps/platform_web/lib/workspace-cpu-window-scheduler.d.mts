@@ -3,7 +3,9 @@ export type WorkspaceCpuWindowPhase = "off" | "on";
 export type WorkspaceCpuWindowPlan = {
   readonly run_id: string;
   readonly off_start_ms: number;
+  readonly off_end_ms: number;
   readonly on_start_ms: number;
+  readonly on_end_ms: number;
   readonly expires_at_ms: number;
 };
 
@@ -13,48 +15,54 @@ export type WorkspaceCpuWindowState = {
   readonly failed: Set<string>;
 };
 
-export declare function scheduleAuthorizedWorkspaceCpuWindowEdges(
-  plan: WorkspaceCpuWindowPlan,
-  freshPlan: WorkspaceCpuWindowPlan | null,
+export declare function scheduleAuthorizedWorkspaceCpuWindowEdges<
+  P extends WorkspaceCpuWindowPlan,
+>(
+  plan: P,
+  freshPlan: P | null,
   authorizedRunId: string | null,
   samePlan: (
-    expected: WorkspaceCpuWindowPlan,
-    current: WorkspaceCpuWindowPlan,
+    expected: P,
+    current: P,
   ) => boolean,
   scheduleWindow: (
-    plan: WorkspaceCpuWindowPlan,
+    plan: P,
     phase: WorkspaceCpuWindowPhase,
   ) => void,
 ): boolean;
 
-export declare function claimWorkspaceCpuWindowStart(
-  plan: WorkspaceCpuWindowPlan,
+export declare function claimWorkspaceCpuWindowStart<
+  P extends WorkspaceCpuWindowPlan,
+>(
+  plan: P,
   phase: WorkspaceCpuWindowPhase,
   state: WorkspaceCpuWindowState,
 ): boolean;
 
-export declare function scheduleWorkspaceCpuWindowStart(
-  plan: WorkspaceCpuWindowPlan,
+export declare function scheduleWorkspaceCpuWindowStart<
+  P extends WorkspaceCpuWindowPlan,
+>(
+  plan: P,
   phase: WorkspaceCpuWindowPhase,
   options: WorkspaceCpuWindowState & {
     now: () => number;
     schedule: (callback: () => void, delayMs: number) => unknown;
-    readPlan: () => WorkspaceCpuWindowPlan | null;
+    readPlan: () => P | null;
     samePlan: (
-      expected: WorkspaceCpuWindowPlan,
-      current: WorkspaceCpuWindowPlan | null,
+      expected: P,
+      current: P | null,
     ) => boolean;
     phaseAt: (
-      current: WorkspaceCpuWindowPlan,
+      current: P,
       nowMs: number,
     ) => WorkspaceCpuWindowPhase | null;
     startTarget: (
-      current: WorkspaceCpuWindowPlan,
+      current: P,
       phase: WorkspaceCpuWindowPhase,
     ) => number;
-    expiresAt: (current: WorkspaceCpuWindowPlan) => number;
+    expiresAt: (current: P) => number;
     onStart: (
-      current: WorkspaceCpuWindowPlan,
+      current: P,
       phase: WorkspaceCpuWindowPhase,
     ) => void;
     startToleranceMs: number;
