@@ -87,7 +87,9 @@ class ApiCpuPlanPermissionTests(unittest.TestCase):
                 "PLATFORM_RUNTIME_SERVICE": "api",
             }
             now_ms = time.time_ns() // 1_000_000
-            off_start_ms = now_ms + 10_000
+            # Exercise the producer's canonical maximum prearm lead and the
+            # corresponding future expiry, not only a short synthetic lead.
+            off_start_ms = now_ms + 52_000
             child_code = textwrap.dedent("""
                 import json
                 import os
