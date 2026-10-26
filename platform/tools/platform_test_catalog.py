@@ -79,6 +79,11 @@ TEST_ENVIRONMENT_REQUIREMENTS: Mapping[str, Mapping[str, str]] = {
         "RUNNER_OS": "Linux",
         "RUNNER_ENVIRONMENT": "github-hosted",
     },
+    "tests.test_platform_api_cpu_plan_permissions.ApiCpuPlanPermissionTests.test_api_plan_reader_accepts_root_plan_from_traversable_directory_as_service_user": {
+        "GITHUB_ACTIONS": "true",
+        "RUNNER_OS": "Linux",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+    },
 }
 
 # These cases execute the real PID-namespace supervisor and require the
@@ -266,6 +271,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_cloudflare_ips
     test_platform_configure_shared_env
     test_platform_configure_ufw
+    test_platform_api_cpu_plan_permissions
     test_platform_cpu_profile
     test_platform_create_closed_auth
     test_platform_db
@@ -451,6 +457,7 @@ PERFORMANCE_MODULES = frozenset(
 
 PRIVILEGED_MODULES = frozenset(
     {
+        "test_platform_api_cpu_plan_permissions",
         "test_platform_cleanup_live_user_qa",
         "test_platform_cleanup_retained_matrix",
         "test_platform_live_qa_guard",
@@ -645,12 +652,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 172,
-    "module_digest": "6b5ea2f0545b8a998f2dc9019ebffa0dc1bb76e145b12666fedb06d2abf0948a",
-    "test_count": 2214,
-    "test_id_digest": "d5542936fea98dadc7c43970bb23cf2aeb0dfc5157f2d7d67f225265f4267ccf",
-    "backend_test_count": 2136,
-    "backend_test_id_digest": "5dc02135f0b37a9634a861786626fc14e69462913eb8881e39a0ad6971602cc2",
+    "module_count": 173,
+    "module_digest": "35329b7c2e255ced3eb20c42b14973519f19fc07830806848f64033d4015f82a",
+    "test_count": 2215,
+    "test_id_digest": "34b19daf466da9af701bee3e6873e20186ccbf42de8f674a4001acd7bbc441a1",
+    "backend_test_count": 2137,
+    "backend_test_id_digest": "32dae7447d3cb93912f2939dac81eae8341317f85ee2336d031e90f116f83da3",
     "verification_test_count": 78,
     "verification_test_id_digest": "3d9621c245877a188d3768cb835b85ddf3055971e4d5ee6b949aadd5d9fd0008",
     "verification_classifier_test_count": 41,
@@ -665,7 +672,7 @@ CONTOUR_RATIONALE: Mapping[str, str] = {
     "backend-unit": "pure unit/domain/backend behavior without external operator resources",
     "backend-tool-contract": "hermetic repository tools, backup restore diagnostics, source-bound artifact proofs and read-only release-capture diagnostics without root-owned host state",
     "backend-integration": "PostgreSQL/Redis workflows and concurrency behavior",
-    "backend-privileged": "root/service-identity, release/install/systemd, artifact ownership, privileged wrappers, verified ephemeral scratch PostgreSQL diagnostics and root-owned API/worker service-recovery fixtures",
+    "backend-privileged": "root/service-identity, release/install/systemd, artifact ownership, privileged wrappers, verified ephemeral scratch PostgreSQL diagnostics, root-owned API plan-directory permission fixtures and API/worker service-recovery fixtures",
     "performance-contract": "deterministic load, observer and acceptance contracts",
     VERIFICATION_CONTOUR: "registry, workflow and profile ownership self-tests",
 }
@@ -689,10 +696,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "d6058717285a42ff732a43c18b4a181b01f487bd82e2691a87b1703aa8cf6066",
     },
     "backend-privileged": {
-        "module_count": 27,
-        "module_digest": "60b3e4ffd2556af3a341b6f18a33740f75dcad5e97fa53b77a9a4ed70cd3aed0",
-        "test_count": 712,
-        "test_id_digest": "4a998e94b7f647d0a76f2b7929fd11e030c6c2bd0c75d46d66eaa589d7abc977",
+        "module_count": 28,
+        "module_digest": "ab96560430aa4c30fb02e1468449f16fd0e6ea4e9a22780303c1b40453c04355",
+        "test_count": 713,
+        "test_id_digest": "7bc884026fe0757be36d24104317790c80e8558d14042a800f798a74386c35d1",
     },
     "performance-contract": {
         "module_count": 11,
