@@ -10,6 +10,11 @@ import { headers } from "next/headers";
 import { hasAuthorizedDiagnosticRunMarker } from "./performance-diagnostic-marker";
 import { releaseMetadataPathFromStandaloneCwd } from "./release-identity-path.mjs";
 import {
+  claimWorkspaceCpuWindowStart,
+  scheduleAuthorizedWorkspaceCpuWindowEdges,
+  scheduleWorkspaceCpuWindowStart,
+} from "./workspace-cpu-window-scheduler.mjs";
+import {
   authorizedWorkspaceDiagnosticPrearmRunId,
   readAuthorizedWorkspaceDiagnosticPrearmRunId,
 } from "./workspace-diagnostic-prearm.mjs";
@@ -80,6 +85,8 @@ const diagnosticStorage = new AsyncLocalStorage<ActiveDiagnostic>();
 const diagnosticPrearmStorage = new AsyncLocalStorage<DiagnosticPlan>();
 const consumedCpuRunIds = new Set<string>();
 const usageWindowsStarted = new Set<string>();
+const usageWindowsScheduled = new Set<string>();
+const usageWindowsFailed = new Set<string>();
 const memoryWindowsStarted = new Set<string>();
 let activeCpuRunId: string | null = null;
 let planCache: { checkedAt: number; plan: DiagnosticPlan | null } | null = null;
@@ -301,7 +308,13 @@ export async function run_with_workspace_cpu_diagnostic<T>(
     const prearmRunId = authorizedWorkspaceDiagnosticPrearmRunId(
       plan, freshPlan, Date.now(),
     );
-    if (freshPlan !== null && prearmRunId === plan.run_id) {
+    if (freshPlan !== null && scheduleAuthorizedWorkspaceCpuWindowEdges(
+      plan,
+      freshPlan,
+      prearmRunId,
+      (expected, current) => canonicalJson(expected) === canonicalJson(current),
+      scheduleCpuUsageWindow,
+    )) {
       return diagnosticPrearmStorage.run(freshPlan, operation);
     }
     return operation();
@@ -368,10 +381,36 @@ function effectiveCpuCapacity(): number | null {
   }
 }
 
+function scheduleCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void {
+  scheduleWorkspaceCpuWindowStart(plan, phase, {
+    now: Date.now,
+    schedule: (callback, delayMs) => {
+      const timer = setTimeout(callback, delayMs);
+      timer.unref();
+      return timer;
+    },
+    readPlan: safeReadPlan,
+    samePlan: (expected, current) => current !== null
+      && canonicalJson(expected) === canonicalJson(current),
+    phaseAt: activePhase,
+    startTarget: (current, currentPhase) => (
+      currentPhase === "off" ? current.off_start_ms : current.on_start_ms
+    ),
+    expiresAt: (current) => current.expires_at_ms,
+    started: usageWindowsStarted,
+    scheduled: usageWindowsScheduled,
+    failed: usageWindowsFailed,
+    onStart: startCpuUsageWindow,
+    startToleranceMs: CPU_WINDOW_TOLERANCE_MS,
+  });
+}
+
 function startCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void {
-  const key = `${plan.run_id}:${phase}`;
-  if (usageWindowsStarted.has(key)) return;
-  usageWindowsStarted.add(key);
+  if (!claimWorkspaceCpuWindowStart(plan, phase, {
+    started: usageWindowsStarted,
+    scheduled: usageWindowsScheduled,
+    failed: usageWindowsFailed,
+  })) return;
   const startTarget = phase === "off" ? plan.off_start_ms : plan.on_start_ms;
   const endTarget = phase === "off" ? plan.off_end_ms : plan.on_end_ms;
   const startMs = Date.now();

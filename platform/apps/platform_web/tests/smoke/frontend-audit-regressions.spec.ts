@@ -8,6 +8,11 @@ import { cancelServerAuthFetchTerminalResponse } from "../../lib/server-fetch-re
 import { formatWorkspaceApiErrorDiagnostic } from "../../lib/ssr-error-diagnostic";
 import { hasAuthorizedDiagnosticRunMarker } from "../../lib/performance-diagnostic-marker";
 import {
+  claimWorkspaceCpuWindowStart,
+  scheduleAuthorizedWorkspaceCpuWindowEdges,
+  scheduleWorkspaceCpuWindowStart,
+} from "../../lib/workspace-cpu-window-scheduler.mjs";
+import {
   readServerAuthJsonResponse,
   SERVER_AUTH_RESPONSE_MAX_BYTES,
 } from "../../lib/server-auth-http-response";
@@ -530,6 +535,157 @@ test("workspace CPU diagnostics require an exact private run marker", () => {
   expect(planModule).toContain("hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)");
   expect(planModule.indexOf("if (!hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id))"))
     .toBeLessThan(planModule.indexOf("diagnosticStorage.run({ plan, phase }, operation)"));
+  expect(planModule).toContain("scheduleAuthorizedWorkspaceCpuWindowEdges(");
+  expect(planModule.indexOf("scheduleAuthorizedWorkspaceCpuWindowEdges("))
+    .toBeLessThan(planModule.indexOf("diagnosticPrearmStorage.run(freshPlan, operation)"));
+});
+
+test("web CPU prearm schedules exact OFF/ON edges once and rejects stale or late starts", () => {
+  const plan = {
+    run_id: "0123456789abcdef0123456789abcdef",
+    off_start_ms: 1_000,
+    off_end_ms: 21_000,
+    on_start_ms: 26_000,
+    on_end_ms: 46_000,
+    expires_at_ms: 46_000,
+  };
+  const scheduledPhases: Array<"off" | "on"> = [];
+  const samePlan = (expected: typeof plan, current: typeof plan | null) => (
+    current !== null && JSON.stringify(expected) === JSON.stringify(current)
+  );
+  expect(scheduleAuthorizedWorkspaceCpuWindowEdges(
+    plan, plan, plan.run_id, samePlan,
+    (_current, phase) => scheduledPhases.push(phase),
+  )).toBe(true);
+  expect(scheduledPhases).toEqual(["off", "on"]);
+  expect(scheduleAuthorizedWorkspaceCpuWindowEdges(
+    plan, plan, "untrusted-run-id", samePlan,
+    (_current, phase) => scheduledPhases.push(phase),
+  )).toBe(false);
+  expect(scheduleAuthorizedWorkspaceCpuWindowEdges(
+    plan, { ...plan, expires_at_ms: plan.expires_at_ms + 1 }, plan.run_id, samePlan,
+    (_current, phase) => scheduledPhases.push(phase),
+  )).toBe(false);
+  expect(scheduledPhases).toEqual(["off", "on"]);
+
+  function createHarness() {
+    let nowMs = 900;
+    let currentPlan: typeof plan | null = plan;
+    const started = new Set<string>();
+    const scheduled = new Set<string>();
+    const failed = new Set<string>();
+    const callbacks: Array<{ dueMs: number; callback: () => void }> = [];
+    const starts: Array<{ phase: "off" | "on"; atMs: number }> = [];
+    let reads = 0;
+    const state = { started, scheduled, failed };
+    const options = () => ({
+      now: () => nowMs,
+      schedule: (callback: () => void, delayMs: number) => {
+        callbacks.push({ dueMs: nowMs + delayMs, callback });
+        return undefined;
+      },
+      readPlan: () => {
+        reads += 1;
+        return currentPlan;
+      },
+      samePlan: (expected: typeof plan, current: typeof plan | null) => (
+        current !== null && JSON.stringify(expected) === JSON.stringify(current)
+      ),
+      phaseAt: (current: typeof plan, atMs: number): "off" | "on" | null => (
+        atMs >= current.off_start_ms && atMs < current.off_end_ms
+          ? "off"
+          : atMs >= current.on_start_ms && atMs < current.on_end_ms
+            ? "on"
+            : null
+      ),
+      startTarget: (current: typeof plan, phase: "off" | "on") => (
+        phase === "off" ? current.off_start_ms : current.on_start_ms
+      ),
+      expiresAt: (current: typeof plan) => current.expires_at_ms,
+      ...state,
+      onStart: (current: typeof plan, phase: "off" | "on") => {
+        if (claimWorkspaceCpuWindowStart(current, phase, state)) {
+          starts.push({ phase, atMs: nowMs });
+        }
+      },
+      startToleranceMs: 250,
+    });
+    const runAt = (atMs: number, fireEarly = false) => {
+      nowMs = atMs;
+      const due = callbacks.filter((entry, index) => (
+        entry.dueMs <= atMs || (fireEarly && index === 0)
+      ));
+      for (const entry of due) {
+        callbacks.splice(callbacks.indexOf(entry), 1);
+        entry.callback();
+      }
+    };
+    return {
+      callbacks,
+      currentPlan: (next: typeof plan | null) => { currentPlan = next; },
+      options,
+      reads: () => reads,
+      runAt,
+      starts,
+      state,
+    };
+  }
+
+  const harness = createHarness();
+  expect(scheduleWorkspaceCpuWindowStart(plan, "off", harness.options())).toBe(true);
+  expect(scheduleWorkspaceCpuWindowStart(plan, "on", harness.options())).toBe(true);
+  expect(scheduleWorkspaceCpuWindowStart(plan, "off", harness.options())).toBe(false);
+  expect(harness.starts).toEqual([]);
+  expect(harness.reads()).toBe(0);
+  expect(claimWorkspaceCpuWindowStart(plan, "off", harness.state)).toBe(false);
+
+  harness.runAt(1_000);
+  expect(harness.starts).toEqual([{ phase: "off", atMs: 1_000 }]);
+  harness.runAt(26_000);
+  expect(harness.starts).toEqual([
+    { phase: "off", atMs: 1_000 },
+    { phase: "on", atMs: 26_000 },
+  ]);
+  expect(scheduleWorkspaceCpuWindowStart(plan, "on", harness.options())).toBe(false);
+
+  const early = createHarness();
+  scheduleWorkspaceCpuWindowStart(plan, "off", early.options());
+  early.runAt(999, true);
+  expect(early.starts).toEqual([]);
+  expect(early.callbacks).toHaveLength(1);
+  early.runAt(1_000);
+  expect(early.starts).toEqual([{ phase: "off", atMs: 1_000 }]);
+
+  for (const { offsetMs, shouldStart } of [
+    { offsetMs: 250, shouldStart: true },
+    { offsetMs: 251, shouldStart: false },
+  ]) {
+    const late = createHarness();
+    scheduleWorkspaceCpuWindowStart(plan, "off", late.options());
+    late.runAt(1_000 + offsetMs);
+    expect(late.starts.length === 1).toBe(shouldStart);
+    expect(late.state.failed.has(`${plan.run_id}:off`)).toBe(!shouldStart);
+  }
+
+  const removed = createHarness();
+  scheduleWorkspaceCpuWindowStart(plan, "off", removed.options());
+  removed.currentPlan(null);
+  removed.runAt(1_000);
+  expect(removed.starts).toEqual([]);
+  expect(removed.state.failed.has(`${plan.run_id}:off`)).toBe(true);
+
+  const replaced = createHarness();
+  scheduleWorkspaceCpuWindowStart(plan, "off", replaced.options());
+  replaced.currentPlan({ ...plan, expires_at_ms: 46_001 });
+  replaced.runAt(1_000);
+  expect(replaced.starts).toEqual([]);
+  expect(replaced.state.failed.has(`${plan.run_id}:off`)).toBe(true);
+
+  const afterExpiry = createHarness();
+  scheduleWorkspaceCpuWindowStart(plan, "on", afterExpiry.options());
+  afterExpiry.runAt(plan.expires_at_ms);
+  expect(afterExpiry.starts).toEqual([]);
+  expect(afterExpiry.state.failed.has(`${plan.run_id}:on`)).toBe(true);
 });
 
 test("CPU memory and GC sampling is bounded to the exact diagnostic phase", () => {
