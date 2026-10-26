@@ -27,10 +27,15 @@ CONTROL_FIELDS = frozenset({
 })
 MAX_CONTROL_BYTES = 2048
 MAX_CONTROL_AGE_SECONDS = 1.5
+CONTROL_READ_ATTEMPTS = 2
 
 
 class CapacityControlError(ValueError):
     """The parent-to-worker control record is absent, stale, or inconsistent."""
+
+
+class _ControlPathReplaced(CapacityControlError):
+    """An atomic heartbeat replacement crossed one control-file snapshot."""
 
 
 def write_control(
@@ -133,7 +138,7 @@ def validate_control(
     return payload
 
 
-def read_control(
+def _read_control_once(
     path: Path,
     *,
     expected: Mapping[str, Any],
@@ -152,10 +157,10 @@ def read_control(
         raise CapacityControlError("control file unavailable") from exc
     try:
         opened = os.fstat(fd)
-        if ((opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid,
-             opened.st_nlink, opened.st_size)
-                != (before.st_dev, before.st_ino, before.st_mode, before.st_uid,
-                    before.st_nlink, before.st_size)):
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise _ControlPathReplaced("control path replaced during open")
+        if ((opened.st_mode, opened.st_uid, opened.st_nlink, opened.st_size)
+                != (before.st_mode, before.st_uid, before.st_nlink, before.st_size)):
             raise CapacityControlError("control file changed")
         raw = bytearray()
         while len(raw) <= MAX_CONTROL_BYTES:
@@ -167,11 +172,12 @@ def read_control(
         after = path.lstat()
     finally:
         os.close(fd)
+    if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+        raise _ControlPathReplaced("control path replaced during read")
     if (len(raw) > MAX_CONTROL_BYTES or not raw.endswith(b"\n")
             or raw.count(b"\n") != 1
             or (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns)
-            != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
-            or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)):
+            != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)):
         raise CapacityControlError("control file changed")
     try:
         payload = json.loads(bytes(raw[:-1]).decode("ascii"))
@@ -183,6 +189,29 @@ def read_control(
     if result["sequence"] < previous_sequence:
         raise CapacityControlError("control sequence moved backwards")
     return result
+
+
+def read_control(
+    path: Path,
+    *,
+    expected: Mapping[str, Any],
+    previous_sequence: int = -1,
+    now_monotonic_ns: int | None = None,
+) -> dict[str, Any]:
+    """Read one fresh control snapshot, retrying one atomic path replacement."""
+
+    for attempt in range(CONTROL_READ_ATTEMPTS):
+        try:
+            return _read_control_once(
+                path,
+                expected=expected,
+                previous_sequence=previous_sequence,
+                now_monotonic_ns=now_monotonic_ns,
+            )
+        except _ControlPathReplaced:
+            if attempt + 1 == CONTROL_READ_ATTEMPTS:
+                raise CapacityControlError("control path changed during snapshot") from None
+    raise CapacityControlError("control snapshot unavailable")
 
 
 def stop_reason_from_control(
