@@ -145,6 +145,7 @@ class ApiCpuPlanPermissionTests(unittest.TestCase):
                     **_diagnostic_payload(),
                     "source_sha": source_sha,
                     "release_slug": release_slug,
+                    "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
                     "off_start_ms": off_start_ms,
                     "off_end_ms": off_start_ms + 20_000,
                     "on_start_ms": off_start_ms + 25_000,
