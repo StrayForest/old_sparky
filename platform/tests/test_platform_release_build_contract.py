@@ -3326,6 +3326,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
         ).read_text()
         self.assertIn("          - authenticated-read-admission-24x8-native\n", deploy_workflow)
+        validator_start = deploy_workflow.index('case "$RUNTIME_PROFILE" in')
+        validator_end = deploy_workflow.index("\n          esac", validator_start)
+        runtime_profile_validator = deploy_workflow[validator_start:validator_end]
+        self.assertIn(
+            "|authenticated-read-admission-24x8-native|",
+            runtime_profile_validator,
+        )
         self.assertIn("restart_web_and_wait()", workflow)
         self.assertIn(
             'baseline|ready-vote-static-*|ready-vote-cprofile|ready-vote-adaptive-v2',

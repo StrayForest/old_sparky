@@ -150,6 +150,126 @@ WARMUP_EXCEPTION_CLASSES = frozenset({
 WARMUP_CONTENT_ENCODINGS = frozenset({
     "identity", "gzip", "deflate", "br", "other", "unknown",
 })
+OFF_PROBE_REASON_COUNTS = (
+    "success", "request_error", "http_status", "content_type", "page_marker",
+    "response_over_5s", "future_timeout", "future_exception", "barrier_failed",
+    "invalid_result",
+)
+OFF_PROBE_STATUS_CLASSES = ("1xx", "2xx", "3xx", "4xx", "5xx", "unknown")
+OFF_PROBE_DIAGNOSTIC_MAX_MS = 600_000
+
+
+def _valid_off_probe(
+    value: Any, *, submitted_limit: int, status: str,
+    resource_abort_reason: Any, complete_submitted: int | None = None,
+) -> bool:
+    if (not isinstance(value, dict)
+            or set(value) not in (
+                {"submitted", "completed", "http_status"},
+                {"submitted", "completed", "http_status", "diagnostics"},
+            )
+            or type(value.get("submitted")) is not int
+            or not 0 <= value["submitted"] <= submitted_limit
+            or type(value.get("completed")) is not int
+            or not 0 <= value["completed"] <= value["submitted"]
+            or (value.get("http_status") is not None
+                and (type(value["http_status"]) is not int
+                     or not 100 <= value["http_status"] <= 599))):
+        return False
+    if complete_submitted is not None and value != {
+        "submitted": complete_submitted,
+        "completed": complete_submitted,
+        "http_status": 200,
+    }:
+        return False
+    if "diagnostics" not in value:
+        return True
+    diagnostics = value["diagnostics"]
+    if (status != "incomplete" or resource_abort_reason != "off_probe_failed"
+            or not isinstance(diagnostics, dict)
+            or set(diagnostics) != {
+                "reason_counts", "status_classes", "http_status_counts", "max_elapsed_ms",
+                "batch_elapsed_ms", "batch_over_11s",
+            }):
+        return False
+    reasons = diagnostics.get("reason_counts")
+    statuses = diagnostics.get("status_classes")
+    http_statuses = diagnostics.get("http_status_counts")
+    if (not isinstance(reasons, dict) or set(reasons) != set(OFF_PROBE_REASON_COUNTS)
+            or any(type(count) is not int or not 0 <= count <= value["submitted"]
+                   for count in reasons.values())
+            or sum(reasons.values()) != value["submitted"]
+            or not isinstance(statuses, dict)
+            or set(statuses) != set(OFF_PROBE_STATUS_CLASSES)
+            or any(type(count) is not int or not 0 <= count <= value["completed"]
+                   for count in statuses.values())
+            or sum(statuses.values()) != value["completed"]
+            or not isinstance(http_statuses, dict)
+            or len(http_statuses) > value["completed"]
+            or any(not isinstance(code, str) or re.fullmatch(r"[1-5][0-9]{2}", code) is None
+                   or str(int(code)) != code
+                   or type(count) is not int or not 0 < count <= value["completed"]
+                   for code, count in http_statuses.items())
+            or sum(http_statuses.values()) != value["completed"] - statuses["unknown"]
+            or {
+                f"{hundreds}xx": sum(
+                    count for code, count in http_statuses.items()
+                    if int(code) // 100 == hundreds
+                )
+                for hundreds in range(1, 6)
+            } != {key: statuses[key] for key in OFF_PROBE_STATUS_CLASSES[:-1]}):
+        return False
+    max_elapsed = diagnostics.get("max_elapsed_ms")
+    batch_elapsed = diagnostics.get("batch_elapsed_ms")
+    batch_over = diagnostics.get("batch_over_11s")
+    return (
+        (max_elapsed is None or (
+            type(max_elapsed) is int and 0 <= max_elapsed <= OFF_PROBE_DIAGNOSTIC_MAX_MS
+        ))
+        and type(batch_elapsed) is int
+        and 0 <= batch_elapsed <= OFF_PROBE_DIAGNOSTIC_MAX_MS
+        and type(batch_over) is int and batch_over in {0, 1}
+        and batch_over == int(batch_elapsed > 11_000)
+    )
+
+
+def _classify_off_probe_result(
+    result: Any,
+) -> tuple[str, str | None, float | None]:
+    if not isinstance(result, external_load.RequestResult):
+        return "invalid_result", None, None
+    status = result.status
+    elapsed_ms = result.elapsed_ms
+    elapsed_float: float | None = None
+    if isinstance(elapsed_ms, (int, float)) and not isinstance(elapsed_ms, bool):
+        try:
+            candidate_elapsed = float(elapsed_ms)
+        except (OverflowError, ValueError):
+            pass
+        else:
+            if math.isfinite(candidate_elapsed) and candidate_elapsed >= 0:
+                elapsed_float = candidate_elapsed
+    elapsed_valid = elapsed_float is not None
+    status_valid = type(status) is int and (status == 0 or 100 <= status <= 599)
+    if not status_valid or not elapsed_valid:
+        return "invalid_result", None, None
+    status_class = f"{status // 100}xx" if status else "unknown"
+    elapsed_value = elapsed_float
+    if status == 0:
+        reason = "request_error"
+    elif status != 200:
+        reason = "http_status"
+    elif result.html_content_type_ok is False:
+        reason = "content_type"
+    elif result.html_page_marker_ok is False:
+        reason = "page_marker"
+    elif result.ok is not True:
+        reason = "request_error"
+    elif elapsed_value > 5_000:
+        reason = "response_over_5s"
+    else:
+        reason = "success"
+    return reason, status_class, elapsed_value
 WARMUP_MARKER_FIELDS = {
     "lifecycle": "marker_lifecycle_missing",
     "authenticated_header": "marker_authenticated_header_missing",
@@ -1182,6 +1302,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     def fail_off(
         reason: str, *, submitted: int, completed: int,
         warmup_failure: Mapping[str, Any] | None = None,
+        off_probe_diagnostics: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         capacity_executor.shutdown(wait=True, cancel_futures=True)
         return _incomplete_report(
@@ -1190,6 +1311,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             off_probe_submitted=submitted, off_probe_completed=completed,
             off_probe_status=None, manifest_sha256=capacity["manifest_sha256"],
             warmup_failure=warmup_failure,
+            off_probe_diagnostics=off_probe_diagnostics,
         )
 
     warm_futures = [
@@ -1251,6 +1373,10 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     off_start_edge = _capture_cpu_edge(capacity["off_start_ms"])
     off_probe_start = time.monotonic()
     barrier = threading.Barrier(probe_count)
+    off_probe_reason_counts = Counter()
+    off_probe_status_classes = Counter()
+    off_probe_http_statuses = Counter()
+    off_probe_elapsed_values: list[float] = []
     probe_futures = [
         capacity_executor.submit(marked_probe, selected[index % len(selected)], barrier)
         for index in range(probe_count)
@@ -1261,21 +1387,55 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
                 result = future.result()
             except Exception:
                 off_failed = True
+                off_probe_reason_counts["future_exception"] += 1
                 continue
             if result is None:
                 off_failed = True
-            else:
+                off_probe_reason_counts["barrier_failed"] += 1
+                continue
+            result_reason, status_class, elapsed_ms = _classify_off_probe_result(result)
+            if isinstance(result, external_load.RequestResult) and status_class is not None:
                 off_results.append(result)
-                if result.ok is not True or result.status != 200 or result.elapsed_ms > 5_000:
-                    off_failed = True
+                off_probe_status_classes[status_class] += 1
+                if type(result.status) is int and result.status != 0:
+                    off_probe_http_statuses[str(result.status)] += 1
+                if elapsed_ms is not None:
+                    off_probe_elapsed_values.append(elapsed_ms)
+            off_probe_reason_counts[result_reason] += 1
+            if result_reason != "success":
+                off_failed = True
     except TimeoutError:
         off_failed = True
+        off_probe_reason_counts["future_timeout"] = (
+            probe_count - sum(off_probe_reason_counts.values())
+        )
     off_probe_elapsed = time.monotonic() - off_probe_start
     off_end_edge = _capture_cpu_edge(capacity["off_end_ms"])
     off_cpu_window = _cpu_window_row("off", off_start_edge, off_end_edge)
     if len(off_results) != probe_count or off_failed or off_probe_elapsed > 11.0:
+        diagnostics = {
+            "reason_counts": {
+                name: int(off_probe_reason_counts.get(name, 0))
+                for name in OFF_PROBE_REASON_COUNTS
+            },
+            "status_classes": {
+                name: int(off_probe_status_classes.get(name, 0))
+                for name in OFF_PROBE_STATUS_CLASSES
+            },
+            "http_status_counts": dict(sorted(off_probe_http_statuses.items())),
+            "max_elapsed_ms": (
+                min(OFF_PROBE_DIAGNOSTIC_MAX_MS, int(math.ceil(max(off_probe_elapsed_values))))
+                if off_probe_elapsed_values else None
+            ),
+            "batch_elapsed_ms": min(
+                OFF_PROBE_DIAGNOSTIC_MAX_MS,
+                max(0, int(math.ceil(off_probe_elapsed * 1000))),
+            ),
+            "batch_over_11s": int(off_probe_elapsed > 11.0),
+        }
         return fail_off(
             "off_probe_failed", submitted=probe_count, completed=len(off_results),
+            off_probe_diagnostics=diagnostics,
         )
     on_start_monotonic = time.monotonic() + max(
         0.0, (capacity["on_start_ms"] - time.time_ns() // 1_000_000) / 1000,
@@ -1426,6 +1586,7 @@ def _incomplete_report(
     manifest_sha256: str,
     off_probe_submitted: int = 0, off_probe_completed: int = 0,
     off_probe_status: int | None = None,
+    off_probe_diagnostics: Mapping[str, Any] | None = None,
     warmup_failure: Mapping[str, Any] | None = None,
     control_failure_reason: str | None = None,
 ) -> dict[str, Any]:
@@ -1456,6 +1617,8 @@ def _incomplete_report(
         "off_probe": {
             "submitted": off_probe_submitted, "completed": off_probe_completed,
             "http_status": off_probe_status,
+            **({"diagnostics": dict(off_probe_diagnostics)}
+               if off_probe_diagnostics is not None else {}),
         },
         "process_cpu_windows": _unknown_cpu_windows(),
         "resource_abort_reason": reason,
@@ -1866,18 +2029,15 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         and _valid_cpu_window_rows(cpu_rows)
         and payload.get("on_window_start_ms") == capacity_config.get("on_start_ms")
         and payload.get("on_window_end_ms") == capacity_config.get("on_end_ms")
-        and isinstance(payload.get("off_probe"), dict)
-        and set(payload["off_probe"]) == {"submitted", "completed", "http_status"}
-        and type(payload["off_probe"].get("submitted")) is int
-        and 0 <= payload["off_probe"]["submitted"] <= 64
-        and type(payload["off_probe"].get("completed")) is int
-        and 0 <= payload["off_probe"]["completed"] <= payload["off_probe"]["submitted"]
-        and (payload["off_probe"].get("http_status") is None
-             or type(payload["off_probe"].get("http_status")) is int)
-        and (payload.get("status") != "complete" or payload["off_probe"] == {
-            "submitted": capacity_config.get("concurrency"),
-            "completed": capacity_config.get("concurrency"), "http_status": 200,
-        })
+        and _valid_off_probe(
+            payload.get("off_probe"), submitted_limit=64,
+            status=payload.get("status"),
+            resource_abort_reason=payload.get("resource_abort_reason"),
+            complete_submitted=(
+                capacity_config.get("concurrency")
+                if payload.get("status") == "complete" else None
+            ),
+        )
         and payload.get("matrix_credit") is False
         and payload.get("slo_credit") is False
         and payload.get("diagnostic_credit") is False
@@ -2823,23 +2983,16 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or worker["on_window_end_ms"] - worker["on_window_start_ms"] != ON_WINDOW_MS
                 or type(worker.get("observed_duration_ms")) is not int
                 or not 0 <= worker["observed_duration_ms"] <= 30_000
-                or not isinstance(worker.get("off_probe"), dict)
-                or set(worker["off_probe"]) != {"submitted", "completed", "http_status"}
-                or type(worker["off_probe"].get("submitted")) is not int
-                or not 0 <= worker["off_probe"]["submitted"] <= value.get("concurrency", 0)
-                or type(worker["off_probe"].get("completed")) is not int
-                or not 0 <= worker["off_probe"]["completed"] <= worker["off_probe"]["submitted"]
-                or (worker.get("status") == "complete" and (
-                    worker["off_probe"]["submitted"] != value.get("concurrency")
-                    or worker["off_probe"]["completed"] != worker["off_probe"]["submitted"]
-                ))
-                or (worker["off_probe"].get("http_status") is not None
-                    and (type(worker["off_probe"]["http_status"]) is not int
-                         or not 100 <= worker["off_probe"]["http_status"] <= 599))
-                or (worker.get("status") == "complete" and worker["off_probe"] != {
-                    "submitted": value.get("concurrency"),
-                    "completed": value.get("concurrency"), "http_status": 200,
-                })
+                or not _valid_off_probe(
+                    worker.get("off_probe"),
+                    submitted_limit=value.get("concurrency", 0),
+                    status=worker.get("status"),
+                    resource_abort_reason=worker.get("resource_abort_reason"),
+                    complete_submitted=(
+                        value.get("concurrency")
+                        if worker.get("status") == "complete" else None
+                    ),
+                )
                 or not _valid_cpu_window_rows(worker.get("process_cpu_windows"))):
             return None
         latency = worker.get("latency_ms")
@@ -3395,15 +3548,17 @@ def _parent_failure_fingerprint(
                 "submitted": off_probe.get("submitted"),
                 "completed": off_probe.get("completed"),
                 "http_status": off_probe.get("http_status"),
+                **({"diagnostics": off_probe.get("diagnostics")}
+                   if isinstance(off_probe, Mapping) and "diagnostics" in off_probe else {}),
             } if isinstance(off_probe, Mapping)
-                and set(off_probe) == {"submitted", "completed", "http_status"}
-                and type(off_probe.get("submitted")) is int
-                and 0 <= off_probe["submitted"] <= args.concurrency
-                and type(off_probe.get("completed")) is int
-                and 0 <= off_probe["completed"] <= off_probe["submitted"]
-                and (off_probe.get("http_status") is None
-                     or type(off_probe.get("http_status")) is int
-                     and 100 <= off_probe["http_status"] <= 599)
+                and _valid_off_probe(
+                    off_probe, submitted_limit=args.concurrency,
+                    status=worker_status,
+                    resource_abort_reason=worker.get("resource_abort_reason"),
+                    complete_submitted=(
+                        args.concurrency if worker_status == "complete" else None
+                    ),
+                )
                 else None,
         }
         if worker.get("resource_abort_reason") == "off_warmup_failed":
