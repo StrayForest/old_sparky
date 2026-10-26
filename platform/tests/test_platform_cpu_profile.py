@@ -4257,7 +4257,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(len(no_memory_telemetry["node_memory_rows"]), 2)
             self.assertTrue(all(
                 row["status"] == "incomplete" and row["sample_count"] is None
-                and row["gc_status"] == "unavailable" and row["gc_overflow"] is False
+                and row["gc_status"] == "incomplete" and row["gc_overflow"] is False
                 for row in no_memory_telemetry["node_memory_rows"]
             ))
 
