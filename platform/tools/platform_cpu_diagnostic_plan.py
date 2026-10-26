@@ -1369,6 +1369,8 @@ def _usage_summary(
             "event_count": sum(len(values) for values in selected),
             "duplicate_count": duplicate_count,
             "status": "complete" if row_complete else "incomplete",
+            "gc_status": "unavailable",
+            "gc_overflow": False,
             "cgroup_memory_status": "complete" if cgroup_complete else "invalid" if cgroup_invalid else "unknown",
             "cgroup_memory_reason": (
                 "invalid_snapshot" if cgroup_invalid else
