@@ -45,6 +45,21 @@ WORKER_OUTPUT_CAP = 64_000
 REPORT_CAP = 64_000
 SSH_LIFECYCLE_RECEIPT_CAP = 2_048
 ROOT_USAGE_OUTPUT_CAP = 32_768
+CPU_PLAN_FAILURE_CAP = 512
+CPU_PLAN_FAILURE_PREFIX = b"CPU_DIAGNOSTIC_PLAN_FAILURE "
+CPU_PLAN_FAILURE_STAGES = frozenset({
+    "helper_spawn", "helper_io", "helper_timeout",
+    "helper_output_limit", "unrecognized_rc2", "inner_exit",
+    "response_framing", "response_parse", "response_summary",
+    "usage_rows", "usage_aggregate", "profile_rows", "profile_categories",
+    "profile_aggregate", "memory_rows", "memory_metrics", "memory_aggregate",
+    "cgroup_aggregate", "summary_bound",
+})
+CPU_PLAN_RESPONSE_STAGES = frozenset({
+    "response_parse", "response_summary", "usage_rows", "usage_aggregate", "profile_rows",
+    "profile_categories", "profile_aggregate", "memory_rows", "memory_metrics",
+    "memory_aggregate", "cgroup_aggregate", "summary_bound",
+})
 USAGE_ROW_FIELDS = frozenset({
     "service", "phase", "expected_targets", "observed_targets", "event_count",
     "cpu_ns", "window_ms_min", "window_ms_max", "start_lag_ms_min",
@@ -145,6 +160,78 @@ def _decode_canonical(raw: bytes, *, cap: int) -> dict[str, Any]:
     if canonical != raw:
         raise PairError("JSON input is not canonical")
     return value
+
+
+def _project_cpu_plan_failure_detail(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    if (
+        set(value) != {
+            "schema", "stage", "child_return_code", "child_stdout_shape",
+            "child_stdout_bytes",
+        }
+        or type(value.get("schema")) is not int or value["schema"] != 1
+        or not isinstance(value.get("stage"), str)
+        or value.get("stage") not in CPU_PLAN_FAILURE_STAGES
+        or not isinstance(value.get("child_stdout_shape"), str)
+        or value.get("child_stdout_shape") not in {"none", "single_line", "malformed"}
+        or type(value.get("child_stdout_bytes")) is not int
+        or not 0 <= value["child_stdout_bytes"] <= 32_769
+    ):
+        return None
+    child_code = value.get("child_return_code")
+    if child_code is not None and (type(child_code) is not int or not -255 <= child_code <= 255):
+        return None
+    if (value["child_stdout_bytes"] == 0) != (value["child_stdout_shape"] == "none"):
+        return None
+    stage = value["stage"]
+    if value["child_stdout_bytes"] == 32_769 and stage != "helper_output_limit":
+        return None
+    if stage == "helper_spawn":
+        if child_code is not None or value["child_stdout_bytes"] != 0:
+            return None
+    elif stage == "helper_output_limit":
+        if value["child_stdout_bytes"] != 32_769:
+            return None
+    elif stage == "unrecognized_rc2":
+        if child_code != 2:
+            return None
+    elif stage == "inner_exit":
+        if child_code in {None, 0, 2}:
+            return None
+    elif stage == "response_framing":
+        if child_code != 0 or value["child_stdout_shape"] == "single_line":
+            return None
+    elif stage in CPU_PLAN_RESPONSE_STAGES:
+        if child_code != 0:
+            return None
+        if value["child_stdout_shape"] != "single_line":
+            return None
+    return {
+        "schema": 1,
+        "stage": stage,
+        "child_return_code": child_code,
+        "child_stdout_shape": value["child_stdout_shape"],
+        "child_stdout_bytes": value["child_stdout_bytes"],
+    }
+
+
+def _decode_cpu_plan_failure(output: bytes) -> dict[str, Any] | None:
+    if (
+        len(output) > CPU_PLAN_FAILURE_CAP
+        or not output.startswith(CPU_PLAN_FAILURE_PREFIX)
+        or not output.endswith(b"\n")
+        or output.count(b"\n") != 1
+    ):
+        return None
+    try:
+        value = _decode_canonical(
+            output[len(CPU_PLAN_FAILURE_PREFIX):-1],
+            cap=CPU_PLAN_FAILURE_CAP - len(CPU_PLAN_FAILURE_PREFIX) - 1,
+        )
+    except (PairError, ValueError, TypeError):
+        return None
+    return _project_cpu_plan_failure_detail(value)
 
 
 def _read_private_file(path: Path, *, cap: int, exact_mode: int | None = None) -> bytes:
@@ -502,6 +589,16 @@ def _public_report(value: dict[str, Any]) -> dict[str, Any]:
         "cpu_profile_attribution": None,
         "memory_attribution": None,
     }
+    raw_failure_detail = value.get("plan_cleanup_failure_detail")
+    if raw_failure_detail is not None:
+        failure_detail = _project_cpu_plan_failure_detail(raw_failure_detail)
+        if (
+            failure_detail is None
+            or output["status"] != "incomplete"
+            or output["plan_cleanup_status"] not in {"bad_protocol", "failed"}
+        ):
+            raise PairError("cleanup failure detail rejected")
+        output["plan_cleanup_failure_detail"] = failure_detail
     fixture = value.get("canonical_fixture")
     if isinstance(fixture, dict):
         for key in ("tournaments", "users", "users_per_tournament", "selected_actors"):
@@ -681,7 +778,7 @@ def _public_ssh_transport(value: Any) -> dict[str, Any]:
         "wait", "protocol", "complete", "transport_failed",
     }
     allowed_child = {"not_started", "running", "reaped", "unknown"}
-    allowed_shape = {"none", "single_line", "prepared_marker", "refusal_marker", "summary_marker", "malformed"}
+    allowed_shape = {"none", "single_line", "prepared_marker", "refusal_marker", "summary_marker", "failure_marker", "malformed"}
     if not isinstance(value, dict):
         return {"stage": "not_started", "return_code": None, "stdout_shape": "none", "child_state": "not_started"}
     code = value.get("return_code")
@@ -753,6 +850,7 @@ def _merge_supervisor_report(
         "plan_cleanup_status": "pending",
         "plan_cleanup_refusal_class": "none",
         "plan_cleanup_failure_code": "none",
+        "plan_cleanup_failure_detail": None,
         "result": {
             key: child_report.get(key)
             for key in (
@@ -1862,6 +1960,9 @@ def _parent(args: argparse.Namespace) -> int:
                     report["plan_cleanup_refusal_class"] = ssh_lifecycle.get(
                         "plan_cleanup_refusal_class", "none"
                     )
+                    report["plan_cleanup_failure_detail"] = ssh_lifecycle.get(
+                        "plan_cleanup_failure_detail"
+                    )
                     report["ssh_cleanup_transport"] = ssh_lifecycle.get("cleanup_transport")
             except (OSError, PairError, subprocess.SubprocessError):
                 report["plan_cleanup"] = "failed"
@@ -1988,6 +2089,8 @@ def _ssh_plan(
     )
     lifecycle[status_key] = "transport_failed"
     lifecycle[refusal_key] = "none"
+    if operation == "cleanup":
+        lifecycle["plan_cleanup_failure_detail"] = None
     lifecycle["last_command_returned"] = False
     data = json.dumps(
         payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
@@ -2070,6 +2173,16 @@ def _ssh_plan(
         )
         if process.returncode != 0 or not output.endswith(b"\n") or output.count(b"\n") != 1:
             if process.returncode == 2:
+                failure_detail = (
+                    _decode_cpu_plan_failure(bytes(output))
+                    if operation == "cleanup" else None
+                )
+                if failure_detail is not None:
+                    lifecycle["plan_cleanup_failure_detail"] = failure_detail
+                    lifecycle[status_key] = "bad_protocol"
+                    transport["stdout_shape"] = "failure_marker"
+                    transport["stage"] = "protocol"
+                    return False, None, None
                 refusal = re.fullmatch(
                     rb"CPU_DIAGNOSTIC_PLAN status=refused class=(PlanError|OSError|ValueError|KeyError|UntrustedHelper|unexpected)\n",
                     bytes(output),

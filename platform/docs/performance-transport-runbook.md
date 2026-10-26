@@ -80,6 +80,23 @@ cgroup, or any positive memory event); an abort is an incomplete diagnostic,
 never a performance pass. These measurements can support workload-specific analysis,
 but do not claim the server's maximum capacity or physical-host headroom.
 
+The plan cleanup dispatcher's success summary and typed refusal lines retain
+their existing contracts. Other cleanup failures use a bounded
+`CPU_DIAGNOSTIC_PLAN_FAILURE` schema-1 line with a closed stage, inner child
+return code, stdout shape and observed byte count; it contains no child output.
+Stages are `helper_spawn`, `helper_io`, `helper_timeout`,
+`helper_output_limit`, `unrecognized_rc2`, `inner_exit`, `response_framing`,
+`response_parse`, `response_summary`, `usage_rows`, `usage_aggregate`,
+`profile_rows`, `profile_categories`, `profile_aggregate`, `memory_rows`,
+`memory_metrics`, `memory_aggregate`, `cgroup_aggregate` and `summary_bound`.
+Empty output has shape `none`; the observed byte count is capped at 32,769,
+where the extra byte marks that the 32,768-byte helper-output bound was crossed.
+The parent accepts that line only as one canonical line with outer exit 2 for
+the cleanup operation. A malformed line stays `bad_protocol`, and legacy
+exit-2 cleanup with no stdout stays an opaque `bad_protocol` failure. The
+failure detail is retained only in incomplete reports and fingerprints; it
+does not change cleanup status or grant diagnostic or capacity credit.
+
 The separately typed `authenticated_html_ssr_capacity_v1` workload measures
 the authenticated `GET /tournaments/<fixture-slug>` document over pinned
 HTTP/1.1 keep-alive. It reuses the existing capacity runner and page route;

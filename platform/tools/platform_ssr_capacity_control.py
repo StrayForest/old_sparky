@@ -28,14 +28,25 @@ CONTROL_FIELDS = frozenset({
 MAX_CONTROL_BYTES = 2048
 MAX_CONTROL_AGE_SECONDS = 1.5
 CONTROL_READ_ATTEMPTS = 2
+CONTROL_FAILURE_REASONS = frozenset({
+    "snapshot_replaced", "snapshot_changed", "stale", "future",
+    "metadata", "schema", "binding", "sequence", "unavailable", "unexpected",
+})
 
 
 class CapacityControlError(ValueError):
     """The parent-to-worker control record is absent, stale, or inconsistent."""
 
+    def __init__(self, message: str, *, reason: str = "schema") -> None:
+        super().__init__(message)
+        self.reason = reason if reason in CONTROL_FAILURE_REASONS else "unexpected"
+
 
 class _ControlPathReplaced(CapacityControlError):
     """An atomic heartbeat replacement crossed one control-file snapshot."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason="snapshot_replaced")
 
 
 def write_control(
@@ -50,25 +61,25 @@ def write_control(
     try:
         parent = path.parent.lstat()
     except OSError as exc:
-        raise CapacityControlError("control directory unavailable") from exc
+        raise CapacityControlError("control directory unavailable", reason="unavailable") from exc
     if (not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
             or parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) != 0o700
             or parent.st_nlink < 2):
-        raise CapacityControlError("control directory metadata invalid")
+        raise CapacityControlError("control directory metadata invalid", reason="metadata")
     try:
         existing = path.lstat()
         if (not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.geteuid()
                 or existing.st_nlink != 1 or stat.S_IMODE(existing.st_mode) != 0o600
                 or existing.st_size > MAX_CONTROL_BYTES):
-            raise CapacityControlError("existing control file metadata invalid")
+            raise CapacityControlError("existing control file metadata invalid", reason="metadata")
     except FileNotFoundError:
         existing = None
     except OSError as exc:
-        raise CapacityControlError("control destination unavailable") from exc
+        raise CapacityControlError("control destination unavailable", reason="unavailable") from exc
     result = validate_control(payload, expected=expected, now_monotonic_ns=now_monotonic_ns)
     raw = canonical_json(result)
     if len(raw) > MAX_CONTROL_BYTES:
-        raise CapacityControlError("control record too large")
+        raise CapacityControlError("control record too large", reason="schema")
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
     fd = os.open(temporary, flags, 0o600)
@@ -108,33 +119,36 @@ def validate_control(
     now_monotonic_ns: int | None = None,
 ) -> dict[str, Any]:
     if not isinstance(payload, dict) or set(payload) != CONTROL_FIELDS:
-        raise CapacityControlError("control schema mismatch")
+        raise CapacityControlError("control schema mismatch", reason="schema")
     if type(payload.get("schema")) is not int or payload["schema"] != 1:
-        raise CapacityControlError("control schema mismatch")
+        raise CapacityControlError("control schema mismatch", reason="schema")
     if type(payload.get("sequence")) is not int or payload["sequence"] < 0:
-        raise CapacityControlError("control sequence invalid")
+        raise CapacityControlError("control sequence invalid", reason="schema")
     if type(payload.get("updated_monotonic_ns")) is not int or payload["updated_monotonic_ns"] <= 0:
-        raise CapacityControlError("control clock invalid")
-    if payload.get("decision") not in {"continue", "abort", "complete"}:
-        raise CapacityControlError("control decision invalid")
-    if payload.get("reason") not in REASONS:
-        raise CapacityControlError("control reason invalid")
+        raise CapacityControlError("control clock invalid", reason="schema")
+    if (not isinstance(payload.get("decision"), str)
+            or payload["decision"] not in {"continue", "abort", "complete"}):
+        raise CapacityControlError("control decision invalid", reason="schema")
+    if not isinstance(payload.get("reason"), str) or payload["reason"] not in REASONS:
+        raise CapacityControlError("control reason invalid", reason="schema")
     if ((payload["decision"] in {"continue", "complete"} and payload["reason"] != "none")
             or (payload["decision"] == "abort" and payload["reason"] == "none")):
-        raise CapacityControlError("control abort is invalid")
+        raise CapacityControlError("control abort is invalid", reason="schema")
     for key, regex in (
         ("run_id", RUN_ID_RE), ("source_sha", SHA_RE),
         ("app_target_sha", SHA_RE), ("profile_digest", DIGEST_RE),
         ("external_run_id", RUN_NUMBER_RE), ("external_run_attempt", RUN_NUMBER_RE),
     ):
         if not isinstance(payload.get(key), str) or regex.fullmatch(payload[key]) is None:
-            raise CapacityControlError("control binding invalid")
+            raise CapacityControlError("control binding invalid", reason="binding")
         if payload[key] != expected.get(key):
-            raise CapacityControlError("control binding mismatch")
+            raise CapacityControlError("control binding mismatch", reason="binding")
     now = time.monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
     age = now - payload["updated_monotonic_ns"]
-    if age < 0 or age > MAX_CONTROL_AGE_SECONDS * 1_000_000_000:
-        raise CapacityControlError("control record is stale")
+    if age < 0:
+        raise CapacityControlError("control record timestamp is in the future", reason="future")
+    if age > MAX_CONTROL_AGE_SECONDS * 1_000_000_000:
+        raise CapacityControlError("control record is stale", reason="stale")
     return payload
 
 
@@ -151,17 +165,32 @@ def _read_control_once(
                 or before.st_uid != os.geteuid() or before.st_nlink != 1
                 or stat.S_IMODE(before.st_mode) != 0o600
                 or before.st_size <= 0 or before.st_size > MAX_CONTROL_BYTES):
-            raise CapacityControlError("control file metadata invalid")
+            raise CapacityControlError("control file metadata invalid", reason="metadata")
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     except OSError as exc:
-        raise CapacityControlError("control file unavailable") from exc
+        raise CapacityControlError("control file unavailable", reason="unavailable") from exc
     try:
         opened = os.fstat(fd)
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             raise _ControlPathReplaced("control path replaced during open")
         if ((opened.st_mode, opened.st_uid, opened.st_nlink, opened.st_size)
                 != (before.st_mode, before.st_uid, before.st_nlink, before.st_size)):
-            raise CapacityControlError("control file changed")
+            if ((opened.st_mode, opened.st_uid, opened.st_size)
+                    == (before.st_mode, before.st_uid, before.st_size)
+                    and opened.st_nlink == 0):
+                try:
+                    current = path.lstat()
+                except OSError:
+                    current = None
+                if (current is not None
+                        and (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+                        and stat.S_ISREG(current.st_mode)
+                        and current.st_uid == os.geteuid()
+                        and current.st_nlink == 1
+                        and stat.S_IMODE(current.st_mode) == 0o600
+                        and 0 < current.st_size <= MAX_CONTROL_BYTES):
+                    raise _ControlPathReplaced("control path replaced during open")
+            raise CapacityControlError("control file metadata changed", reason="metadata")
         raw = bytearray()
         while len(raw) <= MAX_CONTROL_BYTES:
             chunk = os.read(fd, min(1024, MAX_CONTROL_BYTES + 1 - len(raw)))
@@ -178,16 +207,16 @@ def _read_control_once(
             or raw.count(b"\n") != 1
             or (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns)
             != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)):
-        raise CapacityControlError("control file changed")
+        raise CapacityControlError("control snapshot changed", reason="snapshot_changed")
     try:
         payload = json.loads(bytes(raw[:-1]).decode("ascii"))
     except (UnicodeError, json.JSONDecodeError) as exc:
-        raise CapacityControlError("control JSON invalid") from exc
+        raise CapacityControlError("control JSON invalid", reason="schema") from exc
     if canonical_json(payload) != bytes(raw):
-        raise CapacityControlError("control JSON noncanonical")
+        raise CapacityControlError("control JSON noncanonical", reason="schema")
     result = validate_control(payload, expected=expected, now_monotonic_ns=now_monotonic_ns)
     if result["sequence"] < previous_sequence:
-        raise CapacityControlError("control sequence moved backwards")
+        raise CapacityControlError("control sequence moved backwards", reason="sequence")
     return result
 
 
@@ -210,8 +239,39 @@ def read_control(
             )
         except _ControlPathReplaced:
             if attempt + 1 == CONTROL_READ_ATTEMPTS:
-                raise CapacityControlError("control path changed during snapshot") from None
-    raise CapacityControlError("control snapshot unavailable")
+                raise CapacityControlError(
+                    "control path changed during snapshot", reason="snapshot_replaced",
+                ) from None
+    raise CapacityControlError("control snapshot unavailable", reason="unavailable")
+
+
+def stop_reason_from_control_diagnostic(
+    path: Path,
+    *,
+    expected: Mapping[str, Any],
+    previous_sequence: int,
+    now_monotonic_ns: int | None = None,
+) -> tuple[str | None, int, str | None]:
+    """Read one stop decision and return only a closed failure classification."""
+
+    try:
+        record = read_control(
+            path, expected=expected, previous_sequence=previous_sequence,
+            now_monotonic_ns=now_monotonic_ns,
+        )
+    except CapacityControlError as exc:
+        failure_reason = exc.reason if exc.reason in CONTROL_FAILURE_REASONS else "unexpected"
+        return "control_file_invalid", previous_sequence, failure_reason
+    except OSError:
+        return "control_file_invalid", previous_sequence, "unavailable"
+    except Exception:
+        return "control_file_invalid", previous_sequence, "unexpected"
+    decision = record["decision"]
+    if decision == "abort":
+        return record["reason"], record["sequence"], None
+    if decision == "complete":
+        return "window_complete", record["sequence"], None
+    return None, record["sequence"], None
 
 
 def stop_reason_from_control(
@@ -223,18 +283,8 @@ def stop_reason_from_control(
 ) -> tuple[str | None, int]:
     """Map one fresh parent decision into the closed-loop worker stop API."""
 
-    try:
-        record = read_control(
-            path,
-            expected=expected,
-            previous_sequence=previous_sequence,
-            now_monotonic_ns=now_monotonic_ns,
-        )
-    except (OSError, CapacityControlError):
-        return "control_file_invalid", previous_sequence
-    decision = record["decision"]
-    if decision == "abort":
-        return record["reason"], record["sequence"]
-    if decision == "complete":
-        return "window_complete", record["sequence"]
-    return None, record["sequence"]
+    reason, sequence, _failure_reason = stop_reason_from_control_diagnostic(
+        path, expected=expected, previous_sequence=previous_sequence,
+        now_monotonic_ns=now_monotonic_ns,
+    )
+    return reason, sequence

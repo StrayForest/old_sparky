@@ -484,6 +484,8 @@ The SSR memory-row framing correction uses **C12** `fd190e146c81cd90e361dbdc64ea
 
 The bounded SSR memory-watch lead heartbeat uses **C13** `eaac4337dab1ab75ce50eb160fafb37007630e3d` and pin-only **P13** `1449b0c18937bd6ebf81a641e0dd59e8eb5802a6`. C13 keeps the 250ms guard cadence through the pre-OFF lead; P13 updates only the CPU-plan digest and `host_tools_sha` in the unchanged 15-member closure. Source selection does not prove installation or active host behavior; exact-P13 CI, signed preflight, approved provisioning and installed self-test remain required.
 
+The bounded cleanup-failure diagnostics use source **C14** `314afc65d3c3d8ef88e3a9f3f60501c6af10e976`; pin-only **P14** `97fdac9212892c4e03290013687807b506ecc833` selects C14 and records its exact 15-member closure. Follow-on source **Q** `9a31db68f70d38fb80d5c52b831a74ec142db894`, descended from C14 before P14, retries the SSR control read only for a securely verified atomic-replacement race; it does not change the pinned host-tools closure. These repository selections do not prove installation: production remains on application source `7091723350caad643c4f5eafd15dfdc21b20212` with host generation C13. Exact-P14 CI, signed preflight, approved provisioning and installed self-test remain required before C14 is used.
+
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
    blocked.

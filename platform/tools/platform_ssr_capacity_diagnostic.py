@@ -27,16 +27,18 @@ try:
     from tools import platform_load_runtime as load_runtime
     from tools.platform_ssr_capacity_control import (
         CapacityControlError,
+        CONTROL_FAILURE_REASONS,
         write_control,
-        stop_reason_from_control,
+        stop_reason_from_control_diagnostic,
     )
 except ModuleNotFoundError:  # direct execution from platform/tools
     import platform_external_load as external_load  # type: ignore[no-redef]
     import platform_load_runtime as load_runtime  # type: ignore[no-redef]
     from platform_ssr_capacity_control import (  # type: ignore[no-redef]
         CapacityControlError,
+        CONTROL_FAILURE_REASONS,
         write_control,
-        stop_reason_from_control,
+        stop_reason_from_control_diagnostic,
     )
 
 
@@ -199,7 +201,8 @@ SSH_TRANSPORT_STAGES = frozenset({
 })
 SSH_CHILD_STATES = frozenset({"not_started", "running", "reaped", "unknown"})
 SSH_STDOUT_SHAPES = frozenset({
-    "none", "single_line", "prepared_marker", "refusal_marker", "summary_marker", "malformed",
+    "none", "single_line", "prepared_marker", "refusal_marker", "summary_marker",
+    "failure_marker", "malformed",
 })
 
 
@@ -1116,13 +1119,16 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         raise ValueError("capacity control path rejected")
 
     sequence = -1
+    control_failure_reason: str | None = None
 
     def guard() -> str | None:
-        nonlocal sequence
-        reason, sequence_value = stop_reason_from_control(
+        nonlocal sequence, control_failure_reason
+        reason, sequence_value, failure_reason = stop_reason_from_control_diagnostic(
             control_path, expected=binding, previous_sequence=sequence,
         )
         sequence = max(sequence, sequence_value)
+        if failure_reason is not None:
+            control_failure_reason = failure_reason
         return reason
 
     cookie_names = (manifest["session_cookie_name"], manifest["csrf_cookie_name"])
@@ -1133,6 +1139,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             capacity, binding, initial_reason, submitted=0, completed=0,
             observed_duration_ms=0,
             manifest_sha256=capacity["manifest_sha256"],
+            control_failure_reason=control_failure_reason,
         )
     capacity_executor = ThreadPoolExecutor(
         max_workers=probe_count, thread_name_prefix="ssr-capacity",
@@ -1391,6 +1398,9 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         },
         "process_cpu_windows": [off_cpu_window, on_cpu_window],
         "resource_abort_reason": final_reason,
+        **({"control_failure_reason": control_failure_reason}
+           if final_reason == "control_file_invalid" and control_failure_reason is not None
+           else {}),
         "generator_cpu_evidence": _generator_cpu_evidence_status(
             [off_cpu_window, on_cpu_window],
         ),
@@ -1408,6 +1418,7 @@ def _incomplete_report(
     off_probe_submitted: int = 0, off_probe_completed: int = 0,
     off_probe_status: int | None = None,
     warmup_failure: Mapping[str, Any] | None = None,
+    control_failure_reason: str | None = None,
 ) -> dict[str, Any]:
     if type(observed_duration_ms) is not int or not 0 <= observed_duration_ms <= 30_000:
         raise ValueError("capacity incomplete duration is invalid")
@@ -1444,6 +1455,11 @@ def _incomplete_report(
         "server_capacity_claim_reason": "resource_correlation_not_provided",
         "namespace_closed": False,
     }
+    if control_failure_reason is not None:
+        if (reason != "control_file_invalid"
+                or control_failure_reason not in CONTROL_FAILURE_REASONS):
+            raise ValueError("capacity control failure projection rejected")
+        report["control_failure_reason"] = control_failure_reason
     if warmup_failure is not None:
         if (reason != "off_warmup_failed"
                 or not _warmup_failure_is_closed(
@@ -1754,6 +1770,10 @@ def run_isolated_capacity_worker(
             and isinstance(worker_payload, Mapping)
             and "warmup_failure" in worker_payload):
         outcome["worker"]["warmup_failure"] = worker_payload["warmup_failure"]
+    if (valid_worker and isinstance(outcome.get("worker"), dict)
+            and isinstance(worker_payload, Mapping)
+            and "control_failure_reason" in worker_payload):
+        outcome["worker"]["control_failure_reason"] = worker_payload["control_failure_reason"]
     return outcome
 
 
@@ -1774,12 +1794,22 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         "generator_cpu_evidence", "server_capacity_claim", "server_capacity_claim_reason",
         "diagnostic_credit", "namespace_closed",
     }
+    control_diagnostic_fields = expected_fields | {"control_failure_reason"}
     warmup_fields = expected_fields | {"warmup_failure"}
+    warmup_control_fields = control_diagnostic_fields | {"warmup_failure"}
     if set(payload) not in (
         expected_fields, expected_fields - {"process_cpu_windows"},
+        control_diagnostic_fields, control_diagnostic_fields - {"process_cpu_windows"},
         warmup_fields, warmup_fields - {"process_cpu_windows"},
+        warmup_control_fields, warmup_control_fields - {"process_cpu_windows"},
     ):
         return False
+    if "control_failure_reason" in payload:
+        control_reason = payload.get("control_failure_reason")
+        if (payload.get("resource_abort_reason") != "control_file_invalid"
+                or not isinstance(control_reason, str)
+                or control_reason not in CONTROL_FAILURE_REASONS):
+            return False
     has_warmup_failure = "warmup_failure" in payload
     if (has_warmup_failure != (payload.get("resource_abort_reason") == "off_warmup_failed")
             or (has_warmup_failure and (
@@ -2119,6 +2149,14 @@ def _parent_failure_receipt(
             else "failed"
         ),
     }
+    raw_cleanup_failure_detail = cleanup_lifecycle.get("plan_cleanup_failure_detail")
+    cleanup_failure_detail = _project_cpu_plan_failure_detail(raw_cleanup_failure_detail)
+    if raw_cleanup_failure_detail is not None and (
+        cleanup_failure_detail is None or cleanup_status not in {"bad_protocol", "failed"}
+    ):
+        raise ValueError("cleanup failure detail rejected")
+    if cleanup_failure_detail is not None:
+        result["plan_cleanup_failure_detail"] = cleanup_failure_detail
     if workload != WORKLOAD:
         fixture_kind, _presets, _actors = _profile_spec(workload)
         result.update({"workload": workload, "fixture_kind": fixture_kind})
@@ -2136,14 +2174,19 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
         "plan_cleanup_status", "plan_cleanup_refusal_class", "ssh_cleanup_transport",
         "remote_plan_cleanup",
     }
-    if not isinstance(value, dict) or set(value) not in (fields, fields | {"workload", "fixture_kind"}):
+    allowed_fields = {
+        frozenset(fields), frozenset(fields | {"workload", "fixture_kind"}),
+        frozenset(fields | {"plan_cleanup_failure_detail"}),
+        frozenset(fields | {"workload", "fixture_kind", "plan_cleanup_failure_detail"}),
+    }
+    if not isinstance(value, dict) or frozenset(value) not in allowed_fields:
         return None
     workload = value.get("workload", WORKLOAD)
     try:
         expected_fixture_kind, expected_presets, _actor_count = _profile_spec(workload)
     except ValueError:
         return None
-    if set(value) == fields | {"workload", "fixture_kind"} and value.get("fixture_kind") != expected_fixture_kind:
+    if {"workload", "fixture_kind"} <= set(value) and value.get("fixture_kind") != expected_fixture_kind:
         return None
     if (
         type(value.get("schema")) is not int or value["schema"] != 1
@@ -2179,6 +2222,13 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
         manifest_missing and value["stage"] in {"identity", "manifest_read"}
     ):
         return None
+    if "plan_cleanup_failure_detail" in value:
+        if value["plan_cleanup_status"] not in {"bad_protocol", "failed"} or value["remote_plan_cleanup"] != "failed":
+            return None
+        detail = _project_cpu_plan_failure_detail(value["plan_cleanup_failure_detail"])
+        if detail is None:
+            return None
+        value = {**value, "plan_cleanup_failure_detail": detail}
     for key in ("ssh_prepare_transport", "ssh_cleanup_transport"):
         transport = value.get(key)
         if (not isinstance(transport, dict)
@@ -2199,6 +2249,14 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
             )):
         return None
     return value
+
+
+def _project_cpu_plan_failure_detail(value: Any) -> dict[str, Any] | None:
+    try:
+        from tools import platform_cpu_diagnostic_pair as cpu_pair
+    except ModuleNotFoundError:  # direct execution from platform/tools
+        import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
+    return cpu_pair._project_cpu_plan_failure_detail(value)
 
 
 def _project_server_telemetry(summary: Any) -> dict[str, Any]:
@@ -2627,6 +2685,12 @@ def _parent_run(
             "server_capacity_claim_reason": "resource_correlation_not_provided",
         }
     outcome["remote_plan_cleanup"] = "complete" if cleanup_ok else "failed"
+    raw_cleanup_failure_detail = cleanup_lifecycle.get("plan_cleanup_failure_detail")
+    if raw_cleanup_failure_detail is not None:
+        cleanup_failure_detail = _project_cpu_plan_failure_detail(raw_cleanup_failure_detail)
+        if cleanup_failure_detail is None or cleanup_ok:
+            raise ValueError("cleanup failure detail rejected")
+        outcome["plan_cleanup_failure_detail"] = cleanup_failure_detail
     if not cleanup_ok:
         outcome["status"] = "incomplete"
         outcome["passed"] = False
@@ -2646,7 +2710,7 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         "server_capacity_claim_reason", "remote_plan_cleanup", "server_telemetry",
         "generator_cpu_evidence",
     }
-    if not isinstance(value, dict) or set(value) != top_fields:
+    if not isinstance(value, dict) or set(value) not in (top_fields, top_fields | {"plan_cleanup_failure_detail"}):
         return None
     try:
         expected_fixture_kind, expected_presets, expected_actor_count = _profile_spec(value.get("workload"))
@@ -2694,12 +2758,23 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             "fixture_manifest_bytes", "response_bytes_total", "process_cpu_windows",
         }
         warmup_worker = expected_worker | {"warmup_failure"}
+        control_diagnostic_worker = expected_worker | {"control_failure_reason"}
+        warmup_control_worker = control_diagnostic_worker | {"warmup_failure"}
         if (not isinstance(worker, dict)
                 or set(worker) not in (
                     expected_worker, expected_worker - {"process_cpu_windows"},
+                    control_diagnostic_worker, control_diagnostic_worker - {"process_cpu_windows"},
                     warmup_worker, warmup_worker - {"process_cpu_windows"},
+                    warmup_control_worker, warmup_control_worker - {"process_cpu_windows"},
                 )):
             return None
+        has_control_failure_reason = "control_failure_reason" in worker
+        if has_control_failure_reason:
+            control_reason = worker.get("control_failure_reason")
+            if (worker.get("resource_abort_reason") != "control_file_invalid"
+                    or not isinstance(control_reason, str)
+                    or control_reason not in CONTROL_FAILURE_REASONS):
+                return None
         has_warmup_failure = "warmup_failure" in worker
         if (has_warmup_failure != (worker.get("resource_abort_reason") == "off_warmup_failed")
                 or (has_warmup_failure and _project_warmup_failure(
@@ -2707,7 +2782,8 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 ) is None)):
             return None
         expected_final_worker = expected_worker | (
-            {"warmup_failure"} if has_warmup_failure else set()
+            ({"warmup_failure"} if has_warmup_failure else set())
+            | ({"control_failure_reason"} if has_control_failure_reason else set())
         )
         if has_warmup_failure:
             worker = {
@@ -2915,6 +2991,17 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 if value.get("worker") else _unknown_cpu_windows())
     if value.get("generator_cpu_evidence") != _generator_cpu_evidence_status(cpu_rows):
         return None
+    if "plan_cleanup_failure_detail" in value:
+        detail = _project_cpu_plan_failure_detail(value["plan_cleanup_failure_detail"])
+        if (
+            detail is None
+            or value.get("status") != "incomplete"
+            or value.get("passed") is not False
+            or value.get("remote_plan_cleanup") != "failed"
+            or value.get("diagnostic_credit") is not False
+        ):
+            return None
+        value = {**value, "plan_cleanup_failure_detail": detail}
     return value
 
 
@@ -3236,6 +3323,17 @@ def _parent_outcome_fingerprint(
         "slo_credit": False,
         "diagnostic_credit": False,
     }
+    raw_cleanup_failure_detail = (
+        cleanup_lifecycle.get("plan_cleanup_failure_detail")
+        if isinstance(cleanup_lifecycle, Mapping) else None
+    )
+    cleanup_failure_detail = _project_cpu_plan_failure_detail(raw_cleanup_failure_detail)
+    if raw_cleanup_failure_detail is not None and (
+        cleanup_failure_detail is None or cleanup_status not in {"bad_protocol", "failed"}
+    ):
+        raise ValueError("cleanup failure detail rejected")
+    if cleanup_failure_detail is not None:
+        fingerprint["plan_cleanup_failure_detail"] = cleanup_failure_detail
     evidence = _project_supervisor_evidence(supervisor_evidence)
     for source, destination in (
         ("reason", "supervisor_reason"), ("worker_started", "supervisor_process_started"),
@@ -3305,6 +3403,13 @@ def _parent_failure_fingerprint(
             )
             if warmup_failure is not None:
                 worker_summary["warmup_failure"] = warmup_failure
+        if "control_failure_reason" in worker:
+            control_reason = worker.get("control_failure_reason")
+            if (worker.get("resource_abort_reason") != "control_file_invalid"
+                    or not isinstance(control_reason, str)
+                    or control_reason not in CONTROL_FAILURE_REASONS):
+                raise ValueError("capacity control failure fingerprint rejected")
+            worker_summary["control_failure_reason"] = control_reason
     cleanup = stage_state.get("cleanup_lifecycle")
     cleanup = cleanup if isinstance(cleanup, Mapping) else {}
     runner = outcome.get("runner_headroom")
@@ -3336,7 +3441,7 @@ def _parent_failure_fingerprint(
         if isinstance(observer.get("remote_failure_reason"), str)
         and observer.get("remote_failure_reason") in REMOTE_WATCH_FAILURE_REASONS else "unknown",
     }
-    return {
+    payload = {
         "schema": 1,
         "event": "ssr_capacity_parent_fingerprint",
         "diagnostic_only": True,
@@ -3384,6 +3489,18 @@ def _parent_failure_fingerprint(
         },
         "supervisor": _project_supervisor_evidence(stage_state.get("supervisor_evidence")),
     }
+    raw_cleanup_failure_detail = (
+        cleanup.get("plan_cleanup_failure_detail") if isinstance(cleanup, Mapping) else None
+    )
+    cleanup_failure_detail = _project_cpu_plan_failure_detail(raw_cleanup_failure_detail)
+    if raw_cleanup_failure_detail is not None and (
+        cleanup_failure_detail is None
+        or cleanup.get("plan_cleanup_status") not in {"bad_protocol", "failed"}
+    ):
+        raise ValueError("cleanup failure detail rejected")
+    if cleanup_failure_detail is not None:
+        payload["cleanup"]["failure_detail"] = cleanup_failure_detail
+    return payload
 
 
 def _write_parent_failure_fingerprint(

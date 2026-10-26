@@ -1518,6 +1518,33 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         projected = json.loads(dispatch_output.removeprefix("CPU_DIAGNOSTIC_PLAN "))
         self.assertEqual(projected["usage_rows"], rows)
 
+        def assert_cleanup_failure_marker(output: str, *, stage: str) -> None:
+            self.assertTrue(output.startswith("CPU_DIAGNOSTIC_PLAN_FAILURE "))
+            self.assertTrue(output.endswith("\n"))
+            self.assertLessEqual(
+                len(output.encode("ascii")),
+                platform_workflow_remote_dispatch.CPU_DIAGNOSTIC_FAILURE_CAP,
+            )
+            marker = json.loads(output.removeprefix("CPU_DIAGNOSTIC_PLAN_FAILURE "))
+            self.assertEqual(set(marker), {
+                "schema", "stage", "child_return_code", "child_stdout_shape",
+                "child_stdout_bytes",
+            })
+            self.assertIs(type(marker["schema"]), int)
+            self.assertEqual(marker["schema"], 1)
+            self.assertIs(type(marker["stage"]), str)
+            self.assertEqual(marker["stage"], stage)
+            self.assertIs(type(marker["child_return_code"]), int)
+            self.assertEqual(marker["child_return_code"], 0)
+            self.assertIs(type(marker["child_stdout_shape"]), str)
+            self.assertEqual(marker["child_stdout_shape"], "single_line")
+            self.assertIs(type(marker["child_stdout_bytes"]), int)
+            self.assertGreater(marker["child_stdout_bytes"], 0)
+            self.assertLessEqual(
+                marker["child_stdout_bytes"],
+                platform_workflow_remote_dispatch.CPU_DIAGNOSTIC_OUTPUT_CAP,
+            )
+
         real_popen = subprocess.Popen
 
         def invoke_refusal(line: bytes) -> tuple[int, str]:
@@ -1571,7 +1598,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         duplicate_result["usage_rows"] = duplicate_rows
         bad_status, bad_output = invoke_with_helper_result(duplicate_result)
         self.assertEqual(bad_status, 2)
-        self.assertEqual(bad_output, "")
+        assert_cleanup_failure_marker(bad_output, stage="usage_aggregate")
         private_label = dict(helper_result)
         private_profiles = [dict(row) for row in helper_result["profile_rows"]]
         private_profiles[0]["categories"] = [{
@@ -1580,7 +1607,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         private_label["profile_rows"] = private_profiles
         bad_status, bad_output = invoke_with_helper_result(private_label)
         self.assertEqual(bad_status, 2)
-        self.assertEqual(bad_output, "")
+        assert_cleanup_failure_marker(bad_output, stage="profile_categories")
+        self.assertNotIn("raw_function_name", bad_output)
 
     def test_cpu_python_helper_accepts_read_only_release_script_shape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
