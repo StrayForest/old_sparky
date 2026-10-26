@@ -175,6 +175,21 @@ def _read_control_once(
             raise _ControlPathReplaced("control path replaced during open")
         if ((opened.st_mode, opened.st_uid, opened.st_nlink, opened.st_size)
                 != (before.st_mode, before.st_uid, before.st_nlink, before.st_size)):
+            if ((opened.st_mode, opened.st_uid, opened.st_size)
+                    == (before.st_mode, before.st_uid, before.st_size)
+                    and opened.st_nlink == 0):
+                try:
+                    current = path.lstat()
+                except OSError:
+                    current = None
+                if (current is not None
+                        and (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+                        and stat.S_ISREG(current.st_mode)
+                        and current.st_uid == os.geteuid()
+                        and current.st_nlink == 1
+                        and stat.S_IMODE(current.st_mode) == 0o600
+                        and 0 < current.st_size <= MAX_CONTROL_BYTES):
+                    raise _ControlPathReplaced("control path replaced during open")
             raise CapacityControlError("control file metadata changed", reason="metadata")
         raw = bytearray()
         while len(raw) <= MAX_CONTROL_BYTES:

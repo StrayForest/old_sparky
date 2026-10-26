@@ -234,7 +234,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "sequence": sequence, "updated_monotonic_ns": 10_000_000_000 + sequence,
             }
 
-        for boundary in ("before_open", "before_final_path_check"):
+        for boundary in ("before_open", "after_open_before_fstat", "before_final_path_check"):
             with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "capacity-control.json"
                 capacity_control.write_control(
@@ -265,6 +265,23 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         observed = capacity_control.read_control(
                             path, expected=expected, now_monotonic_ns=now,
                         )
+                elif boundary == "after_open_before_fstat":
+                    original_fstat = capacity_control.os.fstat
+                    replaced = False
+
+                    def replace_after_open(fd):
+                        nonlocal replaced
+                        if not replaced:
+                            replaced = True
+                            replace_control()
+                        return original_fstat(fd)
+
+                    with patch.object(
+                        capacity_control.os, "fstat", side_effect=replace_after_open,
+                    ):
+                        observed = capacity_control.read_control(
+                            path, expected=expected, now_monotonic_ns=now,
+                        )
                 else:
                     original_lstat = Path.lstat
                     target_lstat_calls = 0
@@ -286,6 +303,46 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
                 self.assertTrue(replaced)
                 self.assertEqual(observed["sequence"], 2)
+
+        for unsafe_replacement in ("mode", "hardlink"):
+            with self.subTest(unsafe_replacement=unsafe_replacement), \
+                    tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "capacity-control.json"
+                capacity_control.write_control(
+                    path, record(1), expected=expected,
+                    now_monotonic_ns=10_000_000_001,
+                )
+                replacement = path.with_name("capacity-control.next")
+
+                def replace_with_unsafe_control() -> None:
+                    replacement.write_bytes(capacity_control.canonical_json(record(2)))
+                    os.chmod(replacement, 0o600)
+                    if unsafe_replacement == "mode":
+                        os.chmod(replacement, 0o640)
+                    else:
+                        os.link(replacement, path.with_name("capacity-control.link"))
+                    os.replace(replacement, path)
+
+                original_fstat = capacity_control.os.fstat
+                replaced = False
+
+                def replace_with_unsafe_control_after_open(fd):
+                    nonlocal replaced
+                    if not replaced:
+                        replaced = True
+                        replace_with_unsafe_control()
+                    return original_fstat(fd)
+
+                with patch.object(
+                    capacity_control.os, "fstat",
+                    side_effect=replace_with_unsafe_control_after_open,
+                ):
+                    with self.assertRaises(capacity_control.CapacityControlError) as context:
+                        capacity_control.read_control(
+                            path, expected=expected, now_monotonic_ns=now,
+                        )
+                self.assertTrue(replaced)
+                self.assertEqual(context.exception.reason, "metadata")
 
     def test_ssr_capacity_control_exhaustion_and_invalid_records_fail_closed(self) -> None:
         expected = {
