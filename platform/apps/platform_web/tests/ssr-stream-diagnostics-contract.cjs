@@ -1,6 +1,7 @@
 "use strict";
 
 const childProcess = process.getBuiltinModule("node:child_process");
+const fs = process.getBuiltinModule("node:fs");
 const path = process.getBuiltinModule("node:path");
 
 const guardPath = path.resolve(__dirname, "..", "server-shutdown-guard.cjs");
@@ -158,6 +159,114 @@ function assertCount(output, fragment, expected, name) {
 }
 
 async function main() {
+  const prearmModule = await import(path.resolve(
+    __dirname, "..", "lib", "workspace-diagnostic-prearm.mjs",
+  ));
+  const pagePath = path.resolve(
+    __dirname, "..", "app", "(site)", "tournaments", "[slug]", "page.tsx",
+  );
+  const planPath = path.resolve(__dirname, "..", "lib", "performance-diagnostic-plan.ts");
+  const pageSource = fs.readFileSync(pagePath, "utf8");
+  const planSource = fs.readFileSync(planPath, "utf8");
+  const baseHeaders = { cookie: "session=fixture" };
+  const runId = "a".repeat(32);
+  const prearmPlan = {
+    run_id: runId,
+    workload: "authenticated_html_ssr_capacity_v1",
+    off_start_ms: 100_000,
+  };
+  const authorizedRunId = prearmModule.authorizedWorkspaceDiagnosticPrearmRunId(
+    prearmPlan, { ...prearmPlan }, 48_000,
+  );
+  let prearmPlanReadCount = 0;
+  const absentContextRunId = prearmModule.readAuthorizedWorkspaceDiagnosticPrearmRunId(
+    null,
+    () => {
+      prearmPlanReadCount += 1;
+      return prearmPlan;
+    },
+    48_000,
+  );
+  const boundContextRunId = prearmModule.readAuthorizedWorkspaceDiagnosticPrearmRunId(
+    prearmPlan,
+    () => {
+      prearmPlanReadCount += 1;
+      return { ...prearmPlan };
+    },
+    48_000,
+  );
+  if (absentContextRunId !== null || boundContextRunId !== runId || prearmPlanReadCount !== 1) {
+    throw new Error("workspace prearm plan revalidation read without context or skipped bound context");
+  }
+  const sampledCorrelationHeaders = {
+    ...baseHeaders,
+    "x-platform-ssr-trace": "1",
+    "x-platform-ssr-request-id": "request-fixture",
+  };
+  const forwarded = prearmModule.withWorkspaceDiagnosticPrearmHeader(
+    sampledCorrelationHeaders, authorizedRunId,
+  );
+  if (forwarded.cookie !== baseHeaders.cookie
+      || forwarded["x-platform-ssr-trace"] !== runId
+      || forwarded["x-platform-ssr-request-id"] !== "request-fixture"
+      || Object.hasOwn(baseHeaders, "x-platform-ssr-trace")) {
+    throw new Error("workspace prearm helper did not retain the exact marker after correlation headers");
+  }
+  const correlationWithoutPrearm = prearmModule.withWorkspaceDiagnosticPrearmHeader(
+    sampledCorrelationHeaders, null,
+  );
+  if (correlationWithoutPrearm["x-platform-ssr-trace"] !== "1") {
+    throw new Error("workspace prearm helper changed a sampled correlation marker without a plan");
+  }
+  for (const untrusted of [null, "1", `${runId}extra`, runId.toUpperCase()]) {
+    const rejected = prearmModule.withWorkspaceDiagnosticPrearmHeader(baseHeaders, untrusted);
+    if (Object.hasOwn(rejected, "x-platform-ssr-trace")) {
+      throw new Error("workspace prearm helper forwarded an absent or malformed marker");
+    }
+  }
+  for (const [currentPlan, nowMs] of [
+    [null, 48_000],
+    [{ ...prearmPlan, source_sha: "b".repeat(40) }, 48_000],
+    [{ ...prearmPlan, workload: "authenticated_workspace_read_pair_v1" }, 48_000],
+    [{ ...prearmPlan }, 100_000],
+    [{ ...prearmPlan }, 47_999],
+  ]) {
+    if (prearmModule.authorizedWorkspaceDiagnosticPrearmRunId(
+      prearmPlan, currentPlan, nowMs,
+    ) !== null) {
+      throw new Error("workspace prearm authorization accepted absent, replaced, wrong-scope or mistimed plan");
+    }
+  }
+  if (!pageSource.includes("withWorkspaceDiagnosticPrearmHeader(")
+      || !pageSource.includes("current_workspace_cpu_diagnostic_prearm_run_id()")) {
+    throw new Error("tournament page no longer uses the validated workspace prearm helper");
+  }
+  const correlationMerge = pageSource.indexOf("getServerRequestCorrelationHeaders()).forEach");
+  const prearmMerge = pageSource.indexOf(
+    "withWorkspaceDiagnosticPrearmHeader(", pageSource.indexOf("const workspaceHeaders"),
+  );
+  if (correlationMerge < 0 || prearmMerge <= correlationMerge) {
+    throw new Error("validated workspace prearm marker must be merged after sampled correlation headers");
+  }
+  for (const fragment of [
+    "diagnosticPrearmStorage",
+    "hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)",
+    "authorizedWorkspaceDiagnosticPrearmRunId(",
+    "readAuthorizedWorkspaceDiagnosticPrearmRunId(",
+  ]) {
+    if (!planSource.includes(fragment)) {
+      throw new Error(`workspace prearm plan contract omitted ${fragment}`);
+    }
+  }
+  const prearmGetter = planSource.match(
+    /export function current_workspace_cpu_diagnostic_prearm_run_id\(\): string \| null \{([\s\S]*?)\n\}/u,
+  );
+  if (!prearmGetter
+      || !prearmGetter[1].includes("prearmPlan ?? null, safeReadPlan, Date.now()")
+      || prearmGetter[1].includes("safeReadPlan()")) {
+    throw new Error("workspace prearm getter must defer plan reads until its dedicated context exists");
+  }
+
   const enabledOutput = await runFixture("enabled");
   for (const stage of [
     "response_stream_start",

@@ -2543,6 +2543,15 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
     def test_parent_html_incomplete_report_reaches_sanitizer_cli(self) -> None:
         source_sha = "a" * 40
+        self.assertEqual(
+            capacity_diagnostic._warmup_diagnostic_trace_run_id(
+                capacity_diagnostic.HTML_WORKLOAD, "b" * 32,
+            ),
+            "b" * 32,
+        )
+        self.assertIsNone(capacity_diagnostic._warmup_diagnostic_trace_run_id(
+            capacity_diagnostic.WORKLOAD, "b" * 32,
+        ))
         runner_identity_fields = external_load.RunnerCgroupSampler.IDENTITY_FIELDS
         ready_html = (
             b'<span data-testid="tournament-detail-lifecycle" '
@@ -2555,6 +2564,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertNotIn(b"avatar_url", ready_html)
         request_encodings: list[str | None] = []
         request_paths: list[str] = []
+        warmup_trace_headers: list[str | None] = []
         request_count_lock = threading.Lock()
         requests_complete = threading.Event()
         warmup_state = {"all_ready": False, "request_count": 0}
@@ -2618,6 +2628,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.end_headers()
                 self.wfile.write(body)
                 with request_count_lock:
+                    if warmup_state["all_ready"] and warmup_state["request_count"] < 8:
+                        warmup_trace_headers.append(self.headers.get("x-platform-ssr-trace"))
                     warmup_state["request_count"] += 1
                     if warmup_state["all_ready"] and warmup_state["request_count"] == 8:
                         requests_complete.set()
@@ -2768,7 +2780,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 namespace_post_ready_failure_stage=None, watchdog_startup_failure_stage=None,
             )
 
+        prepared_run_ids: list[str] = []
+
         def fake_prepare(**kwargs):
+            prepared_run_ids.append(kwargs["run_id"])
             now_ms = time.time_ns() // 1_000_000
             off_start = now_ms + 52_000
             lifecycle = kwargs["lifecycle"]
@@ -2857,8 +2872,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             ):
                 warmup_state["all_ready"] = True
                 warmup_state["request_count"] = 0
+                warmup_trace_headers.clear()
                 requests_complete.clear()
                 self.assertEqual(capacity_diagnostic.main(success_args), 2)
+                self.assertEqual(warmup_trace_headers, [prepared_run_ids[-1]] * 8)
                 successful_report = json.loads(
                     success_report_path.read_text(encoding="ascii"),
                 )
@@ -4474,6 +4491,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             patch.object(diagnostic_module.time, "time_ns", side_effect=[1_000_000_000, 21_000_000_000]),
             patch.object(diagnostic_module.time, "monotonic_ns", side_effect=[0, 20_000_000_000]),
             patch.object(diagnostic_module.time, "process_time_ns", side_effect=[100, 3_000_000_100]),
+            patch.object(
+                diagnostic_module, "_read_process_plan_uncached", return_value=counter_plan,
+            ),
             patch.object(diagnostic_module, "_emit_cpu_diagnostic_message") as usage_event,
         ):
             diagnostic_module._start_cpu_usage_window(counter_plan, "off", loop)
@@ -4695,6 +4715,244 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 usage_window.assert_called_once()
                 self.assertEqual(usage_window.call_args.args[:2], (plan, "on"))
                 self.assertIsNone(diagnostic_module._active_profile)
+
+        class FakeLoop:
+            def __init__(self) -> None:
+                self.calls: list[tuple[float, object]] = []
+
+            def call_later(self, delay: float, callback):
+                self.calls.append((delay, callback))
+                return object()
+
+        prearm_payload = _diagnostic_payload()
+        prearm_payload.update({
+            "run_id": "e" * 32,
+            "workload": capacity_diagnostic.HTML_WORKLOAD,
+            "off_start_ms": 100_000,
+            "off_end_ms": 120_000,
+            "on_start_ms": 125_000,
+            "on_end_ms": 145_000,
+            "expires_at_ms": 145_000,
+        })
+        prearm_plan = parse_plan_payload(
+            _canonical_payload(prearm_payload), expected_service="api",
+        )
+        prearm_scope = {
+            **scope,
+            "headers": [(b"x-platform-ssr-trace", prearm_plan.run_id.encode("ascii"))],
+        }
+        prearm_loop = FakeLoop()
+        clock = {"now_ms": 48_000}
+        plan_keys = {(prearm_plan.run_id, "off"), (prearm_plan.run_id, "on")}
+        diagnostic_module._usage_windows_started.difference_update(plan_keys)
+        diagnostic_module._usage_windows_scheduled.difference_update(plan_keys)
+        try:
+            wrong_marker_scope = {
+                **prearm_scope,
+                "headers": [(b"x-platform-ssr-trace", b"f" * 32)],
+            }
+            with (
+                patch.object(diagnostic_module, "read_process_plan", return_value=None),
+                patch.object(
+                    diagnostic_module, "_read_process_plan_for_cpu_prearm",
+                    return_value=prearm_plan,
+                ),
+                patch.object(
+                    diagnostic_module.time, "time_ns",
+                    side_effect=lambda: clock["now_ms"] * 1_000_000,
+                ),
+            ):
+                self.assertEqual(
+                    ApiCpuDiagnostic.activate_for_scope(wrong_marker_scope), (None, None),
+                )
+            self.assertFalse(prearm_loop.calls)
+
+            with (
+                patch.object(diagnostic_module, "read_process_plan", return_value=None),
+                patch.object(
+                    diagnostic_module, "_read_process_plan_for_cpu_prearm",
+                    return_value=prearm_plan,
+                ),
+                patch.object(
+                    diagnostic_module.time, "time_ns",
+                    side_effect=lambda: clock["now_ms"] * 1_000_000,
+                ),
+                patch("asyncio.get_running_loop", return_value=prearm_loop),
+            ):
+                self.assertEqual(ApiCpuDiagnostic.activate_for_scope(prearm_scope), (None, None))
+            self.assertEqual([delay for delay, _callback in prearm_loop.calls], [52.0, 77.0])
+            self.assertEqual(diagnostic_module._usage_windows_scheduled, plan_keys)
+            self.assertFalse(plan_keys & diagnostic_module._usage_windows_started)
+            self.assertIsNone(diagnostic_module._active_profile)
+
+            clock["now_ms"] = prearm_plan.off_start_ms
+            with (
+                patch.object(
+                    diagnostic_module, "_read_process_plan_uncached",
+                    return_value=prearm_plan,
+                ),
+                patch.object(
+                    diagnostic_module.time, "time_ns",
+                    side_effect=lambda: clock["now_ms"] * 1_000_000,
+                ),
+                patch.object(diagnostic_module.time, "process_time_ns", return_value=0),
+                patch.object(diagnostic_module.time, "monotonic_ns", return_value=0),
+                patch.object(diagnostic_module, "_effective_cpu_capacity", return_value=2.0),
+                patch.object(diagnostic_module, "_emit_cpu_diagnostic_message") as emit,
+            ):
+                # A request at the active edge cannot replace the still-pending
+                # prearmed callback with an immediate capture.
+                with (
+                    patch.object(
+                        diagnostic_module, "read_process_plan", return_value=prearm_plan,
+                    ),
+                    patch("asyncio.get_running_loop", return_value=prearm_loop),
+                ):
+                    ApiCpuDiagnostic.activate_for_scope(prearm_scope)
+                self.assertEqual(len(prearm_loop.calls), 2)
+                _delay, off_callback = prearm_loop.calls[0]
+                off_callback()
+                self.assertIn((prearm_plan.run_id, "off"), diagnostic_module._usage_windows_started)
+                # The measured OFF window is reserved once after its callback;
+                # subsequent active requests cannot add a duplicate timer.
+                with (
+                    patch.object(
+                        diagnostic_module, "read_process_plan", return_value=prearm_plan,
+                    ),
+                    patch("asyncio.get_running_loop", return_value=prearm_loop),
+                ):
+                    ApiCpuDiagnostic.activate_for_scope(prearm_scope)
+                self.assertEqual(len(prearm_loop.calls), 3)
+                emit.assert_not_called()
+                clock["now_ms"] = prearm_plan.off_end_ms
+                with patch.object(
+                    diagnostic_module, "_read_process_plan_uncached", return_value=None,
+                ):
+                    _delay, off_finish = prearm_loop.calls[2]
+                    off_finish()
+                emit.assert_not_called()
+
+            clock["now_ms"] = prearm_plan.on_start_ms
+            with (
+                patch.object(
+                    diagnostic_module, "_read_process_plan_uncached",
+                    return_value=prearm_plan,
+                ),
+                patch.object(
+                    diagnostic_module.time, "time_ns",
+                    side_effect=lambda: clock["now_ms"] * 1_000_000,
+                ),
+                patch.object(diagnostic_module.time, "process_time_ns", return_value=0),
+                patch.object(diagnostic_module.time, "monotonic_ns", return_value=0),
+                patch.object(diagnostic_module, "_effective_cpu_capacity", return_value=2.0),
+                patch.object(diagnostic_module, "_emit_cpu_diagnostic_message") as emit,
+            ):
+                _delay, on_callback = prearm_loop.calls[1]
+                on_callback()
+                self.assertIn((prearm_plan.run_id, "on"), diagnostic_module._usage_windows_started)
+                self.assertEqual(len(prearm_loop.calls), 4)
+                emit.assert_not_called()
+                # The plan expires at the ON edge, but an already-started
+                # capture may finish within the existing edge tolerance.
+                clock["now_ms"] = prearm_plan.expires_at_ms + 250
+                with (
+                    patch.object(
+                        diagnostic_module, "_read_process_plan_uncached",
+                        return_value=prearm_plan,
+                    ),
+                    patch.object(diagnostic_module.time, "monotonic_ns", return_value=20_250_000_000),
+                    patch.object(diagnostic_module.time, "process_time_ns", return_value=3_000_000_000),
+                ):
+                    _delay, on_finish = prearm_loop.calls[3]
+                    on_finish()
+                    emit.assert_called_once()
+                    self.assertIn("end_lag_ms=250", emit.call_args.args[0])
+                    self.assertIn("timing_complete=true", emit.call_args.args[0])
+                    clock["now_ms"] = prearm_plan.expires_at_ms + 251
+                    on_finish()
+                    emit.assert_called_once()
+
+            replaced_payload = {**prearm_payload, "source_sha": "f" * 40}
+            replaced_plan = parse_plan_payload(
+                _canonical_payload(replaced_payload), expected_service="api",
+            )
+            diagnostic_module._usage_windows_started.discard((prearm_plan.run_id, "on"))
+            diagnostic_module._schedule_cpu_usage_window(
+                prearm_plan, "on", prearm_loop, now_ms=48_000,
+            )
+            clock["now_ms"] = prearm_plan.on_start_ms
+            with (
+                patch.object(
+                    diagnostic_module, "_read_process_plan_uncached",
+                    return_value=replaced_plan,
+                ),
+                patch.object(
+                    diagnostic_module.time, "time_ns",
+                    side_effect=lambda: clock["now_ms"] * 1_000_000,
+                ),
+                patch.object(diagnostic_module, "_start_cpu_usage_window") as start_window,
+            ):
+                _delay, replaced_callback = prearm_loop.calls[-1]
+                replaced_callback()
+                start_window.assert_not_called()
+            self.assertNotIn((prearm_plan.run_id, "on"), diagnostic_module._usage_windows_scheduled)
+
+            for finish_lag_ms in (1, 7):
+                with self.subTest(finish_lag_ms=finish_lag_ms):
+                    finish_payload = {
+                        **prearm_payload,
+                        "run_id": str(finish_lag_ms) * 32,
+                    }
+                    finish_plan = parse_plan_payload(
+                        _canonical_payload(finish_payload), expected_service="api",
+                    )
+                    finish_key = (finish_plan.run_id, "on")
+                    finish_loop = FakeLoop()
+                    finish_clock = {"now_ms": finish_plan.on_start_ms}
+                    diagnostic_module._usage_windows_started.discard(finish_key)
+                    try:
+                        with (
+                            patch.object(
+                                diagnostic_module.time, "time_ns",
+                                side_effect=lambda: finish_clock["now_ms"] * 1_000_000,
+                            ),
+                            patch.object(diagnostic_module.time, "process_time_ns", return_value=0),
+                            patch.object(diagnostic_module.time, "monotonic_ns", return_value=0),
+                            patch.object(diagnostic_module, "_effective_cpu_capacity", return_value=2.0),
+                            patch.object(diagnostic_module, "_emit_cpu_diagnostic_message") as finish_emit,
+                        ):
+                            diagnostic_module._start_cpu_usage_window(
+                                finish_plan, "on", finish_loop,
+                            )
+                            finish_clock["now_ms"] = finish_plan.expires_at_ms + finish_lag_ms
+                            with (
+                                patch.object(
+                                    diagnostic_module, "_read_process_plan_uncached",
+                                    return_value=finish_plan,
+                                ),
+                                patch.object(
+                                    diagnostic_module.time, "monotonic_ns",
+                                    return_value=(20_000 + finish_lag_ms) * 1_000_000,
+                                ),
+                                patch.object(
+                                    diagnostic_module.time, "process_time_ns",
+                                    return_value=3_000_000_000,
+                                ),
+                            ):
+                                finish_loop.calls[0][1]()
+                            finish_emit.assert_called_once()
+                            self.assertIn(
+                                f"end_lag_ms={finish_lag_ms}",
+                                finish_emit.call_args.args[0],
+                            )
+                            self.assertIn(
+                                "timing_complete=true", finish_emit.call_args.args[0],
+                            )
+                    finally:
+                        diagnostic_module._usage_windows_started.discard(finish_key)
+        finally:
+            diagnostic_module._usage_windows_started.difference_update(plan_keys)
+            diagnostic_module._usage_windows_scheduled.difference_update(plan_keys)
 
     def test_capacity_api_usage_summary_requires_both_workers_in_both_phases(self) -> None:
         targets = {

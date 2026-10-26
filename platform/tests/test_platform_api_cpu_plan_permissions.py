@@ -87,7 +87,7 @@ class ApiCpuPlanPermissionTests(unittest.TestCase):
                 "PLATFORM_RUNTIME_SERVICE": "api",
             }
             now_ms = time.time_ns() // 1_000_000
-            off_start_ms = now_ms - 500
+            off_start_ms = now_ms + 10_000
             child_code = textwrap.dedent("""
                 import json
                 import os
@@ -117,11 +117,15 @@ class ApiCpuPlanPermissionTests(unittest.TestCase):
                     start_ticks=ticks, invocation_id=os.environ.get("INVOCATION_ID"),
                     release_identity=None,
                 )
+                prearm_plan = diagnostic._read_process_plan_for_cpu_prearm(
+                    now_ms=int(sys.argv[3]),
+                )
                 print(json.dumps({
-                    "accepted": plan is not None,
+                    "phase_reader_rejected_future": plan is None,
+                    "prearm_accepted": prearm_plan is not None,
                     "legacy_errno": legacy_errno,
-                    "release_bound": plan is not None and (
-                        plan.source_sha, plan.release_slug,
+                    "release_bound": prearm_plan is not None and (
+                        prearm_plan.source_sha, prearm_plan.release_slug,
                     ) == (sys.argv[4], sys.argv[5]),
                 }, sort_keys=True))
             """)
@@ -130,7 +134,7 @@ class ApiCpuPlanPermissionTests(unittest.TestCase):
                     str(setpriv), "--reuid", str(api_user.pw_uid),
                     "--regid", str(api_group.gr_gid), "--init-groups",
                     sys.executable, "-I", "-B", "-c", child_code,
-                    str(package_root), str(plan_directory), str(off_start_ms + 1),
+                    str(package_root), str(plan_directory), str(now_ms),
                     source_sha, release_slug,
                 ],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -183,7 +187,8 @@ class ApiCpuPlanPermissionTests(unittest.TestCase):
             self.assertEqual(child.returncode, 0, stderr)
             result = json.loads(stdout)
             self.assertEqual(result, {
-                "accepted": True,
+                "phase_reader_rejected_future": True,
+                "prearm_accepted": True,
                 "legacy_errno": errno.EACCES,
                 "release_bound": True,
             })

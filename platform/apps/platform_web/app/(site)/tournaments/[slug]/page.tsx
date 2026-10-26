@@ -11,7 +11,11 @@ import {
   recordSsrStage,
   recordSsrWorkspaceApiError
 } from "@/lib/server-ssr-observability";
-import { run_with_workspace_cpu_diagnostic } from "@/lib/performance-diagnostic-plan";
+import {
+  current_workspace_cpu_diagnostic_prearm_run_id,
+  run_with_workspace_cpu_diagnostic,
+} from "@/lib/performance-diagnostic-plan";
+import { withWorkspaceDiagnosticPrearmHeader } from "@/lib/workspace-diagnostic-prearm.mjs";
 import {
   getTournamentWorkspace,
   normalizeTournamentInviteCode,
@@ -60,6 +64,12 @@ export default async function TournamentDetailPage({
           workspaceHeaders[name] = value;
         });
       }
+      Object.assign(
+        workspaceHeaders,
+        withWorkspaceDiagnosticPrearmHeader(
+          {}, current_workspace_cpu_diagnostic_prearm_run_id(),
+        ),
+      );
       const workspaceOptions = {
         participantsLimit: 0,
         workspaceView: "detail" as const,

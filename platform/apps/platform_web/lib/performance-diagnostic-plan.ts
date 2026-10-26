@@ -10,6 +10,10 @@ import { headers } from "next/headers";
 import { hasAuthorizedDiagnosticRunMarker } from "./performance-diagnostic-marker";
 import { releaseMetadataPathFromStandaloneCwd } from "./release-identity-path.mjs";
 import {
+  authorizedWorkspaceDiagnosticPrearmRunId,
+  readAuthorizedWorkspaceDiagnosticPrearmRunId,
+} from "./workspace-diagnostic-prearm.mjs";
+import {
   appendBoundedSample,
   classifyCgroupReadFailure,
   formatCpuDiagnosticMemoryEvent,
@@ -71,6 +75,9 @@ type ActiveDiagnostic = {
 };
 
 const diagnosticStorage = new AsyncLocalStorage<ActiveDiagnostic>();
+// Prearm only carries an authorized marker to the workspace API fetch. It must
+// not make current_diagnostic_run_id() or generic SSR telemetry active.
+const diagnosticPrearmStorage = new AsyncLocalStorage<DiagnosticPlan>();
 const consumedCpuRunIds = new Set<string>();
 const usageWindowsStarted = new Set<string>();
 const memoryWindowsStarted = new Set<string>();
@@ -268,13 +275,19 @@ export function current_diagnostic_run_id(): string | null {
     : null;
 }
 
+export function current_workspace_cpu_diagnostic_prearm_run_id(): string | null {
+  const prearmPlan = diagnosticPrearmStorage.getStore();
+  return readAuthorizedWorkspaceDiagnosticPrearmRunId(
+    prearmPlan ?? null, safeReadPlan, Date.now(),
+  );
+}
+
 export async function run_with_workspace_cpu_diagnostic<T>(
   operation: () => Promise<T>
 ): Promise<T> {
   const plan = currentPlan();
   if (!plan) return operation();
   const phase = activePhase(plan, Date.now());
-  if (!phase) return operation();
   let incomingTrace: string | null = null;
   try {
     incomingTrace = (await headers()).get(DIAGNOSTIC_TRACE_HEADER);
@@ -283,6 +296,16 @@ export async function run_with_workspace_cpu_diagnostic<T>(
     return operation();
   }
   if (!hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)) return operation();
+  if (!phase) {
+    const freshPlan = safeReadPlan();
+    const prearmRunId = authorizedWorkspaceDiagnosticPrearmRunId(
+      plan, freshPlan, Date.now(),
+    );
+    if (freshPlan !== null && prearmRunId === plan.run_id) {
+      return diagnosticPrearmStorage.run(freshPlan, operation);
+    }
+    return operation();
+  }
   startCpuUsageWindow(plan, phase);
   startNodeMemoryWindow(plan, phase);
   if (plan.workload === WORKLOAD_CPU_PAIR && phase === "on"

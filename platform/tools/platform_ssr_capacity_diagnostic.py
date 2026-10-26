@@ -874,6 +874,12 @@ def _worker_counts_are_closed(payload: Mapping[str, Any]) -> bool:
     return payload.get("status") != "complete" or not errors
 
 
+def _warmup_diagnostic_trace_run_id(workload: str, run_id: str) -> str | None:
+    """Only HTML capacity warmups may carry the root-bound API prearm marker."""
+
+    return run_id if workload == HTML_WORKLOAD else None
+
+
 def _warmup_exception_class(value: Any) -> str:
     name = type(value).__name__ if isinstance(value, BaseException) else value
     if not isinstance(name, str):
@@ -1278,11 +1284,14 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     off_results: list[Any] = []
     off_failed = False
 
-    def untraced_warmup(actor: external_load.VirtualUser):
+    def plan_marked_warmup(actor: external_load.VirtualUser):
         return external_load._page_request(
             manifest["origin"], actor, "authenticated_workspace_capacity_warmup", 5.0,
             session_cookie_name=cookie_names[0], csrf_cookie_name=cookie_names[1],
             transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
+            diagnostic_trace_run_id=_warmup_diagnostic_trace_run_id(
+                capacity["workload"], binding["run_id"],
+            ),
             require_authenticated_html=capacity["workload"] == HTML_WORKLOAD,
         )
 
@@ -1315,7 +1324,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         )
 
     warm_futures = [
-        capacity_executor.submit(untraced_warmup, selected[index % len(selected)])
+        capacity_executor.submit(plan_marked_warmup, selected[index % len(selected)])
         for index in range(probe_count)
     ]
     warmup_failure = _new_warmup_failure(probe_count)
@@ -1352,8 +1361,8 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         )
 
     # Warm the same thread-local HTTP/1.1 clients before the plan's OFF
-    # boundary. The marked cohort is synchronized to the immutable plan time;
-    # warmup and its TLS latency are excluded from the measured probe window.
+    # boundary. HTML warmups carry only the root-bound plan marker to prearm
+    # API CPU edges; page diagnostics and warmup latency remain unmeasured.
     while True:
         initial = guard()
         if initial is not None:

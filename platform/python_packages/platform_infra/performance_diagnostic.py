@@ -43,6 +43,7 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
 INVOCATION_RE = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f-]{36})$")
 CPU_CGROUP_RE = re.compile(r"^0::(?P<path>/[A-Za-z0-9._/-]{0,512})$")
 CPU_WINDOW_TOLERANCE_MS = 250
+API_CPU_PREARM_LEAD_MS = 52_000
 
 
 def _warn_cpu_diagnostic_journal_failure(reason: str) -> None:
@@ -331,7 +332,7 @@ def _start_cpu_usage_window(plan: DiagnosticPlan, phase: str, loop: Any) -> None
     """Measure process CPU over one exact phase from its first bound request."""
 
     key = (plan.run_id, phase)
-    if key in _usage_windows_started:
+    if key in _usage_windows_started or key in _usage_windows_scheduled:
         return
     _usage_windows_started.add(key)
     start_ms_target = plan.off_start_ms if phase == "off" else plan.on_start_ms
@@ -345,6 +346,20 @@ def _start_cpu_usage_window(plan: DiagnosticPlan, phase: str, loop: Any) -> None
     def finish() -> None:
         end_ms = time.time_ns() // 1_000_000
         end_lag_ms = end_ms - end_ms_target
+        fresh_plan = _read_process_plan_uncached(
+            "api",
+            now_ms=end_ms,
+            phase_at_ms=end_ms_target - 1,
+            expiry_tolerance_ms=CPU_WINDOW_TOLERANCE_MS,
+            pid=None,
+            start_ticks=None,
+            invocation_id=None,
+            release_identity=None,
+        )
+        if (fresh_plan != plan
+                or end_ms > end_ms_target + CPU_WINDOW_TOLERANCE_MS
+                or end_ms > plan.expires_at_ms + CPU_WINDOW_TOLERANCE_MS):
+            return
         window_ms = max(0, (time.monotonic_ns() - start_monotonic_ns) // 1_000_000)
         cpu_ns = max(0, time.process_time_ns() - start_cpu_ns)
         timing_complete = bool(
@@ -468,6 +483,9 @@ def _read_process_plan_uncached(
     start_ticks: int | None,
     invocation_id: str | None,
     release_identity: tuple[str, str] | None,
+    allow_prearm: bool = False,
+    phase_at_ms: int | None = None,
+    expiry_tolerance_ms: int = 0,
 ) -> DiagnosticPlan | None:
     if service not in PLAN_PATHS:
         return None
@@ -521,9 +539,21 @@ def _read_process_plan_uncached(
     except ValueError:
         return None
     current_ms = int(time.time_ns() // 1_000_000) if now_ms is None else now_ms
-    if plan.phase_at(current_ms) is None:
+    phase_ms = current_ms if phase_at_ms is None else phase_at_ms
+    phase = plan.phase_at(phase_ms)
+    if allow_prearm:
+        lead_ms = plan.off_start_ms - current_ms
+        if (plan.workload != WORKLOAD_HTML_SSR_CAPACITY or phase is not None
+                or not 0 < lead_ms <= API_CPU_PREARM_LEAD_MS):
+            return None
+    elif phase is None:
         return None
-    if current_ms > plan.expires_at_ms or plan.expires_at_ms - plan.off_start_ms > MAX_CAPTURE_MS:
+    # The only nonzero expiry allowance is the finalization of an already
+    # started window at its exact end edge; starts and prearms stay strict.
+    if (type(expiry_tolerance_ms) is not int or expiry_tolerance_ms < 0
+            or (expiry_tolerance_ms and phase_at_ms is None)
+            or current_ms > plan.expires_at_ms + expiry_tolerance_ms
+            or plan.expires_at_ms - plan.off_start_ms > MAX_CAPTURE_MS):
         return None
     expected_pid = os.getpid() if pid is None else pid
     expected_ticks = _read_current_start_ticks() if start_ticks is None else start_ticks
@@ -545,9 +575,75 @@ def _read_process_plan_uncached(
     return plan
 
 
+def _read_process_plan_for_cpu_prearm(*, now_ms: int | None = None) -> DiagnosticPlan | None:
+    """Uncached, process-bound future plan read for HTML CPU edge scheduling."""
+
+    current_ms = int(time.time_ns() // 1_000_000) if now_ms is None else now_ms
+    return _read_process_plan_uncached(
+        "api", now_ms=current_ms, pid=None, start_ticks=None,
+        invocation_id=None, release_identity=None, allow_prearm=True,
+    )
+
+
+def _same_cpu_plan(left: DiagnosticPlan | None, right: DiagnosticPlan) -> bool:
+    return left == right
+
+
+def _schedule_cpu_usage_window(
+    plan: DiagnosticPlan, phase: str, loop: Any, *, now_ms: int | None = None,
+) -> None:
+    """Schedule one exact usage window after a root-plan-authorized prearm."""
+
+    key = (plan.run_id, phase)
+    if key in _usage_windows_started or key in _usage_windows_scheduled:
+        return
+    start_ms = plan.off_start_ms if phase == "off" else plan.on_start_ms
+    current_ms = int(time.time_ns() // 1_000_000) if now_ms is None else now_ms
+    _usage_windows_scheduled.add(key)
+
+    def start_at_edge() -> None:
+        actual_ms = time.time_ns() // 1_000_000
+        if actual_ms < start_ms:
+            fresh_plan = _read_process_plan_uncached(
+                "api", now_ms=actual_ms, phase_at_ms=start_ms,
+                pid=None, start_ticks=None,
+                invocation_id=None, release_identity=None,
+            )
+            if _same_cpu_plan(fresh_plan, plan):
+                loop.call_later((start_ms - actual_ms) / 1000, start_at_edge)
+                return
+        fresh_plan = _read_process_plan_uncached(
+            "api", now_ms=actual_ms, pid=None, start_ticks=None,
+            invocation_id=None, release_identity=None,
+        )
+        if (not _same_cpu_plan(fresh_plan, plan)
+                or fresh_plan.phase_at(actual_ms) != phase
+                or actual_ms < start_ms
+                or actual_ms > fresh_plan.expires_at_ms):
+            _usage_windows_scheduled.discard(key)
+            return
+        _usage_windows_scheduled.discard(key)
+        _start_cpu_usage_window(fresh_plan, phase, loop)
+
+    loop.call_later(max(0.0, (start_ms - current_ms) / 1000), start_at_edge)
+
+
+def _prearm_cpu_usage_windows(plan: DiagnosticPlan, loop: Any, *, now_ms: int | None = None) -> None:
+    """Arm OFF and ON process CPU windows without sampling before their edges."""
+
+    current_ms = int(time.time_ns() // 1_000_000) if now_ms is None else now_ms
+    lead_ms = plan.off_start_ms - current_ms
+    if (plan.workload != WORKLOAD_HTML_SSR_CAPACITY
+            or not 0 < lead_ms <= API_CPU_PREARM_LEAD_MS):
+        return
+    _schedule_cpu_usage_window(plan, "off", loop, now_ms=current_ms)
+    _schedule_cpu_usage_window(plan, "on", loop, now_ms=current_ms)
+
+
 _active_profile: "ApiCpuDiagnostic | None" = None
 _consumed_run_ids: set[str] = set()
 _usage_windows_started: set[tuple[str, str]] = set()
+_usage_windows_scheduled: set[tuple[str, str]] = set()
 
 
 # Only these repository call labels may leave the process. Everything else is
@@ -635,7 +731,21 @@ class ApiCpuDiagnostic:
         if trace_run_id is None or RUN_RE.fullmatch(trace_run_id) is None:
             return None, None
         plan = read_process_plan("api")
-        if plan is None or trace_run_id != plan.run_id:
+        if plan is None:
+            prearm_plan = _read_process_plan_for_cpu_prearm()
+            if prearm_plan is None or trace_run_id != prearm_plan.run_id:
+                return None, None
+            try:
+                import asyncio
+
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return None, None
+            _prearm_cpu_usage_windows(prearm_plan, loop)
+            # Prearming records no request phase or profiler context; only
+            # callbacks at the immutable plan edges emit usage samples.
+            return None, None
+        if trace_run_id != plan.run_id:
             return None, None
         now_ms = int(time.time_ns() // 1_000_000)
         phase = plan.phase_at(now_ms)
@@ -647,6 +757,8 @@ class ApiCpuDiagnostic:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return plan, phase
+        if phase == "off" and plan.workload == WORKLOAD_HTML_SSR_CAPACITY:
+            _schedule_cpu_usage_window(plan, "on", loop, now_ms=now_ms)
         _start_cpu_usage_window(plan, phase, loop)
         # HTML capacity diagnostics need the same run/phase correlation and
         # low-cost CPU usage window, but never enable the expensive cProfile
