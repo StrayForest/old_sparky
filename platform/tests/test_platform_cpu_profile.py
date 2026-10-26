@@ -2385,6 +2385,83 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             report, source_sha="b" * 40, app_target_sha="c" * 40,
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
         ), "PASS")
+        gc_rows = report["server_telemetry"]["node_memory_rows"]
+        fractional_gc_rows = [
+            {**row, "gc_duration_ms": duration}
+            for row, duration in zip(gc_rows, (0.0, 1.25), strict=True)
+        ]
+        projected_gc = capacity_diagnostic._project_server_telemetry({
+            "usage_status": "complete", "usage_reason": "none",
+            "usage_rows": report["server_telemetry"]["cpu_rows"],
+            "memory_status": "complete", "memory_reason": "none",
+            "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
+            "memory_rows": fractional_gc_rows,
+        })
+        self.assertEqual(
+            [row["gc_duration_ms"] for row in projected_gc["node_memory_rows"]],
+            [0.0, 1.25],
+        )
+        fractional_gc_report = {**report, "server_telemetry": projected_gc}
+        self.assertIsNotNone(capacity_diagnostic._project_capacity_report(fractional_gc_report))
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            fractional_gc_report, source_sha="b" * 40, app_target_sha="c" * 40,
+            run_id="12345", attempt="1", manifest_sha256="e" * 64,
+        ), "PASS")
+        for invalid_duration in (True, float("nan"), float("inf"), -0.001, 20_000.001):
+            direct_invalid_rows = [
+                {**row, "gc_duration_ms": invalid_duration if index == 0 else row["gc_duration_ms"]}
+                for index, row in enumerate(gc_rows)
+            ]
+            direct_invalid_report = {
+                **report,
+                "server_telemetry": {
+                    **report["server_telemetry"], "node_memory_rows": direct_invalid_rows,
+                },
+            }
+            self.assertIsNone(capacity_diagnostic._project_capacity_report(direct_invalid_report))
+            invalid_gc_rows = [
+                {**row, "gc_duration_ms": invalid_duration if index == 0 else row["gc_duration_ms"]}
+                for index, row in enumerate(gc_rows)
+            ]
+            projected_invalid_gc = capacity_diagnostic._project_server_telemetry({
+                "usage_status": "complete", "usage_reason": "none",
+                "usage_rows": report["server_telemetry"]["cpu_rows"],
+                "memory_status": "complete", "memory_reason": "none",
+                "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
+                "memory_rows": invalid_gc_rows,
+            })
+            self.assertIsNone(projected_invalid_gc["node_memory_rows"][0]["gc_duration_ms"])
+            self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+                {**report, "server_telemetry": projected_invalid_gc},
+                source_sha="b" * 40, app_target_sha="c" * 40,
+                run_id="12345", attempt="1", manifest_sha256="e" * 64,
+            ), "INVALID")
+        incomplete_gc_report = {
+            **report, "status": "incomplete", "passed": False,
+            "server_telemetry": projected_invalid_gc,
+        }
+        self.assertIsNotNone(capacity_diagnostic._project_capacity_report(incomplete_gc_report))
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            incomplete_gc_report, source_sha="b" * 40, app_target_sha="c" * 40,
+            run_id="12345", attempt="1", manifest_sha256="e" * 64,
+        ), "INVALID")
+        fractional_integer_rows = [
+            {**row, "rss_min_bytes": 1.5 if index == 0 else row["rss_min_bytes"]}
+            for index, row in enumerate(gc_rows)
+        ]
+        projected_fractional_integer = capacity_diagnostic._project_server_telemetry({
+            "usage_status": "complete", "usage_reason": "none",
+            "usage_rows": report["server_telemetry"]["cpu_rows"],
+            "memory_status": "complete", "memory_reason": "none",
+            "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
+            "memory_rows": fractional_integer_rows,
+        })
+        self.assertIsNone(projected_fractional_integer["node_memory_rows"][0]["rss_min_bytes"])
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            {**report, "server_telemetry": projected_fractional_integer},
+            source_sha="b" * 40, app_target_sha="c" * 40,
+            run_id="12345", attempt="1", manifest_sha256="e" * 64,
+        ), "INVALID")
         control_diagnostic = json.loads(json.dumps(report))
         control_diagnostic["status"] = "incomplete"
         control_diagnostic["passed"] = False

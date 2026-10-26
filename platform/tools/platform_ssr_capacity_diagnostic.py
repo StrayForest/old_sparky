@@ -2437,6 +2437,14 @@ def _project_cpu_plan_failure_detail(value: Any) -> dict[str, Any] | None:
     return cpu_pair._project_cpu_plan_failure_detail(value)
 
 
+def _valid_gc_duration_ms(value: Any) -> bool:
+    return (
+        type(value) in {int, float}
+        and 0 <= value <= 20_000
+        and (type(value) is int or math.isfinite(value))
+    )
+
+
 def _project_server_telemetry(summary: Any) -> dict[str, Any]:
     """Keep only closed CPU and Node-memory aggregates from the fixed plan collector."""
 
@@ -2496,7 +2504,10 @@ def _project_server_telemetry(summary: Any) -> dict[str, Any]:
                 clean = {"service": "web", "phase": row["phase"]}
                 for field in node_fields:
                     item = row.get(field)
-                    clean[field] = item if type(item) is int and 0 <= item <= 10**15 else None
+                    if field == "gc_duration_ms":
+                        clean[field] = item if _valid_gc_duration_ms(item) else None
+                    else:
+                        clean[field] = item if type(item) is int and 0 <= item <= 10**15 else None
                 for field, allowed in (
                     ("status", {"complete", "incomplete"}),
                     ("gc_status", {"complete", "incomplete"}),
@@ -3141,12 +3152,12 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
         "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
         "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
-        "gc_count", "gc_duration_ms", "gc_major_count", "gc_minor_count",
+        "gc_count", "gc_major_count", "gc_minor_count",
         "gc_incremental_count", "gc_weakcb_count", "gc_other_count",
     }
     for row in telemetry["node_memory_rows"]:
         required_row = node_integer_fields | {
-            "service", "phase", "status", "gc_status", "cgroup_memory_status",
+            "service", "phase", "status", "gc_duration_ms", "gc_status", "cgroup_memory_status",
             "cgroup_memory_reason", "gc_overflow",
         }
         if (not isinstance(row, dict) or set(row) != required_row
@@ -3156,6 +3167,8 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or row.get("cgroup_memory_status") not in {"complete", "unknown", "invalid"}
                 or row.get("cgroup_memory_reason") not in {"none", "file_unavailable", "hierarchy_unavailable", "invalid_snapshot"}
                 or row.get("gc_overflow") not in {True, False, None}
+                or (row.get("gc_duration_ms") is not None
+                    and not _valid_gc_duration_ms(row.get("gc_duration_ms")))
                 or any(item is not None and type(item) is not int for item in (row[key] for key in node_integer_fields))):
             return None
     cpu_rows = (value["worker"].get("process_cpu_windows", _unknown_cpu_windows())
