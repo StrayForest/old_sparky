@@ -3897,6 +3897,7 @@ def run_authenticated_workspace_capacity_phase(
     abort_on_result: Callable[[Any], str | None] | None = None,
     max_supported_concurrency: int = 16,
     progress_callback: Callable[[str, Any | None], None] | None = None,
+    window_end_callback: Callable[[], None] | None = None,
     executor: ThreadPoolExecutor | None = None,
 ) -> dict[str, Any]:
     """Run a bounded closed-loop workspace read with a fail-closed stop guard.
@@ -3905,6 +3906,9 @@ def run_authenticated_workspace_capacity_phase(
     authenticated read only when one of its bounded in-flight requests drains.
     On a guard decision it stops refilling and waits for the existing futures
     to finish under their request timeout.
+
+    When provided, ``window_end_callback`` runs once at the first observation
+    of the planned end, before any post-window drain or normal return.
     """
 
     if (not actors or type(max_supported_concurrency) is not int
@@ -3915,7 +3919,8 @@ def run_authenticated_workspace_capacity_phase(
             or type(start_at_epoch_ms) is not int or type(end_at_epoch_ms) is not int
             or end_at_epoch_ms - start_at_epoch_ms != 20_000
             or type(timeout) not in (int, float) or isinstance(timeout, bool)
-            or not 0 < timeout <= 30):
+            or not 0 < timeout <= 30
+            or window_end_callback is not None and not callable(window_end_callback)):
         raise ExternalLoadError("capacity diagnostic bounds rejected")
     started = time.monotonic()
     wall_now_ms = time.time_ns() // 1_000_000
@@ -3930,6 +3935,7 @@ def run_authenticated_workspace_capacity_phase(
     submitted = 0
     next_actor = 0
     abort_reason: str | None = None
+    window_end_callback_called = False
 
     def guard_reason() -> str | None:
         try:
@@ -3962,6 +3968,18 @@ def run_authenticated_workspace_capacity_phase(
         in_flight[future] = index
         return True
 
+    def capture_window_end_if_due() -> None:
+        nonlocal window_end_callback_called
+        if (window_end_callback is None or window_end_callback_called
+                or abort_reason not in {None, "window_complete"}
+                or time.monotonic() < deadline):
+            return
+        try:
+            window_end_callback()
+        except Exception as exc:
+            raise ExternalLoadError("capacity window-end callback failed") from exc
+        window_end_callback_called = True
+
     try:
         while len(in_flight) < concurrency and submit_one():
             pass
@@ -3971,6 +3989,7 @@ def run_authenticated_workspace_capacity_phase(
                 abort_reason = reason
             while abort_reason is None and len(in_flight) < concurrency and submit_one():
                 pass
+            capture_window_end_if_due()
             if not in_flight:
                 if abort_reason is not None or time.monotonic() >= deadline:
                     break
@@ -4030,6 +4049,9 @@ def run_authenticated_workspace_capacity_phase(
                     for _result in completed_batch:
                         if not submit_one():
                             break
+        # The loop condition exits before entering its body when there is no
+        # in-flight work at the normal deadline. Capture that boundary too.
+        capture_window_end_if_due()
     except BaseException:
         for future in in_flight:
             future.cancel()
