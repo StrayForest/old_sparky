@@ -5651,6 +5651,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 ):
                     self.assertIsNone(diagnostic_module._read_release_identity())
 
+
     def test_diagnostic_plan_rejects_other_service_duplicate_keys_and_long_window(self) -> None:
         with self.assertRaises(ValueError):
             parse_plan_payload(_canonical_payload(_diagnostic_payload(service="web")), expected_service="api")

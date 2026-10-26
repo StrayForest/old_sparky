@@ -478,9 +478,13 @@ def _read_process_plan_uncached(
         return None
     directory_fd = file_fd = None
     try:
+        path_only_flag = getattr(os, "O_PATH", None)
+        if path_only_flag is None:
+            return None
         directory_fd = os.open(
             PLAN_DIRECTORY,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            path_only_flag | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
         )
         directory_stat = os.fstat(directory_fd)
         if (not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_uid != 0
