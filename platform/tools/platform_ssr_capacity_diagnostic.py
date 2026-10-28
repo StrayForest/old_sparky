@@ -2202,6 +2202,9 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
     binding = capacity_config.get("binding")
     if not isinstance(binding, Mapping) or not isinstance(payload, dict):
         return False
+    # Validation may normalize legacy evidence fields; keep caller-owned reports
+    # reusable for additional projections and mutation checks.
+    payload = dict(payload)
     expected_fields = {
         "worker_report_schema", "partial_work", "inflight_unknown",
         "schema", "workload", "fixture_kind", "fixture_tournaments", "fixture_users",
@@ -3191,6 +3194,9 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
     }
     if not isinstance(value, dict) or set(value) not in (top_fields, top_fields | {"plan_cleanup_failure_detail"}):
         return None
+    # This projector adds compatibility defaults to its output. Do not mutate a
+    # caller's report while validating or projecting a legacy worker payload.
+    value = dict(value)
     try:
         expected_fixture_kind, expected_presets, expected_actor_count = _profile_spec(value.get("workload"))
     except ValueError:
@@ -3230,6 +3236,10 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         return None
     worker = value.get("worker")
     if worker is not None:
+        if not isinstance(worker, dict):
+            return None
+        worker = dict(worker)
+        value["worker"] = worker
         expected_worker = {
             "status", "submitted", "completed", "http_status_counts", "error_counts",
             "failure_evidence", "actual_on_request_started_at_utc",
@@ -3248,8 +3258,6 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         legacy_warmup_worker = legacy_worker | {"warmup_failure"}
         legacy_control_worker = legacy_worker | {"control_failure_reason"}
         legacy_warmup_control_worker = legacy_control_worker | {"warmup_failure"}
-        if not isinstance(worker, dict):
-            return None
         legacy_shapes = tuple(frozenset(shape) for shape in (
             legacy_worker, legacy_worker - {"process_cpu_windows"},
             legacy_warmup_worker, legacy_warmup_worker - {"process_cpu_windows"},
