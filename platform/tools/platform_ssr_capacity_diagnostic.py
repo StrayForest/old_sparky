@@ -1075,8 +1075,16 @@ def _normalize_failure_evidence_fields(
             "failure_evidence_status": "unavailable",
         })
         return True
-    if shape in current_shapes and payload.get("failure_evidence_status") == "available":
-        return False
+    if shape in current_shapes:
+        if payload.get("failure_evidence_status") == "available":
+            return False
+        if (payload.get("failure_evidence_status") == "unavailable"
+                and payload.get("failure_evidence") is None
+                and payload.get("actual_on_request_started_at_utc") is None
+                and payload.get("actual_on_request_finished_at_utc") is None):
+            # This exact canonical form is emitted only when an accepted legacy
+            # keyset is projected for serialization; it carries no new evidence.
+            return True
     return None
 
 

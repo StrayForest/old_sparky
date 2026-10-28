@@ -329,6 +329,9 @@ connection is opened; `response_headers` and `body_receive` are marked only
 after their corresponding transport boundaries. These observations do not
 identify an SSR/API exception or join a client request to an origin log by
 themselves; keep failure runs diagnostic and zero-credit.
+Legacy reports without these fields project to `unavailable` with null evidence
+and timestamps. That exact empty form remains readable after sanitization;
+unavailable reports with evidence or actual timestamps are rejected.
 
 The separate `PLATFORM_SSR_HEAP_METRICS_ENABLED` selector is false in the
 public baseline and every current managed runtime profile. The deploy

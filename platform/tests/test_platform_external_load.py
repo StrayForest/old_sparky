@@ -286,6 +286,25 @@ class ExternalLoadTests(unittest.TestCase):
             legacy_shapes=(legacy_shape,),
             current_shapes=(frozenset(malformed_current),),
         ))
+        canonical_legacy = {
+            "worker_report_schema": 2, "status": "incomplete",
+            "failure_evidence": None,
+            "failure_evidence_status": "unavailable",
+            "actual_on_request_started_at_utc": None,
+            "actual_on_request_finished_at_utc": None,
+        }
+        canonical_shape = frozenset(canonical_legacy)
+        self.assertIs(capacity_diagnostic._normalize_failure_evidence_fields(
+            canonical_legacy, legacy_shapes=(), current_shapes=(canonical_shape,),
+        ), True)
+        for mutation in (
+            {"failure_evidence": {"private": "must-not-echo"}},
+            {"actual_on_request_started_at_utc": "2026-10-28T10:00:00Z"},
+        ):
+            self.assertIsNone(capacity_diagnostic._normalize_failure_evidence_fields(
+                {**canonical_legacy, **mutation},
+                legacy_shapes=(), current_shapes=(canonical_shape,),
+            ))
 
     def _assert_capacity_reports_preserve_off_and_partial_on_failures(self) -> None:
         planned_start = 1_798_200_000_000

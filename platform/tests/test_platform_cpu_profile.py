@@ -2586,6 +2586,15 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     app_target_sha="c" * 40, run_id="12345", attempt="1",
                     workload=capacity_diagnostic.HTML_WORKLOAD,
                 ), "PASS")
+            sanitized_legacy = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertIsNotNone(capacity_diagnostic._project_capacity_report(
+                sanitized_legacy,
+            ))
+            self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+                sanitized_legacy, source_sha="b" * 40, app_target_sha="c" * 40,
+                run_id="12345", attempt="1", manifest_sha256=manifest_sha,
+                workload=capacity_diagnostic.HTML_WORKLOAD,
+            ), "PASS")
         incomplete_window_report = json.loads(json.dumps(report))
         incomplete_window_report["worker"]["process_cpu_windows"][1] = {
             "window": "on", "status": "incomplete", "cpu_ns": None,
