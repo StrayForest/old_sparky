@@ -14,6 +14,20 @@ class _KeepAliveHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+        if self.path in {"/header-timeout", "/body-timeout"}:
+            if self.path == "/header-timeout":
+                time.sleep(0.15)
+            body = b"delayed-body"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.path == "/body-timeout":
+                time.sleep(0.15)
+            try:
+                self.wfile.write(body)
+            except OSError:
+                pass
+            return
         body = b"transport-test"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -105,6 +119,25 @@ class PlatformHttpTransportTests(unittest.TestCase):
                 for key in ("request_write_ms", "edge_wait_ms", "ttfb_ms", "body_receive_ms", "total_ms")
             )
         )
+        self._assert_failure_stage_and_observed_status_reset_at_transport_boundaries()
+
+    def _assert_failure_stage_and_observed_status_reset_at_transport_boundaries(self) -> None:
+        client = HTTP11KeepAliveClient(
+            self.origin,
+            timeout=0.03,
+            max_response_bytes=1024,
+        )
+        try:
+            with self.assertRaises(TimeoutError):
+                client.get("/body-timeout", headers={"Accept": "text/plain"}, timeout=0.03)
+            self.assertEqual(client.last_observed_status, 200)
+            self.assertEqual(client.last_failure_stage, "body_receive")
+            with self.assertRaises(TimeoutError):
+                client.get("/header-timeout", headers={"Accept": "text/plain"}, timeout=0.03)
+            self.assertIsNone(client.last_observed_status)
+            self.assertEqual(client.last_failure_stage, "response_headers")
+        finally:
+            client.close()
 
     def test_rejects_unsafe_origin_and_path(self) -> None:
         with self.assertRaises(ValueError):

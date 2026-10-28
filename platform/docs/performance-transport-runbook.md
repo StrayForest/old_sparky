@@ -312,6 +312,24 @@ and for each safe route class. These are counters from the selected
 boolean values count as unknown, and sampled counts must not be extrapolated
 to the full client population.
 
+The guarded SSR capacity diagnostic keeps its planned OFF/ON window bounds
+separate from actual ON request timestamps. A pre-ON abort therefore has null
+actual ON start/end values; when evidence is available these fields mark the
+first observed ON request start and last observed response completion, which
+may extend beyond the planned submission window. Failure evidence retains phase-level totals and at
+most eight ordered samples with only a closed error class, observed HTTP
+header status (separate from the complete-response status), coarse client
+transport stage, UTC request/exception/completion timestamps, and allowlisted
+phase timings. Truncation and full failure counts remain explicit. This schema
+covers returned OFF-probe and ON-worker `RequestResult`s; warmup, preflight,
+future and worker exceptions remain in their existing summaries without
+request-level rows. The
+combined `connect_or_request_write` stage includes DNS/TCP/TLS setup when a
+connection is opened; `response_headers` and `body_receive` are marked only
+after their corresponding transport boundaries. These observations do not
+identify an SSR/API exception or join a client request to an origin log by
+themselves; keep failure runs diagnostic and zero-credit.
+
 The separate `PLATFORM_SSR_HEAP_METRICS_ENABLED` selector is false in the
 public baseline and every current managed runtime profile. The deploy
 supervisor explicitly selects this key on each profile application, and the

@@ -20,6 +20,7 @@ from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
 import tools.platform_external_load as external_load
+import tools.platform_ssr_capacity_diagnostic as capacity_diagnostic
 from tools.platform_evidence_sanitizer import project_public_artifact
 from tools.platform_external_load import (
     ExternalLoadError,
@@ -180,6 +181,183 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def _assert_capacity_failure_evidence_is_bounded_closed_and_uses_observed_times(self) -> None:
+        off = RequestResult(
+            "off", "GET", "/private-fixture", 0, 5000.0, False, 0,
+            error_kind="TimeoutError", failure_stage="response_headers",
+            started_at_utc="2026-10-28T10:00:00+00:00",
+            exception_at_utc="2026-10-28T10:00:05+00:00",
+            finished_at_utc="2026-10-28T10:00:05+00:00",
+        )
+        on = RequestResult(
+            "on", "GET", "/private-fixture", 0, 5000.0, False, 0,
+            error_kind="TimeoutError", observed_status=200,
+            failure_stage="body_receive",
+            started_at_utc="2026-10-28T10:00:10+00:00",
+            exception_at_utc="2026-10-28T10:00:15+00:00",
+            finished_at_utc="2026-10-28T10:00:15+00:00",
+            transport_timing={"body_receive_ms": 5000.0, "unsafe": "private"},
+        )
+        evidence = capacity_diagnostic._failure_evidence(
+            off_results=[off], on_results=[on] * 10,
+        )
+        self.assertEqual(evidence["failure_count"], 11)
+        self.assertTrue(evidence["records_truncated"])
+        self.assertEqual(evidence["by_phase"]["off_probe"]["failure_count"], 1)
+        self.assertEqual(evidence["by_phase"]["on_worker"]["failure_count"], 10)
+        self.assertEqual(len(evidence["records"]), capacity_diagnostic.FAILURE_RECORD_LIMIT)
+        self.assertEqual(evidence["records"][0]["phase"], "off_probe")
+        self.assertIsNone(evidence["records"][0]["observed_status"])
+        self.assertEqual(evidence["records"][1]["observed_status"], 200)
+        self.assertEqual(evidence["records"][1]["request_status"], 0)
+        self.assertEqual(evidence["records"][1]["stage"], "body_receive")
+        self.assertEqual(evidence["records"][1]["phase_timing_ms"], {"body_receive_ms": 5000.0})
+        self.assertNotIn("private", repr(evidence))
+        self.assertTrue(capacity_diagnostic._failure_evidence_is_closed(evidence, completed=11))
+        self.assertTrue(capacity_diagnostic._failure_evidence_is_closed(
+            evidence, completed=11, phase_completed={"off_probe": 1, "on_worker": 10},
+        ))
+        self.assertFalse(capacity_diagnostic._failure_evidence_is_closed(
+            evidence, completed=11, phase_completed={"off_probe": 0, "on_worker": 10},
+        ))
+        self.assertFalse(capacity_diagnostic._failure_evidence_is_closed(evidence, completed=9))
+        self.assertFalse(capacity_diagnostic._failure_evidence_is_closed(
+            {**evidence, "unsafe": "private"}, completed=11,
+        ))
+        malformed = {**evidence, "records": [dict(evidence["records"][0], stage="private/path")]
+                     + evidence["records"][1:]}
+        self.assertFalse(capacity_diagnostic._failure_evidence_is_closed(malformed, completed=11))
+        bad_order = {**evidence, "records": [dict(
+            evidence["records"][0], exception_at_utc="2026-10-28T09:59:59+00:00",
+        )] + evidence["records"][1:]}
+        self.assertFalse(capacity_diagnostic._failure_evidence_is_closed(bad_order, completed=11))
+        bad_status_pair = {**evidence, "records": [dict(
+            evidence["records"][1], stage="body_receive", observed_status=None,
+        )] + evidence["records"][1:]}
+        self.assertFalse(capacity_diagnostic._failure_evidence_is_closed(bad_status_pair, completed=11))
+
+    def _assert_capacity_actual_request_window_never_uses_planned_window(self) -> None:
+        self.assertEqual(capacity_diagnostic._actual_request_window(None), (None, None))
+        self.assertEqual(capacity_diagnostic._actual_request_window([]), (None, None))
+        observed = [
+            RequestResult(
+                "on", "GET", "/private-fixture", 200, 12.0, True, 8,
+                started_at_utc="2026-10-28T10:00:10+00:00",
+                finished_at_utc="2026-10-28T10:00:11+00:00",
+            ),
+            RequestResult(
+                "on", "GET", "/private-fixture", 0, 5000.0, False, 0,
+                error_kind="TimeoutError",
+                started_at_utc="2026-10-28T10:00:12+00:00",
+                finished_at_utc="2026-10-28T10:00:17+00:00",
+            ),
+        ]
+        self.assertEqual(capacity_diagnostic._actual_request_window(observed), (
+            "2026-10-28T10:00:10+00:00", "2026-10-28T10:00:17+00:00",
+        ))
+
+    def _assert_capacity_worker_legacy_projection_marks_evidence_unavailable(self) -> None:
+        legacy = {"worker_report_schema": 2, "status": "incomplete"}
+        legacy_shape = frozenset(legacy)
+        result = capacity_diagnostic._normalize_failure_evidence_fields(
+            legacy,
+            legacy_shapes=(legacy_shape,),
+            current_shapes=(frozenset({
+                "worker_report_schema", "status", "failure_evidence",
+                "failure_evidence_status", "actual_on_request_started_at_utc",
+                "actual_on_request_finished_at_utc",
+            }),),
+        )
+        self.assertIs(result, True)
+        self.assertEqual(legacy["failure_evidence_status"], "unavailable")
+        self.assertIsNone(legacy["failure_evidence"])
+        self.assertIsNone(legacy["actual_on_request_started_at_utc"])
+        self.assertIsNone(legacy["actual_on_request_finished_at_utc"])
+
+        malformed_current = {
+            "worker_report_schema": 2, "status": "incomplete",
+            "failure_evidence": {"private": "must-not-echo"},
+            "failure_evidence_status": "unavailable",
+            "actual_on_request_started_at_utc": None,
+            "actual_on_request_finished_at_utc": None,
+        }
+        self.assertIsNone(capacity_diagnostic._normalize_failure_evidence_fields(
+            malformed_current,
+            legacy_shapes=(legacy_shape,),
+            current_shapes=(frozenset(malformed_current),),
+        ))
+
+    def _assert_capacity_reports_preserve_off_and_partial_on_failures(self) -> None:
+        planned_start = 1_798_200_000_000
+        capacity = {
+            "concurrency": 8,
+            "workload": capacity_diagnostic.WORKLOAD,
+            "on_start_ms": planned_start,
+            "on_end_ms": planned_start + capacity_diagnostic.ON_WINDOW_MS,
+        }
+        binding = {
+            "source_sha": "a" * 40,
+            "app_target_sha": "b" * 40,
+            "external_run_id": "123",
+            "external_run_attempt": "1",
+            "run_id": "c" * 32,
+            "profile_digest": capacity_diagnostic.profile_digest(8),
+        }
+        off_failure = RequestResult(
+            "off", "GET", "/private-fixture", 0, 5000.0, False, 0,
+            error_kind="TimeoutError", failure_stage="response_headers",
+            started_at_utc="2026-10-28T10:00:00+00:00",
+            exception_at_utc="2026-10-28T10:00:05+00:00",
+            finished_at_utc="2026-10-28T10:00:05+00:00",
+        )
+        before_on = capacity_diagnostic._incomplete_report(
+            capacity, binding, "off_probe_failed", submitted=0, completed=0,
+            observed_duration_ms=0, manifest_sha256="d" * 64,
+            off_probe_submitted=32, off_probe_completed=32,
+            off_results=[off_failure],
+        )
+        self.assertEqual(before_on["status"], "incomplete")
+        self.assertEqual(before_on["resource_abort_reason"], "off_probe_failed")
+        self.assertEqual(before_on["on_window_start_ms"], planned_start)
+        self.assertEqual(before_on["on_window_end_ms"], planned_start + capacity_diagnostic.ON_WINDOW_MS)
+        self.assertIsNone(before_on["actual_on_request_started_at_utc"])
+        self.assertIsNone(before_on["actual_on_request_finished_at_utc"])
+        self.assertEqual(before_on["failure_evidence"]["by_phase"]["off_probe"]["error_class_counts"], {"timeout": 1})
+        self.assertEqual(before_on["failure_evidence"]["by_phase"]["on_worker"]["failure_count"], 0)
+        self.assertEqual(before_on["failure_evidence"]["records"][0]["observed_status"], None)
+
+        on_success = RequestResult(
+            "on", "GET", "/private-fixture", 200, 1000.0, True, 128,
+            started_at_utc="2026-10-28T10:01:00+00:00",
+            finished_at_utc="2026-10-28T10:01:01+00:00",
+        )
+        on_timeout = RequestResult(
+            "on", "GET", "/private-fixture", 0, 5000.0, False, 0,
+            error_kind="TimeoutError", observed_status=200,
+            failure_stage="body_receive",
+            started_at_utc="2026-10-28T10:01:02+00:00",
+            exception_at_utc="2026-10-28T10:01:07+00:00",
+            finished_at_utc="2026-10-28T10:01:07+00:00",
+        )
+        partial_on = capacity_diagnostic._incomplete_report(
+            capacity, binding, "response_failure", submitted=2, completed=2,
+            observed_duration_ms=7000, manifest_sha256="e" * 64,
+            off_probe_submitted=32, off_probe_completed=32, off_probe_status=200,
+            on_results=[on_success, on_timeout],
+        )
+        self.assertEqual(partial_on["status"], capacity_diagnostic._capacity_worker_status(
+            aborted=True, all_200=False,
+        ))
+        self.assertEqual(partial_on["resource_abort_reason"], "response_failure")
+        self.assertEqual(partial_on["actual_on_request_started_at_utc"], on_success.started_at_utc)
+        self.assertEqual(partial_on["actual_on_request_finished_at_utc"], on_timeout.finished_at_utc)
+        self.assertNotEqual(partial_on["actual_on_request_started_at_utc"], str(planned_start))
+        record = partial_on["failure_evidence"]["records"][0]
+        self.assertEqual(record["error_class"], "timeout")
+        self.assertEqual(record["request_status"], 0)
+        self.assertEqual(record["observed_status"], 200)
+        self.assertEqual(record["phase"], "on_worker")
+
     def test_authenticated_html_contract_requires_authenticated_ready_page_markers(self) -> None:
         # Match the route's raw SSR shape: the workspace-seeded Hero and
         # authenticated header are rendered, while the detail view's
@@ -411,13 +589,19 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(call.args[0], "/tournaments/fixture-slug")
         self.assertIn("session=" + user.session_token, call.kwargs["headers"]["Cookie"])
 
-        state = {"gzip": False, "delay": False, "accept_encoding": []}
+        state = {
+            "gzip": False, "delay": False, "accept_encoding": [],
+            "timeout_diagnostic_ids": [],
+        }
 
         class LoopbackHandler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
             def do_GET(self) -> None:
                 state["accept_encoding"].append(self.headers.get("Accept-Encoding"))
+                state["timeout_diagnostic_ids"].append(
+                    self.headers.get("X-Platform-Timeout-Diagnostic-ID"),
+                )
                 if state["delay"]:
                     time.sleep(0.2)
                 response_body = gzip.compress(body) if state["gzip"] else body
@@ -444,11 +628,15 @@ class ExternalLoadTests(unittest.TestCase):
         origin = f"http://127.0.0.1:{server.server_port}"
         external_load._page_transport_local.client = None
         try:
-            ready_result = external_load._page_request_http11_keepalive(
+            ready_result = external_load._page_request(
                 origin, user, "html-capacity", 2.0,
                 session_cookie_name="session", csrf_cookie_name="csrf",
+                transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
+                capture_timestamps=True,
                 require_authenticated_html=True,
             )
+            self.assertIsNotNone(ready_result.started_at_utc)
+            self.assertIsNotNone(ready_result.finished_at_utc)
             self.assertEqual(ready_result.status, 200)
             self.assertTrue(ready_result.html_content_type_ok)
             self.assertEqual(ready_result.html_content_encoding, "identity")
@@ -479,6 +667,7 @@ class ExternalLoadTests(unittest.TestCase):
             external_load._page_transport_local.client.close()
             external_load._page_transport_local.client = None
         self.assertEqual(state["accept_encoding"], ["identity", "identity", "identity"])
+        self.assertEqual(state["timeout_diagnostic_ids"], [None, None, None])
         self.assertFalse(gzip_result.ok)
         self.assertEqual(gzip_result.html_content_encoding, "gzip")
         self.assertFalse(gzip_result.html_page_marker_ok)
@@ -517,6 +706,10 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(result["completed"], 2)
         self.assertEqual(len(result["results"]), 2)
         self.assertEqual(calls, 2)
+        self._assert_capacity_failure_evidence_is_bounded_closed_and_uses_observed_times()
+        self._assert_capacity_actual_request_window_never_uses_planned_window()
+        self._assert_capacity_worker_legacy_projection_marks_evidence_unavailable()
+        self._assert_capacity_reports_preserve_off_and_partial_on_failures()
 
     def test_capacity_closed_loop_guard_stops_refill_and_drains_inflight(self) -> None:
         actors = [VirtualUser(f"actor-{index}", "fixture", "s" * 32, "c" * 32) for index in range(2)]
