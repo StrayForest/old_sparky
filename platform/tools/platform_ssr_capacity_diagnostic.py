@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
+from datetime import datetime, timedelta
 import hashlib
 import json
 import math
@@ -56,6 +57,14 @@ CAPACITY_ERROR_CODES = frozenset({
 FIXTURE_TOURNAMENTS = 1
 FIXTURE_USERS = 14
 ON_WINDOW_MS = 20_000
+FAILURE_RECORD_LIMIT = 8
+FAILURE_STAGES = frozenset({
+    "connect_or_request_write", "response_headers", "body_receive", "response_complete", "unknown",
+})
+FAILURE_TIMING_KEYS = frozenset({
+    "dns_ms", "tcp_connect_ms", "tls_handshake_ms", "request_write_ms",
+    "edge_wait_ms", "ttfb_ms", "body_receive_ms", "total_ms",
+})
 CONTROL_BASENAME = "capacity-control.json"
 REMOTE_WATCH_PREFIX = b"CAPACITY_MEMORY_GUARD "
 REMOTE_WATCH_ERROR_PREFIX = b"CAPACITY_MEMORY_GUARD_ERROR "
@@ -851,6 +860,234 @@ def _capacity_error_code(result: Any) -> str:
     return code if code in CAPACITY_ERROR_CODES else "other"
 
 
+def _utc_timestamp_is_closed(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) > 40:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
+
+
+def _actual_request_window(results: list[Any] | None) -> tuple[str | None, str | None]:
+    started = [item.started_at_utc for item in results or []
+               if _utc_timestamp_is_closed(item.started_at_utc)]
+    finished = [item.finished_at_utc for item in results or []
+                if _utc_timestamp_is_closed(item.finished_at_utc)]
+    if not started or not finished:
+        return None, None
+    return min(started), max(finished)
+
+
+def _request_evidence_fields(
+    *, off_results: list[Any] | None = None, on_results: list[Any] | None = None,
+) -> dict[str, Any]:
+    actual_start, actual_finish = _actual_request_window(on_results)
+    return {
+        "actual_on_request_started_at_utc": actual_start,
+        "actual_on_request_finished_at_utc": actual_finish,
+        "failure_evidence_status": "available",
+        "failure_evidence": _failure_evidence(
+            off_results=off_results, on_results=on_results,
+        ),
+    }
+
+
+def _capacity_worker_status(*, aborted: bool, all_200: bool) -> str:
+    return "incomplete" if aborted else "complete" if all_200 else "failed"
+
+
+def _failure_evidence(
+    *, off_results: list[Any] | None = None, on_results: list[Any] | None = None,
+) -> dict[str, Any]:
+    phased = [
+        (phase, item)
+        for phase, results in (("off_probe", off_results or []), ("on_worker", on_results or []))
+        for item in results if item.error_kind is not None or item.ok is not True
+    ]
+    by_phase: dict[str, Any] = {}
+    for phase in ("off_probe", "on_worker"):
+        phase_items = [item for item_phase, item in phased if item_phase == phase]
+        by_phase[phase] = {
+            "failure_count": len(phase_items),
+            "error_class_counts": dict(sorted(Counter(
+                _capacity_error_code(item) for item in phase_items
+            ).items())),
+            "observed_status_counts": dict(sorted(Counter(
+                str(item.observed_status)
+                if type(item.observed_status) is int and 100 <= item.observed_status <= 599
+                else "unknown"
+                for item in phase_items
+            ).items())),
+        }
+    records: list[dict[str, Any]] = []
+    for ordinal, (phase, item) in enumerate(phased[:FAILURE_RECORD_LIMIT], start=1):
+        stage = item.failure_stage if item.status == 0 else "response_complete"
+        if not isinstance(stage, str) or stage not in FAILURE_STAGES:
+            stage = "unknown"
+        timing = item.transport_timing if isinstance(item.transport_timing, dict) else {}
+        safe_timing = {
+            key: round(float(timing[key]), 3)
+            for key in sorted(FAILURE_TIMING_KEYS)
+            if type(timing.get(key)) in (int, float)
+            and math.isfinite(float(timing[key])) and timing[key] >= 0
+        }
+        record = {
+            "ordinal": ordinal,
+            "phase": phase,
+            "error_class": _capacity_error_code(item),
+            "stage": stage,
+            "request_status": (
+                item.status if type(item.status) is int and 0 <= item.status <= 599 else 0
+            ),
+            "observed_status": (
+                item.observed_status
+                if type(item.observed_status) is int and 100 <= item.observed_status <= 599
+                else None
+            ),
+            "started_at_utc": item.started_at_utc,
+            "exception_at_utc": item.exception_at_utc,
+            "finished_at_utc": item.finished_at_utc,
+            "phase_timing_ms": safe_timing,
+        }
+        records.append(record)
+    return {
+        "failure_count": len(phased),
+        "by_phase": by_phase,
+        "records": records,
+        "records_truncated": len(phased) > FAILURE_RECORD_LIMIT,
+    }
+
+
+def _failure_evidence_is_closed(
+    value: Any, *, completed: int, phase_completed: Mapping[str, int] | None = None,
+) -> bool:
+    if (not isinstance(value, dict)
+            or set(value) != {"failure_count", "by_phase", "records", "records_truncated"}
+            or type(value.get("failure_count")) is not int
+            or not 0 <= value["failure_count"] <= completed
+            or not isinstance(value.get("records"), list)
+            or len(value["records"]) > FAILURE_RECORD_LIMIT
+            or type(value.get("records_truncated")) is not bool
+            or value["records_truncated"] != (value["failure_count"] > FAILURE_RECORD_LIMIT)
+            or len(value["records"]) != min(value["failure_count"], FAILURE_RECORD_LIMIT)):
+        return False
+    by_phase = value.get("by_phase")
+    if not isinstance(by_phase, dict) or set(by_phase) != {"off_probe", "on_worker"}:
+        return False
+    phase_failure_total = 0
+    for phase_data in by_phase.values():
+        if (not isinstance(phase_data, dict)
+                or set(phase_data) != {"failure_count", "error_class_counts", "observed_status_counts"}
+                or type(phase_data.get("failure_count")) is not int
+                or not isinstance(phase_data.get("error_class_counts"), dict)
+                or not isinstance(phase_data.get("observed_status_counts"), dict)
+                or any(key not in CAPACITY_ERROR_CODES or type(count) is not int or count < 0
+                       for key, count in phase_data["error_class_counts"].items())
+                or any(key not in {"unknown", *(str(status) for status in range(100, 600))}
+                       or type(count) is not int or count < 0
+                       for key, count in phase_data["observed_status_counts"].items())
+                or sum(phase_data["error_class_counts"].values()) != phase_data["failure_count"]
+                or sum(phase_data["observed_status_counts"].values()) != phase_data["failure_count"]):
+            return False
+        phase_failure_total += phase_data["failure_count"]
+    if phase_failure_total != value["failure_count"]:
+        return False
+    if phase_completed is not None and any(
+        type(phase_completed.get(phase)) is not int
+        or phase_data["failure_count"] > phase_completed[phase]
+        for phase, phase_data in by_phase.items()
+    ):
+        return False
+    record_phase_counts = Counter(
+        record.get("phase") for record in value["records"]
+        if isinstance(record, dict) and isinstance(record.get("phase"), str)
+    )
+    if any(record_phase_counts[phase] > phase_data["failure_count"]
+           for phase, phase_data in by_phase.items()):
+        return False
+    for ordinal, record in enumerate(value["records"], start=1):
+        if (not isinstance(record, dict)
+                or set(record) != {
+                    "ordinal", "phase", "error_class", "stage", "request_status", "observed_status",
+                    "started_at_utc", "exception_at_utc", "finished_at_utc",
+                    "phase_timing_ms",
+                }
+                or record.get("ordinal") != ordinal
+                or not isinstance(record.get("phase"), str)
+                or record.get("phase") not in {"off_probe", "on_worker"}
+                or not isinstance(record.get("error_class"), str)
+                or record.get("error_class") not in CAPACITY_ERROR_CODES
+                or not isinstance(record.get("stage"), str)
+                or record.get("stage") not in FAILURE_STAGES
+                or type(record.get("request_status")) is not int
+                or not 0 <= record["request_status"] <= 599
+                or (record.get("observed_status") is not None and (
+                    type(record["observed_status"]) is not int
+                    or not 100 <= record["observed_status"] <= 599
+                ))
+                or not _utc_timestamp_is_closed(record.get("started_at_utc"))
+                or not _utc_timestamp_is_closed(record.get("finished_at_utc"))
+                or (record.get("exception_at_utc") is not None
+                    and not _utc_timestamp_is_closed(record["exception_at_utc"]))
+                or (record.get("stage") != "response_complete"
+                    and record.get("exception_at_utc") is None)
+                or (record.get("stage") == "response_complete"
+                    and (record.get("observed_status") is None
+                         or record.get("request_status") != record.get("observed_status")))
+                or (record.get("stage") in {"connect_or_request_write", "response_headers"}
+                    and (record.get("observed_status") is not None
+                         or record.get("request_status") != 0))
+                or (record.get("stage") == "body_receive"
+                    and (record.get("observed_status") is None
+                         or record.get("request_status") != 0))
+                or not isinstance(record.get("phase_timing_ms"), dict)
+                or any(
+                    key not in FAILURE_TIMING_KEYS or type(number) not in (int, float)
+                    or not math.isfinite(float(number)) or number < 0
+                    for key, number in record["phase_timing_ms"].items()
+                )):
+            return False
+        start = datetime.fromisoformat(record["started_at_utc"].replace("Z", "+00:00"))
+        finish = datetime.fromisoformat(record["finished_at_utc"].replace("Z", "+00:00"))
+        if start > finish:
+            return False
+        if record["exception_at_utc"] is not None:
+            event = datetime.fromisoformat(record["exception_at_utc"].replace("Z", "+00:00"))
+            if not start <= event <= finish:
+                return False
+    return True
+
+
+def _normalize_failure_evidence_fields(
+    payload: dict[str, Any], *, legacy_shapes: tuple[frozenset[str], ...],
+    current_shapes: tuple[frozenset[str], ...],
+) -> bool | None:
+    """Return True for a legacy shape normalized as unavailable, False for current."""
+
+    shape = frozenset(payload)
+    if shape in legacy_shapes:
+        payload.update({
+            "failure_evidence": None,
+            "actual_on_request_started_at_utc": None,
+            "actual_on_request_finished_at_utc": None,
+            "failure_evidence_status": "unavailable",
+        })
+        return True
+    if shape in current_shapes:
+        if payload.get("failure_evidence_status") == "available":
+            return False
+        if (payload.get("failure_evidence_status") == "unavailable"
+                and payload.get("failure_evidence") is None
+                and payload.get("actual_on_request_started_at_utc") is None
+                and payload.get("actual_on_request_finished_at_utc") is None):
+            # This exact canonical form is emitted only when an accepted legacy
+            # keyset is projected for serialization; it carries no new evidence.
+            return True
+    return None
+
+
 def _worker_counts_are_closed(payload: Mapping[str, Any]) -> bool:
     statuses = payload.get("http_status_counts")
     errors = payload.get("error_counts")
@@ -1277,6 +1514,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             session_cookie_name=cookie_names[0],
             csrf_cookie_name=cookie_names[1],
             transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
+            capture_timestamps=True,
             diagnostic_trace_run_id=binding["run_id"],
             require_authenticated_html=capacity["workload"] == HTML_WORKLOAD,
         )
@@ -1304,6 +1542,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             manifest["origin"], actor, "authenticated_workspace_capacity_off_probe", 5.0,
             session_cookie_name=cookie_names[0], csrf_cookie_name=cookie_names[1],
             transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
+            capture_timestamps=True,
             diagnostic_trace_run_id=binding["run_id"],
             require_authenticated_html=capacity["workload"] == HTML_WORKLOAD,
         )
@@ -1321,6 +1560,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             off_probe_status=None, manifest_sha256=capacity["manifest_sha256"],
             warmup_failure=warmup_failure,
             off_probe_diagnostics=off_probe_diagnostics,
+            off_results=off_results,
         )
 
     warm_futures = [
@@ -1403,8 +1643,9 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
                 off_probe_reason_counts["barrier_failed"] += 1
                 continue
             result_reason, status_class, elapsed_ms = _classify_off_probe_result(result)
-            if isinstance(result, external_load.RequestResult) and status_class is not None:
+            if isinstance(result, external_load.RequestResult):
                 off_results.append(result)
+            if isinstance(result, external_load.RequestResult) and status_class is not None:
                 off_probe_status_classes[status_class] += 1
                 if type(result.status) is int and result.status != 0:
                     off_probe_http_statuses[str(result.status)] += 1
@@ -1531,7 +1772,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         for item in results
     )
     final_reason = phase_result["abort_reason"]
-    status = "incomplete" if phase_result["aborted"] else "complete" if all_200 else "failed"
+    status = _capacity_worker_status(aborted=phase_result["aborted"], all_200=all_200)
     return {
         **profile_payload(capacity["concurrency"], capacity["workload"]),
         "report_complete": True,
@@ -1554,6 +1795,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         "fixture_manifest_bytes": len(manifest_raw),
         "on_window_start_ms": phase_result["window_start_at_ms"],
         "on_window_end_ms": phase_result["window_end_at_ms"],
+        **_request_evidence_fields(on_results=results),
         "observed_duration_ms": phase_result["duration_ms"],
         "submitted": phase_result["submitted"],
         "completed": phase_result["completed"],
@@ -1598,6 +1840,8 @@ def _incomplete_report(
     off_probe_diagnostics: Mapping[str, Any] | None = None,
     warmup_failure: Mapping[str, Any] | None = None,
     control_failure_reason: str | None = None,
+    off_results: list[Any] | None = None,
+    on_results: list[Any] | None = None,
 ) -> dict[str, Any]:
     if type(observed_duration_ms) is not int or not 0 <= observed_duration_ms <= 30_000:
         raise ValueError("capacity incomplete duration is invalid")
@@ -1617,6 +1861,8 @@ def _incomplete_report(
         "fixture_manifest_bytes": capacity.get("manifest_bytes", 0),
         "on_window_start_ms": capacity["on_start_ms"],
         "on_window_end_ms": capacity["on_end_ms"],
+        # These are observed request events; pre-ON aborts have no ON request.
+        **_request_evidence_fields(off_results=off_results, on_results=on_results),
         # This field measures the ON window; pre-ON aborts pass zero explicitly.
         "observed_duration_ms": observed_duration_ms,
         "submitted": submitted, "completed": completed,
@@ -1932,6 +2178,8 @@ def run_isolated_capacity_worker(
         "worker": {
             key: worker_payload.get(key, _unknown_cpu_windows() if key == "process_cpu_windows" else None) for key in (
                 "status", "submitted", "completed", "http_status_counts", "error_counts",
+                "failure_evidence", "actual_on_request_started_at_utc",
+                "actual_on_request_finished_at_utc", "failure_evidence_status",
                 "latency_ms", "resource_abort_reason", "on_window_start_ms", "on_window_end_ms",
                 "observed_duration_ms", "max_inflight", "fixture_manifest_bytes",
                 "response_bytes_total", "off_probe", "process_cpu_windows",
@@ -1962,6 +2210,9 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
     binding = capacity_config.get("binding")
     if not isinstance(binding, Mapping) or not isinstance(payload, dict):
         return False
+    # Validation may normalize legacy evidence fields; keep caller-owned reports
+    # reusable for additional projections and mutation checks.
+    payload = dict(payload)
     expected_fields = {
         "worker_report_schema", "partial_work", "inflight_unknown",
         "schema", "workload", "fixture_kind", "fixture_tournaments", "fixture_users",
@@ -1978,12 +2229,38 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
     control_diagnostic_fields = expected_fields | {"control_failure_reason"}
     warmup_fields = expected_fields | {"warmup_failure"}
     warmup_control_fields = control_diagnostic_fields | {"warmup_failure"}
-    if set(payload) not in (
+    new_fields = expected_fields | {
+        "failure_evidence", "actual_on_request_started_at_utc",
+        "actual_on_request_finished_at_utc", "failure_evidence_status",
+    }
+    new_control_fields = control_diagnostic_fields | {
+        "failure_evidence", "actual_on_request_started_at_utc",
+        "actual_on_request_finished_at_utc", "failure_evidence_status",
+    }
+    new_warmup_fields = warmup_fields | {
+        "failure_evidence", "actual_on_request_started_at_utc",
+        "actual_on_request_finished_at_utc", "failure_evidence_status",
+    }
+    new_warmup_control_fields = warmup_control_fields | {
+        "failure_evidence", "actual_on_request_started_at_utc",
+        "actual_on_request_finished_at_utc", "failure_evidence_status",
+    }
+    legacy_shapes = tuple(frozenset(shape) for shape in (
         expected_fields, expected_fields - {"process_cpu_windows"},
         control_diagnostic_fields, control_diagnostic_fields - {"process_cpu_windows"},
         warmup_fields, warmup_fields - {"process_cpu_windows"},
         warmup_control_fields, warmup_control_fields - {"process_cpu_windows"},
-    ):
+    ))
+    new_shapes = tuple(frozenset(shape) for shape in (
+        new_fields, new_fields - {"process_cpu_windows"},
+        new_control_fields, new_control_fields - {"process_cpu_windows"},
+        new_warmup_fields, new_warmup_fields - {"process_cpu_windows"},
+        new_warmup_control_fields, new_warmup_control_fields - {"process_cpu_windows"},
+    ))
+    legacy_failure_evidence = _normalize_failure_evidence_fields(
+        payload, legacy_shapes=legacy_shapes, current_shapes=new_shapes,
+    )
+    if legacy_failure_evidence is None:
         return False
     if "control_failure_reason" in payload:
         control_reason = payload.get("control_failure_reason")
@@ -2033,6 +2310,30 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         and payload.get("actors") == _profile_spec(capacity_config["workload"])[2]
         and payload.get("generator_cpu_evidence") == _generator_cpu_evidence_status(cpu_rows)
         and _worker_counts_are_closed(payload)
+        and ((legacy_failure_evidence and payload.get("failure_evidence") is None)
+             or (not legacy_failure_evidence and _failure_evidence_is_closed(
+            payload.get("failure_evidence"), completed=(
+                payload.get("completed", 0)
+                + (payload.get("off_probe", {}).get("completed", 0)
+                   if isinstance(payload.get("off_probe"), dict) else 0)
+            ),
+            phase_completed={
+                "off_probe": (
+                    payload.get("off_probe", {}).get("completed", 0)
+                    if isinstance(payload.get("off_probe"), dict) else 0
+                ),
+                "on_worker": payload.get("completed", 0),
+            },
+        )))
+        and all(
+            payload.get(key) is None or _utc_timestamp_is_closed(payload.get(key))
+            for key in ("actual_on_request_started_at_utc", "actual_on_request_finished_at_utc")
+        )
+        and ((payload.get("actual_on_request_started_at_utc") is None)
+             == (payload.get("actual_on_request_finished_at_utc") is None))
+        and (payload.get("actual_on_request_started_at_utc") is None
+             or payload.get("actual_on_request_started_at_utc")
+             <= payload.get("actual_on_request_finished_at_utc"))
         and payload.get("fixture_tournaments") == FIXTURE_TOURNAMENTS
         and payload.get("fixture_users") == FIXTURE_USERS
         and _valid_cpu_window_rows(cpu_rows)
@@ -2901,6 +3202,9 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
     }
     if not isinstance(value, dict) or set(value) not in (top_fields, top_fields | {"plan_cleanup_failure_detail"}):
         return None
+    # This projector adds compatibility defaults to its output. Do not mutate a
+    # caller's report while validating or projecting a legacy worker payload.
+    value = dict(value)
     try:
         expected_fixture_kind, expected_presets, expected_actor_count = _profile_spec(value.get("workload"))
     except ValueError:
@@ -2940,22 +3244,45 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         return None
     worker = value.get("worker")
     if worker is not None:
+        if not isinstance(worker, dict):
+            return None
+        worker = dict(worker)
+        value["worker"] = worker
         expected_worker = {
             "status", "submitted", "completed", "http_status_counts", "error_counts",
+            "failure_evidence", "actual_on_request_started_at_utc",
+            "actual_on_request_finished_at_utc", "failure_evidence_status",
             "latency_ms", "resource_abort_reason", "on_window_start_ms",
             "on_window_end_ms", "observed_duration_ms", "off_probe", "max_inflight",
             "fixture_manifest_bytes", "response_bytes_total", "process_cpu_windows",
         }
+        legacy_worker = expected_worker - {
+            "failure_evidence", "actual_on_request_started_at_utc",
+            "actual_on_request_finished_at_utc", "failure_evidence_status",
+        }
         warmup_worker = expected_worker | {"warmup_failure"}
         control_diagnostic_worker = expected_worker | {"control_failure_reason"}
         warmup_control_worker = control_diagnostic_worker | {"warmup_failure"}
-        if (not isinstance(worker, dict)
-                or set(worker) not in (
-                    expected_worker, expected_worker - {"process_cpu_windows"},
-                    control_diagnostic_worker, control_diagnostic_worker - {"process_cpu_windows"},
-                    warmup_worker, warmup_worker - {"process_cpu_windows"},
-                    warmup_control_worker, warmup_control_worker - {"process_cpu_windows"},
-                )):
+        legacy_warmup_worker = legacy_worker | {"warmup_failure"}
+        legacy_control_worker = legacy_worker | {"control_failure_reason"}
+        legacy_warmup_control_worker = legacy_control_worker | {"warmup_failure"}
+        legacy_shapes = tuple(frozenset(shape) for shape in (
+            legacy_worker, legacy_worker - {"process_cpu_windows"},
+            legacy_warmup_worker, legacy_warmup_worker - {"process_cpu_windows"},
+            legacy_control_worker, legacy_control_worker - {"process_cpu_windows"},
+            legacy_warmup_control_worker,
+            legacy_warmup_control_worker - {"process_cpu_windows"},
+        ))
+        current_shapes = tuple(frozenset(shape) for shape in (
+            expected_worker, expected_worker - {"process_cpu_windows"},
+            control_diagnostic_worker, control_diagnostic_worker - {"process_cpu_windows"},
+            warmup_worker, warmup_worker - {"process_cpu_windows"},
+            warmup_control_worker, warmup_control_worker - {"process_cpu_windows"},
+        ))
+        legacy_failure_evidence = _normalize_failure_evidence_fields(
+            worker, legacy_shapes=legacy_shapes, current_shapes=current_shapes,
+        )
+        if legacy_failure_evidence is None:
             return None
         has_control_failure_reason = "control_failure_reason" in worker
         if has_control_failure_reason:
@@ -2998,6 +3325,36 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or not 0 <= worker["response_bytes_total"] <= 10**12
                 or not isinstance(worker.get("http_status_counts"), dict)
                 or not isinstance(worker.get("error_counts"), dict)
+                or not (
+                    (legacy_failure_evidence is True
+                     and worker.get("failure_evidence_status") == "unavailable"
+                     and worker.get("failure_evidence") is None
+                     and worker.get("actual_on_request_started_at_utc") is None
+                     and worker.get("actual_on_request_finished_at_utc") is None)
+                    or (legacy_failure_evidence is False
+                     and worker.get("failure_evidence_status") == "available"
+                     and _failure_evidence_is_closed(
+                    worker.get("failure_evidence"),
+                    completed=(worker.get("completed", 0)
+                               + (worker.get("off_probe", {}).get("completed", 0)
+                                  if isinstance(worker.get("off_probe"), dict) else 0)),
+                    phase_completed={
+                        "off_probe": (
+                            worker.get("off_probe", {}).get("completed", 0)
+                            if isinstance(worker.get("off_probe"), dict) else 0
+                        ),
+                        "on_worker": worker.get("completed", 0),
+                    },
+                    )))
+                or any(
+                    worker.get(key) is not None and not _utc_timestamp_is_closed(worker.get(key))
+                    for key in ("actual_on_request_started_at_utc", "actual_on_request_finished_at_utc")
+                )
+                or ((worker.get("actual_on_request_started_at_utc") is None)
+                    != (worker.get("actual_on_request_finished_at_utc") is None))
+                or (worker.get("actual_on_request_started_at_utc") is not None
+                    and worker.get("actual_on_request_started_at_utc")
+                    > worker.get("actual_on_request_finished_at_utc"))
                 or type(worker.get("on_window_start_ms")) is not int
                 or type(worker.get("on_window_end_ms")) is not int
                 or worker["on_window_end_ms"] - worker["on_window_start_ms"] != ON_WINDOW_MS
@@ -3804,7 +4161,7 @@ def sanitize_capacity_report(
     except Exception:
         raise _sanitization_failure("output_write", "output_write_failed") from None
     return evaluate_capacity_report(
-        projected, source_sha=source_sha, app_target_sha=app_target_sha,
+        value, source_sha=source_sha, app_target_sha=app_target_sha,
         run_id=run_id, attempt=attempt,
         manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
         workload=workload,

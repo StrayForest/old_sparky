@@ -1895,6 +1895,10 @@ class RequestResult:
     exception_at_utc: str | None = None
     finished_at_utc: str | None = None
     transport_timing: dict[str, Any] | None = None
+    # Distinguish a status observed at response headers from ``status`` (zero
+    # until the complete response body has been read).
+    observed_status: int | None = None
+    failure_stage: str | None = None
     # Monotonic timestamps are intentionally kept out of the JSON report.  The
     # runner uses them to separate generator scheduling/queueing from the
     # service time reported by the HTTP client.
@@ -3401,6 +3405,7 @@ def _page_request(
     session_cookie_name: str,
     csrf_cookie_name: str,
     diagnostic_id: str | None = None,
+    capture_timestamps: bool = False,
     transport: str = DEFAULT_CLIENT_TRANSPORT,
     diagnostic_trace_run_id: str | None = None,
     require_authenticated_html: bool = False,
@@ -3410,6 +3415,8 @@ def _page_request(
 
     if require_authenticated_html and transport != HTTP11_KEEPALIVE_TRANSPORT:
         raise ExternalLoadError("authenticated HTML validation requires pinned HTTP/1.1 keep-alive")
+    if capture_timestamps and transport != HTTP11_KEEPALIVE_TRANSPORT:
+        raise ExternalLoadError("request timestamp capture requires HTTP/1.1 keep-alive")
     if transport == HTTP11_KEEPALIVE_TRANSPORT:
         return _page_request_http11_keepalive(
             origin,
@@ -3419,6 +3426,7 @@ def _page_request(
             session_cookie_name=session_cookie_name,
             csrf_cookie_name=csrf_cookie_name,
             diagnostic_id=diagnostic_id,
+            capture_timestamps=capture_timestamps,
             diagnostic_trace_run_id=diagnostic_trace_run_id,
             require_authenticated_html=require_authenticated_html,
             budget=budget,
@@ -3475,6 +3483,7 @@ def _page_request_http11_keepalive(
     session_cookie_name: str,
     csrf_cookie_name: str,
     diagnostic_id: str | None = None,
+    capture_timestamps: bool = False,
     diagnostic_trace_run_id: str | None = None,
     require_authenticated_html: bool = False,
     budget: LoadRuntimeBudget | None = None,
@@ -3574,9 +3583,13 @@ def _page_request_http11_keepalive(
             response_etag=response.headers.get("etag") or None,
             error_kind=error_kind,
             diagnostic_id=diagnostic_id,
-            started_at_utc=started_at_utc if diagnostic_id else None,
-            finished_at_utc=datetime.now(UTC).isoformat() if diagnostic_id else None,
+            started_at_utc=started_at_utc if capture_timestamps or diagnostic_id else None,
+            finished_at_utc=(
+                datetime.now(UTC).isoformat()
+                if capture_timestamps or diagnostic_id else None
+            ),
             transport_timing=response.timing,
+            observed_status=status,
             started_at_monotonic=started_at,
             finished_at_monotonic=finished_at,
             user_observed_elapsed_ms=max(0.0, finished_at - started_at) * 1000,
@@ -3601,10 +3614,12 @@ def _page_request_http11_keepalive(
             ),
             error_kind=type(error).__name__,
             diagnostic_id=diagnostic_id,
-            started_at_utc=started_at_utc if diagnostic_id else None,
-            exception_at_utc=finished_at_utc if diagnostic_id else None,
-            finished_at_utc=finished_at_utc if diagnostic_id else None,
+            started_at_utc=started_at_utc if capture_timestamps or diagnostic_id else None,
+            exception_at_utc=finished_at_utc if capture_timestamps or diagnostic_id else None,
+            finished_at_utc=finished_at_utc if capture_timestamps or diagnostic_id else None,
             transport_timing=timing or None,
+            observed_status=getattr(client, "last_observed_status", None),
+            failure_stage=getattr(client, "last_failure_stage", None),
             started_at_monotonic=started_at,
             finished_at_monotonic=finished_at,
             user_observed_elapsed_ms=max(0.0, finished_at - started_at) * 1000,

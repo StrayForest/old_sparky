@@ -191,6 +191,8 @@ class HTTP11KeepAliveClient:
         self._connection: _TimedHTTPConnection | None = None
         self._ssl_context = ssl.create_default_context()
         self.last_timing: dict[str, Any] = {}
+        self.last_failure_stage: str | None = None
+        self.last_observed_status: int | None = None
 
     def set_timeout(self, timeout: float) -> None:
         """Apply the current request timeout to a reused socket as well."""
@@ -263,6 +265,8 @@ class HTTP11KeepAliveClient:
         # Timing belongs to this physical request attempt only. In particular,
         # a rejected deadline must not surface a previous request's timings.
         self.last_timing = {}
+        self.last_failure_stage = None
+        self.last_observed_status = None
         if method not in {"GET", "POST"}:
             raise ValueError("HTTP transport method is unsupported")
         if not path.startswith("/") or "\r" in path or "\n" in path:
@@ -286,6 +290,9 @@ class HTTP11KeepAliveClient:
                 connection.sock.settimeout(connection.timeout)
 
         started = time.perf_counter()
+        # connection.request() can include DNS/TCP/TLS setup as well as the
+        # request write, so this is intentionally one combined stage.
+        failure_stage = "connect_or_request_write"
         connection.phase_timing = {}
         timing: dict[str, Any] = {
             "transport": (
@@ -312,7 +319,10 @@ class HTTP11KeepAliveClient:
                 (write_finished - started) * 1_000,
             )
 
+            failure_stage = "response_headers"
             response = connection.getresponse()
+            self.last_observed_status = int(response.status)
+            failure_stage = "body_receive"
             headers_finished = time.perf_counter()
             timing["edge_wait_ms"] = (headers_finished - write_finished) * 1_000
             timing["ttfb_ms"] = (headers_finished - started) * 1_000
@@ -345,6 +355,7 @@ class HTTP11KeepAliveClient:
             elif not self._reuse_connection:
                 self.close()
             self.last_timing = timing
+            self.last_failure_stage = None
             return TransportResponse(
                 status=int(response.status),
                 reason=str(response.reason),
@@ -360,5 +371,6 @@ class HTTP11KeepAliveClient:
             timing.update(connection.phase_timing)
             timing["total_ms"] = (time.perf_counter() - started) * 1_000
             self.last_timing = timing
+            self.last_failure_stage = failure_stage
             self.close()
             raise
