@@ -4153,7 +4153,7 @@ def sanitize_capacity_report(
     except Exception:
         raise _sanitization_failure("output_write", "output_write_failed") from None
     return evaluate_capacity_report(
-        projected, source_sha=source_sha, app_target_sha=app_target_sha,
+        value, source_sha=source_sha, app_target_sha=app_target_sha,
         run_id=run_id, attempt=attempt,
         manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
         workload=workload,
