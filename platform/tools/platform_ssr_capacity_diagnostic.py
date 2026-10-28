@@ -3250,7 +3250,6 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         legacy_warmup_control_worker = legacy_control_worker | {"warmup_failure"}
         if not isinstance(worker, dict):
             return None
-        worker_shape = frozenset(worker)
         legacy_shapes = tuple(frozenset(shape) for shape in (
             legacy_worker, legacy_worker - {"process_cpu_windows"},
             legacy_warmup_worker, legacy_warmup_worker - {"process_cpu_windows"},
