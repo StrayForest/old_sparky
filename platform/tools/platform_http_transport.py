@@ -322,12 +322,12 @@ class HTTP11KeepAliveClient:
             failure_stage = "response_headers"
             response = connection.getresponse()
             self.last_observed_status = int(response.status)
+            failure_stage = "body_receive"
             headers_finished = time.perf_counter()
             timing["edge_wait_ms"] = (headers_finished - write_finished) * 1_000
             timing["ttfb_ms"] = (headers_finished - started) * 1_000
             if deadline is not None and connection.sock is not None:
                 connection.sock.settimeout(connection._remaining_timeout())
-            failure_stage = "body_receive"
             body = response.read(self._max_response_bytes + 1)
             body_finished = time.perf_counter()
             timing["body_receive_ms"] = (body_finished - headers_finished) * 1_000
