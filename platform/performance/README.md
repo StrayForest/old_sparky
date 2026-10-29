@@ -49,14 +49,18 @@ transport selector applies to `/auth/bootstrap`; the tournament workspace
 request remains on the shared `platformFetch` path. The evidence does not
 justify a workspace transport change or another code-level fix.
 
-The PostgreSQL observer uses top-500 `pg_stat_statements` snapshots and maps
-nonnumeric or null query IDs to the shared `other` sentinel. Distinct statements
-can therefore collide in the query-ID-keyed delta, making those rows
-unattributable as per-query interval costs. A future observer correction
-should preserve statement identity or mark/drop unmatched deltas instead of
-presenting cumulative counters as valid interval values. This is a diagnostic
-correctness limitation, not evidence of an application bottleneck; no code
-change is proposed at this stage.
+The retained A1/B1/A2/B2 PostgreSQL observer artifacts were collected before the
+query-identity correction. That collector mapped null or nonnumeric query IDs to
+a shared `other` identifier, so distinct statements could collide in their
+query-ID-keyed deltas; those historical rows are not per-statement interval
+costs and are not retroactively revalidated by this change. The reviewed
+candidate collector retains validated numeric `queryid` values, excludes
+invalid or ambiguous identities instead of merging them, and marks coverage
+incomplete when the top-500 snapshot or unknown identities prevent a complete
+pairing.
+The public `other` query category is a category label, not an identifier. This
+candidate fix has not been deployed; it improves observer correctness but does
+not prove an application bottleneck or a specific performance gain.
 
 Private analysis reference: `retained-resource-attribution-20261029.md`,
 SHA-256 `612026f8cde27f2a5b977866d6e0ccae442497e15ece36dedc18f645e8a109c9`.
